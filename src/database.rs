@@ -72,7 +72,66 @@ impl fmt::Debug for CachedDeltaProvider {
     }
 }
 
-type DeltaProviderCache = Arc<dashmap::DashMap<(String, String), CachedDeltaProvider>>;
+/// How many snapshot versions to keep cached per `(project, table)`: the
+/// latest plus two predecessors.
+///
+/// One entry per key made the cache degenerate under flush cadence: every
+/// commit bumps `table.version()`, evicting the sole entry, so the next query
+/// rebuilt the delta-rs provider from scratch (snapshot replay — the
+/// `SnapshotVisitor` stacks that dominated live heap in prod, at a 65% hit
+/// rate). Version observation is *not* monotone across concurrent readers
+/// either: two tasks can hold `DeltaTable` handles at v=N and v=N+1 at the
+/// same instant (`fast_resolve_cache` shares one handle that another task
+/// updates), so a single slot thrashes between the two, each miss evicting
+/// the other's freshly built provider.
+///
+/// Retaining a short ring costs at most 3× the provider state per hot key and
+/// cannot serve stale data: lookup is by *exact* version, so a query only ever
+/// gets the provider for the version its own resolved handle reports.
+const PROVIDER_VERSION_RETENTION: usize = 3;
+
+/// The recent-version ring for one `(project, table)`, newest first.
+#[derive(Debug, Default)]
+struct ProviderVersions {
+    versions: Vec<CachedDeltaProvider>,
+}
+
+impl ProviderVersions {
+    /// Cell for `version`, if cached and within TTL. Exact-version match — an
+    /// older retained version is never handed to a query that resolved a newer
+    /// snapshot.
+    fn get(&self, version: u64, ttl: std::time::Duration) -> Option<Arc<DeltaProviderCell>> {
+        self.versions.iter().find(|e| e.version == version && e.created_at.elapsed() <= ttl).map(|e| Arc::clone(&e.cell))
+    }
+
+    /// Install a fresh cell for `version` at the head, dropping any expired or
+    /// same-version predecessor, and keep only `PROVIDER_VERSION_RETENTION`.
+    fn install(&mut self, version: u64, ttl: std::time::Duration) -> Arc<DeltaProviderCell> {
+        let cell = Arc::new(DeltaProviderCell::new());
+        self.versions.retain(|e| e.version != version && e.created_at.elapsed() <= ttl);
+        self.versions.insert(0, CachedDeltaProvider { version, created_at: std::time::Instant::now(), cell: Arc::clone(&cell) });
+        self.versions.truncate(PROVIDER_VERSION_RETENTION);
+        cell
+    }
+
+    /// Drop expired versions; returns how many were removed.
+    fn prune(&mut self, ttl: std::time::Duration) -> usize {
+        let before = self.versions.len();
+        self.versions.retain(|e| e.created_at.elapsed() <= ttl);
+        before - self.versions.len()
+    }
+
+    fn len(&self) -> usize {
+        self.versions.len()
+    }
+
+    /// Is `cell` still retained (at any version)?
+    fn holds(&self, cell: &Arc<DeltaProviderCell>) -> bool {
+        self.versions.iter().any(|e| Arc::ptr_eq(&e.cell, cell))
+    }
+}
+
+type DeltaProviderCache = Arc<dashmap::DashMap<(String, String), ProviderVersions>>;
 type FastResolveCache = Arc<dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>>;
 
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
@@ -1178,7 +1237,9 @@ struct PreparedWrite {
     table_ref: Arc<RwLock<DeltaTable>>,
     schema: &'static crate::schema_loader::TableSchema,
     dirty_bins: Vec<(String, i64)>,
-    batches: Vec<RecordBatch>,
+    /// Lazy: the sort-merge runs when the staging writer drains it, so a
+    /// batch-prepare of N units doesn't hold N sorted buckets at once.
+    batches: FlushBatches,
     writer_properties: WriterProperties,
     /// Store the staged parquet lands in — used to clean it up on a terminal
     /// commit failure (those objects have no Add/Remove, so VACUUM never
@@ -1575,9 +1636,12 @@ pub struct Database {
     /// in the prior session. The provider is parameter-independent: every
     /// query for `(project, table)` at the same snapshot version uses the
     /// same provider, varying only filters/projection/limit on scan().
-    /// Invalidation: compare table.version() against the cached version
-    /// on lookup; mismatch → rebuild + replace. Entries also expire after the
-    /// configured TTL and the cache is capped at its configured capacity.
+    /// Invalidation: look the resolved `table.version()` up in the key's
+    /// recent-version ring (`PROVIDER_VERSION_RETENTION`); absent → build and
+    /// install at the head. Lookup is exact-version, so a bump never serves
+    /// stale files — it just doesn't throw the predecessor away. Versions
+    /// expire after the configured TTL and the total provider count is capped
+    /// at the configured capacity.
     ///
     /// Concurrent misses are de-duplicated through a per-key `OnceCell`:
     /// the first task to miss installs the cell and starts the build; later
@@ -2734,7 +2798,9 @@ impl Database {
         // happening after registration, not a snapshot taken now.
         let fr_handle = self.fast_resolve_cache.clone();
         let dp_handle = self.delta_provider_cache.clone();
-        let cache_sizes: crate::stats_table::CacheSizeSnapshot = Arc::new(move || (fr_handle.len(), dp_handle.len()));
+        // Provider count, not key count: a key holds a small version ring, and
+        // the provider total is what tracks retained heap.
+        let cache_sizes: crate::stats_table::CacheSizeSnapshot = Arc::new(move || (fr_handle.len(), dp_handle.iter().map(|e| e.value().len()).sum()));
         let foyer = self.object_store_cache.clone();
         let foyer_stats: crate::stats_table::FoyerStatsSnapshot =
             Arc::new(move || foyer.as_ref().map_or_else(crate::object_store_cache::FoyerRuntimeStats::default, |cache| cache.runtime_stats()));
@@ -2911,21 +2977,46 @@ impl Database {
         flag.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Total cached providers across every key (a key holds up to
+    /// `PROVIDER_VERSION_RETENTION` versions). This — not the key count — is
+    /// what tracks the cache's heap footprint, so it is what
+    /// `scan.provider_cache_entries` reports.
+    fn delta_provider_cache_entries(&self) -> usize {
+        self.delta_provider_cache.iter().map(|e| e.value().len()).sum()
+    }
+
     fn trim_delta_provider_cache(&self) {
         let ttl = self.config.cache.provider_cache_ttl();
-        let before = self.delta_provider_cache.len();
-        self.delta_provider_cache.retain(|_, entry| entry.created_at.elapsed() <= ttl);
+        // Per-version TTL prune, then drop keys left with nothing.
+        let mut evicted = 0usize;
+        self.delta_provider_cache.retain(|_, entry| {
+            evicted += entry.prune(ttl);
+            entry.len() > 0
+        });
         // The caller is about to insert one provider, so leave one slot free
         // and keep the configured capacity strict after that insertion.
+        // Capacity is counted in providers (not keys) so the bound still
+        // reflects retained memory now that a key holds a version ring.
         let capacity = self.config.cache.provider_cache_capacity().saturating_sub(1);
-        let overflow = self.delta_provider_cache.len().saturating_sub(capacity);
-        let keys: Vec<_> = self.delta_provider_cache.iter().take(overflow).map(|entry| entry.key().clone()).collect();
-        for key in keys {
-            self.delta_provider_cache.remove(&key);
+        let mut total = self.delta_provider_cache_entries();
+        if total > capacity {
+            // Collect first, remove after: DashMap's iterator holds the shard
+            // read lock, so removing mid-iteration can deadlock.
+            let mut doomed = Vec::new();
+            for entry in self.delta_provider_cache.iter() {
+                if total <= capacity {
+                    break;
+                }
+                total -= entry.value().len();
+                doomed.push(entry.key().clone());
+            }
+            for key in doomed {
+                if let Some((_, entry)) = self.delta_provider_cache.remove(&key) {
+                    evicted += entry.len();
+                }
+            }
         }
-        self.scan_metrics
-            .provider_cache_evictions
-            .fetch_add((before.saturating_sub(self.delta_provider_cache.len())) as u64, std::sync::atomic::Ordering::Relaxed);
+        self.scan_metrics.provider_cache_evictions.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
@@ -3968,7 +4059,7 @@ impl Database {
                 let w = w.with_writer_properties(writer_properties.clone());
                 let arrow_schema = w.arrow_schema();
                 let table_fields: std::collections::HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
-                let evolves = batches.iter().any(|b| b.schema().fields().iter().any(|f| !table_fields.contains(f.name().as_str())));
+                let evolves = batches.schemas().iter().any(|s| s.fields().iter().any(|f| !table_fields.contains(f.name().as_str())));
                 (!evolves).then_some(w)
             }
             Err(e) => {
@@ -4098,8 +4189,8 @@ impl Database {
             let target_schema = writer.arrow_schema();
             let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
             let adds: Vec<Action> = async {
-                for b in &batches {
-                    let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                for b in batches {
+                    let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
                     writer.write(casted).await?;
                 }
                 writer.flush().await
@@ -4235,6 +4326,12 @@ impl Database {
         // SCHEMA-EVOLUTION FALLBACK: locked WriteBuilder merge path. Holds the
         // commit lock across the whole write so the schema-metadata merge can't
         // race a concurrent commit. Rare (only when a batch adds a column).
+        //
+        // WriteBuilder re-submits the same rows on every OCC retry, so the lazy
+        // sort-merge has to be materialized once here — this path keeps the old
+        // whole-bucket residency by necessity. It is unreachable when a staged
+        // writer exists (the block above always returns).
+        let batches: Vec<RecordBatch> = batches.collect::<Result<_, _>>()?;
         let commit_lock = self.commit_lock(&project_id, &table_name).await;
         let mut retry_count = 0;
         let mut last_error = None;
@@ -4383,8 +4480,8 @@ impl Database {
                 // columns filled with nulls), mirroring the per-project path.
                 let target_schema = writer.arrow_schema();
                 let adds = async {
-                    for b in &batches {
-                        let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                    for b in batches {
+                        let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
                         writer.write(casted).await?;
                     }
                     writer.flush().await
@@ -6023,8 +6120,8 @@ impl Database {
                         .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
                         .with_writer_properties(writer_properties);
                     let target_schema = writer.arrow_schema();
-                    for b in &deduped {
-                        let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                    for b in deduped {
+                        let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
                         writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
                     }
                     adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
@@ -6658,8 +6755,8 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
                 .with_writer_properties(writer_properties);
             let target_schema = writer.arrow_schema();
-            for b in &batches {
-                let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+            for b in batches {
+                let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
                 writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
             }
             adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(|mut add| {
@@ -7600,10 +7697,182 @@ fn build_query_runtime_env(
 /// would leave rows uncovered. Doubles as a runaway-shard-count backstop.
 const DEDUP_BUCKET_COUNT: u64 = 256;
 
-fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, bool) {
-    use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch};
+/// Rows a bucket must exceed before the streaming merge is worth its setup
+/// (row encoding + heap) over just sorting the single concatenated batch.
+const MERGE_MIN_ROWS: usize = 4_096;
+
+/// Bytes of one emitted merge chunk. The parquet writer coalesces chunks into
+/// row groups itself (`set_max_row_group_bytes`), so this only bounds OUR
+/// transient copy: peak = the (already resident) sorted runs + one chunk,
+/// instead of the concat copy + the `take` copy the old path built.
+const MERGE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const MERGE_CHUNK_ROWS_MIN: usize = 1_024;
+const MERGE_CHUNK_ROWS_MAX: usize = 65_536;
+
+/// Batches a flush/rewrite writes, either eagerly held or produced on demand by
+/// the streaming sort-merge. Iterating yields writer-sized chunks; the merge
+/// frees each sorted run (and its encoded keys) as it is drained, so the whole
+/// bucket is never materialized twice.
+enum FlushBatches {
+    /// Nothing to merge: no sort keys, an unsortable/oversize bucket, or a
+    /// single already-sorted batch. Yielded verbatim.
+    Ready(std::vec::IntoIter<RecordBatch>),
+    Merge(SortMergeStream),
+}
+
+impl FlushBatches {
+    /// Schemas the output may carry — the caller checks these against the table
+    /// schema to decide whether the write needs schema evolution. A merge
+    /// unified its runs, so it has exactly one.
+    fn schemas(&self) -> Vec<arrow_schema::SchemaRef> {
+        match self {
+            Self::Ready(it) => it.as_slice().iter().map(|b| b.schema()).collect(),
+            Self::Merge(m) => vec![m.schema.clone()],
+        }
+    }
+}
+
+impl Iterator for FlushBatches {
+    type Item = Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Ready(it) => it.next().map(Ok),
+            Self::Merge(m) => m.next_chunk(),
+        }
+    }
+}
+
+/// K-way merge of individually sorted runs, emitting chunk-sized batches.
+///
+/// Equivalence to the old concat + `lexsort_to_indices` + `take` path, pinned by
+/// `streaming_merge_matches_reference_sort`: identical multiset of rows, and an
+/// identical sequence of sort-key values (both are total orders by the same
+/// keys, with the same `SortOptions` — `arrow-row` encoding orders identically
+/// to the lexicographic comparator `lexsort_to_indices` uses).
+///
+/// Rows that tie on EVERY sort key may come out in a different relative order
+/// than the old path did. That is not a regression to fix but an ambiguity the
+/// old path never resolved: `arrow_ord::sort::lexsort_to_indices` is an
+/// *unstable* sort (`sort_unstable_by`), so its tie order was already
+/// arbitrary and input-layout dependent. The merge is strictly better defined —
+/// ties break by run index, i.e. by input batch order — and nothing downstream
+/// reads tie order: flush-time dedup already happened upstream
+/// (`mem_buffer::dedup_batches`, which picks survivors by the schema tiebreak,
+/// not by position), and the parquet footer only claims the key ordering.
+struct SortMergeStream {
+    schema: arrow_schema::SchemaRef,
+    converter: arrow::row::RowConverter,
+    /// Individually sorted runs, in input order. Drained runs are replaced by
+    /// an empty batch so their payload frees mid-merge.
+    runs: Vec<RecordBatch>,
+    /// Encoded sort keys, aligned with `runs`; freed on run exhaustion.
+    keys: Vec<arrow::row::Rows>,
+    /// Next unconsumed row per run.
+    pos: Vec<usize>,
+    /// Min-heap of run indices ordered by (current key row, run index).
+    heap: Vec<usize>,
+    chunk_rows: usize,
+}
+
+/// `a`'s head sorts before `b`'s. Ties break by run index — this is what makes
+/// the merge stable w.r.t. the concatenation order.
+fn head_less(a: usize, b: usize, keys: &[arrow::row::Rows], pos: &[usize]) -> bool {
+    match keys[a].row(pos[a]).cmp(&keys[b].row(pos[b])) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => a < b,
+    }
+}
+
+fn sift_up(heap: &mut [usize], mut i: usize, keys: &[arrow::row::Rows], pos: &[usize]) {
+    while i > 0 {
+        let parent = (i - 1) / 2;
+        if !head_less(heap[i], heap[parent], keys, pos) {
+            break;
+        }
+        heap.swap(i, parent);
+        i = parent;
+    }
+}
+
+fn sift_down(heap: &mut [usize], mut i: usize, keys: &[arrow::row::Rows], pos: &[usize]) {
+    loop {
+        let (l, r) = (2 * i + 1, 2 * i + 2);
+        let mut min = i;
+        if l < heap.len() && head_less(heap[l], heap[min], keys, pos) {
+            min = l;
+        }
+        if r < heap.len() && head_less(heap[r], heap[min], keys, pos) {
+            min = r;
+        }
+        if min == i {
+            return;
+        }
+        heap.swap(i, min);
+        i = min;
+    }
+}
+
+impl SortMergeStream {
+    /// Emit the next chunk, or `None` when every run is drained.
+    fn next_chunk(&mut self) -> Option<Result<RecordBatch, arrow_schema::ArrowError>> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let mut indices: Vec<(usize, usize)> = Vec::with_capacity(self.chunk_rows);
+        let mut drained: Vec<usize> = Vec::new();
+        while indices.len() < self.chunk_rows && !self.heap.is_empty() {
+            let run = self.heap[0];
+            indices.push((run, self.pos[run]));
+            self.pos[run] += 1;
+            if self.pos[run] < self.runs[run].num_rows() {
+                sift_down(&mut self.heap, 0, &self.keys, &self.pos);
+            } else {
+                let last = self.heap.len() - 1;
+                self.heap.swap(0, last);
+                self.heap.truncate(last);
+                if !self.heap.is_empty() {
+                    sift_down(&mut self.heap, 0, &self.keys, &self.pos);
+                }
+                drained.push(run);
+            }
+        }
+        let refs: Vec<&RecordBatch> = self.runs.iter().collect();
+        let chunk = arrow::compute::interleave_record_batch(&refs, &indices);
+        // Free what this chunk finished with: the run's columns and its encoded
+        // keys. Without this a merge would hold the whole bucket to the end.
+        for run in drained {
+            self.runs[run] = RecordBatch::new_empty(self.schema.clone());
+            self.keys[run] = self.converter.empty_rows(0, 0);
+        }
+        Some(chunk)
+    }
+}
+
+/// Sort one batch by `sort_idx`, returning it untouched when already ordered.
+fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema_loader::SortingColumnDef)]) -> Result<RecordBatch, arrow_schema::ArrowError> {
+    use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take_record_batch};
+    let sort_cols: Vec<SortColumn> = sort_idx
+        .iter()
+        .map(|(i, sc)| SortColumn { values: batch.column(*i).clone(), options: Some(SortOptions { descending: sc.descending, nulls_first: sc.nulls_first }) })
+        .collect();
+    let indices = lexsort_to_indices(&sort_cols, None)?;
+    // Already ordered (common: append-ordered, ~monotonic timestamp) → skip the take copy.
+    if indices.values().iter().enumerate().all(|(i, &v)| v as usize == i) {
+        return Ok(batch.clone());
+    }
+    take_record_batch(batch, &indices)
+}
+
+fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (FlushBatches, bool) {
+    use arrow::{
+        compute::{SortOptions, concat_batches},
+        row::{RowConverter, SortField},
+    };
+    let unsorted = |b: Vec<RecordBatch>| (FlushBatches::Ready(b.into_iter()), false);
     if batches.is_empty() || schema.sorting_columns.is_empty() {
-        return (batches, false);
+        return unsorted(batches);
     }
     // Skip the in-flight sort for very large coalesced groups (bulk backfill):
     // concat + lexsort + take materializes the whole group 2-3x on the flush
@@ -7614,8 +7883,9 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     // groups stay well under the threshold, keeping their sorted footer +
     // compression; only giant backfill coalesces trip it.
     const SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
-    if batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() > SORT_SKIP_BYTES {
-        return (batches, false);
+    let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    if total_bytes > SORT_SKIP_BYTES {
+        return unsorted(batches);
     }
     let first_schema = batches[0].schema();
     // A schema-diverse bucket (mem_buffer's `schemas_compatible` admits batches
@@ -7636,15 +7906,142 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
             Ok(m) => Arc::new(m),
             Err(e) => {
                 warn!("sort_batches_by_schema: schema merge failed, writing unsorted: {e}");
-                return (batches, false);
+                return unsorted(batches);
             }
         };
         match batches.iter().map(|b| deltalake::kernel::schema::cast_record_batch(b, merged.clone(), true, true)).collect::<Result<Vec<_>, _>>() {
             Ok(normalized) => (merged, normalized),
             Err(e) => {
                 warn!("sort_batches_by_schema: schema-unify cast failed, writing unsorted: {e}");
-                return (batches, false);
+                return unsorted(batches);
             }
+        }
+    };
+    let sort_idx: Vec<(usize, &crate::schema_loader::SortingColumnDef)> =
+        schema.sorting_columns.iter().filter_map(|sc| arrow_schema.index_of(&sc.name).ok().map(|i| (i, sc))).collect();
+    if sort_idx.is_empty() {
+        return unsorted(batches);
+    }
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // Small buckets: one concat + one sort is cheaper than encoding rows and
+    // running a heap, and the peak it can reach is bounded by MERGE_MIN_ROWS.
+    if batches.len() == 1 || total_rows <= MERGE_MIN_ROWS {
+        let combined = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            match concat_batches(&arrow_schema, &batches) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("sort_batches_by_schema: concat failed, writing unsorted: {e}");
+                    return unsorted(batches);
+                }
+            }
+        };
+        return match sort_one_batch(&combined, &sort_idx) {
+            Ok(sorted) => (FlushBatches::Ready(vec![sorted].into_iter()), true),
+            Err(e) => {
+                warn!("sort_batches_by_schema: sort failed, writing unsorted: {e}");
+                (FlushBatches::Ready(vec![combined].into_iter()), false)
+            }
+        };
+    }
+    // Streaming path: sort each run, then k-way merge into writer-sized chunks.
+    // Setup is fallible (row encoding rejects a few exotic key types, lexsort
+    // can fail); any failure before the first chunk falls back to writing the
+    // bucket unsorted — the same downgrade the old concat path took, and the
+    // footer stays honest because `sorted` is decided here, up front. Once the
+    // merge starts there is no downgrade left (rows are already going into a
+    // writer configured with the sorted footer), so a mid-merge error
+    // propagates and fails the flush rather than writing a dishonest file.
+    let converter = match sort_idx
+        .iter()
+        .map(|(i, sc)| {
+            Ok(SortField::new_with_options(arrow_schema.field(*i).data_type().clone(), SortOptions { descending: sc.descending, nulls_first: sc.nulls_first }))
+        })
+        .collect::<Result<Vec<_>, arrow_schema::ArrowError>>()
+        .and_then(RowConverter::new)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("sort_batches_by_schema: row converter unavailable, writing unsorted: {e}");
+            return unsorted(batches);
+        }
+    };
+    let mut merge = SortMergeStream {
+        schema: arrow_schema.clone(),
+        converter,
+        runs: Vec::with_capacity(batches.len()),
+        keys: Vec::with_capacity(batches.len()),
+        pos: Vec::with_capacity(batches.len()),
+        heap: Vec::with_capacity(batches.len()),
+        // Chunk sized in rows from the bucket's own average row width.
+        chunk_rows: (MERGE_CHUNK_BYTES / (total_bytes / total_rows.max(1)).max(1)).clamp(MERGE_CHUNK_ROWS_MIN, MERGE_CHUNK_ROWS_MAX),
+    };
+    // Sort run-by-run, consuming the input as we go: the unsorted original is
+    // dropped as soon as its sorted copy exists, so the bucket is never
+    // resident twice.
+    let mut leftover: Vec<RecordBatch> = Vec::new();
+    for batch in batches {
+        if !leftover.is_empty() {
+            leftover.push(batch);
+            continue;
+        }
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        match sort_one_batch(&batch, &sort_idx).and_then(|run| {
+            let key_cols: Vec<_> = sort_idx.iter().map(|(i, _)| run.column(*i).clone()).collect();
+            merge.converter.convert_columns(&key_cols).map(|keys| (run, keys))
+        }) {
+            Ok((run, keys)) => {
+                merge.runs.push(run);
+                merge.keys.push(keys);
+                merge.pos.push(0);
+            }
+            Err(e) => {
+                // Keep every row: the sorted-so-far runs plus this batch and
+                // the rest go out unsorted (same rows, no order claim).
+                warn!("sort_batches_by_schema: run sort/encode failed, writing unsorted: {e}");
+                leftover = std::mem::take(&mut merge.runs);
+                leftover.push(batch);
+            }
+        }
+    }
+    if !leftover.is_empty() {
+        return unsorted(leftover);
+    }
+    if merge.runs.is_empty() {
+        return unsorted(Vec::new());
+    }
+    for run in 0..merge.runs.len() {
+        merge.heap.push(run);
+        let last = merge.heap.len() - 1;
+        sift_up(&mut merge.heap, last, &merge.keys, &merge.pos);
+    }
+    (FlushBatches::Merge(merge), true)
+}
+
+/// Reference implementation of [`sort_batches_by_schema`]: concat the whole
+/// bucket, one global `lexsort_to_indices`, one `take`. Superseded in
+/// production by the streaming merge (which peaks at ~1 copy instead of 2-3),
+/// and kept as the equivalence oracle the property test compares against —
+/// the streaming path must reproduce this row order exactly, ties included.
+#[cfg(test)]
+fn sort_batches_by_schema_reference(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, bool) {
+    use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch};
+    if batches.is_empty() || schema.sorting_columns.is_empty() {
+        return (batches, false);
+    }
+    let first_schema = batches[0].schema();
+    let (arrow_schema, batches) = if batches.iter().all(|b| b.schema() == first_schema) {
+        (first_schema, batches)
+    } else {
+        let Ok(merged) = arrow_schema::Schema::try_merge(batches.iter().map(|b| b.schema().as_ref().clone())).map(Arc::new) else {
+            return (batches, false);
+        };
+        match batches.iter().map(|b| deltalake::kernel::schema::cast_record_batch(b, merged.clone(), true, true)).collect::<Result<Vec<_>, _>>() {
+            Ok(normalized) => (merged, normalized),
+            Err(_) => return (batches, false),
         }
     };
     let sort_idx: Vec<(usize, &crate::schema_loader::SortingColumnDef)> =
@@ -7652,17 +8049,7 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     if sort_idx.is_empty() {
         return (batches, false);
     }
-    let combined = if batches.len() == 1 {
-        batches.into_iter().next().unwrap()
-    } else {
-        match concat_batches(&arrow_schema, &batches) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("sort_batches_by_schema: concat failed, writing unsorted: {e}");
-                return (batches, false);
-            }
-        }
-    };
+    let combined = if batches.len() == 1 { batches.into_iter().next().unwrap() } else { concat_batches(&arrow_schema, &batches).unwrap() };
     let sort_cols: Vec<SortColumn> = sort_idx
         .iter()
         .map(|(i, sc)| SortColumn {
@@ -7670,24 +8057,11 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
             options: Some(SortOptions { descending: sc.descending, nulls_first: sc.nulls_first }),
         })
         .collect();
-    let indices = match lexsort_to_indices(&sort_cols, None) {
-        Ok(i) => i,
-        Err(e) => {
-            warn!("sort_batches_by_schema: lexsort failed, writing unsorted: {e}");
-            return (vec![combined], false);
-        }
-    };
-    // Already ordered (common: append-ordered, ~monotonic timestamp) → skip the take copy.
+    let indices = lexsort_to_indices(&sort_cols, None).unwrap();
     if indices.values().iter().enumerate().all(|(i, &v)| v as usize == i) {
         return (vec![combined], true);
     }
-    match take_record_batch(&combined, &indices) {
-        Ok(sorted) => (vec![sorted], true),
-        Err(e) => {
-            warn!("sort_batches_by_schema: take failed, writing unsorted: {e}");
-            (vec![combined], false)
-        }
-    }
+    (vec![take_record_batch(&combined, &indices).unwrap()], true)
 }
 
 /// delta-rs optimize `SortColumn` spec from the table's declared
@@ -8551,12 +8925,15 @@ impl ProjectRoutingTable {
         // other. We only take the write path on miss or version mismatch —
         // events that happen seconds apart per project, not per query.
         let ttl = self.database.config.cache.provider_cache_ttl();
-        let read_hit = self
-            .database
-            .delta_provider_cache
-            .get(&cache_key)
-            .filter(|entry| entry.version == current_version && entry.created_at.elapsed() <= ttl)
-            .map(|entry| Arc::clone(&entry.cell));
+        //
+        // Lookup is by EXACT version against the key's small recent-version
+        // ring (see `PROVIDER_VERSION_RETENTION`): a query always gets the
+        // provider matching the snapshot version its own resolved handle
+        // reports, never an older retained one. Retention only means the
+        // provider for v=N survives a bump to v=N+1, so a task still holding a
+        // v=N handle — and a re-bump back through cached versions under
+        // concurrent `update_state` — hits instead of rebuilding the snapshot.
+        let read_hit = self.database.delta_provider_cache.get(&cache_key).and_then(|entry| entry.get(current_version, ttl));
         let (cell, was_fresh_cell, brand_new_entry) = if let Some(c) = read_hit {
             (c, false, false)
         } else {
@@ -8569,20 +8946,13 @@ impl ProjectRoutingTable {
             // between our get() and entry() (DashMap doesn't upgrade locks).
             let entry = self.database.delta_provider_cache.entry(cache_key.clone());
             let brand_new = matches!(entry, dashmap::Entry::Vacant(_));
-            let mut e = entry.or_insert_with(|| CachedDeltaProvider {
-                version: current_version,
-                created_at: std::time::Instant::now(),
-                cell: Arc::new(tokio::sync::OnceCell::new()),
-            });
-            let stale = e.version != current_version || e.created_at.elapsed() > ttl;
-            if stale {
-                *e = CachedDeltaProvider { version: current_version, created_at: std::time::Instant::now(), cell: Arc::new(tokio::sync::OnceCell::new()) };
+            let mut e = entry.or_default();
+            // "Hit" = a cell already existed at this version when we found it.
+            // Miss covers both "never seen" and "expired/absent version".
+            match e.get(current_version, ttl) {
+                Some(c) => (c, false, brand_new),
+                None => (e.install(current_version, ttl), true, brand_new),
             }
-            // "Hit" = the cell was already initialised at this version when
-            // we found it. We approximate this by checking initialised state
-            // BEFORE we touch get_or_try_init; close enough for an alerting
-            // metric. Miss covers both "never seen" and "stale-replaced".
-            (Arc::clone(&e.cell), stale, brand_new)
         };
         if was_fresh_cell || !cell.initialized() {
             self.database.scan_metrics.provider_cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8597,7 +8967,7 @@ impl ProjectRoutingTable {
             if size >= CACHE_SOFT_LIMIT_WARN && size.is_multiple_of(CACHE_SOFT_LIMIT_WARN) {
                 tracing::warn!(
                     target = "table_caches",
-                    provider_cache_entries = size,
+                    provider_cache_keys = size,
                     threshold = CACHE_SOFT_LIMIT_WARN,
                     "delta_provider_cache crossed soft limit (no eviction by design). Watch scan.provider_cache_entries in timefusion_stats."
                 );
@@ -8634,13 +9004,13 @@ impl ProjectRoutingTable {
             })
             .await?
             .clone();
-        // Abandoned-build detection: if the DashMap entry for this key now
-        // points to a different cell than the one we built into, a version
-        // bump replaced our cell mid-build and our work is wasted. Non-zero
-        // counts here under sustained traffic flag pathological version
-        // churn (very frequent compaction, racy update_state).
+        // Abandoned-build detection: if the key's version ring no longer holds
+        // the cell we built into, our work is wasted. With version retention a
+        // plain version bump no longer abandons the build — only churn deeper
+        // than `PROVIDER_VERSION_RETENTION` (or a TTL/capacity eviction) does,
+        // which makes a non-zero count a sharper signal of pathological churn.
         if let Some(current_entry) = self.database.delta_provider_cache.get(&cache_key)
-            && !Arc::ptr_eq(&current_entry.cell, &cell)
+            && !current_entry.holds(&cell)
         {
             self.database.scan_metrics.provider_build_abandoned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -9451,6 +9821,180 @@ mod writer_properties_tests {
         }
     }
 
+    /// Drain the streaming sort into batches, failing loudly on a merge error.
+    fn drain(f: FlushBatches) -> Vec<RecordBatch> {
+        f.collect::<Result<Vec<_>, _>>().expect("merge must not fail on well-formed input")
+    }
+
+    /// Row-wise rendering of a batch list, independent of how rows are chunked
+    /// or of the physical encoding a path happened to produce (dictionary
+    /// remapping, view vs non-view). `cols = None` renders whole rows; a
+    /// column subset renders just those (used for the sort-key sequence).
+    fn render(batches: &[RecordBatch], cols: Option<&[&str]>) -> Vec<String> {
+        use arrow::util::display::{ArrayFormatter, FormatOptions};
+        let opts = FormatOptions::default().with_null("<NULL>");
+        let mut out = Vec::new();
+        for b in batches {
+            let schema = b.schema();
+            let picked: Vec<(usize, &str)> = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| cols.is_none_or(|c| c.contains(&f.name().as_str())))
+                .map(|(i, f)| (i, f.name().as_str()))
+                .collect();
+            let fmt: Vec<_> = picked.iter().map(|(i, _)| ArrayFormatter::try_new(b.column(*i).as_ref(), &opts).unwrap()).collect();
+            for row in 0..b.num_rows() {
+                out.push(picked.iter().zip(&fmt).map(|((_, n), f)| format!("{n}={}", f.value(row))).collect::<Vec<_>>().join("|"));
+            }
+        }
+        out
+    }
+
+    /// EQUIVALENCE: the streaming k-way merge must produce exactly the rows the
+    /// old concat + global-lexsort + take path produced, in the same key order.
+    ///
+    /// Adversarial by construction: batches are individually unsorted, key
+    /// ranges overlap across batches, the key domain is tiny so ties are
+    /// everywhere (with a payload column that makes tie ORDER observable),
+    /// empty batches are interleaved, and the payload includes dictionary and
+    /// byte-view columns whose physical encoding differs between the two paths.
+    ///
+    /// What is asserted, and why not byte-for-byte row order: the reference
+    /// path's tie order is NOT a specification — `lexsort_to_indices` sorts
+    /// with `sort_unstable_by`, so which of two rows that tie on every sort key
+    /// came first was already arbitrary. So we pin the three properties that
+    /// actually matter: (1) the same multiset of rows — nothing dropped,
+    /// duplicated or mangled; (2) an identical sort-KEY sequence, so the
+    /// declared `sorting_columns` footer describes both files identically;
+    /// (3) both paths agree on `sorted`. `unique_keys_order_is_identical`
+    /// below covers exact row-for-row order for the unambiguous case.
+    #[test]
+    fn streaming_merge_matches_reference_sort() {
+        use arrow::array::{DictionaryArray, Int32Array, Int64Array, StringArray, StringViewArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("id", DataType::Utf8, true),
+            // Payload columns: never sort keys, so any order difference between
+            // the two paths shows up here.
+            Field::new("seq", DataType::Int64, false),
+            Field::new("body", DataType::Utf8View, true),
+            Field::new("svc", DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)), true),
+        ]));
+
+        let mut merged_paths = 0;
+        for case in 0..40u64 {
+            let mut rng = fastrand::Rng::with_seed(case);
+            let mut sch = schema_with(vec![], vec!["timestamp", "id"]);
+            // Exercise every direction/null-placement combination.
+            sch.sorting_columns[0].descending = case % 2 == 0;
+            sch.sorting_columns[0].nulls_first = case % 3 == 0;
+            sch.sorting_columns[1].descending = case % 5 == 0;
+            sch.sorting_columns[1].nulls_first = case % 7 == 0;
+
+            let mut batches = Vec::new();
+            let mut seq = 0i64;
+            for _ in 0..rng.usize(1..10) {
+                // Empty batches interleaved — they must not shift the output.
+                let rows = if rng.u8(0..8) == 0 { 0 } else { rng.usize(1..2_400) };
+                let (mut ts, mut ids, mut seqs, mut bodies, mut svcs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..rows {
+                    // Tiny key domain + nulls ⇒ heavy duplicate-key traffic.
+                    ts.push((rng.u8(0..12) != 0).then(|| rng.i64(0..7)));
+                    ids.push((rng.u8(0..12) != 0).then(|| format!("k{}", rng.u8(0..5))));
+                    seqs.push(seq);
+                    seq += 1;
+                    bodies.push((rng.bool()).then(|| format!("body-{}", rng.u32(0..1000))));
+                    svcs.push(Some(format!("svc-{}", rng.u8(0..3))));
+                }
+                let svc: DictionaryArray<arrow::datatypes::Int32Type> = svcs.iter().map(|s| s.as_deref()).collect();
+                batches.push(
+                    RecordBatch::try_new(
+                        arrow_schema.clone(),
+                        vec![
+                            Arc::new(Int64Array::from(ts)),
+                            Arc::new(StringArray::from(ids)),
+                            Arc::new(Int64Array::from(seqs)),
+                            Arc::new(StringViewArray::from(bodies)),
+                            Arc::new(svc) as Arc<dyn arrow::array::Array>,
+                        ],
+                    )
+                    .unwrap(),
+                );
+            }
+            let _ = Int32Array::from(vec![0]); // keep the import honest for dictionary key typing
+
+            let (want, want_sorted) = sort_batches_by_schema_reference(&sch, batches.clone());
+            let (got, got_sorted) = sort_batches_by_schema(&sch, batches);
+            if matches!(got, FlushBatches::Merge(_)) {
+                merged_paths += 1;
+            }
+            let got = drain(got);
+            assert_eq!(want_sorted, got_sorted, "case {case}: both paths must agree on whether the footer may claim an order");
+            assert_eq!(
+                render(&want, Some(&["timestamp", "id"])),
+                render(&got, Some(&["timestamp", "id"])),
+                "case {case}: sort-key sequence diverged — the two files are not in the same order"
+            );
+            let (mut want_rows, mut got_rows) = (render(&want, None), render(&got, None));
+            want_rows.sort();
+            got_rows.sort();
+            assert_eq!(want_rows, got_rows, "case {case}: streaming merge changed the row content (dropped/duplicated/mangled)");
+        }
+        assert!(merged_paths >= 10, "the streaming merge path must actually be exercised (hit {merged_paths}/40 cases)");
+    }
+
+    /// With unique sort keys the order is unambiguous, so the streaming merge
+    /// must match the reference row for row — no tie-order escape hatch.
+    #[test]
+    fn unique_keys_order_is_identical() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        let s = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false), Field::new("payload", DataType::Utf8, false)]));
+        let mut rng = fastrand::Rng::with_seed(99);
+        let mut keys: Vec<i64> = (0..12_000).collect();
+        rng.shuffle(&mut keys);
+        let batches: Vec<RecordBatch> = keys
+            .chunks(1_500)
+            .map(|c| {
+                RecordBatch::try_new(
+                    s.clone(),
+                    vec![Arc::new(Int64Array::from(c.to_vec())), Arc::new(StringArray::from(c.iter().map(|k| format!("p{k}")).collect::<Vec<_>>()))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let sch = schema_with(vec![], vec!["timestamp"]);
+        let (want, _) = sort_batches_by_schema_reference(&sch, batches.clone());
+        let (got, sorted) = sort_batches_by_schema(&sch, batches);
+        assert!(sorted);
+        assert!(matches!(got, FlushBatches::Merge(_)), "this input must take the streaming path");
+        assert_eq!(render(&want, None), render(&drain(got), None));
+    }
+
+    /// The merge emits many bounded chunks rather than one whole-bucket batch —
+    /// that bound is the entire point of the change, so pin it.
+    #[test]
+    fn streaming_merge_emits_bounded_chunks() {
+        use arrow::array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        let s = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
+        // Two interleaved runs, 200k rows total — past the row cap, so the
+        // merge must hand the writer several chunks instead of one big batch.
+        let mk =
+            |off: i64| RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from((0..100_000).map(|i| i * 2 + off).rev().collect::<Vec<_>>()))]).unwrap();
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![mk(0), mk(1)]);
+        assert!(sorted);
+        let chunks = drain(out);
+        assert!(chunks.len() > 1, "output must be chunked, not one 200k-row batch");
+        assert!(chunks.iter().all(|c| c.num_rows() <= MERGE_CHUNK_ROWS_MAX), "no chunk may exceed the row cap");
+        let all: Vec<i64> = chunks.iter().flat_map(|c| c.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect();
+        assert_eq!(all.len(), 200_000);
+        assert!(all.windows(2).all(|w| w[0] <= w[1]), "merge of sorted runs is globally sorted");
+    }
+
     // Regression: a schema-diverse 10-min bucket (mem_buffer's
     // `schemas_compatible` admits batches that differ by an evolved nullable
     // column) must STILL flush as a globally sorted file with an honest parquet
@@ -9488,6 +10032,7 @@ mod writer_properties_tests {
         .unwrap();
 
         let (out, sorted) = sort_batches_by_schema(&sch, vec![batch_a, batch_b]);
+        let out = drain(out);
 
         assert!(sorted, "heterogeneous bucket must still be reported sorted so the footer is declared");
         assert_eq!(out.len(), 1, "batches must be unified into one sorted file");
@@ -9705,13 +10250,14 @@ mod writer_properties_tests {
         let b2 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![2, 0]))]).unwrap();
         let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
         assert!(sorted);
+        let out = drain(out);
         assert_eq!(out.len(), 1);
         let col = out[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(col.values(), &[0, 1, 2, 3]);
         // No declared sort columns → input returned untouched, sorted=false.
         let (passthrough, sorted) = sort_batches_by_schema(&schema_with(vec![], vec![]), vec![out[0].clone(), out[0].clone()]);
         assert!(!sorted);
-        assert_eq!(passthrough.len(), 2);
+        assert_eq!(drain(passthrough).len(), 2);
     }
 
     // A bucket whose batches have evolved schemas (an extra nullable column on
@@ -9731,6 +10277,7 @@ mod writer_properties_tests {
         let b2 =
             RecordBatch::try_new(s2, vec![std::sync::Arc::new(Int64Array::from(vec![3])), std::sync::Arc::new(StringArray::from(vec![Some("x")]))]).unwrap();
         let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
+        let out = drain(out);
         assert!(sorted, "mixed-schema bucket is unified and sorted, not left unsorted");
         assert_eq!(out.len(), 1, "batches unified into one sorted file");
         let ts = out[0].column_by_name("timestamp").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
@@ -11414,8 +11961,46 @@ mod tests {
             "STALE CACHE REGRESSION: second query must see the row added at v=v{v2}. \
              Got {c2}/2 — the delta_provider_cache version-mismatch branch is broken."
         );
-        assert_eq!(db.delta_provider_cache.len(), 1, "version invalidation replaces the entry instead of growing the cache");
+        assert_eq!(db.delta_provider_cache.len(), 1, "version invalidation adds a version to the key's ring, it does not add a key");
+        // Version retention: the v1 provider is still cached alongside v2, so
+        // an in-flight query holding a v1 handle hits instead of replaying the
+        // snapshot. `entries` counts providers, so it now reports 2.
+        {
+            let ring = db.delta_provider_cache.get(&(project_id.clone(), t.to_string())).expect("ring for the queried key");
+            assert_eq!(ring.len(), 2, "both v{v1} and v{v2} providers must be retained");
+            let ttl = db.config.cache.provider_cache_ttl();
+            let old = ring.get(v1 as u64, ttl).expect("previous version still retrievable — no rebuild for in-flight queries");
+            assert!(old.initialized(), "the retained v{v1} cell must still hold its built provider");
+            assert!(ring.get(v2 as u64, ttl).is_some(), "latest version cached");
+            assert!(ring.get(v2 as u64 + 99, ttl).is_none(), "lookup is exact-version: an unseen version must miss");
+        }
+        let stats2 = ctx.sql("SELECT value FROM timefusion_stats WHERE component = 'scan' AND key = 'provider_cache_entries'").await?.collect().await?;
+        let entries2 = stats2[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().expect("stats value").value(0);
+        assert_eq!(entries2, "2", "provider_cache_entries counts retained providers across the version ring");
         Ok(())
+    }
+
+    /// Retention semantics of the per-(project,table) version ring, without IO.
+    #[test]
+    fn provider_versions_retains_recent_and_expires() {
+        let ttl = std::time::Duration::from_secs(300);
+        let mut ring = ProviderVersions::default();
+        let cells: Vec<_> = (1..=4).map(|v| ring.install(v, ttl)).collect();
+        assert_eq!(ring.len(), PROVIDER_VERSION_RETENTION, "ring is bounded at the retention window");
+        assert!(ring.get(1, ttl).is_none(), "the oldest version falls out once the window is full");
+        for (i, v) in [4u64, 3, 2].iter().enumerate() {
+            let got = ring.get(*v, ttl).expect("recent version retained");
+            assert!(Arc::ptr_eq(&got, &cells[3 - i]), "the SAME cell Arc comes back — no rebuild");
+        }
+        // Re-installing an existing version replaces it in place (no duplicate).
+        let fresh = ring.install(4, ttl);
+        assert_eq!(ring.len(), PROVIDER_VERSION_RETENTION);
+        assert!(Arc::ptr_eq(&ring.get(4, ttl).unwrap(), &fresh));
+        // Zero TTL expires everything on lookup and on prune.
+        let zero = std::time::Duration::ZERO;
+        assert!(ring.get(4, zero).is_none(), "expired versions are not served");
+        assert_eq!(ring.prune(zero), PROVIDER_VERSION_RETENTION);
+        assert_eq!(ring.len(), 0);
     }
 
     #[serial]
