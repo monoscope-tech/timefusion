@@ -101,6 +101,7 @@ counter_registry! {
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
     maintenance_cron_long_running => "timefusion.maintenance.cron_long_running": "Cron maintenance runs that exceeded the long-running warning threshold while still in progress. Slow-but-healthy runs are allowed to finish; sustained nonzero with no completion means a job is wedged.",
     reconcile_dangling_removed => "timefusion.maintenance.reconcile_dangling_removed": "Active Add entries whose parquet object was missing from the store and got Remove'd by the reconcile task. NONZERO means committed data was destroyed elsewhere (commit-path parquet deletion bug) — PAGE and investigate",
+    commit_lock_timeouts       => "timefusion.commit.lock_timeouts": "Commit-path operations abandoned by their bound while holding a per-table commit lock (attribute `op`: wave_commit, flush_commit, coalesced_commit, *_refresh, landing_probe). Each one is a hung object-store request that WOULD have stalled every committer for that table (prod 2026-07-30). The work is requeued and its staged parquet preserved (landing unconfirmed), so this is not data loss — but sustained nonzero means R2 latency is pathological and commit throughput is degraded. PAGE if sustained",
     maintenance_checkpoint_corrupt => "timefusion.maintenance.checkpoint_corrupt": "Checkpoints that failed post-write footer verification — the object _last_checkpoint points to is not a readable Parquet file (foreign/corrupt bytes, e.g. an S3 error or SelectObjectContent body written over it, 2026-07-17). Log cleanup is withheld so the JSON commit log — the only recovery source — is never pruned behind an unreadable checkpoint. PAGE if > 0",
 }
 
@@ -341,6 +342,15 @@ pub fn record_optimize_partitions(rewritten: u64, skipped: u64) {
     if let Some(m) = METRICS.get() {
         m.optimize_partitions_rewritten.add(rewritten, &[]);
         m.optimize_partitions_skipped.add(skipped, &[]);
+    }
+}
+
+/// One commit-path operation abandoned by its bound. `op` is a fixed set of
+/// static labels (bounded cardinality by construction — never a table or
+/// project id, which belong on the accompanying warn's span attributes).
+pub fn record_commit_timeout(op: &'static str) {
+    if let Some(m) = METRICS.get() {
+        m.commit_lock_timeouts.add(1, &[KeyValue::new("op", op)]);
     }
 }
 

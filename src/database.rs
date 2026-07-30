@@ -1209,6 +1209,79 @@ struct StagedUnit {
 /// creates dangling Adds — the 2026-07-09 incident shape).
 const INCONCLUSIVE_COMMIT_MARKER: &str = "landing-unconfirmed";
 
+/// LAST-RESORT circuit breaker on a network await taken WHILE a per-table
+/// commit lock is held. That lock serializes every committer for one physical
+/// table (staged flush, coalesced flush, dedup waves, light-optimize waves), so
+/// a request that never returns pins the whole table at zero commit throughput
+/// (prod 2026-07-30 01:20–01:34: a dedup wave hung mid-commit and every other
+/// committer queued behind it).
+///
+/// It is NOT the mechanism that bounds commits — that is the commit-log request
+/// class (see `AwsConfig::log_request_timeout` and
+/// [`crate::object_store_cache::RequestClassRouter`]), which bounds each log
+/// request at 30s and the whole retry ladder at `RetryConfig::retry_timeout`
+/// (180s). Bounding at the client is strictly better because a timeout there is
+/// an ordinary commit error the landed-probe already classifies, while a
+/// timeout HERE abandons a future mid-flight and manufactures an unconfirmed
+/// landing (staged parquet must then be leaked rather than reclaimed).
+///
+/// So this fires only if a request escapes both client bounds — a bug or a
+/// pathological hang. 600s matches `CHECKPOINT_OP_TIMEOUT`; every firing is
+/// counted (`timefusion.commit.lock_timeouts`) and warned, and expected to be
+/// permanently zero.
+const COMMIT_LOCK_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A bounded in-guard commit await that did not succeed.
+struct CommitFailure {
+    message: String,
+    /// The await was ABANDONED mid-flight rather than returning an error. The
+    /// commit may still have landed (the request is running on R2's side), and
+    /// the store is proven slow — so no probe may be trusted to say "no". See
+    /// [`probe_after_timeout`].
+    timed_out: bool,
+}
+
+/// Run one commit-path future under `bound`, so a hung object-store request can
+/// never pin a commit lock for the S3 client's 900s request timeout. A timeout
+/// is reported as a failure whose landing is UNKNOWN, never as "did not
+/// commit": callers must route it through the unconfirmed-landing path
+/// (`probe_after_timeout` + `CommitProbe::Inconclusive`), which leaves staged
+/// parquet in place and requeues the work.
+async fn bounded_commit_await<T, E: std::fmt::Display>(
+    bound: std::time::Duration, op: &'static str, table_name: &str, fut: impl std::future::IntoFuture<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, CommitFailure> {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(bound, fut.into_future()).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(CommitFailure { message: e.to_string(), timed_out: false }),
+        Err(_) => {
+            crate::metrics::record_commit_timeout(op);
+            warn!(
+                table_name,
+                op,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                timeout_secs = bound.as_secs(),
+                event = "commit_lock_timeout",
+                "commit-lock operation exceeded its bound — releasing the lock, landing UNCONFIRMED"
+            );
+            Err(CommitFailure { message: format!("{op} exceeded {}s while holding the commit lock", bound.as_secs()), timed_out: true })
+        }
+    }
+}
+
+/// A commit whose await TIMED OUT can never be classified `NotLanded`. We
+/// abandoned the request in flight, so `N.json` may be written already; and the
+/// probe reads the same store that just proved slow, so "I don't see our Adds"
+/// is not evidence of absence. Downgrading to `Inconclusive` preserves the one
+/// invariant that matters: never delete staged parquet a landed commit
+/// references. `Landed` still passes through — that IS positive evidence.
+fn probe_after_timeout(probe: CommitProbe, timed_out: bool) -> CommitProbe {
+    match (probe, timed_out) {
+        (CommitProbe::NotLanded, true) => CommitProbe::Inconclusive,
+        (probe, _) => probe,
+    }
+}
+
 /// Split a coalesced commit's newly-added file URIs per project. Files are
 /// written under the `project_id=<id>/` partition path, so the path IS the
 /// attribution — downstream consumers (tantivy sidecar, cache warming) keep
@@ -3301,9 +3374,20 @@ impl Database {
 
     /// Internal helper to create/load a Delta table with caching and retry logic
     async fn create_delta_table_internal(&self, storage_uri: &str, storage_options: &HashMap<String, String>, table_name: &str) -> Result<DeltaTable> {
-        // Create the base S3 object store
+        // Create the base S3 object store. TWO clients, one per request class:
+        // the data client keeps the generous `request_timeout` a multi-MB
+        // parquet part needs, while `_delta_log` control-plane traffic gets a
+        // short-timeout client so a hung commit PUT can no longer pin this
+        // table's commit lock for the data bound (prod 2026-07-30). The router
+        // sits BELOW instrumentation + the foyer cache, so caching, metrics and
+        // cache keys are unchanged.
         let base_store = self.create_object_store(storage_uri, storage_options).instrument(tracing::trace_span!("create_object_store")).await?;
-        let instrumented_store = instrument_object_store(base_store, "s3");
+        let log_store_client = self
+            .create_object_store_with_timeout(storage_uri, storage_options, self.config.aws.log_request_timeout())
+            .instrument(tracing::trace_span!("create_object_store_log_class"))
+            .await?;
+        let routed = Arc::new(crate::object_store_cache::RequestClassRouter::new(log_store_client, base_store)) as Arc<dyn object_store::ObjectStore>;
+        let instrumented_store = instrument_object_store(routed, "s3");
 
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
             Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>
@@ -3738,6 +3822,16 @@ impl Database {
 
     /// Create an object store for the given URI and storage options
     pub async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
+        self.create_object_store_with_timeout(storage_uri, storage_options, self.config.aws.request_timeout()).await
+    }
+
+    /// `create_object_store` with an explicit per-request timeout, so the
+    /// commit-log request class can get its own client (see
+    /// [`crate::object_store_cache::RequestClassRouter`]). Every other setting
+    /// — retries, pool sizing, credentials — is identical by construction.
+    pub async fn create_object_store_with_timeout(
+        &self, storage_uri: &str, storage_options: &HashMap<String, String>, request_timeout: String,
+    ) -> Result<Arc<dyn object_store::ObjectStore>> {
         use std::time::Duration;
 
         use object_store::{BackoffConfig, ClientConfigKey, ClientOptions, RetryConfig, aws::AmazonS3Builder};
@@ -3764,7 +3858,7 @@ impl Database {
         // concurrent ops per bucket.
         let client_options = ClientOptions::new()
             .with_config(ClientConfigKey::ConnectTimeout, self.config.aws.connect_timeout())
-            .with_config(ClientConfigKey::Timeout, self.config.aws.request_timeout())
+            .with_config(ClientConfigKey::Timeout, request_timeout)
             .with_config(ClientConfigKey::PoolMaxIdlePerHost, crate::config::S3_POOL_MAX_IDLE_PER_HOST.to_string());
 
         // Build S3 configuration
@@ -4253,16 +4347,30 @@ impl Database {
                 // (refresh + Delta log append) under the lock — these bound the
                 // process-wide commit rate. Remove once the flush bottleneck is found.
                 let _t_refresh = std::time::Instant::now();
-                if let Err(e) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
-                    debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e);
+                if let Err(e) = bounded_commit_await(
+                    COMMIT_LOCK_OP_TIMEOUT,
+                    "flush_refresh",
+                    &table_name,
+                    refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot),
+                )
+                .await
+                {
+                    debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e.message);
                 }
                 let _refresh_ms = _t_refresh.elapsed().as_millis();
                 let mut new_table = { table_ref.read().await.clone() };
                 let _t_build = std::time::Instant::now();
-                let commit_res = deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone().unwrap_or_else(base_commit_properties))
-                    .with_actions(adds.clone())
-                    .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op.clone())
-                    .await;
+                // Bounded for the same reason as the wave path: this await holds
+                // the per-table commit lock every other committer queues on.
+                let commit_res = bounded_commit_await(
+                    COMMIT_LOCK_OP_TIMEOUT,
+                    "flush_commit",
+                    &table_name,
+                    deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone().unwrap_or_else(base_commit_properties))
+                        .with_actions(adds.clone())
+                        .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op.clone()),
+                )
+                .await;
                 let _build_ms = _t_build.elapsed().as_millis();
                 match commit_res {
                     Ok(finalized) => {
@@ -4295,9 +4403,9 @@ impl Database {
                         );
                         return Ok(_committed);
                     }
-                    Err(e) => {
+                    Err(CommitFailure { message: e, timed_out }) => {
                         drop(commit_guard);
-                        if is_occ_conflict_err(&e.to_string()) {
+                        if !timed_out && is_occ_conflict_err(&e) {
                             retry_count += 1;
                             if retry_count >= max_retries {
                                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
@@ -4313,7 +4421,7 @@ impl Database {
                         // clone (only on this rare branch — the OCC-retry path must
                         // not pay the full-table URI walk), then probe.
                         let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                        match self.probe_commit_landed(&table_ref, &adds).await {
+                        match probe_after_timeout(self.probe_commit_landed_bounded(&table_ref, &adds).await, timed_out) {
                             CommitProbe::Landed => {
                                 warn!(
                                     "staged commit for {}/{} reported an error but LANDED (post-commit hook failed) — draining bucket: {}",
@@ -4616,14 +4724,28 @@ impl Database {
         let mut retry_count = 0u32;
         loop {
             let commit_guard = commit_lock.lock().await;
-            if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
-                debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e);
+            if let Err(e) = bounded_commit_await(
+                COMMIT_LOCK_OP_TIMEOUT,
+                "coalesced_refresh",
+                table_name,
+                refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot),
+            )
+            .await
+            {
+                debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e.message);
             }
             let mut new_table = { table_ref.read().await.clone() };
-            let commit_res = deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone())
-                .with_actions(adds.clone())
-                .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op.clone())
-                .await;
+            let commit_res = bounded_commit_await(
+                COMMIT_LOCK_OP_TIMEOUT,
+                "coalesced_commit",
+                table_name,
+                deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone()).with_actions(adds.clone()).build(
+                    Some(new_table.snapshot()? as &dyn TableReference),
+                    new_table.log_store(),
+                    op.clone(),
+                ),
+            )
+            .await;
             match commit_res {
                 Ok(finalized) => {
                     let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
@@ -4633,9 +4755,9 @@ impl Database {
                     debug!("coalesced commit landed: table={} projects={} files={}", table_name, projects.len(), adds.len());
                     return Ok(added);
                 }
-                Err(e) => {
+                Err(CommitFailure { message: e, timed_out }) => {
                     drop(commit_guard);
-                    if is_occ_conflict_err(&e.to_string()) {
+                    if !timed_out && is_occ_conflict_err(&e) {
                         retry_count += 1;
                         if retry_count >= MAX_RETRIES {
                             return Err(anyhow::anyhow!("coalesced staged commit failed after {} retries: {}", MAX_RETRIES, e));
@@ -4649,7 +4771,7 @@ impl Database {
                     // per-project path — never delete parquet a landed commit
                     // references.
                     let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                    match self.probe_commit_landed(table_ref, &adds).await {
+                    match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, &adds).await, timed_out) {
                         CommitProbe::Landed => {
                             warn!("coalesced commit for {} reported an error but LANDED (post-commit hook failed) — draining: {}", table_name, e);
                             let post = { table_ref.read().await.clone() };
@@ -4674,6 +4796,21 @@ impl Database {
     /// safe to delete the staged parquet; `Inconclusive` ⇒ the refresh/read
     /// itself failed, so we can't confirm — leak the parquet rather than risk
     /// deleting files a landed commit references.
+    /// `probe_commit_landed` under the same last-resort bound. Every caller
+    /// reaches it on an already-degraded store; its log reads are commit-log
+    /// class (30s per request), so this only catches a hang that escapes the
+    /// client. A probe that times out is `Inconclusive` by construction —
+    /// never `NotLanded`, which would authorize deleting staged parquet.
+    async fn probe_commit_landed_bounded(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
+        match tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, self.probe_commit_landed(table_ref, adds)).await {
+            Ok(probe) => probe,
+            Err(_) => {
+                crate::metrics::record_commit_timeout("landing_probe");
+                CommitProbe::Inconclusive
+            }
+        }
+    }
+
     async fn probe_commit_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
         use deltalake::kernel::Action;
         if refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await.is_err() {
@@ -6866,6 +7003,10 @@ impl Database {
         let engine = if data_change { "dedup" } else { "light optimize" };
         let mut bins = bins;
         let mut failed: Vec<StagedBin> = Vec::new();
+        // Bins already CONFIRMED landed by an earlier attempt of this wave (see
+        // the self-landed split below). Carried across OCC retries so their
+        // credit — and their dirty-bin certification — is never lost.
+        let mut carried: Vec<StagedBin> = Vec::new();
         // Key on "" explicitly: the wave spans MULTIPLE projects of one physical
         // table, and every other unified-log writer (flush, dedup, coalesced
         // commit) serializes under the ("", table) key. Keying on
@@ -6881,8 +7022,19 @@ impl Database {
         const MAX_RETRIES: usize = 4;
         for attempt in 0..MAX_RETRIES {
             let commit_guard = commit_lock.lock().await;
-            if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
-                debug!("{engine} wave pre-commit refresh failed (attempt {}): {}", attempt + 1, e);
+            // Bounded: this reads the log over the network with the commit lock
+            // held. A timeout here just means we build on a possibly-stale
+            // snapshot — the liveness check + OCC retry ladder below already
+            // handle that, and the lock is freed on schedule either way.
+            if let Err(e) = bounded_commit_await(
+                COMMIT_LOCK_OP_TIMEOUT,
+                "wave_refresh",
+                table_name,
+                refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot),
+            )
+            .await
+            {
+                debug!("{engine} wave pre-commit refresh failed (attempt {}): {}", attempt + 1, e.message);
             }
             let mut new_table = { table_ref.read().await.clone() };
             let live: std::collections::HashSet<String> = match new_table.snapshot() {
@@ -6892,18 +7044,45 @@ impl Database {
                     error!("{engine} wave: no snapshot for {table_name}: {e}");
                     self.discard_bins(&bins).await;
                     failed.extend(bins);
-                    return WaveResult { landed: Vec::new(), failed };
+                    return WaveResult { landed: carried, failed };
                 }
             };
             let (fresh, stale) = split_live_bins(bins, |b| &b.target_paths, &live);
+            // SELF-LANDED SPLIT — do not remove. A bin is "stale" because its
+            // target files left the snapshot, and the normal cause is a
+            // concurrent rewrite, whose staged parquet nothing references (safe
+            // to delete). But OUR OWN previous attempt landing is
+            // indistinguishable by targets alone: a commit that landed and then
+            // reported an error (post-commit hook, or an outer bound firing)
+            // takes the same shape — targets gone, and this retry would DELETE
+            // the very files the landed commit now references (dangling Adds,
+            // the 2026-07-09 incident shape).
+            //
+            // The Adds settle it: staged parquet is uuid-named by the writer, so
+            // nobody else can produce those paths. Present in the snapshot ⇒ our
+            // commit landed.
+            let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| bin_adds_live(b, &live));
             for bin in &stale {
                 debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit");
             }
             self.discard_bins(&stale).await;
             failed.extend(stale);
+            if !self_landed.is_empty() {
+                warn!(
+                    table_name,
+                    engine,
+                    bins = self_landed.len(),
+                    attempt = attempt + 1,
+                    event = "wave_bin_self_landed",
+                    "a previous attempt's commit LANDED despite erroring — crediting its bins instead of deleting their (now live) files"
+                );
+                self.clear_bin_intents(&self_landed);
+                Self::record_wave_landed(&self_landed, data_change);
+                carried.extend(self_landed);
+            }
             if fresh.is_empty() {
                 drop(commit_guard);
-                return WaveResult { landed: Vec::new(), failed };
+                return WaveResult { landed: carried, failed };
             }
             let actions: Vec<Action> = fresh.iter().flat_map(|b| b.removes.iter().chain(b.adds.iter()).cloned()).collect();
             let pre_uris: Option<std::collections::HashSet<String>> = track_files.then(|| scoped_file_uris(&new_table, &markers).into_iter().collect());
@@ -6914,14 +7093,20 @@ impl Database {
                 Err(_) => {
                     drop(commit_guard);
                     failed.extend(fresh);
-                    return WaveResult { landed: Vec::new(), failed };
+                    return WaveResult { landed: carried, failed };
                 }
             };
-            let commit_res =
+            // Bounded: the proven prod hang (2026-07-30) was HERE — one R2
+            // request pinned this lock and every committer on the table stalled.
+            let commit_res = bounded_commit_await(
+                COMMIT_LOCK_OP_TIMEOUT,
+                "wave_commit",
+                table_name,
                 deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                     .with_actions(actions)
-                    .build(Some(snapshot_ref), new_table.log_store(), op)
-                    .await;
+                    .build(Some(snapshot_ref), new_table.log_store(), op),
+            )
+            .await;
             match commit_res {
                 Ok(finalized) => {
                     new_table.state = Some(finalized.snapshot());
@@ -6936,11 +7121,15 @@ impl Database {
                     // every wave (the 2026-07-21 cache-thrash lesson).
                     self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
                     Self::record_wave_landed(&fresh, data_change);
-                    return WaveResult { landed: fresh, failed };
+                    return WaveResult { landed: with(carried, fresh), failed };
                 }
-                Err(e) => {
+                Err(CommitFailure { message: e, timed_out }) => {
+                    // Released BEFORE the probe: on a timeout the store is
+                    // already slow, and the probe is another log read — holding
+                    // the lock across it would re-create the very stall this
+                    // bound exists to end.
                     drop(commit_guard);
-                    let occ = is_occ_conflict_err(&e.to_string());
+                    let occ = !timed_out && is_occ_conflict_err(&e);
                     if occ {
                         crate::metrics::record_optimize_conflict();
                     }
@@ -6954,35 +7143,49 @@ impl Database {
                     // landed-but-hook-failed commit already Removed the OLD
                     // files, so the new files are the only live copy.
                     let all_adds: Vec<Action> = fresh.iter().flat_map(|b| b.adds.iter().cloned()).collect();
-                    match self.probe_commit_landed(table_ref, &all_adds).await {
+                    match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, &all_adds).await, timed_out) {
                         CommitProbe::Landed => {
                             warn!("{engine} wave for '{}' reported an error but LANDED (post-commit hook failed): {}", table_name, e);
                             let post = { table_ref.read().await.clone() };
                             self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
                             self.clear_bin_intents(&fresh);
                             Self::record_wave_landed(&fresh, data_change);
-                            return WaveResult { landed: fresh, failed };
+                            return WaveResult { landed: with(carried, fresh), failed };
                         }
                         CommitProbe::NotLanded => {
                             crate::metrics::record_optimize_failed();
                             error!("{engine} wave commit failed for '{}': {}", table_name, e);
                             self.discard_bins(&fresh).await;
                             failed.extend(fresh);
-                            return WaveResult { landed: Vec::new(), failed };
+                            return WaveResult { landed: carried, failed };
                         }
                         CommitProbe::Inconclusive => {
                             // Staged files stay in place (they may be the only
                             // live copy) — the units still count as failed, so a
                             // dedup unit's dirty bin is requeued.
+                            //
+                            // CONVERGENCE (both for an errored and a TIMED-OUT
+                            // commit): the next wave's first act under the lock
+                            // is `refresh_table_snapshot`, which re-reads the
+                            // Delta log — so a commit that landed while we were
+                            // not looking is observed there. Its Adds are then
+                            // live, its Removes applied, and this wave's targets
+                            // are gone from the snapshot, so the re-staged bins
+                            // fail the liveness check and drop out instead of
+                            // double-applying. If it truly did not land, the
+                            // targets are still live and the bin is simply
+                            // re-staged. Either way the only cost of an
+                            // unconfirmed landing is a leaked staged file, which
+                            // the boot-time staged-intent reconcile reclaims.
                             warn!("{engine} wave for '{}' errored, landing UNCONFIRMED — leaving new files in place: {}", table_name, e);
                             failed.extend(fresh);
-                            return WaveResult { landed: Vec::new(), failed };
+                            return WaveResult { landed: carried, failed };
                         }
                     }
                 }
             }
         }
-        WaveResult { landed: Vec::new(), failed }
+        WaveResult { landed: carried, failed }
     }
 
     /// Per-engine counters for a landed wave. Dedup's dropped-row accounting is
@@ -8483,6 +8686,26 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
 /// object store.
 fn split_live_bins<T>(bins: Vec<T>, targets: impl Fn(&T) -> &[String], live: &std::collections::HashSet<String>) -> (Vec<T>, Vec<T>) {
     bins.into_iter().partition(|bin| targets(bin).iter().all(|t| live.contains(t)))
+}
+
+/// Whether a bin's OWN staged Adds are active in the snapshot — i.e. its commit
+/// landed. Distinguishes "another writer rewrote my targets" (staged parquet is
+/// garbage) from "my own earlier attempt landed and then errored" (staged
+/// parquet is LIVE DATA). See the self-landed split in `commit_wave`.
+/// A bin with no Adds can't have landed anything.
+fn bin_adds_live(bin: &StagedBin, live: &std::collections::HashSet<String>) -> bool {
+    let mut adds = bin.adds.iter().filter_map(|a| match a {
+        deltalake::kernel::Action::Add(add) => Some(add.path.as_str()),
+        _ => None,
+    });
+    adds.next().is_some_and(|first| live.contains(first) && adds.all(|p| live.contains(p)))
+}
+
+/// `landed ++ more` — the wave's two landing sources (bins confirmed by an
+/// earlier attempt, and the ones this attempt just committed) as one list.
+fn with(mut landed: Vec<StagedBin>, more: Vec<StagedBin>) -> Vec<StagedBin> {
+    landed.extend(more);
+    landed
 }
 
 /// Drive one bin per project per round, each round being a WAVE: every project
@@ -11012,6 +11235,79 @@ mod tests {
         let (fresh, stale) = super::split_live_bins(units, |b| &b.target_paths, &live);
         assert_eq!(fresh.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["alpha", "gamma"]);
         assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+    }
+
+    /// The self-landed split (prod 2026-07-30 follow-up). "Targets gone" has TWO
+    /// causes and they need opposite handling: another writer rewrote them
+    /// (staged parquet is garbage → delete), or our OWN earlier attempt landed
+    /// and then reported an error (staged parquet is LIVE DATA → never delete,
+    /// credit the bin). The bin's own Adds are what tells them apart.
+    #[test]
+    fn a_bin_whose_own_adds_are_live_is_self_landed_not_stale() {
+        let alpha = staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6)));
+        let beta = staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 5, 4)));
+        // alpha's commit LANDED: its target is gone AND its staged file is now
+        // active. beta's target was rewritten by someone else.
+        let live: std::collections::HashSet<String> = ["alpha-new.parquet"].iter().map(|s| s.to_string()).collect();
+        let (fresh, stale) = super::split_live_bins(vec![alpha, beta], |b| &b.target_paths, &live);
+        assert!(fresh.is_empty(), "neither bin's targets survive");
+        let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| super::bin_adds_live(b, &live));
+        assert_eq!(self_landed.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["alpha"], "a landed bin must never be discarded");
+        assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+        // Its rows really were dropped from the table, so they count.
+        assert_eq!(super::wave_dropped_rows(&self_landed), 4);
+        // And a bin whose targets ARE live is never mistaken for self-landed.
+        let live_targets: std::collections::HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
+        assert!(!super::bin_adds_live(&staged_unit("alpha", &["f1"], None), &live_targets));
+    }
+
+    /// A commit-lock holder must free the lock on a bounded schedule even when
+    /// the object store never answers, and must route the abandoned commit to
+    /// the UNCONFIRMED-landing branch (leave staged parquet, requeue the bins) —
+    /// never to `NotLanded`, which authorizes deleting files a landed commit
+    /// may reference.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timed_out_commit_frees_the_lock_and_lands_unconfirmed() {
+        let lock: Arc<tokio::sync::Mutex<()>> = Arc::default();
+        let started = std::time::Instant::now();
+        let failure = {
+            let _guard = lock.lock().await;
+            assert!(lock.try_lock().is_err(), "held while the commit is in flight");
+            super::bounded_commit_await(
+                std::time::Duration::from_millis(50),
+                "wave_commit",
+                "otel_logs_and_spans",
+                // The hung R2 request of the 2026-07-30 incident.
+                futures::future::pending::<std::result::Result<(), String>>(),
+            )
+            .await
+            .expect_err("a never-answering commit must be abandoned")
+        };
+        assert!(failure.timed_out, "the failure must be marked as an abandoned await, not a plain error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the bound, not the store, decides when the lock is freed");
+        assert!(lock.try_lock().is_ok(), "the next committer must find the lock free");
+        // The routing decision the wave/flush paths make with `timed_out`.
+        assert!(matches!(super::probe_after_timeout(super::CommitProbe::NotLanded, failure.timed_out), super::CommitProbe::Inconclusive));
+        assert!(matches!(super::probe_after_timeout(super::CommitProbe::Inconclusive, true), super::CommitProbe::Inconclusive));
+        // Positive evidence still passes through — a landed commit is credited.
+        assert!(matches!(super::probe_after_timeout(super::CommitProbe::Landed, true), super::CommitProbe::Landed));
+        // Without a timeout, a probe's "did not land" is trusted (that IS how
+        // orphaned staged parquet gets reclaimed).
+        assert!(matches!(super::probe_after_timeout(super::CommitProbe::NotLanded, false), super::CommitProbe::NotLanded));
+    }
+
+    /// The backstop must be invisible on the happy path and must not swallow
+    /// ordinary commit errors into the unconfirmed branch.
+    #[tokio::test]
+    async fn bounded_commit_await_passes_success_and_errors_through() {
+        let ok: std::result::Result<u8, super::CommitFailure> =
+            super::bounded_commit_await(std::time::Duration::from_secs(30), "flush_commit", "t", async { Ok::<_, String>(7u8) }).await;
+        assert_eq!(ok.map_err(|e| e.message), Ok(7));
+        let err = super::bounded_commit_await(std::time::Duration::from_secs(30), "flush_commit", "t", async { Err::<(), _>("version already exists") })
+            .await
+            .expect_err("errors propagate");
+        assert!(!err.timed_out, "a real commit error must keep its normal (probe/OCC) classification");
+        assert_eq!(err.message, "version already exists");
     }
 
     /// Dropped-row accounting must survive a PARTIAL wave: only landed units

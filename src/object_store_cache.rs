@@ -1694,11 +1694,151 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 }
 
+/// Whether a path belongs to the COMMIT-LOG request class: the small
+/// control-plane objects Delta's transaction protocol reads and writes
+/// (`_delta_log/NNN.json`, `_last_checkpoint`, and log LISTs).
+///
+/// Checkpoint **parquet** under `_delta_log/` is deliberately NOT log class: a
+/// checkpoint for a 26k-file table is a multi-MB bulk transfer whose duration
+/// scales with the table, exactly like a data file — and it already has its own
+/// bound (`CHECKPOINT_OP_TIMEOUT`). Only the sub-second control-plane traffic
+/// gets the short client.
+pub fn is_commit_log_path(location: &Path) -> bool {
+    let p = location.as_ref();
+    p.contains("_delta_log/") && !p.ends_with(".parquet")
+}
+
+/// Routes object-store requests to one of two S3 clients by REQUEST CLASS: the
+/// commit log gets a client with a short request timeout, everything else the
+/// long-timeout data client.
+///
+/// This is the primary defence against the 2026-07-30 stall class — a hung R2
+/// request pinning a per-table commit lock. Bounding it here rather than with an
+/// outer `tokio::time::timeout` is what makes it safe: at this layer a
+/// timed-out commit is an ordinary commit error that TimeFusion's landed-probe
+/// already knows how to classify, whereas an outer timeout abandons a future
+/// mid-flight and manufactures an unconfirmed landing every time it fires.
+///
+/// Sits BELOW the foyer cache and the instrumentation wrapper (see
+/// `create_delta_table_internal`), so cache semantics, metrics and cache keys
+/// are byte-for-byte unchanged — only the HTTP client underneath differs.
+#[derive(Debug)]
+pub struct RequestClassRouter {
+    log: Arc<dyn ObjectStore>,
+    data: Arc<dyn ObjectStore>,
+}
+
+impl RequestClassRouter {
+    pub fn new(log: Arc<dyn ObjectStore>, data: Arc<dyn ObjectStore>) -> Self {
+        Self { log, data }
+    }
+
+    fn route(&self, location: &Path) -> &Arc<dyn ObjectStore> {
+        if is_commit_log_path(location) { &self.log } else { &self.data }
+    }
+
+    /// Prefix-based routing for LIST. A `None` prefix (or a table-root prefix)
+    /// enumerates data files, so only an explicit `_delta_log` prefix is log
+    /// class — a whole-table LIST must keep the generous data bound.
+    fn route_prefix(&self, prefix: Option<&Path>) -> &Arc<dyn ObjectStore> {
+        match prefix {
+            Some(p) if p.as_ref().contains("_delta_log") => &self.log,
+            _ => &self.data,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestClassRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RequestClassRouter(log={}, data={})", self.log, self.data)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for RequestClassRouter {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
+        self.route(location).put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        // Multipart is bulk by definition — never log class, whatever the path.
+        self.data.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.route(location).get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> ObjectStoreResult<Vec<Bytes>> {
+        self.route(location).get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(&self, locations: BoxStream<'static, ObjectStoreResult<Path>>) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        // A mixed-class stream can't be split without buffering it; log cleanup
+        // (the only bulk-delete caller that touches `_delta_log`) is off the
+        // commit lock and already bounded by CHECKPOINT_OP_TIMEOUT.
+        self.data.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.route_prefix(prefix).list(prefix)
+    }
+
+    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.route_prefix(prefix).list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.route_prefix(prefix).list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+        // Route on the DESTINATION: `rename_if_not_exists` into `_delta_log` is
+        // the commit-entry write on non-conditional-put stores.
+        self.route(to).copy_opts(from, to, options).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use object_store::{ObjectStoreExt, memory::InMemory};
 
     use super::*;
+
+    /// The request-class split is the PRIMARY bound on commit-lock hold time
+    /// (prod 2026-07-30), so what counts as commit-log class is load-bearing:
+    /// misroute the commit PUT and it silently goes back to the 900s data
+    /// client; misroute a parquet part and a legitimate multi-minute upload
+    /// starts failing at 30s.
+    #[tokio::test]
+    async fn commit_log_traffic_routes_to_the_short_timeout_client() -> anyhow::Result<()> {
+        let log = Arc::new(InMemory::new());
+        let data = Arc::new(InMemory::new());
+        let router = RequestClassRouter::new(log.clone(), data.clone());
+
+        let commit = Path::from("tbl/_delta_log/00000000000000000001.json");
+        let checkpoint = Path::from("tbl/_delta_log/00000000000000000001.checkpoint.parquet");
+        let part = Path::from("tbl/date=2026-07-30/part-0.parquet");
+        for p in [&commit, &checkpoint, &part] {
+            router.put(p, PutPayload::from_static(b"x")).await?;
+        }
+        assert!(log.head(&commit).await.is_ok(), "the commit entry must use the short-timeout client");
+        assert!(data.head(&commit).await.is_err());
+        // A checkpoint is a multi-MB bulk transfer, not control plane.
+        assert!(data.head(&checkpoint).await.is_ok(), "checkpoint parquet stays on the data client");
+        assert!(data.head(&part).await.is_ok(), "data parquet stays on the data client");
+        assert!(log.head(&part).await.is_err());
+        // Reads follow the same split, so a commit-log GET can't hang for the
+        // data bound either.
+        assert_eq!(router.get(&commit).await?.bytes().await?, Bytes::from_static(b"x"));
+
+        // LIST routes by prefix: only an explicit _delta_log prefix is control
+        // plane — a whole-table listing enumerates data files.
+        assert!(matches!(router.route_prefix(Some(&Path::from("tbl/_delta_log"))), s if Arc::ptr_eq(s, &(log.clone() as Arc<dyn ObjectStore>))));
+        assert!(matches!(router.route_prefix(Some(&Path::from("tbl"))), s if Arc::ptr_eq(s, &(data.clone() as Arc<dyn ObjectStore>))));
+        assert!(matches!(router.route_prefix(None), s if Arc::ptr_eq(s, &(data.clone() as Arc<dyn ObjectStore>))));
+        Ok(())
+    }
 
     // Locks in the containment-probe slice math in get_range_cached: a strict
     // sub-range of the warmed (size-hint..size) footer never equals the warm

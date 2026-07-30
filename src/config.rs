@@ -887,6 +887,23 @@ pub struct AwsConfig {
     /// starved R2 connections. Tunable via TIMEFUSION_S3_REQUEST_TIMEOUT.
     #[serde(default)]
     pub timefusion_s3_request_timeout: Option<String>,
+    /// Per-request bound for the COMMIT-LOG request class (`_delta_log/*.json`,
+    /// `_last_checkpoint`, log LISTs) — humantime, default "30s". Split from
+    /// `timefusion_s3_request_timeout` because the two classes have nothing in
+    /// common: a data request is a multi-MB parquet part that legitimately
+    /// takes minutes, while a log request is a few-KB control-plane operation
+    /// that is sub-second when healthy. Sharing the 900s data bound is what let
+    /// one hung R2 commit PUT hold a per-table commit lock for 14 minutes and
+    /// stall every committer on that table (prod 2026-07-30 01:20–01:34).
+    ///
+    /// A timed-out commit PUT is SAFE to bound this tightly: the conditional
+    /// (`If-None-Match: *`) PUT that delta-rs uses is NOT marked idempotent in
+    /// object_store, so a timeout is never silently re-sent — it surfaces as an
+    /// ordinary commit error and TimeFusion's existing landed-probe
+    /// (`probe_commit_landed`) decides whether the commit landed. Tunable via
+    /// TIMEFUSION_S3_LOG_REQUEST_TIMEOUT.
+    #[serde(default)]
+    pub timefusion_s3_log_request_timeout: Option<String>,
 }
 
 /// Coerce a bare-number timeout (e.g. `"150"`) to humantime seconds (`"150s"`).
@@ -914,6 +931,14 @@ impl AwsConfig {
 
     pub fn request_timeout(&self) -> String {
         normalize_duration(self.timefusion_s3_request_timeout.clone().unwrap_or_else(|| "900s".into()))
+    }
+
+    /// Effective per-request bound for the commit-log request class — see
+    /// `timefusion_s3_log_request_timeout`. Not clamped against
+    /// `request_timeout`: an operator raising it above the data bound is a
+    /// deliberate act, and the two classes are independent by design.
+    pub fn log_request_timeout(&self) -> String {
+        normalize_duration(self.timefusion_s3_log_request_timeout.clone().unwrap_or_else(|| "30s".into()))
     }
 
     pub fn build_storage_options(&self, endpoint_override: Option<&str>) -> HashMap<String, String> {
@@ -1763,6 +1788,19 @@ mod tests {
         assert_eq!(normalize_duration("".into()), "");
         let aws = AwsConfig { timefusion_s3_connect_timeout: Some("150".into()), ..Default::default() };
         assert_eq!(aws.connect_timeout(), "150s");
+    }
+
+    /// The commit-log request class must default to a bound that is ORDERS OF
+    /// MAGNITUDE under the data bound — that gap is the whole fix for the
+    /// 2026-07-30 commit-lock stall, and a default that drifted up to match
+    /// `request_timeout` would silently restore the incident.
+    #[test]
+    fn log_request_timeout_defaults_far_below_the_data_bound() {
+        let aws = AwsConfig::default();
+        assert_eq!(aws.log_request_timeout(), "30s");
+        assert_eq!(aws.request_timeout(), "900s");
+        let tuned = AwsConfig { timefusion_s3_log_request_timeout: Some("45".into()), ..Default::default() };
+        assert_eq!(tuned.log_request_timeout(), "45s", "bare numbers coerce here too, or boot panics");
     }
 
     #[test]
