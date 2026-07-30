@@ -499,14 +499,21 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
             conj.push(in_list(col("project_id"), meta.projects.iter().map(lit).collect(), false));
         }
         let predicate = conj.into_iter().reduce(Expr::and);
-        // `hashes := array_concat(coalesce-style CASE, [tag])`, rebuilt as the
-        // equivalent append-or-singleton (no empty-list literal needed).
-        let assignment = datafusion::logical_expr::when(
-            col("hashes").is_not_null(),
-            datafusion::functions_nested::expr_fn::array_append(col("hashes"), col("tag")),
-        )
-        .otherwise(datafusion::functions_nested::expr_fn::make_array(vec![col("tag")]))
-        .expect("static CASE expr");
+        // Rebuilt equivalents of the two parked shapes (no empty-list literal
+        // needed): scalar `tag` → append-or-singleton; list `new_hashes` →
+        // take-or-concat.
+        let assignment = if meta.list_source {
+            datafusion::logical_expr::when(col("hashes").is_null(), col("new_hashes"))
+                .otherwise(datafusion::functions_nested::expr_fn::array_concat(vec![col("hashes"), col("new_hashes")]))
+                .expect("static CASE expr")
+        } else {
+            datafusion::logical_expr::when(
+                col("hashes").is_not_null(),
+                datafusion::functions_nested::expr_fn::array_append(col("hashes"), col("tag")),
+            )
+            .otherwise(datafusion::functions_nested::expr_fn::make_array(vec![col("tag")]))
+            .expect("static CASE expr")
+        };
         info!("dml redrive: {} rows for {} ({} projects), window {:?}: replaying{}", merged.num_rows(), meta.table_name, meta.projects.len(), meta.date_bounds, if dry_run { " [DRY RUN]" } else { "" });
         if dry_run {
             ok += 1;
@@ -564,13 +571,17 @@ pub(crate) struct QuarantineMeta {
     pub ts_lower: i64,
     pub ts_upper: (i64, bool),
     pub rows: usize,
+    /// Source carries a `new_hashes` list column (second enrichment shape)
+    /// rather than a scalar `tag`.
+    pub list_source: bool,
 }
 
 pub(crate) fn parse_quarantine_meta(meta: &str) -> Option<QuarantineMeta> {
     let field = |k: &str| meta.lines().find_map(|l| l.strip_prefix(k).and_then(|l| l.strip_prefix('=')).map(str::to_owned));
     let (table_name, project_id, predicate, assignments) = (field("table_name")?, field("project_id")?, field("predicate")?, field("assignments")?);
-    // Shape guard: only the hash-enrichment fold is reconstructible.
-    if !assignments.starts_with("hashes:=array_concat(") {
+    // Shape guard: only the two hash-enrichment folds are reconstructible.
+    let list_source = assignments.starts_with("hashes:=CASE WHEN o.hashes IS NULL THEN u.new_hashes");
+    if !list_source && !assignments.starts_with("hashes:=array_concat(") {
         return None;
     }
     let join_keys: Vec<(String, String)> = field("join_keys")?
@@ -614,6 +625,7 @@ pub(crate) fn parse_quarantine_meta(meta: &str) -> Option<QuarantineMeta> {
         ts_lower,
         ts_upper: (ts_upper, upper_incl),
         rows: field("rows").and_then(|r| r.parse().ok()).unwrap_or(0),
+        list_source,
     })
 }
 
@@ -1264,7 +1276,12 @@ mod tests {
         assert_eq!(m.ts_lower, 1785408669559194);
         assert_eq!(m.ts_upper, (1785410181576000, false));
         assert_eq!(m.rows, 766);
-        // Unknown shapes stay parked.
+        // The list-source shape parses too; unknown shapes stay parked.
+        let list = meta.replace(
+            "hashes:=array_concat(CASE WHEN o.hashes IS NOT NULL THEN o.hashes ELSE List([]) END, make_array(u.tag))",
+            "hashes:=CASE WHEN o.hashes IS NULL THEN u.new_hashes ELSE array_concat(o.hashes, u.new_hashes) END",
+        );
+        assert!(parse_quarantine_meta(&list).is_some_and(|m| m.list_source));
         assert!(parse_quarantine_meta(&meta.replace("hashes:=array_concat(", "other:=fn(")).is_none());
     }
 
