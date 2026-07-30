@@ -1,0 +1,136 @@
+<title>TimeFusion compaction — 07-28/29 file counts</title>
+<style>
+:root{
+  --bg:#f6f7f5; --panel:#ffffff; --ink:#1d2321; --ink2:#5b6663; --ink3:#8a9490;
+  --line:#e3e7e4; --track:#e9ece9;
+  --accent:#0f766e; --accent-soft:#0f766e22;
+  --good:#1a7f37; --good-bg:#1a7f3714; --warn:#9a6700; --warn-bg:#9a670014; --mut-bg:#5b666314;
+  --danger:#b42318;
+}
+@media (prefers-color-scheme: dark){:root{
+  --bg:#151917; --panel:#1d2220; --ink:#e8ecea; --ink2:#a7b1ad; --ink3:#77817d;
+  --line:#2c3330; --track:#2b322f;
+  --accent:#2dd4bf; --accent-soft:#2dd4bf26;
+  --good:#4ade80; --good-bg:#4ade8018; --warn:#fbbf24; --warn-bg:#fbbf2418; --mut-bg:#a7b1ad14;
+  --danger:#f87171;
+}}
+:root[data-theme="dark"]{
+  --bg:#151917; --panel:#1d2220; --ink:#e8ecea; --ink2:#a7b1ad; --ink3:#77817d;
+  --line:#2c3330; --track:#2b322f;
+  --accent:#2dd4bf; --accent-soft:#2dd4bf26;
+  --good:#4ade80; --good-bg:#4ade8018; --warn:#fbbf24; --warn-bg:#fbbf2418; --mut-bg:#a7b1ad14;
+  --danger:#f87171;
+}
+:root[data-theme="light"]{
+  --bg:#f6f7f5; --panel:#ffffff; --ink:#1d2321; --ink2:#5b6663; --ink3:#8a9490;
+  --line:#e3e7e4; --track:#e9ece9;
+  --accent:#0f766e; --accent-soft:#0f766e22;
+  --good:#1a7f37; --good-bg:#1a7f3714; --warn:#9a6700; --warn-bg:#9a670014; --mut-bg:#5b666314;
+  --danger:#b42318;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;padding:28px 20px 48px}
+.wrap{max-width:1060px;margin:0 auto}
+h1{font-size:19px;font-weight:650;margin:0 0 2px;text-wrap:balance}
+.sub{color:var(--ink2);margin:0 0 20px;font-size:13px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-bottom:22px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.tile .k{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);margin-bottom:4px}
+.tile .v{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.tile .d{font-size:12px;color:var(--ink2);margin-top:2px}
+.v .dim{color:var(--ink3);font-weight:500}
+.legend{display:flex;gap:18px;align-items:center;font-size:12px;color:var(--ink2);margin:0 0 10px}
+.legend .sw{display:inline-block;width:14px;height:8px;border-radius:2px;vertical-align:1px;margin-right:6px}
+.grid{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:880px}
+th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);text-align:left;font-weight:600;padding:10px 12px;border-bottom:1px solid var(--line)}
+th.num,td.num{text-align:right}
+td{padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+.proj{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;white-space:nowrap}
+.proj .tag{color:var(--ink3);font-family:system-ui,sans-serif}
+.barcell{width:270px;min-width:230px}
+.bar{position:relative;height:12px;background:var(--track);border-radius:3px;overflow:hidden}
+.bar .before{position:absolute;inset:0 auto 0 0;background:var(--ink3);opacity:.35;border-radius:3px}
+.bar .now{position:absolute;inset:0 auto 0 0;background:var(--accent);border-radius:3px;box-shadow:0 0 0 2px var(--panel)}
+.nums{font-variant-numeric:tabular-nums;font-size:12.5px;white-space:nowrap;color:var(--ink2)}
+.nums b{color:var(--ink);font-weight:650}
+.delta{font-size:11.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.delta.down{color:var(--good)} .delta.up{color:var(--danger)} .delta.flat{color:var(--ink3)}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;border-radius:999px;padding:2px 9px;white-space:nowrap}
+.chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.chip.done{color:var(--good);background:var(--good-bg)}
+.chip.run{color:var(--warn);background:var(--warn-bg)}
+.chip.q{color:var(--ink2);background:var(--mut-bg)}
+.note{color:var(--ink2);font-size:12.5px;margin:14px 2px 0;max-width:72ch}
+.note b{color:var(--ink)}
+.foot{color:var(--ink3);font-size:11.5px;margin-top:18px}
+</style>
+<div class="wrap">
+<h1>Compaction of sealed days — live file counts vs this morning</h1>
+<p class="sub">otel_logs_and_spans · unified table on R2 · snapshot v442574, 2026-07-30 20:55 CEST · whale 07-29 COMPLETE; runners on 07-28/26/23</p>
+
+<div class="tiles">
+  <div class="tile"><div class="k">07-29 files</div><div class="v"><span class="dim">27,885 →</span> 132</div><div class="d">−99.5% — DONE. Whale converged to 89 (1GB files + DV residue)</div></div>
+  <div class="tile"><div class="k">07-28 files</div><div class="v"><span class="dim">8,548 →</span> 849</div><div class="d">whale 792 in progress (tfcW1) — everything else 1–17</div></div>
+  <div class="tile"><div class="k">Whale older days 07-20..27</div><div class="v"><span class="dim">6,142 →</span> 5,832</div><div class="d">tfcW2 on 07-26 (450) · tfcW3 on 07-23 (474) · 5 days queued</div></div>
+  <div class="tile"><div class="k">87576849 07-29</div><div class="v">07-29 ✓ · 07-28: 792</div><div class="d">07-29 finished (removed=0 terminal pass); babysitter clears stalls</div></div>
+</div>
+
+<div class="legend">
+  <span><span class="sw" style="background:var(--ink3);opacity:.35"></span>files this morning</span>
+  <span><span class="sw" style="background:var(--accent)"></span>files now</span>
+  <span>bars share one scale (max 3,014)</span>
+</div>
+
+<div class="grid">
+<table>
+<thead><tr>
+  <th>project</th>
+  <th class="barcell">07-29 · morning → now</th><th class="num">Δ</th>
+  <th class="barcell">07-28 · morning → now</th><th class="num">Δ</th>
+  <th class="num">07-30</th>
+  <th>status</th>
+</tr></thead>
+<tbody id="rows"></tbody>
+</table>
+</div>
+
+<p class="note"><b>Reading it:</b> the grey track is this morning’s count, the teal bar is the live count — a short teal bar on a long track is work done. <b>87576849 stands out:</b> its backlog is being drained by three parallel per-date-range runners: 07-29 is COMPLETE (3,014 → 89, a terminal removed=0 pass), 07-28 at 792 in flight, and the eight older days (~5,800 files) worked from both ends. Bonus visible in the 07-30 column: since the ca84fe9 deploy, prod’s own hot-tail compaction collapsed today’s partitions from ~150–225 files to ~20–45 per project. Everything else on 07-28/29 is done (1–20 files each), tfc7 finished the older days’ small partitions — the whale is now the only fragmentation left in the table (a scan back through June found nothing else above target).</p>
+
+<p class="foot">Counts = active Add actions in the Delta snapshot (tombstones excluded) · morning figures from your 07:00 table · 5ce1c976 (1 file/day) omitted</p>
+</div>
+
+<script>
+const MAX=3014;
+// [proj, tag, b29, n29, b28, n28, n30, status]  b=morning, n=now(v431604); b28 null = “–” in the morning table
+const rows=[
+ ["87576849","",3014,89,null,792,589,"run"],
+ ["00000000","default",2967,1,null,6,60,"done"],
+ ["d062e010","",2682,2,689,7,119,"done"],
+ ["28f62f01","",2667,1,null,17,57,"done"],
+ ["6297304f","",2661,31,null,10,72,"done"],
+ ["edb04135","",2568,1,1452,5,57,"done"],
+ ["be87ebc1","",2512,1,null,1,53,"done"],
+ ["98fdd4f3","",2373,1,null,3,58,"done"],
+ ["2a39bd83","",2282,1,null,2,23,"done"],
+ ["dcad860a","",2035,1,625,2,56,"done"],
+ ["94c5dc1f","",1947,1,null,2,43,"done"],
+ ["8100121c","small",177,1,null,1,10,"done"],
+];
+const fmt=n=>n==null?"–":n.toLocaleString("en-US");
+const pct=(b,n)=>{if(b==null)return `<span class="delta flat">new data</span>`;
+ if(n<=b){const p=b?Math.round((1-n/b)*100):0;return `<span class="delta down">−${p}%</span>`}
+ return `<span class="delta up">+${Math.round((n/b-1)*100)}%</span>`};
+const bar=(b,n)=>`<div class="bar" title="${fmt(b)} → ${fmt(n)}">
+ ${b!=null?`<span class="before" style="width:${Math.max(b/MAX*100,.8)}%"></span>`:""}
+ <span class="now" style="width:${Math.max(n/MAX*100,.8)}%"></span></div>
+ <div class="nums">${b!=null?fmt(b)+" → ":""}<b>${fmt(n)}</b></div>`;
+const chips={done:`<span class="chip done">both done</span>`,done29:`<span class="chip done">07-29 done</span>`,run:`<span class="chip run">compacting</span>`,q:`<span class="chip q">queued</span>`};
+document.getElementById("rows").innerHTML=rows.map(([p,tag,b29,n29,b28,n28,n30,st])=>`<tr>
+ <td class="proj">${p}${tag?` <span class="tag">(${tag})</span>`:""}</td>
+ <td class="barcell">${bar(b29,n29)}</td><td class="num">${pct(b29,n29)}</td>
+ <td class="barcell">${bar(b28,n28)}</td><td class="num">${pct(b28,n28)}</td>
+ <td class="num nums">${fmt(n30)}</td>
+ <td>${chips[st]}</td></tr>`).join("");
+</script>
