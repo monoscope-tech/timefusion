@@ -299,6 +299,30 @@ pub type CustomProjectTables = Arc<RwLock<HashMap<(String, String), Arc<RwLock<D
 type ZOrderFilesets = Arc<RwLock<HashMap<String, HashMap<chrono::NaiveDate, std::collections::HashSet<String>>>>>;
 /// Per-(project_id, table_name) DML serialization mutexes — see `Database::dml_lock`.
 type DmlLocks = Arc<dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+/// Per-physical-table count of flush/ingest committers QUEUED on the commit lock
+/// — see `Database::flush_waiters` and the priority check in `commit_wave`.
+type FlushWaiterCounts = Arc<dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicUsize>>>;
+
+/// RAII registration of one flush/ingest committer waiting for a per-table
+/// commit lock. Waves read this count to decide whether to queue at all, so it
+/// must drop the instant the flush acquires the lock — OR the instant its
+/// future is cancelled by a watchdog/timeout. `Drop` covers both; a manual
+/// decrement after `lock().await` silently leaks the count on cancellation and
+/// would wedge maintenance forever.
+struct FlushWaiter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl FlushWaiter {
+    fn register(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for FlushWaiter {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Get a Delta table from custom project tables by project_id and table_name
 pub async fn get_custom_delta_table(custom_tables: &CustomProjectTables, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
@@ -1841,6 +1865,16 @@ pub struct Database {
     /// serialized commits to *different* Delta logs and capped flush
     /// throughput below `flush_parallelism` (issue #83).
     commit_locks: DmlLocks,
+    /// Flush/ingest committers currently QUEUED on each table's `commit_locks`
+    /// entry (same key). `tokio::sync::Mutex` is FIFO and every holder is
+    /// bounded, but a backlogged maintenance tick can still park SEVERAL
+    /// minutes-long wave commits (OCC ladders over a big log) ahead of a flush —
+    /// prod 2026-07-30: flush waited >600s to ACQUIRE and its watchdog killed
+    /// the attempt while `commit_lock_timeouts` stayed 0 (nobody hung; flush
+    /// starved in the queue). Durability outranks maintenance, so `commit_wave`
+    /// declines to enqueue while this is nonzero and flush latency is bounded by
+    /// at most ONE in-flight wave commit instead of a queue of them.
+    flush_waiter_counts: FlushWaiterCounts,
     /// Per-table serialization for in-process DML (see `dml_lock`): concurrent
     /// merges on the same table would OCC-conflict and redo full parquet
     /// rewrites, so they queue here — without touching the table's RwLock,
@@ -2222,6 +2256,7 @@ impl Database {
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             commit_locks: Arc::new(dashmap::DashMap::new()),
+            flush_waiter_counts: Arc::new(dashmap::DashMap::new()),
             dml_locks: Arc::new(dashmap::DashMap::new()),
             snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
@@ -4042,6 +4077,14 @@ impl Database {
         self.commit_locks.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
     }
 
+    /// Waiter count for the SAME key as [`Self::commit_lock`] (see
+    /// `flush_waiter_counts`). Flush/ingest commit paths register a
+    /// [`FlushWaiter`] on it across their `lock().await`; `commit_wave` reads it
+    /// and stands down while it is nonzero.
+    pub(crate) async fn flush_waiters(&self, project_id: &str, table_name: &str) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.flush_waiter_counts.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
+    }
+
     /// Persist `table`'s post-commit snapshot locally (detached) so the next
     /// boot restores it and replays only later commits (see `snapshot_cache`).
     /// Called from every commit path that swaps a fresh table state in.
@@ -4336,6 +4379,7 @@ impl Database {
             let stage_store = stage_store.clone();
 
             let commit_lock = self.commit_lock(&project_id, &table_name).await;
+            let flush_waiters = self.flush_waiters(&project_id, &table_name).await;
             let mut retry_count = 0;
             loop {
                 // Refresh UNDER the lock (the merge path refreshes before locking).
@@ -4345,7 +4389,14 @@ impl Database {
                 // probe-cheap (a single GET that 404-short-circuits when already
                 // current), so the extra lock-hold is sub-millisecond on the common
                 // path.
-                let commit_guard = commit_lock.lock().await;
+                // FLUSH PRIORITY: registered across the WAIT only. Waves stand
+                // down while this is nonzero (see `flush_waiter_counts`), so the
+                // count must fall the moment we hold the lock — or the moment a
+                // watchdog cancels this future.
+                let commit_guard = {
+                    let _waiting = FlushWaiter::register(&flush_waiters);
+                    commit_lock.lock().await
+                };
                 // DIAG (commit-throughput profiling): time the serial commit phases
                 // (refresh + Delta log append) under the lock — these bound the
                 // process-wide commit rate. Remove once the flush bottleneck is found.
@@ -4470,13 +4521,17 @@ impl Database {
         // writer exists (the block above always returns).
         let batches: Vec<RecordBatch> = batches.collect::<Result<_, _>>()?;
         let commit_lock = self.commit_lock(&project_id, &table_name).await;
+        let flush_waiters = self.flush_waiters(&project_id, &table_name).await;
         let mut retry_count = 0;
         let mut last_error = None;
         while retry_count < max_retries {
             if let Err(e) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
-            let commit_guard = commit_lock.lock().await;
+            let commit_guard = {
+                let _waiting = FlushWaiter::register(&flush_waiters);
+                commit_lock.lock().await
+            };
             let (table, pre_uris) = {
                 let guard = table_ref.read().await;
                 let pre: std::collections::HashSet<String> = guard.get_file_uris().map(|it| it.collect()).unwrap_or_default();
@@ -4724,9 +4779,13 @@ impl Database {
         // Any member resolves to the same physical lock (the group key IS
         // `table_lock_key`), so serialization is identical to the per-project path.
         let commit_lock = self.commit_lock(projects[0].0, table_name).await;
+        let flush_waiters = self.flush_waiters(projects[0].0, table_name).await;
         let mut retry_count = 0u32;
         loop {
-            let commit_guard = commit_lock.lock().await;
+            let commit_guard = {
+                let _waiting = FlushWaiter::register(&flush_waiters);
+                commit_lock.lock().await
+            };
             if let Err(e) = bounded_commit_await(
                 COMMIT_LOCK_OP_TIMEOUT,
                 "coalesced_refresh",
@@ -7013,8 +7072,21 @@ impl Database {
             // columns are Struct{Binary, Binary} on disk and a view-typed read
             // blows the rewrite up mid-scan with "Expected Binary, got BinaryView".
             let ctx = datafusion::prelude::SessionContext::new_with_state(self.light_optimize_session_state());
-            ctx.register_table("hot_bin", Arc::new(provider))?;
-            let batches: Vec<RecordBatch> = ctx.sql("SELECT * FROM hot_bin").await?.collect().await?;
+            // Unique per staging: the cached session state's clone SHARES its
+            // catalog, so a fixed name collides across the k concurrent
+            // stagings ("The table hot_bin already exists", prod 2026-07-30 —
+            // serial k=1-2 never collided; k~9 parallelism exposed it).
+            // Deregistered right after the read so the shared catalog can't
+            // accumulate entries.
+            let bin_table = format!("hot_bin_{}", uuid::Uuid::new_v4().simple());
+            ctx.register_table(&bin_table, Arc::new(provider))?;
+            let read = ctx.sql(&format!("SELECT * FROM {bin_table}")).await;
+            let batches_res = match read {
+                Ok(df) => df.collect().await,
+                Err(e) => Err(e),
+            };
+            let _ = ctx.deregister_table(&bin_table);
+            let batches: Vec<RecordBatch> = batches_res?;
             if batches.iter().all(|b| b.num_rows() == 0) {
                 return Ok(());
             }
@@ -7117,6 +7189,8 @@ impl Database {
         // project has custom storage (table_lock_key only collapses non-custom
         // projects) — the liveness check would then race dedup's Removes.
         let commit_lock = self.commit_lock("", table_name).await;
+        // Same key as the lock above — flush/ingest committers queued on it.
+        let flush_waiters = self.flush_waiters("", table_name).await;
         // The wave spans several projects of a handful of dates, so the
         // warm/evict diff is scoped to those dates rather than the whole
         // (26k-file) table.
@@ -7124,6 +7198,34 @@ impl Database {
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         const MAX_RETRIES: usize = 4;
         for attempt in 0..MAX_RETRIES {
+            // FLUSH PRIORITY (prod 2026-07-30). The lock is FIFO, so joining the
+            // queue ahead of a waiting flush costs it OUR whole commit — and on a
+            // backlogged tick several wave commits, each legally minutes long,
+            // stack up in front of it (flush waited >600s to ACQUIRE and its
+            // watchdog killed the attempt; nothing was hung). Durability outranks
+            // maintenance: we don't enqueue at all while a flush is waiting, so
+            // flush latency is bounded by ONE in-flight wave commit.
+            //
+            // NOT a starvation risk for waves: flush is periodic (60s cadence) and
+            // its commit is a short log append, so the count is zero for most of
+            // every minute — a wave that stands down here re-stages and finds a
+            // gap on a later tick. If it were EVER continuously nonzero, flush
+            // would be saturating the commit path and compaction is exactly the
+            // work that should yield.
+            if flush_waiters.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(table_name, engine, round, attempt = attempt + 1, bins = bins.len(), event = "wave_commit_flush_yield");
+                // Nothing was committed, so the bins' target files are still live
+                // and the staged parquet is referenced by nothing. Delta VACUUM
+                // cannot see uncommitted staged files, so leaving them would leak
+                // on S3 forever; the next tick re-stages from the same (still
+                // live) targets. Dedup's bins go back on the dirty queue via the
+                // `failed` list — a partition with duplicates still in it must
+                // never be certified clean.
+                self.discard_bins(&bins).await;
+                failed.extend(bins);
+                return WaveResult { landed: carried, failed };
+            }
             let commit_guard = commit_lock.lock().await;
             // Bounded: this reads the log over the network with the commit lock
             // held. A timeout here just means we build on a possibly-stale
@@ -11815,6 +11917,61 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b), "default projects on a unified table must share one commit lock");
         assert!(!Arc::ptr_eq(&a, &c), "different tables must get independent commit locks");
         assert!(!Arc::ptr_eq(&a, &db.dml_lock("proj_a", "otel_logs_and_spans").await), "commit and DML locks must be distinct");
+        Ok(())
+    }
+
+    /// prod 2026-07-30: the commit lock is FIFO and every holder is bounded, but
+    /// a backlogged tick queued several legally-minutes-long wave commits ahead
+    /// of the flush path — flush waited >600s to ACQUIRE and its watchdog killed
+    /// the attempt (`commit_lock_timeouts` stayed 0: nobody hung, flush starved).
+    /// Durability outranks maintenance, so a wave with a flush already queued
+    /// must NOT enqueue: it requeues its bins and counts the yield. With no
+    /// waiter it commits exactly as before.
+    #[tokio::test]
+    async fn wave_commit_yields_to_a_waiting_flush() -> Result<()> {
+        use datafusion::arrow::{
+            array::{Int32Array, RecordBatch},
+            datatypes::{DataType as ArrowDataType, Field, Schema},
+        };
+        use deltalake::{
+            kernel::{DataType, PrimitiveType, StructField},
+            protocol::SaveMode,
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let db = Database::with_config(create_test_config("wave-flush-priority")).await?;
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///wave_flush_priority")?;
+        let table = DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_backend(mem, url)
+            .build()?
+            .create()
+            .with_columns(vec![StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true)])
+            .await?;
+        let arrow = Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Int32, true)]));
+        let table = table.write(vec![RecordBatch::try_new(arrow, vec![Arc::new(Int32Array::from(vec![1, 2])) as _])?]).with_save_mode(SaveMode::Append).await?;
+        let target = table.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).next().expect("the written file is live");
+        let version = table.version();
+        let table_ref = Arc::new(RwLock::new(table));
+        // The wave keys on ("", table) — the same key every flush committer uses.
+        let bin = || vec![staged_unit("alpha", &[target.as_str()], None)];
+
+        // A flush queued on the lock ⇒ the wave stands down without committing.
+        let waiter = FlushWaiter::register(&db.flush_waiters("", "otel_logs_and_spans").await);
+        let yields = crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed);
+        let deferred = db.commit_wave(&table_ref, "otel_logs_and_spans", &[], false, bin(), 0).await;
+        assert_eq!(crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed), yields + 1, "the yield is counted, not silent");
+        assert!(deferred.landed.is_empty(), "nothing may land while a flush waits");
+        assert_eq!(deferred.failed.len(), 1, "the bin is requeued (dedup's dirty bin must not be certified clean)");
+        assert_eq!(table_ref.read().await.version(), version, "no commit was attempted");
+
+        // Flush done ⇒ the very same wave commits.
+        drop(waiter);
+        let landed = db.commit_wave(&table_ref, "otel_logs_and_spans", &[], false, bin(), 0).await;
+        assert_eq!(crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed), yields + 1, "no yield without a waiter");
+        assert_eq!(landed.landed.len(), 1);
+        assert!(landed.failed.is_empty());
+        assert_eq!(table_ref.read().await.version(), version.map(|v| v + 1), "the wave commits as before once no flush is queued");
         Ok(())
     }
 
