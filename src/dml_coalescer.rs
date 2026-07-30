@@ -34,7 +34,7 @@
 //! write itself* failed, i.e. genuine loss.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     hash::{Hash, Hasher},
     sync::{
         Arc,
@@ -262,6 +262,77 @@ fn widen_bound(a: TimeBound, b: &TimeBound, lower: bool) -> TimeBound {
         Some(_) => b.clone(),
         None => TimeBound { inclusive: true, ..a },
     }
+}
+
+/// Drain-time merge window. The Delta MERGE hash-join builds against every
+/// target row in the predicate's time window regardless of source chunking,
+/// so join memory ∝ window width — 2026-07-30 union-window drains (~1h)
+/// reserved 2.5+ GB per merge and exhausted the 10 GB pool, and k chunks paid
+/// k full scans of the whole window. Bucketing statements by their own bounds
+/// keeps each merge's target side ∝ bucket, not burst.
+const DML_MERGE_BUCKET_MICROS: i64 = 5 * 60 * 1_000_000;
+
+/// A statement's own time bounds, captured at enqueue (the group predicate is
+/// widened to the union, so these are the only record of the narrow window).
+type StmtBounds = (Option<TimeBound>, Option<TimeBound>);
+type BoundBatch = (RecordBatch, StmtBounds);
+
+/// Timestamp scalar → microseconds (inverse of [`watermark_scalar`]).
+fn scalar_micros(v: &ScalarValue) -> Option<i64> {
+    Some(match v {
+        ScalarValue::TimestampSecond(Some(s), _) => s.checked_mul(1_000_000)?,
+        ScalarValue::TimestampMillisecond(Some(ms), _) => ms.checked_mul(1_000)?,
+        ScalarValue::TimestampMicrosecond(Some(us), _) => *us,
+        ScalarValue::TimestampNanosecond(Some(ns), _) => ns.div_euclid(1_000),
+        _ => return None,
+    })
+}
+
+/// The `DML_MERGE_BUCKET_MICROS` bucket span a statement's window covers, or
+/// None when a side is unbounded or non-timestamp (those statements share one
+/// catch-all unit). Spanning statements keep their full window — the span key
+/// just puts same-span statements together; it never narrows anything.
+fn bounds_span(b: &StmtBounds) -> Option<(i64, i64)> {
+    let lo = scalar_micros(&b.0.as_ref()?.value)?;
+    let up = b.1.as_ref()?;
+    // An exclusive upper on a bucket edge contains no row at the edge itself.
+    let hi = scalar_micros(&up.value)? - i64::from(!up.inclusive);
+    Some((lo.div_euclid(DML_MERGE_BUCKET_MICROS), hi.max(lo).div_euclid(DML_MERGE_BUCKET_MICROS)))
+}
+
+/// Split a drained group into per-time-bucket merge units: each unit keeps the
+/// group's shape (residual, keys, assignments, attempts) but narrows the time
+/// window to the union of only its own statements' bounds. Single-bucket
+/// groups pass through untouched — exactly today's one-merge-unit behavior.
+fn bucket_group(mut group: PendingGroup) -> Vec<PendingGroup> {
+    let mut buckets: BTreeMap<Option<(i64, i64)>, Vec<BoundBatch>> = BTreeMap::new();
+    for bb in std::mem::take(&mut group.batches) {
+        buckets.entry(bounds_span(&bb.1)).or_default().push(bb);
+    }
+    if buckets.len() <= 1 {
+        group.batches = buckets.into_values().next().unwrap_or_default();
+        return vec![group];
+    }
+    buckets
+        .into_values()
+        .map(|batches| {
+            let mut predicate = DecomposedPredicate { residual: group.predicate.residual.clone(), lower: batches[0].1.0.clone(), upper: batches[0].1.1.clone() };
+            for (_, (lo, up)) in &batches[1..] {
+                predicate.widen(&DecomposedPredicate { residual: vec![], lower: lo.clone(), upper: up.clone() });
+            }
+            PendingGroup {
+                join_keys: group.join_keys.clone(),
+                assignments: group.assignments.clone(),
+                predicate,
+                time_col: group.time_col,
+                schema: group.schema.clone(),
+                batches,
+                session: group.session.clone(),
+                attempts: group.attempts,
+                folded_projects: group.folded_projects.clone(),
+            }
+        })
+        .collect()
 }
 
 /// Classify a conjunct as `(bound, is_lower)` when it is
@@ -685,7 +756,9 @@ struct PendingGroup {
     predicate: DecomposedPredicate,
     time_col: &'static str,
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    /// Statement batches, each with its own time bounds so the drain can
+    /// bucket by window ([`bucket_group`]).
+    batches: Vec<BoundBatch>,
     /// Freshest enqueuing statement's session — keeps the drain's function
     /// registry identical to what the synchronous merge would have used.
     session: Arc<dyn Session>,
@@ -774,7 +847,7 @@ fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &std::coll
         }
         // Deterministic member order → stable IN-list, fingerprint, and rep key.
         members.sort_by(|a, b| a.0.project_id.cmp(&b.0.project_id));
-        let total_rows: usize = members.iter().flat_map(|(_, g, _)| &g.batches).map(RecordBatch::num_rows).sum();
+        let total_rows: usize = members.iter().flat_map(|(_, g, _)| &g.batches).map(|(b, _)| b.num_rows()).sum();
         if total_rows > MAX_QUEUED_SOURCE_ROWS {
             out.extend(members.into_iter().map(|(k, g, _)| (k, g)));
             continue;
@@ -816,10 +889,10 @@ fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGr
     ));
     let mut batches = Vec::new();
     for (key, group, _) in members {
-        for batch in &group.batches {
+        for (batch, bounds) in &group.batches {
             let project_col = Arc::new(StringArray::from_iter_values(std::iter::repeat_n(key.project_id.as_str(), batch.num_rows())));
             let cols = batch.columns().iter().cloned().chain(std::iter::once(project_col as _)).collect();
-            batches.push(RecordBatch::try_new(schema.clone(), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?);
+            batches.push((RecordBatch::try_new(schema.clone(), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?, bounds.clone()));
         }
     }
 
@@ -918,13 +991,14 @@ impl DmlCoalescer {
             fingerprint: shape_fingerprint(&source.join_keys, assignments, &decomposed.residual, &source.schema),
         };
         let rows = source.batch.num_rows();
+        let bounds = (decomposed.lower.clone(), decomposed.upper.clone());
         {
             let mut groups = self.groups.lock().expect("dml coalescer mutex poisoned");
             match groups.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut g) => {
                     let g = g.get_mut();
                     g.predicate.widen(&decomposed);
-                    g.batches.push(source.batch.clone());
+                    g.batches.push((source.batch.clone(), bounds));
                     g.session = session;
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
@@ -934,7 +1008,7 @@ impl DmlCoalescer {
                         predicate: decomposed,
                         time_col,
                         schema: source.schema.clone(),
-                        batches: vec![source.batch.clone()],
+                        batches: vec![(source.batch.clone(), bounds)],
                         session,
                         attempts: 0,
                         folded_projects: None,
@@ -960,7 +1034,9 @@ impl DmlCoalescer {
             g.drain().collect()
         };
         let groups = if self.fold && groups.len() > 1 { fold_groups(groups, &db.custom_storage_keys().await) } else { groups };
-        for (key, mut group) in groups {
+        // Bucket after folding so each merge unit's target window stays ∝
+        // DML_MERGE_BUCKET_MICROS, not the group's union window (see const).
+        for (key, mut group) in groups.into_iter().flat_map(|(key, g)| bucket_group(g).into_iter().map(move |b| (key.clone(), b))) {
             if let Some(layer) = db.buffered_layer() {
                 // Folded groups clamp against the MAX member watermark: a row
                 // is excludable only when it is unflushed for every member.
@@ -988,10 +1064,10 @@ impl DmlCoalescer {
                 }
             };
             let statements = group.batches.len();
-            let merged = match concat_batches(&group.schema, &group.batches) {
+            let merged = match concat_batches(&group.schema, group.batches.iter().map(|(b, _)| b)) {
                 Ok(b) => b,
                 Err(e) => {
-                    park_group("concat", &e, &group.batches);
+                    park_group("concat", &e, &group.batches.iter().map(|(b, _)| b.clone()).collect::<Vec<_>>());
                     continue;
                 }
             };
@@ -1054,7 +1130,7 @@ impl DmlCoalescer {
     /// drain. The failed batches are older, so they go in front to preserve
     /// per-key round order; the group's newer session wins.
     fn requeue(&self, key: GroupKey, group: PendingGroup) {
-        let rows: usize = group.batches.iter().map(RecordBatch::num_rows).sum();
+        let rows: usize = group.batches.iter().map(|(b, _)| b.num_rows()).sum();
         let mut groups = self.groups.lock().expect("dml coalescer mutex poisoned");
         match groups.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut g) => {
@@ -1128,7 +1204,7 @@ mod tests {
             predicate: DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp"),
             time_col: "timestamp",
             schema: schema.clone(),
-            batches: vec![batch.clone()],
+            batches: vec![(batch.clone(), (None, None))],
             session: Arc::new(datafusion::prelude::SessionContext::new().state()),
             attempts: MAX_DRAIN_ATTEMPTS,
             folded_projects: Some(vec!["proj/1".into(), "proj2".into()]),
@@ -1178,7 +1254,7 @@ mod tests {
             predicate: DecomposedPredicate::decompose(None, "timestamp"),
             time_col: "timestamp",
             schema: schema.clone(),
-            batches: vec![batch.clone()],
+            batches: vec![(batch.clone(), (None, None))],
             session: Arc::new(datafusion::prelude::SessionContext::new().state()),
             attempts: MAX_DRAIN_ATTEMPTS,
             folded_projects: None,
@@ -1194,7 +1270,7 @@ mod tests {
         // file; that is real loss and must bump the paging metric.
         let other =
             RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)])), vec![Arc::new(StringArray::from(vec!["z"]))]).unwrap();
-        group.batches = vec![batch.clone(), other.clone()];
+        group.batches = vec![(batch.clone(), (None, None)), (other.clone(), (None, None))];
         let dropped_before = crate::metrics::dml_stats().coalesce_quarantined.load(Ordering::Relaxed);
         assert!(quarantine_group(dir.path(), &key, &group, &[batch.clone(), other], "mixed"));
         assert_eq!(crate::metrics::dml_stats().coalesce_quarantined.load(Ordering::Relaxed), dropped_before + 1);
@@ -1368,13 +1444,14 @@ mod tests {
             let d = DecomposedPredicate::decompose(Some(&pred), "timestamp");
             let stripped: Vec<Expr> = d.residual.iter().filter(|e| !is_project_eq(e, project)).cloned().collect();
             assert!(stripped.is_empty());
+            let bounds = (d.lower.clone(), d.upper.clone());
             let group = PendingGroup {
                 join_keys: vec![("context___span_id".into(), "span_id".into())],
                 assignments: vec![("hashes".into(), col("source.tag"))],
                 predicate: d,
                 time_col: "timestamp",
                 schema: schema.clone(),
-                batches: vec![batch(ids)],
+                batches: vec![(batch(ids), bounds)],
                 session: Arc::new(datafusion::execution::SessionStateBuilder::new().build()),
                 attempts: 0,
                 folded_projects: None,
@@ -1388,8 +1465,8 @@ mod tests {
         assert_eq!(folded.schema.fields().last().unwrap().name(), "project_id");
         assert_eq!(folded.batches.len(), 2);
         let projects_of = |b: &RecordBatch| b.column(2).as_any().downcast_ref::<StringArray>().unwrap().value(0).to_string();
-        assert_eq!(projects_of(&folded.batches[0]), "p1");
-        assert_eq!(projects_of(&folded.batches[1]), "p2");
+        assert_eq!(projects_of(&folded.batches[0].0), "p1");
+        assert_eq!(projects_of(&folded.batches[1].0), "p2");
         // Join keys extended; window is the union; residual is the IN-list.
         assert_eq!(folded.join_keys.last().unwrap(), &("project_id".to_string(), "project_id".to_string()));
         assert_eq!(folded.predicate.lower.as_ref().unwrap().value, ts(50));
@@ -1403,10 +1480,113 @@ mod tests {
         assert_ne!(key.fingerprint, key2.fingerprint);
 
         // Folded batches concat + round-split cleanly under the widened keys.
-        let merged = concat_batches(&folded.schema, &folded.batches).unwrap();
+        let merged = concat_batches(&folded.schema, folded.batches.iter().map(|(b, _)| b)).unwrap();
         assert_eq!(merged.num_rows(), 3);
         let src = UpdateSource { batch: merged, schema: folded.schema.clone(), join_keys: folded.join_keys.clone() };
         assert_eq!(split_source_rounds(src).unwrap().len(), 1, "distinct (span, project) keys must stay in one round");
+    }
+
+    /// Build a group whose statements each carry their own window, the way
+    /// `enqueue` records them (group predicate widened, per-batch bounds kept).
+    fn group_with_windows(windows: &[(i64, Option<i64>)]) -> PendingGroup {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a"]))]).unwrap();
+        let decomposed: Vec<DecomposedPredicate> = windows
+            .iter()
+            .map(|&(lo, hi)| {
+                let pred = match hi {
+                    Some(hi) => col("service").eq(lit("s1")).and(window(lo, hi)),
+                    None => col("service").eq(lit("s1")).and(col("timestamp").gt_eq(lit(ts(lo)))),
+                };
+                DecomposedPredicate::decompose(Some(&pred), "timestamp")
+            })
+            .collect();
+        let mut predicate = decomposed[0].clone();
+        decomposed[1..].iter().for_each(|d| predicate.widen(d));
+        PendingGroup {
+            join_keys: vec![("id".into(), "id".into())],
+            assignments: vec![("n".into(), lit(9i64))],
+            predicate,
+            time_col: "timestamp",
+            schema,
+            batches: decomposed.into_iter().map(|d| (batch.clone(), (d.lower, d.upper))).collect(),
+            session: Arc::new(datafusion::prelude::SessionContext::new().state()),
+            attempts: 2,
+            folded_projects: None,
+        }
+    }
+
+    const B: i64 = DML_MERGE_BUCKET_MICROS;
+
+    /// Statements in distinct 5-min buckets become separate merge units whose
+    /// time bounds cover only their own statements — not the group union.
+    #[test]
+    fn bucket_group_splits_distinct_buckets_with_narrowed_bounds() {
+        let units = bucket_group(group_with_windows(&[(0, Some(60)), (10, Some(90)), (2 * B, Some(2 * B + 60))]));
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].batches.len(), 2);
+        assert_eq!(units[0].predicate.lower.as_ref().unwrap().value, ts(0));
+        assert_eq!(units[0].predicate.upper.as_ref().unwrap().value, ts(90));
+        assert_eq!(units[1].batches.len(), 1);
+        assert_eq!(units[1].predicate.lower.as_ref().unwrap().value, ts(2 * B));
+        assert_eq!(units[1].predicate.upper.as_ref().unwrap().value, ts(2 * B + 60));
+        // Everything but the time window is carried through unchanged.
+        for u in &units {
+            assert_eq!(u.predicate.residual.len(), 1);
+            assert!(u.predicate.residual[0].to_string().contains("service"));
+            assert_eq!(u.attempts, 2);
+            assert_eq!(u.join_keys, vec![("id".to_string(), "id".to_string())]);
+        }
+    }
+
+    /// A statement spanning a bucket boundary keeps its FULL window (own unit),
+    /// never narrowed to either bucket.
+    #[test]
+    fn bucket_group_never_narrows_spanning_statement() {
+        let units = bucket_group(group_with_windows(&[(B - 10, Some(B + 10)), (0, Some(50))]));
+        assert_eq!(units.len(), 2);
+        let spanning = units.iter().find(|u| u.batches.len() == 1 && u.predicate.upper.as_ref().unwrap().value == ts(B + 10)).expect("spanning unit");
+        assert_eq!(spanning.predicate.lower.as_ref().unwrap().value, ts(B - 10));
+    }
+
+    /// A group whose statements all share one bucket drains exactly as today:
+    /// one merge unit with the union window.
+    #[test]
+    fn bucket_group_single_bucket_is_one_unit() {
+        let units = bucket_group(group_with_windows(&[(0, Some(50)), (60, Some(100))]));
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].batches.len(), 2);
+        assert_eq!(units[0].predicate.lower.as_ref().unwrap().value, ts(0));
+        assert_eq!(units[0].predicate.upper.as_ref().unwrap().value, ts(100));
+    }
+
+    /// Unbounded statements can't be bucketed — they share a catch-all unit
+    /// whose window stays unbounded; bounded statements still bucket narrowly.
+    #[test]
+    fn bucket_group_unbounded_statements_share_catchall() {
+        let units = bucket_group(group_with_windows(&[(0, Some(50)), (10, None)]));
+        assert_eq!(units.len(), 2);
+        let unbounded = units.iter().find(|u| u.predicate.upper.is_none()).expect("catch-all unit");
+        assert_eq!(unbounded.predicate.lower.as_ref().unwrap().value, ts(10));
+        let bounded = units.iter().find(|u| u.predicate.upper.is_some()).unwrap();
+        assert_eq!(bounded.predicate.upper.as_ref().unwrap().value, ts(50));
+        // No statement is dropped or duplicated by bucketing.
+        assert_eq!(units.iter().map(|u| u.batches.len()).sum::<usize>(), 2);
+    }
+
+    /// An exclusive upper exactly on a bucket edge still belongs to the bucket
+    /// below the edge (the window contains no row at the boundary).
+    #[test]
+    fn bucket_group_exclusive_upper_on_edge_stays_below() {
+        let units = bucket_group(group_with_windows(&[(0, Some(B)), (10, Some(20))]));
+        assert_eq!(units.len(), 1);
+    }
+
+    #[test]
+    fn bucket_group_empty_group_passes_through() {
+        let mut g = group_with_windows(&[(0, Some(50))]);
+        g.batches.clear();
+        assert_eq!(bucket_group(g).into_iter().map(|u| u.batches.len()).sum::<usize>(), 0);
     }
 
     #[test]
