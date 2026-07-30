@@ -1442,7 +1442,7 @@ const GC_FLOOR_SLACK_MICROS: i64 = 10 * 60 * 1_000_000;
 /// Directory under the WAL dir holding quarantined payloads (WAL entries that
 /// failed to decode, DML groups that exhausted their drains). Exempt from
 /// [`gc_wal_files`]: these bytes are the only remaining copy of that data.
-pub(crate) const QUARANTINE_DIR_NAME: &str = "quarantine";
+pub const QUARANTINE_DIR_NAME: &str = "quarantine";
 /// Subdir of the quarantine dir holding payloads that were successfully
 /// re-ingested at boot (`redrive_quarantine`). Kept for forensics, but no
 /// longer "awaiting a human" — excluded from [`quarantine_stats`].

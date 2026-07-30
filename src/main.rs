@@ -53,6 +53,30 @@ fn main() -> anyhow::Result<()> {
     // file-count backlog without adding memory pressure to the live server — it
     // commits via the same S3/R2 conditional-put (If-None-Match) coordination as
     // the live server, so concurrent commits conflict-detect safely (OCC retry).
+    // CLI helper: `timefusion redrive-dml [--dir PATH] [--dry-run]` — replay
+    // parked quarantine/dml enrichment groups (see timefusion::dml_coalescer::redrive_dml_quarantine).
+    if std::env::args().nth(1).as_deref() == Some("redrive-dml") {
+        dotenv().ok();
+        let cfg = config::init_config().expect("config load failed");
+        return tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
+            let mut dir = cfg.core.wal_dir().join(timefusion::wal::QUARANTINE_DIR_NAME).join("dml");
+            let mut dry_run = false;
+            let mut it = std::env::args().skip(2);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--dir" => dir = it.next().map(std::path::PathBuf::from).expect("--dir needs a value"),
+                    "--dry-run" => dry_run = true,
+                    other => anyhow::bail!("unknown argument: {other} (usage: timefusion redrive-dml [--dir PATH] [--dry-run])"),
+                }
+            }
+            let db = Arc::new(Database::with_config(Arc::new(cfg.clone())).await?);
+            let (ok, skipped) = timefusion::dml_coalescer::redrive_dml_quarantine(&db, &dir, dry_run).await;
+            println!("redrive-dml: {ok} recovered, {skipped} left parked (dir {dir:?})");
+            db.shutdown().await?;
+            Ok(())
+        });
+    }
+
     if std::env::args().nth(1).as_deref() == Some("optimize") {
         let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
         unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };

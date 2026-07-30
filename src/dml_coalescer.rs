@@ -406,6 +406,217 @@ fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<Record
         .collect()
 }
 
+/// Delta's DV MERGE rejects a source that matches one target row twice.
+/// `split_rounds` should prevent it, yet prod groups still hit it (2026-07-28..30,
+/// root cause open) — so on this error, bisect: halve the source and merge each
+/// half. Single rows cannot multi-match, so recursion always terminates, the
+/// data lands, and the log narrows down the offending key pair.
+fn is_multi_source_match_err(msg: &str) -> bool {
+    msg.contains("multiple source rows")
+}
+
+pub(crate) fn merge_bisect<'a>(
+    db: &'a crate::database::Database, table_name: &'a str, project_id: &'a str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
+    source: UpdateSource, session: Arc<dyn Session>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + 'a>> {
+    Box::pin(async move {
+        let rows = source.batch.num_rows();
+        match crate::dml::perform_delta_merge_update(db, table_name, project_id, predicate.clone(), assignments.clone(), source.clone(), session.clone()).await
+        {
+            Err(e) if is_multi_source_match_err(&e.to_string()) && rows > 1 => {
+                let (a, b) = (source.batch.slice(0, rows / 2), source.batch.slice(rows / 2, rows - rows / 2));
+                warn!("dml merge: multi-source match on {rows} rows for {project_id}/{table_name}; bisecting ({} + {} rows)", a.num_rows(), b.num_rows());
+                let mut n = 0;
+                for half in [a, b] {
+                    let src = UpdateSource { batch: half, schema: source.schema.clone(), join_keys: source.join_keys.clone() };
+                    n += merge_bisect(db, table_name, project_id, predicate.clone(), assignments.clone(), src, session.clone()).await?;
+                }
+                Ok(n)
+            }
+            r => r,
+        }
+    })
+}
+
+/// Re-drive parked `quarantine/dml/*` groups (hash-enrichment shape only; see
+/// [`parse_quarantine_meta`]). Rebuilds the merge from the sidecar, replays it
+/// through round-splitting + [`merge_bisect`], and moves recovered pairs into
+/// `<dir>/redriven/`. Returns `(recovered, skipped)`.
+pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &std::path::Path, dry_run: bool) -> (usize, usize) {
+    use datafusion::logical_expr::{col, in_list};
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        info!("dml redrive: no quarantine dir at {dir:?}");
+        return (0, 0);
+    };
+    let ctx = db.clone().create_session_context();
+    let session: Arc<dyn Session> = Arc::new(ctx.state());
+    let redriven = dir.join("redriven");
+    let (mut ok, mut skipped) = (0usize, 0usize);
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "arrow") {
+            continue;
+        }
+        let meta_path = path.with_extension("meta");
+        let Some(meta) = std::fs::read_to_string(&meta_path).ok().as_deref().and_then(parse_quarantine_meta) else {
+            warn!("dml redrive: {path:?} meta missing or not the reconstructible enrichment shape; leaving parked");
+            skipped += 1;
+            continue;
+        };
+        let batches: Result<Vec<RecordBatch>> = std::fs::File::open(&path)
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+            .and_then(|f| datafusion::arrow::ipc::reader::FileReader::try_new(f, None).map_err(|e| DataFusionError::ArrowError(Box::new(e), None)))
+            .and_then(|r| r.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| DataFusionError::ArrowError(Box::new(e), None)));
+        let merged = match batches.and_then(|b| {
+            let schema = b.first().map(RecordBatch::schema).ok_or_else(|| DataFusionError::Execution("empty IPC file".into()))?;
+            concat_batches(&schema, &b).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("dml redrive: cannot read {path:?}: {e}; leaving parked");
+                skipped += 1;
+                continue;
+            }
+        };
+        // Predicate: same shape the group was parked with. Bare column names —
+        // requalification in the merge routes them (project_id binds to the
+        // source side, which the join equates with the target's anyway).
+        let tz: Arc<str> = Arc::from("UTC");
+        let (ts_upper, upper_incl) = meta.ts_upper;
+        let mut conj = vec![
+            col("context___span_id").is_not_null(),
+            col("context___trace_id").is_not_null(),
+            col("date").gt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.0)))),
+            col("date").lt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.1)))),
+            col("timestamp").gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(meta.ts_lower), Some(tz.clone())))),
+            if upper_incl {
+                col("timestamp").lt_eq(lit(ScalarValue::TimestampMicrosecond(Some(ts_upper), Some(tz.clone()))))
+            } else {
+                col("timestamp").lt(lit(ScalarValue::TimestampMicrosecond(Some(ts_upper), Some(tz))))
+            },
+        ];
+        if meta.projects.len() > 1 {
+            conj.push(in_list(col("project_id"), meta.projects.iter().map(lit).collect(), false));
+        }
+        let predicate = conj.into_iter().reduce(Expr::and);
+        // `hashes := array_concat(coalesce-style CASE, [tag])`, rebuilt as the
+        // equivalent append-or-singleton (no empty-list literal needed).
+        let assignment = datafusion::logical_expr::when(
+            col("hashes").is_not_null(),
+            datafusion::functions_nested::expr_fn::array_append(col("hashes"), col("tag")),
+        )
+        .otherwise(datafusion::functions_nested::expr_fn::make_array(vec![col("tag")]))
+        .expect("static CASE expr");
+        info!("dml redrive: {} rows for {} ({} projects), window {:?}: replaying{}", merged.num_rows(), meta.table_name, meta.projects.len(), meta.date_bounds, if dry_run { " [DRY RUN]" } else { "" });
+        if dry_run {
+            ok += 1;
+            continue;
+        }
+        let key_indices: Result<Vec<usize>> = meta.join_keys.iter().map(|(_, s)| Ok(merged.schema().index_of(s)?)).collect();
+        let rounds = match key_indices.and_then(|idx| split_rounds(&merged, &idx)) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("dml redrive: round split failed for {path:?}: {e}; leaving parked");
+                skipped += 1;
+                continue;
+            }
+        };
+        let mut failed = false;
+        for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
+            let source = UpdateSource { batch: round, schema: merged.schema(), join_keys: meta.join_keys.clone() };
+            if let Err(e) =
+                merge_bisect(db, &meta.table_name, &meta.project_id, predicate.clone(), vec![("hashes".into(), assignment.clone())], source, session.clone())
+                    .await
+            {
+                error!("dml redrive: merge failed for {path:?}: {e}; leaving parked (already-applied rounds are idempotent-safe: re-appended tags only on retried rows)");
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            skipped += 1;
+            continue;
+        }
+        ok += 1;
+        if let Err(e) = std::fs::create_dir_all(&redriven)
+            .and_then(|()| std::fs::rename(&path, redriven.join(entry.file_name())))
+            .and_then(|()| std::fs::rename(&meta_path, redriven.join(meta_path.file_name().unwrap_or_default())))
+        {
+            warn!("dml redrive: recovered but could not move {path:?} to redriven/: {e}");
+        }
+    }
+    info!("dml redrive: {ok} group(s) recovered, {skipped} left parked");
+    (ok, skipped)
+}
+
+/// Parsed `quarantine/dml/*.meta` sidecar for the known hash-enrichment shape.
+/// Only what the re-drive needs is machine-recovered; groups whose meta doesn't
+/// match this shape stay parked (assignments/predicate are stored as Expr
+/// Display strings, which are not generally re-parseable).
+#[derive(Debug, PartialEq)]
+pub(crate) struct QuarantineMeta {
+    pub table_name: String,
+    pub project_id: String,
+    pub projects: Vec<String>,
+    pub join_keys: Vec<(String, String)>,
+    pub date_bounds: (i32, i32),
+    /// (micros, inclusive_upper) — lower is always inclusive.
+    pub ts_lower: i64,
+    pub ts_upper: (i64, bool),
+    pub rows: usize,
+}
+
+pub(crate) fn parse_quarantine_meta(meta: &str) -> Option<QuarantineMeta> {
+    let field = |k: &str| meta.lines().find_map(|l| l.strip_prefix(k).and_then(|l| l.strip_prefix('=')).map(str::to_owned));
+    let (table_name, project_id, predicate, assignments) = (field("table_name")?, field("project_id")?, field("predicate")?, field("assignments")?);
+    // Shape guard: only the hash-enrichment fold is reconstructible.
+    if !assignments.starts_with("hashes:=array_concat(") {
+        return None;
+    }
+    let join_keys: Vec<(String, String)> = field("join_keys")?
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|p| p.split_once('=').map(|(a, b)| (a.to_string(), b.to_string())))
+        .collect::<Option<_>>()?;
+    let projects: Vec<String> = {
+        let fp = field("folded_projects").unwrap_or_default();
+        if fp.is_empty() { vec![project_id.clone()] } else { fp.split(',').map(str::to_string).collect() }
+    };
+    // Date32("YYYY-MM-DD") bounds → day numbers since epoch.
+    let dates: Vec<i32> = predicate
+        .match_indices("Date32(\"")
+        .filter_map(|(i, m)| {
+            let s = &predicate[i + m.len()..];
+            s.split('"').next()?.parse::<chrono::NaiveDate>().ok().map(|d| (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32)
+        })
+        .collect();
+    let (lo, hi) = (dates.iter().min()?, dates.iter().max()?);
+    // `timestamp >= TimestampMicrosecond(N` / `timestamp <[=] TimestampMicrosecond(N`.
+    let ts_after = |pat: &str| {
+        predicate.find(pat).and_then(|i| {
+            let s = &predicate[i + pat.len()..];
+            let s = s.split("TimestampMicrosecond(").nth(1)?;
+            s.split(|c: char| !c.is_ascii_digit() && c != '-').next()?.parse::<i64>().ok()
+        })
+    };
+    let ts_lower = ts_after("timestamp >= ")?;
+    let (ts_upper, upper_incl) = match (ts_after("timestamp <= "), ts_after("timestamp < ")) {
+        (Some(t), _) => (t, true),
+        (None, Some(t)) => (t, false),
+        (None, None) => return None,
+    };
+    Some(QuarantineMeta {
+        table_name,
+        project_id,
+        projects,
+        join_keys,
+        date_bounds: (*lo, *hi),
+        ts_lower,
+        ts_upper: (ts_upper, upper_incl),
+        rows: field("rows").and_then(|r| r.parse().ok()).unwrap_or(0),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GroupKey {
     project_id: String,
@@ -745,7 +956,7 @@ impl DmlCoalescer {
             // Chunk each round to bound per-MERGE memory (see MAX_MERGE_ROWS).
             for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
                 let source = UpdateSource { batch: round, schema: group.schema.clone(), join_keys: group.join_keys.clone() };
-                match crate::dml::perform_delta_merge_update(
+                match merge_bisect(
                     db,
                     &key.table_name,
                     &key.project_id,
@@ -1034,6 +1245,27 @@ mod tests {
             WatermarkClamp::Keep(Some(p)) => assert_eq!(p, pred),
             _ => panic!("expected unchanged predicate"),
         }
+    }
+
+    #[test]
+    fn parse_quarantine_meta_recovers_enrichment_shape() {
+        // Verbatim shape of the 2026-07-28..30 parked groups.
+        let meta = "project_id=00000000-0000-0000-0000-000000000000\n\
+            table_name=otel_logs_and_spans\n\
+            folded_projects=00000000-0000-0000-0000-000000000000,28f62f01-46a1-400e-8195-da7bc3505b5b\n\
+            join_keys=context___span_id=span_id,context___trace_id=trace_id,project_id=project_id\n\
+            assignments=hashes:=array_concat(CASE WHEN o.hashes IS NOT NULL THEN o.hashes ELSE List([]) END, make_array(u.tag))\n\
+            predicate=otel_logs_and_spans.context___span_id IS NOT NULL AND date >= Date32(\"2026-07-30\") AND date <= Date32(\"2026-07-30\") AND project_id IN ([]) AND timestamp >= TimestampMicrosecond(1785408669559194, Some(\"UTC\")) AND timestamp < TimestampMicrosecond(1785410181576000, Some(\"UTC\"))\n\
+            time_col=timestamp\nattempts=3\nrows=766\nstatements=20\nreason=3 failed drains: x\n";
+        let m = parse_quarantine_meta(meta).expect("parses");
+        assert_eq!(m.projects.len(), 2);
+        assert_eq!(m.join_keys.len(), 3);
+        assert_eq!(m.date_bounds, (20664, 20664)); // 2026-07-30
+        assert_eq!(m.ts_lower, 1785408669559194);
+        assert_eq!(m.ts_upper, (1785410181576000, false));
+        assert_eq!(m.rows, 766);
+        // Unknown shapes stay parked.
+        assert!(parse_quarantine_meta(&meta.replace("hashes:=array_concat(", "other:=fn(")).is_none());
     }
 
     #[test]
