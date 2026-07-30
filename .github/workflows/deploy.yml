@@ -117,7 +117,7 @@ jobs:
           # PGMAXPROTOCOLVERSION: env form (not URI param) — older libpq ignores
           # unknown env vars but rejects unknown URI params.
           export PGMAXPROTOCOLVERSION=3.0
-          for attempt in $(seq 1 5); do
+          for attempt in $(seq 1 3); do
             if timeout 300 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH' 2>&1; then
               echo "flush ok (attempt $attempt)"; exit 0
             fi
