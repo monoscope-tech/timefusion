@@ -5621,13 +5621,17 @@ impl Database {
                         if attempt < MAX_ATTEMPTS {
                             if occ {
                                 crate::metrics::record_optimize_conflict();
-                                warn!("compact date={date}: OCC conflict (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), refreshing + retrying: {e}");
+                                warn!(
+                                    "compact date={date}: OCC conflict (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), refreshing + retrying: {e}"
+                                );
                                 // Exponential backoff — matches dedup_partition. Zero-delay
                                 // retries under concurrent heavy ingest amplify contention.
                                 tokio::time::sleep(occ_backoff(attempt.max(1) - 1)).await;
                             } else {
                                 // A multipart part connection-dropped mid-merge (nothing committed).
-                                warn!("compact date={date}: transient S3 error (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), backing off + retrying: {e}");
+                                warn!(
+                                    "compact date={date}: transient S3 error (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), backing off + retrying: {e}"
+                                );
                                 tokio::time::sleep(tokio::time::Duration::from_secs(2 * attempt.max(1) as u64)).await;
                             }
                             continue;
