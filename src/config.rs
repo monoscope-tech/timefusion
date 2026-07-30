@@ -68,18 +68,42 @@ fn detect_memory_limit_bytes() -> usize {
     {
         return v;
     }
+    // No cgroup limit → not a managed container. An explicit env override is
+    // safe to honor HERE and only here (off-box CLI / dev boxes): prod always
+    // runs under a cgroup, so the 2026-06-11 misconfigured-knob OOM-loop
+    // cannot recur through this path.
+    if let Some(v) = env_memory_override_bytes() {
+        tracing::warn!("budget tree: no cgroup limit; using TIMEFUSION_MEMORY_LIMIT_GB override ({} GiB)", v / GIB);
+        return v;
+    }
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo")
         && let Some(v) = parse_meminfo_total_bytes(&s)
     {
         // No cgroup limit → shared host: budget HALF the machine, loudly.
         // Sizing from full host RAM inside a container is the 2026-06-11
-        // memcg OOM-loop (16 kills/24h); the old escape hatch (env knob)
-        // is gone, so the fallback itself must be conservative.
+        // memcg OOM-loop (16 kills/24h), so the fallback stays conservative.
         tracing::warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / 2 / GIB);
         return v / 2;
     }
+    // macOS (dev / off-box CLI): same shared-host half-the-machine rule.
+    #[cfg(target_os = "macos")]
+    {
+        let mem = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory()
+            as usize;
+        if mem > 0 {
+            tracing::warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", mem / 2 / GIB);
+            return mem / 2;
+        }
+    }
     tracing::warn!("budget tree: could not detect memory limit from cgroup or /proc/meminfo; falling back to 8 GiB");
     8 * GIB
+}
+
+/// `TIMEFUSION_MEMORY_LIMIT_GB`, parsed. Consulted ONLY when no cgroup limit
+/// exists (see `detect_memory_limit_bytes`) — a containerized deployment can
+/// never be resized by env var.
+fn env_memory_override_bytes() -> Option<usize> {
+    std::env::var("TIMEFUSION_MEMORY_LIMIT_GB").ok()?.parse::<usize>().ok().filter(|gb| *gb > 0).map(|gb| gb * GIB)
 }
 
 fn detect_memory_limit_clamped() -> usize {
