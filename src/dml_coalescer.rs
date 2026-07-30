@@ -316,7 +316,8 @@ fn bucket_group(mut group: PendingGroup) -> Vec<PendingGroup> {
     buckets
         .into_values()
         .map(|batches| {
-            let mut predicate = DecomposedPredicate { residual: group.predicate.residual.clone(), lower: batches[0].1.0.clone(), upper: batches[0].1.1.clone() };
+            let mut predicate =
+                DecomposedPredicate { residual: group.predicate.residual.clone(), lower: batches[0].1.0.clone(), upper: batches[0].1.1.clone() };
             for (_, (lo, up)) in &batches[1..] {
                 predicate.widen(&DecomposedPredicate { residual: vec![], lower: lo.clone(), upper: up.clone() });
             }
