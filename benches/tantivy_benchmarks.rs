@@ -110,12 +110,12 @@ fn bench_size_ratio(c: &mut Criterion) {
     let table = table();
     let n = 100_000usize;
     let b = synthetic_batch(n);
-    let (blob, stats) = store::build_and_pack(&table, std::slice::from_ref(&b), 19).unwrap();
+    let (blob, stats) = store::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy_index::MergeMode::Now).unwrap();
     let bytes_per_row = blob.len() as f64 / stats.rows as f64;
     println!("tantivy index size: {} bytes for {} rows ({:.2} bytes/row)", blob.len(), stats.rows, bytes_per_row);
     c.bench_function("tantivy_pack_100k_zstd_19", |bench| {
         bench.iter(|| {
-            let _ = store::build_and_pack(&table, std::slice::from_ref(&b), 19).unwrap();
+            let _ = store::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy_index::MergeMode::Now).unwrap();
         });
     });
 }
