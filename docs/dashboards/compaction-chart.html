@@ -68,13 +68,13 @@ tr:last-child td{border-bottom:none}
 </style>
 <div class="wrap">
 <h1>Compaction of sealed days — live file counts vs this morning</h1>
-<p class="sub">otel_logs_and_spans · unified table on R2 · snapshot v442574, 2026-07-30 20:55 CEST · whale 07-29 COMPLETE; runners on 07-28/26/23</p>
+<p class="sub">otel_logs_and_spans · unified table on R2 · snapshot v445672, 2026-07-31 01:00 CEST · whale: 07-29✓ 07-28:769 07-26:271 07-23:389 · 5 older days queued</p>
 
 <div class="tiles">
-  <div class="tile"><div class="k">07-29 files</div><div class="v"><span class="dim">27,885 →</span> 132</div><div class="d">−99.5% — DONE. Whale converged to 89 (1GB files + DV residue)</div></div>
+  <div class="tile"><div class="k">07-29 files</div><div class="v"><span class="dim">27,885 →</span> 135</div><div class="d">−99.5% — DONE. Whale converged to 89 (1GB files + DV residue)</div></div>
   <div class="tile"><div class="k">07-28 files</div><div class="v"><span class="dim">8,548 →</span> 849</div><div class="d">whale 792 in progress (tfcW1) — everything else 1–17</div></div>
-  <div class="tile"><div class="k">Whale older days 07-20..27</div><div class="v"><span class="dim">6,142 →</span> 5,832</div><div class="d">tfcW2 on 07-26 (450) · tfcW3 on 07-23 (474) · 5 days queued</div></div>
-  <div class="tile"><div class="k">87576849 07-29</div><div class="v">07-29 ✓ · 07-28: 792</div><div class="d">07-29 finished (removed=0 terminal pass); babysitter clears stalls</div></div>
+  <div class="tile"><div class="k">Whale older days 07-20..27</div><div class="v"><span class="dim">6,142 →</span> 5,568</div><div class="d">tfcW2 on 07-26 (271) · tfcW3 on 07-23 (389) · 5 days queued</div></div>
+  <div class="tile"><div class="k">87576849 07-29</div><div class="v">07-29 ✓ · 07-28: 769</div><div class="d">overnight grind; DML redrive 5/12 recovered, giants await sliced image</div></div>
 </div>
 
 <div class="legend">
@@ -105,7 +105,7 @@ tr:last-child td{border-bottom:none}
 const MAX=3014;
 // [proj, tag, b29, n29, b28, n28, n30, status]  b=morning, n=now(v431604); b28 null = “–” in the morning table
 const rows=[
- ["87576849","",3014,89,null,792,589,"run"],
+ ["87576849","",3014,79,null,769,875,"run"],
  ["00000000","default",2967,1,null,6,60,"done"],
  ["d062e010","",2682,2,689,7,119,"done"],
  ["28f62f01","",2667,1,null,17,57,"done"],

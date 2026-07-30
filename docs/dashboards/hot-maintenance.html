@@ -48,21 +48,21 @@ h2{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3
 </style>
 <div class="wrap">
 <h1>Intra-day maintenance — what the server is doing to today's data</h1>
-<p class="sub">prod `bc4e884` on captain · counters read 2026-07-30 21:00 CEST via <code>timefusion_stats</code> · all totals are <b>since the last boot (20:32 CEST)</b></p>
+<p class="sub">prod `bc4e884` on captain · updated 2026-07-31 01:00 CEST · prod on 012245d (idle-timeout live) · counters reset at each boot</p>
 
-<div class="banner">⚠️ <span><b>TWO OOM kills today: 18:47 and 20:32 CEST</b> (exit 137, cgroup) — a ~1¾ h crash cadence, not a one-off. RSS rebuilds to ~45-75 GB within minutes of each boot while MemBuffer holds only ~5 GB — the retention is heap churn + the in-server residual reservation leak on a zero-slack budget. Ingest self-heals via WAL replay each time, but every cycle is a ~1 min ingest gap. Strongest case yet for the role-split (maintenance out of the serving process).</span></div>
+<div class="banner">⚠️ <span><b>THREE OOM kills: 18:47, 20:32, 00:21 CEST</b> — the cadence survived two deploys, so the RSS driver is not in the fixed paths; jemalloc heap profiles from all three kills sit on the volume awaiting jeprof analysis (top follow-up). Each cycle self-heals via WAL replay. The window-bucketed DML merges (9460e15, deploying) remove one more suspect; the role-split remains the structural fix.</span></div>
 
 <h2>Ingest &amp; flush (the write path)</h2>
 <div class="tiles">
-  <div class="tile"><div class="k">rows ingested <span class="pill ok">healthy</span></div><div class="v">1.93M</div><div class="d">~107k rows/min since 20:32 boot · flushing normally (460 flushes, 0 failed)</div></div>
+  <div class="tile"><div class="k">rows ingested <span class="pill ok">healthy</span></div><div class="v">1.04M</div><div class="d">~26k rows/min since 21:56 boot · 147 flushes, 0 failed</div></div>
   <div class="tile"><div class="k">flushes <span class="pill ok">0 failed</span></div><div class="v">850</div><div class="d">buffer lag 166k rows · oldest bucket 16 s</div></div>
-  <div class="tile"><div class="k">memory pressure <span class="pill warn">RSS 45.8 GB</span></div><div class="v">8%</div><div class="d">MemBuffer fine — process RSS is the problem, rebuilt in minutes</div></div>
-  <div class="tile"><div class="k">WAL <span class="pill warn">quarantine</span></div><div class="v">40 GB</div><div class="d">41 files · <b>12 quarantined (475 MB)</b> — needs a look</div></div>
+  <div class="tile"><div class="k">memory pressure <span class="pill warn">RSS 27.3 GB</span></div><div class="v">23%</div><div class="d">MemBuffer fine; RSS climb slower on 9bbeeaa — watching</div></div>
+  <div class="tile"><div class="k">WAL <span class="pill warn">quarantine</span></div><div class="v">7 pairs</div><div class="d"><b>5 of 12 recovered + swept from prod</b>; 3 giants await the window-sliced redrive (image building)</div></div>
 </div>
 
 <h2>Light (hot-tail) compaction — every 5 min on today's partitions</h2>
 <div class="tiles">
-  <div class="tile"><div class="k">waves committed <span class="pill ok">working</span></div><div class="v">1</div><div class="d">10 bins since 20:32 reboot; today holds at ~10-120 files/project</div></div>
+  <div class="tile"><div class="k">waves committed <span class="pill warn">0 since boot</span></div><div class="v">0</div><div class="d">40 min without a wave commit post-deploy — today still ~20-60 files/project; check next hour</div></div>
   <div class="tile"><div class="k">today's file counts <span class="pill ok">flat</span></div><div class="v">10–70<span class="dim">/project</span></div><div class="d">was 150–225 before the bin-cap deploy — visibly fixed</div></div>
   <div class="tile"><div class="k">tick health <span class="pill warn">5 timeouts</span></div><div class="v">27 <span class="dim">ticks</span></div><div class="d">6 skipped, 2 truncated, 3 long-running, 0 failures</div></div>
   <div class="tile"><div class="k">brakes/yields <span class="pill ok">0</span></div><div class="v">0</div><div class="d">no memory brakes, no WAL yields, no degraded ticks</div></div>
@@ -70,27 +70,27 @@ h2{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3
 
 <h2>Dedup — physical duplicate removal on flushed bins</h2>
 <div class="tiles">
-  <div class="tile"><div class="k">dirty-bin queue <span class="pill warn">deep</span></div><div class="v">16,571</div><div class="d">mostly cold-deferred (14,359) — drained lowest-priority by design</div></div>
+  <div class="tile"><div class="k">dirty-bin queue <span class="pill warn">deep</span></div><div class="v">16,716</div><div class="d">mostly cold-deferred (14,359) — drained lowest-priority by design</div></div>
   <div class="tile"><div class="k">processed since boot <span class="pill warn">0</span></div><div class="v">0 <span class="dim">bins</span></div><div class="d">21 dedup timeouts, 0 failures — starved by the busy hour, will catch up</div></div>
   <div class="tile"><div class="k">read-side dedup <span class="pill ok">always on</span></div><div class="v">DedupExec</div><div class="d">queries stay duplicate-free regardless of the physical queue</div></div>
 </div>
 
 <h2>Housekeeping crons</h2>
 <div class="tiles">
-  <div class="tile"><div class="k">checkpoints <span class="pill ok">0 failed</span></div><div class="v">15</div><div class="d">lag 43 versions · 516 old log files cleaned</div></div>
+  <div class="tile"><div class="k">checkpoints <span class="pill ok">0 failed</span></div><div class="v">3</div><div class="d">lag 43 versions · 516 old log files cleaned</div></div>
   <div class="tile"><div class="k">vacuum</div><div class="v">every 6 h</div><div class="d">next :15 tick; 24 h retention (protects live query snapshots)</div></div>
   <div class="tile"><div class="k">FSCK / reconcile <span class="pill ok">clean</span></div><div class="v">0</div><div class="d">dangling adds removed: 0 · reconcile failures: 0</div></div>
 </div>
 
 <h2>Read path (context for the same window)</h2>
 <div class="tiles">
-  <div class="tile"><div class="k">queries <span class="pill ok"></span></div><div class="v">25k</div><div class="d">p50 131 ms · p95 2.1 s · p99 8.4 s</div></div>
+  <div class="tile"><div class="k">queries <span class="pill ok"></span></div><div class="v">4.4k</div><div class="d">p50 131 ms · p95 2.1 s · p99 8.4 s</div></div>
   <div class="tile"><div class="k">scan pruning</div><div class="v">78.6%</div><div class="d">of Delta scans skipped entirely; provider cache 82% hits</div></div>
   <div class="tile"><div class="k">plan cache</div><div class="v">56.8%</div><div class="d">3.5k hits / 2.7k misses since boot</div></div>
   <div class="tile"><div class="k">foyer cache</div><div class="v">77.6%</div><div class="d">28.6 GB served from cache · 4 GB mem + 120 GB disk</div></div>
 </div>
 
-<p class="note"><b>How to read this day:</b> the write path and hot-tail compaction are healthy — today's partitions hold at 10–70 files/project because light optimize now commits bounded 32-file bins every few minutes (the morning's fix, working in prod). The two ambers are real but understood: the dedup queue is deep because heavy maintenance spent the day competing with the off-box backfill and lost its slots (its cold backlog drains at lowest priority; read-side dedup keeps queries correct meanwhile), and the WAL quarantine holds 12 files/475 MB that should be inspected per the quarantine routine. The red item is the OOM cadence (18:47, 20:32) — same signature as OOM #3, now recurring: a memory-tight box running maintenance in-process with zero slack. If a third kill lands near ~22:15, treat it as an active incident.</p>
+<p class="note"><b>How to read this day:</b> the write path and hot-tail compaction are healthy — today's partitions hold at 10–70 files/project because light optimize now commits bounded 32-file bins every few minutes (the morning's fix, working in prod). The two ambers are real but understood: the dedup queue is deep because heavy maintenance spent the day competing with the off-box backfill and lost its slots (its cold backlog drains at lowest priority; read-side dedup keeps queries correct meanwhile), and the WAL quarantine holds 12 files/475 MB that should be inspected per the quarantine routine. The red item is the OOM cadence — three kills, an active incident by our own definition; mitigations shipped all day, heap-profile attribution is the next morning task. Silver lining: the wedge mechanism is now CONFIRMED (reaper stack dump: all threads futex-parked = unclosed-channel wait) and its fix is deployed.</p>
 
 <p class="foot">Sources: timefusion_stats over pgwire · docker service state · Delta snapshot v441327+ · counters reset at each boot, so rates are per-35-min-uptime</p>
 </div>
