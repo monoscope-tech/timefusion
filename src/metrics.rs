@@ -523,6 +523,21 @@ pub struct MaintenanceStats {
     pub dirty_bin_requeued: AtomicU64,
     pub dirty_bin_dropped_rows: AtomicU64,
     pub dirty_bin_rewrite_duration_ms: AtomicU64,
+    /// Cold-owned dirty bins (date old enough that the nightly consolidate owns
+    /// the partition) DEPRIORITIZED to the tail of a drain pass and left on the
+    /// queue. They are NOT dropped: consolidate bin-packs but does not collapse
+    /// duplicates, so the dirty-bin drain stays their only physical dedup.
+    /// NOTE `cold_optimize_after_days` defaults to 1 and the drain already skips
+    /// today, so in the default configuration EVERY drainable bin is cold-owned
+    /// — this then reads as "queued bins this pass had no batch slot for".
+    /// Chronic growth = a backlog the batch size can't keep up with.
+    pub dedup_bins_deferred_cold: AtomicU64,
+    /// Drain passes skipped (or cut short between chunks) because the flush path
+    /// was behind. Dedup is an optimization — read-side DedupExec keeps results
+    /// correct — so it yields to persistence (2026-07-30: a boot drain over a
+    /// 10-day backlog pinned the commit path and starved flush for a whole
+    /// container life). Chronic nonzero = flush is unhealthy, not dedup.
+    pub dedup_passes_flush_yields: AtomicU64,
     /// Cron ticks skipped because the previous run of the same job was still
     /// in flight. A steadily growing value = a wedged/overlong job body.
     pub cron_ticks_skipped: AtomicU64,
@@ -564,6 +579,8 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     dirty_bin_requeued: AtomicU64::new(0),
     dirty_bin_dropped_rows: AtomicU64::new(0),
     dirty_bin_rewrite_duration_ms: AtomicU64::new(0),
+    dedup_bins_deferred_cold: AtomicU64::new(0),
+    dedup_passes_flush_yields: AtomicU64::new(0),
     cron_ticks_skipped: AtomicU64::new(0),
     cron_ticks_fired: AtomicU64::new(0),
     cron_long_running: AtomicU64::new(0),

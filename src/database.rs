@@ -6524,9 +6524,61 @@ impl Database {
         }
     }
 
-    async fn dedup_dirty_bins_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
+    /// Is persistence healthy enough to spend the shared commit path on dedup?
+    /// Reuses the compaction brake's signal (`is_wal_backlog_over_threshold`),
+    /// which is true both when the unflushed backlog is over its threshold and
+    /// while a recent flush FAILURE is inside the brake window.
+    fn dedup_flush_healthy(&self) -> bool {
+        !self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold())
+    }
+
+    /// Order one drain pass and split off the work it will not do.
+    ///
+    /// NEWEST-FIRST: recent partitions are the ones queries actually read, so
+    /// dedup there pays immediately; ancient duplicates are already invisible
+    /// (read-side `DedupExec` collapses them) and only cost storage. Boot
+    /// 2026-07-30 drained a 10-day backlog oldest-first and spent its whole
+    /// life rewriting 2026-07-20 while the hot window stayed dirty.
+    ///
+    /// COLD BINS LAST, never dropped: a date owned by the nightly consolidate
+    /// (`date_is_cold`) is bin-packed by `consolidate_date_binned`, which is a
+    /// pure compaction (`OptimizeType::Compact`/`SortBy`) and does NOT collapse
+    /// duplicates — so this drain remains their only physical dedup. They sink
+    /// to lowest priority (drained only when no hot bin is waiting) and the
+    /// remainder is counted + summarized once per pass, never one line per bin.
+    /// (`cold_optimize_after_days` defaults to 1 and the drain already skips
+    /// today, so today that split degenerates to "everything is cold" and the
+    /// newest-first order alone protects the hot window; the tier stays wired to
+    /// `date_is_cold` so raising the setting does the right thing.)
+    ///
+    /// Returns `(ready, deferred_cold)`; `deferred_cold` stays on the queue.
+    /// Dates are ISO-8601, so lexicographic order is chronological.
+    fn select_drain_bins(
+        mut candidates: Vec<(String, String, i64)>, today: chrono::NaiveDate, after_days: u64, batch: usize,
+    ) -> (Vec<(String, String, i64)>, Vec<(String, String, i64)>) {
+        candidates.sort_by(|a, b| (&b.1, b.2).cmp(&(&a.1, a.2)));
+        // An unparseable date sorts cold: it can't be shown to be hot, and the
+        // staging call will surface the parse error when it is finally served.
+        let (hot, mut cold): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|(_, date, _)| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|d| !Self::date_is_cold(today, d, after_days)));
+        let mut ready: Vec<_> = hot.into_iter().take(batch).collect();
+        let deferred = cold.split_off(cold.len().min(batch - ready.len()));
+        ready.extend(cold);
+        (ready, deferred)
+    }
+
+    async fn dedup_dirty_bins_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, flush_healthy: &(dyn Fn() -> bool + Sync)) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
+            return Ok(());
+        }
+        // Dedup is an OPTIMIZATION — read-side DedupExec and flush-time dedup
+        // already keep results correct — so it must never compete with the
+        // persistence path for the per-table commit lock.
+        if !flush_healthy() {
+            crate::metrics::maintenance_stats().dedup_passes_flush_yields.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(table_name, event = "dedup_drain_flush_yield");
             return Ok(());
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
@@ -6545,16 +6597,32 @@ impl Database {
         // (date < today ⇒ eligible tomorrow). Hot-tail light_optimize still
         // sorts/compacts today independently — this only defers DEDUP, not the
         // sorted layout that recent-window (1h/6h) queries prune on.
-        let today = Utc::now().date_naive().to_string();
-        let ready: Vec<_> = self
+        let today_date = Utc::now().date_naive();
+        let today = today_date.to_string();
+        let candidates: Vec<_> = self
             .dedup_dirty_bins
             .iter()
             .filter_map(|entry| {
                 let (project, name, date, bin) = entry.key();
                 (name == table_name && *date != today && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
             })
-            .take(self.config.maintenance.timefusion_dirty_bin_drain_batch.max(1))
             .collect();
+        let (ready, deferred) = Self::select_drain_bins(
+            candidates,
+            today_date,
+            self.config.parquet.cold_optimize_after_days(),
+            self.config.maintenance.timefusion_dirty_bin_drain_batch.max(1),
+        );
+        if !deferred.is_empty() {
+            crate::metrics::maintenance_stats().dedup_bins_deferred_cold.fetch_add(deferred.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            // ONE bounded summary per pass — a 10-day backlog is thousands of bins.
+            info!(
+                table_name,
+                deferred = deferred.len(),
+                oldest = deferred.last().map(|(_, date, _)| date.as_str()).unwrap_or_default(),
+                event = "dedup_bins_deferred_cold"
+            );
+        }
         if ready.is_empty() {
             return Ok(());
         }
@@ -6605,9 +6673,24 @@ impl Database {
             self.persist_dirty_bins();
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
+        // Between-chunk gate: a pass can outlive its start-of-pass health check
+        // (a full drain batch is minutes of rewrites). Once flush falls behind,
+        // stop COMMITTING and put every remaining bin back — the stream is not
+        // dropped, because an in-flight staging future has already removed its
+        // key from the queue and cancelling it would lose the bin.
+        let mut yielded_to_flush = false;
         while let Some((key, elapsed, staged)) = staging.next().await {
             let stats = crate::metrics::maintenance_stats();
             let (project_id, _, date, bin) = key.clone();
+            if !yielded_to_flush && !flush_healthy() {
+                yielded_to_flush = true;
+                stats.dedup_passes_flush_yields.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(table_name, event = "dedup_drain_flush_yield");
+            }
+            if yielded_to_flush {
+                requeue(key, &stats.dirty_bin_requeued);
+                continue;
+            }
             match staged {
                 // Over budget — requeue and move on so other maintenance runs.
                 Err(_) => {
@@ -6637,7 +6720,14 @@ impl Database {
             }
         }
         if !wave.is_empty() {
-            self.commit_dedup_wave(table, table_name, wave).await;
+            if yielded_to_flush {
+                let stats = crate::metrics::maintenance_stats();
+                for key in wave.iter().filter_map(|unit| unit.dedup.as_ref().and_then(|d| d.key.clone())) {
+                    requeue(key, &stats.dirty_bin_requeued);
+                }
+            } else {
+                self.commit_dedup_wave(table, table_name, wave).await;
+            }
         }
         self.persist_dirty_bins();
         Ok(())
@@ -6680,7 +6770,7 @@ impl Database {
     async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
         const DEDUP_WARN: std::time::Duration = std::time::Duration::from_secs(90);
         let t0 = std::time::Instant::now();
-        match self.dedup_dirty_bins_for_table(table, table_name).await {
+        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy()).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
                 warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
                 crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -13149,21 +13239,110 @@ mod tests {
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second", old)?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "successful commits enqueue their timestamp bin");
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans").await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1, "sealed bin is physically deduplicated");
         assert!(db.dedup_dirty_bins.is_empty(), "completed sealed bin is consumed");
 
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "later", old)?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "late retry requeues the previously consumed bin");
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans").await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1, "later observed timestamp survives the requeue rewrite");
 
         let fresh = Utc::now().timestamp_micros();
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "a", fresh)?], true, None).await?;
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "b", fresh)?], true, None).await?;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans").await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "unsealed bin remains queued without rewrite");
         assert_eq!(delta_physical_row_count(&table).await?, 3, "unsealed copies remain for read-side dedup");
+        Ok(())
+    }
+
+    /// Hot bins drain newest-first, and cold-owned dates sink below every hot
+    /// bin instead of monopolising the batch (boot 2026-07-30 drained a 10-day
+    /// backlog oldest-first and never reached the hot window).
+    #[test]
+    fn drain_bins_order_newest_first_and_sink_cold() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let bin = |date: &str, bin: i64| ("p".to_string(), date.to_string(), bin);
+        let candidates = vec![bin("2026-07-20", 5), bin("2026-07-29", 1), bin("2026-07-29", 7), bin("2026-07-21", 3), bin("2026-07-28", 2)];
+
+        // after_days=3 ⇒ 07-20/07-21 are cold-owned, 07-28/07-29 are hot.
+        let (ready, deferred) = Database::select_drain_bins(candidates.clone(), today, 3, 10);
+        assert_eq!(
+            ready,
+            vec![bin("2026-07-29", 7), bin("2026-07-29", 1), bin("2026-07-28", 2), bin("2026-07-21", 3), bin("2026-07-20", 5)],
+            "newest-first within each tier, cold tier last"
+        );
+        assert!(deferred.is_empty(), "a batch with room serves the cold tail too");
+
+        // A batch smaller than the hot tier never spends a slot on cold work.
+        let (ready, deferred) = Database::select_drain_bins(candidates, today, 3, 2);
+        assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-29", 1)]);
+        assert_eq!(deferred, vec![bin("2026-07-21", 3), bin("2026-07-20", 5)], "cold bins are deferred, not dropped");
+        assert_eq!(deferred.last().unwrap().1, "2026-07-20", "summary line reports the oldest deferred date");
+    }
+
+    /// The cold cutoff must never DROP bins: the nightly consolidate bin-packs
+    /// those partitions but does not collapse duplicates, so this drain is
+    /// their only physical dedup.
+    #[serial]
+    #[tokio::test]
+    async fn dirty_dedup_cold_bins_are_deferred_not_dropped() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-cold-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let after_days = db.config.parquet.cold_optimize_after_days();
+        let ancient = (Utc::now() - chrono::Duration::days(after_days as i64 + 2)).timestamp_micros();
+        let row = |observed: &str| json_to_batch(vec![test_span_ts("cold", observed, &project, ancient)]);
+
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1);
+
+        let deferred_before = crate::metrics::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed);
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        // Batch of 1 with a cold-only queue still serves it (lowest priority ≠
+        // never), so the drain deduplicates rather than abandoning the rows.
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
+        assert_eq!(
+            crate::metrics::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
+            deferred_before,
+            "nothing to defer when the batch has room"
+        );
+        assert_eq!(delta_physical_row_count(&table).await?, 1, "cold duplicates are physically collapsed, never silently abandoned");
+        assert!(db.dedup_dirty_bins.is_empty());
+        Ok(())
+    }
+
+    /// Dedup yields to persistence: an unhealthy flush path skips the pass
+    /// whole, leaving the queue intact for a later tick.
+    #[serial]
+    #[tokio::test]
+    async fn dirty_dedup_drain_yields_to_unhealthy_flush() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-gate-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
+        let row = |observed: &str| json_to_batch(vec![test_span_ts("gated", observed, &project, old)]);
+
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1);
+
+        let yields_before = crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false).await?;
+        assert_eq!(
+            crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
+            yields_before + 1,
+            "the skipped pass is counted, not silent"
+        );
+        assert_eq!(db.dedup_dirty_bins.len(), 1, "the bin stays queued for a healthier tick");
+        assert_eq!(delta_physical_row_count(&table).await?, 2, "no rewrite happened; read-side dedup keeps results correct");
+
+        // Healthy again ⇒ the same bin drains normally.
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
+        assert_eq!(delta_physical_row_count(&table).await?, 1);
         Ok(())
     }
 }

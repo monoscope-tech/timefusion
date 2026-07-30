@@ -214,6 +214,8 @@ impl StatsTableProvider {
             rows.push(("maintenance", "dirty_bin_requeued_total".into(), m.dirty_bin_requeued.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_dropped_rows_total".into(), m.dirty_bin_dropped_rows.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_rewrite_duration_ms_total".into(), m.dirty_bin_rewrite_duration_ms.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dedup_bins_deferred_cold_total".into(), m.dedup_bins_deferred_cold.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dedup_passes_flush_yields_total".into(), m.dedup_passes_flush_yields.load(Relaxed).to_string()));
             // Runs exceeding the long-running warning threshold. Slow progress
             // is allowed; sustained nonzero with no completion = wedged.
             rows.push(("maintenance", "cron_long_running_total".into(), m.cron_long_running.load(Relaxed).to_string()));
