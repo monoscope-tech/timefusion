@@ -132,6 +132,8 @@ impl ProviderVersions {
 }
 
 type DeltaProviderCache = Arc<dashmap::DashMap<(String, String), ProviderVersions>>;
+/// (project_id, date, bucket_id) — a dirty-bin drain candidate.
+type DrainBin = (String, String, i64);
 type FastResolveCache = Arc<dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>>;
 
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
@@ -6625,9 +6627,7 @@ impl Database {
     ///
     /// Returns `(ready, deferred_cold)`; `deferred_cold` stays on the queue.
     /// Dates are ISO-8601, so lexicographic order is chronological.
-    fn select_drain_bins(
-        mut candidates: Vec<(String, String, i64)>, today: chrono::NaiveDate, after_days: u64, batch: usize,
-    ) -> (Vec<(String, String, i64)>, Vec<(String, String, i64)>) {
+    fn select_drain_bins(mut candidates: Vec<DrainBin>, today: chrono::NaiveDate, after_days: u64, batch: usize) -> (Vec<DrainBin>, Vec<DrainBin>) {
         candidates.sort_by(|a, b| (&b.1, b.2).cmp(&(&a.1, a.2)));
         // An unparseable date sorts cold: it can't be shown to be hot, and the
         // staging call will surface the parse error when it is finally served.
