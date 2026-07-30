@@ -493,6 +493,10 @@ pub struct MaintenanceStats {
     pub light_optimize_projects_completed: AtomicU64,
     pub light_optimize_bins_committed: AtomicU64,
     pub light_optimize_waves_committed: AtomicU64,
+    /// Dedup-engine waves (data_change: true) — counted separately so the
+    /// light_optimize_* counters mean pure compaction only.
+    pub dedup_bins_committed: AtomicU64,
+    pub dedup_waves_committed: AtomicU64,
     /// Waves not STARTED because the WAL was over its emergency-flush threshold
     /// (durability outranks compaction) or memory was near the cgroup limit.
     /// Chronic nonzero = compaction is being starved, not protected.
@@ -538,6 +542,8 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     light_optimize_projects_completed: AtomicU64::new(0),
     light_optimize_bins_committed: AtomicU64::new(0),
     light_optimize_waves_committed: AtomicU64::new(0),
+    dedup_bins_committed: AtomicU64::new(0),
+    dedup_waves_committed: AtomicU64::new(0),
     light_optimize_wal_yields: AtomicU64::new(0),
     light_optimize_memory_brakes: AtomicU64::new(0),
     light_optimize_ticks_degraded: AtomicU64::new(0),

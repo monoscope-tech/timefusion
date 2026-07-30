@@ -6952,6 +6952,11 @@ impl Database {
             for dropped in landed.iter().filter_map(|b| b.dedup.as_ref()).map(DedupUnit::dropped).filter(|d| *d > 0) {
                 crate::metrics::record_compaction_dedup_dropped(dropped);
             }
+            // Dedup waves count under their own counters — crediting them to
+            // light_optimize_* made the stats under-report committed waves
+            // (2026-07-30: 3 wave_committed log events, counter said 1).
+            stats.dedup_bins_committed.fetch_add(landed.len() as u64, Relaxed);
+            stats.dedup_waves_committed.fetch_add(1, Relaxed);
         } else {
             stats.light_optimize_bins_committed.fetch_add(landed.len() as u64, Relaxed);
             stats.light_optimize_waves_committed.fetch_add(1, Relaxed);

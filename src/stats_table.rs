@@ -202,6 +202,8 @@ impl StatsTableProvider {
             rows.push(("maintenance", "light_optimize_projects_completed_total".into(), m.light_optimize_projects_completed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_bins_committed_total".into(), m.light_optimize_bins_committed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_waves_committed_total".into(), m.light_optimize_waves_committed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dedup_bins_committed_total".into(), m.dedup_bins_committed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dedup_waves_committed_total".into(), m.dedup_waves_committed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_wal_yields_total".into(), m.light_optimize_wal_yields.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_memory_brakes_total".into(), m.light_optimize_memory_brakes.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_ticks_degraded_total".into(), m.light_optimize_ticks_degraded.load(Relaxed).to_string()));
