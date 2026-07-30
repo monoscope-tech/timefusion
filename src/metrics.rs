@@ -538,6 +538,13 @@ pub struct MaintenanceStats {
     /// 10-day backlog pinned the commit path and starved flush for a whole
     /// container life). Chronic nonzero = flush is unhealthy, not dedup.
     pub dedup_passes_flush_yields: AtomicU64,
+    /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
+    /// on a per-table commit lock a flush was already waiting for — the flush
+    /// starvation of prod 2026-07-30, where durability waited >600s behind
+    /// legally-slow maintenance commits. The wave's bins are requeued and
+    /// re-staged later, so this is deferred work, not lost work. Chronic nonzero
+    /// = flush is saturating the commit path and compaction is being crowded out.
+    pub wave_commits_yielded_to_flush: AtomicU64,
     /// Cron ticks skipped because the previous run of the same job was still
     /// in flight. A steadily growing value = a wedged/overlong job body.
     pub cron_ticks_skipped: AtomicU64,
@@ -581,6 +588,7 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     dirty_bin_rewrite_duration_ms: AtomicU64::new(0),
     dedup_bins_deferred_cold: AtomicU64::new(0),
     dedup_passes_flush_yields: AtomicU64::new(0),
+    wave_commits_yielded_to_flush: AtomicU64::new(0),
     cron_ticks_skipped: AtomicU64::new(0),
     cron_ticks_fired: AtomicU64::new(0),
     cron_long_running: AtomicU64::new(0),
