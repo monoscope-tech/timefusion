@@ -34,7 +34,7 @@ const SLOW_DML_PHASE_US: u64 = 1_000_000;
 
 /// Build a clean SessionState with config + runtime from the given session but with
 /// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
-fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
+pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
     // delta-rs's DELETE/UPDATE re-reads existing parquet files and rewrites
     // them. Without `schema_force_view_types=false`, the reader returns
     // Struct{BinaryView,BinaryView} for our Variant columns while

@@ -449,7 +449,10 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
         return (0, 0);
     };
     let ctx = db.clone().create_session_context();
-    let session: Arc<dyn Session> = Arc::new(ctx.state());
+    // Variant columns: the pgwire-facing session reads them as Utf8View, which
+    // the DV-merge write leg cannot cast back to Struct{metadata,value}. Use
+    // the same variant-safe session the interactive DML path hands to merges.
+    let session: Arc<dyn Session> = crate::dml::delta_session_from(&ctx.state());
     let redriven = dir.join("redriven");
     let (mut ok, mut skipped) = (0usize, 0usize);
     for entry in rd.flatten() {
