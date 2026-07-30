@@ -5537,7 +5537,16 @@ impl Database {
         // conflict at commit (the merge read now-removed files). Refresh the
         // snapshot and retry rather than fail; an intermittently-written
         // partition lands on a later attempt. Mirrors the dedup retry loop.
+        //
+        // PROGRESS-AWARE BUDGET: `MAX_ATTEMPTS` counts consecutive attempts
+        // that shrank nothing. An attempt that reduced the partition's file
+        // count banked incremental commits (bins land every
+        // min_commit_interval), so it resets the counter — under a busy
+        // commit stream (2026-07-30: prod flush/dedup churning the same
+        // partition) a fixed budget quit mid-convergence. TOTAL_ATTEMPTS is
+        // the runaway backstop.
         const MAX_ATTEMPTS: usize = 4;
+        const TOTAL_ATTEMPTS: usize = 32;
         // Pre-state file set for the warm/evict diff, hoisted out of the retry
         // loop (only a successful commit — which returns — changes it) and
         // scoped to the partition being compacted: `optimize().with_filters()`
@@ -5549,18 +5558,11 @@ impl Database {
         let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
         let pre_uris: Option<std::collections::HashSet<String>> =
             if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
-        for attempt in 0..MAX_ATTEMPTS {
-            // Runs before every retry (attempt > 0), intentionally for BOTH the
-            // OCC and transient-S3 arms: a concurrent writer may have committed
-            // during the OCC conflict or the S3 backoff sleep, so the next merge
-            // must read a fresh snapshot. Log refresh failures — silently
-            // continuing against a stale snapshot would exhaust all attempts and
-            // surface only the final optimize error, hiding the real cause.
-            if attempt > 0
-                && let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await
-            {
-                debug!("compact_date refresh failed (attempt {}): {}", attempt, e);
-            }
+        let mut scope_files = scoped_file_uris(&*table_ref.read().await, &scope).len();
+        let (mut attempt, mut total_attempts) = (0usize, 0usize);
+        loop {
+            // The snapshot is refreshed in the Err arm (needed there anyway for
+            // the progress check), so every retry re-plans against fresh state.
             let table_clone = { table_ref.read().await.clone() };
             // SortBy: sort the partition by the schema keys and declare it, so
             // cold/consolidated partitions keep an honest DESC footer for the
@@ -5599,23 +5601,39 @@ impl Database {
                     info!("compact date={date} table={table_name}: {} files removed, {} files added", metrics.num_files_removed, metrics.num_files_added);
                     return Ok((metrics.num_files_removed, metrics.num_files_added));
                 }
-                Err(e) if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
-                    crate::metrics::record_optimize_conflict();
-                    warn!("compact date={date}: OCC conflict (attempt {}), refreshing + retrying: {}", attempt + 1, e);
-                    // Exponential backoff before re-submitting — matches dedup_partition
-                    // (150ms << attempt). Zero-delay retries under concurrent heavy
-                    // ingest amplify commit contention instead of resolving it.
-                    tokio::time::sleep(occ_backoff(attempt)).await;
-                }
-                Err(e) if is_transient_s3_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
-                    // A multipart part connection-dropped mid-merge (nothing committed).
-                    // Back off before retrying — R2 flakes under concurrent large PUTs.
-                    warn!("compact date={date}: transient S3 error (attempt {}), backing off + retrying: {}", attempt + 1, e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
-                }
                 Err(e) => {
                     let msg = e.to_string();
-                    if is_occ_conflict_err(&msg) {
+                    let (occ, s3) = (is_occ_conflict_err(&msg), is_transient_s3_err(&msg));
+                    total_attempts += 1;
+                    // Progress check: a failed attempt whose banked bin commits
+                    // shrank the partition resets the no-progress budget (needs
+                    // a fresh snapshot; the retry-refresh above is skipped when
+                    // we bail, so refresh here before counting).
+                    if (occ || s3) && total_attempts < TOTAL_ATTEMPTS {
+                        let _ = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
+                        let now_files = scoped_file_uris(&*table_ref.read().await, &scope).len();
+                        if now_files < scope_files {
+                            scope_files = now_files;
+                            attempt = 0;
+                        } else {
+                            attempt += 1;
+                        }
+                        if attempt < MAX_ATTEMPTS {
+                            if occ {
+                                crate::metrics::record_optimize_conflict();
+                                warn!("compact date={date}: OCC conflict (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), refreshing + retrying: {e}");
+                                // Exponential backoff — matches dedup_partition. Zero-delay
+                                // retries under concurrent heavy ingest amplify contention.
+                                tokio::time::sleep(occ_backoff(attempt.max(1) - 1)).await;
+                            } else {
+                                // A multipart part connection-dropped mid-merge (nothing committed).
+                                warn!("compact date={date}: transient S3 error (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), backing off + retrying: {e}");
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2 * attempt.max(1) as u64)).await;
+                            }
+                            continue;
+                        }
+                    }
+                    if occ {
                         crate::metrics::record_optimize_conflict();
                     }
                     crate::metrics::record_optimize_failed();
@@ -5623,7 +5641,6 @@ impl Database {
                 }
             }
         }
-        unreachable!("compact_date loop returns on success or final error")
     }
 
     /// Distinct `date=YYYY-MM-DD` partitions present in the live file set,
