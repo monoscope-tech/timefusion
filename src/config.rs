@@ -1898,9 +1898,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_brake_is_85pct_of_limit() {
+    fn memory_brake_is_70pct_of_limit() {
         let b = DerivedBudget::from_limits(100 * GIB, 48);
-        assert_eq!(b.memory_brake_limit_bytes(), 85 * GIB);
+        assert_eq!(b.memory_brake_limit_bytes(), 70 * GIB);
     }
 
     // cgroup parsers never panic on "max", garbage, or empty content.
