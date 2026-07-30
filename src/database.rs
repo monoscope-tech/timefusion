@@ -6538,7 +6538,11 @@ impl Database {
     /// which is true both when the unflushed backlog is over its threshold and
     /// while a recent flush FAILURE is inside the brake window.
     fn dedup_flush_healthy(&self) -> bool {
-        !self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold())
+        // Memory brake included: the drain's chunk loop is the one heavy path
+        // that never crosses a wave boundary, so the wave-level brake could
+        // not stop it — prod 2026-07-30 04:31 OOM-killed at 112GB anon with
+        // memory_brakes_total=0 while a drain pass rode RSS up unbraked.
+        !self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) && self.light_optimize_brake().is_none()
     }
 
     /// Order one drain pass and split off the work it will not do.
