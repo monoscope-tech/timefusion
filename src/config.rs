@@ -280,10 +280,15 @@ impl DerivedBudget {
         cron_period.mul_f64(0.8)
     }
 
-    /// Wave-boundary memory brake: 85% of the cgroup limit. One-way safety
-    /// valve only (see doc §5) — never used to size K.
+    /// Wave-boundary memory brake: 70% of the cgroup limit. One-way safety
+    /// valve only (see doc §5) — never used to size K. Was 85%: during the
+    /// 2026-07-30 backlog-drain regime, allocation bursts between wave
+    /// boundaries repeatedly outran jemalloc purge in the 85%→100% window
+    /// (contained OOM kills at 08:24/09:19/10:03, each costing a replay
+    /// cycle). 70% trades drain speed for burst headroom; revisit upward
+    /// once steady-state (no deferred-bin backlog) is the norm.
     pub fn memory_brake_limit_bytes(&self) -> usize {
-        (self.memory_limit_bytes as f64 * 0.85) as usize
+        (self.memory_limit_bytes as f64 * 0.70) as usize
     }
 
     /// WAL emergency-flush byte threshold, as a fraction of the ingest
