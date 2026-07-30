@@ -583,8 +583,18 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 let target = target_size_mb.map_or(cfg.parquet.timefusion_cold_optimize_target_size, |mb| mb * 1024 * 1024);
                 for p in &projects {
                     println!("  consolidate date={d} project={p} target={}MB", target / (1024 * 1024));
-                    if let Err(e) = db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p)).await {
-                        eprintln!("  consolidate date={d} project={p}: FAILED: {e}");
+                    // Committed runs persist across attempts (excluded from
+                    // re-selection), so retrying after a transient S3/OCC error
+                    // resumes at the next slice rather than restarting.
+                    for attempt in 1..=5 {
+                        match db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p)).await {
+                            Ok(()) => break,
+                            Err(e) if attempt < 5 => {
+                                eprintln!("  consolidate date={d} project={p}: attempt {attempt} failed, retrying: {e}");
+                                tokio::time::sleep(std::time::Duration::from_secs(5 * attempt)).await;
+                            }
+                            Err(e) => eprintln!("  consolidate date={d} project={p}: FAILED after {attempt} attempts: {e}"),
+                        }
                     }
                 }
             }
