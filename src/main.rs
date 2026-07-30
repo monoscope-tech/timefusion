@@ -59,6 +59,9 @@ fn main() -> anyhow::Result<()> {
         dotenv().ok();
         let cfg = config::init_config().expect("config load failed");
         return tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+                .try_init();
             let mut dir = cfg.core.wal_dir().join(timefusion::wal::QUARANTINE_DIR_NAME).join("dml");
             let mut dry_run = false;
             let mut it = std::env::args().skip(2);
