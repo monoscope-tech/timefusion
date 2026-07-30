@@ -88,8 +88,8 @@ fn detect_memory_limit_bytes() -> usize {
     // macOS (dev / off-box CLI): same shared-host half-the-machine rule.
     #[cfg(target_os = "macos")]
     {
-        let mem = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory()
-            as usize;
+        let mem =
+            sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory() as usize;
         if mem > 0 {
             tracing::warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", mem / 2 / GIB);
             return mem / 2;

@@ -510,14 +510,18 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
                 .otherwise(datafusion::functions_nested::expr_fn::array_concat(vec![col("hashes"), col("new_hashes")]))
                 .expect("static CASE expr")
         } else {
-            datafusion::logical_expr::when(
-                col("hashes").is_not_null(),
-                datafusion::functions_nested::expr_fn::array_append(col("hashes"), col("tag")),
-            )
-            .otherwise(datafusion::functions_nested::expr_fn::make_array(vec![col("tag")]))
-            .expect("static CASE expr")
+            datafusion::logical_expr::when(col("hashes").is_not_null(), datafusion::functions_nested::expr_fn::array_append(col("hashes"), col("tag")))
+                .otherwise(datafusion::functions_nested::expr_fn::make_array(vec![col("tag")]))
+                .expect("static CASE expr")
         };
-        info!("dml redrive: {} rows for {} ({} projects), window {:?}: replaying{}", merged.num_rows(), meta.table_name, meta.projects.len(), meta.date_bounds, if dry_run { " [DRY RUN]" } else { "" });
+        info!(
+            "dml redrive: {} rows for {} ({} projects), window {:?}: replaying{}",
+            merged.num_rows(),
+            meta.table_name,
+            meta.projects.len(),
+            meta.date_bounds,
+            if dry_run { " [DRY RUN]" } else { "" }
+        );
         if dry_run {
             ok += 1;
             continue;
@@ -538,7 +542,9 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
                 merge_bisect(db, &meta.table_name, &meta.project_id, predicate.clone(), vec![("hashes".into(), assignment.clone())], source, session.clone())
                     .await
             {
-                error!("dml redrive: merge failed for {path:?}: {e}; leaving parked (already-applied rounds are idempotent-safe: re-appended tags only on retried rows)");
+                error!(
+                    "dml redrive: merge failed for {path:?}: {e}; leaving parked (already-applied rounds are idempotent-safe: re-appended tags only on retried rows)"
+                );
                 failed = true;
                 break;
             }
@@ -971,17 +977,7 @@ impl DmlCoalescer {
             // Chunk each round to bound per-MERGE memory (see MAX_MERGE_ROWS).
             for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
                 let source = UpdateSource { batch: round, schema: group.schema.clone(), join_keys: group.join_keys.clone() };
-                match merge_bisect(
-                    db,
-                    &key.table_name,
-                    &key.project_id,
-                    predicate.clone(),
-                    group.assignments.clone(),
-                    source,
-                    group.session.clone(),
-                )
-                .await
-                {
+                match merge_bisect(db, &key.table_name, &key.project_id, predicate.clone(), group.assignments.clone(), source, group.session.clone()).await {
                     Ok(rows) => {
                         crate::metrics::record_dml_coalesce_merge();
                         debug!("dml coalesce: merged {statements} stmts for {}/{} — {rows} rows updated", key.project_id, key.table_name);
