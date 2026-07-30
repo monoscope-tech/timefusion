@@ -141,6 +141,13 @@ const FOYER_MEMORY_FRACTION: f64 = 0.10;
 const WRITER_RESERVE_PER_TASK_BYTES: usize = 3 * GIB / 2;
 /// delta-rs concurrent merge tasks per optimize run (unchanged default).
 const OPTIMIZE_MERGE_TASKS: usize = 2;
+/// Cap on files per optimize merge bin. Byte-only bins pack hundreds of
+/// tiny files into one rewrite whose merge fan-in (streams × decode batch)
+/// or blocking-sort input scales with fragmentation — memory demand peaks
+/// exactly when compaction is most needed (SortPreservingMerge exhaustion
+/// 2026-07-23, OOM #3 2026-07-27). 32 × ~35MB batches ≈ ~1GB peak per
+/// merge; repeated cron passes converge fragmented partitions to target.
+const OPTIMIZE_MAX_FILES_PER_BIN: usize = 32;
 /// Concurrent heavy maintenance rewrites (dedup/optimize/recompress).
 /// Formerly `TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY`; kept at the
 /// proven-safe 2 rather than re-derived (06-11 OOM was uncapped concurrency,
@@ -236,6 +243,12 @@ impl DerivedBudget {
     /// PINNED CONSTANT (not box-derived) — see `rewrite_permits`.
     pub fn optimize_merge_tasks(&self) -> usize {
         OPTIMIZE_MERGE_TASKS
+    }
+
+    /// Files-per-bin cap for every optimize rewrite (see const doc).
+    /// PINNED CONSTANT — bounds per-merge memory regardless of box size.
+    pub fn optimize_max_files_per_bin(&self) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(OPTIMIZE_MAX_FILES_PER_BIN).expect("cap is non-zero")
     }
 
     /// PINNED CONSTANT (not box-derived): empirical sort peak, tighten after

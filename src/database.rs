@@ -614,7 +614,10 @@ fn build_optimize_session_state(
     // Bound per-operator peak memory (bare SessionConfig::new() otherwise keeps
     // DataFusion's larger default) and reserve a small merge floor so the sort
     // can spill instead of erroring under memory pressure.
-    let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
+    // 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are wide —
+    // 8192-row decode batches measured up to 145MB (2026-07-27). Quartering
+    // the batch bounds a 32-file bin merge near ~1GB.
+    let _ = cfg.options_mut().set("datafusion.execution.batch_size", "2048");
     let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "33554432");
     // Cap maintenance parallelism hard. Each partition's ExternalSorter reserves
     // sort_spill_reservation_bytes up-front from the bounded maintenance pool, so
@@ -5145,6 +5148,7 @@ impl Database {
                         .with_filters(&partition_filters)
                         .with_type(optimize_type.clone())
                         .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                        .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                         .with_max_concurrent_tasks(optimize_concurrency)
                         .with_writer_properties(writer_properties.clone())
                         .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
@@ -5516,9 +5520,14 @@ impl Database {
                 .with_filters(&partition_filters)
                 .with_type(optimize_type)
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                 .with_max_concurrent_tasks(sort_concurrency)
                 .with_writer_properties(writer_properties)
-                .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+                // 2min (was 10): bins run serially on the SortBy path, so a
+                // short interval banks incremental commits — an OCC loss to a
+                // concurrent dedup/flush costs one bin's work, not the whole
+                // partition (2026-07-14 all-or-nothing starvation).
+                .with_min_commit_interval(tokio::time::Duration::from_secs(2 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                 // Variant columns: same BinaryView-avoidance session as optimize_table.
                 .with_session_state(Arc::new(self.maintenance_session_state()))
@@ -7522,6 +7531,7 @@ impl Database {
                 // Cloned per attempt: the retry loop re-submits after OCC conflicts.
                 .with_type(optimize_type.clone())
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                 .with_max_concurrent_tasks(self.config.derived.optimize_merge_tasks())
                 .with_writer_properties(writer_properties.clone())
                 .with_min_commit_interval(tokio::time::Duration::from_secs(30))
@@ -10666,7 +10676,7 @@ mod tests {
     fn optimize_session_sets_batch_size_and_spill_reservation() {
         let state = build_optimize_session_state(0, Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
         let exec = &state.config().options().execution;
-        assert_eq!(exec.batch_size, 8192);
+        assert_eq!(exec.batch_size, 2048, "merge memory ≈ fan-in × batch; 8192-row otel batches measured up to 145MB");
         assert_eq!(exec.sort_spill_reservation_bytes, 33_554_432);
         // Parallelism capped so per-partition spill reservations fit the bounded pool.
         assert_eq!(exec.target_partitions, 2, "0 (all cores) must cap to the maintenance limit");
