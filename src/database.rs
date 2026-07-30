@@ -7593,6 +7593,18 @@ impl Database {
             crate::metrics::maintenance_stats().light_optimize_wal_yields.fetch_add(1, Relaxed);
             return Some(Brake::Degrade("wal_backlog_over_threshold"));
         }
+        // HOST pressure, not just our cgroup: on an over-committed host the
+        // kernel's global OOM killer fires long before our 120GiB memcg limit
+        // (2026-07-30 10:57: TF killed at 91.5GB anon by a GLOBAL oom while
+        // the cgroup brake read healthy). /proc/meminfo is the host's inside
+        // a container, so MemAvailable is exactly the number the global OOM
+        // killer is racing against.
+        const HOST_MEM_BRAKE_FLOOR_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+        if host_mem_available_bytes().is_some_and(|avail| avail < HOST_MEM_BRAKE_FLOOR_BYTES) {
+            info!(event = "light_optimize_host_memory_brake");
+            crate::metrics::maintenance_stats().light_optimize_memory_brakes.fetch_add(1, Relaxed);
+            return Some(Brake::Stop("host_memory_low"));
+        }
         let limit = self.config.derived.memory_brake_limit_bytes();
         if limit > 0 && process_memory_bytes().is_some_and(|used| used > limit) {
             info!(limit, event = "light_optimize_memory_brake");
@@ -8796,6 +8808,17 @@ fn process_memory_bytes() -> Option<usize> {
         return Some(v);
     }
     crate::buffered_write_layer::process_rss_bytes()
+}
+
+/// Host free memory: `MemAvailable` from /proc/meminfo, which inside a
+/// container is the HOST's — exactly the figure the kernel's global OOM
+/// killer races against on an over-committed host. `None` on parse failure
+/// (the host brake then never engages; the cgroup brake still does).
+fn host_mem_available_bytes() -> Option<u64> {
+    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = raw.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 /// Tag the fork stamps on sorted-run outputs (delta-rs optimize.rs). Kept in
