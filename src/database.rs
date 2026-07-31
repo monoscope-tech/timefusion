@@ -5592,8 +5592,7 @@ impl Database {
             // higher `max_concurrent` (off-box CLI --concurrency, dedicated
             // container pool) opts out — serial bins on a 25-40 GB pool waste
             // nearly all of it (2026-07-31: 100-bin whale-days at 5-8 h serial).
-            let sort_concurrency =
-                if declare_sorted && max_concurrent <= self.config.derived.optimize_merge_tasks() { 1 } else { max_concurrent };
+            let sort_concurrency = if declare_sorted && max_concurrent <= self.config.derived.optimize_merge_tasks() { 1 } else { max_concurrent };
             let result = table_clone
                 .optimize()
                 .with_filters(&partition_filters)
