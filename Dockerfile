@@ -55,6 +55,11 @@ COPY vendor/ vendor/
 # resolve stacks (the release profile strips by default). Set on cook AND build
 # so cargo-chef's cached dep layer matches the final build's profile.
 ENV CARGO_PROFILE_RELEASE_STRIP=none
+# Frame pointers: jemalloc's heap profiler unwinds allocation stacks via frame
+# pointers; without them every allocation collapses into one bogus leaf frame
+# (2026-07-31: 28GB attributed to a random bz2 symbol — dumps unusable for OOM
+# attribution). ~1% perf cost, and it makes every future OOM self-explaining.
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
 RUN cargo chef cook --release --locked --features profiling --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
