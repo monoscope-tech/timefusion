@@ -228,7 +228,17 @@ impl DedupExec {
 
 impl DisplayAs for DedupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DedupExec: keys=[{}]", self.keys.join(", "))
+        // Surface which seen-set mode this scan will actually run. `bounded`
+        // clears state whenever the bound advances (O(distinct keys within one
+        // bound value)); `full-set` retains every key for the whole scan — the
+        // multi-GB risk this module's docs warn about, and ~19% of prod live
+        // heap in the 2026-07-31 profile. The two are indistinguishable in
+        // EXPLAIN without this, so the only symptom is unexplained heap growth.
+        let in_schema = self.input.schema();
+        match detect_bound(&self.input, &self.keys, &in_schema) {
+            Some(b) => write!(f, "DedupExec: keys=[{}], mode=bounded[{}]", self.keys.join(", "), in_schema.field(b.idx).name()),
+            None => write!(f, "DedupExec: keys=[{}], mode=full-set", self.keys.join(", ")),
+        }
     }
 }
 
@@ -571,6 +581,26 @@ mod tests {
         assert_eq!(o2.num_rows(), 1, "(a,11) survives once; second (a,11) is a same-run dup");
         assert_eq!(seen.len(), 1, "seen-set bounded to the current run, not O(all distinct)");
         assert_eq!(bound.last, Some(11));
+    }
+
+    /// EXPLAIN must say WHICH seen-set mode a scan will run. `full-set` retains
+    /// every key for the whole scan (multi-GB on wide scans, ~19% of prod live
+    /// heap on 2026-07-31) while `bounded` clears per run — previously the plan
+    /// rendered identically either way, so the only symptom was heap growth
+    /// with no way to attribute it. Both spellings are asserted so this
+    /// diagnostic can't quietly stop distinguishing them.
+    #[test]
+    fn explain_reveals_seen_set_mode() {
+        let b = batch(&["a"], &[10]);
+        let keys = vec!["id".to_string(), "v".to_string()];
+
+        let sorted = DedupExec::new(source(&[vec![b.clone()]], Some(col_asc("v", 1))), keys.clone(), None).unwrap();
+        let shown = format!("{}", datafusion::physical_plan::displayable(&sorted).one_line());
+        assert!(shown.contains("mode=bounded[v]"), "sorted input must report the bounded window, got: {shown}");
+
+        let unsorted = DedupExec::new(source(&[vec![b]], None), keys, None).unwrap();
+        let shown = format!("{}", datafusion::physical_plan::displayable(&unsorted).one_line());
+        assert!(shown.contains("mode=full-set"), "unsorted input must report the unbounded seen-set, got: {shown}");
     }
 
     // ---- plumbing ----
