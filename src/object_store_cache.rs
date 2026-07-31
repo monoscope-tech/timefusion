@@ -2074,10 +2074,7 @@ mod tests {
         let entry = cache.cache.get(&FoyerObjectStoreCache::make_cache_key(&path)).await?.expect("entry resident");
         let base = entry.value().data.as_ptr() as usize;
         let got_ptr = got.as_ptr() as usize;
-        assert!(
-            (base..base + entry.value().data.len()).contains(&got_ptr),
-            "served range must alias the cached buffer (zero-copy), not a fresh allocation"
-        );
+        assert!((base..base + entry.value().data.len()).contains(&got_ptr), "served range must alias the cached buffer (zero-copy), not a fresh allocation");
         assert_eq!(got_ptr - base, 10, "and it must alias at the requested offset");
         Ok(())
     }
