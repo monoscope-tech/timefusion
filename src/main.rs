@@ -506,6 +506,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut all = false;
     let mut dry_run = false;
     let mut project: Option<String> = None;
+    let mut concurrency: Option<usize> = None;
     let mut consolidate = false;
     let mut dedup = false;
     let mut target_size_mb: Option<i64> = None;
@@ -520,13 +521,14 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
             "--all" => all = true,
             "--dry-run" => dry_run = true,
             "--project" => project = Some(it.next().context("--project needs a value")?),
+            "--concurrency" => concurrency = Some(it.next().context("--concurrency needs a value")?.parse().context("--concurrency must be an integer")?),
             "--consolidate" => consolidate = true,
             "--dedup" => dedup = true,
             "--target-size-mb" => {
                 target_size_mb = Some(it.next().context("--target-size-mb needs a value")?.parse().context("--target-size-mb must be an integer")?)
             }
             other => anyhow::bail!(
-                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--consolidate [--target-size-mb N]] [--dedup] [--dry-run])"
+                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--consolidate [--target-size-mb N]] [--dedup] [--dry-run])"
             ),
         }
     }
@@ -612,7 +614,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
     let (mut tot_r, mut tot_a) = (0u64, 0u64);
     for d in &dates {
-        match db.compact_date(&table_ref, &table, *d, project.as_deref()).await {
+        match db.compact_date_concurrent(&table_ref, &table, *d, project.as_deref(), concurrency).await {
             Ok((r, a)) => {
                 tot_r += r;
                 tot_a += a;

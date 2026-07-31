@@ -5515,6 +5515,15 @@ impl Database {
         self.compact_date_with(table_ref, table_name, date, project_id, self.config.derived.optimize_merge_tasks()).await
     }
 
+    /// `compact_date` with an explicit bin concurrency (off-box CLI
+    /// `--concurrency N`); `None` keeps the in-server default.
+    pub async fn compact_date_concurrent(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>, concurrency: Option<usize>,
+    ) -> Result<(u64, u64)> {
+        let n = concurrency.unwrap_or_else(|| self.config.derived.optimize_merge_tasks()).max(1);
+        self.compact_date_with(table_ref, table_name, date, project_id, n).await
+    }
+
     /// `compact_date` with an explicit merge concurrency. The cold consolidation
     /// sweep passes 1: a 1GB-target merge holds ~target-sized output buffers per
     /// task, so concurrency × 1GB can OOM the memory-tight in-process instance
@@ -5577,7 +5586,14 @@ impl Database {
             // SortBy is cheap SPM, so serializing partitions costs little.
             let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
-            let sort_concurrency = if declare_sorted { 1 } else { max_concurrent };
+            // SortBy forces serial bins ONLY at in-server concurrency (≤ the
+            // pinned merge-task count): transition sorts stacking on the shared
+            // maintenance pool was the 2026-07-14 OOM multiplier. An explicitly
+            // higher `max_concurrent` (off-box CLI --concurrency, dedicated
+            // container pool) opts out — serial bins on a 25-40 GB pool waste
+            // nearly all of it (2026-07-31: 100-bin whale-days at 5-8 h serial).
+            let sort_concurrency =
+                if declare_sorted && max_concurrent <= self.config.derived.optimize_merge_tasks() { 1 } else { max_concurrent };
             let result = table_clone
                 .optimize()
                 .with_filters(&partition_filters)
