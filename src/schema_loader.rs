@@ -31,9 +31,10 @@ pub struct TableSchema {
     /// Tie-breaker column for dedup: when rows share `dedup_keys`, keep the one
     /// with the greatest value here (ties → last seen, the back-compat default;
     /// NULL sorts lowest, so an un-stamped legacy row always loses).
-    /// A `Timestamp(Microsecond, _)` tiebreak is TF-owned: every write stamps it
-    /// from a per-table monotonic clock (`insert_coerce::stamp_version`), so the
-    /// newest version of a row wins deterministically. `None` = keep-last by position.
+    /// On a [`Self::version_append`] table the tiebreak is TF-OWNED: every write
+    /// stamps it from a per-table monotonic clock (`insert_coerce::stamp_version`),
+    /// so the newest version of a row wins deterministically. Everywhere else it
+    /// is client-supplied and TF never writes it. `None` = keep-last by position.
     #[serde(default)]
     pub dedup_tiebreak: Option<String>,
     /// Nullable `Boolean` column marking a row version as a DELETION of its
@@ -63,6 +64,37 @@ pub struct TableSchema {
     #[serde(default)]
     pub version_append: bool,
 }
+
+// ─── ADDING A COLUMN TO A SHIPPED TABLE (read this before editing any YAML) ───
+//
+// A NEW table may declare whatever columns it likes — `mor_versioned` declares
+// `updated_at` and `deleted` from birth, and nothing is wrong with that because
+// no Delta table with the old column set exists anywhere.
+//
+// An EXISTING shipped table MUST NOT gain a column without an explicit migration
+// path. `otel_logs_and_spans` gained `updated_at` + `deleted` in 7d68f01 and
+// prod took 268 flush failures and rejected pgwire INSERTs within minutes:
+//
+//     Arrow error: Invalid argument error: number of columns(94) must match
+//     number of fields(92)
+//
+// The YAML is only one of TWO schemas. The other is the one physically stored in
+// each live Delta table's transaction log, and it is NOT derived from the YAML —
+// it is whatever was there when the table was created, months ago, per project.
+// Editing the YAML makes the write path build batches to the new shape while
+// every existing Delta table still declares the old one, and nullability buys
+// nothing: the mismatch is arity, not nulls.
+//
+// Every local suite passes anyway, because tests create their tables from
+// scratch and the two schemas therefore always agree. That is precisely the
+// blind spot — a green test run is NOT evidence that a column addition is safe.
+// See `dedup_compaction_test::adding_a_column_to_an_existing_table_is_caught`,
+// which creates a table at an old column set and then writes the new one.
+//
+// So: a column addition to a shipped table needs a migration that evolves the
+// stored Delta schema of every live table (all projects, unified + custom)
+// BEFORE the binary that writes the wider batch is deployed — verified against a
+// pre-existing table, not a fresh one.
 
 impl TableSchema {
     pub fn time_column_name(&self) -> &str {
@@ -465,28 +497,36 @@ mod tests {
         }
     }
 
-    /// The tombstone column must be appended LAST (no existing column's physical
-    /// parquet index may shift), nullable Boolean (NULL = live, so no backfill),
-    /// and named by the schema — nothing hard-codes it. `version_append` stays
-    /// off: it gates only the phase-3 write path, and decoupling it from
-    /// `tombstone_column` keeps rollback from resurrecting deleted rows.
+    /// The tombstone column must be nullable Boolean (NULL = live, so no
+    /// backfill) and named by the schema — nothing hard-codes it. Exercised on
+    /// `mor_versioned`, the from-scratch fixture: it is the ONLY table allowed to
+    /// declare these columns (see the migration note above `TableSchema`).
     #[test]
-    fn otel_tombstone_column_is_last_and_nullable_boolean() {
-        let schema = get_schema("otel_logs_and_spans").expect("otel schema registered");
+    fn mor_versioned_tombstone_column_is_nullable_boolean() {
+        let schema = get_schema("mor_versioned").expect("fixture registered");
         assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"));
-        assert!(!schema.version_append, "write-path flag must stay off until the version-append path lands");
-        let last = schema.fields.last().expect("fields non-empty");
-        assert_eq!(last.name, "deleted", "tombstone column must be appended LAST");
         assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)));
+        assert_eq!(schema.dedup_tiebreak.as_deref(), Some("updated_at"));
     }
 
-    /// Tables that declare no tombstone column are untouched by any of it.
+    /// The SHIPPED tables must not have gained merge-on-read columns. Adding one
+    /// to a table that already has live Delta data broke prod (7d68f01): every
+    /// existing Delta table still stores the old column set, and the write path
+    /// builds batches to the YAML's. Guards the specific columns that did it.
     #[test]
-    fn otel_metrics_has_no_tombstone_column() {
-        let schema = get_schema("otel_metrics").expect("metrics schema registered");
-        assert_eq!(schema.tombstone_column, None);
-        assert!(!schema.version_append);
-        assert_eq!(schema.dedup_tiebreak.as_deref(), Some("ingested_at"));
+    fn shipped_tables_declare_no_merge_on_read_columns() {
+        for name in ["otel_logs_and_spans", "otel_metrics"] {
+            let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
+            assert_eq!(schema.tombstone_column, None, "{name} is a shipped table — a tombstone column needs a Delta-side migration first");
+            assert!(!schema.version_append, "{name} is a shipped table — version_append needs the columns, which need a migration");
+            for col in ["updated_at", "deleted"] {
+                assert!(schema.field_def(col).is_none(), "{name} must not declare `{col}`: prod's Delta tables have no such field (7d68f01)");
+            }
+        }
+        // The tiebreaks these tables actually ship with — client-supplied, and
+        // therefore never stamped (see `insert_coerce::stamp_column`).
+        assert_eq!(get_schema("otel_logs_and_spans").unwrap().dedup_tiebreak.as_deref(), Some("observed_timestamp"));
+        assert_eq!(get_schema("otel_metrics").unwrap().dedup_tiebreak.as_deref(), Some("ingested_at"));
     }
 
     #[test]

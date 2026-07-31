@@ -645,6 +645,10 @@ fn build_optimize_session_state(
     // the batch bounds a 32-file bin merge near ~1GB.
     let _ = cfg.options_mut().set("datafusion.execution.batch_size", "2048");
     let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "33554432");
+    // Same nullability-widened file set as `create_session_context` (2026-07-31,
+    // 7d68f01): maintenance reads the very files that carry it, so any grouping
+    // step here would hit the identical physical-vs-logical check.
+    let _ = cfg.options_mut().set("datafusion.execution.skip_physical_aggregate_schema_check", "true");
     // Cap maintenance parallelism hard. Each partition's ExternalSorter reserves
     // sort_spill_reservation_bytes up-front from the bounded maintenance pool, so
     // the query-derived count (≈ CPU cores) exhausts it before the sort can even
@@ -678,6 +682,10 @@ fn build_delta_write_session_state(
     // cold partition) spills to disk instead of erroring under the bounded
     // maintenance pool — same reason as `build_optimize_session_state`.
     let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "33554432");
+    // Same nullability-widened file set as `create_session_context` (2026-07-31,
+    // 7d68f01): maintenance reads the very files that carry it, so any grouping
+    // step here would hit the identical physical-vs-logical check.
+    let _ = cfg.options_mut().set("datafusion.execution.skip_physical_aggregate_schema_check", "true");
     const MAINTENANCE_MAX_PARTITIONS: usize = 2;
     let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
     cfg = cfg.with_target_partitions(parts);
@@ -2715,6 +2723,28 @@ impl Database {
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
+
+        // INCIDENT 2026-07-31 (7d68f01): during the ~30 min that commit was live,
+        // TF wrote parquet files into the LIVE `otel_logs_and_spans` table whose
+        // physical schema had `timestamp` (and `id`) NULLABLE, while the YAML —
+        // and therefore every logical plan — declares them NOT NULL. Those files
+        // are permanent table content: the rollback restored the binary, but it
+        // cannot un-write them, and no `metaData` action was ever committed so
+        // the Delta schema itself is unchanged and there is nothing to "fix".
+        //
+        // DataFusion then rejects any aggregate grouping on such a column:
+        //   Internal error: Physical input schema should be the same as the one
+        //   converted from logical input schema. Differences: field nullability
+        //   at index 0 [timestamp]: (physical) true vs (logical) false.
+        // which took out every `GROUP BY time_bucket(timestamp)` dashboard on
+        // every project (`GROUP BY status_code` was fine; `otel_metrics` was
+        // unaffected). This flag exists for exactly that physical-vs-logical
+        // nullability mismatch. Widening nullability is always SAFE to read: a
+        // column declared NOT NULL simply has no nulls to observe.
+        //
+        // Keep it set until those files have aged out of retention or been
+        // rewritten by compaction; removing it re-breaks the dashboards.
+        let _ = options.set("datafusion.execution.skip_physical_aggregate_schema_check", "true");
 
         // Must be false: delta_kernel's unshredded_variant() schema uses Binary (not BinaryView).
         // Forcing view types causes UPDATE/DELETE rewrites to fail schema validation against variant columns.
@@ -11192,7 +11222,7 @@ mod tests {
     fn keep_greatest_ordering_requires_a_tiebreak() {
         let otel = get_schema("otel_logs_and_spans").expect("registered");
         let schema = otel.schema_ref();
-        let ord = ProjectRoutingTable::keep_greatest_ordering(otel, &schema).expect("otel declares updated_at + timestamp-led sort");
+        let ord = ProjectRoutingTable::keep_greatest_ordering(otel, &schema).expect("otel declares a tiebreak + timestamp-led sort");
         assert_eq!(ord.to_string(), "timestamp@0 DESC", "one column only — all `detect_bound` reads, and the cheapest leg sort");
 
         let mut no_tiebreak = otel.clone();
@@ -11212,10 +11242,13 @@ mod tests {
     #[test]
     fn tombstone_predicates_are_never_pushed_down() {
         let deleted = col("deleted").eq(lit(true));
-        assert!(ProjectRoutingTable::references_tombstone("otel_logs_and_spans", &deleted));
-        assert!(!ProjectRoutingTable::references_tombstone("otel_logs_and_spans", &col("id").eq(lit("x"))));
-        // A table declaring no tombstone column has no such predicate to protect.
-        assert!(!ProjectRoutingTable::references_tombstone("variant_bench", &deleted));
+        assert!(ProjectRoutingTable::references_tombstone("mor_versioned", &deleted));
+        assert!(!ProjectRoutingTable::references_tombstone("mor_versioned", &col("id").eq(lit("x"))));
+        // Tables declaring no tombstone column have no such predicate to protect
+        // — including the shipped ones, where `deleted` is just an unknown name.
+        for t in ["variant_bench", "otel_logs_and_spans"] {
+            assert!(!ProjectRoutingTable::references_tombstone(t, &deleted));
+        }
     }
 
     /// The optimize/dedup session must carry a bounded batch size and a sort

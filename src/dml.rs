@@ -47,6 +47,10 @@ pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
     // override the view-types flag.
     let cfg: datafusion::prelude::SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
     let cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    // Same nullability-widened file set as `Database::create_session_context`
+    // (2026-07-31, 7d68f01): a DML plan reading those files must not trip the
+    // physical-vs-logical aggregate schema check either.
+    let cfg = cfg.set_bool("datafusion.execution.skip_physical_aggregate_schema_check", true);
     Arc::new(
         SessionStateBuilder::new()
             .with_config(cfg)

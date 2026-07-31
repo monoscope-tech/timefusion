@@ -23,14 +23,6 @@ SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'test_project' AND i
 ----
 sql_span1 sql_test_span
 
-# `updated_at` is TF-owned (the dedup tiebreak): a row inserted without one
-# comes back with one, and a client-supplied value is overwritten — a client
-# must not be able to pin a stale version as the dedup winner.
-query B
-SELECT updated_at IS NOT NULL FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'sql_span1'
-----
-true
-
 # Insert a few more records with batch_spans
 statement ok
 INSERT INTO otel_logs_and_spans (
@@ -171,18 +163,35 @@ SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'
 ----
 3
 
-# A client-supplied `updated_at` is overwritten: the column is the dedup
-# tiebreak, so letting a client set it would let it pin a stale version as the
-# permanent winner. Uses its own project so the counts above stay stable.
+# `updated_at` is TF-owned on a `version_append` table (it is the dedup
+# tiebreak): a row inserted without one comes back with one, and a
+# client-supplied value is OVERWRITTEN — a client must not be able to pin a
+# stale version as the permanent dedup winner. Exercised on `mor_versioned`,
+# the from-scratch fixture; `otel_logs_and_spans` has no such column (its
+# tiebreak is the client-supplied `observed_timestamp`) and must never gain one
+# without a Delta-side migration — see the note above `TableSchema`.
 statement ok
-INSERT INTO otel_logs_and_spans (
-    project_id, timestamp, id, hashes, date, name, summary, updated_at
+INSERT INTO mor_versioned (
+    project_id, timestamp, id, date, name, updated_at
 ) VALUES (
-    'stamp_project', TIMESTAMP '2023-01-01T10:00:00Z', 'client_stamp', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'client stamped', ARRAY['client stamped'], TIMESTAMP '1999-01-01T00:00:00Z'
+    'stamp_project', TIMESTAMP '2023-01-01T10:00:00Z', 'client_stamp', DATE '2023-01-01',
+    'client stamped', TIMESTAMP '1999-01-01T00:00:00Z'
 )
 
 query B
-SELECT updated_at > TIMESTAMP '2000-01-01T00:00:00Z' FROM otel_logs_and_spans WHERE project_id = 'stamp_project' AND id = 'client_stamp'
+SELECT updated_at > TIMESTAMP '2000-01-01T00:00:00Z' FROM mor_versioned WHERE project_id = 'stamp_project' AND id = 'client_stamp'
+----
+true
+
+# ... and a row inserted with no `updated_at` at all is still stamped.
+statement ok
+INSERT INTO mor_versioned (
+    project_id, timestamp, id, date, name
+) VALUES (
+    'stamp_project', TIMESTAMP '2023-01-01T10:00:00Z', 'unstamped', DATE '2023-01-01', 'no stamp sent'
+)
+
+query B
+SELECT updated_at IS NOT NULL FROM mor_versioned WHERE project_id = 'stamp_project' AND id = 'unstamped'
 ----
 true

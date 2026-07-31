@@ -4494,7 +4494,10 @@ mod tests {
         let cfg = create_test_config(dir.path().to_path_buf());
         let wal_dir = cfg.core.wal_dir();
         let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
-        let table = "otel_logs_and_spans";
+        // `mor_versioned` — the only table whose tiebreak TF owns. The WAL and
+        // MemBuffer legs under test are schema-free, so an otel-shaped batch is
+        // fine; what matters is that `stamp_version` fires for this table name.
+        let table = "mor_versioned";
         let project = format!("v{}", &uuid::Uuid::new_v4().to_string()[..4]);
 
         // Stamp from a far-future clock so the value can't be confused with a

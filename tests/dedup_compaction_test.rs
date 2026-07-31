@@ -6,7 +6,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
+use datafusion::arrow::{
+    array::{Array, AsArray},
+    datatypes::Int64Type,
+};
 use serial_test::serial;
 use timefusion::{
     database::Database,
@@ -845,16 +848,17 @@ async fn count_pushdown_declines_where_tombstones_are_possible() -> Result<()> {
     Ok(())
 }
 
-/// The tombstone column is live on `otel_logs_and_spans` (all NULL) before any
-/// tombstone is ever written: NULL must read as LIVE, so the filter is a
-/// provable no-op on existing data.
+/// The tombstone column is live (all NULL) before any tombstone is ever
+/// written: NULL must read as LIVE, so the filter is a provable no-op on
+/// pre-existing data — which is what lets a table declare the column at birth.
 #[serial]
 #[tokio::test]
 async fn null_tombstone_is_live() -> Result<()> {
     let (db, project_id) = buffered_db("mor_tombstone_null").await?;
     let ts = chrono::Utc::now().timestamp_micros();
-    write(&db, &project_id, (0..5).map(|i| test_span_ts(&format!("k{i}"), "v", &project_id, ts - i * 1000)).collect(), true).await?;
-    assert_eq!(column_strings(&db, &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?.len(), 5);
+    let rows = (0..5).map(|i| mor_row(&format!("k{i}"), "v", &project_id, ts - i * 1000, None)).collect();
+    write_to(&db, "mor_versioned", &project_id, rows, true).await?;
+    assert_eq!(column_strings(&db, &format!("SELECT name FROM mor_versioned WHERE project_id = '{project_id}'")).await?.len(), 5);
     Ok(())
 }
 
@@ -869,11 +873,11 @@ async fn tombstone_predicate_is_not_pushed_into_the_scan() -> Result<()> {
     use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
     let (db, project_id) = buffered_db("mor_tombstone_pushdown").await?;
     let ts = chrono::Utc::now().timestamp_micros();
-    write(&db, &project_id, vec![test_span_ts("k", "v1", &project_id, ts)], true).await?;
+    write_to(&db, "mor_versioned", &project_id, vec![mor_row("k", "v1", &project_id, ts, None)], true).await?;
 
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    let provider = ctx.table_provider("otel_logs_and_spans").await?;
+    let provider = ctx.table_provider("mor_versioned").await?;
     let pred = col("deleted").eq(lit(true));
     assert!(
         matches!(provider.supports_filters_pushdown(&[&pred])?[0], TableProviderFilterPushDown::Unsupported),
@@ -882,7 +886,7 @@ async fn tombstone_predicate_is_not_pushed_into_the_scan() -> Result<()> {
 
     // End to end: the dedup still runs under a user predicate on the marker —
     // the predicate is applied above the whole scan, not inside a leg.
-    let text = rendered(&physical_plan(&db, &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND deleted")).await?);
+    let text = rendered(&physical_plan(&db, &format!("SELECT name FROM mor_versioned WHERE project_id = '{project_id}' AND deleted")).await?);
     assert!(text.contains("DedupExec"), "the dedup must still run under a tombstone predicate:\n{text}");
     Ok(())
 }
@@ -905,5 +909,263 @@ async fn topk_path_still_streams() -> Result<()> {
         assert!(line.contains("fetch="), "a blocking whole-window SortExec regrew in the top-K plan: {line}\n{text}");
     }
     assert_eq!(column_strings(&db, &sql).await?.len(), 2);
+    Ok(())
+}
+
+/// The URI + storage options `get_or_create_unified_table` will resolve for
+/// `table` under `cfg` — so a test can reach the SAME Delta table out-of-band
+/// and manufacture states TF's own write path would never produce.
+fn unified_table_location(cfg: &timefusion::config::AppConfig, table: &str) -> (String, std::collections::HashMap<String, String>) {
+    let endpoint = cfg.aws.aws_s3_endpoint.clone();
+    let uri = format!("s3://{}/{}/{}/?endpoint={}", cfg.aws.aws_s3_bucket.as_ref().unwrap(), cfg.core.timefusion_table_prefix, table, endpoint);
+    let opts = [
+        ("AWS_ACCESS_KEY_ID", cfg.aws.aws_access_key_id.clone().unwrap()),
+        ("AWS_SECRET_ACCESS_KEY", cfg.aws.aws_secret_access_key.clone().unwrap()),
+        ("AWS_REGION", cfg.aws.aws_default_region.clone().unwrap()),
+        ("AWS_ENDPOINT_URL", endpoint),
+        ("AWS_ALLOW_HTTP", "true".into()),
+        ("AWS_S3_ALLOW_UNSAFE_RENAME", "true".into()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    (uri, opts)
+}
+
+/// REGRESSION GUARD for the 7d68f01 prod outage (2026-07-31): adding a column to
+/// a table that ALREADY HAS live Delta data.
+///
+/// 7d68f01 appended two nullable columns (`updated_at`, `deleted`) to
+/// `otel_logs_and_spans`. Every local suite passed. Prod took 268 flush failures
+/// and rejected pgwire INSERTs within minutes:
+///
+///     Arrow error: Invalid argument error: number of columns(94) must match
+///     number of fields(92)
+///
+/// The suites passed because a test creates its Delta table FROM the YAML, so
+/// the YAML schema and the stored Delta schema always agree. Prod's tables were
+/// created months earlier and still declare the OLD column set. No amount of
+/// from-scratch testing can see that skew — this test manufactures it.
+///
+/// It creates the Delta table at a TRIMMED column set (the YAML minus its two
+/// trailing nullable columns — the same two columns, appended in the same place,
+/// as the change that broke prod), then drives a normal write carrying the FULL
+/// YAML column set through `Database::insert_records_batch`.
+///
+/// COVERS: the unified-table write path against a narrower-on-disk Delta schema
+/// — `prepare_staged_write`'s `evolves` detection, the staged `RecordBatchWriter`
+/// fast path, and the locked `WriteBuilder` + `SchemaMode::Merge` fallback — for
+/// a nullable column appended at the END, which is the only shape anyone has
+/// proposed adding. Both `skip_queue` variants (direct Delta commit and the
+/// buffered/flush path that produced the 268 failures) are exercised.
+///
+/// DOES NOT COVER: custom (BYO-bucket) project tables, which take a different
+/// `get_or_create_*` branch; non-nullable or mid-schema column insertions; type
+/// CHANGES to an existing column; the reverse skew (Delta wider than the YAML,
+/// i.e. a rollback); the tantivy sidecar and the dedup/optimize rewrite paths,
+/// which read the stored schema separately. A green run here is evidence that
+/// the plain write path tolerates the skew, NOT that a column addition is safe
+/// to deploy.
+#[serial]
+#[tokio::test]
+async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
+    use deltalake::operations::create::CreateBuilder;
+
+    const TABLE: &str = "mor_versioned";
+    let cfg = TestConfigBuilder::new("schema_skew").with_buffer_mode(BufferMode::Enabled).build();
+    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; `#[serial]`.
+    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+
+    // Pre-create the unified Delta table at the OLD column set, at exactly the
+    // URI `get_or_create_unified_table` will later resolve, so TF LOADS this
+    // table instead of creating one from the YAML.
+    let schema = timefusion::schema_loader::get_schema(TABLE).expect("fixture registered");
+    let added = ["updated_at", "deleted"];
+    let old_columns: Vec<_> = schema.columns()?.into_iter().filter(|c| !added.contains(&c.name().as_str())).collect();
+    assert_eq!(old_columns.len(), schema.columns()?.len() - added.len(), "the fixture must still declare the columns this test removes");
+
+    let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
+    CreateBuilder::new()
+        .with_location(&storage_uri)
+        .with_columns(old_columns)
+        .with_partition_columns(schema.partitions.clone())
+        .with_storage_options(storage_options.clone())
+        .await?;
+
+    // Wire the Delta write callback exactly as `bootstrap` does — without it a
+    // flush drains the MemBuffer and never reaches Delta, and this test's whole
+    // point is the Delta commit.
+    let db_inner = Database::with_config(Arc::clone(&cfg)).await?;
+    let db_for_cb = db_inner.clone();
+    let cb: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(move |project, table, batches, wm| {
+        let db = db_for_cb.clone();
+        Box::pin(async move { db.insert_records_batch(&project, &table, batches, true, Some(&wm)).await })
+    });
+    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(cb));
+    let db = Arc::new(db_inner.with_buffered_layer(Arc::clone(&layer)));
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = chrono::Utc::now().timestamp_micros();
+
+    // The write path now builds batches at the FULL (wider) YAML column set
+    // while the loaded Delta table declares the narrower one. This is the exact
+    // skew that failed every prod flush.
+    for (i, skip_queue) in [(0, true), (1, false)] {
+        let rows = vec![mor_row(&format!("k{i}"), "v", &project_id, ts - i * 1000, None)];
+        let batch = timefusion::test_utils::test_helpers::json_to_batch_for(TABLE, rows)?;
+        db.insert_records_batch(&project_id, TABLE, vec![batch], skip_queue, None).await.map_err(|e| {
+            anyhow::anyhow!(
+                "writing the YAML's column set into a Delta table created at an OLDER one failed (skip_queue={skip_queue}): {e}\n\
+                 This is the 7d68f01 prod failure. Either the write path must evolve the stored Delta schema, \
+                 or the column addition needs an explicit migration before deploy — see the note above `TableSchema`."
+            )
+        })?;
+    }
+
+    // Drain the buffered row through the FLUSH path — the leg that actually
+    // produced the 268 prod failures. Without this the MemBuffer row never
+    // reaches a Delta commit and the test would pass on the fast path alone.
+    // Pre-flush the buffered row is served from the MemBuffer leg; both rows
+    // must be visible through the routed scan.
+    let where_ = format!("WHERE project_id = '{project_id}'");
+    let mut ids = column_strings(&db, &format!("SELECT id FROM {TABLE} {where_}")).await?;
+    ids.sort();
+    assert_eq!(ids, ["k0", "k1"], "both rows must be readable across the MemBuffer ∪ Delta union under the schema skew");
+    assert_eq!(
+        column_strings(&db, &format!("SELECT CAST(updated_at AS VARCHAR) FROM {TABLE} {where_}")).await?.iter().filter(|s| !s.is_empty()).count(),
+        2,
+        "the added column must carry values — silently dropping it is the quieter form of this bug"
+    );
+
+    // Now the FLUSH leg — the one that produced the 268 prod failures.
+    // `flush_all_now` swallows per-bucket errors into `buckets_failed`; that
+    // counter IS the 268, so it is the assertion that matters.
+    let stats = layer.flush_all_now().await.map_err(|e| {
+        anyhow::anyhow!(
+            "flushing a buffered write into a Delta table created at an OLDER column set failed: {e}\n\
+             This is the 7d68f01 prod failure — see the note above `TableSchema`."
+        )
+    })?;
+    assert_eq!(stats.buckets_failed, 0, "a bucket failed to flush against the older Delta schema: {stats:?}");
+    assert!(stats.total_rows > 0, "the flush must have moved the buffered row to Delta, got {stats:?}");
+
+    // Both rows are now physically in Delta. Read the log FRESH (not through
+    // TF's cached snapshot, which lags a flush) so this asserts what durably
+    // landed rather than what a cache remembers.
+    let table = deltalake::DeltaTableBuilder::from_url(url::Url::parse(&storage_uri)?)?.with_storage_options(storage_options).load().await?;
+    let snapshot = table.snapshot()?;
+    let adds = snapshot.add_actions_table(true)?;
+    let nr = adds.column_by_name("num_records").expect("num_records").as_primitive::<Int64Type>();
+    let physical: i64 = (0..nr.len()).filter(|&i| !nr.is_null(i)).map(|i| nr.value(i)).sum();
+    assert_eq!(physical, 2, "both rows must be durable in Delta after the flush");
+    // ...and the evolved stored schema really did gain the columns.
+    let stored: Vec<String> = snapshot.schema().fields().map(|f| f.name().to_string()).collect();
+    for c in added {
+        assert!(stored.contains(&c.to_string()), "the write path did not evolve the stored Delta schema — `{c}` is still missing: {stored:?}");
+    }
+    Ok(())
+}
+
+/// REGRESSION GUARD for the 2026-07-31 dashboard outage — the SECOND failure
+/// from 7d68f01, and the one that survived the rollback.
+///
+/// While 7d68f01 was live TF wrote parquet into the LIVE `otel_logs_and_spans`
+/// table with `timestamp` NULLABLE, though the YAML declares it NOT NULL. Those
+/// files are permanent table content: no `metaData` action was ever committed
+/// (the Delta schema never changed), so rolling the binary back fixed nothing.
+/// Every logical plan still types `timestamp` NOT NULL from the YAML, and
+/// DataFusion rejected the resulting aggregate:
+///
+///     Internal error: Physical input schema should be the same as the one
+///     converted from logical input schema. Differences: field nullability at
+///     index 0 [timestamp]: (physical) true vs (logical) false.
+///
+/// which killed `GROUP BY time_bucket(timestamp)` on every project. `GROUP BY
+/// status_code` (a nullable-declared column) kept working — that asymmetry is
+/// the fingerprint, so this test asserts both.
+///
+/// Reproduces it through the SAME mechanism prod hit: a `SchemaMode::Merge`
+/// write. delta-rs merges nullability by UNION (`left.is_nullable() ||
+/// right.is_nullable()`, `kernel/schema/cast/merge_schema.rs:149`), so a
+/// nullable incoming batch permanently widens the physical parquet — while the
+/// committed Delta schema, which only changes when the STRUCTURAL schema does,
+/// stays NOT NULL. That merge path is exactly what `prepare_staged_write` falls
+/// back to when a batch carries a column the table lacks, which is why the
+/// column addition and the nullability widening were one event.
+///
+/// Note TF's normal (staged) write path casts to the table's arrow schema and
+/// does NOT widen — so a test that merely hands `insert_records_batch` a
+/// nullable batch passes with or without the flag and proves nothing. The
+/// out-of-band merge write below is what makes this a real guard.
+///
+/// Guards `datafusion.execution.skip_physical_aggregate_schema_check`.
+///
+/// HONESTY NOTE: with the state above reproduced exactly, this query passes on
+/// THIS branch whether or not the flag is set — the failure was observed on
+/// 5692555, and something in the scan path here already normalizes the schema.
+/// So it pins prod's on-disk state and the dashboards' query shape, but it does
+/// NOT by itself prove the flag is what keeps them working. Do not delete the
+/// flag on the strength of this test being green.
+#[serial]
+#[tokio::test]
+async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
+    use datafusion::arrow::{datatypes::Schema, record_batch::RecordBatch};
+    use deltalake::operations::write::SchemaMode;
+
+    const TABLE: &str = "otel_logs_and_spans";
+    let cfg = TestConfigBuilder::new("nullability_widened").with_buffer_mode(BufferMode::Enabled).build();
+    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; `#[serial]`.
+    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+
+    // A normal write first, so TF creates the table with `timestamp` NOT NULL.
+    let rows: Vec<_> = (0..2).map(|i| test_span_ts(&format!("n{i}"), "v", &project_id, ts + i * 1000)).collect();
+    db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(rows)?], true, None).await?;
+
+    // Now widen `timestamp` + `id` to nullable and merge-write them in, exactly
+    // as the 7d68f01 binary did. Values untouched — only the field flags move.
+    let rows: Vec<_> = (2..4).map(|i| test_span_ts(&format!("n{i}"), "v", &project_id, ts + i * 1000)).collect();
+    let batch = json_to_batch(rows)?;
+    let widened: Vec<_> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| if matches!(f.name().as_str(), "timestamp" | "id") { Arc::new(f.as_ref().clone().with_nullable(true)) } else { f.clone() })
+        .collect();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new_with_metadata(widened, batch.schema().metadata().clone())), batch.columns().to_vec())?;
+
+    let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
+    let table = deltalake::DeltaTableBuilder::from_url(url::Url::parse(&storage_uri)?)?.with_storage_options(storage_options).load().await?;
+    table.write(vec![batch]).with_schema_mode(SchemaMode::Merge).await?;
+
+    // Precondition: the file set really is nullability-widened. If this ever
+    // stops holding, the test below is green for the wrong reason.
+    let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
+    let table = deltalake::DeltaTableBuilder::from_url(url::Url::parse(&storage_uri)?)?.with_storage_options(storage_options).load().await?;
+    let ts_field = table.snapshot()?.schema().field("timestamp").expect("timestamp declared").clone();
+    // The COMMITTED schema is untouched (no `metaData` action) while the file
+    // just written has `timestamp nullable = true` in its parquet footer —
+    // verified out-of-band against MinIO, and the exact state prod is in.
+    assert!(!ts_field.is_nullable(), "the COMMITTED Delta schema must still say NOT NULL — that is the whole mismatch");
+
+    // THE production query shape. Without the skip flag this is an
+    // `Internal error: Physical input schema should be the same ...`.
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let sql = format!("SELECT time_bucket('1 hour', timestamp) AS b, COUNT(*) AS c FROM {TABLE} WHERE project_id = '{project_id}' GROUP BY b");
+    let got = ctx.sql(&sql).await?.collect().await.map_err(|e| {
+        anyhow::anyhow!(
+            "GROUP BY on a NOT NULL-declared column failed over nullability-widened files: {e}\n\
+             Set datafusion.execution.skip_physical_aggregate_schema_check (2026-07-31 dashboard outage)."
+        )
+    })?;
+    assert_eq!(got.iter().map(|b| b.num_rows()).sum::<usize>(), 1, "all four rows fall in one hour bucket");
+
+    // The asymmetry that identified the bug in prod: grouping on a column the
+    // YAML already declares nullable was never affected, so a green result there
+    // alone would NOT have proved anything.
+    let sql = format!("SELECT status_code, COUNT(*) FROM {TABLE} WHERE project_id = '{project_id}' GROUP BY status_code");
+    assert_eq!(ctx.sql(&sql).await?.collect().await?.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     Ok(())
 }

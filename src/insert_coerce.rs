@@ -144,12 +144,18 @@ pub fn observe_stamp(table: &str, value: i64) {
     with_cell(table, |cell| cell.fetch_max(value, Ordering::AcqRel));
 }
 
-/// The declared version-stamp column for `table`: the schema's `dedup_tiebreak`
-/// when it is a microsecond timestamp. Tables with no tiebreak, or one that
-/// isn't TF-ownable (a client-supplied ordering column of some other type), get
-/// `None` and are left completely alone.
+/// The declared version-stamp column for `table`: the schema's `dedup_tiebreak`,
+/// when it is a microsecond timestamp AND the table declares `version_append`.
+///
+/// `version_append` is what makes the tiebreak **TF-owned** — it is the flag that
+/// says UPDATE/DELETE append a new version carrying a fresh tiebreak, which is
+/// only sound if TF, not the client, issues that value. A microsecond-timestamp
+/// tiebreak on its own is NOT enough to claim ownership: `otel_logs_and_spans`
+/// breaks ties on `observed_timestamp` and `otel_metrics` on `ingested_at`, both
+/// client-supplied and both `Timestamp(Microsecond, _)` — stamping those would
+/// silently overwrite ingested data on tables that never had a version stamp.
 fn stamp_column(table: &str) -> Option<(&'static str, DataType, bool)> {
-    let schema = crate::schema_loader::get_schema(table)?;
+    let schema = crate::schema_loader::get_schema(table).filter(|s| s.version_append)?;
     let name = schema.dedup_tiebreak.as_deref()?;
     let (dt, nullable) = schema.field_def(name)?;
     matches!(dt, DataType::Timestamp(TimeUnit::Microsecond, _)).then_some((name, dt, nullable))
@@ -300,36 +306,42 @@ mod stamp_tests {
 
     #[test]
     fn stamp_fills_a_missing_column_and_overwrites_a_client_supplied_one() {
-        let out = stamp_version("otel_logs_and_spans", vec![batch_with(None), batch_with(Some(1_234))]);
+        let out = stamp_version("mor_versioned", vec![batch_with(None), batch_with(Some(1_234))]);
         let filled = stamp_of(&out[0]).expect("missing column is appended and populated");
         let overwritten = stamp_of(&out[1]).expect("client value is replaced, not left");
         assert_ne!(overwritten, 1_234, "a client-supplied stamp must be overwritten by TF's");
         assert!(overwritten > filled, "successive batches get increasing stamps");
     }
 
-    /// A table declaring no `dedup_tiebreak` is left byte-for-byte alone.
+    /// Only a `version_append` table has a TF-owned tiebreak; every other table
+    /// is left byte-for-byte alone. Covers both reasons for that: no tiebreak at
+    /// all (`variant_bench`), and a CLIENT-supplied microsecond-timestamp
+    /// tiebreak that TF must not overwrite (`otel_logs_and_spans` breaks ties on
+    /// the OTel-assigned `observed_timestamp`; `otel_metrics` on `ingested_at`).
     #[test]
-    fn table_without_a_tiebreak_is_untouched() {
-        assert!(stamp_column("variant_bench").is_none(), "variant_bench declares no dedup_tiebreak");
-        let before = batch_with(None);
-        let out = stamp_version("variant_bench", vec![before.clone()]);
-        assert_eq!(out[0].schema(), before.schema());
-        assert_eq!(out.len(), 1);
+    fn only_version_append_tables_are_stamped() {
+        for t in ["variant_bench", "otel_logs_and_spans", "otel_metrics"] {
+            assert!(stamp_column(t).is_none(), "{t} is not a version_append table — TF must not own its tiebreak");
+            let before = batch_with(None);
+            let out = stamp_version(t, vec![before.clone()]);
+            assert_eq!(out[0].schema(), before.schema(), "{t} batch schema must be untouched");
+            assert_eq!(out.len(), 1);
+        }
         // Unknown tables (per-test WAL/MemBuffer tables) are likewise untouched.
         assert!(stamp_column(&unique_table()).is_none());
     }
 
-    /// `observe_batch` reads the schema's tiebreak column, whatever it is named
-    /// — nothing hard-codes `updated_at`.
+    /// `observe_batch` reads the schema's declared tiebreak column, whatever it
+    /// is named — nothing hard-codes `updated_at`.
     #[test]
     fn observe_batch_is_schema_driven() {
         let t = unique_table();
-        let schema = Arc::new(Schema::new(vec![Field::new("ingested_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)]));
+        let declared = crate::schema_loader::get_schema("mor_versioned").expect("fixture registered").dedup_tiebreak.clone().expect("declares a tiebreak");
+        assert_eq!(stamp_column("mor_versioned").map(|(n, _, _)| n), Some(declared.as_str()), "the stamp column comes from the YAML, not a literal");
+        let schema = Arc::new(Schema::new(vec![Field::new(&declared, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(TimestampMicrosecondArray::from(vec![7_777_i64]).with_timezone("UTC")) as ArrayRef]).unwrap();
-        // otel_metrics declares `ingested_at`; the same code path picks it up.
-        assert_eq!(stamp_column("otel_metrics").map(|(n, _, _)| n), Some("ingested_at"));
-        observe_batch("otel_metrics", &batch);
-        assert!(next_stamp("otel_metrics") > 7_777);
+        observe_batch("mor_versioned", &batch);
+        assert!(next_stamp("mor_versioned") > 7_777);
         // A table with no schema observes nothing (and must not panic).
         observe_batch(
             &t,
