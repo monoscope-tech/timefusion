@@ -6000,7 +6000,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>,
     ) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
+        let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
         let date_str = date.to_string();
         let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
@@ -9231,6 +9231,24 @@ fn choose_optimize_type(
     if allow_sort && !sort_cols.is_empty() { (OptimizeType::SortBy(sort_cols), true) } else { (OptimizeType::Compact, false) }
 }
 
+/// Consolidation upgrades SortBy to SortByDedup: duplicates share every sort
+/// key (`id` is a content hash), so they're consecutive in the sorted stream
+/// and the fork drops them for free while writing. Tiebreak mirrors flush
+/// dedup's last-write-wins — greatest `dedup_tiebreak` (observed_timestamp)
+/// sorts first and survives, so the enriched re-emit beats the base row.
+fn consolidate_optimize_type(
+    schema: &crate::schema_loader::TableSchema, allow_sort: bool,
+) -> (deltalake::operations::optimize::OptimizeType, bool) {
+    use deltalake::operations::optimize::{DedupConfig, OptimizeType, SortColumn};
+    match choose_optimize_type(schema, false, allow_sort) {
+        (OptimizeType::SortBy(cols), true) if !schema.dedup_keys.is_empty() => {
+            let tiebreak = schema.dedup_tiebreak.as_ref().map(|tb| SortColumn { column: tb.clone(), descending: true, nulls_first: false });
+            (OptimizeType::SortByDedup(cols, DedupConfig { columns: schema.dedup_keys.clone(), tiebreak }), true)
+        }
+        other => other,
+    }
+}
+
 /// Pure builder for parquet `WriterProperties` at a given compression tier.
 /// Lives outside `impl Database` so unit tests can exercise tier/encoding/bloom
 /// decisions without instantiating a Database (which needs S3/MinIO).
@@ -12314,6 +12332,21 @@ mod tests {
         let (optimize_type, declare_sorted) = full_optimize_type(schema, true);
         assert!(matches!(optimize_type, OptimizeType::SortBy(_)));
         assert!(declare_sorted);
+    }
+
+    #[test]
+    fn consolidate_dedups_on_sorted_rewrite() {
+        use deltalake::operations::optimize::OptimizeType;
+        let schema = get_schema("otel_logs_and_spans").unwrap();
+        let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, true);
+        let OptimizeType::SortByDedup(cols, dedup) = optimize_type else { panic!("expected SortByDedup") };
+        assert_eq!(cols[0].column, "timestamp");
+        assert_eq!(dedup.columns, vec!["timestamp", "id"]);
+        let tb = dedup.tiebreak.expect("tiebreak from schema");
+        assert!(tb.column == "observed_timestamp" && tb.descending);
+        assert!(declare_sorted);
+        // sort disabled → plain Compact, no dedup claim
+        assert!(matches!(consolidate_optimize_type(schema, false), (OptimizeType::Compact, false)));
     }
 
     /// Helper function to extract string value from array column, handling different string array types
