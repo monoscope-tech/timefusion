@@ -240,7 +240,6 @@ impl DerivedBudget {
         Self::from_limits(env_memory_budget_bytes().map_or(detected, |b| b.min(detected)), detect_cores())
     }
 
-
     pub fn query_pool_bytes(&self) -> usize {
         self.query_pool_bytes
     }
