@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
 
 use serde::Deserialize;
-use tracing::info;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
@@ -238,25 +237,9 @@ impl DerivedBudget {
     /// number the whole tree derives from — see `env_memory_budget_bytes`.
     pub fn compute() -> Self {
         let detected = detect_memory_limit_clamped();
-        let budget = Self::from_limits(env_memory_budget_bytes().map_or(detected, |b| b.min(detected)), detect_cores());
-        // Log the DERIVED tree, not the knobs: prod carried
-        // TIMEFUSION_MEMORY_LIMIT_GB=26 for months while the process actually
-        // budgeted 120 GiB, and nothing on the box revealed the ~5x gap
-        // (2026-07-31). Whatever this line prints is what the process will use.
-        let gib = |b: usize| b as f64 / GIB as f64;
-        info!(
-            detected_limit_gib = gib(detected),
-            effective_limit_gib = gib(budget.memory_limit_bytes),
-            cores = budget.cores,
-            query_pool_gib = gib(budget.query_pool_bytes),
-            ingest_buffer_gib = gib(budget.ingest_buffer_bytes),
-            foyer_gib = gib(budget.foyer_memory_bytes),
-            writer_reserve_gib = gib(budget.writer_reserve_bytes),
-            maintenance_pool_gib = gib(budget.maintenance_pool_bytes),
-            "derived memory budget (sums to the effective limit — TF will grow into it)"
-        );
-        budget
+        Self::from_limits(env_memory_budget_bytes().map_or(detected, |b| b.min(detected)), detect_cores())
     }
+
 
     pub fn query_pool_bytes(&self) -> usize {
         self.query_pool_bytes
@@ -388,9 +371,10 @@ impl DerivedBudget {
 /// Startup log of the whole derived tree so a misread cgroup limit is
 /// immediately visible (doc §4 hard requirement). `hot_project_count` uses
 /// prod's current 11 as the illustrative K.
-fn log_derived_budget(b: &DerivedBudget) {
+pub fn log_derived_budget(b: &DerivedBudget) {
     tracing::info!(
-        memory_limit_gb = b.memory_limit_bytes / GIB,
+        detected_limit_gb = detect_memory_limit_clamped() / GIB,
+        effective_limit_gb = b.memory_limit_bytes / GIB,
         cores = b.cores,
         query_pool_gb = b.query_pool_bytes() / GIB,
         ingest_buffer_gb = b.buffer_max_bytes() / GIB,
@@ -415,7 +399,6 @@ pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // See: https://github.com/softprops/envy/issues/26
     let memory: MemoryConfig = envy::from_env()?;
     let derived = DerivedBudget::compute();
-    log_derived_budget(&derived);
     Ok(AppConfig {
         aws: envy::from_env()?,
         core: envy::from_env()?,
@@ -844,7 +827,9 @@ pub struct AppConfig {
     #[serde(flatten)]
     pub tantivy: TantivyConfig,
     /// Self-sizing budget tree, derived (not deserialized) once at
-    /// construction time from cgroup limits + `timefusion_memory_fraction`.
+    /// construction time from the cgroup limit, optionally lowered by
+    /// `TIMEFUSION_MEMORY_BUDGET_GB`. NOT `timefusion_memory_fraction` — that
+    /// knob has been dead since the tree landed.
     #[serde(skip)]
     pub derived: DerivedBudget,
 }

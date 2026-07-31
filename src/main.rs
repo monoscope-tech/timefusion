@@ -102,6 +102,11 @@ fn main() -> anyhow::Result<()> {
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize OpenTelemetry with OTLP exporter
     telemetry::init_telemetry(&cfg.telemetry)?;
+    // AFTER init_telemetry: config is built before the subscriber exists, so
+    // logging the tree at derivation time is silently swallowed — which is why
+    // prod could carry TIMEFUSION_MEMORY_LIMIT_GB=26 while actually budgeting
+    // 120 GiB with nothing on the box revealing the gap (2026-07-31).
+    config::log_derived_budget(&cfg.derived);
     clock::init_from_env();
 
     // Start heap+CPU profiling (no-op unless --features profiling on Linux).
