@@ -6,7 +6,7 @@ use std::sync::{
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray, UInt32Array},
     compute::{concat, filter_record_batch},
-    datatypes::{DataType, SchemaRef, TimeUnit},
+    datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit},
     row::{OwnedRow, RowConverter, SortField},
 };
 use dashmap::DashMap;
@@ -102,6 +102,54 @@ fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
         info!("Schema evolution: {} new nullable field(s) added", new_fields);
     }
     true
+}
+
+/// Take field nullability from the **declared** table schema wherever the data
+/// honestly supports it, so one schema is authoritative end-to-end.
+///
+/// Arrow records nullability from how an array was *built*, not from whether it
+/// holds nulls, so client and decode paths routinely hand us
+/// `timestamp: nullable=true` for a column that is never null. That metadata
+/// used to be pinned on the TableBuffer for the process lifetime (whatever the
+/// first batch happened to say), ride into demoted hot-tier IPC files and the
+/// flush path, and only surface far downstream as a mismatch against the
+/// declared NOT NULL schema — as a hot-tier read miss, or as DataFusion's
+/// `physical true vs logical false` aggregate error (prod 2026-07-31).
+///
+/// Only same-name, **exactly**-same-type fields are substituted, which leaves
+/// variant columns (Utf8View SQL view vs Struct storage view) and any timezone
+/// mismatch untouched. Tightening to NOT NULL additionally requires the column
+/// to actually hold no nulls: a declared-NOT-NULL column that does contain
+/// nulls stays nullable rather than asserting an invariant the data violates.
+/// `null_count` is `None` when no data is available to check (schema-only
+/// alignment), in which case the declared nullability is taken as given.
+fn align_nullability(schema: &SchemaRef, declared: &SchemaRef, null_count: Option<&dyn Fn(usize) -> usize>) -> Option<SchemaRef> {
+    let mut changed = false;
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let honest = |d: &Field| d.is_nullable() || null_count.is_none_or(|nc| nc(i) == 0);
+            match declared.field_with_name(f.name()) {
+                Ok(d) if d.data_type() == f.data_type() && d.is_nullable() != f.is_nullable() && honest(d) => {
+                    changed = true;
+                    Arc::new(f.as_ref().clone().with_nullable(d.is_nullable()))
+                }
+                _ => f.clone(),
+            }
+        })
+        .collect();
+    changed.then(|| Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())) as SchemaRef)
+}
+
+/// [`align_nullability`] applied to a batch. Returns the batch untouched when
+/// nothing differs (the steady-state path) or when the rebuild would fail.
+fn align_batch_nullability(batch: RecordBatch, declared: Option<&SchemaRef>) -> RecordBatch {
+    let Some(declared) = declared else { return batch };
+    let nc = |i: usize| batch.column(i).null_count();
+    let Some(aligned) = align_nullability(&batch.schema(), declared, Some(&nc)) else { return batch };
+    RecordBatch::try_new(aligned, batch.columns().to_vec()).unwrap_or(batch)
 }
 
 fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
@@ -258,6 +306,11 @@ pub type BucketCacheKey = (Arc<str>, Arc<str>, i64);
 pub struct TableBuffer {
     buckets: DashMap<i64, TimeBucket>,
     schema: SchemaRef, // Immutable after creation - no lock needed
+    /// Declared (YAML) schema for `table_name`, resolved once at construction.
+    /// Every inbound batch is reconciled against it by [`align_nullability`];
+    /// `None` for tables with no registry entry (tests, ad-hoc tables), which
+    /// keeps the incoming batch's own metadata authoritative.
+    declared: Option<SchemaRef>,
     project_id: Arc<str>,
     table_name: Arc<str>,
 }
@@ -2434,7 +2487,13 @@ impl Default for MemBuffer {
 
 impl TableBuffer {
     fn new(schema: SchemaRef, project_id: Arc<str>, table_name: Arc<str>) -> Self {
-        Self { buckets: DashMap::new(), schema, project_id, table_name }
+        // Resolve the declared schema once per table (`schema_ref()` builds
+        // ~100 fields, far too costly per batch) and pin its nullability onto
+        // the advertised schema, so readers see the declared truth rather than
+        // whatever metadata the first batch to arrive happened to carry.
+        let declared = crate::schema_loader::get_schema(&table_name).map(|s| s.schema_ref());
+        let schema = declared.as_ref().and_then(|d| align_nullability(&schema, d, None)).unwrap_or(schema);
+        Self { buckets: DashMap::new(), schema, declared, project_id, table_name }
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -2457,7 +2516,10 @@ impl TableBuffer {
     /// only the insert size is what leaked the coalesce savings and let the
     /// MemBuffer-level total drift (see `MemBuffer::estimated_bytes`).
     pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>) -> anyhow::Result<(i64, i64)> {
-        let batch = compact_batch(batch);
+        // Reconcile against the declared schema BEFORE the batch is stored:
+        // every downstream consumer (coalesce, flush, hot-tier demotion, query)
+        // then sees one authoritative nullability. See `align_nullability`.
+        let batch = align_batch_nullability(compact_batch(batch), self.declared.as_ref());
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let new_size = estimate_batch_size(&batch);
@@ -2715,6 +2777,67 @@ mod tests {
         assert_eq!(merge_ranges(vec![(0, 30), (5, 10)]), vec![(0, 30)]);
         assert!(merge_ranges(vec![]).is_empty());
         assert!(overlaps((0, 10), (9, 20)) && !overlaps((0, 10), (10, 20)));
+    }
+
+    /// Batch shaped like a client-built insert: every field marked nullable
+    /// (Arrow takes nullability from how the array was *built*, not from the
+    /// data) even though the columns are fully populated.
+    fn nullable_otel_batch(with_null_id: bool) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+            Field::new("id", DataType::Utf8View, true),
+        ]));
+        let ts = TimestampMicrosecondArray::from(vec![1_000i64, 2_000]).with_timezone("UTC");
+        let id = StringViewArray::from(vec![Some("a"), if with_null_id { None } else { Some("b") }]);
+        RecordBatch::try_new(schema, vec![Arc::new(ts), Arc::new(id)]).unwrap()
+    }
+
+    /// Regression (prod 2026-07-31): MemBuffer pinned whatever nullability the
+    /// FIRST batch happened to carry, so a fully-populated `timestamp` arriving
+    /// as `nullable=true` made the buffer advertise a schema that disagreed
+    /// with the declared NOT NULL one — surfacing downstream as hot-tier read
+    /// misses and DataFusion's `physical true vs logical false` aggregate error.
+    #[test]
+    fn membuffer_takes_nullability_from_declared_schema_not_first_batch() {
+        let buffer = MemBuffer::new();
+        buffer.insert("p1", "otel_logs_and_spans", nullable_otel_batch(false), 1_000).unwrap();
+
+        let advertised = buffer.get_table("p1", "otel_logs_and_spans").unwrap().schema();
+        let stored = buffer.query("p1", "otel_logs_and_spans", &[]).unwrap();
+
+        for schema in [advertised, stored[0].schema()] {
+            for col in ["timestamp", "id"] {
+                assert!(!schema.field_with_name(col).unwrap().is_nullable(), "`{col}` is declared NOT NULL and holds no nulls, so it must not stay nullable");
+            }
+        }
+    }
+
+    /// The alignment must never assert an invariant the data violates: a
+    /// declared-NOT-NULL column that genuinely contains nulls stays nullable
+    /// (surfacing the bad data) rather than being relabelled NOT NULL.
+    #[test]
+    fn declared_not_null_column_holding_nulls_stays_nullable() {
+        let buffer = MemBuffer::new();
+        buffer.insert("p1", "otel_logs_and_spans", nullable_otel_batch(true), 1_000).unwrap();
+
+        let stored = buffer.query("p1", "otel_logs_and_spans", &[]).unwrap();
+        let schema = stored[0].schema();
+        assert!(schema.field_with_name("id").unwrap().is_nullable(), "`id` actually contains a null; relabelling it NOT NULL would lie about the data");
+        assert!(!schema.field_with_name("timestamp").unwrap().is_nullable(), "`timestamp` is null-free and must still be tightened");
+    }
+
+    /// Alignment is name+exact-type only, so it must leave unknown tables and
+    /// mismatched types alone rather than silently re-typing a column.
+    #[test]
+    fn nullability_alignment_ignores_unknown_tables_and_mismatched_types() {
+        let buffer = MemBuffer::new();
+        buffer.insert("p1", "not_a_registered_table", nullable_otel_batch(false), 1_000).unwrap();
+        assert!(buffer.query("p1", "not_a_registered_table", &[]).unwrap()[0].schema().field_with_name("timestamp").unwrap().is_nullable());
+
+        // `id` is declared Utf8; an Int64 `id` must keep its own metadata.
+        let declared = crate::schema_loader::get_schema("otel_logs_and_spans").unwrap().schema_ref();
+        let mistyped = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        assert!(align_nullability(&mistyped, &declared, None).is_none());
     }
 
     fn create_test_batch(timestamp_micros: i64) -> RecordBatch {

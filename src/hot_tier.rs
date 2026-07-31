@@ -483,6 +483,11 @@ impl HotTier {
             // (caught only by `schema_drift_total` == `read_hits_total`).
             // Re-stamp instead, once the data proves it satisfies the stricter
             // schema.
+            //
+            // The root cause was upstream — MemBuffer pinned whatever
+            // nullability the first batch to arrive happened to carry — and is
+            // fixed at the source in `mem_buffer::align_nullability`. This stays
+            // as tolerance for files demoted by an older binary.
             let batches = match align_nullability(batches.as_ref(), schema) {
                 Some(b) => b,
                 None => {
