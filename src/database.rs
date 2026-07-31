@@ -10364,10 +10364,18 @@ impl TableProvider for ProjectRoutingTable {
         // requested columns. No-op when the table declares no dedup_keys.
         let table_schema = crate::schema_loader::get_schema(&self.table_name);
         let dedup_keys: Vec<String> = table_schema.as_ref().map(|s| s.dedup_keys.clone()).unwrap_or_default();
-        // The tiebreak rides in with the keys: DedupExec keeps the GREATEST
-        // version per key (merge-on-read, docs/plans/2026-08-01-merge-on-read-dml.md),
-        // so it must see the column even when the query projected it away.
-        let dedup_tiebreak: Option<String> = table_schema.and_then(|s| s.dedup_tiebreak.clone());
+        // The tiebreak rides in with the keys ONLY for merge-on-read tables:
+        // DedupExec keeps the GREATEST version per key there
+        // (docs/plans/2026-08-01-merge-on-read-dml.md), so it must see the
+        // column even when the query projected it away.
+        //
+        // Gated on `version_append` because pulling it in unconditionally is a
+        // pure cost on every other table: keep-greatest cannot engage without
+        // the ordered union (also version_append-gated), so the column is read
+        // and never used. Measured on prod 2026-07-31: adding
+        // `observed_timestamp` to every otel_logs_and_spans scan took
+        // count(1h) 14.8s -> 31s and count(3h) 22.9s -> >150s.
+        let dedup_tiebreak: Option<String> = table_schema.as_ref().filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone());
         // Merge-on-read DELETE: a tombstone version must reach the filter ABOVE
         // the dedup, so its marker column rides in with the keys and is stripped
         // again afterwards. `None` on every table that declares none.
