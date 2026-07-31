@@ -29,16 +29,66 @@ pub struct TableSchema {
     #[serde(default)]
     pub dedup_keys: Vec<String>,
     /// Tie-breaker column for dedup: when rows share `dedup_keys`, keep the one
-    /// with the greatest value here (ties → last seen, the back-compat default).
-    /// Lets an enriched re-emit with a later `observed_timestamp` win over the
-    /// base row (parity plan Defect 3). `None` = keep-last by position.
+    /// with the greatest value here (ties → last seen, the back-compat default;
+    /// NULL sorts lowest, so an un-stamped legacy row always loses).
+    /// A `Timestamp(Microsecond, _)` tiebreak is TF-owned: every write stamps it
+    /// from a per-table monotonic clock (`insert_coerce::stamp_version`), so the
+    /// newest version of a row wins deterministically. `None` = keep-last by position.
     #[serde(default)]
     pub dedup_tiebreak: Option<String>,
+    /// Nullable `Boolean` column marking a row version as a DELETION of its
+    /// `dedup_keys` tuple (merge-on-read). `None` = the table has no tombstones
+    /// and every mechanism below is a no-op. NULL and `false` both mean live —
+    /// only `true` is a tombstone — so a table can declare the column before a
+    /// single tombstone exists (and before any backfill) with zero effect.
+    ///
+    /// Independent of [`Self::version_append`] on purpose: read-side filtering
+    /// and the sweep's version collapse key off this column alone, so they come
+    /// alive (as no-ops) without waiting for the write path.
+    #[serde(default)]
+    pub tombstone_column: Option<String>,
+    /// Merge-on-read WRITE path: `UPDATE`/`DELETE` append a new row version
+    /// (with a fresh `dedup_tiebreak`, and `tombstone_column = true` for a
+    /// delete) instead of planning a Delta MERGE. Per-table opt-in; false =
+    /// today's in-place mutation. Requires `dedup_keys`, `dedup_tiebreak` and
+    /// `tombstone_column`.
+    ///
+    /// Read-side fast paths that are only *wrong* once a key has more than one
+    /// version on disk gate on THIS flag, not on `tombstone_column`: see
+    /// [`Self::tombstones_possible`] (COUNT(*)-from-stats pushdown) and the
+    /// order-preserving union in `ProjectRoutingTable::scan` (which exists only
+    /// to make `DedupExec`'s keep-greatest engage). Declaring the column is
+    /// inert, so gating those on the column alone costs a full scan / a blocking
+    /// sort + k-way merge for a feature that cannot yet have written anything.
+    #[serde(default)]
+    pub version_append: bool,
 }
 
 impl TableSchema {
     pub fn time_column_name(&self) -> &str {
         self.time_column.as_deref().unwrap_or("timestamp")
+    }
+
+    /// Arrow type + nullability of one declared field, without building the
+    /// whole `schema_ref()` (which allocates ~100 fields per call).
+    pub fn field_def(&self, name: &str) -> Option<(ArrowDataType, bool)> {
+        let f = self.fields.iter().find(|f| f.name == name)?;
+        Some((parse_arrow_data_type(&f.data_type).ok()?, f.nullable))
+    }
+
+    /// Can a tombstone row EXIST in this table's storage? Only if the column is
+    /// declared AND the write path that emits tombstones is enabled — a declared
+    /// column with `version_append: false` is a no-op (see `tombstone_column`).
+    ///
+    /// ORDERING INVARIANT: `version_append` is the flag that *enables* writing a
+    /// tombstone, so it is necessarily true strictly before the first tombstone
+    /// exists; a reader that trusts it therefore never counts one it hasn't
+    /// accounted for. Never add a write path that appends a tombstone (or any
+    /// second row version) without gating it on `version_append`, and never flip
+    /// the flag off after tombstones were written — either breaks this and turns
+    /// the COUNT(*) stats pushdown into a silent over-count.
+    pub fn tombstones_possible(&self) -> bool {
+        self.tombstone_column.is_some() && self.version_append
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -61,6 +111,21 @@ impl TableSchema {
             if f.data_type == "Variant" {
                 anyhow::bail!("schema `{}`: dedup_tiebreak cannot be a Variant column `{}`", self.table_name, tb);
             }
+        }
+        if let Some(tc) = &self.tombstone_column {
+            let f = self
+                .fields
+                .iter()
+                .find(|f| f.name == *tc)
+                .ok_or_else(|| anyhow::anyhow!("schema `{}`: tombstone_column references unknown field `{}`", self.table_name, tc))?;
+            // Nullable Boolean is load-bearing: NULL must be a legal "live"
+            // encoding so existing rows need no backfill.
+            if f.data_type != "Boolean" || !f.nullable {
+                anyhow::bail!("schema `{}`: tombstone_column `{}` must be a nullable Boolean field", self.table_name, tc);
+            }
+        }
+        if self.version_append && (self.dedup_keys.is_empty() || self.dedup_tiebreak.is_none() || self.tombstone_column.is_none()) {
+            anyhow::bail!("schema `{}`: version_append requires dedup_keys, dedup_tiebreak and tombstone_column", self.table_name);
         }
         Ok(())
     }
@@ -398,6 +463,62 @@ mod tests {
             let want = data_cols.iter().position(|n| *n == def.name).unwrap() as i32;
             assert_eq!(sc.column_idx, want, "sort col `{}` column_idx mismatch", def.name);
         }
+    }
+
+    /// The tombstone column must be appended LAST (no existing column's physical
+    /// parquet index may shift), nullable Boolean (NULL = live, so no backfill),
+    /// and named by the schema — nothing hard-codes it. `version_append` stays
+    /// off: it gates only the phase-3 write path, and decoupling it from
+    /// `tombstone_column` keeps rollback from resurrecting deleted rows.
+    #[test]
+    fn otel_tombstone_column_is_last_and_nullable_boolean() {
+        let schema = get_schema("otel_logs_and_spans").expect("otel schema registered");
+        assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"));
+        assert!(!schema.version_append, "write-path flag must stay off until the version-append path lands");
+        let last = schema.fields.last().expect("fields non-empty");
+        assert_eq!(last.name, "deleted", "tombstone column must be appended LAST");
+        assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)));
+    }
+
+    /// Tables that declare no tombstone column are untouched by any of it.
+    #[test]
+    fn otel_metrics_has_no_tombstone_column() {
+        let schema = get_schema("otel_metrics").expect("metrics schema registered");
+        assert_eq!(schema.tombstone_column, None);
+        assert!(!schema.version_append);
+        assert_eq!(schema.dedup_tiebreak.as_deref(), Some("ingested_at"));
+    }
+
+    #[test]
+    fn validate_rejects_bad_tombstone_and_version_append_declarations() {
+        let base = "table_name: t\npartitions: []\nsorting_columns: []\nz_order_columns: []\ndedup_keys: [id]\ndedup_tiebreak: updated_at\n";
+        let fields = "fields:\n  - {name: id, data_type: Utf8, nullable: false}\n  - {name: updated_at, data_type: 'Timestamp(Microsecond, None)', nullable: true}\n  - {name: deleted, data_type: Boolean, nullable: true}\n";
+        let parse = |extra: &str, fields: &str| serde_yaml::from_str::<TableSchema>(&format!("{base}{extra}{fields}")).expect("yaml parses").validate();
+
+        parse("tombstone_column: deleted\nversion_append: true\n", fields).expect("well-formed version-append table");
+        assert!(parse("tombstone_column: missing\n", fields).unwrap_err().to_string().contains("unknown field"));
+        assert!(parse("tombstone_column: id\n", fields).unwrap_err().to_string().contains("nullable Boolean"));
+        let non_null = fields.replace("deleted, data_type: Boolean, nullable: true", "deleted, data_type: Boolean, nullable: false");
+        assert!(parse("tombstone_column: deleted\n", &non_null).unwrap_err().to_string().contains("nullable Boolean"));
+        assert!(parse("version_append: true\n", fields).unwrap_err().to_string().contains("version_append requires"));
+    }
+
+    /// A declared-but-dormant tombstone column must NOT read as "tombstones can
+    /// exist" — that verdict is what the COUNT(*) stats pushdown gates on, and
+    /// reading it off the column alone cost every `COUNT(*)` on the main table
+    /// its fast path (pre-deploy review, 2026-07-31).
+    #[test]
+    fn tombstones_possible_needs_the_write_path_too() {
+        let base = "table_name: t\npartitions: []\nsorting_columns: []\nz_order_columns: []\ndedup_keys: [id]\ndedup_tiebreak: updated_at\n";
+        let fields = "fields:\n  - {name: id, data_type: Utf8, nullable: false}\n  - {name: updated_at, data_type: 'Timestamp(Microsecond, None)', nullable: true}\n  - {name: deleted, data_type: Boolean, nullable: true}\n";
+        let parse = |extra: &str| serde_yaml::from_str::<TableSchema>(&format!("{base}{extra}{fields}")).expect("yaml parses");
+
+        assert!(!parse("").tombstones_possible(), "no tombstone column at all");
+        assert!(!parse("tombstone_column: deleted\n").tombstones_possible(), "declared but dormant → no tombstone can exist");
+        assert!(parse("tombstone_column: deleted\nversion_append: true\n").tombstones_possible(), "write path on → tombstones can exist");
+        // The live schemas, as shipped.
+        assert!(!get_schema("otel_logs_and_spans").unwrap().tombstones_possible());
+        assert!(get_schema("mor_versioned").unwrap().tombstones_possible());
     }
 
     #[test]

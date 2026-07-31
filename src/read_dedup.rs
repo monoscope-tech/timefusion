@@ -2,9 +2,12 @@
 //!
 //! TF's write path can leave physical duplicates of a `(id, timestamp)` row in
 //! Delta (cross-flush `SaveMode::Append`, late prior-day DLQ replays the
-//! background sweep hasn't reached yet). `DedupExec` guarantees `COUNT(*)` is
-//! correct *at query time* by collapsing those duplicates over the routed +
-//! pruned MemBuffer ∪ Delta union, independent of sweep timing.
+//! background sweep hasn't reached yet), and under the merge-on-read model
+//! (`docs/plans/2026-08-01-merge-on-read-dml.md`) an `UPDATE` deliberately
+//! appends a *new version* of the row. `DedupExec` collapses those copies over
+//! the routed + pruned MemBuffer ∪ Delta union so `COUNT(*)` is correct at query
+//! time, and — when the table declares a `dedup_tiebreak` — so the surviving
+//! copy is the newest version, independent of sweep timing.
 //!
 //! Why a physical operator and not an `AnalyzerRule` wrapping the `TableScan`:
 //! a `Distinct::On` node between the `project_id` filter and
@@ -12,41 +15,67 @@
 //! to `default_project` and time/partition pruning is lost (see the plan's
 //! reverted-blocker note). Deduping here, after routing, avoids all of that.
 //!
-//! Implementation: a **streaming keep-first** dedup. It requires a single input
-//! partition (DataFusion inserts a `CoalescePartitionsExec`) so a key can't be
-//! split across partitions, then keeps a `HashSet` of seen key-rows and filters
-//! each batch in place. Only the (tiny) key columns are held — never the fat
-//! body/attributes payload — so it streams, supports downstream early-LIMIT,
-//! and never trips Arrow's 2 GB string-offset limit. The set is keyed on the
-//! encoded key bytes (`ahash`, borrowed-probe, allocate-on-miss); when the
-//! input is already sorted by a dedup-key column it runs in bounded-window mode
-//! (see `Bound`) which caps the set at one timestamp run instead of O(distinct
-//! over the whole scan). Keep-first means the
-//! MemBuffer copy (unioned first) wins. KNOWN GAP: this does NOT apply the
-//! `dedup_tiebreak` (observed_timestamp) that the write-side `dedup_batches`
-//! and the sweep now honor, so a Defect-3 enriched re-emit that hasn't been
-//! collapsed yet may read back as the stale base row (COUNT is still correct).
-//! A streaming keep-first operator can't choose the greatest-tiebreak survivor
-//! without buffering the whole stream, which would break early-LIMIT; the
-//! sweep is the authority for which physical row survives.
+//! Implementation: one input partition (DataFusion inserts a
+//! `CoalescePartitionsExec`) so a key can't be split across partitions, and a
+//! streaming filter per batch. Only the (tiny) encoded key rows are held — never
+//! the fat body/attributes payload — so it streams, supports downstream
+//! early-LIMIT, and never trips Arrow's 2 GB string-offset limit.
 //!
-//! Dedup keys must be present in the input; the caller augments the pushed
-//! projection so they are, then `output_projection` restores the requested
-//! columns (via `RecordBatch::project`, which preserves row count for the empty
-//! `COUNT(*)` projection).
+//! Two survivor policies:
+//!
+//! * **keep-first** (no tiebreak, or no usable input ordering): a `HashSet` of
+//!   seen key-rows filters each batch in place. "First" is only ever *arrival*
+//!   order — `CoalescePartitionsExec` interleaves the union's partitions
+//!   nondeterministically — so which physical copy survives is not a guarantee
+//!   (COUNT is).
+//! * **keep-greatest** (`dedup_tiebreak` present in the input *and* bounded mode
+//!   available): the row with the greatest tiebreak per key wins, NULL lowest,
+//!   so a pre-existing row always loses to any new version. Streaming survives
+//!   because equal dedup keys share the same `timestamp` (the key is
+//!   `(timestamp, id)`), so all versions of a key live inside one bound run
+//!   (`Bound`): candidates are held only until the run closes, then emitted in
+//!   input position order. A run's batches are held (Arc clones) while it is
+//!   open, capped by `RUN_BUFFER_MAX_BYTES`; on overflow the run is flushed
+//!   early and its tail degrades to keep-first — never unbounded, never worse
+//!   than the old behaviour.
+//!
+//! Keep-greatest is deliberately NOT attempted without a bound: it would have to
+//! hold one candidate per distinct key for the whole scan, which on a 7-day wide
+//! scan is the exact shape of the 2026-07-21 wide-scan OOM. Unordered input
+//! therefore keeps keep-first (today's semantics), and the dedup sweep stays the
+//! authority for which physical row survives on that path.
+//!
+//! Single-partition only, deliberately. A hash-partitioned mode existed and was
+//! deleted: a mode shootout over the real 89-column `otel_logs_and_spans`
+//! schema (counting allocator, release) measured it 2–4× slower and ~90× peak
+//! heap on wide rows (0% dup: 54ms/26MB serial vs 205ms/2383MB hash),
+//! because dedup cost is per-ROW (RowConverter + ahash probe) while the
+//! `RepartitionExec` that `Distribution::HashPartitioned` forces copies every
+//! byte of every column. It can only win on narrow rows with heavy duplication,
+//! which is not the steady state. Don't re-litigate.
+//!
+//! Dedup keys (and the tiebreak) must be present in the input; the caller
+//! augments the pushed projection so they are, then `output_projection` restores
+//! the requested columns (via `RecordBatch::project`, which preserves row count
+//! for the empty `COUNT(*)` projection).
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use datafusion::{
     arrow::{
         array::{ArrayRef, BooleanArray, RecordBatch},
-        compute::filter_record_batch,
-        datatypes::SchemaRef,
+        compute::{SortOptions, filter_record_batch},
+        datatypes::{DataType, SchemaRef},
         row::{RowConverter, SortField},
     },
     error::{DataFusionError, Result as DFResult},
     execution::TaskContext,
-    physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, stream::RecordBatchStreamAdapter,
+    },
 };
 use futures::StreamExt;
 
@@ -60,18 +89,25 @@ use crate::errors::arrow_err;
 /// per duplicate row). `ahash` replaces std's SipHash.
 type SeenSet = HashSet<Box<[u8]>, ahash::RandomState>;
 
+/// Cap on the batches held open for one keep-greatest run. A run is one
+/// `timestamp` value, normally a handful of rows; this only fires on pathological
+/// input (a whole scan at one timestamp), where it flushes the run early rather
+/// than growing without bound.
+const RUN_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// Bounded-window dedup state (parity plan Point 3, Tier 2). When the input is
 /// already sorted by a dedup-key column (`timestamp` leads the table sort
 /// order), duplicates of a key are confined to a single bound-value run: two
 /// rows with the same dedup key share the same `timestamp` (equal key ⇒ equal
-/// bound), so they arrive contiguously. Clearing `seen` each time the bound
+/// bound), so they arrive contiguously. Clearing state each time the bound
 /// *advances* past the current run caps it at O(distinct keys within one
 /// timestamp value) instead of O(distinct over the whole scan) — the fix for
-/// the multi-GB seen-set risk on wide historical scans. Opportunistic only: we
+/// the multi-GB seen-set risk on wide historical scans, and the property that
+/// lets keep-greatest emit without buffering the stream. Opportunistic only: we
 /// never *require* the ordering (that could make EnforceSorting insert a
 /// blocking SortExec over unsorted MemBuffer partitions and break streaming);
 /// when the input isn't sorted, `detect_bound` returns `None` and dedup falls
-/// back to the full-set path — always sound.
+/// back to the full-set keep-first path — always sound.
 struct Bound {
     /// Bound column index within the input schema.
     idx: usize,
@@ -86,7 +122,7 @@ struct Bound {
 fn bound_slice(col: &ArrayRef) -> Option<&[i64]> {
     use datafusion::arrow::{
         array::AsArray,
-        datatypes::{DataType, Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType},
+        datatypes::{Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType},
     };
     Some(match col.data_type() {
         DataType::Int64 => col.as_primitive::<Int64Type>().values(),
@@ -102,7 +138,7 @@ fn bound_slice(col: &ArrayRef) -> Option<&[i64]> {
 /// i64-backed type. That guarantees equal dedup keys share the bound value, so
 /// clearing on a bound advance can never evict a key that could still recur.
 fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &SchemaRef) -> Option<Bound> {
-    use datafusion::{arrow::datatypes::DataType, physical_expr::expressions::Column};
+    use datafusion::physical_expr::expressions::Column;
     let se = input.properties().output_ordering()?.iter().next()?;
     let any: &dyn std::any::Any = se.expr.as_ref();
     let col = any.downcast_ref::<Column>()?;
@@ -118,26 +154,29 @@ fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &Sch
 
 /// The input's output ordering, remapped through `output_projection` onto the
 /// dedup output schema. Keeps the longest prefix of plain-column sort exprs
-/// whose columns survive the projection; `None` when nothing survives or the
-/// input declares no ordering.
+/// whose columns survive the projection (`map_while`: a non-column or
+/// projected-away expr truncates it); `None` when nothing survives or the input
+/// declares no ordering.
 fn remap_ordering(
     input: &Arc<dyn ExecutionPlan>, output_projection: &Option<Vec<usize>>, schema: &SchemaRef,
 ) -> Option<datafusion::physical_expr::LexOrdering> {
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
-    let in_ordering = input.properties().output_ordering()?;
-    let mut out: Vec<PhysicalSortExpr> = Vec::new();
-    for se in in_ordering.iter() {
-        // Explicit Any upcast — the PhysicalExpr trait's `as_any` collides
-        // with downcast-rs's blanket method in this crate's scope.
-        let any: &dyn std::any::Any = se.expr.as_ref();
-        let Some(col) = any.downcast_ref::<Column>() else { break };
-        let new_idx = match output_projection {
-            None => Some(col.index()),
-            Some(idxs) => idxs.iter().position(|&i| i == col.index()),
-        };
-        let Some(new_idx) = new_idx else { break };
-        out.push(PhysicalSortExpr::new(Arc::new(Column::new(schema.field(new_idx).name(), new_idx)), se.options));
-    }
+    let out: Vec<PhysicalSortExpr> = input
+        .properties()
+        .output_ordering()?
+        .iter()
+        .map_while(|se| {
+            // Explicit Any upcast — the PhysicalExpr trait's `as_any` collides
+            // with downcast-rs's blanket method in this crate's scope.
+            let any: &dyn std::any::Any = se.expr.as_ref();
+            let col = any.downcast_ref::<Column>()?;
+            let ni = match output_projection {
+                None => col.index(),
+                Some(idxs) => idxs.iter().position(|&i| i == col.index())?,
+            };
+            Some(PhysicalSortExpr::new(Arc::new(Column::new(schema.field(ni).name(), ni)), se.options))
+        })
+        .collect();
     LexOrdering::new(out)
 }
 
@@ -147,6 +186,9 @@ pub struct DedupExec {
     keys: Vec<String>,
     /// Indices of the key columns within `input.schema()`.
     key_idxs: Vec<usize>,
+    /// Schema's `dedup_tiebreak` column name, when the table declares one.
+    /// Keep-greatest engages only if it is also present in the input schema.
+    tiebreak: Option<String>,
     /// Indices into `input.schema()` to emit after dedup, restoring the
     /// originally-requested projection. `None` = emit the input schema as-is.
     output_projection: Option<Vec<usize>>,
@@ -156,6 +198,10 @@ pub struct DedupExec {
 
 impl DedupExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, keys: Vec<String>, output_projection: Option<Vec<usize>>) -> DFResult<Self> {
+        Self::with_tiebreak(input, keys, None, output_projection)
+    }
+
+    pub fn with_tiebreak(input: Arc<dyn ExecutionPlan>, keys: Vec<String>, tiebreak: Option<String>, output_projection: Option<Vec<usize>>) -> DFResult<Self> {
         let in_schema = input.schema();
         let key_idxs = keys
             .iter()
@@ -165,22 +211,18 @@ impl DedupExec {
             Some(idxs) => Arc::new(in_schema.project(idxs)?),
             None => in_schema.clone(),
         };
-        // Keep-first dedup preserves the input's row order, so the input's
-        // output ordering remains valid on the output (remapped through the
-        // projection). Without this the sorted Delta scan's declared order
-        // (fork sort-order pushdown) dies here and `ORDER BY timestamp
-        // LIMIT n` re-sorts the whole window instead of early-terminating.
+        // Dedup preserves the input's row order (it only drops rows), so the
+        // input's output ordering remains valid on the output (remapped through
+        // the projection). Without this the sorted Delta scan's declared order
+        // (fork sort-order pushdown) dies here and `ORDER BY timestamp LIMIT n`
+        // re-sorts the whole window instead of early-terminating.
         let eq = match remap_ordering(&input, &output_projection, &schema) {
             Some(ordering) => datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), [ordering]),
             None => datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
         };
-        let properties = Arc::new(PlanProperties::new(
-            eq,
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            input.properties().emission_type,
-            input.properties().boundedness,
-        ));
-        Ok(Self { input, keys, key_idxs, output_projection, schema, properties })
+        let properties =
+            Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), input.properties().emission_type, input.properties().boundedness));
+        Ok(Self { input, keys, key_idxs, tiebreak, output_projection, schema, properties })
     }
 }
 
@@ -201,14 +243,14 @@ impl ExecutionPlan for DedupExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        // Global dedup needs every row in one partition.
         vec![Distribution::SinglePartition]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        // Streaming keep-first: surviving rows appear in input order. Lets
-        // EnforceSorting swap the single-partition coalesce below for a
-        // SortPreservingMergeExec when a downstream ordering requires it.
+        // Streaming dedup: surviving rows appear in input order (keep-greatest
+        // emits a closed run in input position order). Lets EnforceSorting swap
+        // the single-partition coalesce below for a SortPreservingMergeExec when
+        // a downstream ordering requires it.
         vec![true]
     }
 
@@ -217,7 +259,7 @@ impl ExecutionPlan for DedupExec {
     }
 
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DedupExec::new(children[0].clone(), self.keys.clone(), self.output_projection.clone())?))
+        Ok(Arc::new(DedupExec::with_tiebreak(children[0].clone(), self.keys.clone(), self.tiebreak.clone(), self.output_projection.clone())?))
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
@@ -225,29 +267,44 @@ impl ExecutionPlan for DedupExec {
             return Err(DataFusionError::Internal(format!("DedupExec only produces partition 0, got {partition}")));
         }
         let in_schema = self.input.schema();
-        let sort_fields: Vec<SortField> = self.key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect();
-        let converter = RowConverter::new(sort_fields).map_err(arrow_err)?;
-
-        let input = self.input.execute(0, context)?;
-        let out_schema = self.schema.clone();
-
-        // Streaming keep-first dedup. State threads the loop-invariant config
-        // (key_idxs, output_projection, converter) alongside the mutable cursor
-        // (`input`) and the `seen` set, so nothing is re-cloned per poll. `seen`
-        // holds only the encoded key rows — never the payload — but it does grow
-        // for the whole stream lifetime, O(distinct keys) over the scan.
         let bound = detect_bound(&self.input, &self.keys, &in_schema);
-        let state = (input, converter, SeenSet::default(), self.key_idxs.clone(), self.output_projection.clone(), bound);
-        let stream = futures::stream::unfold(state, |(mut input, converter, mut seen, key_idxs, output_projection, mut bound)| async move {
+        // Keep-greatest needs the bound to know when a key can no longer recur;
+        // without it we'd have to buffer a candidate per key for the whole scan.
+        let greatest = match (&self.tiebreak, &bound) {
+            (Some(tb), Some(_)) => in_schema.index_of(tb).ok().map(|idx| Greatest::new(idx, in_schema.field(idx).data_type())).transpose()?,
+            _ => None,
+        };
+        let dedup = Dedup {
+            key_idxs: self.key_idxs.clone(),
+            conv: RowConverter::new(self.key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
+            output_projection: self.output_projection.clone(),
+            seen: SeenSet::default(),
+            bound,
+            greatest,
+        };
+
+        let input = self.input.execute(partition, context)?;
+        let out_schema = self.schema.clone();
+        let stream = futures::stream::unfold((input, dedup, Vec::new(), false), |(mut input, mut dedup, mut queue, mut done)| async move {
             loop {
-                match input.next().await {
-                    None => return None,
-                    Some(Err(e)) => return Some((Err(e), (input, converter, seen, key_idxs, output_projection, bound))),
-                    Some(Ok(batch)) => match dedup_batch(&batch, &key_idxs, &converter, &mut seen, output_projection.as_deref(), bound.as_mut()) {
-                        Ok(Some(b)) => return Some((Ok(b), (input, converter, seen, key_idxs, output_projection, bound))),
-                        Ok(None) => continue, // entire batch was duplicates → pull the next one
-                        Err(e) => return Some((Err(e), (input, converter, seen, key_idxs, output_projection, bound))),
-                    },
+                if let Some(b) = queue.pop() {
+                    return Some((Ok(b), (input, dedup, queue, done)));
+                }
+                if done {
+                    return None;
+                }
+                // `queue` is drained from the back, so push in reverse.
+                let produced = match input.next().await {
+                    None => {
+                        done = true;
+                        dedup.finish()
+                    }
+                    Some(Err(e)) => return Some((Err(e), (input, dedup, queue, done))),
+                    Some(Ok(batch)) => dedup.push(&batch),
+                };
+                match produced {
+                    Ok(bs) => queue.extend(bs.into_iter().rev()),
+                    Err(e) => return Some((Err(e), (input, dedup, queue, done))),
                 }
             }
         });
@@ -256,13 +313,147 @@ impl ExecutionPlan for DedupExec {
     }
 }
 
-/// Drop rows whose key tuple was already emitted, then restore the requested
-/// projection. Returns `None` when nothing survives (caller pulls the next batch).
-fn dedup_batch(
-    batch: &RecordBatch, key_idxs: &[usize], converter: &RowConverter, seen: &mut SeenSet, output_projection: Option<&[usize]>, bound: Option<&mut Bound>,
+/// Winning row for a dedup key within the open run: where it sits in the
+/// buffered batches, plus its order-encoded tiebreak for comparison.
+struct Cand {
+    batch: u32,
+    row: u32,
+    tb: Box<[u8]>,
+}
+
+/// Keep-greatest run state: the open run's batches (Arc clones) and its
+/// per-key winners.
+struct Greatest {
+    /// Tiebreak column index within the input schema.
+    idx: usize,
+    /// Order-preserving encoder for the tiebreak (ascending, NULLs first ⇒ NULL
+    /// encodes lowest, so a pre-existing row loses to any new version). Arrow's
+    /// row format compares byte-lexicographically in value order, so `>` on the
+    /// encoded bytes *is* `>` on the value, for any type.
+    conv: RowConverter,
+    best: HashMap<Box<[u8]>, Cand, ahash::RandomState>,
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+}
+
+impl Greatest {
+    fn new(idx: usize, dt: &DataType) -> DFResult<Self> {
+        let sf = SortField::new_with_options(dt.clone(), SortOptions { descending: false, nulls_first: true });
+        Ok(Self { idx, conv: RowConverter::new(vec![sf]).map_err(arrow_err)?, best: HashMap::default(), batches: Vec::new(), bytes: 0 })
+    }
+
+    /// Emit the run's winners in input position order and reset. `partial` (a
+    /// `RUN_BUFFER_MAX_BYTES` overflow, not a real run boundary) parks the
+    /// emitted keys in `seen` so the run's tail can't re-emit them — that tail
+    /// degrades to keep-first.
+    fn flush(&mut self, output_projection: Option<&[usize]>, seen: &mut SeenSet, partial: bool) -> DFResult<Vec<RecordBatch>> {
+        self.bytes = 0;
+        let batches = std::mem::take(&mut self.batches);
+        if self.best.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut masks: Vec<Vec<bool>> = batches.iter().map(|b| vec![false; b.num_rows()]).collect();
+        for (k, c) in self.best.drain() {
+            masks[c.batch as usize][c.row as usize] = true;
+            if partial {
+                seen.insert(k);
+            }
+        }
+        batches
+            .into_iter()
+            .zip(masks)
+            .filter_map(|(b, m)| {
+                let kept = match filter_record_batch(&b, &BooleanArray::from(m)).map_err(arrow_err) {
+                    Ok(k) => k,
+                    Err(e) => return Some(Err(e)),
+                };
+                let out = match output_projection {
+                    Some(idxs) => match kept.project(idxs).map_err(arrow_err) {
+                        Ok(o) => o,
+                        Err(e) => return Some(Err(e)),
+                    },
+                    None => kept,
+                };
+                (out.num_rows() > 0).then(|| Ok(out))
+            })
+            .collect()
+    }
+}
+
+/// Per-partition streaming dedup state.
+struct Dedup {
+    key_idxs: Vec<usize>,
+    conv: RowConverter,
+    output_projection: Option<Vec<usize>>,
+    /// Keep-first: keys already emitted. Keep-greatest: keys emitted by a
+    /// partial (overflow) flush of the open run, cleared at the run boundary.
+    seen: SeenSet,
+    bound: Option<Bound>,
+    greatest: Option<Greatest>,
+}
+
+impl Dedup {
+    fn push(&mut self, batch: &RecordBatch) -> DFResult<Vec<RecordBatch>> {
+        let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
+        let keys = self.conv.convert_columns(&key_arrays).map_err(arrow_err)?;
+        let (Some(g), Some(bound)) = (self.greatest.as_mut(), self.bound.as_mut()) else {
+            return Ok(dedup_first(batch, &keys, &mut self.seen, self.output_projection.as_deref(), self.bound.as_mut())?.into_iter().collect());
+        };
+        let proj = self.output_projection.as_deref();
+        let mut out = Vec::new();
+        if g.bytes > RUN_BUFFER_MAX_BYTES {
+            out.extend(g.flush(proj, &mut self.seen, true)?);
+        }
+        let tbs = g.conv.convert_columns(&[batch.column(g.idx).clone()]).map_err(arrow_err)?;
+        let bvals =
+            bound_slice(batch.column(bound.idx)).ok_or_else(|| DataFusionError::Internal(format!("DedupExec bound column {} is not i64-backed", bound.idx)))?;
+        let (desc, mut last) = (bound.desc, bound.last);
+        // Index of `batch` within the open run's buffer; `None` until a row of
+        // this batch wins something, and reset by every flush (the run changed).
+        let mut cur: Option<u32> = None;
+        for (i, &t) in bvals.iter().enumerate().take(batch.num_rows()) {
+            if last.is_some_and(|l| if desc { t < l } else { t > l }) {
+                out.extend(g.flush(proj, &mut self.seen, false)?);
+                self.seen.clear();
+                cur = None;
+            }
+            if last.is_none_or(|l| if desc { t < l } else { t > l }) {
+                last = Some(t);
+            }
+            let key = keys.row(i).data();
+            if self.seen.contains(key) {
+                continue;
+            }
+            let tb = tbs.row(i).data();
+            if g.best.get(key).is_some_and(|c| tb <= &c.tb[..]) {
+                continue;
+            }
+            let bi = *cur.get_or_insert_with(|| {
+                g.batches.push(batch.clone());
+                g.bytes += batch.get_array_memory_size();
+                g.batches.len() as u32 - 1
+            });
+            g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into() });
+        }
+        bound.last = last;
+        Ok(out)
+    }
+
+    /// End of stream: emit the still-open run.
+    fn finish(&mut self) -> DFResult<Vec<RecordBatch>> {
+        match self.greatest.as_mut() {
+            Some(g) => g.flush(self.output_projection.as_deref(), &mut self.seen, false),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// Keep-first: drop rows whose key tuple was already emitted, then restore the
+/// requested projection. Returns `None` when nothing survives (caller pulls the
+/// next batch).
+fn dedup_first(
+    batch: &RecordBatch, keys: &datafusion::arrow::row::Rows, seen: &mut SeenSet, output_projection: Option<&[usize]>, bound: Option<&mut Bound>,
 ) -> DFResult<Option<RecordBatch>> {
-    let key_arrays: Vec<ArrayRef> = key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
-    let rows = converter.convert_columns(&key_arrays).map_err(arrow_err)?;
     // Bounded-window state (Tier 2): the bound column's per-row values, sort
     // direction, and the run cursor. `bound_slice` returning None (unsupported
     // type) silently disables eviction for this batch — still correct.
@@ -286,7 +477,7 @@ fn dedup_batch(
                     last = Some(t);
                 }
             }
-            let bytes = rows.row(i).data();
+            let bytes = keys.row(i).data();
             !seen.contains(bytes) && {
                 seen.insert(bytes.into());
                 true
@@ -306,9 +497,12 @@ fn dedup_batch(
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::{
-        array::{Int64Array, StringArray},
-        datatypes::{DataType, Field, Schema},
+    use datafusion::{
+        arrow::{
+            array::{Array, Int64Array, StringArray},
+            datatypes::{Field, Schema},
+        },
+        physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column},
     };
 
     use super::*;
@@ -322,6 +516,10 @@ mod tests {
         RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap()
     }
 
+    fn keys_of(b: &RecordBatch, idxs: &[usize], c: &RowConverter) -> datafusion::arrow::row::Rows {
+        c.convert_columns(&idxs.iter().map(|&i| b.column(i).clone()).collect::<Vec<_>>()).unwrap()
+    }
+
     /// COUNT-correctness + keep-first across batches: the seen-set threads
     /// state, duplicates (including cross-batch) collapse, and the *first*
     /// occurrence's row survives (its `v`). Regression guard for the
@@ -331,7 +529,7 @@ mod tests {
         let converter = conv();
         let mut seen = SeenSet::default();
         let b1 = batch(&["a", "b", "a", "c"], &[1, 2, 3, 4]);
-        let out1 = dedup_batch(&b1, &[0], &converter, &mut seen, None, None).unwrap().unwrap();
+        let out1 = dedup_first(&b1, &keys_of(&b1, &[0], &converter), &mut seen, None, None).unwrap().unwrap();
         let ids = out1.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let vs = out1.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ids.iter().flatten().collect::<Vec<_>>(), vec!["a", "b", "c"]);
@@ -339,11 +537,11 @@ mod tests {
 
         // Second batch: every key already seen → whole batch drops (None).
         let b2 = batch(&["b", "a"], &[9, 9]);
-        assert!(dedup_batch(&b2, &[0], &converter, &mut seen, None, None).unwrap().is_none());
+        assert!(dedup_first(&b2, &keys_of(&b2, &[0], &converter), &mut seen, None, None).unwrap().is_none());
 
         // A fresh key in an otherwise-dup batch survives alone.
         let b3 = batch(&["a", "d"], &[9, 5]);
-        let out3 = dedup_batch(&b3, &[0], &converter, &mut seen, None, None).unwrap().unwrap();
+        let out3 = dedup_first(&b3, &keys_of(&b3, &[0], &converter), &mut seen, None, None).unwrap().unwrap();
         assert_eq!(out3.num_rows(), 1);
         assert_eq!(out3.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "d");
     }
@@ -362,16 +560,245 @@ mod tests {
 
         // Run ts=10: a,b,a → within-run dup of `a` collapses.
         let r1 = batch(&["a", "b", "a"], &[10, 10, 10]);
-        let o1 = dedup_batch(&r1, &[0, 1], &converter, &mut seen, None, Some(&mut bound)).unwrap().unwrap();
+        let o1 = dedup_first(&r1, &keys_of(&r1, &[0, 1], &converter), &mut seen, None, Some(&mut bound)).unwrap().unwrap();
         assert_eq!(o1.num_rows(), 2, "(a,10),(b,10) survive; second (a,10) dropped");
         assert_eq!(seen.len(), 2);
 
         // ts advances to 11: seen cleared; `a` re-seen at a NEW ts is a distinct
         // key and survives. Set shrank to the new run only.
         let r2 = batch(&["a", "a"], &[11, 11]);
-        let o2 = dedup_batch(&r2, &[0, 1], &converter, &mut seen, None, Some(&mut bound)).unwrap().unwrap();
+        let o2 = dedup_first(&r2, &keys_of(&r2, &[0, 1], &converter), &mut seen, None, Some(&mut bound)).unwrap().unwrap();
         assert_eq!(o2.num_rows(), 1, "(a,11) survives once; second (a,11) is a same-run dup");
         assert_eq!(seen.len(), 1, "seen-set bounded to the current run, not O(all distinct)");
         assert_eq!(bound.last, Some(11));
+    }
+
+    // ---- plumbing ----
+
+    fn source(partitions: &[Vec<RecordBatch>], ordering: Option<LexOrdering>) -> Arc<dyn ExecutionPlan> {
+        use datafusion::datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+        let schema = partitions[0][0].schema();
+        let cfg = MemorySourceConfig::try_new(partitions, schema, None).unwrap();
+        let cfg = match ordering {
+            Some(o) => cfg.try_with_sort_information(vec![o]).unwrap(),
+            None => cfg,
+        };
+        Arc::new(DataSourceExec::new(Arc::new(cfg)))
+    }
+
+    fn col_asc(name: &str, idx: usize) -> LexOrdering {
+        LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new(name, idx)), SortOptions::default())]).unwrap()
+    }
+
+    // ---- keep-greatest (merge-on-read phase 2) ----
+
+    /// (id Utf8, ts Int64, tb Int64 nullable) — dedup key `(id, ts)` sorted by
+    /// `ts`, tiebreak `tb`. Mirrors `(timestamp, id)` + `updated_at`.
+    fn vbatch(ids: &[&str], ts: &[i64], tb: &[Option<i64>]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("tb", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(ids.to_vec())), Arc::new(Int64Array::from(ts.to_vec())), Arc::new(Int64Array::from(tb.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn greatest_plan(batches: Vec<RecordBatch>) -> DedupExec {
+        let src = source(&[batches], Some(col_asc("ts", 1)));
+        DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
+    }
+
+    async fn collect_rows(plan: &DedupExec) -> Vec<(String, i64, Option<i64>)> {
+        let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let mut out = Vec::new();
+        while let Some(b) = futures::StreamExt::next(&mut stream).await {
+            let b = b.unwrap();
+            let (ids, ts, tb) = (
+                b.column(0).as_any().downcast_ref::<StringArray>().unwrap(),
+                b.column(1).as_any().downcast_ref::<Int64Array>().unwrap(),
+                b.column(2).as_any().downcast_ref::<Int64Array>().unwrap(),
+            );
+            out.extend((0..b.num_rows()).map(|i| (ids.value(i).to_string(), ts.value(i), tb.is_valid(i).then(|| tb.value(i)))));
+        }
+        out
+    }
+
+    /// The version-append contract: the greatest-tiebreak copy of a key wins,
+    /// even when the newer version arrives in a later batch, and even when the
+    /// key's versions straddle batches within one `ts` run. Counts stay right.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_greatest_picks_highest_tiebreak_across_batches() {
+        let plan = greatest_plan(vec![
+            vbatch(&["a", "b"], &[10, 10], &[Some(1), Some(5)]),
+            vbatch(&["a", "b"], &[10, 10], &[Some(7), Some(2)]), // a upgraded, b's older loses
+            vbatch(&["a"], &[10], &[Some(3)]),
+        ]);
+        assert_eq!(collect_rows(&plan).await, vec![("b".into(), 10, Some(5)), ("a".into(), 10, Some(7))]);
+    }
+
+    /// Runs are the unit of emission: keys of a closed run are emitted when the
+    /// bound advances, and a key re-seen at a *new* ts is a different row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_greatest_across_run_boundary() {
+        let plan = greatest_plan(vec![
+            vbatch(&["a", "a", "b"], &[10, 10, 11], &[Some(1), Some(9), Some(1)]),
+            vbatch(&["a", "b"], &[11, 11], &[Some(4), Some(8)]),
+            vbatch(&["a"], &[12], &[Some(0)]),
+        ]);
+        // Survivors are emitted at their own input positions (a@11 wins at row 0
+        // of batch 2, b@11 at row 1), i.e. a subsequence of the input — so any
+        // declared ordering, not just the bound column, still holds.
+        assert_eq!(
+            collect_rows(&plan).await,
+            vec![("a".into(), 10, Some(9)), ("a".into(), 11, Some(4)), ("b".into(), 11, Some(8)), ("a".into(), 12, Some(0)),]
+        );
+    }
+
+    /// NULL tiebreak sorts lowest: a pre-existing (unstamped) row always loses
+    /// to any stamped version, in either arrival order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_greatest_null_tiebreak_loses() {
+        let plan = greatest_plan(vec![vbatch(&["a", "a", "b", "b"], &[1, 1, 2, 2], &[None, Some(1), Some(1), None])]);
+        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1)), ("b".into(), 2, Some(1))]);
+        // All-NULL keeps exactly one row (no spurious duplicate).
+        let plan = greatest_plan(vec![vbatch(&["a", "a"], &[1, 1], &[None, None])]);
+        assert_eq!(collect_rows(&plan).await.len(), 1);
+    }
+
+    /// No `dedup_tiebreak` ⇒ byte-for-byte the old behaviour: keep-FIRST, even
+    /// though a later copy would have won under keep-greatest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_tiebreak_stays_keep_first() {
+        let src = source(&[vec![vbatch(&["a", "a"], &[1, 1], &[Some(1), Some(9)])]], Some(col_asc("ts", 1)));
+        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], None, None).unwrap();
+        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1))]);
+    }
+
+    /// Unordered input has no run boundary, so keep-greatest is deliberately NOT
+    /// engaged (buffering a candidate per key over a wide scan is the
+    /// 2026-07-21 OOM shape): it degrades to keep-first, never to unbounded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unordered_input_falls_back_to_keep_first() {
+        let src = source(&[vec![vbatch(&["a", "a"], &[1, 1], &[Some(1), Some(9)])]], None);
+        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap();
+        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1))]);
+    }
+
+    /// `output_projection` still restores the requested columns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn applies_output_projection() {
+        let src = source(&[vec![batch(&["a", "a", "b"], &[1, 2, 3])]], None);
+        let plan = DedupExec::new(src, vec!["id".into()], Some(vec![1])).unwrap();
+        assert_eq!(plan.schema().fields().len(), 1);
+        assert_eq!(plan.schema().field(0).name(), "v");
+        let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let b = futures::StreamExt::next(&mut stream).await.unwrap().unwrap();
+        assert_eq!(b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values(), &[1, 3]);
+    }
+
+    /// PlanProperties must not lie: one output partition, the remapped input
+    /// ordering preserved (that is what keeps `ORDER BY … LIMIT` streaming).
+    #[test]
+    fn plan_properties() {
+        let data = vec![vec![batch(&["a"], &[1])]];
+        let ser = DedupExec::new(source(&data, Some(col_asc("id", 0))), vec!["id".into()], None).unwrap();
+        assert_eq!(ser.properties().output_partitioning().partition_count(), 1);
+        assert!(ser.properties().output_ordering().is_some());
+        assert!(matches!(ser.required_input_distribution()[0], Distribution::SinglePartition));
+        assert_eq!(ser.maintains_input_order(), vec![true]);
+    }
+
+    /// Lazy ordered source that counts the batches actually pulled — the probe
+    /// for early-LIMIT termination. One `ts` run per batch, each with a
+    /// duplicate pair so dedup has real work to do.
+    #[derive(Debug)]
+    struct CountingExec {
+        schema: SchemaRef,
+        props: Arc<PlanProperties>,
+        pulled: Arc<std::sync::atomic::AtomicUsize>,
+        n: i64,
+    }
+
+    impl CountingExec {
+        fn new(pulled: Arc<std::sync::atomic::AtomicUsize>, n: i64) -> Arc<dyn ExecutionPlan> {
+            use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+            let schema = vbatch(&["a"], &[0], &[Some(0)]).schema();
+            let eq = datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), [col_asc("ts", 1)]);
+            let props = Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
+            Arc::new(Self { schema, props, pulled, n })
+        }
+    }
+
+    impl DisplayAs for CountingExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "CountingExec")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionPlan for CountingExec {
+        fn name(&self) -> &'static str {
+            "CountingExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.props
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(&self, _p: usize, _c: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+            let pulled = self.pulled.clone();
+            let stream = futures::stream::iter((0..self.n).map(move |t| {
+                pulled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vbatch(&["a", "a"], &[t, t], &[Some(0), Some(1)]))
+            }));
+            Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream)))
+        }
+    }
+
+    /// The load-bearing claim of the merge-on-read design: keep-greatest still
+    /// streams. A `LIMIT` over a huge ordered input must terminate after pulling
+    /// a handful of batches — if the operator buffered versions past a run
+    /// boundary it would drain the whole source instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_greatest_limit_terminates_early() {
+        use datafusion::physical_plan::{collect, limit::GlobalLimitExec};
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let src = CountingExec::new(pulled.clone(), 1_000_000);
+        let dedup = Arc::new(DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap());
+        let plan = Arc::new(GlobalLimitExec::new(dedup, 0, Some(5)));
+        let out = collect(plan, Arc::new(TaskContext::default())).await.unwrap();
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
+        let n = pulled.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(n <= 8, "LIMIT 5 pulled {n} of 1M batches — the operator is not streaming");
+    }
+
+    /// Run state is bounded: after N runs the candidate map and the buffered
+    /// batches hold only the open run, not O(scan).
+    #[test]
+    fn keep_greatest_run_state_is_bounded() {
+        let in_schema = vbatch(&["a"], &[0], &[Some(0)]).schema();
+        let mut d = Dedup {
+            key_idxs: vec![1, 0],
+            conv: RowConverter::new(vec![SortField::new(DataType::Int64), SortField::new(DataType::Utf8)]).unwrap(),
+            output_projection: None,
+            seen: SeenSet::default(),
+            bound: Some(Bound { idx: 1, desc: false, last: None }),
+            greatest: Some(Greatest::new(2, in_schema.field(2).data_type()).unwrap()),
+        };
+        for t in 0..200i64 {
+            d.push(&vbatch(&["a", "b", "a"], &[t, t, t], &[Some(1), Some(1), Some(2)])).unwrap();
+        }
+        let g = d.greatest.as_ref().unwrap();
+        assert_eq!(g.best.len(), 2, "only the open run's keys are held");
+        assert_eq!(g.batches.len(), 1, "only the open run's batches are held");
+        assert!(d.seen.is_empty(), "seen only holds overflow-flushed keys");
     }
 }

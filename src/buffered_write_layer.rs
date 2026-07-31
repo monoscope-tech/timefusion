@@ -186,6 +186,8 @@ pub struct StatsSnapshot {
     pub tantivy_recovery_pending_files: usize,
     /// Process start time, used to distinguish a replacement from its predecessor.
     pub boot_micros: i64,
+    /// Local hot tier occupancy + counters (all zero when it is disabled).
+    pub hot_tier: crate::hot_tier::HotTierStats,
 }
 
 #[derive(Debug, Default)]
@@ -394,6 +396,16 @@ pub struct BufferedWriteLayer {
     config: Arc<AppConfig>,
     wal: Arc<WalManager>,
     mem_buffer: Arc<MemBuffer>,
+    /// Local hot tier: drained buckets are demoted here post-commit and served
+    /// as the scan's third leg. Always constructed — with
+    /// `TIMEFUSION_HOT_TIER_RETENTION_HOURS=0` it demotes nothing and serves
+    /// nothing, but still sweeps its own directory.
+    hot_tier: Arc<crate::hot_tier::HotTier>,
+    /// One demotion at a time. Demotion holds drained batches alive AFTER
+    /// MemBuffer stopped accounting for them, so an unbounded queue of them is
+    /// heap the memory governor cannot see; over the bound we simply skip (the
+    /// tier is a cache). Also the point GC and tests quiesce against.
+    demote_permit: Arc<tokio::sync::Semaphore>,
     shutdown: CancellationToken,
     delta_write_callback: Option<DeltaWriteCallback>,
     /// Set alongside `delta_write_callback`; used instead of it when
@@ -561,6 +573,9 @@ impl BufferedWriteLayer {
             config: cfg.clone(),
             wal,
             mem_buffer,
+            // `open` rescans the dir, so a restart comes back warm.
+            hot_tier: crate::hot_tier::HotTier::open(cfg.core.hot_tier_dir(), cfg.buffer.hot_tier_retention(), cfg.buffer.hot_tier_limits()),
+            demote_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             shutdown: CancellationToken::new(),
             delta_write_callback: None,
             coalesced_write_callback: None,
@@ -1084,6 +1099,10 @@ impl BufferedWriteLayer {
                                 warn!("Skipping empty batch during WAL recovery for {}.{}", entry.project_id, entry.table_name);
                                 return;
                             }
+                            // Seed the version clock from what is already durable:
+                            // the first stamp issued after this boot must exceed
+                            // every replayed one (see `insert_coerce::observe_stamp`).
+                            crate::insert_coerce::observe_batch(&entry.table_name, &batch);
                             let apply_start = std::time::Instant::now();
                             let rows = batch.num_rows() as u64;
                             let insert_res = mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros);
@@ -1845,6 +1864,7 @@ impl BufferedWriteLayer {
                     // reap_expired_empty_buckets.
                     let retention_micros = (self.config.buffer.retention_mins() as i64) * 60 * 1_000_000;
                     self.mem_buffer.reap_expired_empty_buckets(crate::clock::now_micros() - retention_micros);
+                    self.hot_tier_gc().await;
                     self.eviction_tick_notify.notify_waiters();
                 }
                 _ = self.shutdown.cancelled() => {
@@ -2111,6 +2131,9 @@ impl BufferedWriteLayer {
                     // bucket's rows are neither freed nor authoritative in
                     // Delta, and will be counted when its re-flush drains.
                     let drained: Vec<_> = source_buckets.iter().filter(|b| self.mem_buffer.finish_flushed_snapshot(b)).collect();
+                    // Post-commit is the ONLY sound point to demote: anywhere
+                    // earlier makes the hot tier a durability boundary.
+                    self.demote_drained(&drained);
                     self.release_and_advance(&combined.project_id, &combined.table_name, token);
                     any_ok = true;
                     crate::metrics::record_flush(true);
@@ -2170,6 +2193,74 @@ impl BufferedWriteLayer {
         (any_ok, stats)
     }
 
+    pub fn hot_tier(&self) -> &Arc<crate::hot_tier::HotTier> {
+        &self.hot_tier
+    }
+
+    /// The hot tier's window in micros, `0` when the tier is off — which makes
+    /// the scan-side depth test (`lookback > this`) reject every scan, so a
+    /// disabled tier is never consulted.
+    pub fn hot_tier_retention_micros(&self) -> i64 {
+        self.config.buffer.hot_tier_retention().map_or(0, |r| r.as_micros() as i64)
+    }
+
+    /// Write post-commit drained buckets to the hot tier, off the flush's
+    /// critical path (a blocking task; batches are Arc clones) and entirely
+    /// best-effort — a demotion failure only costs the next query a Delta hit.
+    fn demote_drained(&self, drained: &[&FlushableBucket]) {
+        let work: Vec<_> =
+            drained.iter().map(|b| (b.project_id.clone(), b.table_name.clone(), b.bucket_id, b.batches.clone(), b.min_timestamp, b.max_timestamp)).collect();
+        if work.is_empty() {
+            return;
+        }
+        let Ok(permit) = self.demote_permit.clone().try_acquire_owned() else {
+            crate::metrics::record_hot_tier_demote_skipped();
+            return;
+        };
+        let tier = self.hot_tier.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            for (p, t, id, batches, min, max) in work {
+                tier.demote(&p, &t, id, &batches, min, max);
+            }
+        });
+    }
+
+    /// Age/disk-cap sweep of the hot tier, driven by the eviction task. Waits
+    /// out any in-flight demotion first, which also makes it the deterministic
+    /// settle point for `force_evict_now`.
+    async fn hot_tier_gc(&self) {
+        let _quiesce = self.demote_permit.acquire().await;
+        let (tier, now) = (self.hot_tier.clone(), crate::clock::now_micros());
+        let _ = tokio::task::spawn_blocking(move || tier.gc(now)).await;
+    }
+
+    /// A DML mutates rows the hot tier may hold a pre-DML copy of, and the hot
+    /// leg is ordered ahead of Delta in the union (keep-first dedup), so a
+    /// stale file would shadow the corrected Delta row.
+    ///
+    /// Every row the statement can touch satisfies its predicate, so a demoted
+    /// file whose row range is disjoint from the predicate's time window holds
+    /// none of them and survives. When no window can be derived the whole
+    /// table goes — over-invalidating costs a Delta read, under-invalidating
+    /// resurrects a stale row.
+    ///
+    /// `source` is the `UPDATE ... FROM` source: the touched rows are the
+    /// JOIN's matches, so a bound is only the target's when the source cannot
+    /// also supply that column name (bound matching is by column name, which
+    /// ignores the qualifier — `u.timestamp >= X` would read as a target
+    /// bound). A source carrying the time column falls back.
+    fn invalidate_hot_tier(
+        &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, source: Option<&crate::dml::UpdateSource>,
+    ) {
+        let time_col = crate::dml_coalescer::table_time_column(table_name);
+        let shadowed = source.is_some_and(|s| s.schema.fields().iter().any(|f| f.name() == time_col));
+        match (!shadowed).then(|| crate::dml_coalescer::dml_time_window(predicate, time_col)).flatten() {
+            Some((lo, hi)) => self.hot_tier.invalidate_range(project_id, table_name, lo, hi),
+            None => self.hot_tier.invalidate(project_id, table_name),
+        }
+    }
+
     /// Pre-commit half of a bucket flush: raise the Delta watermark, dedup the
     /// rows, and compute the conservative WAL watermark the commit must carry.
     /// Split out of [`Self::flush_bucket`] so the cross-project coalesced path
@@ -2186,7 +2277,10 @@ impl BufferedWriteLayer {
         let schema = crate::schema_loader::get_schema(&bucket.table_name);
         let dedup_keys = schema.map(|s| s.dedup_keys.as_slice()).unwrap_or(&[]);
         let tiebreak = schema.and_then(|s| s.dedup_tiebreak.as_deref());
-        let batches = crate::mem_buffer::dedup_batches(bucket.batches.clone(), dedup_keys, tiebreak)?;
+        // Never drops tombstones: this bucket is a fraction of the key's
+        // versions (older ones are already in Delta), so the tombstone must
+        // reach Delta to keep winning there.
+        let batches = crate::mem_buffer::dedup_batches(bucket.batches.clone(), dedup_keys, tiebreak, None)?;
         let after: usize = batches.iter().map(|b| b.num_rows()).sum();
         if bucket.row_count > after {
             let dropped = bucket.row_count - after;
@@ -2714,6 +2808,7 @@ impl BufferedWriteLayer {
     pub async fn force_evict_now(&self) -> anyhow::Result<()> {
         self.flush_completed_buckets().await?;
         self.evict_drained_metadata();
+        self.hot_tier_gc().await;
         self.eviction_tick_notify.notify_waiters();
         Ok(())
     }
@@ -2803,6 +2898,7 @@ impl BufferedWriteLayer {
             wal_recovery_complete: self.wal_recovery_complete.load(Ordering::Relaxed),
             tantivy_recovery_pending_files: self.deferred_tantivy_files.lock().unwrap().len(),
             boot_micros: self.boot_micros,
+            hot_tier: self.hot_tier.stats(),
         }
     }
 
@@ -2941,6 +3037,7 @@ impl BufferedWriteLayer {
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
+        self.invalidate_hot_tier(project_id, table_name, predicate, None);
         // Log to WAL first for durability. Failure here means the delete is
         // not recoverable after a crash — propagate so the client knows the
         // operation didn't commit, rather than apply in-memory and lose it
@@ -2963,6 +3060,7 @@ impl BufferedWriteLayer {
     ) -> datafusion::error::Result<u64> {
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &std::collections::HashSet::new());
+        self.invalidate_hot_tier(project_id, table_name, predicate, None);
         // See `delete()` — WAL failure must propagate so the client doesn't
         // see a "successful" update that disappears on the next restart.
         self.with_wal_pin(
@@ -2987,6 +3085,7 @@ impl BufferedWriteLayer {
         let predicate_sql = predicate.map(|p| Self::normalized_wal_sql(p, &source_cols));
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &source_cols);
 
+        self.invalidate_hot_tier(project_id, table_name, predicate, Some(source));
         let batch_ipc = crate::wal::serialize_record_batch(&source.batch).map_err(wal_err("source serialize"))?;
         let serialized_source = crate::wal::SerializedSource { join_keys: source.join_keys.clone(), batch_ipc };
 
@@ -3081,6 +3180,53 @@ mod tests {
         let results = layer.query(&project, &table, &[]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].num_rows(), 3);
+    }
+
+    /// The DML seams must scope hot-tier invalidation to the statement's own
+    /// time window — monoscope's enrichment UPDATEs all carry one — and fall
+    /// back to the whole table (today's behaviour) only when no bound exists.
+    /// A file the window can't reach holds no row the statement rewrote.
+    #[serial]
+    #[tokio::test]
+    async fn dml_invalidates_only_the_hot_files_its_time_window_reaches() {
+        let dir = tempdir().unwrap();
+        // Explicit: the shipped default is 0 (tier off for its first release),
+        // so this test must opt the tier in rather than inherit it.
+        let cfg = {
+            let mut c = AppConfig::default();
+            c.core.timefusion_data_dir = dir.path().to_path_buf();
+            c.buffer.timefusion_hot_tier_retention_hours = 6;
+            Arc::new(c)
+        };
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("hp{test_id}"), format!("ht{test_id}"));
+
+        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        let batch = create_test_batch(&project);
+        let tier = layer.hot_tier().clone();
+        tier.demote(&project, &table, 1, &[batch.clone()], 1_000, 1_999);
+        tier.demote(&project, &table, 2, &[batch], 10_000, 10_999);
+
+        use datafusion::prelude::lit;
+        let ts = |micros: i64| lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())));
+        let bounded = datafusion::prelude::col("project_id")
+            .eq(lit(project.clone()))
+            .and(datafusion::prelude::col("timestamp").gt_eq(ts(1_500)))
+            .and(datafusion::prelude::col("timestamp").lt(ts(5_000)));
+        layer.delete(&project, &table, Some(&bounded)).unwrap();
+
+        let s = layer.hot_tier().stats();
+        assert_eq!((s.files, s.invalidations_ranged, s.invalidations_full), (1, 1, 0), "only the overlapped file goes");
+        assert_eq!(tier.buckets_in_range(&project, &table, None)[0].bucket_id, 2);
+
+        // No time predicate → no derivable window → today's whole-table drop,
+        // and the fallback must be VISIBLE (it is what a broken derivation
+        // looks like in prod).
+        layer.delete(&project, &table, Some(&datafusion::prelude::col("project_id").eq(lit(project.clone())))).unwrap();
+        let s = layer.hot_tier().stats();
+        assert_eq!((s.files, s.invalidations_ranged, s.invalidations_full), (0, 1, 1));
     }
 
     /// C3 — cross-project flush commit coalescing, from the flush layer's side.
@@ -4333,6 +4479,54 @@ mod tests {
             cfg.core.wal_dir().join(".timefusion_meta").join("recovery_rewind.json").exists(),
             "rewind marker must survive the bail so the next boot re-reads the un-preserved entries"
         );
+    }
+
+    /// The version stamp must be durable and boot-seeding must work end to end:
+    /// an insert stamps `updated_at` BEFORE the WAL append (so replay reproduces
+    /// the same value rather than re-issuing a later one), and replay folds the
+    /// replayed maximum back into the clock — so the first stamp a fresh boot
+    /// issues exceeds everything already durable, even if the wall clock has
+    /// stepped backwards since.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn version_stamp_is_durable_and_seeds_the_clock_at_boot() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+        let table = "otel_logs_and_spans";
+        let project = format!("v{}", &uuid::Uuid::new_v4().to_string()[..4]);
+
+        // Stamp from a far-future clock so the value can't be confused with a
+        // wall-clock one issued after the simulated reboot.
+        crate::clock::set_micros(4_000_000_000_000_000);
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts(
+            "a",
+            "s1",
+            &project,
+            crate::clock::now_micros(),
+        )])
+        .unwrap();
+        // Stamping happens one level up, in `Database::insert_records_batch`
+        // (the inbound funnel); apply it here so this test covers the WAL leg.
+        let batches = crate::insert_coerce::stamp_version(table, vec![batch]);
+        layer.insert(&project, table, batches).await.unwrap();
+        let stamped = crate::test_utils::test_helpers::query_col_strings(&layer, &project, table, "updated_at");
+        assert_eq!(stamped.len(), 1);
+        assert!(!stamped[0].is_empty(), "a row inserted without updated_at must come back with one");
+        drop(layer);
+
+        // Reboot: clock steps back an epoch and the in-memory clock is gone.
+        crate::clock::set_micros(3_000_000_000_000_000);
+        crate::insert_coerce::reset_stamp_state(table);
+        let layer2 = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
+        layer2.recover_from_wal().await.unwrap();
+        let replayed = crate::test_utils::test_helpers::query_col_strings(&layer2, &project, table, "updated_at");
+        assert_eq!(replayed, stamped, "replay must reproduce the durable stamp, not re-issue one");
+        let next = crate::insert_coerce::next_stamp(table);
+        crate::clock::unfreeze();
+        assert!(next > 4_000_000_000_000_000, "post-boot stamp {next} must exceed everything replayed");
     }
 
     /// P0 quarantine re-drive (2026-07-28 silent-loss incidents): a parked

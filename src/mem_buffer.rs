@@ -511,9 +511,18 @@ pub(crate) fn compact_batch(batch: RecordBatch) -> RecordBatch {
 /// behave identically either way). Nulls sort lowest, so a non-null tiebreak
 /// always beats a null one.
 ///
+/// `drop_tombstones`: name of the schema's `tombstone_column` **only when the
+/// caller's scope guarantees that no older version of any key in `batches` can
+/// survive outside this call's input** — then a key whose winning version is a
+/// tombstone (`true`) disappears entirely instead of leaving the tombstone
+/// behind. `None` = retain the tombstone as the surviving version. Every
+/// current caller passes `None`; see the safety derivation at the dedup sweep's
+/// call site in `database.rs`. Dropping early is silent data resurrection,
+/// retaining is a bounded storage cost — when unsure, pass `None`.
+///
 /// Only collapses dupes inside this call's input — cross-bucket dupes need
 /// the read-side dedup (`DedupExec`).
-pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
+pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Option<&str>, drop_tombstones: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
     if keys.is_empty() || batches.is_empty() {
         return Ok(batches);
     }
@@ -562,11 +571,29 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
             }
         }
     }
-    if chosen.len() == rows.num_rows() {
+    // Tombstone winners. Loaded before the no-duplicates fast path because a
+    // tombstone with no surviving older version in this input is still a row to
+    // drop. `true_count() == 0` (the all-NULL/all-false steady state of a table
+    // that has never been deleted from) keeps the fast path intact.
+    let tombstones = match drop_tombstones {
+        Some(col) => {
+            let arr = concat_col(col)?;
+            let flags = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow::anyhow!("tombstone column `{col}` must be Boolean, got {}", arr.data_type()))?
+                .clone();
+            (flags.true_count() > 0).then_some(flags)
+        }
+        None => None,
+    };
+    if chosen.len() == rows.num_rows() && tombstones.is_none() {
         // No duplicates — return the batches untouched (never fused into one array).
         return Ok(batches);
     }
-    let keep: std::collections::HashSet<u32> = chosen.into_values().collect();
+    // NULL and false both mean live; only `true` retires the key.
+    let keep: std::collections::HashSet<u32> =
+        chosen.into_values().filter(|&i| tombstones.as_ref().is_none_or(|f| !(f.is_valid(i as usize) && f.value(i as usize)))).collect();
     // Filter each batch against its slice of the global row-index space.
     let mut out = Vec::with_capacity(batches.len());
     let mut base = 0u32;
@@ -703,7 +730,7 @@ fn extract_timestamp_range(filters: &[Expr]) -> (Option<i64>, Option<i64>) {
 }
 
 /// Compile filters into a single conjunction physical expression evaluated against `schema`.
-fn compile_filter_conjunction(filters: &[Expr], schema: &SchemaRef) -> DFResult<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> {
+pub fn compile_filter_conjunction(filters: &[Expr], schema: &SchemaRef) -> DFResult<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> {
     if filters.is_empty() {
         return Ok(None);
     }
@@ -749,11 +776,33 @@ fn apply_predicate(batch: &RecordBatch, pred: &Arc<dyn datafusion::physical_expr
 /// Apply an optional compiled predicate to a bucket snapshot, dropping
 /// non-matching rows and any batch that ends up empty. `None` returns the
 /// snapshot unchanged.
-fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>) -> Vec<RecordBatch> {
+pub fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>) -> Vec<RecordBatch> {
     match pred {
         Some(p) => snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0).collect(),
         None => snapshot,
     }
+}
+
+/// Half-open `[start, end)` interval overlap — the ONE range convention shared
+/// by MemBuffer bucket ranges, hot-tier file ranges, and the Delta exclusion
+/// filters built from them.
+pub fn overlaps(a: (i64, i64), b: (i64, i64)) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+/// Sort + coalesce touching or overlapping half-open ranges. The Delta leg
+/// excludes the UNION of the other tiers' ranges, and consecutive sealed
+/// buckets are contiguous, so this collapses what would be one
+/// `(ts < a OR ts >= b)` conjunct per bucket into (typically) one.
+pub fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.sort_unstable();
+    ranges.into_iter().fold(Vec::new(), |mut out, (start, end)| {
+        match out.last_mut() {
+            Some((_, prev_end)) if start <= *prev_end => *prev_end = (*prev_end).max(end),
+            _ => out.push((start, end)),
+        }
+        out
+    })
 }
 
 /// Check if a bucket's time range overlaps with the query range.
@@ -2656,6 +2705,18 @@ mod tests {
 
     use super::*;
 
+    /// The Delta leg excludes the UNION of the tiers' ranges, so merging must
+    /// preserve it exactly: adjacent buckets (`end == next start`) collapse,
+    /// disjoint ones must NOT — merging a gap would hide the Delta rows in it.
+    #[test]
+    fn merge_ranges_collapses_contiguous_windows_only() {
+        assert_eq!(merge_ranges(vec![(20, 30), (0, 10), (10, 20)]), vec![(0, 30)]);
+        assert_eq!(merge_ranges(vec![(0, 10), (11, 20)]), vec![(0, 10), (11, 20)]);
+        assert_eq!(merge_ranges(vec![(0, 30), (5, 10)]), vec![(0, 30)]);
+        assert!(merge_ranges(vec![]).is_empty());
+        assert!(overlaps((0, 10), (9, 20)) && !overlaps((0, 10), (10, 20)));
+    }
+
     fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
@@ -2837,7 +2898,7 @@ mod tests {
             mk(vec![200], vec![2], vec!["v2-new"]),
         ];
         let keys = vec!["id".to_string(), "timestamp".to_string()];
-        let out = dedup_batches(batches, &keys, None).expect("dedup ok");
+        let out = dedup_batches(batches, &keys, None, None).expect("dedup ok");
         // Dedup filters each batch in place (no full-payload concat), so the
         // survivors come back as multiple batches — collect across all of them.
         let total: usize = out.iter().map(|b| b.num_rows()).sum();
@@ -2854,13 +2915,52 @@ mod tests {
         assert_eq!(got, vec![(1, "v1-new".into()), (3, "v3".into()), (2, "v2-new".into())]);
     }
 
+    /// A NULL tiebreak must sort LOWEST, in either arrival order. This is the
+    /// whole migration story for the `updated_at` version stamp: rows written
+    /// before the column existed carry NULL and must always lose to any stamped
+    /// version, no matter which one the flush happens to see first. (It holds
+    /// because `SortField::new` takes `SortOptions::default()` — ascending,
+    /// nulls first — so a NULL row encodes below every value.)
+    #[test]
+    fn dedup_batches_null_tiebreak_always_loses() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+            Field::new("payload", DataType::Utf8View, false),
+        ]));
+        let mk = |stamp: Option<i64>, payload: &str| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1i64])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![stamp]).with_timezone("UTC")),
+                    Arc::new(StringViewArray::from(vec![payload])),
+                ],
+            )
+            .unwrap()
+        };
+        let keys = vec!["id".to_string()];
+        for (batches, want) in [(vec![mk(None, "legacy"), mk(Some(10), "stamped")], "stamped"), (vec![mk(Some(10), "stamped"), mk(None, "legacy")], "stamped")]
+        {
+            let out = dedup_batches(batches, &keys, Some("updated_at"), None).expect("dedup ok");
+            let survivors: Vec<String> = out
+                .iter()
+                .flat_map(|b| {
+                    let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
+                    (0..b.num_rows()).map(|i| pl.value(i).to_string()).collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(survivors, vec![want.to_string()], "NULL tiebreak must lose regardless of arrival order");
+        }
+    }
+
     #[test]
     fn dedup_batches_noop_when_keys_empty_or_input_empty() {
         let empty: Vec<RecordBatch> = vec![];
-        assert!(dedup_batches(empty, &["id".to_string()], None).unwrap().is_empty());
+        assert!(dedup_batches(empty, &["id".to_string()], None, None).unwrap().is_empty());
 
         let batch = create_test_batch(123);
-        let out = dedup_batches(vec![batch.clone()], &[], None).unwrap();
+        let out = dedup_batches(vec![batch.clone()], &[], None, None).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].num_rows(), batch.num_rows());
     }
@@ -2878,7 +2978,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![id])), Arc::new(StringViewArray::from(vec![p]))]).unwrap()
         };
         let batches = vec![mk(1, "a"), mk(2, "b"), mk(3, "c")];
-        let out = dedup_batches(batches, &["id".to_string()], None).expect("dedup ok");
+        let out = dedup_batches(batches, &["id".to_string()], None, None).expect("dedup ok");
         assert_eq!(out.len(), 3, "distinct-key batches must be returned un-fused (no 2GB-prone concat)");
         assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
@@ -2886,7 +2986,7 @@ mod tests {
     #[test]
     fn dedup_batches_errors_on_unknown_key() {
         let batch = create_test_batch(1);
-        let err = dedup_batches(vec![batch], &["nonexistent".to_string()], None).unwrap_err();
+        let err = dedup_batches(vec![batch], &["nonexistent".to_string()], None, None).unwrap_err();
         assert!(err.to_string().contains("nonexistent"), "msg: {err}");
     }
 
@@ -2912,7 +3012,7 @@ mod tests {
         // id=2: base has a NULL observed, enriched has 50 — non-null must win.
         let batches =
             vec![mk(vec![1, 2], vec![Some(200), None], vec!["1-enriched", "2-base"]), mk(vec![1, 2], vec![Some(100), Some(50)], vec!["1-base", "2-enriched"])];
-        let out = dedup_batches(batches, &["id".to_string()], Some("observed")).expect("dedup ok");
+        let out = dedup_batches(batches, &["id".to_string()], Some("observed"), None).expect("dedup ok");
         let mut got: Vec<(i64, String)> = out
             .iter()
             .flat_map(|b| {
@@ -2923,6 +3023,121 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, vec![(1, "1-enriched".into()), (2, "2-enriched".into())]);
+    }
+
+    /// Merge-on-read version collapse. Builds `[id, updated_at, deleted, payload]`
+    /// rows; the survivor is the greatest `updated_at` per id, and `deleted=true`
+    /// on that survivor retires the key when — and only when — the caller declares
+    /// its scope safe (`drop_tombstones = Some("deleted")`).
+    mod tombstones {
+        use super::*;
+
+        fn schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+                Field::new("deleted", DataType::Boolean, true),
+                Field::new("payload", DataType::Utf8View, false),
+            ]))
+        }
+
+        /// One row per batch, so input order is explicit at every call site.
+        fn row(id: i64, updated_at: Option<i64>, deleted: Option<bool>, payload: &str) -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![id])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![updated_at]).with_timezone("UTC")),
+                    Arc::new(BooleanArray::from(vec![deleted])),
+                    Arc::new(StringViewArray::from(vec![payload])),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn collapse(batches: Vec<RecordBatch>, drop_tombstones: Option<&str>) -> Vec<(i64, String, Option<bool>)> {
+            let out = dedup_batches(batches, &["id".to_string()], Some("updated_at"), drop_tombstones).expect("collapse ok");
+            let mut got: Vec<(i64, String, Option<bool>)> = out
+                .iter()
+                .flat_map(|b| {
+                    let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+                    let del = b.column_by_name("deleted").unwrap().as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
+                    (0..b.num_rows()).map(move |i| (ids.value(i), pl.value(i).to_string(), del.is_valid(i).then(|| del.value(i)))).collect::<Vec<_>>()
+                })
+                .collect();
+            got.sort();
+            got
+        }
+
+        /// A tombstone is just another version: it wins on `updated_at`, not on
+        /// being a tombstone. The live row is gone either way — what differs is
+        /// whether the tombstone itself survives to keep it gone.
+        #[test]
+        fn tombstone_beats_older_live_version() {
+            let batches = vec![row(1, Some(10), None, "live"), row(1, Some(20), Some(true), "deleted")];
+            assert_eq!(collapse(batches, None), vec![(1, "deleted".into(), Some(true))]);
+        }
+
+        /// Out-of-order flush: the older live version arrives AFTER the tombstone.
+        /// `updated_at`, not position, decides — so the row is not resurrected.
+        #[test]
+        fn late_older_live_version_does_not_resurrect() {
+            let batches = vec![row(1, Some(20), Some(true), "deleted"), row(1, Some(10), None, "live")];
+            assert_eq!(collapse(batches.clone(), None), vec![(1, "deleted".into(), Some(true))]);
+            assert_eq!(collapse(batches, Some("deleted")), vec![], "tombstone drop must take the whole key, not just the tombstone row");
+        }
+
+        /// The two policies, same input: retained (the sweep's choice — an older
+        /// version may live in a file/partition/buffer it never saw) vs dropped
+        /// (only when the caller's scope holds every version of the key).
+        #[test]
+        fn tombstone_retained_unless_caller_declares_scope_safe() {
+            let batches = vec![row(1, Some(10), Some(false), "live"), row(1, Some(20), Some(true), "deleted"), row(2, Some(5), None, "untouched")];
+            assert_eq!(collapse(batches.clone(), None), vec![(1, "deleted".into(), Some(true)), (2, "untouched".into(), None)]);
+            assert_eq!(collapse(batches, Some("deleted")), vec![(2, "untouched".into(), None)]);
+        }
+
+        /// A tombstone with no older version in the input is still a row to drop —
+        /// it must not slip through the no-duplicates fast path.
+        #[test]
+        fn lone_tombstone_drops_without_a_duplicate() {
+            assert_eq!(collapse(vec![row(1, Some(20), Some(true), "deleted")], Some("deleted")), vec![]);
+        }
+
+        /// A newer LIVE version un-deletes the key (re-insert after delete), and
+        /// NULL/false are both live. The all-NULL steady state of a table that
+        /// declares `tombstone_column` but has never been deleted from is a no-op:
+        /// same rows, and the untouched-batches fast path is preserved.
+        #[test]
+        fn null_and_false_are_live() {
+            let undelete = vec![row(1, Some(20), Some(true), "deleted"), row(1, Some(30), Some(false), "reinserted")];
+            assert_eq!(collapse(undelete, Some("deleted")), vec![(1, "reinserted".into(), Some(false))]);
+
+            let all_null = vec![row(1, Some(10), None, "a"), row(2, Some(20), None, "b")];
+            let out = dedup_batches(all_null.clone(), &["id".to_string()], Some("updated_at"), Some("deleted")).expect("collapse ok");
+            assert_eq!(out.len(), 2, "no tombstones present → batches returned untouched, not re-filtered");
+            assert_eq!(collapse(all_null.clone(), Some("deleted")), collapse(all_null, None));
+        }
+
+        /// A table that declares no tombstone column is byte-identical to before:
+        /// the tombstone argument is the only thing that can change the row set,
+        /// even when a Boolean column happens to be named `deleted` and set.
+        #[test]
+        fn no_tombstone_column_means_unchanged_behaviour() {
+            let batches = vec![row(1, Some(10), Some(true), "a"), row(2, Some(20), Some(true), "b")];
+            let out = dedup_batches(batches, &["id".to_string()], Some("updated_at"), None).expect("collapse ok");
+            assert_eq!(out.len(), 2, "distinct keys, no drop → inputs returned un-fused");
+            assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        }
+
+        /// A non-Boolean tombstone column is a schema error, not a silent
+        /// mis-drop. (`validate()` rejects it at load; this pins the runtime.)
+        #[test]
+        fn non_boolean_tombstone_column_errors() {
+            let err = dedup_batches(vec![row(1, Some(10), None, "a")], &["id".to_string()], Some("updated_at"), Some("payload")).unwrap_err();
+            assert!(err.to_string().contains("must be Boolean"), "msg: {err}");
+        }
     }
 
     #[test]

@@ -33,6 +33,8 @@ fn table() -> TableSchema {
         time_column: None,
         dedup_keys: vec![],
         dedup_tiebreak: None,
+        tombstone_column: None,
+        version_append: false,
         fields: vec![
             FieldDef {
                 name: "timestamp".into(),

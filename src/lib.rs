@@ -14,6 +14,7 @@ pub mod dml_coalescer;
 pub mod errors;
 pub mod functions;
 pub mod grpc_handlers;
+pub mod hot_tier;
 pub mod insert_coerce;
 pub mod mem_buffer;
 pub mod metrics;

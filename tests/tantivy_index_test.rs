@@ -63,6 +63,8 @@ fn small_table() -> TableSchema {
         time_column: None,
         dedup_keys: vec![],
         dedup_tiebreak: None,
+        tombstone_column: None,
+        version_append: false,
         fields: vec![
             ts_field("timestamp", false),
             FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },

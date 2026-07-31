@@ -1,0 +1,56 @@
+# Merge-on-read FIXTURE table: the only schema shipping with
+# `version_append: true`, so the read-side machinery that is dormant on
+# `otel_logs_and_spans` (keep-greatest ordering under DedupExec, the tombstone
+# filter, the COUNT(*)-pushdown decline) has somewhere to be exercised end to
+# end. Nothing writes to it in production — like `variant_bench`, it exists so
+# tests run the real path instead of a mock.
+#
+# When `otel_logs_and_spans` flips `version_append: true`, this stays: it is the
+# regression guard for the pre-flip behaviour of every OTHER table.
+table_name: mor_versioned
+partitions:
+  - project_id
+  - date
+dedup_keys:
+  - timestamp
+  - id
+dedup_tiebreak: updated_at
+tombstone_column: deleted
+version_append: true
+# `timestamp DESC` matches otel: the lead sort key is a dedup key, which is what
+# `keep_greatest_ordering` requires before the union may be ordered at all.
+sorting_columns:
+  - name: timestamp
+    descending: true
+    nulls_first: true
+  - name: id
+    descending: false
+    nulls_first: false
+z_order_columns:
+  - timestamp
+  - id
+fields:
+  - name: date
+    data_type: Date32
+    nullable: false
+  - name: timestamp
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
+    nullable: false
+  - name: id
+    data_type: Utf8
+    nullable: false
+  - name: name
+    data_type: Utf8
+    nullable: true
+  # Nullable for the same reason as otel_logs_and_spans: delta-rs nulls out
+  # partition columns in per-file stats.
+  - name: project_id
+    data_type: Utf8
+    nullable: true
+  # TF-owned version stamp (`dedup_tiebreak`), written by `insert_coerce::stamp_version`.
+  - name: updated_at
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
+    nullable: true
+  - name: deleted
+    data_type: Boolean
+    nullable: true

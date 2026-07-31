@@ -11,7 +11,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 pub use defer_expensive_projection::DeferExpensiveProjection;
-pub use ordered_union_for_topk::OrderedUnionForTopK;
+pub use ordered_union_for_topk::{OrderedUnionForTopK, ordered_children};
 pub use pg_array_literal_rewriter::PgArrayLiteralRewriter;
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;

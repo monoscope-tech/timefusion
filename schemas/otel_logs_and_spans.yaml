@@ -10,11 +10,28 @@ dedup_keys:
   - timestamp
   - id
 # Tie-breaker when rows share (id, timestamp): keep the one with the greatest
-# observed_timestamp. The enrichment worker re-emits the enriched row with a
-# fresh observed_timestamp (parity plan Defect 3), so it wins over the base row.
-# Identical retries share observed_timestamp → tie falls back to keep-last (no
-# behavior change for the existing duplicate case).
-dedup_tiebreak: observed_timestamp
+# `updated_at`. TF stamps that column on every write (see
+# `insert_coerce::stamp_version`) from a per-table hybrid logical clock, so no
+# two versions of a row can tie and a clock step backwards cannot make a new
+# version lose to an old one.
+#
+# NOT `observed_timestamp`: it is OTel-assigned and is not rewritten by an
+# in-place `UPDATE`, so every version of an enriched row carries the SAME value
+# — "greatest wins" then degenerates to an arbitrary keep-last. (It does change
+# on the enrichment *re-emit* path, which is not the path monoscope's
+# background jobs take.)
+#
+# Pre-existing Delta rows have NULL here. NULL sorts lowest in the row-format
+# comparison `dedup_batches` uses, so an un-stamped row always loses to a
+# stamped one — that is the whole migration story.
+dedup_tiebreak: updated_at
+# Merge-on-read tombstone column (see `deleted` below). Declared here so no
+# mechanism hard-codes a column name. Read-side filtering and the sweep's
+# version collapse key off THIS setting alone — deliberately not off
+# `version_append` (which gates only the write path): were they one switch,
+# turning version-append off after a rollback would un-hide every row deleted
+# while it was on. A declared column with no tombstones written is a no-op.
+tombstone_column: deleted
 # Hot paths: point lookup by (timestamp, id), and service_name queries within
 # a time range. Leading with `timestamp` keeps row-group min/max stats tight
 # for any timestamp-bound query; sorting by service_name next clusters rows
@@ -355,4 +372,18 @@ fields:
     nullable: true
   - name: message_size_bytes
     data_type: Int64
+    nullable: true
+  # TF-owned version stamp (`dedup_tiebreak` above). Clients never send it; a
+  # value that arrives from one is overwritten. Nullable only because existing
+  # Delta files predate the column — every newly written row carries a value.
+  # Appended LAST so no existing column's physical parquet index shifts.
+  - name: updated_at
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
+    nullable: true
+  # Merge-on-read tombstone (`tombstone_column` above). TRUE marks this row
+  # version as a deletion of its dedup key; NULL and FALSE both mean live, so
+  # every pre-existing row is live without a backfill. Appended LAST, after
+  # `updated_at`, so no existing column's physical parquet index shifts.
+  - name: deleted
+    data_type: Boolean
     nullable: true

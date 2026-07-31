@@ -133,7 +133,12 @@ pub mod test_helpers {
     }
 
     pub fn json_to_batch(records: Vec<Value>) -> anyhow::Result<RecordBatch> {
-        let target_schema = get_default_schema().schema_ref();
+        json_to_batch_for(&get_default_schema().table_name, records)
+    }
+
+    /// `json_to_batch` against any registered table's schema.
+    pub fn json_to_batch_for(table: &str, records: Vec<Value>) -> anyhow::Result<RecordBatch> {
+        let target_schema = crate::schema_loader::get_schema(table).ok_or_else(|| anyhow::anyhow!("unknown table `{table}`"))?.schema_ref();
 
         // Create a schema for reading JSON with Utf8 (which arrow-json produces)
         let json_read_schema = Arc::new(Schema::new(

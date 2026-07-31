@@ -354,6 +354,53 @@ fn classify_time_conjunct(e: &Expr, time_col: &str) -> Option<(TimeBound, bool)>
     }
 }
 
+/// The half-open `[lo, hi)` microsecond window a statement's predicate can
+/// touch on `time_col`, with `i64::MIN`/`i64::MAX` for an unbounded side.
+/// `None` = no bound at all could be derived, and the caller must treat the
+/// statement as touching the whole table.
+///
+/// Only AND-position `time_col CMP literal` conjuncts contribute (through
+/// `Cast`/`TryCast` on either side — extended-protocol param binding wraps the
+/// literal, which is what silently disabled the merge date-prune for ~6% of
+/// prod enrichment merges). Anything else — OR, NOT, a non-literal bound, a
+/// unit that doesn't convert — is simply not a bound, so the window can only
+/// ever be a SUPERSET of the touched rows.
+///
+/// Both ends round OUTWARD — `lo = floor(v)`, `hi = floor(v) + 1` — so a
+/// sub-µs literal can never cut off a µs-granular row on the boundary, at the
+/// cost of at most 1µs of extra width. That also makes the
+/// inclusive/exclusive distinction irrelevant, so there is one rule per side
+/// instead of four.
+pub(crate) fn dml_time_window(predicate: Option<&Expr>, time_col: &str) -> Option<(i64, i64)> {
+    fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
+        match expr {
+            Expr::Literal(scalar, _) => Some(scalar),
+            Expr::Cast(c) => unwrap_literal(c.expr.as_ref()),
+            Expr::TryCast(c) => unwrap_literal(c.expr.as_ref()),
+            _ => None,
+        }
+    }
+    let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+    for conjunct in split_conjunction(predicate?) {
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = conjunct else { continue };
+        let (bound, op) = if crate::optimizers::is_col_through_cast(left, time_col) {
+            (right.as_ref(), *op)
+        } else if crate::optimizers::is_col_through_cast(right, time_col) {
+            (left.as_ref(), crate::optimizers::swap_comparison(op))
+        } else {
+            continue;
+        };
+        let Some(v) = unwrap_literal(bound).and_then(scalar_micros) else { continue };
+        match op {
+            Operator::Gt | Operator::GtEq => lo = lo.max(v),
+            Operator::Lt | Operator::LtEq => hi = hi.min(v.saturating_add(1)),
+            Operator::Eq => (lo, hi) = (lo.max(v), hi.min(v.saturating_add(1))),
+            _ => continue,
+        }
+    }
+    ((lo, hi) != (i64::MIN, i64::MAX)).then_some((lo, hi))
+}
+
 /// Express `watermark_micros` in the same scalar type as `template` so bounds
 /// stay comparable. None (no clamping) when the template isn't a timestamp or
 /// the unit conversion overflows.
@@ -1186,6 +1233,46 @@ mod tests {
 
     fn window(lo: i64, hi: i64) -> Expr {
         col("timestamp").gt_eq(lit(ts(lo))).and(col("timestamp").lt(lit(ts(hi))))
+    }
+
+    /// The window a DML invalidation of the hot tier is scoped to. It must be a
+    /// SUPERSET of the touched rows in every shape it accepts, and `None`
+    /// (→ full-table invalidation) in every shape it doesn't.
+    #[test]
+    fn dml_time_window_derives_supersets_or_nothing() {
+        let w = |e: Option<&Expr>| dml_time_window(e, "timestamp");
+        // The monoscope enrichment shape: `>= lo AND < hi`. Both ends round
+        // outward by design, so the window is [lo, hi+1) — a superset.
+        assert_eq!(w(Some(&window(100, 200))), Some((100, 201)));
+        // Inclusive/exclusive on either end, and reversed operands.
+        assert_eq!(w(Some(&col("timestamp").gt(lit(ts(100))).and(col("timestamp").lt_eq(lit(ts(200)))))), Some((100, 201)));
+        assert_eq!(w(Some(&lit(ts(100)).lt_eq(col("timestamp")))), Some((100, i64::MAX)));
+        // One-sided bounds keep the side they have.
+        assert_eq!(w(Some(&col("timestamp").gt_eq(lit(ts(100))))), Some((100, i64::MAX)));
+        assert_eq!(w(Some(&col("timestamp").lt(lit(ts(200))))), Some((i64::MIN, 201)));
+        assert_eq!(w(Some(&col("timestamp").eq(lit(ts(100))))), Some((100, 101)));
+        // A cast-wrapped literal (extended-protocol param binding — the 2026-07-20
+        // shape that silently disabled the merge date-prune) still derives.
+        let cast = Expr::Cast(datafusion::logical_expr::expr::Cast::new(
+            Box::new(lit(ts(100))),
+            DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
+        ));
+        assert_eq!(w(Some(&col("timestamp").gt_eq(cast))), Some((100, i64::MAX)));
+        // Sub-µs literals floor outward, never inward.
+        let ns = |n: i64| lit(ScalarValue::TimestampNanosecond(Some(n), Some("UTC".into())));
+        assert_eq!(w(Some(&col("timestamp").gt(ns(1_500)).and(col("timestamp").lt(ns(9_500))))), Some((1, 10)));
+        // Residual conjuncts are irrelevant; the time bound still applies.
+        assert_eq!(w(Some(&col("project_id").eq(lit("p")).and(window(100, 200)))), Some((100, 201)));
+
+        // No derivable bound → caller must invalidate the whole table.
+        assert_eq!(w(None), None);
+        assert_eq!(w(Some(&col("project_id").eq(lit("p")))), None);
+        // OR is not an AND-conjunct, NOT is not a comparison, a non-literal
+        // bound is not a bound, and a different column is not the time column.
+        assert_eq!(w(Some(&window(100, 200).or(col("id").eq(lit("x"))))), None);
+        assert_eq!(w(Some(&!col("timestamp").gt_eq(lit(ts(100))))), None);
+        assert_eq!(w(Some(&col("timestamp").gt_eq(col("other_ts")))), None);
+        assert_eq!(w(Some(&col("observed_timestamp").gt_eq(lit(ts(100))))), None);
     }
 
     /// Regression guard for the 2026-07-27 04:42Z loss: the terminal drain

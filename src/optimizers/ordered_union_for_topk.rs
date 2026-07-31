@@ -67,6 +67,56 @@ fn resolve_ordering(req: &LexOrdering, schema: &Schema) -> Option<LexOrdering> {
     LexOrdering::new(out)
 }
 
+/// The shared mechanism: `children` with every child that does not already
+/// satisfy `req` wrapped in `SortExec(req)` (carrying `fetch`), so a union over
+/// them advertises `req`.
+///
+/// Callers: this rule (top-K, `fetch` known) and `ProjectRoutingTable::scan`,
+/// which uses it with no fetch so the mem ∪ hot ∪ delta union advertises the
+/// table's lead sort key and `EnforceDistribution` satisfies `DedupExec`'s
+/// `SinglePartition` with a `SortPreservingMergeExec` rather than a
+/// `CoalescePartitionsExec` (which declares no ordering, leaving keep-greatest
+/// dormant — see `docs/plans/2026-08-01-merge-on-read-dml.md` §3).
+///
+/// `Ok(None)` means "leave the plan alone":
+/// - every child already satisfies `req` (nothing to inject), or
+/// - a child that doesn't satisfy it is marked unsortable — `sortable[i] ==
+///   false` says "this leg is a whole-window parquet scan; a blocking sort on
+///   it costs far more than the ordering buys" (indices past `sortable`'s end
+///   are sortable), or
+/// - `require_ordered_child` and no child is ordered. The top-K rule sets this:
+///   with the Delta footer pushdown off, neither branch is ordered and sorting
+///   the mem branch alone buys nothing. `scan` does not — a MemBuffer-only scan
+///   has no ordered leg by construction, yet is exactly where a fresh version
+///   append lives, so it must still be ordered.
+pub fn ordered_children(
+    children: &[Arc<dyn ExecutionPlan>], req: &LexOrdering, fetch: Option<usize>, sortable: &[bool], require_ordered_child: bool,
+) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    let sat: Vec<bool> = children.iter().map(|c| c.properties().equivalence_properties().ordering_satisfy(req.iter().cloned())).collect::<Result<Vec<_>>>()?;
+    let unsortable = |i: usize| !sortable.get(i).copied().unwrap_or(true);
+    if sat.iter().all(|&s| s) || sat.iter().enumerate().any(|(i, &s)| !s && unsortable(i)) || (require_ordered_child && !sat.iter().any(|&s| s)) {
+        return Ok(None);
+    }
+    Ok(Some(
+        children
+            .iter()
+            .zip(sat)
+            // `preserve_partitioning`: sort each input partition independently
+            // (in parallel) and keep them, rather than requiring — and getting —
+            // a `CoalescePartitionsExec` that serialises the leg. Per-partition
+            // ordering is what the union advertises and what the merge above
+            // consumes, so this is the cheaper shape for both callers.
+            .map(|(c, s)| {
+                if s {
+                    c.clone()
+                } else {
+                    Arc::new(SortExec::new(req.clone(), c.clone()).with_preserve_partitioning(true).with_fetch(fetch)) as Arc<dyn ExecutionPlan>
+                }
+            })
+            .collect(),
+    ))
+}
+
 /// Walk down from a fetching sort through single-child order-preserving
 /// operators to the first `UnionExec`; if the union is mixed (some children
 /// satisfy `req`, some don't), sort the unsatisfying children by `req` (with
@@ -80,20 +130,14 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
         let Some(req_here) = resolve_ordering(req, &union.schema()) else {
             return Ok(None);
         };
-        let children = union.children();
-        let sat: Vec<bool> =
-            children.iter().map(|c| c.properties().equivalence_properties().ordering_satisfy(req_here.iter().cloned())).collect::<Result<Vec<_>>>()?;
-        // Mixed union only: an ordered child to merge toward AND an unordered
-        // child to fix. All-ordered needs nothing; none-ordered means the Delta
-        // pushdown is off (mixed footers) — leave the blocking sort in place.
-        if !sat.iter().any(|&s| s) || sat.iter().all(|&s| s) {
+        // Mixed union only (`require_ordered_child`): an ordered child to merge
+        // toward AND an unordered child to fix. All-ordered needs nothing;
+        // none-ordered means the Delta pushdown is off (mixed footers) — leave
+        // the blocking sort in place.
+        let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
+        let Some(new_children) = ordered_children(&children, &req_here, fetch, &[], true)? else {
             return Ok(None);
-        }
-        let new_children: Vec<Arc<dyn ExecutionPlan>> = children
-            .into_iter()
-            .zip(sat)
-            .map(|(c, s)| if s { c.clone() } else { Arc::new(SortExec::new(req_here.clone(), c.clone()).with_fetch(fetch)) as Arc<dyn ExecutionPlan> })
-            .collect();
+        };
         return Ok(Some(UnionExec::try_new(new_children)?));
     }
     // Descend only through single-child, order-preserving operators so the
@@ -269,6 +313,34 @@ mod tests {
 
         let out = OrderedUnionForTopK.optimize(top.clone(), &ConfigOptions::new()).unwrap();
         assert_eq!(count_sort_over_mem(&out), 1, "no injection when there is no fetch");
+    }
+
+    // `ordered_children` is also called directly by `ProjectRoutingTable::scan`
+    // (merge-on-read), with `sortable` marking the cheap in-memory legs and
+    // `require_ordered_child = false`. Both guards must hold: an unsortable
+    // unordered leg (a whole-window Delta scan) aborts the whole rewrite, and a
+    // MemBuffer-only scan with no ordered leg at all still gets sorted.
+    #[test]
+    fn ordered_children_honours_sortable_and_lone_leg() {
+        let (s, ord) = (schema(), ts_desc());
+        let mem = MockLeaf::leaf(s.clone(), None);
+        let delta_ordered = MockLeaf::leaf(s.clone(), Some(ord.clone()));
+        let delta_unordered = MockLeaf::leaf(s.clone(), None);
+
+        // mem (sortable) ∪ delta (ordered) → mem gets sorted.
+        let out = ordered_children(&[mem.clone(), delta_ordered], &ord, None, &[true, false], false).unwrap().expect("mixed union is rewritten");
+        assert_eq!(count_sort_over_mem(&out[0]), 1, "the mem leg is sorted");
+        assert_eq!(count_sort_over_mem(&out[1]), 0, "the already-ordered Delta leg is untouched");
+
+        // mem (sortable) ∪ delta (UNORDERED, unsortable) → bail entirely: a
+        // blocking sort over a whole-window parquet scan is the 2026-07-21 OOM.
+        assert!(ordered_children(&[mem.clone(), delta_unordered], &ord, None, &[true, false], false).unwrap().is_none());
+
+        // A lone unordered mem leg: nothing to merge toward, but it is exactly
+        // where a fresh version append lives, so it is still sorted.
+        assert!(ordered_children(std::slice::from_ref(&mem), &ord, None, &[true], false).unwrap().is_some());
+        // ...unless the caller is the top-K rule, which requires an ordered peer.
+        assert!(ordered_children(std::slice::from_ref(&mem), &ord, None, &[true], true).unwrap().is_none());
     }
 
     // Guard: when no child is ordered (Delta pushdown off during mixed-footer

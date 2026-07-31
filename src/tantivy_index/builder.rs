@@ -341,6 +341,8 @@ mod tests {
             time_column: None,
             dedup_keys: vec![],
             dedup_tiebreak: None,
+            tombstone_column: None,
+            version_append: false,
             fields: vec![
                 f("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", None),
                 f("id", "Utf8", None),

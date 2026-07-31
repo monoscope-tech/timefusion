@@ -8404,6 +8404,7 @@ dependencies = [
  "instrumented-object-store",
  "log",
  "lru 0.16.3",
+ "memmap2",
  "num_cpus",
  "object_store",
  "opentelemetry",

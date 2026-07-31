@@ -114,6 +114,7 @@ tempfile = "3"
 sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
 num_cpus = "1.16"
 scopeguard = "1.2.0"
+memmap2 = "0.9.10"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

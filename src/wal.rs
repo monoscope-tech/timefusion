@@ -1270,13 +1270,27 @@ pub(crate) fn cursor_snapshot_path_in(data_dir: &std::path::Path) -> PathBuf {
 /// pure hint files (post-flush cursor snapshot) skip the syncs.
 fn write_atomic(target: &std::path::Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = target.with_extension("json.tmp");
-    {
+    write_atomic_with(target, durable, |f| f.write_all(bytes))
+}
+
+/// [`write_atomic`] for content that is streamed rather than held as a byte
+/// slice (the hot tier writes an Arrow `FileWriter` straight through it). The
+/// temp file is removed on failure so a partial write can't accumulate.
+pub(crate) fn write_atomic_with(target: &std::path::Path, durable: bool, write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut tmp = target.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = (|| {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
+        write(&mut f)?;
         if durable {
             f.sync_all()?;
         }
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     std::fs::rename(&tmp, target)?;
     if durable

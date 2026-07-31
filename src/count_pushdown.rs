@@ -20,7 +20,10 @@
 //!   in Delta would inflate numRecords);
 //! - every in-window file's `[min,max]` timestamp lies fully inside the
 //!   window (boundary-straddling files bail — v1 has no hybrid scan);
-//! - no file carries a deletion vector (numRecords is pre-DV).
+//! - no file carries a deletion vector (numRecords is pre-DV);
+//! - the table cannot hold merge-on-read tombstones (`tombstone_column`
+//!   declared *and* `version_append` on — a declared-but-dormant column can
+//!   hold none, so it does not disqualify the fast path).
 
 use std::sync::Arc;
 
@@ -261,7 +264,21 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
     let Some(q) = match_count_plan(plan) else { return Ok(None) };
     // Only tables served by ProjectRoutingTable qualify (system tables like
     // timefusion_stats share the session but not the storage model).
-    if crate::schema_loader::get_schema(&q.table_name).is_none() {
+    let Some(schema) = crate::schema_loader::get_schema(&q.table_name) else { return Ok(None) };
+    // Tombstones make `stats.numRecords` an over-count in exactly the way
+    // deletion vectors do (below), except invisibly: a merge-on-read DELETE is
+    // an APPEND, so the file stats count both the tombstone version and the
+    // live version it retires. There is no per-file statistic that could tell
+    // us how many — the answer only exists after the dedup+filter the scan
+    // does. Silent wrong answer if we don't decline.
+    //
+    // Gated on tombstones being *possible*, not merely declared: a declared
+    // column with `version_append: false` can hold none, and declining there
+    // would trade the whole stats fast path (the highest-frequency dashboard
+    // tile) for an unbounded scan that buys nothing. See
+    // `TableSchema::tombstones_possible` for the ordering invariant that makes
+    // this sound.
+    if schema.tombstones_possible() {
         return Ok(None);
     }
 
@@ -278,7 +295,7 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
     // above intentionally precedes this: rows leave the buffer only AFTER
     // their commit swapped the shared table, so anything missing from mem at
     // gate time is present in this (later) snapshot.
-    let dedup_keys: Vec<String> = crate::schema_loader::get_schema(&q.table_name).map(|s| s.dedup_keys.clone()).unwrap_or_default();
+    let dedup_keys: &[String] = &schema.dedup_keys;
     let Ok(table_ref) = database.resolve_table(&q.project_id, &q.table_name).await else {
         return Ok(None);
     };

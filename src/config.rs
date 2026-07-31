@@ -496,6 +496,14 @@ const_default!(d_pgwire_user: String = "postgres");
 // by compaction/OPTIMIZE).
 const_default!(d_flush_interval: u64 = 60);
 const_default!(d_retention_mins: u64 = 70);
+// 0 = OFF for the tier's first release: it is a new disk + page-cache consumer
+// and prod is memory-tight (host-level OOM kills, 2026-07-31). Enable per
+// deployment with TIMEFUSION_HOT_TIER_RETENTION_HOURS=6 and watch
+// hot_tier.bytes / workingset_refault; flip this default once soaked.
+const_default!(d_hot_tier_retention_hours: u64 = 0);
+const_default!(d_hot_tier_max_disk_gb: u64 = 64);
+const_default!(d_hot_tier_leg_budget_mb: u64 = 512);
+const_default!(d_hot_tier_memo_mb: u64 = 1024);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
@@ -629,6 +637,16 @@ const_default!(d_write_capture_budget_mb: usize = 256);
 const_default!(d_foyer_block_size_mb: usize = 256);
 const_default!(d_l1_max_entry_mb: usize = 16);
 const_default!(d_cache_recent_days: usize = 8);
+/// Bound on the post-commit cache confirm. It is an optimization, never a
+/// durability gate, so a slow warm must not stall the flush loop.
+pub const CACHE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+/// Concurrency of the confirm's full-file fetches. Deliberately NOT the 16-way
+/// `timefusion_warm_concurrency` (detached, off the flush path): each miss
+/// buffers a whole flush-sized parquet body in transient heap no memory pool
+/// tracks, ON the flush path — the untracked-consumer shape behind this box's
+/// prior OOMs. Peak ≈ this × largest added file.
+pub const CACHE_CONFIRM_CONCURRENCY: usize = 4;
+const_default!(d_cache_bypass_scan_hours: u64 = 24);
 const_default!(d_page_rows: usize = 20_000);
 const_default!(d_zstd_level: i32 = 3);
 // Tiered compression by partition age. Hot writes prioritize ingest latency;
@@ -1043,6 +1061,11 @@ impl CoreConfig {
     pub fn cache_dir(&self) -> PathBuf {
         self.timefusion_data_dir.join("cache")
     }
+    /// Own root for the local hot tier — never share a dir with a generic
+    /// recursive deleter (ba8820e: WAL GC ate the quarantine dir).
+    pub fn hot_tier_dir(&self) -> PathBuf {
+        self.timefusion_data_dir.join("hot_tier")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1053,6 +1076,31 @@ pub struct BufferConfig {
     pub timefusion_buffer_retention_mins: u64,
     #[serde(default = "d_eviction_interval")]
     pub timefusion_eviction_interval_secs: u64,
+    /// Local hot tier: instead of dropping a drained bucket, demote it to an
+    /// uncompressed Arrow IPC file on local disk and serve recent-window reads
+    /// from it via zero-copy mmap (third plan leg, between MemBuffer and Delta).
+    /// This is the tier's main switch — hours of window; **0 turns demotion
+    /// off** (GC still sweeps, so the directory can't strand bytes). Past this
+    /// age a demoted file is unlinked and its window falls back to Delta.
+    #[serde(default = "d_hot_tier_retention_hours")]
+    pub timefusion_hot_tier_retention_hours: u64,
+    /// Hard cap on the tier's directory; over it, GC unlinks oldest-first. The
+    /// tier shares the WAL/data volume, which has twice been eaten by an
+    /// unbounded consumer (273GB of orphaned spill dirs, 238GB of tantivy
+    /// cache whose size knob was dead code), so this one is a real dial.
+    #[serde(default = "d_hot_tier_max_disk_gb")]
+    pub timefusion_hot_tier_max_disk_gb: u64,
+    /// Per-scan heap ceiling for the hot leg: post-filter Arrow bytes one
+    /// query may materialize out of demoted files before the leg stops adding
+    /// them (remaining windows fall through to Delta). The hot leg is planned
+    /// eagerly and sits in no memory pool, so this is its ONLY bound.
+    #[serde(default = "d_hot_tier_leg_budget_mb")]
+    pub timefusion_hot_tier_leg_budget_mb: u64,
+    /// Process-wide ceiling on memoized decodes. Each memo entry pins one
+    /// file's mmap (clean, reclaimable pages) plus its `ArrayData` structs;
+    /// over the cap the least-recently-used entries are dropped.
+    #[serde(default = "d_hot_tier_memo_mb")]
+    pub timefusion_hot_tier_memo_mb: u64,
     #[serde(default = "d_buffer_max_memory")]
     pub timefusion_buffer_max_memory_mb: usize,
     #[serde(default = "d_stop_grace")]
@@ -1163,6 +1211,21 @@ impl BufferConfig {
     pub fn retention_mins(&self) -> u64 {
         self.timefusion_buffer_retention_mins.max(1)
     }
+    /// Hot-tier window, `None` when `TIMEFUSION_HOT_TIER_RETENTION_HOURS=0`
+    /// (the tier's off switch: no demotion, no third scan leg, no disk use).
+    pub fn hot_tier_retention(&self) -> Option<Duration> {
+        (self.timefusion_hot_tier_retention_hours > 0).then(|| Duration::from_secs(self.timefusion_hot_tier_retention_hours * 3_600))
+    }
+    /// The tier's three ceilings — disk, per-scan heap, memoized decodes.
+    pub fn hot_tier_limits(&self) -> crate::hot_tier::HotTierLimits {
+        const GB: u64 = 1024 * 1024 * 1024;
+        crate::hot_tier::HotTierLimits {
+            max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GB),
+            leg_budget_bytes: self.timefusion_hot_tier_leg_budget_mb.saturating_mul(GB / 1024),
+            memo_bytes: self.timefusion_hot_tier_memo_mb.saturating_mul(GB / 1024),
+        }
+    }
+
     /// mtime age past which a WAL file is PRESUMED dead weight. This is a
     /// heuristic, not a soundness bound: replay is cursor-bounded (no age
     /// cutoff — see `recover_from_wal`), so GC soundness comes from the
@@ -1365,6 +1428,12 @@ pub struct CacheConfig {
     pub timefusion_write_capture_budget_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_disabled: bool,
+    /// Scan-resistant admission: a scan reaching further back than this many
+    /// hours runs with cache population BYPASSED, so a 7d/14d sweep can't
+    /// flush the hot tail out of L1/disk (ClickHouse big-scan bypass). Reads
+    /// still HIT what is already cached. 0 disables the bypass.
+    #[serde(default = "d_cache_bypass_scan_hours")]
+    pub timefusion_cache_bypass_scan_hours: u64,
 }
 
 impl CacheConfig {
@@ -1409,6 +1478,11 @@ impl CacheConfig {
     }
     pub fn l1_max_entry_bytes(&self) -> usize {
         self.timefusion_foyer_l1_max_entry_mb * MIB
+    }
+    /// Scan lookback depth past which cache population is bypassed, in the same
+    /// unit the read path measures it. `None` = never bypass.
+    pub fn cache_bypass_scan_micros(&self) -> Option<i64> {
+        (self.timefusion_cache_bypass_scan_hours > 0).then(|| self.timefusion_cache_bypass_scan_hours as i64 * 3_600 * 1_000_000)
     }
     pub fn metadata_disk_size_bytes(&self) -> usize {
         self.timefusion_foyer_metadata_disk_mb.map_or(self.timefusion_foyer_metadata_disk_gb * GIB, |mb| mb * MIB)

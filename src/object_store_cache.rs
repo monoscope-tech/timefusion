@@ -232,7 +232,10 @@ impl FoyerCacheConfig {
             memory_size_bytes: 10 * 1024 * 1024, // 10MB
             disk_size_bytes: 50 * 1024 * 1024,   // 50MB
             ttl: Duration::from_secs(300),
-            cache_dir: PathBuf::from(format!("/tmp/test_foyer_{}", name)),
+            // Per-process dir: foyer's disk tier outlives the run, so a fixed
+            // path leaks entries into the NEXT `cargo test` and any absence
+            // assertion then passes only on a clean /tmp.
+            cache_dir: PathBuf::from(format!("/tmp/test_foyer_{}_{}", name, std::process::id())),
             shards: 2,
             file_size_bytes: 1024 * 1024, // 1MB
             enable_stats: true,
@@ -501,6 +504,16 @@ impl SharedFoyerCache {
     pub fn evict_data_entry(&self, key: &str) {
         self.cache.remove(key);
     }
+
+    /// Non-populating existence probe on the main cache, keyed like
+    /// `evict_data_entry` (the object-store-relative path). Checks L1 plus the
+    /// disk bloom filter, so it costs no IO and never promotes an entry — which
+    /// is what makes the pre-drain confirm free for already-captured files.
+    /// May false-positive on a hash collision (foyer's contract): the cost is
+    /// one un-warmed file, i.e. a later cache miss.
+    pub fn contains_data(&self, key: &str) -> bool {
+        self.cache.contains(key)
+    }
 }
 
 /// Strip the `scheme://` prefix and trailing slashes from a table URI, yielding
@@ -568,6 +581,35 @@ pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
         Ok(result) => result.bytes().await.is_ok(),
         Err(_) => false,
     }
+}
+
+tokio::task_local! {
+    /// Set for the duration of a scan that must not pollute the cache.
+    static SCAN_BYPASS: bool;
+}
+
+/// Run `fut` with cache POPULATION suppressed (lookups still hit normally) when
+/// `bypass` is set — scan-resistant admission, so a wide historical scan can't
+/// evict the hot tail it will never re-read (ClickHouse's big-scan bypass).
+///
+/// Task-local, so it covers everything awaited inside `fut` but NOT work the
+/// inner store hands to a separate task. That's the intended blast radius: the
+/// gated scan's own fetches are what read GBs of cold parquet.
+pub fn scan_bypass_scope<F: std::future::Future>(bypass: bool, fut: F) -> impl std::future::Future<Output = F::Output> {
+    SCAN_BYPASS.scope(bypass, fut)
+}
+
+pub fn bypass_active() -> bool {
+    SCAN_BYPASS.try_with(|b| *b).unwrap_or(false)
+}
+
+/// [`warm_full`] that skips the GET when the cache already holds the object —
+/// on the flush path most files were captured during their own upload, so the
+/// Influx-oracle confirm costs one free existence probe and only fetches the
+/// gap write-capture left (over its per-upload cap or the process budget).
+/// Returns `true` iff bytes were actually fetched.
+pub async fn warm_full_if_absent(store: &dyn ObjectStore, shared: &SharedFoyerCache, location: &Path) -> bool {
+    !shared.contains_data(location.as_ref()) && warm_full(store, location).await
 }
 
 /// Parse the `date=YYYY-MM-DD` Hive partition segment from `s`. `None` for
@@ -1155,7 +1197,7 @@ impl FoyerObjectStoreCache {
                     e_tag: file_meta.e_tag.clone(),
                     version: file_meta.version.clone(),
                 };
-                self.metadata_cache.insert(range_cache_key, CacheValue::new(data.to_vec(), range_meta));
+                self.admit(&self.metadata_cache, range_cache_key, CacheValue::new(data.to_vec(), range_meta), 0);
 
                 return Ok(data);
             } else {
@@ -1257,7 +1299,7 @@ impl FoyerObjectStoreCache {
         // Cache immutable parquet meta so later footer reads skip the HEAD. Skip
         // mutable paths (Delta log / _last_checkpoint can be rewritten in place).
         if is_parquet_file(location) {
-            self.metadata_cache.insert(Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()));
+            self.admit(&self.metadata_cache, Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()), 0);
         }
         Ok(meta)
     }
@@ -1323,7 +1365,18 @@ impl FoyerObjectStoreCache {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        insert_main(&self.cache, Self::make_cache_key(location), value, self.config.l1_max_entry_bytes);
+        self.admit(&self.cache, Self::make_cache_key(location), value, self.config.l1_max_entry_bytes);
+    }
+
+    /// Single funnel for every cache population, so `scan_bypass_scope` can
+    /// suppress all of them in one place. `l1_max_entry_bytes = 0` (metadata
+    /// entries) keeps the default L1+disk placement.
+    fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
+        if bypass_active() {
+            crate::metrics::record_cache_insert_bypassed();
+            return;
+        }
+        insert_main(cache, key, value, l1_max_entry_bytes);
     }
 
     /// Sliding-TTL refresh: keep an entry at most `ttl` past its *last query*
@@ -1620,8 +1673,8 @@ impl ObjectStore for FoyerObjectStoreCache {
                     e_tag: meta.e_tag.clone(),
                     version: meta.version.clone(),
                 };
-                self.metadata_cache.insert(Self::make_range_cache_key(location, &abs_range), CacheValue::new(bytes.to_vec(), range_meta));
-                self.metadata_cache.insert(Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()));
+                self.admit(&self.metadata_cache, Self::make_range_cache_key(location, &abs_range), CacheValue::new(bytes.to_vec(), range_meta), 0);
+                self.admit(&self.metadata_cache, Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()), 0);
             }
             let data_len = bytes.len() as u64;
             return Ok(GetResult {
@@ -2929,6 +2982,83 @@ mod tests {
 
         cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    // P0 scan-resistant admission: a wide historical scan must be able to READ
+    // through the cache without POPULATING it, or one 14d query evicts the hot
+    // tail the whole design exists to keep local.
+    #[tokio::test]
+    async fn bypass_scope_suppresses_population_but_not_hits() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let cache = FoyerObjectStoreCache::new(inner.clone(), FoyerCacheConfig::test_config("scan_bypass")).await?;
+        let hot = Path::from("tbl/date=2026-01-02/hot.parquet");
+        let cold = Path::from("tbl/date=2020-01-01/cold.parquet");
+        cache.put(&hot, PutPayload::from_static(b"hot-bytes")).await?; // cached from the write payload
+        inner.put(&cold, PutPayload::from_static(b"cold-bytes")).await?; // only in the inner store
+        cache.reset_stats().await;
+
+        let (hot_bytes, cold_bytes) =
+            scan_bypass_scope(true, async { (cache.get(&hot).await.unwrap().bytes().await.unwrap(), cache.get(&cold).await.unwrap().bytes().await.unwrap()) })
+                .await;
+        assert_eq!(hot_bytes, Bytes::from_static(b"hot-bytes"));
+        assert_eq!(cold_bytes, Bytes::from_static(b"cold-bytes"));
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 1, "lookups still hit inside a bypass scope");
+        assert_eq!(stats.main.inner_gets, 1, "the miss still fetches");
+        assert!(!cache.cache.contains(cold.as_ref()), "a bypassed miss must not populate the cache");
+        assert!(cache.cache.contains(hot.as_ref()), "the pre-existing hot entry survives the scan");
+
+        // Same read outside the scope populates normally — the suppression is
+        // scoped, not a config kill switch.
+        cache.get(&cold).await?.bytes().await?;
+        assert!(cache.cache.contains(cold.as_ref()));
+        assert!(!bypass_active(), "the scope must not leak past its future");
+
+        cache.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contains_data_probes_without_populating() -> anyhow::Result<()> {
+        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("contains_probe")).await?;
+        let path = Path::from("tbl/date=2026-01-02/part.parquet");
+        assert!(!shared.contains_data(path.as_ref()), "probe is false before insert");
+        let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: 3, e_tag: None, version: None };
+        shared.cache.insert(path.to_string(), CacheValue::new(b"abc".to_vec(), meta));
+        assert!(shared.contains_data(path.as_ref()));
+        assert!(!shared.contains_data("tbl/date=2026-01-02/other.parquet"));
+        shared.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(5)).await?;
+        Ok(())
+    }
+
+    // The oracle's whole point is that files already captured during upload are
+    // free to confirm: only the write-capture gap may cost a fetch.
+    #[tokio::test]
+    async fn warm_full_if_absent_fetches_only_the_uncaptured_files() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicUsize;
+        let mem = Arc::new(InMemory::new());
+        let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
+        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("confirm_cached")).await?;
+        let cache = FoyerObjectStoreCache::new_with_shared_cache(counting, &shared);
+
+        let captured = Path::from("tbl/date=2026-01-02/captured.parquet");
+        let skipped = Path::from("tbl/date=2026-01-02/skipped.parquet");
+        cache.put(&captured, PutPayload::from_static(b"captured")).await?; // write-capture path
+        mem.put(&skipped, PutPayload::from_static(b"skipped")).await?; // capture was skipped (over cap)
+
+        assert!(!warm_full_if_absent(&cache, &shared, &captured).await, "the captured file costs a probe, not a GET");
+        assert!(warm_full_if_absent(&cache, &shared, &skipped).await, "only the uncaptured file is fetched");
+        assert_eq!(gets.load(Ordering::Relaxed), 1);
+        assert!(shared.contains_data(skipped.as_ref()), "the gap is cached before the caller drains");
+
+        // Idempotent: a second pass is pure probes.
+        assert!(!warm_full_if_absent(&cache, &shared, &captured).await);
+        assert!(!warm_full_if_absent(&cache, &shared, &skipped).await);
+        assert_eq!(gets.load(Ordering::Relaxed), 1);
+
+        cache.shutdown().await?;
         Ok(())
     }
 }

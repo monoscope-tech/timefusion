@@ -606,3 +606,304 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     assert_eq!(after, before, "second sweep must be a no-op on converged runs");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Merge-on-read read path (docs/plans/2026-08-01-merge-on-read-dml.md §3).
+//
+// Keep-greatest only engages while `DedupExec`'s input still DECLARES an
+// ordering on the leading dedup key — that is what makes every version of a key
+// arrive in one contiguous run. `DedupExec` requires `SinglePartition`, which
+// otherwise gets an ordering-erasing `CoalescePartitionsExec`, and the
+// mem ∪ hot ∪ delta union is unordered while the MemBuffer branch declares
+// nothing. `scan` therefore sorts the (in-memory, cheap) mem/hot legs up to the
+// Delta leg's declared footer ordering; the union then advertises it and
+// `EnforceDistribution` picks a `SortPreservingMergeExec` instead.
+//
+// The shape under test is the production one: the base row is already flushed to
+// Delta (one file → the fork's footer pushdown declares `timestamp DESC`) and
+// the new version is still in MemBuffer.
+// ---------------------------------------------------------------------------
+
+/// A `Database` with a real buffered layer, so writes can land in MemBuffer.
+async fn buffered_db(name: &str) -> Result<(Arc<Database>, String)> {
+    let cfg = TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).build();
+    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; every
+    // caller is `#[serial]`, same as `buffer_consistency_test::setup_db_with_buffer`.
+    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
+    Ok((db, format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8])))
+}
+
+/// `to_delta = true` commits straight to Delta (the already-flushed base row);
+/// `false` goes through the buffered layer into MemBuffer (the new version).
+async fn write(db: &Arc<Database>, project_id: &str, rows: Vec<serde_json::Value>, to_delta: bool) -> Result<()> {
+    write_to(db, "otel_logs_and_spans", project_id, rows, to_delta).await
+}
+
+async fn write_to(db: &Arc<Database>, table: &str, project_id: &str, rows: Vec<serde_json::Value>, to_delta: bool) -> Result<()> {
+    let batch = timefusion::test_utils::test_helpers::json_to_batch_for(table, rows)?;
+    db.insert_records_batch(project_id, table, vec![batch], to_delta, None).await?;
+    Ok(())
+}
+
+/// A `mor_versioned` row — the fixture table that ships `version_append: true`,
+/// so the merge-on-read read path is actually live on it.
+fn mor_row(id: &str, name: &str, project_id: &str, ts: i64, deleted: Option<bool>) -> serde_json::Value {
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+    serde_json::json!({ "timestamp": ts, "id": id, "name": name, "project_id": project_id, "date": date, "deleted": deleted })
+}
+
+/// Run the dedup sweep until the window's partitions carry a clean fingerprint —
+/// the precondition both the read-side dedup skip and `count_pushdown` gate on.
+/// Only a 0-drop pass over an UNCHANGED live file set certifies a partition, so
+/// a first pass that rewrote anything marks nothing — the second pass over the
+/// settled set is what certifies. Two passes; the second is an early-return
+/// no-op when the first already left the table's version untouched.
+async fn sweep_clean(db: &Arc<Database>, table: &str) -> Result<()> {
+    let table_ref = db.unified_tables().read().await.get(table).expect("table created").clone();
+    for _ in 0..2 {
+        db.dedup_today_partitions(&table_ref, table, table).await?;
+    }
+    Ok(())
+}
+
+async fn physical_plan(db: &Arc<Database>, sql: &str) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    let mut ctx = Arc::clone(db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    Ok(ctx.sql(sql).await?.create_physical_plan().await?)
+}
+
+fn rendered(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> String {
+    datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string()
+}
+
+/// Depth-first search for the first node named `name`.
+fn find_node(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, name: &str) -> Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    if plan.name() == name {
+        return Some(plan.clone());
+    }
+    plan.children().into_iter().find_map(|c| find_node(c, name))
+}
+
+async fn column_strings(db: &Arc<Database>, sql: &str) -> Result<Vec<String>> {
+    let mut ctx = Arc::clone(db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    Ok(ctx
+        .sql(sql)
+        .await?
+        .collect()
+        .await?
+        .iter()
+        .flat_map(|b| (0..b.num_rows()).map(|i| timefusion::test_utils::test_helpers::array_get_str(b.column(0).as_ref(), i)).collect::<Vec<_>>())
+        .collect())
+}
+
+/// The load-bearing prerequisite, as a plan-shape assertion: a PLAIN `SELECT`
+/// (no ORDER BY, no LIMIT) over a `version_append` table must reach `DedupExec`
+/// through a `SortPreservingMergeExec`, never a `CoalescePartitionsExec`, and
+/// its input must still declare an ordering.
+#[serial]
+#[tokio::test]
+async fn plain_select_merges_ordered_under_dedup() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_plan_shape").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    let rows = (0..8).map(|i| mor_row(&format!("k{i}"), "v", &project_id, ts - i * 1000, None)).collect();
+    write_to(&db, "mor_versioned", &project_id, rows, true).await?;
+    write_to(&db, "mor_versioned", &project_id, vec![mor_row("k0", "v2", &project_id, ts, None)], false).await?;
+
+    let plan = physical_plan(&db, &format!("SELECT name FROM mor_versioned WHERE project_id = '{project_id}'")).await?;
+    let text = rendered(&plan);
+    let dedup = find_node(&plan, "DedupExec").unwrap_or_else(|| panic!("no DedupExec in plan:\n{text}"));
+    let input = dedup.children()[0].clone();
+    assert_eq!(input.name(), "SortPreservingMergeExec", "DedupExec must be fed by an order-preserving merge, got `{}`:\n{text}", input.name());
+    assert!(input.properties().output_ordering().is_some(), "the merge must still declare the ordering keep-greatest reads:\n{text}");
+    assert!(!text.contains("CoalescePartitionsExec"), "an ordering-erasing coalesce under DedupExec is exactly the blocker:\n{text}");
+    Ok(())
+}
+
+/// The other half of the gate, and the one that ships: while `version_append` is
+/// OFF, the ordering machinery must be completely absent from the scan. No
+/// version can exist, so the blocking `SortExec` over the mem/hot legs and the
+/// k-way `SortPreservingMergeExec` (one in-flight batch per Delta partition —
+/// the 2026-07-20 OOM shape) would be pure cost. `DedupExec` keeps its
+/// keep-first behaviour behind the pre-existing `CoalescePartitionsExec`.
+#[serial]
+#[tokio::test]
+async fn dormant_version_append_table_keeps_coalesce_and_no_injected_sort() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_plan_shape_dormant").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    write(&db, &project_id, (0..8).map(|i| test_span_ts(&format!("k{i}"), "v", &project_id, ts - i * 1000)).collect(), true).await?;
+    write(&db, &project_id, vec![test_span_ts("k0", "v2", &project_id, ts)], false).await?;
+
+    let plan = physical_plan(&db, &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
+    let text = rendered(&plan);
+    let dedup = find_node(&plan, "DedupExec").unwrap_or_else(|| panic!("no DedupExec in plan:\n{text}"));
+    assert_eq!(dedup.children()[0].name(), "CoalescePartitionsExec", "a dormant version_append table must keep the pre-merge-on-read plan shape:\n{text}");
+    assert!(!text.contains("SortExec"), "no sort may be injected over the mem/hot legs while version_append is off:\n{text}");
+    assert!(!text.contains("SortPreservingMergeExec"), "no k-way merge may be injected while version_append is off:\n{text}");
+    Ok(())
+}
+
+/// A table declaring no `dedup_tiebreak` (and no dedup keys / tombstone) must
+/// plan exactly as it did before merge-on-read: no injected sort, no merge, no
+/// dedup, no tombstone filter.
+#[serial]
+#[tokio::test]
+async fn no_tiebreak_table_plan_is_unchanged() -> Result<()> {
+    let (db, _project_id) = buffered_db("mor_no_tiebreak").await?;
+    let text = rendered(&physical_plan(&db, "SELECT id FROM variant_bench WHERE project_id = 'p'").await?);
+    for op in ["DedupExec", "SortPreservingMergeExec", "SortExec", "IS DISTINCT FROM true"] {
+        assert!(!text.contains(op), "variant_bench declares no dedup_tiebreak/tombstone — `{op}` must not appear:\n{text}");
+    }
+    Ok(())
+}
+
+/// The behavioural contract of merge-on-read: two versions of one
+/// `(timestamp, id)` that differ only in their TF-stamped `updated_at` must both
+/// read back as the NEWER version — through a plain `SELECT` and through an
+/// aggregation. Under keep-first (arrival order) this returns "v1".
+#[serial]
+#[tokio::test]
+async fn keep_greatest_returns_newest_version() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_keep_greatest").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    write_to(&db, "mor_versioned", &project_id, vec![mor_row("k", "v1", &project_id, ts, None)], true).await?;
+    write_to(&db, "mor_versioned", &project_id, vec![mor_row("k", "v2", &project_id, ts, None)], false).await?;
+
+    let where_ = format!("WHERE project_id = '{project_id}' AND id = 'k'");
+    assert_eq!(column_strings(&db, &format!("SELECT name FROM mor_versioned {where_}")).await?, vec!["v2"], "plain SELECT must resolve to the newest version");
+    assert_eq!(
+        column_strings(&db, &format!("SELECT max(name) FROM mor_versioned {where_}")).await?,
+        vec!["v2"],
+        "an aggregation must see the newest version too — one surviving row"
+    );
+    Ok(())
+}
+
+/// Merge-on-read `DELETE`: the tombstone version must first BEAT the older live
+/// version on `updated_at` (so keep-greatest picks it), and only then remove the
+/// row. Filtering below the dedup would drop the tombstone and resurrect the
+/// stale live row. It must vanish from `SELECT` and from `COUNT(*)` alike — the
+/// latter also pins that the stats-based `count_pushdown` declines on a
+/// tombstone table, where `numRecords` counts versions it never materializes.
+#[serial]
+#[tokio::test]
+async fn tombstoned_row_hidden_from_select_and_count() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_tombstone").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    let row = |id: &str, deleted: Option<bool>| mor_row(id, id, &project_id, ts, deleted);
+    write_to(&db, "mor_versioned", &project_id, vec![row("gone", None), row("live", None)], true).await?;
+    write_to(&db, "mor_versioned", &project_id, vec![row("gone", Some(true))], false).await?;
+
+    let where_ = format!("WHERE project_id = '{project_id}'");
+    assert_eq!(
+        column_strings(&db, &format!("SELECT id FROM mor_versioned {where_}")).await?,
+        vec!["live"],
+        "a key whose winning version is a tombstone must not appear in SELECT"
+    );
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let cnt = ctx.sql(&format!("SELECT COUNT(*) FROM mor_versioned {where_}")).await?.collect().await?;
+    assert_eq!(cnt[0].column(0).as_primitive::<Int64Type>().value(0), 1, "COUNT(*) must not count the tombstoned row");
+    Ok(())
+}
+
+/// `COUNT(*)` over a Delta-only, fully-flushed, timestamp-bounded window — the
+/// exact shape `count_pushdown` answers from add-action `numRecords`, and one
+/// `dedup_window_clean` will happily certify. Those stats count a tombstone as a
+/// row and the live version it retires as another, so the pushdown must decline
+/// wherever tombstones can exist; the answer here is 0, not 2.
+#[serial]
+#[tokio::test]
+async fn count_pushdown_declines_where_tombstones_are_possible() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_count_pushdown").await?;
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let iso = |t: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(t).unwrap().to_rfc3339();
+    // Both versions in ONE Delta file (so the footer ordering is declared and
+    // keep-greatest engages), nothing in MemBuffer. `numRecords` says 2.
+    let rows = vec![mor_row("k", "v", &project_id, ts, None), mor_row("k", "v", &project_id, ts, Some(true))];
+    write_to(&db, "mor_versioned", &project_id, rows, true).await?;
+    sweep_clean(&db, "mor_versioned").await?;
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM mor_versioned WHERE project_id = '{project_id}' AND timestamp >= '{}'::timestamptz AND timestamp < '{}'::timestamptz",
+        iso(ts - 60_000_000),
+        iso(ts + 60_000_000)
+    );
+    // A successful pushdown replaces the whole plan with a one-row in-memory
+    // exec; declining leaves the real scan (dedup + tombstone filter) standing.
+    let text = rendered(&physical_plan(&db, &sql).await?);
+    assert!(text.contains("DedupExec"), "count_pushdown must decline where tombstones can exist — it answered from add-action stats:\n{text}");
+    assert!(text.contains("IS DISTINCT FROM true"), "the tombstone filter must be part of the counted plan:\n{text}");
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let cnt = ctx.sql(&sql).await?.collect().await?;
+    assert_eq!(cnt[0].column(0).as_primitive::<Int64Type>().value(0), 0, "the tombstone wins its key and removes the row — stats would have said 2");
+    Ok(())
+}
+
+/// The tombstone column is live on `otel_logs_and_spans` (all NULL) before any
+/// tombstone is ever written: NULL must read as LIVE, so the filter is a
+/// provable no-op on existing data.
+#[serial]
+#[tokio::test]
+async fn null_tombstone_is_live() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_tombstone_null").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    write(&db, &project_id, (0..5).map(|i| test_span_ts(&format!("k{i}"), "v", &project_id, ts - i * 1000)).collect(), true).await?;
+    assert_eq!(column_strings(&db, &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?.len(), 5);
+    Ok(())
+}
+
+/// A predicate on the tombstone marker must NEVER be pushed into a scan leg:
+/// applied at the source it drops the tombstone row before the dedup, so the
+/// older live version wins and a deleted row silently resurrects. It is reported
+/// `Unsupported` (DataFusion keeps its own `FilterExec` above the whole scan)
+/// and stripped again inside `scan`.
+#[serial]
+#[tokio::test]
+async fn tombstone_predicate_is_not_pushed_into_the_scan() -> Result<()> {
+    use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
+    let (db, project_id) = buffered_db("mor_tombstone_pushdown").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    write(&db, &project_id, vec![test_span_ts("k", "v1", &project_id, ts)], true).await?;
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let provider = ctx.table_provider("otel_logs_and_spans").await?;
+    let pred = col("deleted").eq(lit(true));
+    assert!(
+        matches!(provider.supports_filters_pushdown(&[&pred])?[0], TableProviderFilterPushDown::Unsupported),
+        "a tombstone-column predicate must never be pushed to the scan legs"
+    );
+
+    // End to end: the dedup still runs under a user predicate on the marker —
+    // the predicate is applied above the whole scan, not inside a leg.
+    let text = rendered(&physical_plan(&db, &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND deleted")).await?);
+    assert!(text.contains("DedupExec"), "the dedup must still run under a tombstone predicate:\n{text}");
+    Ok(())
+}
+
+/// The existing top-K path must still early-terminate: `ORDER BY timestamp DESC
+/// LIMIT n` must not regrow the blocking whole-window `SortExec` that
+/// `ordered_union_for_topk` exists to remove — every surviving sort carries a
+/// fetch (a TopK).
+#[serial]
+#[tokio::test]
+async fn topk_path_still_streams() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_topk").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    write(&db, &project_id, (0..8).map(|i| test_span_ts(&format!("t{i}"), "n", &project_id, ts - i * 1000)).collect(), true).await?;
+    write(&db, &project_id, vec![test_span_ts("t9", "n", &project_id, ts + 1000)], false).await?;
+
+    let sql = format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY timestamp DESC LIMIT 2");
+    let text = rendered(&physical_plan(&db, &sql).await?);
+    for line in text.lines().filter(|l| l.contains("SortExec")) {
+        assert!(line.contains("fetch="), "a blocking whole-window SortExec regrew in the top-K plan: {line}\n{text}");
+    }
+    assert_eq!(column_strings(&db, &sql).await?.len(), 2);
+    Ok(())
+}

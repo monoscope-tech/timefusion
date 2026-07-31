@@ -96,6 +96,11 @@ counter_registry! {
     dml_coalesce_dropped       => "timefusion.dml.coalesce_dropped": "Coalesced DML groups whose rows could NOT even be quarantined — deferred Delta updates were LOST for rows already in Delta (buffer-resident rows are unaffected). PAGE if > 0",
     dml_coalesce_quarantined   => "timefusion.dml.coalesce_quarantined": "Coalesced DML groups parked to <wal_dir>/quarantine/dml after exhausting drain retries. Rows are recoverable (Arrow IPC + .meta sidecar) but the Delta leg has NOT applied — investigate and re-drive. ALERT if > 0",
     write_capture_skipped      => "timefusion.cache.write_capture_skipped": "Multipart uploads whose cache write-tee was skipped or abandoned (over the per-upload cap or the process-wide capture budget). Purely a cache miss later — the upload itself is unaffected. Sustained high values on flush-sized files mean the caps are too tight",
+    cache_confirm_attempts     => "timefusion.cache.confirm_attempts": "Files probed by the pre-drain cache confirm on the flush path (Influx oracle ordering). Files captured during upload cost only this probe",
+    cache_confirm_warmed       => "timefusion.cache.confirm_warmed": "Files the pre-drain confirm had to fetch because write-capture skipped them. Sustained ~= confirm_attempts means the write-capture caps are too tight — every flush output is being re-read from S3",
+    cache_confirm_timeouts     => "timefusion.cache.confirm_timeouts": "Pre-drain cache confirms that hit their bound and gave up. Best-effort — the commit and the drain proceed; the next query on those files just pays an S3 round-trip",
+    cache_insert_bypassed      => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
+    hot_tier_demote_skipped    => "timefusion.hot_tier.demote_skipped": "Flush groups NOT demoted to the local hot tier because a demotion was already running (the bound that keeps drained batches from piling up off-ledger). Purely a latency miss — those windows are served from Delta. WARN if sustained: the local IPC write is falling behind the flush rate",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
     maintenance_checkpoint_failed => "timefusion.maintenance.checkpoint_failed": "Out-of-band checkpoint attempts that errored (e.g. R2 500 on the checkpoint PUT). Retried next tick; ingest is unaffected. WARN if sustained — checkpoints falling behind slows boot replay and blocks log cleanup",
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
@@ -209,6 +214,34 @@ pub fn init_metrics(
     // rows so the pair stays comparable after a restart (see snapshot_stats).
     layer_counter!("timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s.rows_ingested_total);
     layer_counter!("timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
+    // Local hot tier. The two "the tier is broken" signals are write_failures
+    // (demotion failing — reads stay correct, just slower) and read_misses
+    // (torn/absent files falling back to Delta); schema_drift is the silent
+    // one, where a file looks like a healthy hit but contributes zero rows.
+    layer_gauge!("timefusion.hot_tier.bytes", "Bytes of demoted Arrow IPC held by the local hot tier", |s| s.hot_tier.bytes);
+    layer_gauge!("timefusion.hot_tier.files", "Demoted bucket files in the local hot tier", |s| s.hot_tier.files as u64);
+    layer_counter!("timefusion.hot_tier.writes_total", "Buckets demoted to the local hot tier", |s| s.hot_tier.writes);
+    layer_counter!("timefusion.hot_tier.write_failures_total", "Demotions that errored. ALERT if sustained", |s| s.hot_tier.write_failures);
+    layer_counter!("timefusion.hot_tier.read_hits_total", "Hot-tier files served to a scan", |s| s.hot_tier.read_hits);
+    layer_counter!("timefusion.hot_tier.read_misses_total", "Hot-tier files that read as torn/absent and fell through to Delta. ALERT if sustained", |s| s
+        .hot_tier
+        .read_misses);
+    layer_counter!("timefusion.hot_tier.schema_drift_total", "Hot-tier files skipped because their schema no longer matches the table's", |s| s
+        .hot_tier
+        .schema_drift);
+    layer_counter!("timefusion.hot_tier.mem_skipped_total", "Hot-tier files skipped because MemBuffer still owned their window (expected)", |s| s
+        .hot_tier
+        .mem_skipped);
+    layer_gauge!(
+        "timefusion.hot_tier.suppressed_tables",
+        "Tables currently not demoting because a DML kept invalidating their files before any query read them",
+        |s| s.hot_tier.suppressed_tables as u64
+    );
+    layer_counter!(
+        "timefusion.hot_tier.suppressions_total",
+        "Times a table's demotions were judged not to pay off and were suspended for a cooldown. Sustained growth on a table you expect to be read means the hot tier is losing a race with continuous enrichment — expected for whole-table UPDATE workloads, otherwise investigate",
+        |s| s.hot_tier.suppressions
+    );
     layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
     layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
     layer_gauge!("timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
@@ -322,6 +355,18 @@ simple_recorders! {
     record_backpressure_force_flush => backpressure_force_flush,
     record_flush_stalled => flush_stalled,
     record_write_capture_skipped => write_capture_skipped,
+    record_cache_confirm_timeout => cache_confirm_timeouts,
+    record_cache_insert_bypassed => cache_insert_bypassed,
+    record_hot_tier_demote_skipped => hot_tier_demote_skipped,
+}
+
+/// One pre-drain confirm pass: `attempted` files probed, `warmed` of them
+/// missing and fetched (the write-capture gap).
+pub fn record_cache_confirm(attempted: u64, warmed: u64) {
+    if let Some(m) = METRICS.get() {
+        m.cache_confirm_attempts.add(attempted, &[]);
+        m.cache_confirm_warmed.add(warmed, &[]);
+    }
 }
 
 pub fn record_dedup_dropped(rows: u64) {

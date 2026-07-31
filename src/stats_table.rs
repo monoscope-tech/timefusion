@@ -164,6 +164,52 @@ impl StatsTableProvider {
             // how gc_wal_files deleted them unnoticed. ALERT if files > 0.
             rows.push(("wal", "quarantine_files".into(), s.quarantine_files.to_string()));
             rows.push(("wal", "quarantine_mb".into(), format!("{:.1}", s.quarantine_bytes as f64 / (1024.0 * 1024.0))));
+            // Local hot tier (demoted sealed buckets served by mmap'd Arrow
+            // IPC). `read_misses` growing = torn/absent files falling through
+            // to Delta; `write_failures` growing = demotion is broken (reads
+            // stay correct, just slower).
+            let h = &s.hot_tier;
+            for (k, v) in [
+                ("tables", h.tables as u64),
+                ("files", h.files as u64),
+                ("bytes", h.bytes),
+                ("writes_total", h.writes),
+                ("write_failures_total", h.write_failures),
+                ("read_hits_total", h.read_hits),
+                ("read_misses_total", h.read_misses),
+                ("mem_skipped_total", h.mem_skipped),
+                ("schema_drift_total", h.schema_drift),
+                ("gc_deleted_total", h.gc_deleted),
+                ("gc_bytes_freed_total", h.gc_bytes_freed),
+                ("invalidated_total", h.invalidated),
+                // DML statements scoped to their own time window vs. those
+                // that had to drop the whole table. `invalidations_full_total`
+                // dominating means the range derivation isn't matching the
+                // workload's predicate shapes — the tier is back to paying for
+                // files every enrichment statement throws away.
+                ("invalidations_ranged_total", h.invalidations_ranged),
+                ("invalidations_full_total", h.invalidations_full),
+                // Tables that stopped demoting because a DML kept dropping
+                // their files before any query read them (continuous
+                // whole-table enrichment). Non-zero is the tier working as
+                // intended; it used to be an invisible silent waste.
+                ("suppressed_tables", h.suppressed_tables as u64),
+                ("suppressions_total", h.suppressions),
+                // The two heap bounds. `memo_bytes` is the mapping the decode
+                // memo pins (LRU-capped); `leg_budget_stops_total` counts scans
+                // that hit the per-query hot-leg byte budget and served the
+                // remaining windows from Delta instead — sustained non-zero
+                // means the budget, not retention, is the tier's real size.
+                ("memo_files", h.memo_files as u64),
+                ("memo_bytes", h.memo_bytes),
+                ("memo_evicted_total", h.memo_evicted),
+                ("leg_budget_stops_total", h.leg_budget_stops),
+            ] {
+                rows.push(("hot_tier", k.into(), v.to_string()));
+            }
+            for ((project, table), secs) in &h.suppressed {
+                rows.push(("hot_tier", format!("suppressed.{project}.{table}"), format!("cooldown_secs_remaining={secs}")));
+            }
             rows.push(("wal", "shards_per_topic".into(), s.wal_shards_per_topic.to_string()));
             rows.push(("wal", "known_topics".into(), s.wal_known_topics.to_string()));
         } else {

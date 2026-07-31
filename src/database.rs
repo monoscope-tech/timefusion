@@ -3567,19 +3567,38 @@ impl Database {
     /// S3 round-trips), and — when `timefusion_warm_full_files` is set — a full
     /// GET primes the main cache for data reads.
     ///
-    /// Non-blocking and strictly best-effort: the whole job runs in a detached,
-    /// concurrency-bounded task and never affects the commit. Files are filtered
-    /// to partitions within `timefusion_warm_recency_days` so we don't spend S3
-    /// GETs (and evict useful entries) warming cold partitions nobody reads.
-    async fn warm_cache_for_uris(&self, object_store: Arc<dyn object_store::ObjectStore>, table_uri: String, uris: Vec<String>) {
+    /// Normally non-blocking and strictly best-effort: the job runs in a
+    /// detached, concurrency-bounded task and never affects the commit. Files
+    /// are filtered to partitions within `timefusion_warm_recency_days` so we
+    /// don't spend S3 GETs (and evict useful entries) warming cold partitions
+    /// nobody reads.
+    ///
+    /// `confirm` switches to the Influx-oracle flush-path mode: the pass is
+    /// awaited under that deadline, files the cache already holds (captured
+    /// during their own upload) cost a free probe instead of a GET, and the
+    /// warm is full-bytes/recent-only — a footer-only entry would still leave
+    /// the next dashboard query paying an R2 first-byte for the data. Policy
+    /// otherwise (kill switch, recency) is shared with the detached path.
+    async fn warm_cache_for_uris(
+        &self, object_store: Arc<dyn object_store::ObjectStore>, table_uri: String, uris: Vec<String>, confirm: Option<std::time::Duration>,
+    ) {
         let maint = &self.config.maintenance;
         if !maint.timefusion_warm_after_compaction || uris.is_empty() {
             return;
         }
-        let warm_full_files = maint.timefusion_warm_full_files;
-        let warm_all_footers = maint.timefusion_warm_all_footers;
+        let (warm_full_files, warm_all_footers) = match confirm {
+            Some(_) => (true, false),
+            None => (maint.timefusion_warm_full_files, maint.timefusion_warm_all_footers),
+        };
         let recency_days = maint.timefusion_warm_recency_days;
-        let concurrency = maint.timefusion_warm_concurrency.max(1);
+        // Confirm fetches whole parquet bodies into untracked transient heap ON
+        // the flush path, so it gets its own much lower bound — never the
+        // 16-way detached compaction knob. See the config docs.
+        let concurrency = match confirm {
+            Some(_) => crate::config::CACHE_CONFIRM_CONCURRENCY,
+            None => maint.timefusion_warm_concurrency,
+        }
+        .max(1);
         let metadata_size_hint = self.config.cache.timefusion_parquet_metadata_size_hint as u64;
         let stats_cache = self.object_store_cache.clone();
 
@@ -3620,13 +3639,13 @@ impl Database {
         // post-warm hit rate would read artificially low. The real
         // beneficiary is the next dashboard query — log the pre-warm
         // steady-state rate as the relevant baseline.
-        let baseline = match &stats_cache {
-            Some(cache) => {
+        let baseline = match (&stats_cache, confirm) {
+            (Some(cache), None) => {
                 let s = cache.get_stats().await.main;
                 let rate = if s.hits + s.misses > 0 { (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0 } else { 0.0 };
                 Some(rate)
             }
-            None => None,
+            _ => None,
         };
 
         // Labelled scope rather than `full=true/false` so warm logs are easy to
@@ -3634,42 +3653,64 @@ impl Database {
         let scope = if warm_full_files { "full" } else { "footer-only" };
         // Surface the burst size up front so operators can see what a restart
         // is about to issue against S3 (the completion log alone can't —
-        // a large warm set takes minutes to get there).
-        info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
+        // a large warm set takes minutes to get there). The confirm pass is
+        // per-flush and bounded, so it only logs on completion.
+        if confirm.is_none() {
+            info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
+        }
         let t0 = std::time::Instant::now();
         // Progress heartbeat: a 10k-file boot warm runs minutes; without one
         // operators can't tell warming from a hang. The {count} denominator
         // is the selected warm set (footer warms); full-file warming covers
         // only the `recent` subset of it.
         const WARM_PROGRESS_INTERVAL: usize = 500;
-        let done = std::sync::atomic::AtomicUsize::new(0);
-        let done = &done;
-        futures::stream::iter(paths)
-            .for_each_concurrent(concurrency, |(path, recent)| {
-                let store = object_store.clone();
-                async move {
+        let (done, fetched) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+        let (done, fetched, shared) = (&done, &fetched, stats_cache.as_ref());
+        let pass = futures::stream::iter(paths).for_each_concurrent(concurrency, |(path, recent)| {
+            let store = object_store.clone();
+            async move {
+                // A full-file entry also serves the ranged footer reads, so the
+                // confirm's full warm subsumes the footer pass.
+                if confirm.is_none() {
                     let _ = crate::object_store_cache::warm_footer(store.as_ref(), &path, metadata_size_hint).await;
-                    if warm_full_files && recent {
-                        let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
-                    }
-                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n.is_multiple_of(WARM_PROGRESS_INTERVAL) {
-                        // Elapsed on the heartbeat lets operators extrapolate
-                        // time-remaining without waiting for completion.
-                        info!("Cache warm progress: {n}/{count} files ({:.1}s elapsed)", t0.elapsed().as_secs_f64());
-                    }
                 }
-            })
-            .await;
+                if warm_full_files && recent {
+                    let hit = match shared {
+                        Some(shared) => crate::object_store_cache::warm_full_if_absent(store.as_ref(), shared, &path).await,
+                        None => crate::object_store_cache::warm_full(store.as_ref(), &path).await,
+                    };
+                    fetched.fetch_add(hit as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_multiple_of(WARM_PROGRESS_INTERVAL) {
+                    // Elapsed on the heartbeat lets operators extrapolate
+                    // time-remaining without waiting for completion.
+                    info!("Cache warm progress: {n}/{count} files ({:.1}s elapsed)", t0.elapsed().as_secs_f64());
+                }
+            }
+        });
 
-        let elapsed_s = t0.elapsed().as_secs_f64();
-        match baseline {
-            Some(rate) => info!(
-                "Cache warm complete: {} files warmed (scope={}) in {:.1}s; foyer main hit rate before warm was {:.2}% (next query benefits)",
-                count, scope, elapsed_s, rate
-            ),
-            None => info!("Cache warm complete: {} files warmed (scope={}) in {:.1}s", count, scope, elapsed_s),
+        let Some(deadline) = confirm else {
+            pass.await;
+            let elapsed_s = t0.elapsed().as_secs_f64();
+            match baseline {
+                Some(rate) => info!(
+                    "Cache warm complete: {} files warmed (scope={}) in {:.1}s; foyer main hit rate before warm was {:.2}% (next query benefits)",
+                    count, scope, elapsed_s, rate
+                ),
+                None => info!("Cache warm complete: {} files warmed (scope={}) in {:.1}s", count, scope, elapsed_s),
+            }
+            return;
+        };
+        // Never a durability gate: on timeout the commit is already done and the
+        // uncached tail just costs the next query an object-store round trip.
+        if tokio::time::timeout(deadline, pass).await.is_err() {
+            crate::metrics::record_cache_confirm_timeout();
+            warn!("cache confirm exceeded {:?} for {} file(s) — proceeding uncached (commit unaffected)", deadline, count);
         }
+        let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
+        crate::metrics::record_cache_confirm(count as u64, fetched as u64);
+        debug!("cache confirm: {count} file(s), {fetched} fetched, {:.1}s", t0.elapsed().as_secs_f64());
     }
 
     /// Proactively evict the cached full-file bytes of files a compaction
@@ -3736,7 +3777,7 @@ impl Database {
                 };
                 // Already inside a detached task — await the warm directly
                 // instead of spawning a second nested task.
-                db.warm_cache_for_uris(store, table_uri, uris).await;
+                db.warm_cache_for_uris(store, table_uri, uris, None).await;
             }
         });
     }
@@ -3778,7 +3819,7 @@ impl Database {
                                 (uris, table.log_store().object_store(None), table.table_url().to_string())
                             };
                             info!("bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}", uris.len(), t.elapsed().as_millis());
-                            db.warm_cache_for_uris(store, table_uri, uris).await;
+                            db.warm_cache_for_uris(store, table_uri, uris, None).await;
                         }
                         Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }
@@ -3845,7 +3886,7 @@ impl Database {
         let db = self.clone();
         tokio::spawn(async move {
             let uri = warm_table_uri;
-            db.warm_cache_for_uris(warm_store, uri.clone(), added).await;
+            db.warm_cache_for_uris(warm_store, uri.clone(), added, None).await;
             db.evict_cache_for_uris(&uri, &removed);
         });
         live_uris
@@ -4285,6 +4326,20 @@ impl Database {
 
         // Use provided table_name or default to otel_logs_and_spans
         let table_name = if table_name.is_empty() { "otel_logs_and_spans".to_string() } else { table_name.to_string() };
+
+        // Stamp the schema's TF-owned version column. This is the single funnel
+        // every *inbound* write passes through — pgwire INSERT (`write_all`),
+        // the `__bulk` direct-to-Delta alias, gRPC ingest, the legacy batch
+        // queue — regardless of whether the buffered layer is configured, and it
+        // runs before the WAL append so the durable record carries the value.
+        //
+        // A `watermark` marks the one caller that is NOT inbound: the flush of
+        // buffered rows back out to Delta (bucket flush, coalesced flush, boot
+        // relief). Those rows were stamped on their way in and must keep that
+        // value — a re-stamp would give a crash-retried flush a different value
+        // than the WAL holds. WAL replay bypasses this function entirely and
+        // seeds the clock via `insert_coerce::observe_batch` instead.
+        let batches = if watermark.is_none() { crate::insert_coerce::stamp_version(&table_name, batches) } else { batches };
 
         // If buffered layer is configured and not skipping, use it (WAL → MemBuffer flow).
         // No files are written synchronously on this path; an empty URI list is correct.
@@ -4961,15 +5016,26 @@ impl Database {
         // — must not spawn detached warm tasks whose in-flight connections
         // outlive a short-lived runtime and poison the shared client pool.
         if warm {
-            let db = self.clone();
+            // Influx-oracle ordering: the MemBuffer prefix drains right after
+            // this returns (`settle_flushed_group`), so on the flush path we
+            // confirm the new files are cached BEFORE that handoff — a detached
+            // warm loses the race and the next dashboard query pays an R2
+            // first-byte per fresh file. Bounded + best-effort: it can never
+            // fail the commit. Same warm path either way — only WHEN it returns
+            // differs.
             let warm_added = added.clone();
-            let shutdown = self.maintenance_shutdown.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {}
-                    _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added) => {}
-                }
-            });
+            if self.object_store_cache.is_some() {
+                self.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, Some(crate::config::CACHE_CONFIRM_TIMEOUT)).await;
+            } else {
+                let db = self.clone();
+                let shutdown = self.maintenance_shutdown.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {}
+                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None) => {}
+                    }
+                });
+            }
         }
         for (project, dirty_bins) in projects {
             self.statistics_extractor.invalidate(project, table_name).await;
@@ -6390,7 +6456,31 @@ impl Database {
                         continue;
                     }
                     before += shard_before;
-                    let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())?;
+                    // Version collapse: greatest `dedup_tiebreak` per key wins, so a
+                    // merge-on-read table's newest version survives and the older ones
+                    // are dropped here rather than at every read.
+                    //
+                    // Tombstones are RETAINED (`drop_tombstones = None`). Dropping one
+                    // requires that no older version of its key can exist outside this
+                    // rewrite's input. The input is every live file of this
+                    // (project_id, date) snapshot holding a row in the 10-minute chunk
+                    // window; since `timestamp` is a dedup key and `date` derives from
+                    // it, all versions of a key do share that window — but three ways
+                    // an older version outlives the rewrite are NOT excludable here:
+                    //   1. files appended after the file-id query (flush, WAL replay,
+                    //      an off-box writer). `commit_wave`'s liveness check verifies
+                    //      the TARGETS still exist; it cannot see a new file carrying
+                    //      an older version of the same key.
+                    //   2. rows still in MemBuffer/WAL/hot tier. The 2h sealed-chunk
+                    //      guard bounds EVENT time, not arrival: a late client re-send
+                    //      (or a version append, which carries the base row's original
+                    //      `timestamp`) lands in a long-sealed window at any wall clock.
+                    //   3. tables whose `dedup_keys` omit `timestamp` take the
+                    //      whole-partition branch above, where versions of one key may
+                    //      sit in date partitions this sweep never holds together.
+                    // A retained tombstone costs one row per deleted key forever; a
+                    // dropped one silently resurrects the row. Retain.
+                    let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None)?;
                     after += deduped.iter().map(|b| b.num_rows()).sum::<usize>();
                     // Variant struct columns may still be BinaryView if the partition
                     // mixes tiers — cast to Binary so the write accepts the schema.
@@ -9604,29 +9694,109 @@ impl ProjectRoutingTable {
         Ok(self.gate_if_wide(coerced, filters))
     }
 
-    /// A read scan is "wide" if it reaches further back than the configured
-    /// lookback (or has no lower time bound at all) — the case where a one-sided
-    /// `timestamp >= cutoff` can't prune files past the date cut and every file's
-    /// row groups are fully decoded. Uses lookback DEPTH (`now - min_ts`), not
-    /// raw window width, so the hot one-sided `>= now()-1h` dashboard (whose max
-    /// is open-ended) reads as narrow.
-    fn is_wide_scan(&self, filters: &[Expr]) -> bool {
-        let hours = self.database.config.memory.timefusion_wide_scan_lookback_hours;
-        let cutoff_micros = (hours as i64).saturating_mul(3_600_000_000);
+    /// How far back a scan reaches (`now - min_ts`), in micros. `None` = no
+    /// lower time bound, i.e. infinitely deep. Depth, not raw window width, so
+    /// the hot one-sided `>= now()-1h` dashboard (whose max is open-ended)
+    /// reads as shallow while a `[30d ago, 29d ago]` history slice does not.
+    fn scan_lookback_micros(&self, filters: &[Expr]) -> Option<i64> {
         match self.extract_time_range_from_filters(filters) {
-            Some((min, _)) if min != i64::MIN => crate::clock::now_micros().saturating_sub(min) > cutoff_micros,
-            _ => true, // no lower bound → full-history scan → always gate
+            Some((min, _)) if min != i64::MIN => Some(crate::clock::now_micros().saturating_sub(min)),
+            _ => None,
         }
     }
 
-    /// Wrap a wide Delta scan so its Parquet decoding draws from the shared
-    /// `heavy_scan_sem`, bounding concurrent decode heap across all queries.
+    /// Wrap a "wide" Delta scan — one reaching further back than the configured
+    /// lookback, or with no lower time bound at all, where a one-sided
+    /// `timestamp >= cutoff` can't prune files past the date cut and every
+    /// file's row groups are fully decoded — so its Parquet decoding draws from
+    /// the shared `heavy_scan_sem`, bounding concurrent decode heap across all
+    /// queries.
     fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> Arc<dyn ExecutionPlan> {
-        if self.is_wide_scan(filters) {
-            Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone(), Some(self.database.scan_metrics.clone())))
-        } else {
-            plan
+        let depth = self.scan_lookback_micros(filters);
+        let deeper_than = |micros: i64| depth.is_none_or(|d| d > micros);
+        if !deeper_than((self.database.config.memory.timefusion_wide_scan_lookback_hours as i64).saturating_mul(3_600_000_000)) {
+            return plan;
         }
+        // Two thresholds over one measure, not two notions of "wide": the gate
+        // bounds decode HEAP and must fire early (hours), while the cache
+        // bypass gives up cache population and must NOT fire on a merely-widish
+        // dashboard that will be re-read — hence its own, higher, knob.
+        let bypass_cache = self.database.config.cache.cache_bypass_scan_micros().is_some_and(deeper_than);
+        Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone(), Some(self.database.scan_metrics.clone()), bypass_cache))
+    }
+
+    /// The lead sort key that makes `DedupExec`'s keep-greatest engage: the
+    /// table's first declared sorting column, but only when the table declares a
+    /// `dedup_tiebreak` AND that column is itself a dedup key of an i64-backed
+    /// type. That is `read_dedup::detect_bound`'s exact contract — equal dedup
+    /// keys then share the bound value, so all versions of a row live in one
+    /// contiguous run and the operator can emit without buffering the scan.
+    ///
+    /// One column, not the whole declared sort order: it is all the operator
+    /// reads, and it keeps the sort injected over the in-memory legs as cheap as
+    /// it can be. `None` (no tiebreak, or the sort key isn't a dedup key) leaves
+    /// the plan exactly as it was before merge-on-read.
+    fn keep_greatest_ordering(table: &crate::schema_loader::TableSchema, leg_schema: &SchemaRef) -> Option<datafusion::physical_expr::LexOrdering> {
+        use datafusion::{
+            arrow::{compute::SortOptions, datatypes::DataType},
+            physical_expr::{LexOrdering, PhysicalSortExpr},
+        };
+        table.dedup_tiebreak.as_ref()?;
+        let sc = table.sorting_columns.first()?;
+        if !table.dedup_keys.iter().any(|k| k == &sc.name) {
+            return None;
+        }
+        let idx = leg_schema.index_of(&sc.name).ok()?;
+        if !matches!(leg_schema.field(idx).data_type(), DataType::Int64 | DataType::Timestamp(..)) {
+            return None;
+        }
+        let opts = SortOptions { descending: sc.descending, nulls_first: sc.nulls_first };
+        LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(PhysicalColumn::new(&sc.name, idx)), opts)])
+    }
+
+    /// Does `f` mention the table's tombstone marker? Such a predicate must
+    /// NEVER reach a scan leg. Applied at the source — `MemBuffer::query`'s
+    /// `compile_filter_conjunction`, or the Delta kernel — it would drop the
+    /// tombstone row *before* the dedup, leaving the older live version to win
+    /// keep-greatest: a deleted row silently resurrects, with no error anywhere.
+    /// Reported `Unsupported` so DataFusion keeps its own `FilterExec` above the
+    /// whole scan (above `DedupExec` and the tombstone filter), and stripped
+    /// again in `scan` so a filter arriving by any other route still can't be
+    /// pushed into a leg. Both together, because someone will try to optimize
+    /// this downward later.
+    pub(crate) fn references_tombstone(table_name: &str, f: &Expr) -> bool {
+        crate::schema_loader::get_schema(table_name).and_then(|s| s.tombstone_column.as_deref()).is_some_and(|t| f.column_refs().iter().any(|c| c.name == t))
+    }
+
+    /// Drop rows whose WINNING version is a tombstone (merge-on-read `DELETE`).
+    ///
+    /// Sits ABOVE the dedup, deliberately: the tombstone must first beat the
+    /// older live version of its key on `dedup_tiebreak`, and only then remove
+    /// the row. Filtering below the dedup would delete the tombstone and let the
+    /// stale live version survive — the row would come back.
+    ///
+    /// `marker IS DISTINCT FROM true` — NULL and `false` are both live, so the
+    /// column can exist (all-NULL) on a table nothing has ever tombstoned with
+    /// no effect on any result. `keep` strips the marker back off when it was
+    /// projected in only for this filter.
+    fn filter_tombstones(plan: Arc<dyn ExecutionPlan>, marker: &str, keep: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::{
+            physical_expr::{PhysicalExpr, expressions::binary},
+            physical_plan::filter::FilterExec,
+        };
+        let schema = plan.schema();
+        let Ok(idx) = schema.index_of(marker) else { return Ok(plan) };
+        let live = binary(
+            Arc::new(PhysicalColumn::new(marker, idx)),
+            Operator::IsDistinctFrom,
+            datafusion::physical_expr::expressions::lit(ScalarValue::Boolean(Some(true))),
+            &schema,
+        )?;
+        let filtered = Arc::new(FilterExec::try_new(live, plan)?) as Arc<dyn ExecutionPlan>;
+        let Some(k) = keep.filter(|&k| k < schema.fields().len()) else { return Ok(filtered) };
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            (0..k).map(|i| (Arc::new(PhysicalColumn::new(schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>, schema.field(i).name().clone())).collect();
+        Ok(Arc::new(ProjectionExec::try_new(exprs, filtered)?))
     }
 
     /// Wrap an execution plan with type coercion if the output schema doesn't match the target.
@@ -9788,12 +9958,16 @@ struct GatedScanExec {
     properties: Arc<PlanProperties>,
     /// Decode accounting only — this operator never denies on memory.
     metrics: Option<Arc<ScanMetrics>>,
+    /// Scan-resistant admission: a scan deep enough to be reading history — not
+    /// the hot tail — must not evict the hot tail on its way through. Derived
+    /// once, from the caller's filters (see `gate_if_wide`).
+    bypass_cache: bool,
 }
 
 impl GatedScanExec {
-    fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>, bypass_cache: bool) -> Self {
         let properties = input.properties().clone();
-        Self { input, sem, properties, metrics }
+        Self { input, sem, properties, metrics, bypass_cache }
     }
 }
 
@@ -9817,13 +9991,14 @@ impl ExecutionPlan for GatedScanExec {
         vec![&self.input]
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self { input: children[0].clone(), sem: self.sem.clone(), properties: self.properties.clone(), metrics: self.metrics.clone() }))
+        Ok(Arc::new(Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache)))
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let inner = self.input.execute(partition, context)?;
         let schema = inner.schema();
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
+        let bypass = self.bypass_cache;
         // Hold a permit only across each `poll_next` (one batch decode), then
         // release so other partitions/queries can proceed — see type docs.
         // The permit window is also exactly the decode window, which is what
@@ -9836,7 +10011,13 @@ impl ExecutionPlan for GatedScanExec {
                 if let Some(m) = &metrics {
                     m.decode_begin();
                 }
-                let next = futures::StreamExt::next(&mut inner).await;
+                // The object-store fetches for this batch happen inside the
+                // poll, so the bypass scope covers exactly them. Only paid for
+                // when it's actually suppressing.
+                let next = match bypass {
+                    true => crate::object_store_cache::scan_bypass_scope(true, futures::StreamExt::next(&mut inner)).await,
+                    false => futures::StreamExt::next(&mut inner).await,
+                };
                 if let Some(m) = &metrics {
                     // Size the decoded Arrow, not the compressed parquet.
                     m.decode_end(next.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |b: &RecordBatch| b.get_array_memory_size() as u64));
@@ -9965,7 +10146,9 @@ impl TableProvider for ProjectRoutingTable {
         Ok(filter
             .iter()
             .map(|f| {
-                if !variant_cols.is_empty() && f.column_refs().iter().any(|c| variant_cols.contains(&c.name)) {
+                if Self::references_tombstone(&self.table_name, f)
+                    || (!variant_cols.is_empty() && f.column_refs().iter().any(|c| variant_cols.contains(&c.name)))
+                {
                     TableProviderFilterPushDown::Unsupported
                 } else if Self::is_exact_pushdown_filter(f) {
                     TableProviderFilterPushDown::Exact
@@ -10000,7 +10183,11 @@ impl TableProvider for ProjectRoutingTable {
         let scan_metrics = self.database.scan_metrics.clone();
 
         // Apply our custom optimizations to the filters
-        let optimized_filters = self.apply_time_series_optimizations(filters)?;
+        // Second line of defence behind `supports_filters_pushdown`: a predicate
+        // on the tombstone marker must never reach a scan leg (see
+        // `references_tombstone` — it resurrects deleted rows silently).
+        let filters: Vec<Expr> = filters.iter().filter(|f| !Self::references_tombstone(&self.table_name, f)).cloned().collect();
+        let optimized_filters = self.apply_time_series_optimizations(&filters)?;
 
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
@@ -10145,25 +10332,49 @@ impl TableProvider for ProjectRoutingTable {
         // pushed projection with any dedup-key columns the query projected away
         // (so DedupExec can see them); `output_projection` then restores the
         // requested columns. No-op when the table declares no dedup_keys.
-        let dedup_keys: Vec<String> = crate::schema_loader::get_schema(&self.table_name).map(|s| s.dedup_keys.clone()).unwrap_or_default();
-        // Only a `Some` projection over a dedup_keys table can hide the keys: a
-        // `None` projection already scans every column and a no-dedup table needs
-        // nothing — both fold into the pass-through arm, which also skips the
-        // `self.schema()` build (it un-types Variant cols) on the common tables.
-        let (scan_projection, output_projection): (Option<Vec<usize>>, Option<Vec<usize>>) = match projection {
-            Some(p) if !dedup_keys.is_empty() => {
+        let table_schema = crate::schema_loader::get_schema(&self.table_name);
+        let dedup_keys: Vec<String> = table_schema.as_ref().map(|s| s.dedup_keys.clone()).unwrap_or_default();
+        // The tiebreak rides in with the keys: DedupExec keeps the GREATEST
+        // version per key (merge-on-read, docs/plans/2026-08-01-merge-on-read-dml.md),
+        // so it must see the column even when the query projected it away.
+        let dedup_tiebreak: Option<String> = table_schema.and_then(|s| s.dedup_tiebreak.clone());
+        // Merge-on-read DELETE: a tombstone version must reach the filter ABOVE
+        // the dedup, so its marker column rides in with the keys and is stripped
+        // again afterwards. `None` on every table that declares none.
+        let tombstone: Option<String> = table_schema.and_then(|s| s.tombstone_column.clone());
+        // Only a `Some` projection over a dedup_keys/tombstone table can hide the
+        // columns those mechanisms need: a `None` projection already scans every
+        // column and a plain table needs nothing — both fold into the pass-through
+        // arm, which also skips the `self.schema()` build (it un-types Variant
+        // cols) on the common tables. `tombstone_keep` is the requested width when
+        // the marker was projected in purely for the filter (it then occupies one
+        // trailing column that the post-filter projection removes).
+        let (scan_projection, output_projection, tombstone_keep): (Option<Vec<usize>>, Option<Vec<usize>>, Option<usize>) = match projection {
+            Some(p) if !dedup_keys.is_empty() || tombstone.is_some() => {
                 let full_schema = self.schema();
-                let missing: Vec<usize> = dedup_keys.iter().filter_map(|k| full_schema.index_of(k).ok()).filter(|i| !p.contains(i)).collect();
+                let missing: Vec<usize> = dedup_keys
+                    .iter()
+                    .chain(dedup_tiebreak.iter())
+                    .chain(tombstone.iter())
+                    .filter_map(|k| full_schema.index_of(k).ok())
+                    .filter(|i| !p.contains(i))
+                    .collect();
                 if missing.is_empty() {
-                    (Some(p.clone()), None)
+                    (Some(p.clone()), None, None)
                 } else {
                     let mut aug = p.clone();
-                    aug.extend(missing);
+                    aug.extend(&missing);
                     // Requested columns occupy the first p.len() positions of the augmented output.
-                    (Some(aug), Some((0..p.len()).collect()))
+                    let mut out: Vec<usize> = (0..p.len()).collect();
+                    // The marker alone must survive DedupExec's projection restore.
+                    let extra = tombstone.as_ref().and_then(|t| full_schema.index_of(t).ok()).filter(|i| !p.contains(i));
+                    if let Some(ti) = extra {
+                        out.push(aug.iter().position(|&i| i == ti).expect("just extended with it"));
+                    }
+                    (Some(aug), Some(out), extra.map(|_| p.len()))
                 }
             }
-            _ => (projection.cloned(), None),
+            _ => (projection.cloned(), None, None),
         };
         let projection = scan_projection.as_ref();
         // When DedupExec is active it drops rows AFTER the scan, so a pushed
@@ -10171,19 +10382,80 @@ impl TableProvider for ProjectRoutingTable {
         // result can yield < limit distinct rows even when more exist below the
         // cut, and the outer GlobalLimitExec (which DataFusion keeps) can't
         // recover them. Suppress the per-scan limit; the outer limit still caps.
-        // `orig_limit` is restored on Delta-only paths that skip DedupExec.
+        // `orig_limit` is restored on Delta-only paths that skip DedupExec. The
+        // tombstone filter drops rows after the scan for exactly the same reason,
+        // so it suppresses the pushed limit even where dedup doesn't.
         let orig_limit = limit;
-        let limit = if dedup_keys.is_empty() { limit } else { None };
+        let post_scan_row_drop = !dedup_keys.is_empty() || tombstone.is_some();
+        let limit = if post_scan_row_drop { None } else { limit };
 
         let scan_state = parking_lot::Mutex::new(ScanShape::default());
-        let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Legs of the mem ∪ hot ∪ delta union, each flagged `sortable` — true for
+        // the in-memory legs (MemBuffer / hot tier), false for a Delta scan.
+        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, bool)>| -> DFResult<Arc<dyn ExecutionPlan>> {
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
-            if dedup_keys.is_empty() || shape.skip_dedup {
-                Ok(plan)
-            } else {
-                Ok(Arc::new(crate::read_dedup::DedupExec::new(plan, dedup_keys.clone(), output_projection.clone())?))
+            let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
+            let (mut plans, sortable): (Vec<Arc<dyn ExecutionPlan>>, Vec<bool>) = legs.into_iter().unzip();
+            // Merge-on-read prerequisite: `DedupExec`'s keep-greatest only engages
+            // while its input still declares an ordering on the leading dedup key
+            // (that is what makes every version of a key arrive in one run), and
+            // `Distribution::SinglePartition` otherwise gets an ordering-erasing
+            // `CoalescePartitionsExec`. Sort the in-memory legs up to the Delta
+            // leg's declared footer ordering, then merge explicitly.
+            //
+            // The `SortPreservingMergeExec` is built here rather than left to
+            // `EnforceDistribution`: `DedupExec` declares no *required* input
+            // ordering, so `EnforceSorting` would delete the injected leg sorts as
+            // unnecessary and we would be back to a coalesce. The SPM makes the
+            // ordering required, and — being already single-partition —
+            // `EnforceDistribution` then adds nothing.
+            //
+            // Gated on `version_append`: the ordering exists ONLY to let
+            // keep-greatest pick between versions of a key, and until the write
+            // path appends versions there are none. Ungated it charged every
+            // scan of the table a blocking `SortExec` over the mem (≤70min) and
+            // hot (≤6h) legs plus a k-way `SortPreservingMergeExec` holding one
+            // in-flight batch per Delta partition (48 × the measured 145MB peak
+            // batch = the 2026-07-20 OOM shape) for a dormant feature. The
+            // mechanism ships inert and activates with the write path it serves.
+            let mut merge_req = None;
+            if dedup_on
+                && table_schema.is_some_and(|t| t.version_append)
+                && let Some(req) = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &plans[0].schema()))
+            {
+                match crate::optimizers::ordered_children(&plans, &req, None, &sortable, false)? {
+                    Some(ordered) => {
+                        plans = ordered;
+                        merge_req = Some(req);
+                    }
+                    // `None` is either "every leg already satisfies `req`" (merge
+                    // anyway — the legs are still N partitions) or "an unsortable
+                    // leg doesn't" (a Delta scan whose footer ordering isn't
+                    // declared: bail, keep-greatest stays dormant, keep-first is
+                    // still sound and the dedup sweep remains the authority).
+                    None => {
+                        let all = plans
+                            .iter()
+                            .map(|p| p.properties().equivalence_properties().ordering_satisfy(req.iter().cloned()))
+                            .collect::<DFResult<Vec<_>>>()?;
+                        merge_req = all.iter().all(|&s| s).then_some(req);
+                    }
+                }
+            }
+            let plan = if plans.len() == 1 { plans.remove(0) } else { UnionExec::try_new(plans)? };
+            let plan = match merge_req {
+                Some(req) => Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(req, plan)),
+                None => plan,
+            };
+            let plan = match dedup_on {
+                true => Arc::new(crate::read_dedup::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?),
+                false => plan,
+            };
+            match &tombstone {
+                Some(marker) => Self::filter_tombstones(plan, marker, tombstone_keep),
+                None => Ok(plan),
             }
         };
         let tag_shape = |f: &dyn Fn(&mut ScanShape)| {
@@ -10210,11 +10482,13 @@ impl TableProvider for ProjectRoutingTable {
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }
-            let eff_limit = if skip_dedup { orig_limit } else { limit };
+            // Restoring the pushed limit is only sound when nothing above the
+            // scan drops rows — the tombstone filter does, regardless of dedup.
+            let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(plan);
+            return wrap_result(vec![(plan, false)]);
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -10252,9 +10526,42 @@ impl TableProvider for ProjectRoutingTable {
             }
         };
 
-        // If no mem buffer data, query Delta only
+        // Hot-tier third leg (P1) — see `HotTier::query_partitioned` for the
+        // coverage contract. Consulted only when Delta is actually being
+        // scanned: `skip_delta` means the window is entirely newer than
+        // anything ever flushed, and the hot tier only ever holds flushed
+        // (post-commit) data.
+        // ...and only when the scan is shallow enough for the tier to be worth
+        // its heap. The hot leg is materialized EAGERLY at plan time into a
+        // `MemorySourceConfig` — outside every memory pool and outside
+        // `GatedScanExec`, which wraps only the Delta plan. A 7d/14d scan's
+        // `query_time_range` covers the whole hot window, so it would pull the
+        // entire tier into heap to shave a few files off a scan already
+        // dominated by thousands; past the retention window the tier is by
+        // definition a fraction of the answer. Same depth signal the wide-scan
+        // gate uses (`scan_lookback_micros`: now - min_ts, so a one-sided
+        // `>= now()-1h` dashboard reads as shallow), thresholded on the tier's
+        // own window rather than the gate's — the tier exists for exactly the
+        // 1h/3h reads inside it.
+        //
+        // DEDUP: a non-empty hot leg forces the union path below, which never
+        // sets `skip_dedup` — see `HotTier::query_partitioned`'s dedup contract
+        // (the hot leg serves pre-dedup rows and relies on `DedupExec`).
+        let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters), layer.hot_tier_retention_micros());
+        let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
+        let (hot_partitions, hot_ranges) = match skip_delta || too_deep {
+            true => Default::default(),
+            false => {
+                layer
+                    .hot_tier()
+                    .query_partitioned(&project_id, &self.table_name, query_time_range, &mem_ranges, &optimized_filters, &self.schema, projection)
+                    .await
+            }
+        };
+
+        // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
-        if mem_partitions.is_empty() {
+        if mem_partitions.is_empty() && hot_partitions.is_empty() && hot_ranges.is_empty() {
             debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
             let mut delta_only_filters = optimized_filters.clone();
             if let Some(f) = tantivy_id_filter.clone() {
@@ -10268,22 +10575,30 @@ impl TableProvider for ProjectRoutingTable {
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }
-            let eff_limit = if skip_dedup { orig_limit } else { limit };
+            // Restoring the pushed limit is only sound when nothing above the
+            // scan drops rows — the tombstone filter does, regardless of dedup.
+            let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(plan);
+            return wrap_result(vec![(plan, false)]);
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
-        let mem_plan = self.create_memory_exec(&mem_partitions, projection)?;
-        tag_shape(&|s| s.has_mem = true);
+        let mem_plan = match mem_partitions.is_empty() {
+            true => None,
+            false => {
+                tag_shape(&|s| s.has_mem = true);
+                Some(self.create_memory_exec(&mem_partitions, projection)?)
+            }
+        };
 
-        // If we can skip Delta, return mem plan directly
-        if skip_delta {
+        // If we can skip Delta, return mem plan directly (the hot leg is empty
+        // by construction on this path — see above).
+        if let Some(mem_plan) = mem_plan.clone().filter(|_| skip_delta) {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(mem_plan);
+            return wrap_result(vec![(mem_plan, true)]);
         }
 
         // Build Delta filters with per-bucket exclusion.
@@ -10298,14 +10613,20 @@ impl TableProvider for ProjectRoutingTable {
         // row sets in both stores (force-flush removes rows from MemBuffer
         // *before* committing). Excluding those windows hid the Delta share
         // for hours when the flush pipeline backed up (2026-06-11).
-        let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
+        //
+        // The hot tier's included files are authoritative for their own row
+        // ranges in exactly the same sense, so their ranges join the exclusion
+        // list — mem ∪ hot ∪ delta then covers each timestamp window once.
+        // Delta excludes the UNION of those ranges, and consecutive sealed
+        // buckets are contiguous, so merging first collapses what would be one
+        // conjunct per bucket (~36 for a 6h tier) into typically one.
         let mut delta_filters = optimized_filters.clone();
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
-        for (start, end) in &mem_ranges {
+        for (start, end) in crate::mem_buffer::merge_ranges([mem_ranges, hot_ranges].concat()) {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
-            let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(*start) });
-            let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(*end) });
+            let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(start) });
+            let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(end) });
             delta_filters.push(Expr::BinaryExpr(BinaryExpr { left: Box::new(below), op: Operator::Or, right: Box::new(at_or_above) }));
         }
         if let Some(f) = tantivy_id_filter.clone() {
@@ -10328,13 +10649,26 @@ impl TableProvider for ProjectRoutingTable {
         let table = delta_table.read().await;
         let delta_plan =
             self.scan_delta_table(&table, state, projection, &delta_filters, limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref()).await?;
-        tag_shape(&|s| {
-            s.has_mem = true;
-            s.has_delta = true;
-        });
+        tag_shape(&|s| s.has_delta = true);
 
-        // Union both plans (mem data first for recency, then Delta for historical)
-        wrap_result(UnionExec::try_new(vec![mem_plan, delta_plan])?)
+        // Union the legs in recency order — mem, then hot tier, then Delta —
+        // so DedupExec's keep-first favours the freshest copy of a row. The hot
+        // leg already applied the projection (it filters post-projection), so
+        // it carries the projected schema and pushes nothing further.
+        let hot_plan = match hot_partitions.is_empty() {
+            true => None,
+            false => {
+                let hot_schema = match projection {
+                    Some(p) => Arc::new(self.schema.project(p)?),
+                    None => self.schema.clone(),
+                };
+                let source = MemorySourceConfig::try_new(&hot_partitions, hot_schema, None).map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Some(Arc::new(DataSourceExec::new(Arc::new(source))) as Arc<dyn ExecutionPlan>)
+            }
+        };
+        let legs: Vec<(Arc<dyn ExecutionPlan>, bool)> =
+            [mem_plan.map(|p| (p, true)), hot_plan.map(|p| (p, true)), Some((delta_plan, false))].into_iter().flatten().collect();
+        wrap_result(legs)
     }
 
     fn statistics(&self) -> Option<Statistics> {
@@ -10370,6 +10704,8 @@ mod writer_properties_tests {
             time_column: None,
             dedup_keys: vec![],
             dedup_tiebreak: None,
+            tombstone_column: None,
+            version_append: false,
         }
     }
 
@@ -10847,6 +11183,41 @@ mod tests {
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
 
+    /// The merge-on-read gate: `keep_greatest_ordering` yields the lead sort key
+    /// only when the table declares a `dedup_tiebreak` AND that key is a dedup
+    /// key of an i64-backed type. Without a tiebreak it must yield `None` — that
+    /// is what keeps a non-merge-on-read table's plan byte-identical to the
+    /// pre-merge-on-read shape (no leg sort, no merge).
+    #[test]
+    fn keep_greatest_ordering_requires_a_tiebreak() {
+        let otel = get_schema("otel_logs_and_spans").expect("registered");
+        let schema = otel.schema_ref();
+        let ord = ProjectRoutingTable::keep_greatest_ordering(otel, &schema).expect("otel declares updated_at + timestamp-led sort");
+        assert_eq!(ord.to_string(), "timestamp@0 DESC", "one column only — all `detect_bound` reads, and the cheapest leg sort");
+
+        let mut no_tiebreak = otel.clone();
+        no_tiebreak.dedup_tiebreak = None;
+        assert!(ProjectRoutingTable::keep_greatest_ordering(&no_tiebreak, &schema).is_none(), "no tiebreak ⇒ no plan change at all");
+
+        // A sort key that isn't a dedup key breaks `detect_bound`'s contract
+        // (equal keys would no longer share the bound value), so: no ordering.
+        let mut unkeyed = otel.clone();
+        unkeyed.dedup_keys = vec!["id".into()];
+        assert!(ProjectRoutingTable::keep_greatest_ordering(&unkeyed, &schema).is_none(), "lead sort key must itself be a dedup key");
+    }
+
+    /// A predicate on the tombstone marker must never be handed to a scan leg —
+    /// applied at the source it drops the tombstone before the dedup and the
+    /// stale live version wins (silent resurrection).
+    #[test]
+    fn tombstone_predicates_are_never_pushed_down() {
+        let deleted = col("deleted").eq(lit(true));
+        assert!(ProjectRoutingTable::references_tombstone("otel_logs_and_spans", &deleted));
+        assert!(!ProjectRoutingTable::references_tombstone("otel_logs_and_spans", &col("id").eq(lit("x"))));
+        // A table declaring no tombstone column has no such predicate to protect.
+        assert!(!ProjectRoutingTable::references_tombstone("variant_bench", &deleted));
+    }
+
     /// The optimize/dedup session must carry a bounded batch size and a sort
     /// spill reservation so the Z-order external sort spills instead of failing
     /// with "Resources exhausted" (prod 2026-07-12). Guards the config half of
@@ -10883,7 +11254,7 @@ mod tests {
         let partitions: Vec<Vec<RecordBatch>> =
             (0..8).map(|i| vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![i]))]).unwrap()]).collect();
         let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema.clone(), None).unwrap())));
-        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2)), None));
+        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2)), None, false));
         let ctx = Arc::new(TaskContext::default());
         let mut streams: Vec<_> = (0..8).map(|p| gated.execute(p, ctx.clone()).unwrap()).collect();
         let firsts = tokio::time::timeout(std::time::Duration::from_secs(10), futures::future::join_all(streams.iter_mut().map(futures::StreamExt::next)))
@@ -10911,7 +11282,7 @@ mod tests {
         let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema, None).unwrap())));
 
         let metrics = Arc::new(ScanMetrics::default());
-        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(4)), Some(metrics.clone())));
+        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(4)), Some(metrics.clone()), false));
         let mut stream = gated.execute(0, Arc::new(TaskContext::default())).unwrap();
         let mut rows = 0;
         while let Some(b) = futures::StreamExt::next(&mut stream).await {
