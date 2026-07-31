@@ -44,6 +44,34 @@ use tracing::{debug, info, warn};
 
 use crate::mem_buffer::{TableKey, compile_filter_conjunction, filter_snapshot, overlaps};
 
+/// Reconcile a demoted file's schema with the table's, tolerating ONLY a
+/// nullability difference: names, order and data types must match exactly.
+/// Returns `None` when they genuinely drift, or when a column the table
+/// declares NOT NULL actually contains nulls (re-stamping there would hand
+/// DataFusion a batch that lies about its own data).
+///
+/// Cheap: metadata-only when the schemas already agree, otherwise one
+/// `null_count()` per tightened column plus a `RecordBatch` rebuild that
+/// re-uses the same `ArrayData` (no row copy).
+fn align_nullability(batches: &[RecordBatch], schema: &SchemaRef) -> Option<Vec<RecordBatch>> {
+    let first = batches.first()?;
+    let have = first.schema();
+    if have.fields() == schema.fields() {
+        return Some(batches.to_vec());
+    }
+    let compatible = have.fields().len() == schema.fields().len()
+        && have.fields().iter().zip(schema.fields()).all(|(h, w)| h.name() == w.name() && h.data_type() == w.data_type());
+    if !compatible {
+        return None;
+    }
+    // Only columns the table tightens need checking; widening is always safe.
+    let tightened: Vec<usize> = schema.fields().iter().enumerate().filter(|(i, w)| !w.is_nullable() && have.field(*i).is_nullable()).map(|(i, _)| i).collect();
+    batches
+        .iter()
+        .map(|b| tightened.iter().all(|&i| b.column(i).null_count() == 0).then(|| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).ok())?)
+        .collect()
+}
+
 const EXT: &str = "arrow";
 const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
 /// magic + minimal footer + trailer; anything shorter is definitionally torn.
@@ -447,10 +475,22 @@ impl HotTier {
             // One schema per IPC file by construction, so one compare per file.
             // Drift (a column added since the demotion) breaks the
             // `MemorySourceConfig` contract — treat the file as absent.
-            if batches.first().is_some_and(|b| b.schema().fields() != schema.fields()) {
-                self.schema_drift.fetch_add(1, Relaxed);
-                continue;
-            }
+            //
+            // Nullability alone is NOT drift. Prod 2026-07-31: demoted batches
+            // carried `timestamp` nullable while the table declares it NOT
+            // NULL, so strict field equality rejected 100% of reads — the tier
+            // served zero rows while files/bytes/writes all looked healthy
+            // (caught only by `schema_drift_total` == `read_hits_total`).
+            // Re-stamp instead, once the data proves it satisfies the stricter
+            // schema.
+            let batches = match align_nullability(batches.as_ref(), schema) {
+                Some(b) => b,
+                None => {
+                    self.schema_drift.fetch_add(1, Relaxed);
+                    continue;
+                }
+            };
+            let batches = std::sync::Arc::new(batches);
             // Project BEFORE filtering: `filter_record_batch` heap-copies every
             // column it is handed, so an unprojected filter would materialize
             // `body`/`attributes` for the whole hot window on a 3-column query.
@@ -846,6 +886,34 @@ mod tests {
 
     fn open(dir: &tempfile::TempDir) -> Arc<HotTier> {
         HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX))
+    }
+
+    /// PROD REGRESSION 2026-07-31: demoted batches carried `timestamp` as
+    /// NULLABLE while the table declares it NOT NULL, and the leg's strict
+    /// field-equality check discarded 100% of reads — `schema_drift_total`
+    /// tracked `read_hits_total` exactly (75/75) while files/bytes/writes all
+    /// looked healthy, so the tier burned disk and RAM serving zero rows.
+    /// Nullability alone must NOT count as drift.
+    #[test]
+    fn nullability_difference_is_not_drift_but_real_nulls_are() {
+        let nullable = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true), Field::new("name", DataType::Utf8, false)]));
+        let strict = schema(); // ts NOT NULL
+
+        // Widened-on-disk, no actual nulls => re-stamped to the strict schema.
+        let b = RecordBatch::try_new(nullable.clone(), vec![Arc::new(Int64Array::from(vec![1i64, 2])), Arc::new(StringArray::from(vec!["a", "b"]))]).unwrap();
+        let out = align_nullability(&[b], &strict).expect("nullability alone is not drift");
+        assert_eq!(out[0].schema().fields(), strict.fields(), "batch is re-stamped to the table schema");
+        assert_eq!(out[0].num_rows(), 2, "no rows lost");
+
+        // A real NULL in a NOT NULL column must still be rejected — re-stamping
+        // there would hand DataFusion a batch that lies about its own data.
+        let with_null =
+            RecordBatch::try_new(nullable, vec![Arc::new(Int64Array::from(vec![Some(1i64), None])), Arc::new(StringArray::from(vec!["a", "b"]))]).unwrap();
+        assert!(align_nullability(&[with_null], &strict).is_none(), "a genuine null in a NOT NULL column is drift");
+
+        // A genuinely different column set is still drift.
+        let other = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        assert!(align_nullability(&[batch(2)], &other).is_none(), "column-count drift still rejected");
     }
 
     /// The whole design rests on mmap'd IPC decoding WITHOUT a realigning
