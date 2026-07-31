@@ -3206,7 +3206,7 @@ mod tests {
         let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
         let batch = create_test_batch(&project);
         let tier = layer.hot_tier().clone();
-        tier.demote(&project, &table, 1, &[batch.clone()], 1_000, 1_999);
+        tier.demote(&project, &table, 1, std::slice::from_ref(&batch), 1_000, 1_999);
         tier.demote(&project, &table, 2, &[batch], 10_000, 10_999);
 
         use datafusion::prelude::lit;
