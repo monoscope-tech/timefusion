@@ -223,3 +223,11 @@ datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres
 # reaches TF's DmlQueryPlanner (Delta MergeBuilder / MemBuffer hash-join).
 # Mirrors apache/datafusion#21530; drop once upstream merges #19950.
 datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", branch = "timefusion-update-from-54" }
+# tikv-jemalloc-sys 0.6.1 vendored with a single build.rs delta: honour
+# `JEMALLOC_SYS_PROF_BACKTRACE` so the heap profiler can be built with a working
+# unwinder (`--enable-prof-libunwind`). Upstream passes `--enable-prof` alone and
+# exposes no hook for extra configure flags, and the resulting libgcc unwinder
+# returns zero frames in our binary — every prod heap dump was one anonymous
+# frame (2026-07-31). Re-vendor from the registry on upgrade; see the PATCH
+# comment in vendor/tikv-jemalloc-sys/build.rs.
+tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }

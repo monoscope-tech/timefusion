@@ -7,9 +7,10 @@ FROM rust:1.91-slim-bookworm AS chef
 WORKDIR /app
 # protoc is required by tonic-prost-build (build.rs). make is required by
 # tikv-jemalloc-sys (jemalloc compiles from C source under --features
-# profiling); the slim image ships cc but not make.
+# profiling); the slim image ships cc but not make. libunwind-dev backs the
+# heap profiler's unwinder (see JEMALLOC_SYS_PROF_BACKTRACE below).
 RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev protobuf-compiler make && \
+    apt-get install -y pkg-config libssl-dev protobuf-compiler make libunwind-dev && \
     rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --version 0.1.77 --locked
 
@@ -60,6 +61,14 @@ ENV CARGO_PROFILE_RELEASE_STRIP=none
 # (2026-07-31: 28GB attributed to a random bz2 symbol — dumps unusable for OOM
 # attribution). ~1% perf cost, and it makes every future OOM self-explaining.
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
+# ...but frame pointers alone were not enough: jemalloc's profiler unwinds with
+# whatever method it was *configured* with, and stock tikv-jemalloc-sys leaves it
+# on the libgcc unwinder, which returns zero frames here — 100% of an 88GB prod
+# dump landed in one anonymous `prof_backtrace_impl` frame (2026-07-31). Our
+# vendored -sys patch (vendor/tikv-jemalloc-sys) turns this env var into
+# `--enable-prof-libunwind`. Fallback needing no libs: `gcc` (uses the frame
+# pointers above). Verify with scripts/verify-jemalloc-prof.sh.
+ENV JEMALLOC_SYS_PROF_BACKTRACE=libunwind
 RUN cargo chef cook --release --locked --features profiling --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
@@ -73,6 +82,10 @@ RUN cargo build --release --locked --features profiling
 
 # App state dirs (distroless runtime has no shell to mkdir at runtime).
 RUN mkdir -p /queue_db /data
+# jemalloc's profiler links libunwind dynamically; distroless ships neither it
+# nor its liblzma dep, so stage both (cp -a keeps the soname symlinks) for the
+# runtime stage. Arch-agnostic glob: /usr/lib/{x86_64,aarch64}-linux-gnu.
+RUN mkdir -p /profdeps && cp -a /usr/lib/*/libunwind.so.8* /usr/lib/*/liblzma.so.5* /profdeps/
 
 ##############################
 #         Runtime            #
@@ -87,6 +100,8 @@ WORKDIR /app
 COPY --from=builder --chown=nonroot:nonroot /app/target/release/timefusion /usr/local/bin/timefusion
 COPY --from=builder --chown=nonroot:nonroot /queue_db /app/queue_db
 COPY --from=builder --chown=nonroot:nonroot /data     /app/data
+COPY --from=builder /profdeps/ /usr/local/lib/
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 EXPOSE 80 5432
 
