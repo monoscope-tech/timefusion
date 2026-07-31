@@ -34,22 +34,6 @@ struct CacheValue {
     timestamp_millis: u64,
 }
 
-/// Owner that lets `Bytes` borrow a cached entry's buffer without copying it.
-///
-/// `CacheValue::data` is a `Vec<u8>` owned by the cache, so serving a range used
-/// to `to_vec()` it. `HybridCacheEntry` is refcounted, so handing `Bytes` an
-/// owner that holds the entry keeps the buffer alive for exactly as long as the
-/// slice does. Only correct for entries that are already resident (a cache hit);
-/// slicing a freshly-materialised buffer this way would pin a whole file to
-/// serve a small range, which is why the miss path still copies.
-struct EntryBytes(foyer::HybridCacheEntry<String, CacheValue>);
-
-impl AsRef<[u8]> for EntryBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.0.value().data
-    }
-}
-
 impl CacheValue {
     fn new(data: Vec<u8>, meta: ObjectMeta) -> Self {
         Self { data, meta, timestamp_millis: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
@@ -1082,12 +1066,18 @@ impl FoyerObjectStoreCache {
                     is_parquet,
                     current_millis().saturating_sub(value.timestamp_millis)
                 );
-                // Zero-copy: the entry is IN the cache, so keeping it alive costs
-                // nothing, while copying the range costs a fresh allocation on
-                // every read. A parquet scan issues many ranges against the same
-                // cached file, so this was ~11% of prod live heap — the single
-                // largest non-dedup site in the 2026-07-31 heap profile.
-                let sliced = Bytes::from_owner(EntryBytes(entry.clone())).slice(range.start as usize..range.end as usize);
+                // NOTE: this copy is ~11% of prod live heap (2026-07-31 profile)
+                // and is the obvious thing to make zero-copy. It was tried
+                // (2bb5e85) by handing `Bytes` an owner holding the
+                // `HybridCacheEntry`, and it took prod down: every returned
+                // slice pins its entry, so under scan load entries stop being
+                // reclaimable and the cache stalls — surfacing as GET timeouts
+                // on whatever needs the cache next (the tantivy manifest fetch
+                // on the FLUSH path: 191 failed flushes, MemBuffer to 96%,
+                // reverted here). Any retry must bound how long a slice may pin
+                // an entry, and must be load-tested — a correctness test passes
+                // either way.
+                let sliced = Bytes::from(value.data[range.start as usize..range.end as usize].to_vec());
                 self.maybe_touch(&self.cache, &full_cache_key, entry.clone(), self.config.l1_max_entry_bytes);
                 return Ok(sliced);
             }
@@ -2050,32 +2040,27 @@ mod tests {
         Ok(())
     }
 
-    /// A cache-hit range read must return the right bytes WITHOUT copying them:
-    /// `get_range_cached` used to `to_vec()` every served range, which the
-    /// 2026-07-31 prod heap profile put at ~11% of live heap (the largest
-    /// non-dedup site) because a parquet scan issues many ranges per file.
+    /// A cache-hit range read serves the requested slice of the cached object.
     ///
-    /// Zero-copy is asserted structurally — the returned `Bytes` must point INTO
-    /// the cached buffer, which a copy cannot do — so the property can't rot
-    /// into a copy again without failing.
+    /// It COPIES, deliberately. Serving it zero-copy (2bb5e85) pinned the
+    /// `HybridCacheEntry` behind every returned slice, entries stopped being
+    /// reclaimable under scan load, and the stalled cache timed out the tantivy
+    /// manifest GET on the flush path — 191 failed flushes and MemBuffer at 96%
+    /// in prod before the revert. This test deliberately asserts only the
+    /// CONTENT, because the aliasing assertion it used to make passed while the
+    /// change was actively unsafe.
     #[tokio::test]
-    async fn cache_hit_range_is_served_zero_copy() -> anyhow::Result<()> {
-        let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("zero_copy_range")).await?;
+    async fn cache_hit_serves_the_requested_range() -> anyhow::Result<()> {
+        let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("hit_range")).await?;
         let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(object_store::memory::InMemory::new()), &cache);
         let path = Path::from("test/zc.parquet");
         let body: Vec<u8> = (0u8..=255).collect();
         let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: body.len() as u64, e_tag: None, version: None };
         cache.cache.insert(FoyerObjectStoreCache::make_cache_key(&path), CacheValue::new(body.clone(), meta));
 
-        let got = store.get_range_cached(&path, 10..40).await?;
-        assert_eq!(&got[..], &body[10..40], "served range must be the cached bytes");
-
-        // The cached allocation's address range; a copy would land outside it.
-        let entry = cache.cache.get(&FoyerObjectStoreCache::make_cache_key(&path)).await?.expect("entry resident");
-        let base = entry.value().data.as_ptr() as usize;
-        let got_ptr = got.as_ptr() as usize;
-        assert!((base..base + entry.value().data.len()).contains(&got_ptr), "served range must alias the cached buffer (zero-copy), not a fresh allocation");
-        assert_eq!(got_ptr - base, 10, "and it must alias at the requested offset");
+        assert_eq!(&store.get_range_cached(&path, 10..40).await?[..], &body[10..40], "served range must be the cached bytes");
+        assert_eq!(&store.get_range_cached(&path, 0..1).await?[..], &body[0..1], "leading edge");
+        assert_eq!(&store.get_range_cached(&path, 255..256).await?[..], &body[255..256], "trailing edge");
         Ok(())
     }
 
