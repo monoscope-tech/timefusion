@@ -11,8 +11,10 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // jemalloc reads this symbol at startup — bakes the profiler config into the
 // binary so no MALLOC_CONF env (host is read-only) is needed. prof_active
 // samples live allocations; lg_prof_sample:19 = ~512KiB sampling (low
-// overhead); lg_prof_interval:33 auto-dumps a .heap every ~8GiB allocated so
-// the dumps just before each ~89GB OOM capture the offending call stacks;
+// overhead); lg_prof_interval:35 auto-dumps a .heap every ~32GiB allocated so
+// the retained dump window spans the whole boot→OOM RSS climb (at :33 prod
+// churned ~80 dumps/min and rotation kept only the last minute — useless for
+// growth diffs, 2026-07-31);
 // prof_prefix points into the data-dir volume we can read off the host.
 // Analyze: `jeprof --svg <binary> <prof_prefix>.*.heap`.
 #[cfg(all(feature = "profiling", target_os = "linux"))]
@@ -21,7 +23,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // purges dirty pages on allocation events per-arena, so 4-8GB/min of write-path
 // churn retained ~2/3 of RSS as freed-but-unreturned pages (2026-07-29: 26GB
 // live heap vs 115GB RSS at the cgroup OOM kill).
-pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:33,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 use std::sync::Arc;
 

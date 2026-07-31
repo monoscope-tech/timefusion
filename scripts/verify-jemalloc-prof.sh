@@ -16,7 +16,8 @@ IMAGE="${1:?usage: verify-jemalloc-prof.sh <image-tag>}"
 WORK="$(mktemp -d)"
 NAME="tf-profverify-$$"
 trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/data"
+mkdir -p "$WORK/data/timefusion/profiles" "$WORK/data/wal"
+chmod -R 777 "$WORK/data"   # distroless runs as uid 65532; dumps must be writable
 chmod -R 777 "$WORK"   # container runs as nonroot (65532)
 
 # prof_gdump: dump on every virtual-memory high-water mark, so boot allocations
@@ -43,22 +44,26 @@ echo "dump: $DUMP"
 DEPTH="$(awk -F'@' '/@ 0x/ {n=gsub(/0x/,"",$2); if (n>m) m=n} END {print m+0}' "$DUMP")"
 echo "deepest stack: $DEPTH frames"
 
-# Symbolize against the binary from the image (distroless has no perl/jeprof).
+# Symbolize against the binary from the image. jeprof's own symbolizer is
+# broken for this PIE layout (it picks the wrong base), so resolve manually:
+# vaddr = runtime addr − load base (the first r--p file mapping in the dump).
 docker create --name "$NAME-cp" "$IMAGE" >/dev/null
 docker cp "$NAME-cp:/usr/local/bin/timefusion" "$WORK/timefusion" >/dev/null
 docker rm "$NAME-cp" >/dev/null
 cp "$DUMP" "$WORK/dump.heap"
-if command -v jeprof >/dev/null; then
-  jeprof --text "$WORK/timefusion" "$WORK/dump.heap" > "$WORK/text" 2>/dev/null
-else
-  docker run --rm -v "$WORK:/w" debian:bookworm-slim sh -c \
-    'apt-get update -qq && apt-get install -y -qq libjemalloc-dev binutils >/dev/null && jeprof --text /w/timefusion /w/dump.heap' \
-    > "$WORK/text" 2>/dev/null
-fi
-head -20 "$WORK/text"
+docker run --rm -v "$WORK:/w" debian:bookworm-slim sh -c '
+  apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq binutils >/dev/null 2>&1
+  BASE=$(grep -a "r--p 00000000.*timefusion" /w/dump.heap | head -1 | cut -d- -f1)
+  echo "load base: 0x$BASE"
+  grep -aoE "0x[0-9a-f]{10,16}" /w/dump.heap | sort | uniq -c | sort -rn | head -12 | \
+  while read -r _ A; do
+    OFF=$(printf "0x%x" $(( A - 0x$BASE )) 2>/dev/null) || continue
+    echo "$A -> $(addr2line -f -C -e /w/timefusion "$OFF" 2>/dev/null | head -1)"
+  done' > "$WORK/text" 2>/dev/null
+cat "$WORK/text"
 
-grep -qE 'alloc::|datafusion|timefusion|arrow' "$WORK/text" \
-  || { echo "FAIL: jeprof resolved no Rust symbols — unwinder still blind"; exit 1; }
+grep -qE 'alloc::|datafusion|timefusion|arrow|tokio|core::|std::' "$WORK/text" \
+  || { echo "FAIL: no Rust symbols resolved — unwinder still blind"; exit 1; }
 [ "$DEPTH" -gt 3 ] \
   || { echo "FAIL: deepest stack is $DEPTH frames (<=3) — unwinder still blind"; exit 1; }
 echo "OK: heap profiles are attributable ($DEPTH-frame stacks, Rust symbols resolved)"
