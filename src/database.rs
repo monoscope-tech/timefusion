@@ -9236,9 +9236,7 @@ fn choose_optimize_type(
 /// and the fork drops them for free while writing. Tiebreak mirrors flush
 /// dedup's last-write-wins — greatest `dedup_tiebreak` (observed_timestamp)
 /// sorts first and survives, so the enriched re-emit beats the base row.
-fn consolidate_optimize_type(
-    schema: &crate::schema_loader::TableSchema, allow_sort: bool,
-) -> (deltalake::operations::optimize::OptimizeType, bool) {
+fn consolidate_optimize_type(schema: &crate::schema_loader::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     use deltalake::operations::optimize::{DedupConfig, OptimizeType, SortColumn};
     match choose_optimize_type(schema, false, allow_sort) {
         (OptimizeType::SortBy(cols), true) if !schema.dedup_keys.is_empty() => {
