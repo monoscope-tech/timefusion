@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
 
 use serde::Deserialize;
+use tracing::info;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
@@ -104,6 +105,26 @@ fn detect_memory_limit_bytes() -> usize {
 /// never be resized by env var.
 fn env_memory_override_bytes() -> Option<usize> {
     std::env::var("TIMEFUSION_MEMORY_LIMIT_GB").ok()?.parse::<usize>().ok().filter(|gb| *gb > 0).map(|gb| gb * GIB)
+}
+
+/// `TIMEFUSION_MEMORY_BUDGET_GB`: size the whole tree BELOW the cgroup limit.
+///
+/// Unlike the deleted per-consumer knobs this is a *single* input — every budget
+/// still derives from it, so the shares can never drift out of proportion with
+/// each other, which is the failure mode that got those knobs removed.
+///
+/// Why it's needed: the tree budgets 100% of the cgroup. That's right for a
+/// dedicated box and wrong for a shared one. Prod runs a 120 GiB TF container on
+/// a 188 GB host alongside ~62 GB of other services, so "TF may use its whole
+/// cgroup" oversubscribes the HOST — TF grows into its entitlement and the
+/// kernel OOM-kills it (repeatedly, 2026-07-31). Lowering the container limit
+/// fixes it too but needs an orchestrator change and a redeploy; this lets the
+/// process size itself to the share it should actually take.
+///
+/// Only ever LOWERS the effective limit — budgeting above the cgroup is never
+/// valid, so an over-large value is clamped rather than honoured.
+fn env_memory_budget_bytes() -> Option<usize> {
+    std::env::var("TIMEFUSION_MEMORY_BUDGET_GB").ok()?.parse::<f64>().ok().filter(|gb| *gb > 0.0).map(|gb| (gb * GIB as f64) as usize)
 }
 
 fn detect_memory_limit_clamped() -> usize {
@@ -212,9 +233,29 @@ impl DerivedBudget {
         Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes }
     }
 
-    /// Detect the real container limits and derive the tree. No env inputs.
+    /// Detect the real container limits and derive the tree. The only env input
+    /// is `TIMEFUSION_MEMORY_BUDGET_GB`, which can lower (never raise) the one
+    /// number the whole tree derives from — see `env_memory_budget_bytes`.
     pub fn compute() -> Self {
-        Self::from_limits(detect_memory_limit_clamped(), detect_cores())
+        let detected = detect_memory_limit_clamped();
+        let budget = Self::from_limits(env_memory_budget_bytes().map_or(detected, |b| b.min(detected)), detect_cores());
+        // Log the DERIVED tree, not the knobs: prod carried
+        // TIMEFUSION_MEMORY_LIMIT_GB=26 for months while the process actually
+        // budgeted 120 GiB, and nothing on the box revealed the ~5x gap
+        // (2026-07-31). Whatever this line prints is what the process will use.
+        let gib = |b: usize| b as f64 / GIB as f64;
+        info!(
+            detected_limit_gib = gib(detected),
+            effective_limit_gib = gib(budget.memory_limit_bytes),
+            cores = budget.cores,
+            query_pool_gib = gib(budget.query_pool_bytes),
+            ingest_buffer_gib = gib(budget.ingest_buffer_bytes),
+            foyer_gib = gib(budget.foyer_memory_bytes),
+            writer_reserve_gib = gib(budget.writer_reserve_bytes),
+            maintenance_pool_gib = gib(budget.maintenance_pool_bytes),
+            "derived memory budget (sums to the effective limit — TF will grow into it)"
+        );
+        budget
     }
 
     pub fn query_pool_bytes(&self) -> usize {
@@ -1892,6 +1933,41 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tree budgets 100% of whatever limit it is given — correct for a
+    /// dedicated box, and the reason prod OOM-looped on 2026-07-31: a 120 GiB TF
+    /// container on a 188 GB host shared with ~62 GB of other services means TF's
+    /// entitlement alone oversubscribes the HOST. Pinning the arithmetic so the
+    /// "sums to the whole limit" property can't be changed unnoticed.
+    #[test]
+    fn budget_tree_allocates_the_entire_limit() {
+        let b = DerivedBudget::from_limits(120 * GIB, 48);
+        let total = b.query_pool_bytes + b.ingest_buffer_bytes + b.foyer_memory_bytes + b.writer_reserve_bytes + b.maintenance_pool_bytes;
+        assert_eq!(total, 120 * GIB, "every byte of the limit is handed to some consumer");
+        assert_eq!(b.query_pool_bytes, 30 * GIB);
+        assert_eq!(b.ingest_buffer_bytes, 24 * GIB);
+        assert_eq!(b.foyer_memory_bytes, 12 * GIB);
+    }
+
+    /// `TIMEFUSION_MEMORY_BUDGET_GB` exists so a shared host can size TF below
+    /// its cgroup without an orchestrator change. It must scale the WHOLE tree
+    /// from one input (the per-consumer knobs it replaces drifted out of
+    /// proportion, which is why they were deleted) and must never raise the
+    /// limit above what the cgroup actually allows.
+    #[test]
+    fn memory_budget_override_scales_whole_tree_and_only_lowers() {
+        let full = DerivedBudget::from_limits(120 * GIB, 48);
+        let capped = DerivedBudget::from_limits(80 * GIB, 48);
+        assert_eq!(capped.query_pool_bytes, 20 * GIB);
+        assert_eq!(capped.ingest_buffer_bytes, 16 * GIB);
+        assert_eq!(capped.foyer_memory_bytes, 8 * GIB);
+        assert!(capped.maintenance_pool_bytes < full.maintenance_pool_bytes, "maintenance shrinks with the rest, not at its expense");
+
+        // The clamp: an over-large request can never budget past the cgroup.
+        let detected = 80 * GIB;
+        assert_eq!(Some(200 * GIB).map_or(detected, |b: usize| b.min(detected)), detected);
+        assert_eq!(Some(40 * GIB).map_or(detected, |b: usize| b.min(detected)), 40 * GIB);
+    }
 
     // Regression for the 2026-06-24 crash loop: TIMEFUSION_S3_CONNECT_TIMEOUT=150
     // (unitless) panicked object_store's Duration parse at boot. Bare numbers must
