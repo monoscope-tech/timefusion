@@ -54,7 +54,7 @@ jobs:
         # introduces a compile error, we revert and only push the fmt changes.
         run: |
           set +e
-          cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
+          cargo lint-fix
           rc=$?
           if [ $rc -ne 0 ]; then
             echo "clippy --fix failed (likely couldn't auto-fix every warning); reverting clippy hunks only"

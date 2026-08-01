@@ -5,3 +5,22 @@
 # Install: `brew install llvm@15` (or any llvm providing ld64.lld).
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm@15/bin/ld64.lld"]
+
+# THE lint definition. CI (`.github/workflows/ci.yml`) and the autofix workflow
+# both invoke these aliases, so `cargo lint` locally is byte-for-byte what CI
+# runs — there is no second copy of the flags to drift.
+#
+# Why the flags matter (2026-08-01: a 52-file sweep passed a bare
+# `cargo clippy --all-targets` and still failed CI on six lints):
+#   --all-features  the `e2e`/`profiling` cfgs compile code the default build
+#                   never sees, and lints fire inside it
+#   --locked        a stale Cargo.lock changes what is linted
+#   -D warnings     CI treats every lint as an error; a local run that only
+#                   prints them tells you nothing about whether CI will pass
+#
+# Deliberately NOT a `[lints]` table in Cargo.toml: that would apply
+# `deny(warnings)` to `cargo build`/`cargo test` too, so a stray unused import
+# would break the dev loop this repo optimizes hard for.
+[alias]
+lint = "clippy --all-targets --all-features --locked -- -D warnings"
+lint-fix = "clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings"

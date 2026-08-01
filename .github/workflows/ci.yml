@@ -142,9 +142,11 @@ jobs:
           tool: cargo-nextest@0.9.140
 
       # Clippy is shard-independent — run it once (on shard 1) instead of 4×.
+      # `cargo lint` is the alias in `.cargo/config.toml`; `make lint` and the
+      # `prepush` gate call the same one, so local and CI cannot drift.
       - name: Clippy
         if: ${{ matrix.shard == 1 }}
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo lint
 
       # Default features only. `--all-features` would enable `e2e`, which runs
       # the testcontainers e2e suite here in parallel — 40 tests each spinning a

@@ -1,4 +1,4 @@
-.PHONY: test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # Default test (fast, excludes slow integration tests)
 test:
@@ -10,11 +10,23 @@ test:
 test-unit:
 	cargo test --lib $${ARGS}
 
-# Pre-push gate: the full local suite (lib + sqllogictest + dedup + integration)
-# in one invocation so all four test binaries share a single compile pass.
-# Set TIMEFUSION_TEST_S3_ENDPOINT to reuse a persistent MinIO and skip container
-# startup on the S3-heavy sqllogictest.
-prepush:
+# Exactly what CI's Clippy step runs — the flags live once, in the `cargo lint`
+# alias in `.cargo/config.toml`. A bare `cargo clippy` is NOT equivalent: it
+# misses --all-features and doesn't deny warnings, so it passes on code CI
+# rejects (2026-08-01).
+lint:
+	cargo lint
+
+# Apply clippy's autofixes (what the autoformat workflow runs).
+lint-fix:
+	cargo lint-fix
+
+# Pre-push gate: CI's lint first (fails fast and cheap — a lint error should not
+# cost you a 2-minute test run), then the full local suite (lib + sqllogictest +
+# dedup + integration) in one invocation so all four test binaries share a single
+# compile pass. Set TIMEFUSION_TEST_S3_ENDPOINT to reuse a persistent MinIO and
+# skip container startup on the S3-heavy sqllogictest.
+prepush: lint
 	RUST_LOG=off cargo test --lib --test sqllogictest --test dedup_compaction_test --test integration_test $${ARGS}
 
 # Run all tests including slow integration tests
