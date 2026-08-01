@@ -15,6 +15,7 @@ mod flush_warm;
 mod hash_enrichment;
 mod hot_tier;
 mod insert_unnest_variant;
+mod merge_on_read;
 mod multi_tenant_isolation;
 mod or_utf8view_delta;
 mod ordering_pushdown;

@@ -119,7 +119,7 @@ struct Bound {
 
 /// The i64-backed values of a bound column (timestamps / Int64), for cheap
 /// run-boundary comparison. `None` for any other type → bounded mode disabled.
-fn bound_slice(col: &ArrayRef) -> Option<&[i64]> {
+pub(crate) fn bound_slice(col: &ArrayRef) -> Option<&[i64]> {
     use datafusion::arrow::{
         array::AsArray,
         datatypes::{Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType},
@@ -189,6 +189,19 @@ pub struct DedupExec {
     /// Schema's `dedup_tiebreak` column name, when the table declares one.
     /// Keep-greatest engages only if it is also present in the input schema.
     tiebreak: Option<String>,
+    /// Ordering keep-greatest DEPENDS on, declared as *required* so
+    /// `EnforceSorting` preserves it.
+    ///
+    /// Without this the operator is silently correctness-fragile: the caller
+    /// builds a `SortPreservingMergeExec` to supply the run property, but
+    /// EnforceSorting deletes any ordering no parent requires — which is every
+    /// aggregate. The plan then reaches `execute` unordered, `detect_bound`
+    /// returns `None`, keep-greatest degrades to keep-FIRST, and a merge-on-read
+    /// table answers `MAX(updated_at)` with the PRE-update row while the same
+    /// data read by a plain projection answers correctly. Requiring the ordering
+    /// is what makes version resolution a property of the operator rather than
+    /// of what happens to sit above it.
+    required_ordering: Option<datafusion::physical_expr::LexOrdering>,
     /// Indices into `input.schema()` to emit after dedup, restoring the
     /// originally-requested projection. `None` = emit the input schema as-is.
     output_projection: Option<Vec<usize>>,
@@ -222,7 +235,15 @@ impl DedupExec {
         };
         let properties =
             Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), input.properties().emission_type, input.properties().boundedness));
-        Ok(Self { input, keys, key_idxs, tiebreak, output_projection, schema, properties })
+        Ok(Self { input, keys, key_idxs, tiebreak, required_ordering: None, output_projection, schema, properties })
+    }
+
+    /// Declare the ordering keep-greatest needs (see `required_ordering`).
+    /// `None` leaves the operator ordering-agnostic — the pre-merge-on-read
+    /// behaviour every table without `version_append` keeps.
+    pub fn requiring(mut self, ordering: Option<datafusion::physical_expr::LexOrdering>) -> Self {
+        self.required_ordering = ordering;
+        self
     }
 }
 
@@ -256,6 +277,10 @@ impl ExecutionPlan for DedupExec {
         vec![Distribution::SinglePartition]
     }
 
+    fn required_input_ordering(&self) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
+        vec![self.required_ordering.clone().map(datafusion::physical_expr::OrderingRequirements::from)]
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         // Streaming dedup: surviving rows appear in input order (keep-greatest
         // emits a closed run in input position order). Lets EnforceSorting swap
@@ -269,7 +294,10 @@ impl ExecutionPlan for DedupExec {
     }
 
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DedupExec::with_tiebreak(children[0].clone(), self.keys.clone(), self.tiebreak.clone(), self.output_projection.clone())?))
+        Ok(Arc::new(
+            DedupExec::with_tiebreak(children[0].clone(), self.keys.clone(), self.tiebreak.clone(), self.output_projection.clone())?
+                .requiring(self.required_ordering.clone()),
+        ))
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {

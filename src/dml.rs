@@ -796,11 +796,159 @@ fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_n
     })
 }
 
+/// Aliases the merge-on-read plan gives its two sides. The source alias matches
+/// `perform_delta_merge_update`'s so [`requalify_for_merge`] serves both paths;
+/// the target keeps the TABLE NAME because the statement's predicate and
+/// assignments were planned against it and may still carry that qualifier.
+const MOR_SOURCE: &str = "source";
+
+/// Merge-on-read DML (`docs/plans/2026-08-01-merge-on-read-dml.md`). On a
+/// `version_append` table an UPDATE/DELETE rewrites NOTHING: it resolves its
+/// target rows through the normal routed read path — mem ∪ hot ∪ delta, already
+/// version-collapsed by `DedupExec` — evaluates the `SET` expressions against
+/// them, and appends the results as new row versions.
+/// [`BufferedWriteLayer::insert`] stamps a fresh monotonic `dedup_tiebreak`
+/// (`insert_coerce::stamp_version`) on the way through, so the appended version
+/// outranks every older copy at read time. No Delta MERGE, no deletion vector,
+/// no OCC retry, and — because nothing existing changes — no hot-tier
+/// invalidation.
+///
+/// DELETE appends the same FULL row with the schema's `tombstone_column` set,
+/// not a key-only stub: the row has just been read anyway, a stub could not
+/// satisfy the table's NOT NULL columns, and the read side keys off the marker
+/// alone.
+///
+/// STREAMED, not collected. Rows are appended in scan-sized chunks, so an
+/// UPDATE over a wide window costs one batch of memory rather than the whole
+/// match set — the 2026-07-04 `update_with_source` OOM shape. The trade is
+/// statement atomicity: a failure partway leaves the versions already appended
+/// in place. That is sound under merge-on-read (each is a COMPLETE row version,
+/// never a half-written row) and the client sees the error and retries, which
+/// re-appends them idempotently.
+#[allow(clippy::too_many_arguments)]
+async fn perform_version_append(
+    database: &Arc<Database>, layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
+    assignments: &[(String, Expr)], source: Option<&UpdateSource>, tombstone: bool, session: &Arc<dyn Session>,
+) -> Result<u64> {
+    use datafusion::{
+        datasource::{MemTable, provider_as_source},
+        logical_expr::{LogicalPlanBuilder, col, lit},
+    };
+
+    let schema = crate::schema_loader::get_schema(table_name)
+        .ok_or_else(|| DataFusionError::Execution(format!("merge-on-read: no registered schema for {table_name}")))?;
+    let tombstone_col = schema.tombstone_column.clone();
+    if tombstone && tombstone_col.is_none() {
+        // `version_append` is documented to require all three columns; a DELETE
+        // with nowhere to write the marker would silently delete nothing.
+        return Err(DataFusionError::Execution(format!("merge-on-read: {table_name} sets version_append but declares no tombstone_column")));
+    }
+    let table_schema = schema.schema_ref();
+
+    // The routing provider IS the logical table: it unions MemBuffer, the hot
+    // tier and Delta, prunes by the predicate's project/time bounds, and runs
+    // DedupExec — so the rows we read are already the current versions.
+    let provider =
+        Arc::new(crate::database::ProjectRoutingTable::new(project_id.to_string(), database.clone(), table_schema.clone(), None, table_name.to_string()));
+    // `project_id` is STRIPPED from the DML predicate (it is routing
+    // information, consumed by `extract_dml_info`), so it must be put back as a
+    // row filter here. Routing alone is not tenant isolation: every default
+    // project shares ONE unified Delta table, so without this conjunct an
+    // UPDATE scoped to one tenant rewrites the matching rows of every tenant in
+    // that table. It also prunes, which is why the in-place Delta leg
+    // re-augments its own predicate the same way.
+    let tenant = Expr::Column(Column::from_name("project_id")).eq(lit(project_id));
+    let filter = match predicate.clone() {
+        Some(p) => tenant.and(p),
+        None => tenant,
+    };
+    let mut builder = LogicalPlanBuilder::scan(table_name, provider_as_source(provider), None)?.filter(filter)?;
+
+    let source_cols: std::collections::HashSet<String> = source.map(|s| s.schema.fields().iter().map(|f| f.name().clone()).collect()).unwrap_or_default();
+    if let Some(src) = source {
+        let mem = MemTable::try_new(src.schema.clone(), vec![vec![src.batch.clone()]])?;
+        let src_plan = LogicalPlanBuilder::scan(MOR_SOURCE, provider_as_source(Arc::new(mem)), None)?.build()?;
+        let on: Vec<Expr> = src
+            .join_keys
+            .iter()
+            .map(|(t, s)| Expr::Column(Column::new(Some(table_name.to_string()), t)).eq(Expr::Column(Column::new(Some(MOR_SOURCE.to_string()), s))))
+            .collect();
+        builder = builder.join_on(src_plan, JoinType::Inner, on)?;
+    }
+
+    // Full-row versions: every column is carried forward, with the assignments
+    // (and the tombstone marker) substituted in place. The version stamp is
+    // deliberately NOT set here — `insert` owns it.
+    let exprs = table_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let name = f.name();
+            if tombstone && tombstone_col.as_deref() == Some(name.as_str()) {
+                return Ok(lit(true).alias(name));
+            }
+            match assignments.iter().find(|(c, _)| c == name) {
+                Some((_, e)) => Ok(requalify_for_merge(e.clone(), &source_cols, MOR_SOURCE, table_name)?.alias(name)),
+                None => Ok(col(Column::new(Some(table_name.to_string()), name)).alias(name)),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let plan = builder.project(exprs)?.build()?;
+
+    // `session` is already `delta_session_from(...)`: default analyzer rules
+    // only, so Variant columns round-trip as raw Structs instead of being
+    // wrapped in `variant_to_json` for the wire and re-parsed on the way back.
+    let physical = session.create_physical_plan(&plan).await?;
+    let mut stream = datafusion::physical_plan::execute_stream(physical, session.task_ctx())?;
+    let mut rows = 0u64;
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        rows += batch.num_rows() as u64;
+        // Marked before the write, and through the SAME funnel every other
+        // write uses — `insert_records_batch` is what stamps the version
+        // (`insert_coerce::stamp_version`) and routes to the buffered layer
+        // when there is one. Appending via `BufferedWriteLayer::insert`
+        // directly skips the stamp, and every version of a row then ties on the
+        // tiebreak, which keep-greatest resolves ARBITRARILY: five successive
+        // updates read back as the first one.
+        let batches = vec![batch];
+        if let Some(l) = layer {
+            l.mark_version_buckets(project_id, table_name, &batches);
+        }
+        database
+            .insert_records_batch(project_id, table_name, batches, false, None)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("merge-on-read append failed for {project_id}/{table_name}: {e}")))?;
+    }
+    debug!(project_id, table_name, rows, tombstone, "merge-on-read version append");
+    Ok(rows)
+}
+
+/// Merge-on-read is a per-table property of the SCHEMA alone. It must not also
+/// depend on a buffered layer being attached: a table that appends versions on
+/// one deployment and mutates in place on another would resolve versions
+/// differently for the same data.
+fn is_version_append(table_name: &str) -> bool {
+    crate::schema_loader::get_schema(table_name).is_some_and(|s| s.version_append)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn perform_update_with_buffer(
-    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
+    database: &Arc<Database>, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
     assignments: Vec<(String, Expr)>, source: Option<UpdateSource>, session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
+    // Merge-on-read tables take neither leg: one append supersedes the row
+    // wherever it lives, so there is no mem/Delta split to coordinate.
+    if is_version_append(table_name) {
+        let append_span = tracing::trace_span!(parent: span, "mor.update");
+        return perform_version_append(database, buffered_layer, table_name, project_id, predicate, &assignments, source.as_ref(), false, &session)
+            .instrument(append_span)
+            .await;
+    }
+
     // `UPDATE ... FROM` path: MemBuffer takes the join via update_with_source,
     // Delta path uses MergeBuilder via perform_delta_merge_update — either
     // synchronously or deferred through the coalescer when enabled.
@@ -847,9 +995,16 @@ async fn perform_update_with_buffer(
 }
 
 async fn perform_delete_with_buffer(
-    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
+    database: &Arc<Database>, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
     session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
+    // Merge-on-read: a DELETE appends a tombstone version instead of planning a
+    // Delta delete + deletion vector (see `perform_version_append`).
+    if is_version_append(table_name) {
+        let append_span = tracing::trace_span!(parent: span, "mor.delete");
+        return perform_version_append(database, buffered_layer, table_name, project_id, predicate, &[], None, true, &session).instrument(append_span).await;
+    }
+
     let delete_span = tracing::trace_span!(parent: span, "delta.delete");
     // The clamp applies to deletes too: rows above the flush watermark were
     // removed from the buffer by the mem leg and will never flush, so Delta

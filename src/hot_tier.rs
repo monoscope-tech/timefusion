@@ -36,7 +36,11 @@ use std::{
     time::Duration,
 };
 
-use arrow::{array::RecordBatch, buffer::Buffer, datatypes::SchemaRef};
+use arrow::{
+    array::RecordBatch,
+    buffer::Buffer,
+    datatypes::{DataType, SchemaRef, TimeUnit},
+};
 use arrow_ipc::{Block, convert::fb_to_schema, reader::FileDecoder, reader::read_footer_length, root_as_footer, writer::FileWriter, writer::IpcWriteOptions};
 use dashmap::DashMap;
 use datafusion::logical_expr::Expr;
@@ -176,12 +180,46 @@ pub struct HotBucketMeta {
     pub min_ts: i64,
     pub end_ts: i64,
     pub bytes: u64,
+    /// Greatest `dedup_tiebreak` (version stamp) among the file's rows, on a
+    /// `version_append` table. It is what lets the file keep excluding its
+    /// window from Delta while merge-on-read keeps appending newer versions
+    /// INTO that window: everything at or below this stamp is already in this
+    /// file, so only strictly-greater stamps need reading from Delta (see
+    /// `version_gate`). `None` = unknown (file demoted before the table opted
+    /// in, or by an older binary) — the gate then admits every stamped row,
+    /// which is conservative, never wrong.
+    pub max_stamp: Option<i64>,
     pub path: PathBuf,
 }
 
 impl HotBucketMeta {
     fn range(&self) -> (i64, i64) {
         (self.min_ts, self.end_ts)
+    }
+}
+
+/// What the hot tier contributes to one scan.
+#[derive(Debug, Default)]
+pub struct HotLeg {
+    /// One batch partition per served file.
+    pub partitions: Vec<Vec<RecordBatch>>,
+    /// Windows the served files are authoritative for; the caller excludes them
+    /// from the Delta leg.
+    pub ranges: Vec<(i64, i64)>,
+    /// Merge-on-read gate. Under `version_append` an UPDATE appends a NEW
+    /// version carrying the row's ORIGINAL timestamp, so it lands in Delta
+    /// *inside* one of `ranges` and a plain range exclusion would hide it. The
+    /// caller therefore weakens each exclusion with `OR stamp > gate`: at-or
+    /// below the gate the hot files already hold the newest version, above it
+    /// only Delta does. `None` = the table does not append versions, so no row
+    /// in an excluded window can be newer than the file that owns it and the
+    /// exclusion stands unweakened.
+    pub version_gate: Option<i64>,
+}
+
+impl HotLeg {
+    pub fn is_empty(&self) -> bool {
+        self.partitions.is_empty() && self.ranges.is_empty()
     }
 }
 
@@ -295,10 +333,43 @@ fn parse_meta(path: PathBuf, bytes: u64) -> Option<HotBucketMeta> {
     let stem = path.file_stem()?.to_str()?;
     let mut parts = stem.split('_');
     let (bucket_id, min_ts, end_ts, seq) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    // The stamp is an OPTIONAL 5th component so a tier written before the
+    // version gate existed still rescans (as `max_stamp: None`), and so a
+    // rollback to a binary that rejects it degrades to "file absent" rather
+    // than to a mis-parsed range.
+    let max_stamp = match parts.next() {
+        Some(s) => Some(s.parse().ok()?),
+        None => None,
+    };
     if parts.next().is_some() {
         return None;
     }
-    Some(HotBucketMeta { bucket_id: bucket_id.parse().ok()?, min_ts: min_ts.parse().ok()?, end_ts: end_ts.parse().ok()?, seq: seq.parse().ok()?, bytes, path })
+    Some(HotBucketMeta {
+        bucket_id: bucket_id.parse().ok()?,
+        min_ts: min_ts.parse().ok()?,
+        end_ts: end_ts.parse().ok()?,
+        seq: seq.parse().ok()?,
+        max_stamp,
+        bytes,
+        path,
+    })
+}
+
+/// Greatest non-null value of `column` across `batches`, as micros. `None` when
+/// the column is absent, not a microsecond timestamp, or entirely null — every
+/// one of which means "this file cannot vouch for any stamp", which the gate
+/// reads as "admit everything".
+fn max_stamp_of(batches: &[RecordBatch], column: &str) -> Option<i64> {
+    use arrow::{array::AsArray, datatypes::TimestampMicrosecondType};
+    batches
+        .iter()
+        .filter_map(|b| {
+            let col = b.column_by_name(column)?;
+            matches!(col.data_type(), DataType::Timestamp(TimeUnit::Microsecond, _))
+                .then(|| datafusion::arrow::compute::max(col.as_primitive::<TimestampMicrosecondType>()))
+                .flatten()
+        })
+        .max()
 }
 
 impl HotTier {
@@ -385,7 +456,14 @@ impl HotTier {
         let dir = self.root.join(project_id).join(table_name);
         fs::create_dir_all(&dir)?;
         let seq = self.seq.fetch_add(1, Relaxed);
-        let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}.{EXT}"));
+        // The stamp rides in the FILENAME so `rescan` recovers the gate after a
+        // restart without reopening every file.
+        let max_stamp = crate::schema_loader::get_schema(table_name)
+            .filter(|s| s.version_append)
+            .and_then(|s| s.dedup_tiebreak.clone())
+            .and_then(|c| max_stamp_of(batches, &c));
+        let stamp_suffix = max_stamp.map(|s| format!("_{s}")).unwrap_or_default();
+        let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{stamp_suffix}.{EXT}"));
         crate::wal::write_atomic_with(&path, true, |f| {
             // Default options: 64-byte alignment, V5, NO compression — the
             // alignment is what keeps the mmap read zero-copy, the absence of
@@ -394,7 +472,7 @@ impl HotTier {
             batches.iter().try_for_each(|b| w.write(b)).map_err(std::io::Error::other)?;
             w.finish().map_err(std::io::Error::other)
         })?;
-        Ok(Some(HotBucketMeta { bucket_id, seq, min_ts, end_ts, bytes: fs::metadata(&path)?.len(), path }))
+        Ok(Some(HotBucketMeta { bucket_id, seq, min_ts, end_ts, max_stamp, bytes: fs::metadata(&path)?.len(), path }))
     }
 
     /// Files whose row range overlaps `query_range` — a CLOSED `[lo, hi]`
@@ -439,24 +517,25 @@ impl HotTier {
     pub async fn query_partitioned(
         self: &Arc<Self>, project_id: &str, table_name: &str, query_range: Option<(i64, i64)>, mem_ranges: &[(i64, i64)], filters: &[Expr], schema: &SchemaRef,
         projection: Option<&Vec<usize>>,
-    ) -> (Vec<Vec<RecordBatch>>, Vec<(i64, i64)>) {
+    ) -> HotLeg {
         let metas = self.buckets_in_range(project_id, table_name, query_range);
         if metas.is_empty() {
             return Default::default();
         }
+        let versioned = crate::schema_loader::get_schema(table_name).is_some_and(|s| s.version_append);
         let (tier, mem_ranges, filters, schema, projection) = (self.clone(), mem_ranges.to_vec(), filters.to_vec(), schema.clone(), projection.cloned());
         // open + mmap + decode + page faults are blocking syscalls; a planner
         // future must not run them on its async worker.
-        tokio::task::spawn_blocking(move || tier.read_leg(&metas, &mem_ranges, &filters, &schema, projection.as_deref())).await.unwrap_or_default()
+        tokio::task::spawn_blocking(move || tier.read_leg(&metas, &mem_ranges, &filters, &schema, projection.as_deref(), versioned)).await.unwrap_or_default()
     }
 
     fn read_leg(
-        &self, metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], filters: &[Expr], schema: &SchemaRef, projection: Option<&[usize]>,
-    ) -> (Vec<Vec<RecordBatch>>, Vec<(i64, i64)>) {
+        &self, metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], filters: &[Expr], schema: &SchemaRef, projection: Option<&[usize]>, versioned: bool,
+    ) -> HotLeg {
         let cols = plan_columns(projection, filters, schema);
         let filter_schema = cols.as_ref().map_or_else(|| schema.clone(), |c| c.schema.clone());
         let pred = compile_filter_conjunction(filters, &filter_schema).ok().flatten();
-        let (mut partitions, mut ranges, mut used) = (Vec::new(), Vec::new(), 0u64);
+        let (mut partitions, mut ranges, mut used, mut gate) = (Vec::new(), Vec::new(), 0u64, None::<i64>);
         for meta in metas {
             if mem_ranges.iter().any(|r| overlaps(meta.range(), *r)) {
                 self.mem_skipped.fetch_add(1, Relaxed);
@@ -530,11 +609,19 @@ impl HotTier {
             }
             used += bytes;
             ranges.push(meta.range());
+            // The gate travels with the range it guards: a file that cannot
+            // vouch for a stamp (`None`) drops it to `i64::MIN`, which admits
+            // every stamped Delta row in the excluded windows — the safe
+            // direction, since an over-admitted row is a duplicate `DedupExec`
+            // collapses while an under-admitted one is a stale read.
+            if versioned {
+                gate = Some(gate.unwrap_or(i64::MAX).min(meta.max_stamp.unwrap_or(i64::MIN)));
+            }
             if !filtered.is_empty() {
                 partitions.push(filtered);
             }
         }
-        (partitions, ranges)
+        HotLeg { partitions, ranges, version_gate: gate }
     }
 
     /// Zero-copy read of one demoted file, memoized. `None` = treat as absent
@@ -951,7 +1038,7 @@ mod tests {
         tier.demote("p1", "t", 1, &[batch(8)], 10, 20);
         let filters = vec![datafusion::prelude::col("ts").gt(datafusion::prelude::lit(5i64))];
         // Project only `name`; `ts` is predicate-only and must not leak out.
-        let (parts, ranges) = tier.query_partitioned("p1", "t", None, &[], &filters, &schema(), Some(&vec![1])).await;
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &filters, &schema(), Some(&vec![1])).await;
         assert_eq!(ranges, vec![(10, 21)]);
         let batches: Vec<_> = parts.into_iter().flatten().collect();
         assert_eq!(batches[0].num_columns(), 1);
@@ -960,9 +1047,72 @@ mod tests {
 
         // A file MemBuffer still owns is skipped whole — no rows, no range, so
         // the window stays with the tier that has the fresher copy.
-        let (parts, ranges) = tier.query_partitioned("p1", "t", None, &[(15, 25)], &filters, &schema(), None).await;
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[(15, 25)], &filters, &schema(), None).await;
         assert!(parts.is_empty() && ranges.is_empty());
         assert_eq!(tier.stats().mem_skipped, 1);
+    }
+
+    /// Merge-on-read version gate. A `version_append` table's demoted file
+    /// records the greatest stamp it holds, survives a restart carrying it (the
+    /// stamp rides in the filename), and the leg reports the MINIMUM across the
+    /// files it served — the conservative bound the caller weakens its Delta
+    /// exclusion with. A file that cannot vouch for a stamp drops the gate to
+    /// `i64::MIN`, which admits every stamped row rather than hiding one.
+    #[tokio::test]
+    async fn version_gate_is_the_minimum_stamp_and_survives_restart() {
+        use arrow::{
+            array::TimestampMicrosecondArray,
+            datatypes::{Field, Schema, TimeUnit},
+        };
+
+        let versioned = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+        ]));
+        let rows = |stamps: Vec<i64>| {
+            let ts: Vec<i64> = (0..stamps.len() as i64).collect();
+            RecordBatch::try_new(
+                versioned.clone(),
+                vec![Arc::new(Int64Array::from(ts)), Arc::new(TimestampMicrosecondArray::from(stamps).with_timezone("UTC"))],
+            )
+            .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        // `mor_versioned` is the shipped `version_append` schema; the gate keys
+        // off the registry, not off the batch, exactly as the write path does.
+        tier.demote("p1", "mor_versioned", 1, &[rows(vec![100, 400])], 0, 1);
+        tier.demote("p1", "mor_versioned", 2, &[rows(vec![200, 300])], 2, 3);
+
+        let leg = tier.query_partitioned("p1", "mor_versioned", None, &[], &[], &versioned, None).await;
+        assert_eq!(leg.version_gate, Some(300), "the gate is the least per-file maximum, so no file's newer rows are excluded");
+        assert_eq!(leg.ranges.len(), 2);
+
+        // A file whose rows predate the stamp (all NULL — the state of every row
+        // written before a table opted in) cannot vouch for one; the gate must
+        // collapse to "admit everything", never to the other files' higher
+        // bound.
+        let unstamped = RecordBatch::try_new(
+            versioned.clone(),
+            vec![Arc::new(Int64Array::from(vec![0i64, 1])), Arc::new(TimestampMicrosecondArray::from(vec![None, None]).with_timezone("UTC"))],
+        )
+        .unwrap();
+        tier.demote("p1", "mor_versioned", 3, &[unstamped], 4, 5);
+        let leg = tier.query_partitioned("p1", "mor_versioned", None, &[], &[], &versioned, None).await;
+        assert_eq!(leg.version_gate, Some(i64::MIN), "an unstamped file must not let the gate hide newer Delta rows");
+
+        // A table that does not append versions gets no gate at all — its
+        // exclusion stands unweakened, byte-for-byte the pre-merge-on-read plan.
+        tier.demote("p1", "t", 1, &[batch(4)], 10, 20);
+        let leg = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        assert_eq!(leg.version_gate, None);
+
+        // Restart: `rescan` recovers the stamp from the filename.
+        let reopened = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX));
+        let metas = reopened.buckets_in_range("p1", "mor_versioned", None);
+        let stamps: Vec<_> = metas.iter().map(|m| m.max_stamp).collect();
+        assert_eq!(stamps, vec![Some(400), Some(300), None], "stamps must survive a restart via the filename");
     }
 
     #[test]
@@ -1200,7 +1350,7 @@ mod tests {
         let s = tier.stats();
         assert_eq!((s.suppressed_tables, s.files), (1, 1));
 
-        let (parts, ranges) = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         assert_eq!(ranges, vec![(10, 21)]);
         assert_eq!(parts.into_iter().flatten().map(|b| b.num_rows()).sum::<usize>(), 4);
         assert_eq!(tier.stats().read_hits, 1);
@@ -1234,14 +1384,14 @@ mod tests {
         let probe = tempfile::tempdir().unwrap();
         let t0 = HotTier::open(probe.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX));
         t0.demote("p1", "t", 0, &[batch(64)], 0, 10);
-        let (parts, _) = t0.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        let HotLeg { partitions: parts, .. } = t0.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         let one: u64 = parts.into_iter().flatten().map(|b| b.get_array_memory_size() as u64).sum();
 
         let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { leg_budget_bytes: one * 2, ..limits(u64::MAX) });
         for i in 0..5i64 {
             tier.demote("p1", "t", i, &[batch(64)], i * 100, i * 100 + 10);
         }
-        let (parts, ranges) = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         assert_eq!(parts.len(), 2, "the budget admits two files' worth and stops");
         assert_eq!(ranges, vec![(0, 11), (100, 111)], "exactly the admitted files' ranges are excluded from Delta — no more");
         assert_eq!(parts.len(), ranges.len(), "one range per admitted partition, always");
@@ -1251,7 +1401,7 @@ mod tests {
         // Budget edge: a budget smaller than ONE file admits nothing at all —
         // and, critically, excludes nothing, so every window falls to Delta.
         let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { leg_budget_bytes: 1, ..limits(u64::MAX) });
-        let (parts, ranges) = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         assert!(parts.is_empty() && ranges.is_empty(), "no rows AND no exclusion — the whole window must fall through to Delta");
     }
 
@@ -1307,7 +1457,7 @@ mod tests {
         FileWriter::try_new_with_options(f, schema().as_ref(), IpcWriteOptions::default()).unwrap().finish().unwrap();
         assert_eq!(tier.read_file(&path).unwrap().len(), 0, "it decodes fine — it is just empty");
 
-        let (parts, ranges) = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         assert!(parts.is_empty(), "no rows");
         assert!(ranges.is_empty(), "and NO exclusion range: the window must fall through to Delta, not vanish");
         assert_eq!(tier.stats().read_misses, 1, "counted as a miss, like any other unusable file");

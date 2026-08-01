@@ -8952,9 +8952,27 @@ fn process_memory_bytes() -> Option<usize> {
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
         && let Ok(v) = raw.trim().parse::<usize>()
     {
-        return Some(v);
+        // Discount the INACTIVE file cache. `memory.current` counts it, but the
+        // kernel reclaims it before OOM-killing anything, so charging it to the
+        // brake is charging pressure that does not exist — and it is not small:
+        // prod 2026-08-01 read 88.4 GB current = 75.6 GB anon + 11.7 GB
+        // inactive file. That 11.7 GB brought the brake forward by the same
+        // amount, and since the brake means "no maintenance AT ALL", it shortens
+        // the post-restart window in which compaction and dedup can make any
+        // progress (19.8k-deep dirty-bin backlog, 14 bins processed per process
+        // lifetime). Active file cache is left charged: it is being read now and
+        // reclaiming it costs IO.
+        return Some(v.saturating_sub(cgroup_inactive_file_bytes().unwrap_or(0)));
     }
     crate::buffered_write_layer::process_rss_bytes()
+}
+
+/// `inactive_file` from cgroup v2 `memory.stat` — the page cache the kernel
+/// drops first under pressure. `None` when unreadable (the caller then charges
+/// the full `memory.current`, i.e. today's behaviour).
+fn cgroup_inactive_file_bytes() -> Option<usize> {
+    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?;
+    raw.lines().find_map(|l| l.strip_prefix("inactive_file ")?.trim().parse().ok())
 }
 
 /// Host free memory: `MemAvailable` from /proc/meminfo, which inside a
@@ -10444,14 +10462,13 @@ impl TableProvider for ProjectRoutingTable {
         let limit = if post_scan_row_drop { None } else { limit };
 
         let scan_state = parking_lot::Mutex::new(ScanShape::default());
-        // Legs of the mem ∪ hot ∪ delta union, each flagged `sortable` — true for
-        // the in-memory legs (MemBuffer / hot tier), false for a Delta scan.
-        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, bool)>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Legs of the mem ∪ hot ∪ delta union, in recency order.
+        let wrap_result = |legs: Vec<Arc<dyn ExecutionPlan>>| -> DFResult<Arc<dyn ExecutionPlan>> {
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
             let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
-            let (mut plans, sortable): (Vec<Arc<dyn ExecutionPlan>>, Vec<bool>) = legs.into_iter().unzip();
+            let mut plans = legs;
             // Merge-on-read prerequisite: `DedupExec`'s keep-greatest only engages
             // while its input still declares an ordering on the leading dedup key
             // (that is what makes every version of a key arrive in one run), and
@@ -10479,6 +10496,17 @@ impl TableProvider for ProjectRoutingTable {
                 && table_schema.is_some_and(|t| t.version_append)
                 && let Some(req) = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &plans[0].schema()))
             {
+                // EVERY leg is sortable here, the Delta one included. Marking it
+                // unsortable — as the pre-merge-on-read code did — makes
+                // keep-greatest depend on the Delta scan happening to declare its
+                // footer ordering, and ONE file written without that declaration
+                // silently drops the whole scan's ordering, demotes the operator
+                // to keep-first and serves the PRE-UPDATE row. Correctness must
+                // not hinge on file metadata. The cost is bounded: sorting is
+                // skipped for any leg that already satisfies `req` (the normal
+                // case, since the table declares `sorting_columns`), and a
+                // `SortExec` here is per-partition and spillable.
+                let sortable = vec![true; plans.len()];
                 match crate::optimizers::ordered_children(&plans, &req, None, &sortable, false)? {
                     Some(ordered) => {
                         plans = ordered;
@@ -10499,12 +10527,17 @@ impl TableProvider for ProjectRoutingTable {
                 }
             }
             let plan = if plans.len() == 1 { plans.remove(0) } else { UnionExec::try_new(plans)? };
-            let plan = match merge_req {
+            let plan = match merge_req.clone() {
                 Some(req) => Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(req, plan)),
                 None => plan,
             };
             let plan = match dedup_on {
-                true => Arc::new(crate::read_dedup::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?),
+                true => Arc::new(
+                    crate::read_dedup::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?
+                        // Declaring it REQUIRED is what stops EnforceSorting from
+                        // deleting the merge above as unused — see the field docs.
+                        .requiring(merge_req.clone()),
+                ),
                 false => plan,
             };
             match &tombstone {
@@ -10542,7 +10575,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![(plan, false)]);
+            return wrap_result(vec![plan]);
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -10603,7 +10636,7 @@ impl TableProvider for ProjectRoutingTable {
         // (the hot leg serves pre-dedup rows and relies on `DedupExec`).
         let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters), layer.hot_tier_retention_micros());
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
-        let (hot_partitions, hot_ranges) = match skip_delta || too_deep {
+        let hot: crate::hot_tier::HotLeg = match skip_delta || too_deep {
             true => Default::default(),
             false => {
                 layer
@@ -10612,6 +10645,7 @@ impl TableProvider for ProjectRoutingTable {
                     .await
             }
         };
+        let (hot_partitions, hot_ranges, version_gate) = (hot.partitions, hot.ranges, hot.version_gate);
 
         // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
@@ -10635,7 +10669,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![(plan, false)]);
+            return wrap_result(vec![plan]);
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
@@ -10652,7 +10686,7 @@ impl TableProvider for ProjectRoutingTable {
         if let Some(mem_plan) = mem_plan.clone().filter(|_| skip_delta) {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(vec![(mem_plan, true)]);
+            return wrap_result(vec![mem_plan]);
         }
 
         // Build Delta filters with per-bucket exclusion.
@@ -10674,14 +10708,35 @@ impl TableProvider for ProjectRoutingTable {
         // Delta excludes the UNION of those ranges, and consecutive sealed
         // buckets are contiguous, so merging first collapses what would be one
         // conjunct per bucket (~36 for a 6h tier) into typically one.
+        //
+        // MERGE-ON-READ: on a `version_append` table an UPDATE appends a new
+        // version of the row carrying its ORIGINAL timestamp, so the newer
+        // version lands in Delta *inside* one of these ranges and the exclusion
+        // above would hide it — serving the pre-update row forever. Each
+        // conjunct is therefore weakened with `OR stamp > gate`: at or below the
+        // gate the in-memory/hot leg already holds the newest version of every
+        // row in the window, above it only Delta does. Applied to the merged
+        // (mem ∪ hot) ranges rather than the hot ones alone because weakening is
+        // safe in one direction only — an over-admitted row is a duplicate
+        // `DedupExec` collapses, an under-admitted one is a stale read — and the
+        // union path never grants `skip_dedup`.
         let mut delta_filters = optimized_filters.clone();
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
+        let version_col = table_schema.as_ref().filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone());
         for (start, end) in crate::mem_buffer::merge_ranges([mem_ranges, hot_ranges].concat()) {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(start) });
             let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(end) });
-            delta_filters.push(Expr::BinaryExpr(BinaryExpr { left: Box::new(below), op: Operator::Or, right: Box::new(at_or_above) }));
+            let outside = Expr::BinaryExpr(BinaryExpr { left: Box::new(below), op: Operator::Or, right: Box::new(at_or_above) });
+            delta_filters.push(match (&version_col, version_gate) {
+                (Some(c), Some(g)) => Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(outside),
+                    op: Operator::Or,
+                    right: Box::new(Expr::BinaryExpr(BinaryExpr { left: Box::new(col(c)), op: Operator::Gt, right: ts_lit(g) })),
+                }),
+                _ => outside,
+            });
         }
         if let Some(f) = tantivy_id_filter.clone() {
             delta_filters.push(f);
@@ -10720,8 +10775,7 @@ impl TableProvider for ProjectRoutingTable {
                 Some(Arc::new(DataSourceExec::new(Arc::new(source))) as Arc<dyn ExecutionPlan>)
             }
         };
-        let legs: Vec<(Arc<dyn ExecutionPlan>, bool)> =
-            [mem_plan.map(|p| (p, true)), hot_plan.map(|p| (p, true)), Some((delta_plan, false))].into_iter().flatten().collect();
+        let legs: Vec<Arc<dyn ExecutionPlan>> = [mem_plan, hot_plan, Some(delta_plan)].into_iter().flatten().collect();
         wrap_result(legs)
     }
 

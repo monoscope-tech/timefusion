@@ -70,6 +70,7 @@ pub struct E2eEnvBuilder {
     dml_merge_key_prune: bool,
     dml_coalesce_secs: u64,
     page_row_count_limit: Option<usize>,
+    hot_tier_retention_hours: u64,
 }
 
 impl Default for E2eEnvBuilder {
@@ -87,6 +88,9 @@ impl Default for E2eEnvBuilder {
             checkpoint_interval: 10,
             optimize_sort_by: false,
             warm_full_files: false,
+            // Mirrors the prod default: the local hot tier is OFF unless a test
+            // asks for it (`with_hot_tier`).
+            hot_tier_retention_hours: 0,
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
@@ -114,6 +118,14 @@ impl E2eEnvBuilder {
     }
     pub fn with_retention(mut self, d: Duration) -> Self {
         self.retention_mins = (d.as_secs() / 60).max(1);
+        self
+    }
+    /// Enable the local hot tier with an `hours`-wide window. Off by default,
+    /// exactly like prod (`TIMEFUSION_HOT_TIER_RETENTION_HOURS=0`) — a test that
+    /// asserts on demoted files MUST call this or the tier silently does
+    /// nothing and the assertion reads as a product bug.
+    pub fn with_hot_tier(mut self, hours: u64) -> Self {
+        self.hot_tier_retention_hours = hours;
         self
     }
     pub fn with_foyer_enabled(mut self) -> Self {
@@ -253,6 +265,7 @@ impl E2eEnvBuilder {
             warm_full_files: self.warm_full_files,
             dml_merge_key_prune: self.dml_merge_key_prune,
             dml_coalesce_secs: self.dml_coalesce_secs,
+            hot_tier_retention_hours: self.hot_tier_retention_hours,
             page_row_count_limit: self.page_row_count_limit,
             test_id: &test_id,
         });
@@ -353,6 +366,7 @@ impl E2eEnv {
             warm_full_files: self.builder.warm_full_files,
             dml_merge_key_prune: self.builder.dml_merge_key_prune,
             dml_coalesce_secs: self.builder.dml_coalesce_secs,
+            hot_tier_retention_hours: self.builder.hot_tier_retention_hours,
             page_row_count_limit: self.builder.page_row_count_limit,
             test_id: &self.test_id,
         });
@@ -461,6 +475,7 @@ struct BuildCfgArgs<'a> {
     dml_merge_key_prune: bool,
     dml_coalesce_secs: u64,
     page_row_count_limit: Option<usize>,
+    hot_tier_retention_hours: u64,
     test_id: &'a str,
 }
 
@@ -488,6 +503,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
+    cfg.buffer.timefusion_hot_tier_retention_hours = args.hot_tier_retention_hours;
     if let Some(rows) = args.page_row_count_limit {
         cfg.parquet.timefusion_page_row_count_limit = rows;
     }

@@ -836,6 +836,21 @@ pub fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafus
     }
 }
 
+/// The DISTINCT bucket ids `batch`'s rows land in, keyed off `time_col`.
+/// Empty when the column is absent or is not an i64-backed time type — the
+/// caller then simply marks nothing, which is the conservative direction only
+/// for callers that treat "unknown" as "do not exempt"; today's single caller
+/// (`BufferedWriteLayer::insert_versions`) is on a table that always declares
+/// the column.
+pub fn batch_bucket_ids(batch: &RecordBatch, time_col: &str) -> Vec<i64> {
+    let Some(col) = batch.column_by_name(time_col) else { return Vec::new() };
+    let Some(values) = crate::read_dedup::bound_slice(col) else { return Vec::new() };
+    let mut ids: Vec<i64> = values.iter().map(|&t| MemBuffer::compute_bucket_id(t)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Half-open `[start, end)` interval overlap — the ONE range convention shared
 /// by MemBuffer bucket ranges, hot-tier file ranges, and the Delta exclusion
 /// filters built from them.
@@ -2777,6 +2792,24 @@ mod tests {
         assert_eq!(merge_ranges(vec![(0, 30), (5, 10)]), vec![(0, 30)]);
         assert!(merge_ranges(vec![]).is_empty());
         assert!(overlaps((0, 10), (9, 20)) && !overlaps((0, 10), (10, 20)));
+    }
+
+    /// `insert_versions` exempts exactly the buckets a merge-on-read append
+    /// lands in, so the id derivation must cover every row (a missed bucket is
+    /// a window whose untouched Delta rows go dark) and must not invent any.
+    #[test]
+    fn batch_bucket_ids_covers_every_row_and_dedups() {
+        let d = bucket_duration_micros();
+        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
+        let batch = |ts: Vec<i64>| RecordBatch::try_new(schema.clone(), vec![Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC"))]).unwrap();
+
+        // Two rows in one bucket and one in the next → two ids, sorted, once each.
+        assert_eq!(batch_bucket_ids(&batch(vec![0, 1, d]), "timestamp"), vec![0, 1]);
+        // Rows spanning a gap keep the gap: only buckets that actually receive
+        // a row are exempted.
+        assert_eq!(batch_bucket_ids(&batch(vec![5 * d, 0]), "timestamp"), vec![0, 5]);
+        // An absent time column yields nothing rather than a wrong bucket.
+        assert!(batch_bucket_ids(&batch(vec![0]), "no_such_column").is_empty());
     }
 
     /// Batch shaped like a client-built insert: every field marked nullable
