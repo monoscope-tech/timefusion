@@ -781,6 +781,12 @@ const_default!(d_query_partitions: usize = 0);
 // scans queue. Both tunable via TIMEFUSION_{MAX_CONCURRENT_SCAN_READERS,WIDE_SCAN_LOOKBACK_HOURS}.
 const_default!(d_max_concurrent_scan_readers: usize = 16);
 const_default!(d_wide_scan_lookback_hours: u64 = 2);
+// Sized against the incident the gate exists for: the 7-day dashboard opened
+// hundreds of files at ~48-way parallelism. A recent-window scan on the busiest
+// prod tenant selects a handful of files after pruning, so 8 files / 256 MB
+// sits an order of magnitude below the danger and well above the normal path.
+const_default!(d_wide_scan_max_files: usize = 8);
+const_default!(d_wide_scan_max_mb: u64 = 256);
 const_default!(d_plan_cache_capacity: usize = 2048);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
@@ -1838,6 +1844,21 @@ pub struct MemoryConfig {
     pub timefusion_max_concurrent_scan_readers: usize,
     #[serde(default = "d_wide_scan_lookback_hours")]
     pub timefusion_wide_scan_lookback_hours: u64,
+    /// Depth alone badly over-fires the gate above. Lookback is only a PROXY for
+    /// decode heap, and once file pruning works the proxy breaks: prod
+    /// 2026-08-01, the same `ORDER BY timestamp DESC LIMIT 50` took 255ms at a
+    /// 115-minute lookback and 40-57s at 125 minutes, and `EXPLAIN ANALYZE`
+    /// showed the slow plan reading ONE file and 8.24 KB with every other metric
+    /// in microseconds — it was simply queued behind a saturated gate
+    /// (`permits=0`). So a scan is gated only when it is deep AND actually
+    /// selected real work: more than `..._max_files` files or `..._max_mb` of
+    /// them, counted from the plan's file groups AFTER pruning. The 7-day scan
+    /// that caused the original OOM selects hundreds of files and is still
+    /// gated; the deep-but-pruned dashboard query no longer waits behind it.
+    #[serde(default = "d_wide_scan_max_files")]
+    pub timefusion_wide_scan_max_files: usize,
+    #[serde(default = "d_wide_scan_max_mb")]
+    pub timefusion_wide_scan_max_mb: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
     /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
     /// set with room to spare. Each entry is one LogicalPlan (~KBs).

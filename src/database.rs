@@ -22,7 +22,7 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+use datafusion_datasource::{file_scan_config::FileScanConfig, memory::MemorySourceConfig, source::DataSourceExec};
 use datafusion_functions_json;
 use deltalake::{
     DeltaTable, DeltaTableBuilder, PartitionFilter, datafusion::parquet::file::properties::WriterProperties, kernel::transaction::CommitProperties,
@@ -9839,7 +9839,22 @@ impl ProjectRoutingTable {
     fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> Arc<dyn ExecutionPlan> {
         let depth = self.scan_lookback_micros(filters);
         let deeper_than = |micros: i64| depth.is_none_or(|d| d > micros);
-        if !deeper_than((self.database.config.memory.timefusion_wide_scan_lookback_hours as i64).saturating_mul(3_600_000_000)) {
+        let mem = &self.database.config.memory;
+        if !deeper_than((mem.timefusion_wide_scan_lookback_hours as i64).saturating_mul(3_600_000_000)) {
+            return plan;
+        }
+        // Depth is only a proxy for decode heap, and pruning breaks the proxy: a
+        // deep query on a well-pruned partition selects one file and 8 KB, yet
+        // paid ~40s queued behind this shared gate in prod (2026-08-01, 115m =
+        // 255ms vs 125m = 40-57s for the identical result). Refine with the work
+        // the plan ACTUALLY selected, which is known here because pruning has
+        // already run. Only ever *releases* a scan the depth rule would gate —
+        // nothing becomes newly gated — so the guard's ceiling is unchanged.
+        // `None` = no readable file groups, so fall back to depth alone.
+        if let Some((files, bytes)) = selected_file_work(&plan)
+            && files <= mem.timefusion_wide_scan_max_files
+            && bytes <= mem.timefusion_wide_scan_max_mb.saturating_mul(1 << 20)
+        {
             return plan;
         }
         // Two thresholds over one measure, not two notions of "wide": the gate
@@ -10041,6 +10056,21 @@ impl ProjectRoutingTable {
 
         (min_ts.is_some() || max_ts.is_some()).then(|| (min_ts.unwrap_or(i64::MIN), max_ts.unwrap_or(i64::MAX)))
     }
+}
+
+/// Files and bytes a scan will actually open, read off the plan's file groups
+/// AFTER pruning. `None` when the plan carries no file scan (so the caller must
+/// not read "no files" as "no work").
+fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
+    if let Some(src) = (plan.as_ref() as &dyn std::any::Any).downcast_ref::<DataSourceExec>()
+        && let Some(conf) = (src.data_source().as_ref() as &dyn std::any::Any).downcast_ref::<FileScanConfig>()
+    {
+        let files = conf.file_groups.iter().flat_map(|g| g.files());
+        return Some(files.fold((0, 0), |(n, b), f| (n + 1, b + f.object_meta.size)));
+    }
+    // Fold children so a `None` child (a leg with no file scan, e.g. the
+    // in-memory leg) doesn't erase a sibling's real work.
+    plan.children().into_iter().filter_map(selected_file_work).reduce(|(n, b), (n2, b2)| (n + n2, b + b2))
 }
 
 /// Concurrency-gates a wide read scan: each output partition acquires a permit

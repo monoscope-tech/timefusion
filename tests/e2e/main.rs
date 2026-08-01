@@ -28,4 +28,5 @@ mod recent_window_pruning;
 mod restart_recovery;
 mod smoke;
 mod staged_commit;
+mod wide_scan_gate;
 mod zorder_idempotence;
