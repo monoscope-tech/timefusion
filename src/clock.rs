@@ -35,6 +35,13 @@ pub fn now_micros() -> i64 {
     frozen_micros().unwrap_or_else(|| chrono::Utc::now().timestamp_micros())
 }
 
+/// Today's UTC date on the (possibly frozen) clock. Maintenance that decides
+/// which partitions are sealed must read this rather than `Utc::now`, or a
+/// frozen-clock test sees a date its fixture data never lands in.
+pub fn today_utc() -> chrono::NaiveDate {
+    chrono::DateTime::from_timestamp_micros(now_micros()).unwrap_or_default().date_naive()
+}
+
 /// True when the clock is currently pinned (test mode).
 pub fn is_frozen() -> bool {
     frozen_micros().is_some()

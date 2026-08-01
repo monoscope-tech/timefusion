@@ -7,6 +7,7 @@ mod harness;
 
 mod bulk_load;
 mod cache_warmth;
+mod consolidate_catchup;
 mod deletion_vectors;
 mod dml_compression;
 mod eviction;

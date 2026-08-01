@@ -580,7 +580,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
                     // re-selection), so retrying after a transient S3/OCC error
                     // resumes at the next slice rather than restarting.
                     for attempt in 1..=MAX_ATTEMPTS {
-                        match db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p)).await {
+                        match db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p), usize::MAX).await {
                             Ok(()) => break,
                             Err(e) if attempt < MAX_ATTEMPTS => {
                                 eprintln!("  consolidate date={d} project={p}: attempt {attempt} failed, retrying: {e}");

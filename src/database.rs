@@ -2513,6 +2513,19 @@ impl Database {
                         }
                         db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name)).await;
                     }
+                    // Hot compaction only ever touches TODAY's partition, so a
+                    // sealed day the daily cold sweep failed to finish stays
+                    // fragmented forever. Piggy-back a bounded catch-up slice on
+                    // this tick, which actually runs often enough to converge.
+                    let passes = db.config.maintenance.timefusion_consolidate_catchup_passes;
+                    for (_, table_name, table) in db.all_tables().await {
+                        if db.maintenance_shutdown.is_cancelled() || passes == 0 {
+                            return;
+                        }
+                        if let Err(e) = db.consolidate_catchup(&table, &table_name, passes).await {
+                            warn!("consolidate-catchup failed for '{}': {}", table_name, e);
+                        }
+                    }
                 }
             }
         });
@@ -5948,17 +5961,67 @@ impl Database {
     /// (bounds S3 I/O across the whole cold backlog). Covers "previous days and
     /// further", picking up backfill that landed in old partitions.
     pub async fn consolidate_sealed_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
-        let today = Utc::now().date_naive();
+        let today = crate::clock::today_utc();
         let after_days = self.config.parquet.cold_optimize_after_days();
         let dates: Vec<chrono::NaiveDate> = self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
         info!("consolidate: table={} sweeping {} sealed partition(s) older than {}d", table_name, dates.len(), after_days);
         for date in dates {
             let target = self.optimize_target_for_date(date);
-            if let Err(e) = self.consolidate_date_binned(table_ref, table_name, date, target, None).await {
+            if let Err(e) = self.consolidate_date_binned(table_ref, table_name, date, target, None, usize::MAX).await {
                 warn!("consolidate: skipping date={} after error: {}", date, e);
             }
         }
         Ok(())
+    }
+
+    /// Incremental catch-up for the cold sweep above, for partitions it has not
+    /// reached.
+    ///
+    /// `consolidate_sealed_partitions` runs once a day and sweeps EVERY cold
+    /// date in one long job, so it only helps if the process survives the whole
+    /// sweep. Prod does not: it restarts every 30-120 minutes, and on
+    /// 2026-08-01 the previous day's partitions held 3128-3515 files each while
+    /// every partition older than that sat at 1-99 — the daily job had landed
+    /// for those and simply never finished for the newest sealed day. Files
+    /// then stay fragmented forever, and file count is what arms the wide-scan
+    /// gate and drives decode heap.
+    ///
+    /// So do the same work from the frequent tick in a BOUNDED slice: pick the
+    /// single most fragmented cold partition and give it a few passes. Each
+    /// pass is its own commit, so whatever finishes before a restart is kept
+    /// and the next tick resumes from the new snapshot. No date can starve —
+    /// consolidating the worst one lowers its count until another becomes the
+    /// worst.
+    pub async fn consolidate_catchup(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, max_passes: usize) -> Result<()> {
+        let today = crate::clock::today_utc();
+        let after_days = self.config.parquet.cold_optimize_after_days();
+        let target_of = |d| self.optimize_target_for_date(d);
+        // Count only files still BELOW their date's target: a partition of big
+        // converged runs is done, however many of them there are, and must not
+        // out-rank a genuinely fragmented one.
+        let worst = {
+            let table = table_ref.read().await;
+            table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .filter_map(|f| {
+                    let date = f.path().split('/').find_map(|s| s.strip_prefix("date="))?.parse::<chrono::NaiveDate>().ok()?;
+                    (Self::date_is_cold(today, date, after_days) && f.size() < target_of(date)).then_some(date)
+                })
+                .fold(HashMap::<chrono::NaiveDate, usize>::new(), |mut acc, d| {
+                    *acc.entry(d).or_default() += 1;
+                    acc
+                })
+                .into_iter()
+                // Ties break to the NEWEST date: it is the one queries read.
+                .max_by_key(|&(date, n)| (n, date))
+        };
+        let Some((date, small_files)) = worst.filter(|&(_, n)| n >= 2) else {
+            return Ok(());
+        };
+        info!("consolidate-catchup: table={} date={} {} small file(s), running up to {} pass(es)", table_name, date, small_files, max_passes);
+        self.consolidate_date_binned(table_ref, table_name, date, target_of(date), None, max_passes).await
     }
 
     /// Leveled (L2) consolidation of one sealed `date`: per project, repeatedly
@@ -5976,7 +6039,7 @@ impl Database {
     /// consolidate a still-hot date to the cold (1GB) target for one tenant
     /// without waiting for the partition to seal.
     pub async fn consolidate_date_binned(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>, max_passes: usize,
     ) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
@@ -5986,11 +6049,13 @@ impl Database {
         // Backstop against a selection that stops shrinking (e.g. a rewrite
         // that keeps losing OCC to a dedup); a normal day converges in
         // partition_bytes/target passes.
-        const MAX_PASSES: usize = 128;
+        // Backstop for the full sweep; the catch-up caller passes a small budget
+        // so one tick's work fits between restarts.
+        let max_passes = max_passes.min(128).max(1);
         for project_id in Self::hot_project_ids(&uris, date).into_iter().filter(|p| only_project.is_none_or(|only| only == p)) {
             let partition_filters =
                 vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
-            for _ in 0..MAX_PASSES {
+            for _ in 0..max_passes {
                 let selected_files = {
                     let table = table_ref.read().await;
                     Self::light_optimize_tail(&table, &partition_filters, target_size, 2, i64::MAX).await?

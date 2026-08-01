@@ -721,6 +721,7 @@ const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
 // cold target. Calendar-age driven; idempotent (skips ≥-target files).
 const_default!(d_consolidate_schedule: String = "0 30 2 * * *");
+const_default!(d_consolidate_catchup_passes: usize = 4);
 // Every 6h (not daily): tombstones leave checkpoints once older than the
 // retention property, so vacuum must visit often enough to delete the files
 // before their tombstones are pruned — a daily cadence against a 24h
@@ -1615,6 +1616,12 @@ pub struct MaintenanceConfig {
     pub timefusion_optimize_schedule: String,
     #[serde(default = "d_consolidate_schedule")]
     pub timefusion_consolidate_schedule: String,
+    /// Passes of cold consolidation to run on each hot-compaction tick, for
+    /// sealed partitions the daily sweep never reached. Small on purpose: each
+    /// pass is one ≤target sorted rewrite and its own commit, so a restart
+    /// costs at most one pass and the next tick resumes. 0 disables.
+    #[serde(default = "d_consolidate_catchup_passes")]
+    pub timefusion_consolidate_catchup_passes: usize,
     #[serde(default = "d_vacuum_schedule")]
     pub timefusion_vacuum_schedule: String,
     #[serde(default = "d_recompress_schedule")]
