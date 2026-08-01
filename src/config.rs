@@ -698,24 +698,27 @@ const_default!(d_compact_min_files: usize = 5);
 // opens ≈ 1.2s). A larger target collapses today's sealed slices into a few
 // large event-time-disjoint runs so recent queries open a handful of files.
 const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
-// 4 GiB (was 256 MiB). The 256 MiB guard was written for an implementation that
-// concatenated the whole group and did one `lexsort + take` — a 2-3x
-// materialisation. The current path does neither: `sort_one_batch` sorts each
-// batch independently (and skips the `take` entirely when a batch is already
-// ordered, the common append-ordered case), then a heap k-way merge drains the
-// runs, replacing each with an empty batch so its payload frees mid-merge. Peak
-// is therefore ~1x the bucket plus the encoded sort keys, not 2-3x.
+// 256 MiB. This was briefly raised to 4 GiB (2026-08-01) so that large prod
+// flush buckets — ~170 MB compressed, ~2.9 GB in memory at the measured ~17x
+// zstd ratio — would be sorted rather than written with no `sorting_columns`
+// footer. That reasoning was right about the READ cost and wrong about what it
+// would do to the box, so it is reverted:
 //
-// The old value was doing real damage: prod flush files reached ~170 MB
-// compressed (~2.9 GB in memory at the measured ~17x zstd ratio), so a
-// high-volume tenant tripped it on ordinary flushes and wrote them UNSORTED.
-// One unsorted file disables the reader's all-or-nothing footer ordering for
-// every scan touching the partition, which costs the streaming top-N pushdown
-// and forces DedupExec into its unbounded seen-set.
+// The flush sort is IN-PROCESS and, unlike compaction's, allocates OUTSIDE the
+// DataFusion memory pool. Raising the ceiling authorised multi-GB untracked
+// allocations on the INGEST path of a box whose pool hard limit is 23 GB. Both
+// images carrying the raise OOM-killed (exit 137); the image before it was
+// replaced by a normal deploy. That is a small sample on a box where OOMs are
+// chronic, so it is suggestive rather than proven — but a multi-GB unpooled
+// allocation on the ingest path is not worth defending on a suggestive prior.
 //
-// Still a ceiling, not a removal: a pathological bulk-backfill coalesce should
-// bail rather than hold a huge run set, and this stays the incident knob.
-const_default!(d_sort_skip_bytes: usize = 4 * GIB);
+// Reverting costs little now: hot-tail compaction sorts inside the DataFusion
+// plan (pooled, spillable) and declares the footer honestly, so an unsorted
+// flush file is transient rather than permanent — measured 2026-08-01, every
+// window older than ~30 min plans `bounded` with a streaming merge. The right
+// long-term fix is to ESCALATE an oversized flush bucket to the pooled sort
+// instead of skipping it; until then, skipping is the safe failure mode.
+const_default!(d_sort_skip_bytes: usize = 256 * MIB);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
