@@ -32,12 +32,14 @@ COPY vendor/ vendor/
 # can parse the manifest without the real sources. recipe.json content depends
 # only on the dep graph, not on these stubs, so the builder cook layer stays
 # cached across src/ edits.
+# Derived from the manifest, not hardcoded: a hardcoded list silently breaks the
+# image build the first time someone adds a [[bench]] (the manifest then names a
+# target whose source is absent, and `cargo chef prepare` fails to parse it).
 RUN mkdir -p src benches && \
     echo 'fn main() {}' > src/main.rs && \
-    echo 'fn main() {}' > benches/core_benchmarks.rs && \
-    echo 'fn main() {}' > benches/tantivy_benchmarks.rs && \
-    echo 'fn main() {}' > benches/sort_layout_benchmarks.rs && \
-    echo 'fn main() {}' > benches/dedup_benchmarks.rs
+    sed -n '/^\[\[bench\]\]/,+2p' Cargo.toml | sed -n 's/^name *= *"\(.*\)"/\1/p' \
+      | while read -r bench; do echo 'fn main() {}' > "benches/$bench.rs"; done && \
+    ls benches/
 RUN cargo chef prepare --recipe-path recipe.json
 
 ##############################
