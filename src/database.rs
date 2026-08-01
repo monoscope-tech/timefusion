@@ -1636,6 +1636,13 @@ pub struct Database {
     /// in 25 min with zero OCC conflicts). Separate pool ⇒ today's
     /// compaction always has its reserve; total budget stays constant.
     light_optimize_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Flush-path sort pool, for buckets too large for the in-process sort.
+    /// Its own slice, not maintenance's: flush is on the INGEST path and must
+    /// not queue behind a Z-order holding the maintenance pool for minutes.
+    /// Bounded + spillable, which is the whole point — the in-process sort
+    /// allocates outside every pool, and authorising GBs of that on a 26 GB box
+    /// is what took prod down on 2026-08-01.
+    flush_sort_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Memoized `build_optimize_session_state` results, one per runtime env.
     /// Building a `SessionState` re-registers every analyzer/optimizer rule and
     /// the whole UDF/UDAF set; the maintenance loop did that on EVERY optimize
@@ -2214,6 +2221,7 @@ impl Database {
             runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
             light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
@@ -4088,6 +4096,94 @@ impl Database {
         self.light_optimize_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.light_optimize_pool_bytes(), "light_optimize_spill")).clone()
     }
 
+    /// Sort one flush group, picking the strategy by size.
+    ///
+    /// Below `timefusion_sort_skip_bytes` the in-process sort wins on latency
+    /// and this is the ingest path. Above it, escalate to the pooled+spilling
+    /// DataFusion sort rather than SKIPPING the sort as this used to: a skipped
+    /// sort writes a file with no `sorting_columns` footer, and one such file
+    /// disables the reader's all-or-nothing ordering for every scan touching
+    /// the partition. Spilling is the better failure mode.
+    async fn sort_flush_group(&self, schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (FlushBatches, bool) {
+        let ceiling = self.config.maintenance.timefusion_sort_skip_bytes;
+        let total: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+        if total <= ceiling || batches.is_empty() || schema.sorting_columns.is_empty() {
+            // `usize::MAX`: the size decision is made here, so the in-process
+            // helper must not second-guess it and silently skip.
+            return sort_batches_by_schema(schema, batches, usize::MAX);
+        }
+        match self.sort_flush_group_spilling(schema, &batches).await {
+            Some(sorted) => {
+                debug!("flush sort: escalated {} MB group to the spilling DataFusion sort", total / (1 << 20));
+                (FlushBatches::Ready(sorted.into_iter()), true)
+            }
+            // Never lose rows to a sort failure: write the originals unsorted.
+            None => (FlushBatches::Ready(batches.into_iter()), false),
+        }
+    }
+
+    /// Flush-path sort pool (see field doc). Bounded and spillable, so an
+    /// oversized bucket degrades to disk I/O instead of an unpooled spike.
+    fn flush_sort_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+        self.flush_sort_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.config.maintenance.flush_sort_pool_bytes(), "flush_sort_spill")).clone()
+    }
+
+    /// Sort an oversized flush group INSIDE a DataFusion plan.
+    ///
+    /// The in-process path (`sort_batches_by_schema`) allocates outside every
+    /// memory pool, so past a point the only safe options are "skip the sort"
+    /// (which writes a file with no `sorting_columns` footer, costing the
+    /// reader's ordering) or this: a pooled sort that spills to disk. Spilling
+    /// is strictly better than skipping — the footer stays honest and the peak
+    /// is bounded by the pool rather than by the bucket.
+    ///
+    /// Returns `None` if anything goes wrong, so the caller falls back to
+    /// writing the ORIGINAL batches unsorted. A flush must never lose rows to
+    /// a sort failure.
+    async fn sort_flush_group_spilling(&self, schema: &crate::schema_loader::TableSchema, batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
+        use datafusion::{datasource::MemTable, prelude::SessionContext};
+        let first = batches.first()?.schema();
+        // Schema-diverse buckets (an evolved nullable column) must be unified
+        // before MemTable will accept them; give up rather than guess.
+        let arrow_schema = match batches.iter().all(|b| b.schema() == first) {
+            true => first,
+            false => Arc::new(arrow_schema::Schema::try_merge(batches.iter().map(|b| b.schema().as_ref().clone())).ok()?),
+        };
+        let unified: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| match b.schema() == arrow_schema {
+                true => Ok(b.clone()),
+                false => deltalake::kernel::schema::cast_record_batch(b, arrow_schema.clone(), true, true),
+            })
+            .collect::<Result<_, _>>()
+            .ok()?;
+
+        let order_by = schema
+            .sorting_columns
+            .iter()
+            .filter(|c| arrow_schema.index_of(&c.name).is_ok())
+            .map(|c| format!("\"{}\" {} NULLS {}", c.name, if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { "FIRST" } else { "LAST" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if order_by.is_empty() {
+            return None;
+        }
+
+        let state = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.flush_sort_runtime_env());
+        let ctx = SessionContext::new_with_state(state);
+        let name = format!("flush_sort_{}", uuid::Uuid::new_v4().simple());
+        ctx.register_table(&name, Arc::new(MemTable::try_new(arrow_schema, vec![unified]).ok()?)).ok()?;
+        let out = ctx.sql(&format!("SELECT * FROM {name} ORDER BY {order_by}")).await.ok()?.collect().await;
+        let _ = ctx.deregister_table(&name);
+        match out {
+            Ok(sorted) => Some(sorted),
+            Err(e) => {
+                warn!("flush sort: spilling DataFusion sort failed, writing unsorted: {e}");
+                None
+            }
+        }
+    }
+
     /// Heavy-maintenance session state, built once (see field doc).
     fn maintenance_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.maintenance_session_state
@@ -4266,7 +4362,7 @@ impl Database {
         // SortingColumn footer is honest and the page index localizes the lead
         // key. `sorted` is false when a schema-evolved bucket can't be combined
         // (we then write unsorted) — declare the footer only when it's true.
-        let (batches, sorted) = sort_batches_by_schema(schema, batches, self.config.maintenance.timefusion_sort_skip_bytes);
+        let (batches, sorted) = self.sort_flush_group(schema, batches).await;
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
         let staging_table = { table_ref.read().await.clone() };
@@ -6556,7 +6652,7 @@ impl Database {
                     // Variant struct columns may still be BinaryView if the partition
                     // mixes tiers — cast to Binary so the write accepts the schema.
                     let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-                    let (deduped, sorted) = sort_batches_by_schema(schema, deduped, self.config.maintenance.timefusion_sort_skip_bytes);
+                    let (deduped, sorted) = self.sort_flush_group(schema, deduped).await;
                     let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
                     let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                         .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?

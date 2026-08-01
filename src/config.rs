@@ -712,13 +712,16 @@ const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
 // chronic, so it is suggestive rather than proven — but a multi-GB unpooled
 // allocation on the ingest path is not worth defending on a suggestive prior.
 //
-// Reverting costs little now: hot-tail compaction sorts inside the DataFusion
-// plan (pooled, spillable) and declares the footer honestly, so an unsorted
-// flush file is transient rather than permanent — measured 2026-08-01, every
-// window older than ~30 min plans `bounded` with a streaming merge. The right
-// long-term fix is to ESCALATE an oversized flush bucket to the pooled sort
-// instead of skipping it; until then, skipping is the safe failure mode.
-const_default!(d_sort_skip_bytes: usize = 256 * MIB);
+// This is now an ESCALATION threshold, not a skip threshold: past it the flush
+// sorts inside a DataFusion plan (`sort_flush_group_spilling`) whose pool is
+// bounded and spills to disk, so the footer stays honest and the peak is
+// bounded by the pool rather than by the bucket. 2 GiB keeps the fast
+// in-process path for everything ordinary — the measured crossover where
+// DataFusion's sort overtakes Arrow lexsort is ~262k rows / ~370 MB
+// (benches/sort_strategy_benchmarks.rs: 0.63x at 372 MB, 0.33x at 1.5 GB), so
+// above the threshold the pooled sort is also simply faster.
+const_default!(d_sort_skip_bytes: usize = 2 * GIB);
+const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
@@ -1597,6 +1600,12 @@ pub struct MaintenanceConfig {
     /// consulting this at all — see `stage_hot_bin`.
     #[serde(default = "d_sort_skip_bytes")]
     pub timefusion_sort_skip_bytes: usize,
+    /// Pool for the flush-path escalation sort, in MB. Its own slice so an
+    /// ingest-path sort never queues behind a Z-order holding the maintenance
+    /// pool. Deliberately smaller than the escalation threshold: exceeding it
+    /// spills to disk, which is the intended degradation.
+    #[serde(default = "d_flush_sort_pool_mb")]
+    pub timefusion_flush_sort_pool_mb: u64,
     #[serde(default = "d_compact_min_files")]
     pub timefusion_compact_min_files: usize,
     /// Five-minute hot-partition compaction is required to prevent a
@@ -1793,6 +1802,14 @@ pub struct MaintenanceConfig {
     /// `TIMEFUSION_DML_MERGE_KEY_PRUNE=false` reverts to scanning all window files.
     #[serde(default = "d_true")]
     pub timefusion_dml_merge_key_prune: bool,
+}
+
+impl MaintenanceConfig {
+    /// Flush escalation-sort pool in bytes. Floored so a misconfigured 0 can't
+    /// build a zero-sized pool that fails every sort.
+    pub fn flush_sort_pool_bytes(&self) -> usize {
+        (self.timefusion_flush_sort_pool_mb.max(64) as usize).saturating_mul(1 << 20)
+    }
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
