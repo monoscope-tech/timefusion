@@ -12,12 +12,12 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayRef, BooleanBuilder, StringArray, StringViewArray},
+    array::{Array, ArrayRef, BooleanArray, StringArray, StringViewArray},
     datatypes::DataType,
 };
 use datafusion::{
     common::Result as DFResult,
-    logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
+    logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
 
 pub const TEXT_MATCH_NAME: &str = "text_match";
@@ -64,62 +64,35 @@ pub fn is_eq_term_safe(c: char) -> bool {
 /// `_` (single-char wildcard) is never accelerable. Returns None.
 pub fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool) -> Option<String> {
     let esc = escape.unwrap_or('\\');
-    let chars: Vec<char> = pat.chars().collect();
-    let total = chars.len();
-    if total == 0 {
-        return None;
-    }
+    let mut it = pat.chars().peekable();
+    let leading_wildcard = it.next_if_eq(&'%').is_some();
     let mut out = String::new();
-    let mut i = 0;
-    let mut leading_wildcard = false;
     let mut trailing_wildcard = false;
-    // Detect leading %
-    if chars[0] == '%' {
-        leading_wildcard = true;
-        i = 1;
-    }
-    while i < total {
-        let c = chars[i];
-        if c == esc {
-            // Next char is literal.
-            i += 1;
-            if i >= total {
-                return None; // trailing escape
-            }
-            let n = chars[i];
-            if !is_tantivy_safe_term_char(n) {
-                return None;
-            }
-            out.push(n);
-            i += 1;
-            continue;
-        }
-        if c == '_' {
-            return None;
-        }
-        if c == '%' {
-            if i + 1 == total {
+    while let Some(c) = it.next() {
+        let lit = match c {
+            c if c == esc => it.next()?, // trailing escape → bail
+            '_' => return None,
+            // Only the leading-or-trailing-only wildcard forms are handled:
+            // `'a%b'` would need positional ranking tantivy can't trivially give.
+            '%' if it.peek().is_none() => {
                 trailing_wildcard = true;
                 break;
             }
-            // Embedded %: only the leading-or-trailing-only forms are
-            // handled here. `'a%b'` would need positional ranking that
-            // tantivy can't trivially give us. Bail.
+            '%' => return None,
+            other => other,
+        };
+        if !is_tantivy_safe_term_char(lit) {
             return None;
         }
-        if !is_tantivy_safe_term_char(c) {
-            return None;
-        }
-        out.push(c);
-        i += 1;
+        out.push(lit);
     }
     if out.is_empty() {
         return None;
     }
     Some(match (leading_wildcard, trailing_wildcard) {
         // Plain exact / prefix / suffix / infix matches.
-        (false, false) => out,                // 'foo'
-        (false, true) => format!("{}*", out), // 'foo%' (prefix)
+        (false, false) => out,      // 'foo'
+        (false, true) => out + "*", // 'foo%' (prefix)
         // Suffix-only and infix forms only meaningful on ngram3; for raw/
         // default tokenizers we'd be sending tantivy a query that matches
         // the substring as a whole token (it won't). Bail.
@@ -150,17 +123,11 @@ pub fn regex_literal_substring(pat: &str) -> Option<String> {
     let mut out = String::new();
     let mut it = pat.chars();
     while let Some(c) = it.next() {
-        let lit = if c == '\\' {
-            let n = it.next()?; // trailing backslash → invalid regex, bail
-            if !REGEX_META.contains(n) {
-                return None;
-            }
-            n
-        } else {
-            if REGEX_META.contains(c) {
-                return None;
-            }
-            c
+        let lit = match c {
+            // trailing backslash / non-meta escape (`\d`, `\y`, …) → not a literal
+            '\\' => it.next().filter(|n| REGEX_META.contains(*n))?,
+            c if REGEX_META.contains(c) => return None,
+            c => c,
         };
         if !is_tantivy_safe_term_char(lit) {
             return None;
@@ -183,20 +150,14 @@ pub fn classify_deferred(kind: &str, value: &str) -> Option<String> {
         return (!value.is_empty() && value.chars().all(is_eq_term_safe)).then(|| value.to_string());
     }
     let (form, tok) = kind.split_once(':')?;
-    let ci = match form {
-        "like" => false,
-        "ilike" => true,
+    match form {
+        "ilike" if tok == RAW_TOKENIZER => return None, // case-sensitive single token can't serve ILIKE
+        "like" | "ilike" => {}
         _ => return None,
-    };
-    if ci && tok == RAW_TOKENIZER {
-        return None; // case-sensitive single token can't serve ILIKE
     }
     let allow_substring = tok == NGRAM3_TOKENIZER;
     let q = classify_like_pattern(value, None, allow_substring)?;
-    if allow_substring && q.chars().filter(|c| *c != '*').count() < NGRAM_MIN_QUERY_LEN {
-        return None;
-    }
-    Some(q)
+    (!allow_substring || q.chars().filter(|c| *c != '*').count() >= NGRAM_MIN_QUERY_LEN).then_some(q)
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -209,12 +170,7 @@ impl Default for TextMatchUdf {
         // 2-arg: plan-time-classified query. 3-arg: deferred placeholder
         // routing — (col, $N, kind); the 3rd arg is consumed by the scan-side
         // collector, not by row evaluation.
-        Self {
-            sig: Signature::one_of(
-                vec![datafusion::logical_expr::TypeSignature::Any(2), datafusion::logical_expr::TypeSignature::Any(3)],
-                Volatility::Immutable,
-            ),
-        }
+        Self { sig: Signature::one_of(vec![TypeSignature::Any(2), TypeSignature::Any(3)], Volatility::Immutable) }
     }
 }
 
@@ -229,29 +185,19 @@ impl ScalarUDFImpl for TextMatchUdf {
         Ok(DataType::Boolean)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let arrs = args
-            .args
-            .into_iter()
-            .map(|c| match c {
-                ColumnarValue::Array(a) => a,
-                ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows).expect("scalar→array"),
-            })
-            .collect::<Vec<ArrayRef>>();
-        let col = &arrs[0];
-        let pat = &arrs[1];
         let n = args.number_rows;
-        let mut b = BooleanBuilder::with_capacity(n);
-        let col_str: Box<dyn Fn(usize) -> Option<String>> = string_extractor(col);
-        let pat_str: Box<dyn Fn(usize) -> Option<String>> = string_extractor(pat);
+        let arrs = args.args.iter().map(|c| c.to_array(n)).collect::<DFResult<Vec<ArrayRef>>>()?;
+        let col_str = string_extractor(&arrs[0]);
+        let pat_str = string_extractor(&arrs[1]);
         // 3-arg deferred calls carry the RAW predicate value + kind; their
         // row-eval must reproduce the ORIGINAL predicate's semantics (a
         // superset of it), not tantivy token containment — substring-matching
         // a raw LIKE pattern silently dropped rows for `_`/embedded-`%`.
-        let kind: Option<String> = arrs.get(2).and_then(|a| string_extractor(a)(0));
-        for i in 0..n {
-            match (col_str(i), pat_str(i)) {
-                (Some(haystack), Some(needle)) => {
-                    let ok = match kind.as_deref() {
+        let kind: Option<String> = arrs.get(2).filter(|a| !a.is_empty()).and_then(|a| string_extractor(a)(0));
+        let out: BooleanArray = (0..n)
+            .map(|i| {
+                Some(match (col_str(i), pat_str(i)) {
+                    (Some(haystack), Some(needle)) => match kind.as_deref() {
                         Some(k) => deferred_row_matches(k, &needle, &haystack),
                         // 2-arg: plan-time-classified tantivy syntax
                         // (`'foo*'` prefix, `'foo'` substring on ngram3);
@@ -264,13 +210,12 @@ impl ScalarUDFImpl for TextMatchUdf {
                                 .map(|tok| tok.trim_matches(|c: char| c == '*' || c == '?'))
                                 .all(|tok| !tok.is_empty() && h_low.contains(tok))
                         }
-                    };
-                    b.append_value(ok);
-                }
-                _ => b.append_value(false),
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(b.finish()) as ArrayRef))
+                    },
+                    _ => false,
+                })
+            })
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
     }
 }
 
@@ -280,10 +225,10 @@ impl ScalarUDFImpl for TextMatchUdf {
 /// (case-folding makes it a superset of case-sensitive LIKE; the original
 /// predicate re-filters exactly).
 fn deferred_row_matches(kind: &str, value: &str, haystack: &str) -> bool {
-    if kind == "eq" {
-        return haystack.to_lowercase().contains(&value.to_lowercase());
+    match kind {
+        "eq" => haystack.to_lowercase().contains(&value.to_lowercase()),
+        _ => like_match_ci(value, haystack),
     }
-    like_match_ci(value, haystack)
 }
 
 /// Case-insensitive SQL LIKE. Classic two-pointer glob with `%` backtracking;
@@ -294,60 +239,54 @@ fn like_match_ci(pattern: &str, text: &str) -> bool {
         One,
         Lit(char),
     }
-    let mut toks: Vec<Tok> = Vec::new();
-    let mut it = pattern.to_lowercase().chars().collect::<Vec<_>>().into_iter();
-    while let Some(c) = it.next() {
-        match c {
-            '\\' => {
-                if let Some(n) = it.next() {
-                    toks.push(Tok::Lit(n));
-                }
-            }
-            '%' => toks.push(Tok::Percent),
-            '_' => toks.push(Tok::One),
-            other => toks.push(Tok::Lit(other)),
-        }
-    }
+    let lowered = pattern.to_lowercase();
+    let mut chars = lowered.chars();
+    let toks: Vec<Tok> = std::iter::from_fn(|| {
+        chars.next().map(|c| match c {
+            '\\' => chars.next().map(Tok::Lit), // trailing escape is dropped
+            '%' => Some(Tok::Percent),
+            '_' => Some(Tok::One),
+            other => Some(Tok::Lit(other)),
+        })
+    })
+    .flatten()
+    .collect();
+    // Backtracking two-pointer glob: kept imperative — the `%` restart point
+    // is state no iterator adapter expresses without re-walking the text.
     let t: Vec<char> = text.to_lowercase().chars().collect();
     let (mut ti, mut pi) = (0usize, 0usize);
-    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+    let mut star: Option<(usize, usize)> = None;
     while ti < t.len() {
-        let step = pi < toks.len()
-            && match &toks[pi] {
-                Tok::One => true,
-                Tok::Lit(c) => *c == t[ti],
-                Tok::Percent => false,
-            };
+        let step = match toks.get(pi) {
+            Some(Tok::One) => true,
+            Some(Tok::Lit(c)) => *c == t[ti],
+            _ => false,
+        };
         if step {
             pi += 1;
             ti += 1;
-        } else if pi < toks.len() && matches!(toks[pi], Tok::Percent) {
-            star_pi = pi;
-            star_ti = ti;
+        } else if matches!(toks.get(pi), Some(Tok::Percent)) {
+            star = Some((pi, ti));
             pi += 1;
-        } else if star_pi != usize::MAX {
-            pi = star_pi + 1;
-            star_ti += 1;
-            ti = star_ti;
+        } else if let Some((sp, st)) = star {
+            star = Some((sp, st + 1));
+            (pi, ti) = (sp + 1, st + 1);
         } else {
             return false;
         }
     }
-    while pi < toks.len() && matches!(toks[pi], Tok::Percent) {
-        pi += 1;
-    }
-    pi == toks.len()
+    toks[pi..].iter().all(|k| matches!(k, Tok::Percent))
 }
 
 fn string_extractor(arr: &ArrayRef) -> Box<dyn Fn(usize) -> Option<String> + '_> {
     match arr.data_type() {
         DataType::Utf8 => {
-            let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
+            let a = arr.as_any().downcast_ref::<StringArray>().expect("Utf8 array");
+            Box::new(move |i| (!a.is_null(i)).then(|| a.value(i).to_string()))
         }
         DataType::Utf8View => {
-            let a = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
+            let a = arr.as_any().downcast_ref::<StringViewArray>().expect("Utf8View array");
+            Box::new(move |i| (!a.is_null(i)).then(|| a.value(i).to_string()))
         }
         // Variant Struct{metadata,value}: render each row to canonical JSON text
         // via the SAME serializer the tantivy index and the LIKE-coercion path
@@ -385,19 +324,14 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
     if sf.func.name() != TEXT_MATCH_NAME {
         return None;
     }
-    let col = match sf.args.first()? {
-        Expr::Column(c) => c.name.clone(),
+    let Some(Expr::Column(c)) = sf.args.first() else { return None };
+    let query = match sf.args.as_slice() {
+        [_, q] => utf8_lit(q)?,
+        // a `$N` still un-substituted fails `utf8_lit` → opaque
+        [_, value, kind] => classify_deferred(&utf8_lit(kind)?, &utf8_lit(value)?)?,
         _ => return None,
     };
-    match sf.args.len() {
-        2 => Some(TextMatchPred { column: col, query: utf8_lit(&sf.args[1])? }),
-        3 => {
-            let value = utf8_lit(&sf.args[1])?; // still a placeholder pre-substitution → opaque
-            let kind = utf8_lit(&sf.args[2])?;
-            Some(TextMatchPred { column: col, query: classify_deferred(&kind, &value)? })
-        }
-        _ => None,
-    }
+    Some(TextMatchPred { column: c.name.clone(), query })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,11 +362,25 @@ impl PredNode {
 
     /// Conjunction of flat predicates (legacy shape used by tests/tools).
     pub fn from_preds(preds: &[TextMatchPred]) -> Option<PredNode> {
-        match preds.len() {
-            0 => None,
-            1 => Some(PredNode::Leaf(preds[0].clone())),
-            _ => Some(PredNode::And(preds.iter().cloned().map(PredNode::Leaf).collect())),
-        }
+        combine(true, preds.iter().cloned().map(PredNode::Leaf))
+    }
+}
+
+/// Fold children into one `And`/`Or` node, flattening same-kind nesting (for
+/// readability of the compiled query) and collapsing the 0/1-child cases.
+fn combine(and: bool, nodes: impl IntoIterator<Item = PredNode>) -> Option<PredNode> {
+    let kids: Vec<PredNode> = nodes
+        .into_iter()
+        .flat_map(|n| match n {
+            PredNode::And(inner) if and => inner,
+            PredNode::Or(inner) if !and => inner,
+            other => vec![other],
+        })
+        .collect();
+    match kids.len() {
+        0 => None,
+        1 => kids.into_iter().next(),
+        _ => Some(if and { PredNode::And(kids) } else { PredNode::Or(kids) }),
     }
 }
 
@@ -462,12 +410,7 @@ struct NodeRes {
 ///   whole node is opaque (no prefilter from inside it may be used).
 /// - anything else: opaque, incomplete.
 pub fn collect_text_match_tree(filters: &[datafusion::logical_expr::Expr]) -> Option<PredNode> {
-    let kids: Vec<PredNode> = filters.iter().filter_map(|f| expr_node(f).node).collect();
-    match kids.len() {
-        0 => None,
-        1 => Some(kids.into_iter().next().expect("len 1")),
-        _ => Some(PredNode::And(kids)),
-    }
+    combine(true, filters.iter().filter_map(|f| expr_node(f).node))
 }
 
 fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
@@ -478,34 +421,12 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
     match e {
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
             let (a, b) = (expr_node(left), expr_node(right));
-            let mut kids: Vec<PredNode> = Vec::new();
-            for n in [a.node, b.node].into_iter().flatten() {
-                // Flatten nested Ands for readability of the compiled query.
-                match n {
-                    PredNode::And(inner) => kids.extend(inner),
-                    other => kids.push(other),
-                }
-            }
-            let node = match kids.len() {
-                0 => None,
-                1 => Some(kids.into_iter().next().expect("len 1")),
-                _ => Some(PredNode::And(kids)),
-            };
-            NodeRes { node, complete: a.complete || b.complete }
+            NodeRes { node: combine(true, [a.node, b.node].into_iter().flatten()), complete: a.complete || b.complete }
         }
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Or, right }) => {
             let (a, b) = (expr_node(left), expr_node(right));
             match (a.node, b.node, a.complete && b.complete) {
-                (Some(an), Some(bn), true) => {
-                    let mut kids = Vec::new();
-                    for n in [an, bn] {
-                        match n {
-                            PredNode::Or(inner) => kids.extend(inner),
-                            other => kids.push(other),
-                        }
-                    }
-                    NodeRes { node: Some(PredNode::Or(kids)), complete: true }
-                }
+                (Some(an), Some(bn), true) => NodeRes { node: combine(false, [an, bn]), complete: true },
                 _ => NodeRes { node: None, complete: false },
             }
         }

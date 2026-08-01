@@ -1,57 +1,55 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use datafusion::arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct BatchQueue {
     tx: mpsc::Sender<RecordBatch>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: CancellationToken,
+}
+
+/// Row-wise partition of a chunk: one queued batch may carry rows for many projects.
+fn group_by_project(batches: impl IntoIterator<Item = RecordBatch>) -> HashMap<String, Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .filter_map(|batch| {
+            crate::database::partition_batch_by_project(batch, "default")
+                .inspect_err(|e| error!(error = %e, "Skipping batch: failed to partition by project_id"))
+                .ok()
+        })
+        .flatten()
+        .fold(HashMap::new(), |mut grouped, (project_id, sub)| {
+            grouped.entry(project_id).or_default().push(sub);
+            grouped
+        })
 }
 
 impl BatchQueue {
     pub fn new(db: Arc<crate::database::Database>, interval_ms: u64, max_rows: usize) -> Self {
-        let channel_capacity = db.config().core.timefusion_batch_queue_capacity;
-        let (tx, rx) = mpsc::channel(channel_capacity);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let shutdown_clone = shutdown.clone();
+        let (tx, rx) = mpsc::channel(db.config().core.timefusion_batch_queue_capacity);
+        let shutdown = CancellationToken::new();
+        let cancelled = shutdown.clone();
 
         tokio::spawn(async move {
             let stream = ReceiverStream::new(rx).chunks_timeout(max_rows, Duration::from_millis(interval_ms));
             tokio::pin!(stream);
 
-            loop {
-                tokio::select! {
-                    Some(batches) = stream.next() => {
-                        if !batches.is_empty() {
-                            let mut grouped = std::collections::HashMap::<String, Vec<RecordBatch>>::new();
-                            for batch in batches {
-                                // Partition row-wise: a queued batch may carry rows for many projects.
-                                match crate::database::partition_batch_by_project(batch, "default") {
-                                    Ok(parts) => {
-                                        for (project_id, sub) in parts {
-                                            grouped.entry(project_id).or_default().push(sub);
-                                        }
-                                    }
-                                    Err(e) => error!("Skipping batch: failed to partition by project_id: {}", e),
-                                }
-                            }
-
-                            for (project_id, batches) in grouped {
-                                let count = batches.len();
-                                let row_counts: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
-                                if let Err(e) = db.insert_records_batch(&project_id, "otel_logs_and_spans", batches, true, None).await {
-                                    error!("Failed to insert {} batches for project {}: {}", count, project_id, e);
-                                } else {
-                                    info!("Inserted {} batches with rows {:?} for project {}", count, row_counts, project_id);
-                                }
-                            }
-                        }
+            while let Some(chunk) = tokio::select! {
+                chunk = stream.next() => chunk,
+                _ = cancelled.cancelled() => None,
+            } {
+                // Effectful loop: one awaited Delta insert per project.
+                for (project_id, batches) in group_by_project(chunk) {
+                    let (count, rows) = (batches.len(), batches.iter().map(RecordBatch::num_rows).collect::<Vec<_>>());
+                    match db.insert_records_batch(&project_id, "otel_logs_and_spans", batches, true, None).await {
+                        Ok(_) => info!(%project_id, count, ?rows, "Inserted batches"),
+                        Err(e) => error!(%project_id, count, error = %e, "Failed to insert batches"),
                     }
-                    _ = shutdown_clone.cancelled() => break,
                 }
             }
         });
@@ -60,7 +58,7 @@ impl BatchQueue {
     }
 
     pub fn queue(&self, batch: RecordBatch) -> Result<()> {
-        self.tx.try_send(batch).map_err(|_| anyhow::anyhow!("Queue full"))
+        self.tx.try_send(batch).map_err(|_| anyhow!("Queue full"))
     }
 
     pub async fn shutdown(&self) {
@@ -70,82 +68,44 @@ impl BatchQueue {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use serde_json::json;
     use serial_test::serial;
     use tokio::time::sleep;
 
     use super::*;
     use crate::{database::Database, test_utils::test_helpers::*};
 
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_batch_queue_processing() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            dotenv::dotenv().ok();
-            unsafe {
-                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-bq-{}", uuid::Uuid::new_v4()));
-            }
+    /// SAFETY: `set_var` races other threads' env reads; every caller is `#[serial]`.
+    async fn test_queue(max_rows: usize) -> Result<BatchQueue> {
+        dotenv::dotenv().ok();
+        unsafe {
+            std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
+            std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-bq-{}", uuid::Uuid::new_v4()));
+        }
+        Ok(BatchQueue::new(Arc::new(Database::new().await?), 100, max_rows))
+    }
 
-            let db = Arc::new(Database::new().await?);
-            let batch_queue = BatchQueue::new(Arc::clone(&db), 100, 10);
-
-            // Create test records
-            let now = Utc::now();
-            let records: Vec<serde_json::Value> = (0..5)
-                .map(|i| {
-                    let mut record = create_default_record();
-                    record.insert("timestamp".to_string(), json!(now.timestamp_micros()));
-                    record.insert("id".to_string(), json!(format!("test-{}", i)));
-                    record.insert("project_id".to_string(), json!("test-project-uuid"));
-                    record.insert("date".to_string(), json!(now.date_naive().to_string()));
-                    record.insert("hashes".to_string(), json!([]));
-                    record.insert("summary".to_string(), json!(vec![format!("Batch queue test record {}", i)]));
-                    serde_json::Value::Object(record.into_iter().collect())
-                })
-                .collect();
-
-            let batch = json_to_batch(records)?;
-            batch_queue.queue(batch)?;
-
-            // Wait for processing
+    /// Queue one span per (id, project), let the flush interval fire, then shut down.
+    async fn run(max_rows: usize, spans: impl IntoIterator<Item = (String, String)>) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            let queue = test_queue(max_rows).await?;
+            spans.into_iter().try_for_each(|(id, project)| queue.queue(json_to_batch(vec![test_span(&id, &format!("span_{project}"), &project)])?))?;
             sleep(Duration::from_millis(200)).await;
-            batch_queue.shutdown().await;
-            sleep(Duration::from_millis(100)).await;
-
+            queue.shutdown().await;
             Ok(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Test timed out"))?
+        .map_err(|_| anyhow!("Test timed out"))?
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_batch_queue_processing() -> Result<()> {
+        run(10, (0..5).map(|i| (format!("test-{i}"), "test-project-uuid".to_string()))).await
     }
 
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_batch_queue_grouping() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            dotenv::dotenv().ok();
-            unsafe {
-                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-bq-{}", uuid::Uuid::new_v4()));
-            }
-
-            let db = Arc::new(Database::new().await?);
-            let batch_queue = BatchQueue::new(Arc::clone(&db), 100, 100);
-
-            // Queue batches for different projects
-            for project in ["project_a", "project_b", "project_c"] {
-                let batch = json_to_batch(vec![test_span(&format!("id_{}", project), &format!("span_{}", project), project)])?;
-                batch_queue.queue(batch)?;
-            }
-
-            // Wait for processing
-            sleep(Duration::from_millis(200)).await;
-            batch_queue.shutdown().await;
-
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out"))?
+        run(100, ["project_a", "project_b", "project_c"].map(|p| (format!("id_{p}"), p.to_string()))).await
     }
 }

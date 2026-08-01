@@ -25,9 +25,12 @@
 //! Logged once at startup so ops can see exactly what was chosen.
 
 use sysinfo::Disks;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::AppConfig;
+
+const MB: usize = 1024 * 1024;
+const GB: usize = 1024 * MB;
 
 const RAM_FRACTION_FOYER_META: f64 = 0.02;
 const DISK_FRACTION_FOYER: f64 = 0.40;
@@ -51,22 +54,20 @@ const MIN_FOYER_MEM_MB: usize = 128;
 // 16 GiB: the derived tree reserves 10% of the limit for foyer (12 GiB on the
 // 120 GiB box); an 8 GiB cap stranded a third of that reservation.
 const MAX_FOYER_MEM_MB: usize = 16 * 1024;
+const MIN_FOYER_META_MB: usize = 64;
 const MAX_FOYER_META_MB: usize = 512;
 const MIN_FOYER_DISK_GB: usize = 1;
 const MAX_FOYER_DISK_GB: usize = 500;
 const MAX_FOYER_META_DISK_GB: usize = 5;
 
 /// Apply host-aware overrides to `config`. Knobs whose env var is set by the
-/// user are left untouched. Returns the set of knobs that were auto-tuned for
-/// logging.
+/// user are left untouched.
 pub fn apply(config: &mut AppConfig) {
     // ONE memory source: the derived budget tree's cgroup-clamped detection.
     // A second (sysinfo) reading here once let the oversubscription audit warn
     // against a different denominator than the budgets were derived from —
     // exactly the drift class the tree exists to kill.
-    let total_ram_bytes = config.derived.memory_limit_bytes();
-    let total_ram_gb = total_ram_bytes / (1024 * 1024 * 1024);
-    let total_ram_mb = total_ram_bytes / (1024 * 1024);
+    let total_ram_mb = config.derived.memory_limit_bytes() / MB;
 
     let cpus = crate::config::detect_cores();
 
@@ -77,85 +78,67 @@ pub fn apply(config: &mut AppConfig) {
 
     info!(
         "Auto-tune host detection: ram={}GB, cpus={}, data_dir={:?}, available_disk={}",
-        total_ram_gb,
+        total_ram_mb / 1024,
         cpus,
         data_dir,
-        available_disk_gb.map_or("unknown".to_string(), |g| format!("{}GB", g))
+        available_disk_gb.map_or_else(|| "unknown".to_string(), |g| format!("{g}GB"))
     );
 
-    let mut applied: Vec<(&str, String)> = Vec::new();
-
-    // MemBuffer. Default static = 4096MB.
-    if env_unset("TIMEFUSION_BUFFER_MAX_MEMORY_MB") {
-        // Sourced from DerivedBudget — ONE set of RAM fractions (see config.rs
-        // budget tree); autotune only applies it under env-unset-wins semantics.
-        let derived = (config.derived.buffer_max_bytes() / (1024 * 1024)).max(MIN_BUFFER_MB);
-        if derived != config.buffer.timefusion_buffer_max_memory_mb {
-            config.buffer.timefusion_buffer_max_memory_mb = derived;
-            applied.push(("TIMEFUSION_BUFFER_MAX_MEMORY_MB", format!("{}MB", derived)));
+    // Imperative by necessity: each knob is a `&mut` into a *different* config
+    // field, so the env-unset-wins / changed / record triad can only be shared
+    // via a closure taking the slot by reference.
+    let mut applied = Vec::new();
+    let mut tune = |name: &'static str, slot: &mut usize, derived: usize, unit: &str| {
+        if std::env::var(name).is_err() && *slot != derived {
+            *slot = derived;
+            applied.push(format!("{name}={derived}{unit}"));
         }
-    }
+    };
 
-    // Foyer memory cache. Default static = 512MB.
-    if env_unset("TIMEFUSION_FOYER_MEMORY_MB") {
-        let derived = (config.derived.foyer_memory_bytes() / (1024 * 1024)).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB);
-        if derived != config.cache.timefusion_foyer_memory_mb {
-            config.cache.timefusion_foyer_memory_mb = derived;
-            applied.push(("TIMEFUSION_FOYER_MEMORY_MB", format!("{}MB", derived)));
-        }
-    }
-
-    // Foyer metadata memory cache. Default static = 512MB.
-    if env_unset("TIMEFUSION_FOYER_METADATA_MEMORY_MB") {
-        let derived = ((total_ram_mb as f64 * RAM_FRACTION_FOYER_META) as usize).clamp(64, MAX_FOYER_META_MB);
-        if derived != config.cache.timefusion_foyer_metadata_memory_mb {
-            config.cache.timefusion_foyer_metadata_memory_mb = derived;
-            applied.push(("TIMEFUSION_FOYER_METADATA_MEMORY_MB", format!("{}MB", derived)));
-        }
-    }
-
-    // Foyer disk cache (depends on available disk on data_dir's volume).
+    // MemBuffer and foyer memory come from DerivedBudget — ONE set of RAM
+    // fractions (see the config.rs budget tree); autotune only applies them.
+    tune(
+        "TIMEFUSION_BUFFER_MAX_MEMORY_MB",
+        &mut config.buffer.timefusion_buffer_max_memory_mb,
+        (config.derived.buffer_max_bytes() / MB).max(MIN_BUFFER_MB),
+        "MB",
+    );
+    tune(
+        "TIMEFUSION_FOYER_MEMORY_MB",
+        &mut config.cache.timefusion_foyer_memory_mb,
+        (config.derived.foyer_memory_bytes() / MB).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB),
+        "MB",
+    );
+    tune(
+        "TIMEFUSION_FOYER_METADATA_MEMORY_MB",
+        &mut config.cache.timefusion_foyer_metadata_memory_mb,
+        ((total_ram_mb as f64 * RAM_FRACTION_FOYER_META) as usize).clamp(MIN_FOYER_META_MB, MAX_FOYER_META_MB),
+        "MB",
+    );
     if let Some(avail_gb) = available_disk_gb {
-        if env_unset("TIMEFUSION_FOYER_DISK_GB") {
-            let derived = ((avail_gb as f64 * DISK_FRACTION_FOYER) as usize).clamp(MIN_FOYER_DISK_GB, MAX_FOYER_DISK_GB);
-            if derived != config.cache.timefusion_foyer_disk_gb {
-                config.cache.timefusion_foyer_disk_gb = derived;
-                applied.push(("TIMEFUSION_FOYER_DISK_GB", format!("{}GB", derived)));
-            }
-        }
-        if env_unset("TIMEFUSION_FOYER_METADATA_DISK_GB") {
-            let derived = ((avail_gb as f64 * DISK_FRACTION_FOYER_META) as usize).clamp(1, MAX_FOYER_META_DISK_GB);
-            if derived != config.cache.timefusion_foyer_metadata_disk_gb {
-                config.cache.timefusion_foyer_metadata_disk_gb = derived;
-                applied.push(("TIMEFUSION_FOYER_METADATA_DISK_GB", format!("{}GB", derived)));
-            }
-        }
+        let disk_share = |fraction: f64, max| ((avail_gb as f64 * fraction) as usize).clamp(MIN_FOYER_DISK_GB, max);
+        tune("TIMEFUSION_FOYER_DISK_GB", &mut config.cache.timefusion_foyer_disk_gb, disk_share(DISK_FRACTION_FOYER, MAX_FOYER_DISK_GB), "GB");
+        tune(
+            "TIMEFUSION_FOYER_METADATA_DISK_GB",
+            &mut config.cache.timefusion_foyer_metadata_disk_gb,
+            disk_share(DISK_FRACTION_FOYER_META, MAX_FOYER_META_DISK_GB),
+            "GB",
+        );
     }
-
-    // Flush parallelism. Default static = 4.
-    if env_unset("TIMEFUSION_FLUSH_PARALLELISM") {
-        let derived = (cpus / 2).max(2);
-        if derived != config.buffer.timefusion_flush_parallelism {
-            config.buffer.timefusion_flush_parallelism = derived;
-            applied.push(("TIMEFUSION_FLUSH_PARALLELISM", derived.to_string()));
-        }
-    }
-
-    // Query/maintenance target_partitions, from the cgroup CPU quota. Default
-    // static = 0 (DataFusion default); applies to query + optimize sessions.
-    if env_unset("TIMEFUSION_QUERY_PARTITIONS") {
-        let derived = detected_query_partitions();
-        if derived != config.memory.timefusion_query_partitions {
-            config.memory.timefusion_query_partitions = derived;
-            applied.push(("TIMEFUSION_QUERY_PARTITIONS", derived.to_string()));
-        }
-    }
+    tune("TIMEFUSION_FLUSH_PARALLELISM", &mut config.buffer.timefusion_flush_parallelism, (cpus / 2).max(2), "");
+    // Query/maintenance target_partitions. DataFusion defaults it to
+    // `num_cpus::get()`, which on Linux reads `sched_getaffinity` — that honors
+    // cpuset pinning but NOT the CFS quota (`docker --cpus`). In a CFS-throttled
+    // container TF would see the host's core count, split even a single small
+    // parquet file into that many scan groups (each re-opening the file's
+    // metadata), and oversubscribe the CPU it actually has. `detect_cores`
+    // derives from the cgroup quota instead.
+    tune("TIMEFUSION_QUERY_PARTITIONS", &mut config.memory.timefusion_query_partitions, cpus, "");
 
     if applied.is_empty() {
         info!("Auto-tune: no overrides applied (user has set all knobs explicitly or host signals unavailable)");
     } else {
-        let summary = applied.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
-        info!("Auto-tune applied: {}", summary);
+        info!("Auto-tune applied: {}", applied.join(", "));
     }
 
     // Coherence guard: user-pinned envs can oversubscribe RAM (prod ran a
@@ -165,28 +148,20 @@ pub fn apply(config: &mut AppConfig) {
     // authority, but the failure mode becomes visible instead of an OOM.
     let audit = budget_audit(config, total_ram_mb);
     let _ = BOOT_AUDIT.set(audit);
-    // Always emit the breakdown: "we fit" is the interesting case too, since
-    // the slack is what absorbs untracked allocation, and an operator tuning a
-    // knob needs the current split in front of them.
+    // Always emit the breakdown, "we fit" included: the slack figure is the
+    // operator's only view of how much room the untracked consumers have.
+    let slack_mb = audit.slack_mb();
+    let BudgetAudit { committed_mb, warn_at_mb, query_pool_mb, mem_buffer_hard_mb, maintenance_pool_mb, foyer_mb, tantivy_peak_mb, df_metadata_cache_mb } =
+        audit;
     let msg = format!(
-        "bootstrap.phase=budget_audit committed_mb={} warn_at_mb={} slack_mb={} \
-         (query_pool={} mem_buffer_hard={} maintenance_pool={} foyer={} tantivy_peak={} df_metadata_cache={}) ram_mb={total_ram_mb} — \
+        "bootstrap.phase=budget_audit committed_mb={committed_mb} warn_at_mb={warn_at_mb} slack_mb={slack_mb} \
+         (query_pool={query_pool_mb} mem_buffer_hard={mem_buffer_hard_mb} maintenance_pool={maintenance_pool_mb} foyer={foyer_mb} \
+         tantivy_peak={tantivy_peak_mb} df_metadata_cache={df_metadata_cache_mb}) ram_mb={total_ram_mb} — \
          slack absorbs UNTRACKED allocation (parquet decode, walrus mmaps, tantivy, allocator overhead); one wide scan can \
-         exceed a small slack, which is how a box gets OOM-killed while every individual budget looks fine",
-        audit.committed_mb,
-        audit.warn_at_mb,
-        audit.warn_at_mb.saturating_sub(audit.committed_mb),
-        audit.query_pool_mb,
-        audit.mem_buffer_hard_mb,
-        audit.maintenance_pool_mb,
-        audit.foyer_mb,
-        audit.tantivy_peak_mb,
-        audit.df_metadata_cache_mb,
+         exceed a small slack, which is how a box gets OOM-killed while every individual budget looks fine"
     );
-    // "We fit" is worth logging too: the slack figure is the operator's only
-    // view of how much room the untracked consumers actually have.
     if audit.oversubscribed() {
-        tracing::warn!("{msg} — OVERSUBSCRIBED, expect OOM kills under load; lower one of these knobs");
+        warn!("{msg} — OVERSUBSCRIBED, expect OOM kills under load; lower one of these knobs");
     } else {
         info!("{msg}");
     }
@@ -244,7 +219,6 @@ pub fn boot_budget_audit() -> Option<&'static BudgetAudit> {
 /// The light-optimize slice is deliberately NOT added: it is carved *out of*
 /// `maintenance_pool_bytes()`, so counting it again would double-count.
 pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
-    const MB: usize = 1024 * 1024;
     let foyer_mb = if config.cache.is_disabled() { 0 } else { (config.cache.memory_size_bytes() + config.cache.metadata_memory_size_bytes()) / MB };
     // Peak tantivy writer heap: one writer per in-flight flush.
     let tantivy_peak_mb =
@@ -253,8 +227,7 @@ pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
     // reduced by foyer + tantivy (which are counted separately below, so using
     // the raw knob here would double-count them), then admission runs to a 120%
     // hard ceiling (HARD_LIMIT_HEADROOM_DIVISOR).
-    let mem_buffer_budget_mb = config.buffer.max_memory_mb().saturating_sub(foyer_mb + tantivy_peak_mb).max(64);
-    let mem_buffer_hard_mb = mem_buffer_budget_mb * 6 / 5;
+    let mem_buffer_hard_mb = config.buffer.max_memory_mb().saturating_sub(foyer_mb + tantivy_peak_mb).max(64) * 6 / 5;
     let query_pool_mb = config.derived.query_pool_bytes() / MB;
     let maintenance_pool_mb = config.derived.maintenance_pool_bytes() / MB;
     let df_metadata_cache_mb = config.cache.timefusion_df_metadata_cache_mb;
@@ -270,37 +243,17 @@ pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
     }
 }
 
-fn env_unset(name: &str) -> bool {
-    std::env::var(name).is_err()
-}
-
-/// Query/maintenance parallelism (DataFusion `target_partitions`).
-///
-/// DataFusion defaults `target_partitions` to `num_cpus::get()`, which on Linux
-/// reads `sched_getaffinity` — that honors cpuset pinning but NOT the CFS quota
-/// (`docker --cpus`). In a CFS-throttled container TF therefore sees the host's
-/// core count, splits even a single small parquet file into that many scan
-/// groups (each re-opening the file's metadata), and oversubscribes the CPU it
-/// actually has. Derive from the cgroup CPU quota instead, capped at the
-/// affinity-derived count. Set onto the config in `apply()`; the env override
-/// `TIMEFUSION_QUERY_PARTITIONS` wins via serde (apply only fills when unset).
-fn detected_query_partitions() -> usize {
-    crate::config::detect_cores()
-}
-
-/// Round a quota/period ratio up to whole cores (a 1.5-core quota → 2).
 /// Return free space (GB) on the volume hosting `path`. Returns None if no
 /// disk in the sysinfo enumeration covers the path — defensive: we'd rather
 /// skip the override than guess wrong.
 fn available_disk_for(path: &std::path::Path) -> Option<usize> {
-    let disks = Disks::new_with_refreshed_list();
-    let canonical = std::fs::canonicalize(path).ok().or_else(|| Some(path.to_path_buf()))?;
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     // Pick the disk whose mount_point is the longest prefix of our path.
-    disks
+    Disks::new_with_refreshed_list()
         .iter()
         .filter(|d| canonical.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| (d.available_space() / (1024 * 1024 * 1024)) as usize)
+        .map(|d| (d.available_space() / GB as u64) as usize)
 }
 
 #[cfg(test)]
@@ -313,17 +266,15 @@ mod tests {
         // values come from the test process's env which doesn't have these
         // vars set (autotune will fire).
         let mut cfg = AppConfig::default();
-        let buffer_before = cfg.buffer.timefusion_buffer_max_memory_mb;
         apply(&mut cfg);
         // On any modern dev host, MemBuffer should now reflect RAM-based sizing.
         // We only assert non-decrease relative to the 256MB floor; on tiny CI
         // runners the floor wins, which is fine.
         assert!(cfg.buffer.timefusion_buffer_max_memory_mb >= MIN_BUFFER_MB);
         // Reapplying must not change anything (idempotent).
-        let snapshot = cfg.clone();
+        let before = cfg.buffer.timefusion_buffer_max_memory_mb;
         apply(&mut cfg);
-        assert_eq!(cfg.buffer.timefusion_buffer_max_memory_mb, snapshot.buffer.timefusion_buffer_max_memory_mb);
-        let _ = buffer_before;
+        assert_eq!(cfg.buffer.timefusion_buffer_max_memory_mb, before);
     }
 
     /// The prod config that was OOM-killed four times in nine hours on
@@ -342,8 +293,8 @@ mod tests {
 
         // The container limit, not the 188GB host: this is what the kernel kills on.
         let a = budget_audit(&cfg, 24 * 1024);
-        assert_eq!(a.query_pool_mb, cfg.derived.query_pool_bytes() / (1024 * 1024));
-        assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / (1024 * 1024), "was missing entirely");
+        assert_eq!(a.query_pool_mb, cfg.derived.query_pool_bytes() / MB);
+        assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / MB, "was missing entirely");
         assert_eq!(a.foyer_mb, 4560);
         // MemBuffer's ceiling is on its EFFECTIVE budget (knob − foyer −
         // tantivy peak), then x1.2 — not the raw knob, which would count foyer

@@ -117,6 +117,15 @@ struct Bound {
     last: Option<i64>,
 }
 
+impl Bound {
+    /// Move to row value `t`, returning true when doing so *closed* a previous
+    /// run (state built for the old run may then be dropped). A run opens on the
+    /// first row ever, or on a value strictly past `last` in the sort direction.
+    fn advance(&mut self, t: i64) -> bool {
+        self.last.is_none_or(|l| if self.desc { t < l } else { t > l }) && self.last.replace(t).is_some()
+    }
+}
+
 /// The i64-backed values of a bound column (timestamps / Int64), for cheap
 /// run-boundary comparison. `None` for any other type → bounded mode disabled.
 fn bound_slice(col: &ArrayRef) -> Option<&[i64]> {
@@ -134,18 +143,20 @@ fn bound_slice(col: &ArrayRef) -> Option<&[i64]> {
     })
 }
 
+/// Downcast a sort expr's physical expr to `Column`. Explicit `Any` upcast —
+/// the `PhysicalExpr` trait's `as_any` collides with downcast-rs's blanket
+/// method in this crate's scope.
+fn sort_col(se: &datafusion::physical_expr::PhysicalSortExpr) -> Option<&datafusion::physical_expr::expressions::Column> {
+    crate::optimizers::downcast(se.expr.as_ref())
+}
+
 /// Enable bounded mode iff the input's leading sort column is a dedup key of an
 /// i64-backed type. That guarantees equal dedup keys share the bound value, so
 /// clearing on a bound advance can never evict a key that could still recur.
 fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &SchemaRef) -> Option<Bound> {
-    use datafusion::physical_expr::expressions::Column;
     let se = input.properties().output_ordering()?.iter().next()?;
-    let any: &dyn std::any::Any = se.expr.as_ref();
-    let col = any.downcast_ref::<Column>()?;
-    if !keys.iter().any(|k| k == col.name()) {
-        return None;
-    }
-    matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..)).then(|| Bound {
+    let col = sort_col(se)?;
+    (keys.iter().any(|k| k == col.name()) && matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))).then(|| Bound {
         idx: col.index(),
         desc: se.options.descending,
         last: None,
@@ -166,10 +177,7 @@ fn remap_ordering(
         .output_ordering()?
         .iter()
         .map_while(|se| {
-            // Explicit Any upcast — the PhysicalExpr trait's `as_any` collides
-            // with downcast-rs's blanket method in this crate's scope.
-            let any: &dyn std::any::Any = se.expr.as_ref();
-            let col = any.downcast_ref::<Column>()?;
+            let col = sort_col(se)?;
             let ni = match output_projection {
                 None => col.index(),
                 Some(idxs) => idxs.iter().position(|&i| i == col.index())?,
@@ -235,9 +243,10 @@ impl DisplayAs for DedupExec {
         // heap in the 2026-07-31 profile. The two are indistinguishable in
         // EXPLAIN without this, so the only symptom is unexplained heap growth.
         let in_schema = self.input.schema();
+        write!(f, "DedupExec: keys=[{}], mode=", self.keys.join(", "))?;
         match detect_bound(&self.input, &self.keys, &in_schema) {
-            Some(b) => write!(f, "DedupExec: keys=[{}], mode=bounded[{}]", self.keys.join(", "), in_schema.field(b.idx).name()),
-            None => write!(f, "DedupExec: keys=[{}], mode=full-set", self.keys.join(", ")),
+            Some(b) => write!(f, "bounded[{}]", in_schema.field(b.idx).name()),
+            None => f.write_str("full-set"),
         }
     }
 }
@@ -280,10 +289,13 @@ impl ExecutionPlan for DedupExec {
         let bound = detect_bound(&self.input, &self.keys, &in_schema);
         // Keep-greatest needs the bound to know when a key can no longer recur;
         // without it we'd have to buffer a candidate per key for the whole scan.
-        let greatest = match (&self.tiebreak, &bound) {
-            (Some(tb), Some(_)) => in_schema.index_of(tb).ok().map(|idx| Greatest::new(idx, in_schema.field(idx).data_type())).transpose()?,
-            _ => None,
-        };
+        let greatest = self
+            .tiebreak
+            .as_ref()
+            .filter(|_| bound.is_some())
+            .and_then(|tb| in_schema.index_of(tb).ok())
+            .map(|idx| Greatest::new(idx, in_schema.field(idx).data_type()))
+            .transpose()?;
         let dedup = Dedup {
             key_idxs: self.key_idxs.clone(),
             conv: RowConverter::new(self.key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
@@ -295,29 +307,22 @@ impl ExecutionPlan for DedupExec {
 
         let input = self.input.execute(partition, context)?;
         let out_schema = self.schema.clone();
-        let stream = futures::stream::unfold((input, dedup, Vec::new(), false), |(mut input, mut dedup, mut queue, mut done)| async move {
-            loop {
-                if let Some(b) = queue.pop() {
-                    return Some((Ok(b), (input, dedup, queue, done)));
-                }
-                if done {
-                    return None;
-                }
-                // `queue` is drained from the back, so push in reverse.
-                let produced = match input.next().await {
-                    None => {
-                        done = true;
-                        dedup.finish()
-                    }
-                    Some(Err(e)) => return Some((Err(e), (input, dedup, queue, done))),
-                    Some(Ok(batch)) => dedup.push(&batch),
-                };
-                match produced {
-                    Ok(bs) => queue.extend(bs.into_iter().rev()),
-                    Err(e) => return Some((Err(e), (input, dedup, queue, done))),
-                }
+        // One input batch can yield several output batches (a keep-greatest
+        // flush emits one per buffered batch) or none at all; `flat_map` fans
+        // them out lazily — an empty result just re-polls the source, and a
+        // downstream LIMIT can stop mid-run.
+        let stream = futures::stream::unfold((input, dedup, false), |(mut input, mut dedup, done)| async move {
+            if done {
+                return None;
             }
-        });
+            let (produced, done) = match input.next().await {
+                None => (dedup.finish(), true),
+                Some(Err(e)) => (Err(e), false),
+                Some(Ok(batch)) => (dedup.push(&batch), false),
+            };
+            Some((produced, (input, dedup, done)))
+        })
+        .flat_map(|r| futures::stream::iter(r.map_or_else(|e| vec![Err(e)], |bs| bs.into_iter().map(Ok).collect::<Vec<_>>())));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream)))
     }
@@ -372,20 +377,8 @@ impl Greatest {
         batches
             .into_iter()
             .zip(masks)
-            .filter_map(|(b, m)| {
-                let kept = match filter_record_batch(&b, &BooleanArray::from(m)).map_err(arrow_err) {
-                    Ok(k) => k,
-                    Err(e) => return Some(Err(e)),
-                };
-                let out = match output_projection {
-                    Some(idxs) => match kept.project(idxs).map_err(arrow_err) {
-                        Ok(o) => o,
-                        Err(e) => return Some(Err(e)),
-                    },
-                    None => kept,
-                };
-                (out.num_rows() > 0).then(|| Ok(out))
-            })
+            .map(|(b, m)| project_out(filter_record_batch(&b, &BooleanArray::from(m)).map_err(arrow_err)?, output_projection))
+            .filter(|r| !r.as_ref().is_ok_and(|o| o.num_rows() == 0))
             .collect()
     }
 }
@@ -417,18 +410,14 @@ impl Dedup {
         let tbs = g.conv.convert_columns(&[batch.column(g.idx).clone()]).map_err(arrow_err)?;
         let bvals =
             bound_slice(batch.column(bound.idx)).ok_or_else(|| DataFusionError::Internal(format!("DedupExec bound column {} is not i64-backed", bound.idx)))?;
-        let (desc, mut last) = (bound.desc, bound.last);
         // Index of `batch` within the open run's buffer; `None` until a row of
         // this batch wins something, and reset by every flush (the run changed).
         let mut cur: Option<u32> = None;
         for (i, &t) in bvals.iter().enumerate().take(batch.num_rows()) {
-            if last.is_some_and(|l| if desc { t < l } else { t > l }) {
+            if bound.advance(t) {
                 out.extend(g.flush(proj, &mut self.seen, false)?);
                 self.seen.clear();
                 cur = None;
-            }
-            if last.is_none_or(|l| if desc { t < l } else { t > l }) {
-                last = Some(t);
             }
             let key = keys.row(i).data();
             if self.seen.contains(key) {
@@ -445,7 +434,6 @@ impl Dedup {
             });
             g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into() });
         }
-        bound.last = last;
         Ok(out)
     }
 
@@ -458,34 +446,36 @@ impl Dedup {
     }
 }
 
+/// Restore the requested projection on a surviving batch.
+fn project_out(b: RecordBatch, output_projection: Option<&[usize]>) -> DFResult<RecordBatch> {
+    match output_projection {
+        Some(idxs) => b.project(idxs).map_err(arrow_err),
+        None => Ok(b),
+    }
+}
+
 /// Keep-first: drop rows whose key tuple was already emitted, then restore the
 /// requested projection. Returns `None` when nothing survives (caller pulls the
 /// next batch).
 fn dedup_first(
-    batch: &RecordBatch, keys: &datafusion::arrow::row::Rows, seen: &mut SeenSet, output_projection: Option<&[usize]>, bound: Option<&mut Bound>,
+    batch: &RecordBatch, keys: &datafusion::arrow::row::Rows, seen: &mut SeenSet, output_projection: Option<&[usize]>, mut bound: Option<&mut Bound>,
 ) -> DFResult<Option<RecordBatch>> {
-    // Bounded-window state (Tier 2): the bound column's per-row values, sort
-    // direction, and the run cursor. `bound_slice` returning None (unsupported
+    // Bounded-window values (Tier 2). `bound_slice` returning None (unsupported
     // type) silently disables eviction for this batch — still correct.
-    let (bvals, desc, mut last) = match &bound {
-        Some(b) => (bound_slice(batch.column(b.idx)), b.desc, b.last),
-        None => (None, false, None),
-    };
+    // `.map(idx)` first so the slice's lifetime is tied to `batch`, not to the
+    // borrow of `bound` the closure below needs mutably.
+    let bvals = bound.as_ref().map(|b| b.idx).and_then(|i| bound_slice(batch.column(i)));
     // Borrowed probe: hash the encoded bytes in place; on a miss (first sighting)
     // allocate one `Box<[u8]>`. Duplicates never allocate — the mask is the
     // negation folded into the `&&` so a hit short-circuits before `insert`.
-    // When bounded and the bound advances (strictly past the current run), the
-    // seen-set is cleared first: no earlier key can recur in a sorted stream.
+    // When bounded and the bound advances past the current run, the seen-set is
+    // cleared first: no earlier key can recur in a sorted stream.
     let mask: BooleanArray = (0..batch.num_rows())
         .map(|i| {
-            if let Some(vals) = bvals {
-                let t = vals[i];
-                if last.is_some_and(|l| if desc { t < l } else { t > l }) {
-                    seen.clear();
-                }
-                if last.is_none_or(|l| if desc { t < l } else { t > l }) {
-                    last = Some(t);
-                }
+            if let (Some(b), Some(vals)) = (bound.as_deref_mut(), bvals)
+                && b.advance(vals[i])
+            {
+                seen.clear();
             }
             let bytes = keys.row(i).data();
             !seen.contains(bytes) && {
@@ -494,14 +484,7 @@ fn dedup_first(
             }
         })
         .collect();
-    if let Some(b) = bound {
-        b.last = last;
-    }
-    let kept = filter_record_batch(batch, &mask).map_err(arrow_err)?;
-    let out = match output_projection {
-        Some(idxs) => kept.project(idxs).map_err(arrow_err)?,
-        None => kept,
-    };
+    let out = project_out(filter_record_batch(batch, &mask).map_err(arrow_err)?, output_projection)?;
     Ok((out.num_rows() > 0).then_some(out))
 }
 

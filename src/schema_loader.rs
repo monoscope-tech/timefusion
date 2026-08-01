@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
-use arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use deltalake::{
     datafusion::parquet::file::metadata::SortingColumn,
     kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField},
@@ -124,41 +124,29 @@ impl TableSchema {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        for k in &self.dedup_keys {
-            let f = self
-                .fields
+        let field = |role: &str, name: &str| {
+            self.fields
                 .iter()
-                .find(|f| f.name == *k)
-                .ok_or_else(|| anyhow::anyhow!("schema `{}`: dedup_keys references unknown field `{}`", self.table_name, k))?;
-            if f.data_type == "Variant" {
-                anyhow::bail!("schema `{}`: dedup_keys cannot include Variant column `{}`", self.table_name, k);
-            }
-        }
-        if let Some(tb) = &self.dedup_tiebreak {
-            let f = self
-                .fields
-                .iter()
-                .find(|f| f.name == *tb)
-                .ok_or_else(|| anyhow::anyhow!("schema `{}`: dedup_tiebreak references unknown field `{}`", self.table_name, tb))?;
-            if f.data_type == "Variant" {
-                anyhow::bail!("schema `{}`: dedup_tiebreak cannot be a Variant column `{}`", self.table_name, tb);
-            }
-        }
+                .find(|f| f.name == name)
+                .ok_or_else(|| anyhow::anyhow!("schema `{}`: {role} references unknown field `{}`", self.table_name, name))
+        };
+        self.dedup_keys.iter().map(|k| ("dedup_keys", k)).chain(self.dedup_tiebreak.iter().map(|tb| ("dedup_tiebreak", tb))).try_for_each(
+            |(role, name)| -> anyhow::Result<()> {
+                anyhow::ensure!(field(role, name)?.data_type != "Variant", "schema `{}`: {role} cannot be a Variant column `{}`", self.table_name, name);
+                Ok(())
+            },
+        )?;
         if let Some(tc) = &self.tombstone_column {
-            let f = self
-                .fields
-                .iter()
-                .find(|f| f.name == *tc)
-                .ok_or_else(|| anyhow::anyhow!("schema `{}`: tombstone_column references unknown field `{}`", self.table_name, tc))?;
+            let f = field("tombstone_column", tc)?;
             // Nullable Boolean is load-bearing: NULL must be a legal "live"
             // encoding so existing rows need no backfill.
-            if f.data_type != "Boolean" || !f.nullable {
-                anyhow::bail!("schema `{}`: tombstone_column `{}` must be a nullable Boolean field", self.table_name, tc);
-            }
+            anyhow::ensure!(f.data_type == "Boolean" && f.nullable, "schema `{}`: tombstone_column `{}` must be a nullable Boolean field", self.table_name, tc);
         }
-        if self.version_append && (self.dedup_keys.is_empty() || self.dedup_tiebreak.is_none() || self.tombstone_column.is_none()) {
-            anyhow::bail!("schema `{}`: version_append requires dedup_keys, dedup_tiebreak and tombstone_column", self.table_name);
-        }
+        anyhow::ensure!(
+            !self.version_append || (!self.dedup_keys.is_empty() && self.dedup_tiebreak.is_some() && self.tombstone_column.is_some()),
+            "schema `{}`: version_append requires dedup_keys, dedup_tiebreak and tombstone_column",
+            self.table_name
+        );
         Ok(())
     }
 }
@@ -212,55 +200,32 @@ impl TableSchema {
         self.fields
             .iter()
             .map(|f| {
-                let data_type = parse_arrow_data_type(&f.data_type)?;
-                let mut field = Field::new(&f.name, data_type, f.nullable);
-                // Mark Variant fields with the Arrow ExtensionType key so
-                // downstream code that does `Field::try_extension_type::<VariantType>()`
-                // (delta-rs main, parquet-variant-compute) doesn't panic
-                // with "Extension type name missing". Without this, fresh
-                // tables (variant_bench) crash on the first INSERT.
-                if f.data_type == "Variant" {
-                    use std::collections::HashMap;
-                    let mut md: HashMap<String, String> = field.metadata().clone();
-                    md.insert("ARROW:extension:name".into(), "arrow.parquet.variant".into());
-                    field = field.with_metadata(md);
-                }
-                Ok(Arc::new(field) as FieldRef)
+                let field = Field::new(&f.name, parse_arrow_data_type(&f.data_type)?, f.nullable);
+                // Without the ExtensionType marker fresh tables (variant_bench)
+                // crash on the first INSERT — see `VARIANT_EXT_KEY`.
+                Ok(Arc::new(match f.data_type.as_str() {
+                    "Variant" => field.with_metadata(HashMap::from([(VARIANT_EXT_KEY.to_string(), VARIANT_EXT_VALUE.to_string())])),
+                    _ => field,
+                }) as FieldRef)
             })
             .collect()
     }
 
     pub fn columns(&self) -> anyhow::Result<Vec<StructField>> {
-        self.fields
-            .iter()
-            .map(|f| {
-                let data_type = parse_delta_data_type(&f.data_type)?;
-                Ok(StructField::new(&f.name, data_type, f.nullable))
-            })
-            .collect()
+        self.fields.iter().map(|f| Ok(StructField::new(&f.name, parse_delta_data_type(&f.data_type)?, f.nullable))).collect()
     }
 
     pub fn schema_ref(&self) -> SchemaRef {
-        // Return schema with partition columns moved to the end to match Delta Lake's output order
+        // Partition columns move to the end to match Delta Lake's output order,
+        // order preserved within each group.
         let all_fields = self.fields().unwrap_or_else(|e| panic!("Failed to build schema for table {}: {e:?}", self.table_name));
+        let partition_set = self.partition_set();
+        let (partition_fields, data_fields): (Vec<_>, Vec<_>) = all_fields.into_iter().partition(|f| partition_set.contains(f.name().as_str()));
+        Arc::new(Schema::new(data_fields.into_iter().chain(partition_fields).collect::<Vec<_>>()))
+    }
 
-        let partition_set: std::collections::HashSet<&str> = self.partitions.iter().map(|s| s.as_str()).collect();
-
-        // Separate non-partition and partition fields, maintaining order within each group
-        let mut non_partition_fields = Vec::new();
-        let mut partition_fields = Vec::new();
-
-        for field in all_fields {
-            if partition_set.contains(field.name().as_str()) {
-                partition_fields.push(field);
-            } else {
-                non_partition_fields.push(field);
-            }
-        }
-
-        // Combine: non-partition fields first, then partition fields at the end
-        non_partition_fields.extend(partition_fields);
-        Arc::new(Schema::new(non_partition_fields))
+    fn partition_set(&self) -> HashSet<&str> {
+        self.partitions.iter().map(String::as_str).collect()
     }
 
     pub fn sorting_columns(&self) -> Vec<SortingColumn> {
@@ -271,7 +236,7 @@ impl TableSchema {
         // the raw fields-list index over-counts by every partition column that
         // precedes a sort key (e.g. `date` at field 0), so the footer points at
         // the wrong column and the sort-order pushdown silently never fires.
-        let partition_set: std::collections::HashSet<&str> = self.partitions.iter().map(|s| s.as_str()).collect();
+        let partition_set = self.partition_set();
         let data_cols: Vec<&str> = self.fields.iter().map(|f| f.name.as_str()).filter(|n| !partition_set.contains(n)).collect();
         self.sorting_columns
             .iter()
@@ -300,8 +265,8 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8View, true))),
         "List(Int64)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Int64, true))),
         "List(Float64)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Float64, true))),
-        "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+        "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         // Variant: declare the inner buffers as Binary to match
         // `delta_kernel::unshredded_variant()`. delta-rs's kernel rejects
         // schema mismatches at scan validation time even when no data
@@ -311,8 +276,8 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         //     (set in our session and in `delta_session_from` for DML);
         //   - `convert_variant_columns` casts VariantArrayBuilder's
         //     BinaryView output to Binary before MemBuffer ever sees it.
-        // The ExtensionType marker (`ARROW:extension:name = arrow.parquet.variant`)
-        // is added to the Field's metadata in `fields()` below.
+        // The ExtensionType marker (`VARIANT_EXT_KEY`) is added to the Field's
+        // metadata in `fields()`.
         "Variant" => ArrowDataType::Struct(
             vec![
                 Arc::new(Field::new(VARIANT_METADATA_FIELD, ArrowDataType::Binary, false)),
@@ -351,26 +316,16 @@ pub struct SchemaRegistry {
 
 impl SchemaRegistry {
     fn new() -> Self {
-        let mut schemas = HashMap::new();
-
-        // Load all YAML schemas from the directory
-        for file in SCHEMAS_DIR.files() {
-            if file.path().extension().and_then(|s| s.to_str()) == Some("yaml") {
+        let schemas = SCHEMAS_DIR
+            .files()
+            .filter(|f| f.path().extension().and_then(|s| s.to_str()) == Some("yaml"))
+            .map(|file| {
                 let content = file.contents_utf8().expect("Schema file should be UTF-8");
-                match serde_yaml::from_str::<TableSchema>(content) {
-                    Ok(schema) => {
-                        if let Err(e) = schema.validate() {
-                            panic!("Invalid schema {:?}: {}", file.path(), e);
-                        }
-                        schemas.insert(schema.table_name.clone(), schema);
-                    }
-                    Err(e) => {
-                        panic!("Failed to parse schema {:?}: {}", file.path(), e);
-                    }
-                }
-            }
-        }
-
+                let schema: TableSchema = serde_yaml::from_str(content).unwrap_or_else(|e| panic!("Failed to parse schema {:?}: {}", file.path(), e));
+                schema.validate().unwrap_or_else(|e| panic!("Invalid schema {:?}: {}", file.path(), e));
+                (schema.table_name.clone(), schema)
+            })
+            .collect();
         Self { schemas }
     }
 
@@ -378,8 +333,8 @@ impl SchemaRegistry {
         self.schemas.get(table_name)
     }
 
+    // otel_logs_and_spans predates multi-schema, so it's the back-compat default.
     pub fn get_default(&self) -> Option<&TableSchema> {
-        // Return the first schema as default (for backward compatibility)
         self.schemas.get("otel_logs_and_spans").or_else(|| self.schemas.values().next())
     }
 
@@ -403,12 +358,10 @@ pub fn registry() -> &'static SchemaRegistry {
     SCHEMA_REGISTRY.get_or_init(SchemaRegistry::new)
 }
 
-// Convenience function to get a schema by name
 pub fn get_schema(table_name: &str) -> Option<&'static TableSchema> {
     registry().get(table_name)
 }
 
-// Get the default schema (for backward compatibility)
 pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
 }
@@ -420,16 +373,18 @@ pub fn get_default_schema() -> &'static TableSchema {
 pub const VARIANT_METADATA_FIELD: &str = "metadata";
 pub const VARIANT_VALUE_FIELD: &str = "value";
 
+/// Arrow ExtensionType marker every Variant field must carry, or
+/// `Field::try_extension_type::<VariantType>()` (delta-rs, parquet-variant-compute)
+/// panics with "Extension type name missing".
+pub const VARIANT_EXT_KEY: &str = "ARROW:extension:name";
+pub const VARIANT_EXT_VALUE: &str = "arrow.parquet.variant";
+
 /// Returns true if the given Arrow DataType structurally matches a Variant
 /// (Struct with `metadata` + `value` binary/binaryview fields).
 pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
-    match data_type {
-        ArrowDataType::Struct(fields) if fields.len() == 2 => {
-            fields.iter().any(|f| f.name() == VARIANT_METADATA_FIELD && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
-                && fields.iter().any(|f| f.name() == VARIANT_VALUE_FIELD && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
-        }
-        _ => false,
-    }
+    let ArrowDataType::Struct(fields) = data_type else { return false };
+    let binary_named = |name: &str| fields.iter().any(|f| f.name() == name && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView));
+    fields.len() == 2 && binary_named(VARIANT_METADATA_FIELD) && binary_named(VARIANT_VALUE_FIELD)
 }
 
 /// Replaces Variant fields with Utf8View on a schema. This is the schema we hand to the
@@ -449,29 +404,38 @@ pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
 /// `DataSink::write_all` converts inbound Utf8/Utf8View → Variant struct (via
 /// `parquet_variant_compute::VariantArrayBuilder`) before the Delta write.
 pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
-    let new_fields: Vec<FieldRef> = schema
+    // `tf.pg_type = jsonb`: pgwire Describe derives RowDescription from the
+    // *unanalyzed* plan, where Variant cols carry this Utf8View view. Without
+    // the tag, bare Variant columns surface text OID 25 and strict drivers
+    // (hasql) reject the row (expected jsonb 3802). vendor/arrow-pg maps the
+    // tag to OID 3802 + the 0x01 binary jsonb version byte.
+    let fields: Vec<FieldRef> = schema
         .fields()
         .iter()
         .map(|f| {
             if is_variant_type(f.data_type()) {
-                // `tf.pg_type = jsonb`: pgwire Describe derives RowDescription from the
-                // *unanalyzed* plan, where Variant cols carry this Utf8View view. Without
-                // the tag, bare Variant columns surface text OID 25 and strict drivers
-                // (hasql) reject the row (expected jsonb 3802). vendor/arrow-pg maps the
-                // tag to OID 3802 + the 0x01 binary jsonb version byte.
-                let md = [("tf.pg_type".to_string(), "jsonb".to_string())].into_iter().collect();
-                Arc::new(Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable()).with_metadata(md))
+                Arc::new(
+                    Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable())
+                        .with_metadata(HashMap::from([("tf.pg_type".to_string(), "jsonb".to_string())])),
+                )
             } else {
                 f.clone()
             }
         })
         .collect();
-    Arc::new(Schema::new(new_fields))
+    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BASE_YAML: &str = "table_name: t\npartitions: []\nsorting_columns: []\nz_order_columns: []\ndedup_keys: [id]\ndedup_tiebreak: updated_at\n";
+    const FIELDS_YAML: &str = "fields:\n  - {name: id, data_type: Utf8, nullable: false}\n  - {name: updated_at, data_type: 'Timestamp(Microsecond, None)', nullable: true}\n  - {name: deleted, data_type: Boolean, nullable: true}\n";
+
+    fn parse_schema(extra: &str, fields: &str) -> TableSchema {
+        serde_yaml::from_str(&format!("{BASE_YAML}{extra}{fields}")).expect("yaml parses")
+    }
 
     // Regression: parquet `SortingColumn.column_idx` must index the non-partition
     // (physical parquet) columns, not the raw fields list. `date` is a partition
@@ -483,7 +447,7 @@ mod tests {
         let schema = get_schema("otel_logs_and_spans").expect("otel schema registered");
         let scs = schema.sorting_columns();
         // Build the expected physical (non-partition) column order.
-        let partition_set: std::collections::HashSet<&str> = schema.partitions.iter().map(|s| s.as_str()).collect();
+        let partition_set = schema.partition_set();
         let data_cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).filter(|n| !partition_set.contains(n)).collect();
         // timestamp is the lead sort key and the first physical column → index 0.
         assert_eq!(data_cols[0], "timestamp");
@@ -531,16 +495,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_tombstone_and_version_append_declarations() {
-        let base = "table_name: t\npartitions: []\nsorting_columns: []\nz_order_columns: []\ndedup_keys: [id]\ndedup_tiebreak: updated_at\n";
-        let fields = "fields:\n  - {name: id, data_type: Utf8, nullable: false}\n  - {name: updated_at, data_type: 'Timestamp(Microsecond, None)', nullable: true}\n  - {name: deleted, data_type: Boolean, nullable: true}\n";
-        let parse = |extra: &str, fields: &str| serde_yaml::from_str::<TableSchema>(&format!("{base}{extra}{fields}")).expect("yaml parses").validate();
+        let parse = |extra: &str, fields: &str| parse_schema(extra, fields).validate();
 
-        parse("tombstone_column: deleted\nversion_append: true\n", fields).expect("well-formed version-append table");
-        assert!(parse("tombstone_column: missing\n", fields).unwrap_err().to_string().contains("unknown field"));
-        assert!(parse("tombstone_column: id\n", fields).unwrap_err().to_string().contains("nullable Boolean"));
-        let non_null = fields.replace("deleted, data_type: Boolean, nullable: true", "deleted, data_type: Boolean, nullable: false");
+        parse("tombstone_column: deleted\nversion_append: true\n", FIELDS_YAML).expect("well-formed version-append table");
+        assert!(parse("tombstone_column: missing\n", FIELDS_YAML).unwrap_err().to_string().contains("unknown field"));
+        assert!(parse("tombstone_column: id\n", FIELDS_YAML).unwrap_err().to_string().contains("nullable Boolean"));
+        let non_null = FIELDS_YAML.replace("deleted, data_type: Boolean, nullable: true", "deleted, data_type: Boolean, nullable: false");
         assert!(parse("tombstone_column: deleted\n", &non_null).unwrap_err().to_string().contains("nullable Boolean"));
-        assert!(parse("version_append: true\n", fields).unwrap_err().to_string().contains("version_append requires"));
+        assert!(parse("version_append: true\n", FIELDS_YAML).unwrap_err().to_string().contains("version_append requires"));
     }
 
     /// A declared-but-dormant tombstone column must NOT read as "tombstones can
@@ -549,9 +511,7 @@ mod tests {
     /// its fast path (pre-deploy review, 2026-07-31).
     #[test]
     fn tombstones_possible_needs_the_write_path_too() {
-        let base = "table_name: t\npartitions: []\nsorting_columns: []\nz_order_columns: []\ndedup_keys: [id]\ndedup_tiebreak: updated_at\n";
-        let fields = "fields:\n  - {name: id, data_type: Utf8, nullable: false}\n  - {name: updated_at, data_type: 'Timestamp(Microsecond, None)', nullable: true}\n  - {name: deleted, data_type: Boolean, nullable: true}\n";
-        let parse = |extra: &str| serde_yaml::from_str::<TableSchema>(&format!("{base}{extra}{fields}")).expect("yaml parses");
+        let parse = |extra: &str| parse_schema(extra, FIELDS_YAML);
 
         assert!(!parse("").tombstones_possible(), "no tombstone column at all");
         assert!(!parse("tombstone_column: deleted\n").tombstones_possible(), "declared but dormant → no tombstone can exist");

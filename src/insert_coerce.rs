@@ -37,7 +37,7 @@ use dashmap::DashMap;
 use datafusion::{
     arrow::{
         array::{Array, ArrayRef, TimestampMicrosecondArray},
-        datatypes::{DataType, Field, Schema, TimeUnit},
+        datatypes::{DataType, Field, FieldRef, Schema, TimeUnit},
         record_batch::RecordBatch,
     },
     common::tree_node::{Transformed, TreeNode},
@@ -46,52 +46,40 @@ use datafusion::{
 use tracing::warn;
 
 pub fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
-    let result = plan
-        .clone()
+    plan.clone()
         .transform_up(|node| {
             let LogicalPlan::Values(values) = node else {
                 return Ok(Transformed::no(node));
             };
-            let schema = values.schema.clone();
-            let column_types: Vec<_> = schema.fields().iter().map(|f| f.data_type().clone()).collect();
-            let new_rows: Vec<Vec<Expr>> = values
-                .values
-                .iter()
+            let Values { schema, values } = values;
+            let values = values
+                .into_iter()
                 .map(|row| {
-                    row.iter()
-                        .enumerate()
-                        .map(|(col_idx, expr)| {
-                            let Some(target_ty) = column_types.get(col_idx).cloned() else {
-                                return expr.clone();
-                            };
-                            let Expr::Placeholder(_) = expr else {
-                                return expr.clone();
-                            };
-                            // Always wrap in Cast. Even if the Placeholder's inferred
-                            // `field` already has a matching type, that information
-                            // is only set reliably for row-1 placeholders in a
-                            // multi-row VALUES; row-2+ get `field: None` and so
-                            // `get_parameter_types()` reports them as unknown. Adding
-                            // the explicit Cast forces extract_placeholder_cast_types
-                            // to pick up every placeholder.
-                            Expr::Cast(Cast::new(Box::new(expr.clone()), target_ty))
+                    row.into_iter()
+                        .zip(schema.fields())
+                        // Always wrap in Cast. Even if the Placeholder's inferred `field`
+                        // already has a matching type, that information is only set
+                        // reliably for row-1 placeholders in a multi-row VALUES; row-2+
+                        // get `field: None` and so `get_parameter_types()` reports them as
+                        // unknown. The explicit Cast forces extract_placeholder_cast_types
+                        // to pick up every placeholder.
+                        .map(|(expr, f)| match expr {
+                            Expr::Placeholder(_) => Expr::Cast(Cast::new(Box::new(expr), f.data_type().clone())),
+                            _ => expr,
                         })
                         .collect()
                 })
                 .collect();
-            Ok(Transformed::yes(LogicalPlan::Values(Values { schema, values: new_rows })))
+            Ok(Transformed::yes(LogicalPlan::Values(Values { schema, values })))
         })
-        .map(|t| t.data);
-    match result {
-        Ok(p) => p,
-        Err(e) => {
+        .map(|t| t.data)
+        .unwrap_or_else(|e| {
             // Falling back to the un-coerced plan can leave pgwire serving the wrong
             // placeholder types for multi-row INSERTs — surface at warn! so it's
             // visible in ops dashboards.
             warn!(target: "insert_coerce", "plan rewrite skipped (multi-row INSERT type inference may suffer): {e}");
             plan
-        }
-    }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +103,7 @@ fn with_cell<R>(table: &str, f: impl FnOnce(&AtomicI64) -> R) -> R {
     if let Some(cell) = map.get(table) {
         return f(cell.value());
     }
-    f(map.entry(table.to_string()).or_insert_with(|| AtomicI64::new(i64::MIN)).value())
+    f(map.entry(table.to_string()).or_insert(AtomicI64::new(i64::MIN)).value())
 }
 
 /// Issue the next stamp for `table`: `max(now, last_issued + 1)`. Strictly
@@ -124,14 +112,9 @@ fn with_cell<R>(table: &str, f: impl FnOnce(&AtomicI64) -> R) -> R {
 pub fn next_stamp(table: &str) -> i64 {
     with_cell(table, |cell| {
         let now = crate::clock::now_micros();
-        let mut prev = cell.load(Ordering::Relaxed);
-        loop {
-            let next = now.max(prev.saturating_add(1));
-            match cell.compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => return next,
-                Err(cur) => prev = cur,
-            }
-        }
+        let next = |prev: i64| now.max(prev.saturating_add(1));
+        // Ok/Err both carry the CAS'd `prev`, so re-deriving `next(prev)` is exactly what was stored.
+        next(cell.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |prev| Some(next(prev))).unwrap_or_else(|prev| prev))
     })
 }
 
@@ -154,11 +137,12 @@ pub fn observe_stamp(table: &str, value: i64) {
 /// breaks ties on `observed_timestamp` and `otel_metrics` on `ingested_at`, both
 /// client-supplied and both `Timestamp(Microsecond, _)` — stamping those would
 /// silently overwrite ingested data on tables that never had a version stamp.
-fn stamp_column(table: &str) -> Option<(&'static str, DataType, bool)> {
+fn stamp_column(table: &str) -> Option<(FieldRef, Option<Arc<str>>)> {
     let schema = crate::schema_loader::get_schema(table).filter(|s| s.version_append)?;
     let name = schema.dedup_tiebreak.as_deref()?;
     let (dt, nullable) = schema.field_def(name)?;
-    matches!(dt, DataType::Timestamp(TimeUnit::Microsecond, _)).then_some((name, dt, nullable))
+    let DataType::Timestamp(TimeUnit::Microsecond, tz) = &dt else { return None };
+    Some((Arc::new(Field::new(name, dt.clone(), nullable)), tz.clone()))
 }
 
 /// Stamp every batch's version column with a fresh monotonic value.
@@ -177,28 +161,21 @@ fn stamp_column(table: &str) -> Option<(&'static str, DataType, bool)> {
 /// were stamped on their original append and must keep that value; replay feeds
 /// `observe_stamp` instead.
 pub fn stamp_version(table: &str, batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
-    let Some((name, data_type, nullable)) = stamp_column(table) else {
+    let Some((field, tz)) = stamp_column(table) else {
         return batches;
     };
     batches
         .into_iter()
         .map(|batch| {
-            let tz = match &data_type {
-                DataType::Timestamp(_, tz) => tz.clone(),
-                _ => None,
-            };
-            let mut arr = TimestampMicrosecondArray::from(vec![next_stamp(table); batch.num_rows()]);
-            if let Some(tz) = tz {
-                arr = arr.with_timezone(tz);
-            }
-            let arr = Arc::new(arr) as ArrayRef;
-            let field = Arc::new(Field::new(name, data_type.clone(), nullable));
-            let (old_schema, mut columns) = (batch.schema(), batch.columns().to_vec());
-            let mut fields: Vec<_> = old_schema.fields().iter().cloned().collect();
-            match old_schema.index_of(name) {
-                Ok(i) => (fields[i], columns[i]) = (field, arr),
+            let arr = Arc::new(TimestampMicrosecondArray::from(vec![next_stamp(table); batch.num_rows()]).with_timezone_opt(tz.clone())) as ArrayRef;
+            let old_schema = batch.schema();
+            // Positional replace-or-append; a fold over the field list would clone every
+            // column to express the same thing.
+            let (mut fields, mut columns) = (old_schema.fields().to_vec(), batch.columns().to_vec());
+            match old_schema.index_of(field.name()) {
+                Ok(i) => (fields[i], columns[i]) = (field.clone(), arr),
                 Err(_) => {
-                    fields.push(field);
+                    fields.push(field.clone());
                     columns.push(arr);
                 }
             }
@@ -221,14 +198,9 @@ pub fn reset_stamp_state(table: &str) {
 
 /// Fold a replayed batch's stamps into the table's clock (see `observe_stamp`).
 pub fn observe_batch(table: &str, batch: &RecordBatch) {
-    let Some((name, _, _)) = stamp_column(table) else {
-        return;
-    };
-    let Some(col) = batch.column_by_name(name) else {
-        return;
-    };
-    if let Some(arr) = col.as_any().downcast_ref::<TimestampMicrosecondArray>()
-        && let Some(max) = datafusion::arrow::compute::max(arr)
+    if let Some((field, _)) = stamp_column(table)
+        && let Some(max) =
+            batch.column_by_name(field.name()).and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>()).and_then(datafusion::arrow::compute::max)
     {
         observe_stamp(table, max);
     }
@@ -248,19 +220,21 @@ mod stamp_tests {
     /// One row batch with an `id` column, plus optionally a client-supplied
     /// `updated_at` we expect TF to overwrite.
     fn batch_with(client_stamp: Option<i64>) -> RecordBatch {
-        let mut fields: Vec<Arc<Field>> = vec![Arc::new(Field::new("id", DataType::Int64, false))];
-        let mut cols: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1i64]))];
-        if let Some(v) = client_stamp {
-            fields.push(Arc::new(Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)));
-            cols.push(Arc::new(TimestampMicrosecondArray::from(vec![v]).with_timezone("UTC")));
-        }
+        let id = (Arc::new(Field::new("id", DataType::Int64, false)), Arc::new(Int64Array::from(vec![1i64])) as ArrayRef);
+        let stamp = client_stamp.map(|v| {
+            (
+                Arc::new(Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)),
+                Arc::new(TimestampMicrosecondArray::from(vec![v]).with_timezone("UTC")) as ArrayRef,
+            )
+        });
+        let (fields, cols): (Vec<Arc<Field>>, Vec<ArrayRef>) = std::iter::once(id).chain(stamp).unzip();
         RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
     }
 
     fn stamp_of(batch: &RecordBatch) -> Option<i64> {
         let col = batch.column_by_name("updated_at")?;
         let arr = col.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
-        (!arr.is_null(0)).then(|| arr.value(0))
+        arr.is_valid(0).then(|| arr.value(0))
     }
 
     /// Two writes inside the SAME microsecond must not tie — "greatest version
@@ -337,7 +311,7 @@ mod stamp_tests {
     fn observe_batch_is_schema_driven() {
         let t = unique_table();
         let declared = crate::schema_loader::get_schema("mor_versioned").expect("fixture registered").dedup_tiebreak.clone().expect("declares a tiebreak");
-        assert_eq!(stamp_column("mor_versioned").map(|(n, _, _)| n), Some(declared.as_str()), "the stamp column comes from the YAML, not a literal");
+        assert_eq!(stamp_column("mor_versioned").map(|(f, _)| f.name().clone()), Some(declared.clone()), "the stamp column comes from the YAML, not a literal");
         let schema = Arc::new(Schema::new(vec![Field::new(&declared, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(TimestampMicrosecondArray::from(vec![7_777_i64]).with_timezone("UTC")) as ArrayRef]).unwrap();
         observe_batch("mor_versioned", &batch);

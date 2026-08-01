@@ -12,7 +12,10 @@
 //! Registered after DataFusion's defaults, so `push_down_limit` has already
 //! folded LIMIT into `Sort.fetch` by the time it runs.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use datafusion::{
     common::{
@@ -46,61 +49,60 @@ impl OptimizerRule for DeferExpensiveProjection {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Sort(sort) = plan else { return Ok(Transformed::no(plan)) };
-        let (LogicalPlan::Projection(proj), Some(_)) = (sort.input.as_ref(), sort.fetch) else {
-            return Ok(Transformed::no(LogicalPlan::Sort(sort)));
-        };
-        if proj.expr.iter().all(is_trivial) {
-            return Ok(Transformed::no(LogicalPlan::Sort(sort)));
-        }
-
-        // Projection-output column → underlying (unaliased) expr, for inlining
-        // sort keys that reference projection outputs.
-        let out_map: std::collections::HashMap<Column, Expr> =
-            proj.schema.iter().zip(proj.expr.iter()).map(|((q, f), e)| (Column::new(q.cloned(), f.name()), e.clone().unalias())).collect();
-        let new_sort_exprs = sort
-            .expr
-            .iter()
-            .map(|se| {
-                let expr = se
-                    .expr
-                    .clone()
-                    .transform_up(|e| {
-                        Ok(match &e {
-                            Expr::Column(c) => match out_map.get(c) {
-                                Some(rep) => Transformed::yes(rep.clone()),
-                                None => Transformed::no(e),
-                            },
-                            _ => Transformed::no(e),
-                        })
-                    })?
-                    .data;
-                Ok(SortExpr { expr, ..se.clone() })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Raw input columns the deferred exprs and inlined sort keys need.
-        let mut needed: Vec<Column> = Vec::new();
-        for e in proj.expr.iter().chain(new_sort_exprs.iter().map(|se| &se.expr)) {
-            for c in e.column_refs() {
-                if !needed.contains(c) {
-                    needed.push(c.clone());
-                }
-            }
-        }
-        if needed.is_empty() {
-            return Ok(Transformed::no(LogicalPlan::Sort(sort)));
-        }
-
-        let min_proj = Projection::try_new(needed.into_iter().map(Expr::Column).collect(), Arc::clone(&proj.input))?;
-        let new_sort = LogicalPlan::Sort(Sort { expr: new_sort_exprs, input: Arc::new(LogicalPlan::Projection(min_proj)), fetch: sort.fetch });
-        // Rebuild the original projection above the TopK, aliasing each expr
-        // to its original (qualifier, name) so the parent plan's column
-        // references and the root schema are unchanged.
-        let rebuilt = proj.schema.iter().zip(proj.expr.iter()).map(|((q, f), e)| e.clone().unalias().alias_qualified(q.cloned(), f.name())).collect();
-        let hoisted = Projection::try_new_with_schema(rebuilt, Arc::new(new_sort), Arc::clone(&proj.schema))?;
-        Ok(Transformed::yes(LogicalPlan::Projection(hoisted)))
+        let rewritten = defer(&plan)?;
+        Ok(rewritten.map_or_else(|| Transformed::no(plan), Transformed::yes))
     }
+}
+
+/// `None` when the plan is not a `Sort(fetch)` over a projection worth deferring.
+fn defer(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    let LogicalPlan::Sort(sort) = plan else { return Ok(None) };
+    let (LogicalPlan::Projection(proj), Some(_)) = (sort.input.as_ref(), sort.fetch) else { return Ok(None) };
+    if proj.expr.iter().all(is_trivial) {
+        return Ok(None);
+    }
+
+    // (qualifier, name, unaliased expr) per projection output — used both to
+    // inline sort keys below the TopK and to rebuild the projection above it.
+    let outputs = || proj.schema.iter().zip(proj.expr.iter()).map(|((q, f), e)| (q.cloned(), f.name(), e.clone().unalias()));
+    let out_map: HashMap<Column, Expr> = outputs().map(|(q, name, e)| (Column::new(q, name), e)).collect();
+
+    let new_sort_exprs = sort
+        .expr
+        .iter()
+        .map(|se| {
+            let expr = se
+                .expr
+                .clone()
+                .transform_up(|e| {
+                    Ok(match &e {
+                        // `match` over `map_or` here: the latter would clone `e` on the hit path too.
+                        Expr::Column(c) => match out_map.get(c) {
+                            Some(rep) => Transformed::yes(rep.clone()),
+                            None => Transformed::no(e),
+                        },
+                        _ => Transformed::no(e),
+                    })
+                })?
+                .data;
+            Ok(SortExpr { expr, asc: se.asc, nulls_first: se.nulls_first })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Raw input columns the deferred exprs and inlined sort keys need; the set
+    // is ordered so the rewritten plan is deterministic (`column_refs` is not).
+    let needed: BTreeSet<&Column> = proj.expr.iter().chain(new_sort_exprs.iter().map(|se| &se.expr)).flat_map(|e| e.column_refs()).collect();
+    if needed.is_empty() {
+        return Ok(None);
+    }
+
+    let min_proj = Projection::try_new(needed.into_iter().cloned().map(Expr::Column).collect(), Arc::clone(&proj.input))?;
+    let new_sort = LogicalPlan::Sort(Sort { expr: new_sort_exprs, input: Arc::new(LogicalPlan::Projection(min_proj)), fetch: sort.fetch });
+    // Alias each rebuilt expr to its original (qualifier, name) so the parent
+    // plan's column references and the root schema are unchanged.
+    let rebuilt = outputs().map(|(q, name, e)| e.alias_qualified(q, name)).collect();
+    let hoisted = Projection::try_new_with_schema(rebuilt, Arc::new(new_sort), Arc::clone(&proj.schema))?;
+    Ok(Some(LogicalPlan::Projection(hoisted)))
 }
 
 #[cfg(test)]
@@ -115,10 +117,8 @@ mod tests {
     use super::*;
 
     async fn plans(sql: &str, with_rule: bool) -> (String, String) {
-        let mut builder = SessionStateBuilder::new().with_default_features();
-        if with_rule {
-            builder = builder.with_optimizer_rule(Arc::new(DeferExpensiveProjection));
-        }
+        let builder = SessionStateBuilder::new().with_default_features();
+        let builder = if with_rule { builder.with_optimizer_rule(Arc::new(DeferExpensiveProjection)) } else { builder };
         let ctx = SessionContext::new_with_state(builder.build());
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -127,8 +127,8 @@ mod tests {
         ]));
         ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
         let df = ctx.sql(sql).await.unwrap();
-        let logical = format!("{}", df.clone().into_optimized_plan().unwrap().display_indent());
-        let physical = format!("{}", datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref()).indent(false));
+        let logical = df.clone().into_optimized_plan().unwrap().display_indent().to_string();
+        let physical = datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref()).indent(false).to_string();
         (logical, physical)
     }
 

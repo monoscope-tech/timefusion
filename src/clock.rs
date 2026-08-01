@@ -19,26 +19,25 @@ const WALL_SENTINEL: i64 = i64::MIN;
 
 static FROZEN_NOW: AtomicI64 = AtomicI64::new(WALL_SENTINEL);
 
+fn frozen_micros() -> Option<i64> {
+    Some(FROZEN_NOW.load(Ordering::Acquire)).filter(|&v| v != WALL_SENTINEL)
+}
+
 pub fn init_from_env() {
-    if let Ok(s) = std::env::var("TIMEFUSION_FROZEN_TIME") {
-        let t = chrono::DateTime::parse_from_rfc3339(&s).unwrap_or_else(|e| panic!("TIMEFUSION_FROZEN_TIME must be RFC3339 ({s:?}): {e}")).timestamp_micros();
-        FROZEN_NOW.store(t, Ordering::Release);
-        tracing::warn!(
-            frozen_at = %chrono::DateTime::from_timestamp_micros(t).unwrap(),
-            "TIMEFUSION_FROZEN_TIME set; clock is frozen (test mode)"
-        );
-    }
+    let Ok(s) = std::env::var("TIMEFUSION_FROZEN_TIME") else { return };
+    let t = chrono::DateTime::parse_from_rfc3339(&s).unwrap_or_else(|e| panic!("TIMEFUSION_FROZEN_TIME must be RFC3339 ({s:?}): {e}")).timestamp_micros();
+    set_micros(t);
+    tracing::warn!(frozen_at = %s, "TIMEFUSION_FROZEN_TIME set; clock is frozen (test mode)");
 }
 
 #[inline]
 pub fn now_micros() -> i64 {
-    let v = FROZEN_NOW.load(Ordering::Acquire);
-    if v == WALL_SENTINEL { chrono::Utc::now().timestamp_micros() } else { v }
+    frozen_micros().unwrap_or_else(|| chrono::Utc::now().timestamp_micros())
 }
 
 /// True when the clock is currently pinned (test mode).
 pub fn is_frozen() -> bool {
-    FROZEN_NOW.load(Ordering::Acquire) != WALL_SENTINEL
+    frozen_micros().is_some()
 }
 
 /// Install or replace the frozen time (test mode). Returns the new value.
@@ -51,11 +50,7 @@ pub fn set_micros(t: i64) -> i64 {
 /// this freezes it at `wall_now + delta_micros` so the first call from an
 /// unprimed test harness has predictable behavior. Returns new value.
 pub fn advance_micros(delta_micros: i64) -> i64 {
-    let cur = FROZEN_NOW.load(Ordering::Acquire);
-    let base = if cur == WALL_SENTINEL { chrono::Utc::now().timestamp_micros() } else { cur };
-    let next = base.saturating_add(delta_micros);
-    FROZEN_NOW.store(next, Ordering::Release);
-    next
+    set_micros(now_micros().saturating_add(delta_micros))
 }
 
 /// Switch back to wall-clock mode.

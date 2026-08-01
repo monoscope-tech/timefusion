@@ -17,7 +17,10 @@
 //! use), the helpers no-op.
 
 use std::{
-    sync::{Arc, OnceLock, Weak},
+    sync::{
+        OnceLock, Weak,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     time::Duration,
 };
 
@@ -114,8 +117,7 @@ pub fn registry() -> Option<&'static MetricsRegistry> {
     METRICS.get()
 }
 
-/// Initialize OTel metrics. Idempotent (subsequent calls are no-ops). Returns
-/// the meter provider so the caller can keep a handle for shutdown if needed.
+/// Initialize OTel metrics. Idempotent (subsequent calls are no-ops).
 ///
 /// `buffered_layer` is a Weak so the metrics callback doesn't extend its
 /// lifetime — the layer owns its shutdown order, not us.
@@ -139,12 +141,11 @@ pub fn init_metrics(
         .with_timeout(Duration::from_secs(10))
         .build()?;
 
-    // 30s export interval is the OTLP/Prometheus convention. Memory cost is
-    // negligible since we have ~7 series.
+    // 30s export interval is the OTLP/Prometheus convention.
     let reader = PeriodicReader::builder(exporter).with_interval(Duration::from_secs(30)).build();
 
-    let provider = SdkMeterProvider::builder().with_reader(reader).with_resource(resource).build();
-    opentelemetry::global::set_meter_provider(provider.clone());
+    // The global registry owns the provider for the rest of the process.
+    opentelemetry::global::set_meter_provider(SdkMeterProvider::builder().with_reader(reader).with_resource(resource).build());
 
     let meter = opentelemetry::global::meter("timefusion");
 
@@ -156,23 +157,24 @@ pub fn init_metrics(
         .u64_observable_gauge("timefusion.mem_buffer.oldest_bucket_age_seconds")
         .with_description("Age of oldest MemBuffer bucket; alert if > 2x flush_interval_secs")
         .with_callback(move |obs| {
-            if let Some(layer) = bl_for_buckets.upgrade()
-                && let Some(age) = layer.snapshot_stats().oldest_bucket_age_secs
-            {
+            if let Some(age) = bl_for_buckets.upgrade().and_then(|l| l.snapshot_stats().oldest_bucket_age_secs) {
                 obs.observe(age, &[]);
             }
         })
         .build();
 
-    // Each simple gauge upgrades the Weak, snapshots stats, and observes one
-    // derived value. The macro captures that shape so each metric is a single
-    // line; gauges with conditional/Option logic (oldest bucket age, index lag)
-    // stay spelled out below.
-    macro_rules! layer_gauge {
-        ($id:literal, $desc:literal, |$s:ident| $value:expr) => {{
+    // Each simple metric upgrades the Weak, snapshots stats, and observes one
+    // derived value; the macro captures that shape so each is a single line.
+    // Metrics with conditional/Option logic (oldest bucket age, index lag) stay
+    // spelled out. `counter` registers a monotonic observable counter (OTel Sum
+    // → Prometheus Counter) so PromQL rate() applies reset detection and
+    // survives restarts (values snap to 0 on boot); use it for cumulative
+    // totals, `gauge` for point-in-time levels.
+    macro_rules! layer_metric {
+        (@build $method:ident, $id:literal, $desc:literal, |$s:ident| $value:expr) => {{
             let weak = buffered_layer.clone();
             meter
-                .u64_observable_gauge($id)
+                .$method($id)
                 .with_description($desc)
                 .with_callback(move |obs| {
                     if let Some(layer) = weak.upgrade() {
@@ -182,69 +184,52 @@ pub fn init_metrics(
                 })
                 .build();
         }};
+        (gauge $($rest:tt)+) => { layer_metric!(@build u64_observable_gauge, $($rest)+) };
+        (counter $($rest:tt)+) => { layer_metric!(@build u64_observable_counter, $($rest)+) };
     }
 
-    // Same shape as layer_gauge! but registers a monotonic observable counter
-    // (OTel Sum → Prometheus Counter) so PromQL rate() applies reset detection
-    // and survives process restarts (the values snap to 0 on boot). Use for
-    // cumulative totals; layer_gauge! for point-in-time levels.
-    macro_rules! layer_counter {
-        ($id:literal, $desc:literal, |$s:ident| $value:expr) => {{
-            let weak = buffered_layer.clone();
-            meter
-                .u64_observable_counter($id)
-                .with_description($desc)
-                .with_callback(move |obs| {
-                    if let Some(layer) = weak.upgrade() {
-                        let $s = layer.snapshot_stats();
-                        obs.observe($value, &[]);
-                    }
-                })
-                .build();
-        }};
-    }
-
-    layer_gauge!("timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
-    layer_gauge!("timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
-    layer_gauge!("timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
+    layer_metric!(gauge "timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
+    layer_metric!(gauge "timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
+    layer_metric!(gauge "timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
     // Ingest vs drain: rate() these two and compare. Ingested climbing faster
     // than flushed (while pressure_pct=100, flush_failed flat) = ingest
     // outpacing a working drain, not a stuck flush. Counters (not gauges) so
     // rate() handles the restart-to-0 reset. `ingested` includes WAL-recovered
     // rows so the pair stays comparable after a restart (see snapshot_stats).
-    layer_counter!("timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s.rows_ingested_total);
-    layer_counter!("timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
+    layer_metric!(counter "timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s
+        .rows_ingested_total);
+    layer_metric!(counter "timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
     // Local hot tier. The two "the tier is broken" signals are write_failures
     // (demotion failing — reads stay correct, just slower) and read_misses
     // (torn/absent files falling back to Delta); schema_drift is the silent
     // one, where a file looks like a healthy hit but contributes zero rows.
-    layer_gauge!("timefusion.hot_tier.bytes", "Bytes of demoted Arrow IPC held by the local hot tier", |s| s.hot_tier.bytes);
-    layer_gauge!("timefusion.hot_tier.files", "Demoted bucket files in the local hot tier", |s| s.hot_tier.files as u64);
-    layer_counter!("timefusion.hot_tier.writes_total", "Buckets demoted to the local hot tier", |s| s.hot_tier.writes);
-    layer_counter!("timefusion.hot_tier.write_failures_total", "Demotions that errored. ALERT if sustained", |s| s.hot_tier.write_failures);
-    layer_counter!("timefusion.hot_tier.read_hits_total", "Hot-tier files served to a scan", |s| s.hot_tier.read_hits);
-    layer_counter!("timefusion.hot_tier.read_misses_total", "Hot-tier files that read as torn/absent and fell through to Delta. ALERT if sustained", |s| s
+    layer_metric!(gauge "timefusion.hot_tier.bytes", "Bytes of demoted Arrow IPC held by the local hot tier", |s| s.hot_tier.bytes);
+    layer_metric!(gauge "timefusion.hot_tier.files", "Demoted bucket files in the local hot tier", |s| s.hot_tier.files as u64);
+    layer_metric!(counter "timefusion.hot_tier.writes_total", "Buckets demoted to the local hot tier", |s| s.hot_tier.writes);
+    layer_metric!(counter "timefusion.hot_tier.write_failures_total", "Demotions that errored. ALERT if sustained", |s| s.hot_tier.write_failures);
+    layer_metric!(counter "timefusion.hot_tier.read_hits_total", "Hot-tier files served to a scan", |s| s.hot_tier.read_hits);
+    layer_metric!(counter "timefusion.hot_tier.read_misses_total", "Hot-tier files that read as torn/absent and fell through to Delta. ALERT if sustained", |s| s
         .hot_tier
         .read_misses);
-    layer_counter!("timefusion.hot_tier.schema_drift_total", "Hot-tier files skipped because their schema no longer matches the table's", |s| s
+    layer_metric!(counter "timefusion.hot_tier.schema_drift_total", "Hot-tier files skipped because their schema no longer matches the table's", |s| s
         .hot_tier
         .schema_drift);
-    layer_counter!("timefusion.hot_tier.mem_skipped_total", "Hot-tier files skipped because MemBuffer still owned their window (expected)", |s| s
+    layer_metric!(counter "timefusion.hot_tier.mem_skipped_total", "Hot-tier files skipped because MemBuffer still owned their window (expected)", |s| s
         .hot_tier
         .mem_skipped);
-    layer_gauge!(
+    layer_metric!(gauge
         "timefusion.hot_tier.suppressed_tables",
         "Tables currently not demoting because a DML kept invalidating their files before any query read them",
         |s| s.hot_tier.suppressed_tables as u64
     );
-    layer_counter!(
+    layer_metric!(counter
         "timefusion.hot_tier.suppressions_total",
         "Times a table's demotions were judged not to pay off and were suspended for a cooldown. Sustained growth on a table you expect to be read means the hot tier is losing a race with continuous enrichment — expected for whole-table UPDATE workloads, otherwise investigate",
         |s| s.hot_tier.suppressions
     );
-    layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
-    layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
-    layer_gauge!("timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
+    layer_metric!(gauge "timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
+    layer_metric!(gauge "timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
+    layer_metric!(gauge "timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
         .tantivy_recovery_pending_files
         as u64);
 
@@ -252,35 +237,20 @@ pub fn init_metrics(
     // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
     // indexing lag that the rewriter / search service can't shortcut around.
     if let Some(indexer_weak) = tantivy_indexer {
-        let bl_for_lag = buffered_layer;
         meter
             .u64_observable_gauge("timefusion.tantivy.index_lag_seconds")
             .with_description("now() minus newest indexed timestamp; quantifies post-flush index lag")
             .with_callback(move |obs| {
                 let Some(svc) = indexer_weak.upgrade() else { return };
                 let Some(newest_idx) = svc.newest_indexed_micros() else { return };
-                // Compare against newest MemBuffer timestamp if available
-                // (more meaningful than wall clock — ingest may have stopped).
-                // Fall back to wall clock if no MemBuffer reference exists.
-                let now_micros = if let Some(layer) = bl_for_lag.upgrade() {
-                    layer.snapshot_stats().oldest_bucket_age_secs.map(|_| crate::clock::now_micros()).unwrap_or_else(crate::clock::now_micros)
-                } else {
-                    crate::clock::now_micros()
-                };
-                let lag_secs = ((now_micros - newest_idx).max(0) / 1_000_000) as u64;
-                obs.observe(lag_secs, &[]);
+                obs.observe(((crate::clock::now_micros() - newest_idx).max(0) / 1_000_000) as u64, &[]);
             })
             .build();
     }
 
-    let registry = MetricsRegistry::new(&meter);
-    if METRICS.set(registry).is_err() {
+    if METRICS.set(MetricsRegistry::new(&meter)).is_err() {
         warn!("MetricsRegistry was already set; metric counters from this call will be discarded");
     }
-
-    // Keep provider alive by leaking the Arc — it's process-global and lives
-    // until shutdown anyway. Avoids stashing a handle the caller must own.
-    let _ = Arc::new(provider);
 
     info!("OpenTelemetry metrics initialized (OTLP -> {}, interval=30s)", config.otel_exporter_otlp_endpoint);
     Ok(())
@@ -314,20 +284,20 @@ pub fn record_ingest_error(project_id: &str, table_name: &str) {
 
 pub fn record_flush(success: bool) {
     if let Some(m) = METRICS.get() {
-        if success {
-            m.flush_completed.add(1, &[]);
-        } else {
-            m.flush_failed.add(1, &[]);
-        }
+        (if success { &m.flush_completed } else { &m.flush_failed }).add(1, &[]);
     }
 }
 
-/// Generates the no-attribute "increment by one" recorders. Each no-ops if
-/// metrics weren't initialized.
-macro_rules! simple_recorders {
-    ($($fn_name:ident => $field:ident),+ $(,)?) => {
+/// Generates the no-attribute "increment by one" recorders. Each no-ops on the
+/// OTel side if metrics weren't initialized; `mirror STATIC.field` additionally
+/// bumps a process-global atomic, which — unlike an OTel counter — is readable
+/// back in-process by the `timefusion_stats` view and by tests.
+macro_rules! recorders {
+    ($($(#[$doc:meta])* $fn_name:ident => $field:ident $(mirror $stats:ident . $mirrored:ident)?),+ $(,)?) => {
         $(
+            $(#[$doc])*
             pub fn $fn_name() {
+                $($stats.$mirrored.fetch_add(1, Relaxed);)?
                 if let Some(m) = METRICS.get() {
                     m.$field.add(1, &[]);
                 }
@@ -336,7 +306,22 @@ macro_rules! simple_recorders {
     };
 }
 
-simple_recorders! {
+/// Same, for recorders that add caller-supplied counts to one or more counters.
+macro_rules! sum_recorders {
+    ($($(#[$doc:meta])* $fn_name:ident ( $($arg:ident => $field:ident $(mirror $stats:ident . $mirrored:ident)?),+ $(,)? ));+ $(;)?) => {
+        $(
+            $(#[$doc])*
+            pub fn $fn_name($($arg: u64),+) {
+                $($($stats.$mirrored.fetch_add($arg, Relaxed);)?)+
+                if let Some(m) = METRICS.get() {
+                    $(m.$field.add($arg, &[]);)+
+                }
+            }
+        )+
+    };
+}
+
+recorders! {
     record_wal_corruption => wal_corruption,
     record_quarantine_redriven => quarantine_redriven,
     record_quarantine_backlog => quarantine_backlog,
@@ -358,36 +343,51 @@ simple_recorders! {
     record_cache_confirm_timeout => cache_confirm_timeouts,
     record_cache_insert_bypassed => cache_insert_bypassed,
     record_hot_tier_demote_skipped => hot_tier_demote_skipped,
+    /// One optimize/compaction OCC conflict (retryable). A sustained rate means the
+    /// optimizer is repeatedly losing commit races to concurrent dedup/flush.
+    record_optimize_conflict => optimize_conflict,
+    /// One optimize/compaction run that errored or gave up after retries — that
+    /// partition stays fragmented until a later run succeeds.
+    record_optimize_failed => optimize_failed,
+    /// One DML Delta operation OCC conflict (retried on a fresh snapshot).
+    record_dml_conflict => dml_conflict mirror DML_STATS.occ_conflicts,
+    record_dml_retry_success => dml_retry_success mirror DML_STATS.retry_successes,
+    record_dml_retry_exhausted => dml_retry_exhausted mirror DML_STATS.retry_exhausted,
+    /// One DML Delta leg skipped because its time window is entirely unflushed.
+    record_dml_delta_leg_skipped => dml_delta_leg_skipped,
+    /// One `UPDATE ... FROM` Delta leg deferred into the coalescer.
+    record_dml_coalesce_enqueued => dml_coalesce_enqueued,
+    /// One Delta merge executed by a coalescer drain.
+    record_dml_coalesce_merge => dml_coalesce_merges mirror DML_STATS.coalesce_merges,
+    /// One coalesced DML group parked to the quarantine dir after exhausting
+    /// drain retries. Recoverable — unlike `record_dml_coalesce_dropped`.
+    record_dml_coalesce_quarantined => dml_coalesce_quarantined mirror DML_STATS.coalesce_quarantined,
+    /// One coalesced DML group whose rows could not be quarantined — real loss.
+    record_dml_coalesce_dropped => dml_coalesce_dropped,
+    /// One dedup chunk rewrite skipped (over budget or in failure backoff).
+    record_dedup_chunk_skipped => dedup_chunk_skipped,
+    /// One cron maintenance run that exceeded the long-running warning threshold.
+    record_cron_long_running => maintenance_cron_long_running mirror MAINTENANCE_STATS.cron_long_running,
+    /// One out-of-band checkpoint failure (also mirrors to OTel for alerting).
+    record_checkpoint_failed => maintenance_checkpoint_failed mirror MAINTENANCE_STATS.checkpoint_failed,
+    /// One checkpoint that failed post-write footer verification (mirrors to OTel).
+    record_checkpoint_corrupt => maintenance_checkpoint_corrupt mirror MAINTENANCE_STATS.checkpoint_corrupt,
+    /// One out-of-band log-cleanup failure (mirrors to OTel).
+    record_log_cleanup_failed => maintenance_log_cleanup_failed mirror MAINTENANCE_STATS.log_cleanup_failed,
 }
 
-/// One pre-drain confirm pass: `attempted` files probed, `warmed` of them
-/// missing and fetched (the write-capture gap).
-pub fn record_cache_confirm(attempted: u64, warmed: u64) {
-    if let Some(m) = METRICS.get() {
-        m.cache_confirm_attempts.add(attempted, &[]);
-        m.cache_confirm_warmed.add(warmed, &[]);
-    }
-}
-
-pub fn record_dedup_dropped(rows: u64) {
-    if let Some(m) = METRICS.get() {
-        m.dedup_dropped_rows.add(rows, &[]);
-    }
-}
-
-pub fn record_compaction_dedup_dropped(rows: u64) {
-    if let Some(m) = METRICS.get() {
-        m.compaction_dedup_dropped_rows.add(rows, &[]);
-    }
-}
-
-/// Record one full-optimize run's idempotence split: how many window partitions
-/// were rewritten vs skipped as unchanged (the cache-churn-avoided signal).
-pub fn record_optimize_partitions(rewritten: u64, skipped: u64) {
-    if let Some(m) = METRICS.get() {
-        m.optimize_partitions_rewritten.add(rewritten, &[]);
-        m.optimize_partitions_skipped.add(skipped, &[]);
-    }
+sum_recorders! {
+    /// One pre-drain confirm pass: `attempted` files probed, `warmed` of them
+    /// missing and fetched (the write-capture gap).
+    record_cache_confirm(attempted => cache_confirm_attempts, warmed => cache_confirm_warmed);
+    record_dedup_dropped(rows => dedup_dropped_rows);
+    record_compaction_dedup_dropped(rows => compaction_dedup_dropped_rows);
+    /// Record one full-optimize run's idempotence split: how many window partitions
+    /// were rewritten vs skipped as unchanged (the cache-churn-avoided signal).
+    record_optimize_partitions(rewritten => optimize_partitions_rewritten, skipped => optimize_partitions_skipped);
+    /// `n` dangling Add entries Remove'd by the reconcile task (mirrors to OTel).
+    /// Nonzero ⇒ committed data was destroyed elsewhere.
+    record_dangling_removed(n => reconcile_dangling_removed mirror MAINTENANCE_STATS.dangling_removed);
 }
 
 /// One commit-path operation abandoned by its bound. `op` is a fixed set of
@@ -399,175 +399,89 @@ pub fn record_commit_timeout(op: &'static str) {
     }
 }
 
-/// One optimize/compaction OCC conflict (retryable). A sustained rate means the
-/// optimizer is repeatedly losing commit races to concurrent dedup/flush.
-pub fn record_optimize_conflict() {
-    if let Some(m) = METRICS.get() {
-        m.optimize_conflict.add(1, &[]);
+/// Declares a process-global atomic-counter struct together with its all-zero
+/// static, so a new counter can't drift from its initializer.
+macro_rules! atomic_stats {
+    ($(#[$sm:meta])* $name:ident => $global:ident { $($(#[$fm:meta])* $field:ident),+ $(,)? }) => {
+        $(#[$sm])*
+        pub struct $name {
+            $($(#[$fm])* pub $field: AtomicU64,)+
+        }
+        static $global: $name = $name { $($field: AtomicU64::new(0),)+ };
+    };
+}
+
+atomic_stats! {
+    DmlStats => DML_STATS {
+        occ_conflicts,
+        retry_successes,
+        retry_exhausted,
+        /// Delta merges executed by coalescer drains — readable in-process (the
+        /// OTel counter isn't); tests assert on deltas of this to pin folding.
+        coalesce_merges,
+        /// Groups parked to `<wal_dir>/quarantine/dml` — in-process readable so
+        /// tests can assert the terminal branch parks instead of dropping.
+        coalesce_quarantined,
     }
 }
-
-/// One optimize/compaction run that errored or gave up after retries — that
-/// partition stays fragmented until a later run succeeds.
-pub fn record_optimize_failed() {
-    if let Some(m) = METRICS.get() {
-        m.optimize_failed.add(1, &[]);
-    }
-}
-
-/// One DML Delta operation OCC conflict (retried on a fresh snapshot).
-pub fn record_dml_conflict() {
-    DML_STATS.occ_conflicts.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.dml_conflict.add(1, &[]);
-    }
-}
-
-pub fn record_dml_retry_success() {
-    DML_STATS.retry_successes.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.dml_retry_success.add(1, &[]);
-    }
-}
-
-pub fn record_dml_retry_exhausted() {
-    DML_STATS.retry_exhausted.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.dml_retry_exhausted.add(1, &[]);
-    }
-}
-
-/// One DML Delta leg skipped because its time window is entirely unflushed.
-pub fn record_dml_delta_leg_skipped() {
-    if let Some(m) = METRICS.get() {
-        m.dml_delta_leg_skipped.add(1, &[]);
-    }
-}
-
-/// One `UPDATE ... FROM` Delta leg deferred into the coalescer.
-pub fn record_dml_coalesce_enqueued() {
-    if let Some(m) = METRICS.get() {
-        m.dml_coalesce_enqueued.add(1, &[]);
-    }
-}
-
-/// One Delta merge executed by a coalescer drain.
-pub fn record_dml_coalesce_merge() {
-    DML_STATS.coalesce_merges.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.dml_coalesce_merges.add(1, &[]);
-    }
-}
-
-/// One coalesced DML group parked to the quarantine dir after exhausting
-/// drain retries. Recoverable — unlike `record_dml_coalesce_dropped`.
-pub fn record_dml_coalesce_quarantined() {
-    DML_STATS.coalesce_quarantined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.dml_coalesce_quarantined.add(1, &[]);
-    }
-}
-
-/// One coalesced DML group whose rows could not be quarantined — real loss.
-pub fn record_dml_coalesce_dropped() {
-    if let Some(m) = METRICS.get() {
-        m.dml_coalesce_dropped.add(1, &[]);
-    }
-}
-
-/// One dedup chunk rewrite skipped (over budget or in failure backoff).
-pub fn record_dedup_chunk_skipped() {
-    if let Some(m) = METRICS.get() {
-        m.dedup_chunk_skipped.add(1, &[]);
-    }
-}
-
-/// One cron maintenance run that exceeded the long-running warning threshold.
-pub fn record_cron_long_running() {
-    MAINTENANCE_STATS.cron_long_running.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.maintenance_cron_long_running.add(1, &[]);
-    }
-}
-
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-pub struct DmlStats {
-    pub occ_conflicts: AtomicU64,
-    pub retry_successes: AtomicU64,
-    pub retry_exhausted: AtomicU64,
-    /// Delta merges executed by coalescer drains — readable in-process (the
-    /// OTel counter isn't); tests assert on deltas of this to pin folding.
-    pub coalesce_merges: AtomicU64,
-    /// Groups parked to `<wal_dir>/quarantine/dml` — in-process readable so
-    /// tests can assert the terminal branch parks instead of dropping.
-    pub coalesce_quarantined: AtomicU64,
-}
-
-static DML_STATS: DmlStats = DmlStats {
-    occ_conflicts: AtomicU64::new(0),
-    retry_successes: AtomicU64::new(0),
-    retry_exhausted: AtomicU64::new(0),
-    coalesce_merges: AtomicU64::new(0),
-    coalesce_quarantined: AtomicU64::new(0),
-};
 
 pub fn dml_stats() -> &'static DmlStats {
     &DML_STATS
 }
 
-/// Readable maintenance counters for the `timefusion_stats` view — the OTel
-/// counters above can't be read back in-process. Process-global const atomics
-/// (no init needed), incremented by the out-of-band checkpoint + reconcile
-/// tasks. `checkpoint_lag_versions` is the last observed max lag (a gauge), the
-/// rest are monotonic.
-#[derive(Default)]
-pub struct MaintenanceStats {
-    pub checkpoints_created: AtomicU64,
-    pub checkpoint_failed: AtomicU64,
+atomic_stats! {
+    /// Readable maintenance counters for the `timefusion_stats` view — the OTel
+    /// counters above can't be read back in-process. Process-global const atomics
+    /// (no init needed), incremented by the out-of-band checkpoint + reconcile
+    /// tasks. `checkpoint_lag_versions` is the last observed max lag (a gauge), the
+    /// rest are monotonic.
+    #[derive(Default)]
+    MaintenanceStats => MAINTENANCE_STATS {
+    checkpoints_created,
+    checkpoint_failed,
     /// Checkpoints that wrote OK but failed post-write footer verification
     /// (the referenced object isn't a readable Parquet). Log cleanup is
     /// withheld so the JSON log stays recoverable. PAGE if > 0.
-    pub checkpoint_corrupt: AtomicU64,
-    pub log_files_cleaned: AtomicU64,
-    pub log_cleanup_failed: AtomicU64,
-    pub checkpoint_lag_versions: AtomicU64,
-    pub dangling_removed: AtomicU64,
-    pub reconcile_failed: AtomicU64,
-    pub dedup_timed_out: AtomicU64,
-    pub dedup_failed: AtomicU64,
-    pub light_optimize_timed_out: AtomicU64,
-    pub light_optimize_failed: AtomicU64,
+    checkpoint_corrupt,
+    log_files_cleaned,
+    log_cleanup_failed,
+    checkpoint_lag_versions,
+    dangling_removed,
+    reconcile_failed,
+    dedup_timed_out,
+    dedup_failed,
+    light_optimize_timed_out,
+    light_optimize_failed,
     /// Ticks that hit the wall-clock budget with hot projects still pending.
-    pub light_optimize_tick_truncated: AtomicU64,
+    light_optimize_tick_truncated,
     /// Wave-engine per-tick accounting. `planned` counts projects the tick's
     /// single metadata walk found work for; `completed` counts bins that landed.
     /// ALERT when completed lags planned for N consecutive ticks — that's the
     /// "8 of 11 hot projects never reached" shape (prod 2026-07-29).
-    pub light_optimize_projects_planned: AtomicU64,
-    pub light_optimize_projects_completed: AtomicU64,
-    pub light_optimize_bins_committed: AtomicU64,
-    pub light_optimize_waves_committed: AtomicU64,
+    light_optimize_projects_planned,
+    light_optimize_projects_completed,
+    light_optimize_bins_committed,
+    light_optimize_waves_committed,
     /// Dedup-engine waves (data_change: true) — counted separately so the
     /// light_optimize_* counters mean pure compaction only.
-    pub dedup_bins_committed: AtomicU64,
-    pub dedup_waves_committed: AtomicU64,
+    dedup_bins_committed,
+    dedup_waves_committed,
     /// Waves not STARTED because the WAL was over its emergency-flush threshold
     /// (durability outranks compaction) or memory was near the cgroup limit.
     /// Chronic nonzero = compaction is being starved, not protected.
-    pub light_optimize_wal_yields: AtomicU64,
-    pub light_optimize_memory_brakes: AtomicU64,
+    light_optimize_wal_yields,
+    light_optimize_memory_brakes,
     /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
     /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
     /// outrunning flush often enough that compaction is running at the floor.
-    pub light_optimize_ticks_degraded: AtomicU64,
-    pub dirty_bin_queue_depth: AtomicU64,
-    pub dirty_bin_enqueued: AtomicU64,
-    pub dirty_bin_eligible: AtomicU64,
-    pub dirty_bin_processed: AtomicU64,
-    pub dirty_bin_requeued: AtomicU64,
-    pub dirty_bin_dropped_rows: AtomicU64,
-    pub dirty_bin_rewrite_duration_ms: AtomicU64,
+    light_optimize_ticks_degraded,
+    dirty_bin_queue_depth,
+    dirty_bin_enqueued,
+    dirty_bin_eligible,
+    dirty_bin_processed,
+    dirty_bin_requeued,
+    dirty_bin_dropped_rows,
+    dirty_bin_rewrite_duration_ms,
     /// Cold-owned dirty bins (date old enough that the nightly consolidate owns
     /// the partition) DEPRIORITIZED to the tail of a drain pass and left on the
     /// queue. They are NOT dropped: consolidate bin-packs but does not collapse
@@ -576,102 +490,45 @@ pub struct MaintenanceStats {
     /// today, so in the default configuration EVERY drainable bin is cold-owned
     /// — this then reads as "queued bins this pass had no batch slot for".
     /// Chronic growth = a backlog the batch size can't keep up with.
-    pub dedup_bins_deferred_cold: AtomicU64,
+    dedup_bins_deferred_cold,
     /// Drain passes skipped (or cut short between chunks) because the flush path
     /// was behind. Dedup is an optimization — read-side DedupExec keeps results
     /// correct — so it yields to persistence (2026-07-30: a boot drain over a
     /// 10-day backlog pinned the commit path and starved flush for a whole
     /// container life). Chronic nonzero = flush is unhealthy, not dedup.
-    pub dedup_passes_flush_yields: AtomicU64,
+    dedup_passes_flush_yields,
     /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
     /// on a per-table commit lock a flush was already waiting for — the flush
     /// starvation of prod 2026-07-30, where durability waited >600s behind
     /// legally-slow maintenance commits. The wave's bins are requeued and
     /// re-staged later, so this is deferred work, not lost work. Chronic nonzero
     /// = flush is saturating the commit path and compaction is being crowded out.
-    pub wave_commits_yielded_to_flush: AtomicU64,
+    wave_commits_yielded_to_flush,
     /// Cron ticks skipped because the previous run of the same job was still
     /// in flight. A steadily growing value = a wedged/overlong job body.
-    pub cron_ticks_skipped: AtomicU64,
+    cron_ticks_skipped,
     /// Cron fires actually dispatched (all jobs). Frozen while uptime grows =
     /// the scheduler is dead (2026-07-14 outage signature).
-    pub cron_ticks_fired: AtomicU64,
+    cron_ticks_fired,
     /// Cron runs that exceeded the long-running warning threshold. Slow but
     /// progressing work is allowed to finish; this is for observability.
-    pub cron_long_running: AtomicU64,
+    cron_long_running,
+    }
 }
-
-static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
-    checkpoints_created: AtomicU64::new(0),
-    checkpoint_failed: AtomicU64::new(0),
-    checkpoint_corrupt: AtomicU64::new(0),
-    log_files_cleaned: AtomicU64::new(0),
-    log_cleanup_failed: AtomicU64::new(0),
-    checkpoint_lag_versions: AtomicU64::new(0),
-    dangling_removed: AtomicU64::new(0),
-    reconcile_failed: AtomicU64::new(0),
-    dedup_timed_out: AtomicU64::new(0),
-    dedup_failed: AtomicU64::new(0),
-    light_optimize_timed_out: AtomicU64::new(0),
-    light_optimize_failed: AtomicU64::new(0),
-    light_optimize_tick_truncated: AtomicU64::new(0),
-    light_optimize_projects_planned: AtomicU64::new(0),
-    light_optimize_projects_completed: AtomicU64::new(0),
-    light_optimize_bins_committed: AtomicU64::new(0),
-    light_optimize_waves_committed: AtomicU64::new(0),
-    dedup_bins_committed: AtomicU64::new(0),
-    dedup_waves_committed: AtomicU64::new(0),
-    light_optimize_wal_yields: AtomicU64::new(0),
-    light_optimize_memory_brakes: AtomicU64::new(0),
-    light_optimize_ticks_degraded: AtomicU64::new(0),
-    dirty_bin_queue_depth: AtomicU64::new(0),
-    dirty_bin_enqueued: AtomicU64::new(0),
-    dirty_bin_eligible: AtomicU64::new(0),
-    dirty_bin_processed: AtomicU64::new(0),
-    dirty_bin_requeued: AtomicU64::new(0),
-    dirty_bin_dropped_rows: AtomicU64::new(0),
-    dirty_bin_rewrite_duration_ms: AtomicU64::new(0),
-    dedup_bins_deferred_cold: AtomicU64::new(0),
-    dedup_passes_flush_yields: AtomicU64::new(0),
-    wave_commits_yielded_to_flush: AtomicU64::new(0),
-    cron_ticks_skipped: AtomicU64::new(0),
-    cron_ticks_fired: AtomicU64::new(0),
-    cron_long_running: AtomicU64::new(0),
-};
 
 pub fn maintenance_stats() -> &'static MaintenanceStats {
     &MAINTENANCE_STATS
 }
 
-/// One out-of-band checkpoint failure (also mirrors to OTel for alerting).
-pub fn record_checkpoint_failed() {
-    MAINTENANCE_STATS.checkpoint_failed.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.maintenance_checkpoint_failed.add(1, &[]);
-    }
-}
-
-/// One checkpoint that failed post-write footer verification (mirrors to OTel).
-pub fn record_checkpoint_corrupt() {
-    MAINTENANCE_STATS.checkpoint_corrupt.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.maintenance_checkpoint_corrupt.add(1, &[]);
-    }
-}
-
-/// One out-of-band log-cleanup failure (mirrors to OTel).
-pub fn record_log_cleanup_failed() {
-    MAINTENANCE_STATS.log_cleanup_failed.fetch_add(1, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.maintenance_log_cleanup_failed.add(1, &[]);
-    }
-}
-
-/// `n` dangling Add entries Remove'd by the reconcile task (mirrors to OTel).
-/// Nonzero ⇒ committed data was destroyed elsewhere.
-pub fn record_dangling_removed(n: u64) {
-    MAINTENANCE_STATS.dangling_removed.fetch_add(n, Relaxed);
-    if let Some(m) = METRICS.get() {
-        m.reconcile_dangling_removed.add(n, &[]);
-    }
+/// Resident set size of this process in bytes from `/proc/self/statm`
+/// (Linux only; None elsewhere). Compare against the MemBuffer's
+/// `estimate_batch_size` charge: a large RSS-below-estimate gap means the
+/// per-bucket estimate (`get_array_memory_size` on wide Utf8View / replayed
+/// batches) is over-counting, so backpressure is tripping on phantom bytes
+/// rather than real memory.
+pub fn process_rss_bytes() -> Option<usize> {
+    // statm fields are in pages; resident is field 2. 4 KiB pages on every
+    // Linux target TF deploys to (x86_64) — avoids a libc dependency.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    statm.split_whitespace().nth(1)?.parse::<usize>().ok().map(|pages| pages * 4096)
 }

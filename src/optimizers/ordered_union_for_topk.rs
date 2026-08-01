@@ -47,6 +47,8 @@ use datafusion::{
     },
 };
 
+use super::downcast;
+
 #[derive(Debug, Default)]
 pub struct OrderedUnionForTopK;
 
@@ -55,16 +57,14 @@ pub struct OrderedUnionForTopK;
 /// if any key is not a plain column or is absent from `schema` — in which case
 /// the rule bails (correctness over cleverness).
 fn resolve_ordering(req: &LexOrdering, schema: &Schema) -> Option<LexOrdering> {
-    let mut out = Vec::with_capacity(req.len());
-    for se in req.iter() {
-        // Explicit Any upcast — the PhysicalExpr trait's `as_any` collides with
-        // downcast-rs's blanket method in this crate's scope (see read_dedup.rs).
-        let any: &dyn std::any::Any = se.expr.as_ref();
-        let col = any.downcast_ref::<Column>()?;
-        let idx = schema.index_of(col.name()).ok()?;
-        out.push(PhysicalSortExpr::new(Arc::new(Column::new(col.name(), idx)), se.options));
-    }
-    LexOrdering::new(out)
+    req.iter()
+        .map(|se| {
+            let col = downcast::<Column>(se.expr.as_ref())?;
+            let idx = schema.index_of(col.name()).ok()?;
+            Some(PhysicalSortExpr::new(Arc::new(Column::new(col.name(), idx)), se.options))
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(LexOrdering::new)
 }
 
 /// The shared mechanism: `children` with every child that does not already
@@ -94,10 +94,8 @@ pub fn ordered_children(
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
     let sat: Vec<bool> = children.iter().map(|c| c.properties().equivalence_properties().ordering_satisfy(req.iter().cloned())).collect::<Result<Vec<_>>>()?;
     let unsortable = |i: usize| !sortable.get(i).copied().unwrap_or(true);
-    if sat.iter().all(|&s| s) || sat.iter().enumerate().any(|(i, &s)| !s && unsortable(i)) || (require_ordered_child && !sat.iter().any(|&s| s)) {
-        return Ok(None);
-    }
-    Ok(Some(
+    let leave_alone = sat.iter().all(|&s| s) || sat.iter().enumerate().any(|(i, &s)| !s && unsortable(i)) || (require_ordered_child && !sat.iter().any(|&s| s));
+    Ok((!leave_alone).then(|| {
         children
             .iter()
             .zip(sat)
@@ -108,13 +106,13 @@ pub fn ordered_children(
             // consumes, so this is the cheaper shape for both callers.
             .map(|(c, s)| {
                 if s {
-                    c.clone()
+                    Arc::clone(c)
                 } else {
-                    Arc::new(SortExec::new(req.clone(), c.clone()).with_preserve_partitioning(true).with_fetch(fetch)) as Arc<dyn ExecutionPlan>
+                    Arc::new(SortExec::new(req.clone(), Arc::clone(c)).with_preserve_partitioning(true).with_fetch(fetch)) as Arc<dyn ExecutionPlan>
                 }
             })
-            .collect(),
-    ))
+            .collect()
+    }))
 }
 
 /// Walk down from a fetching sort through single-child order-preserving
@@ -123,10 +121,7 @@ pub fn ordered_children(
 /// `fetch`) so the union becomes order-preserving. Returns the rewritten
 /// subtree, or `None` when nothing applied.
 fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<usize>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    // Explicit Any upcast — `ExecutionPlan: Any` but exposes no `as_any` trait
-    // method in this build (see read_dedup.rs for the same pattern).
-    let plan_any: &dyn std::any::Any = plan.as_ref();
-    if let Some(union) = plan_any.downcast_ref::<UnionExec>() {
+    if let Some(union) = downcast::<UnionExec>(plan.as_ref()) {
         let Some(req_here) = resolve_ordering(req, &union.schema()) else {
             return Ok(None);
         };
@@ -135,10 +130,7 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
         // none-ordered means the Delta pushdown is off (mixed footers) — leave
         // the blocking sort in place.
         let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
-        let Some(new_children) = ordered_children(&children, &req_here, fetch, &[], true)? else {
-            return Ok(None);
-        };
-        return Ok(Some(UnionExec::try_new(new_children)?));
+        return ordered_children(&children, &req_here, fetch, &[], true)?.map(UnionExec::try_new).transpose();
     }
     // Descend only through single-child, order-preserving operators so the
     // ordering we create actually propagates up to the sort.
@@ -165,28 +157,19 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
         Ok(plan
             .transform_down(|node| {
                 // Anchor: a fetching global sort (the `ORDER BY … LIMIT n` shape).
-                let node_any: &dyn std::any::Any = node.as_ref();
-                let (req, fetch) = if let Some(s) = node_any.downcast_ref::<SortExec>() {
-                    (s.expr().clone(), s.fetch())
-                } else if let Some(m) = node_any.downcast_ref::<SortPreservingMergeExec>() {
-                    (m.expr().clone(), m.fetch())
-                } else {
+                let Some((req, fetch)) = downcast::<SortExec>(node.as_ref())
+                    .map(|s| (s.expr().clone(), s.fetch()))
+                    .or_else(|| downcast::<SortPreservingMergeExec>(node.as_ref()).map(|m| (m.expr().clone(), m.fetch())))
+                    .filter(|(_, fetch)| fetch.is_some())
+                else {
                     return Ok(Transformed::no(node));
                 };
-                if fetch.is_none() {
-                    return Ok(Transformed::no(node));
-                }
                 let children = node.children();
-                let Some(input) = children.first().copied() else {
-                    return Ok(Transformed::no(node));
-                };
-                match order_union(input, &req, fetch)? {
-                    Some(new_input) => {
-                        let new_node = Arc::clone(&node).with_new_children(vec![new_input])?;
-                        Ok(Transformed::yes(new_node))
-                    }
-                    None => Ok(Transformed::no(node)),
-                }
+                let rewritten = children.first().copied().map(|input| order_union(input, &req, fetch)).transpose()?.flatten();
+                Ok(match rewritten {
+                    Some(new_input) => Transformed::yes(node.with_new_children(vec![new_input])?),
+                    None => Transformed::no(node),
+                })
             })?
             .data)
     }
@@ -194,18 +177,15 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use datafusion::arrow::compute::SortOptions;
     use datafusion::{
-        arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
-        common::config::ConfigOptions,
-        physical_expr::{LexOrdering, Partitioning, PhysicalSortExpr, expressions::Column},
+        arrow::{
+            compute::SortOptions,
+            datatypes::{DataType, Field, SchemaRef, TimeUnit},
+        },
+        physical_expr::{EquivalenceProperties, Partitioning},
         physical_plan::{
-            ExecutionPlan, PlanProperties,
+            PlanProperties,
             execution_plan::{Boundedness, EmissionType},
-            sorts::sort::SortExec,
-            union::UnionExec,
         },
     };
 
@@ -231,11 +211,8 @@ mod tests {
 
     impl MockLeaf {
         fn leaf(schema: SchemaRef, ordering: Option<LexOrdering>) -> Arc<dyn ExecutionPlan> {
-            use datafusion::physical_expr::EquivalenceProperties;
-            let eq = match ordering {
-                Some(o) => EquivalenceProperties::new_with_orderings(schema, [o]),
-                None => EquivalenceProperties::new(schema),
-            };
+            // `Option<LexOrdering>` is an iterator of 0..1 orderings — no branch needed.
+            let eq = EquivalenceProperties::new_with_orderings(schema, ordering);
             let props = Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
             Arc::new(MockLeaf { props })
         }
@@ -265,14 +242,18 @@ mod tests {
         }
     }
 
-    fn count_sort_over_mem(plan: &Arc<dyn ExecutionPlan>) -> usize {
-        // Number of SortExec nodes anywhere in the tree.
-        let any: &dyn std::any::Any = plan.as_ref();
-        let mut n = usize::from(any.downcast_ref::<SortExec>().is_some());
-        for c in plan.children() {
-            n += count_sort_over_mem(c);
-        }
-        n
+    /// Number of `SortExec` nodes anywhere in the tree.
+    fn count_sorts(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        usize::from(downcast::<SortExec>(plan.as_ref()).is_some()) + plan.children().into_iter().map(count_sorts).sum::<usize>()
+    }
+
+    /// `SortExec(ts DESC, fetch)` over `mem (unordered) ∪ delta`, where delta
+    /// advertises `[ts DESC]` only when `delta_ordered` — the two dimensions the
+    /// guards below vary. Returns the plan and the requested ordering.
+    fn fetching_sort_over_union(delta_ordered: bool, fetch: Option<usize>) -> (Arc<dyn ExecutionPlan>, LexOrdering) {
+        let (s, ord) = (schema(), ts_desc());
+        let union = UnionExec::try_new(vec![MockLeaf::leaf(s.clone(), None), MockLeaf::leaf(s, delta_ordered.then(|| ord.clone()))]).unwrap();
+        (Arc::new(SortExec::new(ord.clone(), union).with_fetch(fetch)), ord)
     }
 
     // Bug: `ORDER BY timestamp DESC LIMIT n` over a mem∪delta union re-sorts the
@@ -281,38 +262,26 @@ mod tests {
     // sort the mem branch to match delta's advertised ordering.
     #[test]
     fn wraps_unordered_mem_branch_of_fetching_sort() {
-        let s = schema();
-        let ord = ts_desc();
-        let mem = MockLeaf::leaf(s.clone(), None); // MemBuffer: no ordering
-        let delta = MockLeaf::leaf(s.clone(), Some(ord.clone())); // Delta: [ts DESC]
-        let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![mem, delta]).unwrap();
-        let top: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ord.clone(), union).with_fetch(Some(50)));
+        let (top, ord) = fetching_sort_over_union(true, Some(50));
 
         let out = OrderedUnionForTopK.optimize(top, &ConfigOptions::new()).unwrap();
 
         // The union is now order-preserving: it advertises [ts DESC].
-        let union = out.children()[0];
         assert!(
-            union.properties().equivalence_properties().ordering_satisfy(ord.iter().cloned()).unwrap(),
+            out.children()[0].properties().equivalence_properties().ordering_satisfy(ord.iter().cloned()).unwrap(),
             "union must advertise the sort ordering after the rule runs"
         );
         // Top sort + one injected mem sort = 2 SortExecs.
-        assert_eq!(count_sort_over_mem(&out), 2, "exactly one SortExec injected over the mem branch");
+        assert_eq!(count_sorts(&out), 2, "exactly one SortExec injected over the mem branch");
     }
 
     // Guard: no fetch (plain ORDER BY, no LIMIT) → rule must not touch the plan,
     // so counts/aggregations and unbounded sorts don't grow a MemBuffer sort.
     #[test]
     fn ignores_sort_without_fetch() {
-        let s = schema();
-        let ord = ts_desc();
-        let mem = MockLeaf::leaf(s.clone(), None);
-        let delta = MockLeaf::leaf(s.clone(), Some(ord.clone()));
-        let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![mem, delta]).unwrap();
-        let top: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ord.clone(), union));
-
-        let out = OrderedUnionForTopK.optimize(top.clone(), &ConfigOptions::new()).unwrap();
-        assert_eq!(count_sort_over_mem(&out), 1, "no injection when there is no fetch");
+        let (top, _) = fetching_sort_over_union(true, None);
+        let out = OrderedUnionForTopK.optimize(top, &ConfigOptions::new()).unwrap();
+        assert_eq!(count_sorts(&out), 1, "no injection when there is no fetch");
     }
 
     // `ordered_children` is also called directly by `ProjectRoutingTable::scan`
@@ -329,8 +298,8 @@ mod tests {
 
         // mem (sortable) ∪ delta (ordered) → mem gets sorted.
         let out = ordered_children(&[mem.clone(), delta_ordered], &ord, None, &[true, false], false).unwrap().expect("mixed union is rewritten");
-        assert_eq!(count_sort_over_mem(&out[0]), 1, "the mem leg is sorted");
-        assert_eq!(count_sort_over_mem(&out[1]), 0, "the already-ordered Delta leg is untouched");
+        assert_eq!(count_sorts(&out[0]), 1, "the mem leg is sorted");
+        assert_eq!(count_sorts(&out[1]), 0, "the already-ordered Delta leg is untouched");
 
         // mem (sortable) ∪ delta (UNORDERED, unsortable) → bail entirely: a
         // blocking sort over a whole-window parquet scan is the 2026-07-21 OOM.
@@ -347,14 +316,8 @@ mod tests {
     // rollout) the rule is a no-op — the built-in blocking sort stays.
     #[test]
     fn ignores_union_with_no_ordered_child() {
-        let s = schema();
-        let ord = ts_desc();
-        let mem = MockLeaf::leaf(s.clone(), None);
-        let delta = MockLeaf::leaf(s.clone(), None);
-        let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![mem, delta]).unwrap();
-        let top: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ord.clone(), union).with_fetch(Some(50)));
-
+        let (top, _) = fetching_sort_over_union(false, Some(50));
         let out = OrderedUnionForTopK.optimize(top, &ConfigOptions::new()).unwrap();
-        assert_eq!(count_sort_over_mem(&out), 1, "no injection when neither branch is ordered");
+        assert_eq!(count_sorts(&out), 1, "no injection when neither branch is ordered");
     }
 }

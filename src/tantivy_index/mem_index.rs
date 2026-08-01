@@ -6,21 +6,10 @@
 //! Indexes are dropped when the bucket drains or is evicted — they're a
 //! pure query cache, never the authoritative source.
 //!
-//! Lifecycle:
-//! ```text
-//!   first text_match query           bucket drains
-//!         │                                │
-//!         ▼                                ▼
-//!   build_from_batches()  ←─→  search()  drop_cache()
-//!         │
-//!         └─► cached until row_count > built_with_rows
-//! ```
-//!
-//! Memory profile: each index holds `~2× indexed text size` in postings.
-//! For 10 minutes of moderate log ingest (~100MB indexed text) that's
-//! ~200MB per active bucket. Acceptable when there are ≤ flush_interval
-//! buckets active at once; outside that window the post-flush callback
-//! takes over and these in-memory copies are released.
+//! Memory profile: each index holds `~2× indexed text size` in postings —
+//! ~200MB per active bucket at 10 minutes of moderate log ingest. Acceptable
+//! while ≤ flush_interval buckets are active; past that window the post-flush
+//! callback takes over and these in-memory copies are released.
 
 use std::sync::Arc;
 
@@ -32,9 +21,9 @@ use crate::{
     schema_loader::TableSchema,
     tantivy_index::{
         builder,
-        reader::Hit,
-        schema::{BuiltSchema, register_tokenizers},
-        udf::TextMatchPred,
+        reader::{Hit, PredsQuery, build_node_query, query_index},
+        schema::{BuiltSchema, indexed_field_names, register_tokenizers},
+        udf::PredNode,
     },
 };
 
@@ -47,11 +36,8 @@ pub struct BucketTextIndex {
     /// rebuild on next query; the original SQL predicate keeps results
     /// correct in the meantime.
     pub indexed_rows: usize,
-    /// Approximate memory cost of this index in bytes. Used by the
-    /// `MemBuffer` LRU to enforce a global budget. Estimated from the
-    /// snapshot's indexed-text bytes × 2 (rough overhead for trigram
-    /// postings + skip lists); errs on the high side so the budget is
-    /// conservative rather than blown.
+    /// Approximate memory cost in bytes (see `estimate_index_size`);
+    /// drives the `MemBuffer` LRU budget.
     pub size_bytes: usize,
 }
 
@@ -59,31 +45,23 @@ impl BucketTextIndex {
     /// Build (or return None if the table has no indexed fields) from the
     /// bucket's current batches. Caller decides whether to cache the result.
     pub fn build(table: &TableSchema, batches: &[RecordBatch], row_count: usize) -> Result<Option<Self>> {
-        // Skip if no indexed fields — there's no useful work to do.
-        if !table.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)) {
+        let indexed = indexed_field_names(table);
+        if indexed.is_empty() || batches.is_empty() {
             return Ok(None);
         }
-        if batches.is_empty() {
-            return Ok(None);
-        }
-        let size_bytes = estimate_index_size(table, batches);
+        let size_bytes = estimate_index_size(&indexed, batches);
         let (index, built_schema, _stats) = builder::build_in_memory(table, batches).with_context(|| format!("build mem-index for {}", table.table_name))?;
         register_tokenizers(&index);
         Ok(Some(Self { index, built_schema: Arc::new(built_schema), indexed_rows: row_count, size_bytes }))
     }
 
-    /// Run a `text_match`-style query against this index and return hits.
-    pub fn search(&self, pred: &TextMatchPred) -> Result<Vec<Hit>> {
-        self.search_node(&crate::tantivy_index::udf::PredNode::Leaf(pred.clone()))
-    }
-
     /// Evaluate a routable predicate tree as ONE combined query. Shares the
     /// query builder with the Delta sidecar search so both sides interpret
     /// predicates identically (And→Must, Or→Should).
-    pub fn search_node(&self, node: &crate::tantivy_index::udf::PredNode) -> Result<Vec<Hit>> {
-        match crate::tantivy_index::reader::build_node_query(&self.index, node)? {
-            crate::tantivy_index::reader::PredsQuery::MissingField => Err(anyhow!("field not in mem-index (schema drift within bucket lifetime)")),
-            crate::tantivy_index::reader::PredsQuery::Query(q) => crate::tantivy_index::reader::query_index(&self.index, &*q, None),
+    pub fn search_node(&self, node: &PredNode) -> Result<Vec<Hit>> {
+        match build_node_query(&self.index, node)? {
+            PredsQuery::MissingField => Err(anyhow!("field not in mem-index (schema drift within bucket lifetime)")),
+            PredsQuery::Query(q) => query_index(&self.index, q.as_ref(), None),
         }
     }
 }
@@ -92,25 +70,18 @@ impl BucketTextIndex {
 /// indexed-text bytes × 2 (postings + skip-list overhead, conservative for
 /// trigram tokenizers). Used by the `MemBuffer` LRU budget — accurate to
 /// within ~2× is sufficient since the budget is itself a soft cap.
-fn estimate_index_size(table: &TableSchema, batches: &[RecordBatch]) -> usize {
+fn estimate_index_size(indexed_fields: &[String], batches: &[RecordBatch]) -> usize {
     use arrow::array::{Array, AsArray};
-    let indexed_fields: Vec<&str> = table.fields.iter().filter(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)).map(|f| f.name.as_str()).collect();
-    if indexed_fields.is_empty() {
-        return 0;
-    }
-    let mut bytes: usize = 0;
-    for batch in batches {
-        for field_name in &indexed_fields {
-            let Some(arr) = batch.column_by_name(field_name) else { continue };
-            if let Some(a) = arr.as_string_opt::<i32>() {
-                bytes += a.value_data().len();
-            } else if arr.as_any().downcast_ref::<arrow::array::StringViewArray>().is_some() {
-                // Utf8View — approximate by total array byte size; over-counts
-                // by the validity/offset overhead but stays in the right
-                // order of magnitude.
-                bytes += arr.get_array_memory_size();
-            }
-        }
-    }
-    bytes.saturating_mul(2)
+    batches
+        .iter()
+        .flat_map(|batch| indexed_fields.iter().filter_map(move |name| batch.column_by_name(name)))
+        .map(|arr| match arr.as_string_opt::<i32>() {
+            Some(a) => a.value_data().len(),
+            // Utf8View has no contiguous value buffer — total array bytes
+            // over-count by view/validity overhead but stay in magnitude.
+            None if arr.as_string_view_opt().is_some() => arr.get_array_memory_size(),
+            None => 0,
+        })
+        .sum::<usize>()
+        .saturating_mul(2)
 }

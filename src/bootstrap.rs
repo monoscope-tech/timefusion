@@ -48,15 +48,10 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     let delta_write_callback: DeltaWriteCallback =
         Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
             let db = db_for_callback.clone();
-            Box::pin(async move {
-                // insert_records_batch warms the just-flushed files itself
-                // (watermark-gated) — warming here too would double the GETs.
-                let added = db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
-                Ok(added)
-            })
+            // insert_records_batch warms the just-flushed files itself
+            // (watermark-gated) — warming here too would double the GETs.
+            Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await })
         });
-
-    let coalesced_write_callback = coalesced_delta_write_callback(&db);
 
     let mut session_context = Arc::new(db.clone()).create_session_context();
     db.setup_session_udfs(&mut session_context)?;
@@ -69,29 +64,22 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     let t_layer = std::time::Instant::now();
     let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?
         .with_delta_writer(delta_write_callback)
-        .with_coalesced_delta_writer(coalesced_write_callback);
+        .with_coalesced_delta_writer(coalesced_delta_write_callback(&db));
     tracing::info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
 
     // Optional tantivy sidecar (mirrors main.rs). Disabled when no indexed
     // tables OR the bucket is unset (tests with foyer-only setups).
-    let indexed_tables = cfg.tantivy.indexed_tables();
-    if !indexed_tables.is_empty() {
-        let bucket = cfg.aws.aws_s3_bucket.clone().unwrap_or_default();
-        if !bucket.is_empty() {
-            let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
-            let storage_opts = cfg.aws.build_storage_options(None);
-            let obj_store = db.create_object_store(&storage_uri, &storage_opts).await?;
-            let svc = Arc::new(crate::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
-            layer = layer.with_tantivy_indexer(svc.clone().callback());
-            let cache_root = cfg.core.timefusion_data_dir.clone();
-            let search = Arc::new(crate::tantivy_index::search::TantivySearchService::new(obj_store, cache_root));
-            db = db.with_tantivy_search(search).with_tantivy_indexer(svc);
-        }
+    let bucket = cfg.aws.aws_s3_bucket.clone().unwrap_or_default();
+    if !cfg.tantivy.indexed_tables().is_empty() && !bucket.is_empty() {
+        let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
+        let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+        let svc = Arc::new(crate::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
+        layer = layer.with_tantivy_indexer(svc.clone().callback());
+        let search = Arc::new(crate::tantivy_index::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone()));
+        db = db.with_tantivy_search(search).with_tantivy_indexer(svc);
     }
 
     let buffered_layer = Arc::new(layer);
-    // Tantivy init may also dominate on cold start if many indexed tables
-    // exist; bracket it independently from the WAL/Delta phases below.
 
     // Mirror main.rs: clean snapshot → skip the Delta cursor scan; dirty/missing
     // snapshot → derive cursors from Delta so WAL replay doesn't re-inject
@@ -101,8 +89,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     // without needing trace-level enabled.
     let wal_ref = buffered_layer.wal();
     let t_snap = std::time::Instant::now();
-    let skip_delta_scan =
-        if let Some(snap) = wal_ref.load_cursor_snapshot() { wal_ref.restore_cursor_snapshot(&snap).is_ok() && snap.clean_shutdown } else { false };
+    let skip_delta_scan = wal_ref.load_cursor_snapshot().is_some_and(|snap| wal_ref.restore_cursor_snapshot(&snap).is_ok() && snap.clean_shutdown);
     tracing::info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
     if !skip_delta_scan {
         let t_delta = std::time::Instant::now();
@@ -141,11 +128,15 @@ pub fn coalesced_delta_write_callback(db: &crate::database::Database) -> crate::
     Arc::new(move |units: Vec<crate::buffered_write_layer::FlushUnit>| {
         let db = db.clone();
         Box::pin(async move {
-            let topics: Vec<(String, String)> = units.iter().map(|u| (u.project_id.clone(), u.table_name.clone())).collect();
-            let units = units
+            let (topics, units): (Vec<(String, String)>, Vec<_>) = units
                 .into_iter()
-                .map(|u| crate::database::CoalescedWriteUnit { project_id: u.project_id, table_name: u.table_name, batches: u.batches, watermark: u.watermark })
-                .collect();
+                .map(|u| {
+                    (
+                        (u.project_id.clone(), u.table_name.clone()),
+                        crate::database::CoalescedWriteUnit { project_id: u.project_id, table_name: u.table_name, batches: u.batches, watermark: u.watermark },
+                    )
+                })
+                .unzip();
             let results = db.insert_records_batches_coalesced(units).await;
             // `insert_records_batches_coalesced` warms the flushed files itself
             // (as insert_records_batch does) — no warm here, or every flush
@@ -159,11 +150,11 @@ pub fn coalesced_delta_write_callback(db: &crate::database::Database) -> crate::
             // queries would skip Delta and read only MemBuffer. Tantivy indexing
             // stays driven by the actual file list inside the insert path.
             // Identical to the per-project callback in `main.rs`.
-            for ((project_id, table_name), result) in topics.iter().zip(&results) {
-                if result.is_ok() {
-                    db.mark_delta_has_files(project_id, table_name);
-                }
-            }
+            topics
+                .iter()
+                .zip(&results)
+                .filter(|(_, result)| result.is_ok())
+                .for_each(|((project_id, table_name), _)| db.mark_delta_has_files(project_id, table_name));
             results
         })
     })

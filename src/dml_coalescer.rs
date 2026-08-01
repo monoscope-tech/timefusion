@@ -34,7 +34,7 @@
 //! write itself* failed, i.e. genuine loss.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     hash::{Hash, Hasher},
     sync::{
         Arc,
@@ -59,7 +59,10 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::dml::UpdateSource;
+use crate::{
+    dml::UpdateSource,
+    optimizers::{is_col_through_cast, scalar_micros, swap_comparison, unwrap_literal},
+};
 
 /// Queue-size pressure threshold: total buffered source rows above which a
 /// drain is triggered immediately instead of waiting for the timer. Matches
@@ -102,11 +105,8 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
     }
     // Schema drift is itself a quarantine reason (concat failure), so keep
     // only what this IPC file can actually hold and say so if any are left.
-    let (writable, skipped): (Vec<&RecordBatch>, usize) = {
-        let keep: Vec<&RecordBatch> = batches.iter().filter(|b| b.schema() == group.schema).collect();
-        let skipped = batches.len() - keep.len();
-        (keep, skipped)
-    };
+    let writable: Vec<&RecordBatch> = batches.iter().filter(|b| b.schema() == group.schema).collect();
+    let skipped = batches.len() - writable.len();
     if writable.is_empty() {
         error!(
             "dml quarantine: no batch matches the group schema for {}/{} — {} rows LOST: {reason}",
@@ -116,37 +116,28 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
         );
         return false;
     }
-    let rows: usize = writable.iter().copied().map(RecordBatch::num_rows).sum();
+    let rows: usize = writable.iter().map(|b| b.num_rows()).sum();
     // Fingerprint disambiguates two groups for the same project/table parked in
     // the same microsecond; `create_new` then turns any residual collision into
     // an error rather than a silent truncation of already-parked user data.
     let stem = format!("{}_{:016x}_{}__{}", crate::clock::now_micros(), key.fingerprint, key.project_id, key.table_name).replace(['/', '\\', ':', '\0'], "_");
-    let (path, file) = match (0..16).find_map(|n| {
+    let Some((path, file)) = (0..16).find_map(|n| {
         let p = dir.join(if n == 0 { format!("{stem}.arrow") } else { format!("{stem}-{n}.arrow") });
         crate::buffered_write_layer::create_owner_only(&p, true).ok().map(|f| (p, f))
-    }) {
-        Some(pf) => pf,
-        None => {
-            error!("dml quarantine: cannot create a unique payload file under {dir:?} for {}/{}", key.project_id, key.table_name);
-            return false;
-        }
+    }) else {
+        error!("dml quarantine: cannot create a unique payload file under {dir:?} for {}/{}", key.project_id, key.table_name);
+        return false;
     };
 
     // Arrow IPC (not raw bytes): self-describing schema, so a re-drive needs
     // only the sidecar for the merge shape. Streamed straight to the file —
     // buffering a multi-GB group in a Vec first risks OOM at the exact moment
     // memory exhaustion is what brought us here.
-    match datafusion::arrow::ipc::writer::FileWriter::try_new(std::io::BufWriter::new(file), &group.schema) {
-        Ok(mut w) => {
-            if let Err(e) = writable.iter().try_for_each(|b| w.write(b)).and_then(|()| w.finish()) {
-                error!("dml quarantine: IPC write failed for {path:?}: {e}");
-                return false;
-            }
-        }
-        Err(e) => {
-            error!("dml quarantine: IPC writer init failed for {path:?}: {e}");
-            return false;
-        }
+    if let Err(e) = datafusion::arrow::ipc::writer::FileWriter::try_new(std::io::BufWriter::new(file), &group.schema)
+        .and_then(|mut w| writable.iter().try_for_each(|b| w.write(b)).and_then(|()| w.finish()))
+    {
+        error!("dml quarantine: IPC write failed for {path:?}: {e}");
+        return false;
     }
 
     let meta = format!(
@@ -205,16 +196,15 @@ pub(crate) struct DecomposedPredicate {
 
 impl DecomposedPredicate {
     pub fn decompose(predicate: Option<&Expr>, time_col: &str) -> Self {
-        let mut d = Self::default();
-        let Some(pred) = predicate else { return d };
-        for conjunct in split_conjunction(pred) {
+        let Some(pred) = predicate else { return Self::default() };
+        split_conjunction(pred).into_iter().fold(Self::default(), |mut d, conjunct| {
             match classify_time_conjunct(conjunct, time_col) {
                 Some((bound, true)) if d.lower.is_none() => d.lower = Some(bound),
                 Some((bound, false)) if d.upper.is_none() => d.upper = Some(bound),
                 _ => d.residual.push(conjunct.clone()),
             }
-        }
-        d
+            d
+        })
     }
 
     /// Conjoin residual + bounds back into a predicate (inverse of decompose).
@@ -240,11 +230,17 @@ impl DecomposedPredicate {
     /// lower takes the smaller bound, upper the larger; a missing bound on
     /// either side is unbounded and dominates.
     fn widen(&mut self, other: &Self) {
-        self.lower = match (self.lower.take(), &other.lower) {
+        self.widen_bounds(&other.lower, &other.upper);
+    }
+
+    /// `widen` against bare bounds — a statement's own window, without
+    /// fabricating a whole predicate to carry it.
+    fn widen_bounds(&mut self, lower: &Option<TimeBound>, upper: &Option<TimeBound>) {
+        self.lower = match (self.lower.take(), lower) {
             (Some(a), Some(b)) => Some(widen_bound(a, b, true)),
             _ => None,
         };
-        self.upper = match (self.upper.take(), &other.upper) {
+        self.upper = match (self.upper.take(), upper) {
             (Some(a), Some(b)) => Some(widen_bound(a, b, false)),
             _ => None,
         };
@@ -278,16 +274,6 @@ type StmtBounds = (Option<TimeBound>, Option<TimeBound>);
 type BoundBatch = (RecordBatch, StmtBounds);
 
 /// Timestamp scalar → microseconds (inverse of [`watermark_scalar`]).
-fn scalar_micros(v: &ScalarValue) -> Option<i64> {
-    Some(match v {
-        ScalarValue::TimestampSecond(Some(s), _) => s.checked_mul(1_000_000)?,
-        ScalarValue::TimestampMillisecond(Some(ms), _) => ms.checked_mul(1_000)?,
-        ScalarValue::TimestampMicrosecond(Some(us), _) => *us,
-        ScalarValue::TimestampNanosecond(Some(ns), _) => ns.div_euclid(1_000),
-        _ => return None,
-    })
-}
-
 /// The `DML_MERGE_BUCKET_MICROS` bucket span a statement's window covers, or
 /// None when a side is unbounded or non-timestamp (those statements share one
 /// catch-all unit). Spanning statements keep their full window — the span key
@@ -305,10 +291,10 @@ fn bounds_span(b: &StmtBounds) -> Option<(i64, i64)> {
 /// window to the union of only its own statements' bounds. Single-bucket
 /// groups pass through untouched — exactly today's one-merge-unit behavior.
 fn bucket_group(mut group: PendingGroup) -> Vec<PendingGroup> {
-    let mut buckets: BTreeMap<Option<(i64, i64)>, Vec<BoundBatch>> = BTreeMap::new();
-    for bb in std::mem::take(&mut group.batches) {
-        buckets.entry(bounds_span(&bb.1)).or_default().push(bb);
-    }
+    let buckets: BTreeMap<Option<(i64, i64)>, Vec<BoundBatch>> = std::mem::take(&mut group.batches).into_iter().fold(BTreeMap::new(), |mut m, bb| {
+        m.entry(bounds_span(&bb.1)).or_default().push(bb);
+        m
+    });
     if buckets.len() <= 1 {
         group.batches = buckets.into_values().next().unwrap_or_default();
         return vec![group];
@@ -316,22 +302,14 @@ fn bucket_group(mut group: PendingGroup) -> Vec<PendingGroup> {
     buckets
         .into_values()
         .map(|batches| {
-            let mut predicate =
-                DecomposedPredicate { residual: group.predicate.residual.clone(), lower: batches[0].1.0.clone(), upper: batches[0].1.1.clone() };
-            for (_, (lo, up)) in &batches[1..] {
-                predicate.widen(&DecomposedPredicate { residual: vec![], lower: lo.clone(), upper: up.clone() });
-            }
-            PendingGroup {
-                join_keys: group.join_keys.clone(),
-                assignments: group.assignments.clone(),
-                predicate,
-                time_col: group.time_col,
-                schema: group.schema.clone(),
-                batches,
-                session: group.session.clone(),
-                attempts: group.attempts,
-                folded_projects: group.folded_projects.clone(),
-            }
+            let predicate = batches[1..].iter().fold(
+                DecomposedPredicate { residual: group.predicate.residual.clone(), lower: batches[0].1.0.clone(), upper: batches[0].1.1.clone() },
+                |mut p, (_, (lo, up))| {
+                    p.widen_bounds(lo, up);
+                    p
+                },
+            );
+            PendingGroup { predicate, batches, ..group.clone() }
         })
         .collect()
 }
@@ -372,32 +350,25 @@ fn classify_time_conjunct(e: &Expr, time_col: &str) -> Option<(TimeBound, bool)>
 /// inclusive/exclusive distinction irrelevant, so there is one rule per side
 /// instead of four.
 pub(crate) fn dml_time_window(predicate: Option<&Expr>, time_col: &str) -> Option<(i64, i64)> {
-    fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
-        match expr {
-            Expr::Literal(scalar, _) => Some(scalar),
-            Expr::Cast(c) => unwrap_literal(c.expr.as_ref()),
-            Expr::TryCast(c) => unwrap_literal(c.expr.as_ref()),
-            _ => None,
-        }
-    }
-    let (mut lo, mut hi) = (i64::MIN, i64::MAX);
-    for conjunct in split_conjunction(predicate?) {
-        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = conjunct else { continue };
-        let (bound, op) = if crate::optimizers::is_col_through_cast(left, time_col) {
-            (right.as_ref(), *op)
-        } else if crate::optimizers::is_col_through_cast(right, time_col) {
-            (left.as_ref(), crate::optimizers::swap_comparison(op))
-        } else {
-            continue;
-        };
-        let Some(v) = unwrap_literal(bound).and_then(scalar_micros) else { continue };
-        match op {
-            Operator::Gt | Operator::GtEq => lo = lo.max(v),
-            Operator::Lt | Operator::LtEq => hi = hi.min(v.saturating_add(1)),
-            Operator::Eq => (lo, hi) = (lo.max(v), hi.min(v.saturating_add(1))),
-            _ => continue,
-        }
-    }
+    let (lo, hi) = split_conjunction(predicate?)
+        .into_iter()
+        .filter_map(|conjunct| {
+            let Expr::BinaryExpr(BinaryExpr { left, op, right }) = conjunct else { return None };
+            let (bound, op) = if is_col_through_cast(left, time_col) {
+                (right.as_ref(), *op)
+            } else if is_col_through_cast(right, time_col) {
+                (left.as_ref(), swap_comparison(*op))
+            } else {
+                return None;
+            };
+            Some((unwrap_literal(bound).and_then(crate::optimizers::scalar_micros)?, op))
+        })
+        .fold((i64::MIN, i64::MAX), |(lo, hi), (v, op)| match op {
+            Operator::Gt | Operator::GtEq => (lo.max(v), hi),
+            Operator::Lt | Operator::LtEq => (lo, hi.min(v.saturating_add(1))),
+            Operator::Eq => (lo.max(v), hi.min(v.saturating_add(1))),
+            _ => (lo, hi),
+        });
     ((lo, hi) != (i64::MIN, i64::MAX)).then_some((lo, hi))
 }
 
@@ -449,16 +420,16 @@ enum ClampAction {
 /// synchronous path above and the coalescer drain, which clamps the widened
 /// window at drain time — the watermark only rises, so later is tighter).
 fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> ClampAction {
-    let template = d.lower.as_ref().or(d.upper.as_ref()).map(|b| b.value.clone());
-    let Some(wm) = template.and_then(|t| watermark_scalar(&t, watermark_micros)) else {
+    let Some(wm) = d.lower.as_ref().or(d.upper.as_ref()).and_then(|b| watermark_scalar(&b.value, watermark_micros)) else {
         return ClampAction::Unchanged;
     };
-    if let Some(lo) = &d.lower {
-        match lo.value.partial_cmp(&wm) {
-            Some(std::cmp::Ordering::Greater) => return ClampAction::Skip,
-            Some(std::cmp::Ordering::Equal) if !lo.inclusive => return ClampAction::Skip,
-            _ => {}
-        }
+    let above_watermark = |b: &TimeBound| match b.value.partial_cmp(&wm) {
+        Some(std::cmp::Ordering::Greater) => true,
+        Some(std::cmp::Ordering::Equal) => !b.inclusive,
+        _ => false,
+    };
+    if d.lower.as_ref().is_some_and(above_watermark) {
+        return ClampAction::Skip;
     }
     let tighter = match &d.upper {
         Some(up) => matches!(up.value.partial_cmp(&wm), Some(std::cmp::Ordering::Greater)),
@@ -490,18 +461,18 @@ pub(crate) fn split_source_rounds(source: UpdateSource) -> Result<Vec<UpdateSour
 /// Nth distinct payload, in arrival order) so no single MERGE sees duplicate
 /// source keys — Delta rejects a source that matches a target row twice.
 fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<RecordBatch>> {
-    let to_fields = |idxs: &[usize]| idxs.iter().map(|&i| SortField::new(batch.column(i).data_type().clone())).collect::<Vec<_>>();
+    let fields = |cols: &[datafusion::arrow::array::ArrayRef]| cols.iter().map(|c| SortField::new(c.data_type().clone())).collect::<Vec<_>>();
     let key_cols: Vec<_> = key_indices.iter().map(|&i| batch.column(i).clone()).collect();
-    let all_idx: Vec<usize> = (0..batch.num_columns()).collect();
-    let key_rows = RowConverter::new(to_fields(key_indices))?.convert_columns(&key_cols)?;
-    let full_rows = RowConverter::new(to_fields(&all_idx))?.convert_columns(batch.columns())?;
+    let key_rows = RowConverter::new(fields(&key_cols))?.convert_columns(&key_cols)?;
+    let full_rows = RowConverter::new(fields(batch.columns()))?.convert_columns(batch.columns())?;
 
-    // Bind each Row (a thin view) so the byte-slice keys can borrow from
-    // them across the loop — no per-row heap copies.
+    // Imperative by necessity: the round assignment carries borrowed dedup
+    // state across rows. Row views are bound first so the byte-slice keys can
+    // borrow from them across the loop — no per-row heap copies.
     let full_row_views: Vec<_> = (0..batch.num_rows()).map(|i| full_rows.row(i)).collect();
     let key_row_views: Vec<_> = (0..batch.num_rows()).map(|i| key_rows.row(i)).collect();
-    let mut seen_full: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
-    let mut rounds: Vec<(std::collections::HashSet<&[u8]>, Vec<u32>)> = Vec::new();
+    let mut seen_full: HashSet<&[u8]> = HashSet::new();
+    let mut rounds: Vec<(HashSet<&[u8]>, Vec<u32>)> = Vec::new();
     for i in 0..batch.num_rows() {
         if !seen_full.insert(full_row_views[i].as_ref()) {
             continue; // exact duplicate statement row — one application suffices
@@ -527,13 +498,9 @@ fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<Record
 
 /// Delta's DV MERGE rejects a source that matches one target row twice.
 /// `split_rounds` should prevent it, yet prod groups still hit it (2026-07-28..30,
-/// root cause open) — so on this error, bisect: halve the source and merge each
+/// root cause open) — so on that error, bisect: halve the source and merge each
 /// half. Single rows cannot multi-match, so recursion always terminates, the
 /// data lands, and the log narrows down the offending key pair.
-fn is_multi_source_match_err(msg: &str) -> bool {
-    msg.contains("multiple source rows")
-}
-
 pub(crate) fn merge_bisect<'a>(
     db: &'a crate::database::Database, table_name: &'a str, project_id: &'a str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
     source: UpdateSource, session: Arc<dyn Session>,
@@ -542,9 +509,10 @@ pub(crate) fn merge_bisect<'a>(
         let rows = source.batch.num_rows();
         match crate::dml::perform_delta_merge_update(db, table_name, project_id, predicate.clone(), assignments.clone(), source.clone(), session.clone()).await
         {
-            Err(e) if is_multi_source_match_err(&e.to_string()) && rows > 1 => {
+            Err(e) if e.to_string().contains("multiple source rows") && rows > 1 => {
                 let (a, b) = (source.batch.slice(0, rows / 2), source.batch.slice(rows / 2, rows - rows / 2));
                 warn!("dml merge: multi-source match on {rows} rows for {project_id}/{table_name}; bisecting ({} + {} rows)", a.num_rows(), b.num_rows());
+                // Sequential await per half: the recursion is fallible and ordered, which an iterator chain can't express here.
                 let mut n = 0;
                 for half in [a, b] {
                     let src = UpdateSource { batch: half, schema: source.schema.clone(), join_keys: source.join_keys.clone() };
@@ -615,22 +583,18 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
         let slices = (meta.rows / 150_000).clamp(1, 32) as i64;
         let span = (ts_upper - meta.ts_lower).max(slices);
         let base_conj = |lo: i64, hi: i64, hi_incl: bool| {
-            let mut conj = vec![
+            let ts_lit = |v: i64| lit(ScalarValue::TimestampMicrosecond(Some(v), Some(tz.clone())));
+            [
                 col("context___span_id").is_not_null(),
                 col("context___trace_id").is_not_null(),
                 col("date").gt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.0)))),
                 col("date").lt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.1)))),
-                col("timestamp").gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(lo), Some(tz.clone())))),
-                if hi_incl {
-                    col("timestamp").lt_eq(lit(ScalarValue::TimestampMicrosecond(Some(hi), Some(tz.clone()))))
-                } else {
-                    col("timestamp").lt(lit(ScalarValue::TimestampMicrosecond(Some(hi), Some(tz.clone()))))
-                },
-            ];
-            if meta.projects.len() > 1 {
-                conj.push(in_list(col("project_id"), meta.projects.iter().map(lit).collect(), false));
-            }
-            conj.into_iter().reduce(Expr::and)
+                col("timestamp").gt_eq(ts_lit(lo)),
+                if hi_incl { col("timestamp").lt_eq(ts_lit(hi)) } else { col("timestamp").lt(ts_lit(hi)) },
+            ]
+            .into_iter()
+            .chain((meta.projects.len() > 1).then(|| in_list(col("project_id"), meta.projects.iter().map(lit).collect(), false)))
+            .reduce(Expr::and)
         };
         let slice_bounds: Vec<(i64, i64, bool)> = (0..slices)
             .map(|i| {
@@ -673,36 +637,29 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
                 continue;
             }
         };
-        let mut failed = false;
-        'slices: for (si, &(lo, hi, hi_incl)) in slice_bounds.iter().enumerate() {
-            let predicate = base_conj(lo, hi, hi_incl);
-            if slice_bounds.len() > 1 {
-                info!("dml redrive: {path:?} slice {}/{} [{lo}..{hi}]", si + 1, slice_bounds.len());
-            }
-            for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
-                let source = UpdateSource { batch: round, schema: merged.schema(), join_keys: meta.join_keys.clone() };
-                if let Err(e) = merge_bisect(
-                    db,
-                    &meta.table_name,
-                    &meta.project_id,
-                    predicate.clone(),
-                    vec![("hashes".into(), assignment.clone())],
-                    source,
-                    session.clone(),
-                )
-                .await
-                {
-                    error!(
-                        "dml redrive: merge failed for {path:?} (slice {}/{}): {e}; leaving parked (applied slices re-append tags only on retried rows)",
-                        si + 1,
-                        slice_bounds.len()
-                    );
-                    failed = true;
-                    break 'slices;
+        // Sequential awaits with `?`: the first failed slice leaves the group parked.
+        let outcome = async {
+            for (si, &(lo, hi, hi_incl)) in slice_bounds.iter().enumerate() {
+                let predicate = base_conj(lo, hi, hi_incl);
+                if slice_bounds.len() > 1 {
+                    info!("dml redrive: {path:?} slice {}/{} [{lo}..{hi}]", si + 1, slice_bounds.len());
+                }
+                for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
+                    let source = UpdateSource { batch: round, schema: merged.schema(), join_keys: meta.join_keys.clone() };
+                    let assignments = vec![("hashes".into(), assignment.clone())];
+                    merge_bisect(db, &meta.table_name, &meta.project_id, predicate.clone(), assignments, source, session.clone()).await.inspect_err(|e| {
+                        error!(
+                            "dml redrive: merge failed for {path:?} (slice {}/{}): {e}; leaving parked (applied slices re-append tags only on retried rows)",
+                            si + 1,
+                            slice_bounds.len()
+                        );
+                    })?;
                 }
             }
+            Ok::<(), DataFusionError>(())
         }
-        if failed {
+        .await;
+        if outcome.is_err() {
             skipped += 1;
             continue;
         }
@@ -751,10 +708,8 @@ pub(crate) fn parse_quarantine_meta(meta: &str) -> Option<QuarantineMeta> {
         .filter(|s| !s.is_empty())
         .map(|p| p.split_once('=').map(|(a, b)| (a.to_string(), b.to_string())))
         .collect::<Option<_>>()?;
-    let projects: Vec<String> = {
-        let fp = field("folded_projects").unwrap_or_default();
-        if fp.is_empty() { vec![project_id.clone()] } else { fp.split(',').map(str::to_string).collect() }
-    };
+    let projects: Vec<String> =
+        field("folded_projects").filter(|fp| !fp.is_empty()).map_or_else(|| vec![project_id.clone()], |fp| fp.split(',').map(str::to_string).collect());
     // Date32("YYYY-MM-DD") bounds → day numbers since epoch.
     let dates: Vec<i32> = predicate
         .match_indices("Date32(\"")
@@ -798,6 +753,7 @@ struct GroupKey {
     fingerprint: u64,
 }
 
+#[derive(Clone)]
 struct PendingGroup {
     join_keys: Vec<(String, String)>,
     assignments: Vec<(String, Expr)>,
@@ -861,57 +817,59 @@ fn is_project_eq(e: &Expr, project_id: &str) -> bool {
 /// projects resolve to physically separate tables — never fold those).
 /// Ineligible groups and singleton buckets pass through untouched; any arrow
 /// failure while folding a bucket falls back to its unfolded members.
-fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &std::collections::HashSet<(String, String)>) -> Vec<(GroupKey, PendingGroup)> {
+fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(String, String)>) -> Vec<(GroupKey, PendingGroup)> {
     // A fold candidate: its enqueue key/group plus the residual with the
     // own-project equality stripped.
     type Member = (GroupKey, PendingGroup, Vec<Expr>);
-    let mut out = Vec::with_capacity(groups.len());
-    let mut buckets: HashMap<(String, u64), Vec<Member>> = HashMap::new();
-    for (key, group) in groups {
-        // The optimizer usually pushes `project_id = '<id>'` into the
-        // TableScan (partition column), so most predicates carry no project
-        // conjunct at all — scope rides in `key.project_id`. Strip an explicit
-        // own-project equality when present; any OTHER reference to
-        // project_id (IN, !=, expressions) is a shape we can't restate as the
-        // folded IN-list, so it stays unfolded.
-        let stripped: Vec<Expr> = group.predicate.residual.iter().filter(|e| !is_project_eq(e, &key.project_id)).cloned().collect();
-        let eligible = group.folded_projects.is_none()
+    let is_eligible = |(key, group, stripped): &Member| {
+        group.folded_projects.is_none()
             && !stripped.iter().any(|e| e.column_refs().iter().any(|c| c.name == "project_id"))
             && group.schema.field_with_name("project_id").is_err()
             && !group.join_keys.iter().any(|(t, s)| t == "project_id" || s == "project_id")
-            && !custom_storage.contains(&(key.project_id.clone(), key.table_name.clone()));
-        if !eligible {
-            out.push((key, group));
-            continue;
-        }
+            && !custom_storage.contains(&(key.project_id.clone(), key.table_name.clone()))
+    };
+    // The optimizer usually pushes `project_id = '<id>'` into the TableScan
+    // (partition column), so most predicates carry no project conjunct at all —
+    // scope rides in `key.project_id`. Strip an explicit own-project equality
+    // when present; any OTHER reference to project_id (IN, !=, expressions) is a
+    // shape we can't restate as the folded IN-list, so it stays unfolded.
+    let (candidates, ineligible): (Vec<Member>, Vec<Member>) = groups
+        .into_iter()
+        .map(|(key, group)| {
+            let stripped: Vec<Expr> = group.predicate.residual.iter().filter(|e| !is_project_eq(e, &key.project_id)).cloned().collect();
+            (key, group, stripped)
+        })
+        .partition(is_eligible);
+    let buckets: HashMap<(String, u64), Vec<Member>> = candidates.into_iter().fold(HashMap::new(), |mut m, (key, group, stripped)| {
         let fp = shape_fingerprint(&group.join_keys, &group.assignments, &stripped, &group.schema);
-        buckets.entry((key.table_name.clone(), fp)).or_default().push((key, group, stripped));
-    }
-    for ((table_name, shape_fp), mut members) in buckets {
-        if members.len() == 1 {
-            let (key, group, _) = members.pop().expect("len checked");
-            out.push((key, group));
-            continue;
-        }
-        // Deterministic member order → stable IN-list, fingerprint, and rep key.
-        members.sort_by(|a, b| a.0.project_id.cmp(&b.0.project_id));
-        let total_rows: usize = members.iter().flat_map(|(_, g, _)| &g.batches).map(|(b, _)| b.num_rows()).sum();
-        if total_rows > MAX_QUEUED_SOURCE_ROWS {
-            out.extend(members.into_iter().map(|(k, g, _)| (k, g)));
-            continue;
-        }
-        match build_folded(&table_name, shape_fp, &members) {
-            Ok(folded) => {
-                debug!("dml coalesce: folded {} projects into one {} merge group", members.len(), table_name);
-                out.push(folded);
+        m.entry((key.table_name.clone(), fp)).or_default().push((key, group, stripped));
+        m
+    });
+    let unfolded = |members: Vec<Member>| members.into_iter().map(|(k, g, _)| (k, g)).collect::<Vec<_>>();
+    unfolded(ineligible)
+        .into_iter()
+        .chain(buckets.into_iter().flat_map(|((table_name, shape_fp), mut members)| {
+            if members.len() == 1 {
+                return unfolded(members);
             }
-            Err(e) => {
-                warn!("dml coalesce: folding {} groups for {} failed ({e}), draining per-project", members.len(), table_name);
-                out.extend(members.into_iter().map(|(k, g, _)| (k, g)));
+            // Deterministic member order → stable IN-list, fingerprint, and rep key.
+            members.sort_by(|a, b| a.0.project_id.cmp(&b.0.project_id));
+            let total_rows: usize = members.iter().flat_map(|(_, g, _)| &g.batches).map(|(b, _)| b.num_rows()).sum();
+            if total_rows > MAX_QUEUED_SOURCE_ROWS {
+                return unfolded(members);
             }
-        }
-    }
-    out
+            match build_folded(&table_name, shape_fp, &members) {
+                Ok(folded) => {
+                    debug!("dml coalesce: folded {} projects into one {} merge group", members.len(), table_name);
+                    vec![folded]
+                }
+                Err(e) => {
+                    warn!("dml coalesce: folding {} groups for {} failed ({e}), draining per-project", members.len(), table_name);
+                    unfolded(members)
+                }
+            }
+        }))
+        .collect()
 }
 
 /// Assemble the folded group: append a constant `project_id` column to every
@@ -935,27 +893,33 @@ fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGr
             .chain(std::iter::once(Arc::new(Field::new("project_id", datafusion::arrow::datatypes::DataType::Utf8, false))))
             .collect::<Vec<_>>(),
     ));
-    let mut batches = Vec::new();
-    for (key, group, _) in members {
-        for (batch, bounds) in &group.batches {
-            let project_col = Arc::new(StringArray::from_iter_values(std::iter::repeat_n(key.project_id.as_str(), batch.num_rows())));
-            let cols = batch.columns().iter().cloned().chain(std::iter::once(project_col as _)).collect();
-            batches.push((RecordBatch::try_new(schema.clone(), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?, bounds.clone()));
-        }
-    }
+    let out_schema = &schema; // &SchemaRef is Copy — capturable by both closures without moving `schema`
+    let batches: Vec<BoundBatch> = members
+        .iter()
+        .flat_map(move |(key, group, _)| {
+            group.batches.iter().map(move |(batch, bounds)| {
+                let project_col = Arc::new(StringArray::from_iter_values(std::iter::repeat_n(key.project_id.as_str(), batch.num_rows())));
+                let cols = batch.columns().iter().cloned().chain(std::iter::once(project_col as _)).collect();
+                Ok((RecordBatch::try_new(out_schema.clone(), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?, bounds.clone()))
+            })
+        })
+        .collect::<Result<_>>()?;
 
-    let mut predicate = DecomposedPredicate {
-        residual: stripped
-            .iter()
-            .cloned()
-            .chain(std::iter::once(datafusion::prelude::col("project_id").in_list(projects.iter().map(|p| lit(p.as_str())).collect(), false)))
-            .collect(),
-        lower: base.predicate.lower.clone(),
-        upper: base.predicate.upper.clone(),
-    };
-    for (_, group, _) in &members[1..] {
-        predicate.widen(&group.predicate);
-    }
+    let predicate = members[1..].iter().fold(
+        DecomposedPredicate {
+            residual: stripped
+                .iter()
+                .cloned()
+                .chain(std::iter::once(datafusion::prelude::col("project_id").in_list(projects.iter().map(|p| lit(p.as_str())).collect(), false)))
+                .collect(),
+            lower: base.predicate.lower.clone(),
+            upper: base.predicate.upper.clone(),
+        },
+        |mut p, (_, group, _)| {
+            p.widen(&group.predicate);
+            p
+        },
+    );
 
     let mut h = std::hash::DefaultHasher::new();
     shape_fp.hash(&mut h);
@@ -1043,13 +1007,13 @@ impl DmlCoalescer {
         {
             let mut groups = self.groups.lock().expect("dml coalescer mutex poisoned");
             match groups.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut g) => {
+                Entry::Occupied(mut g) => {
                     let g = g.get_mut();
                     g.predicate.widen(&decomposed);
                     g.batches.push((source.batch.clone(), bounds));
                     g.session = session;
                 }
-                std::collections::hash_map::Entry::Vacant(v) => {
+                Entry::Vacant(v) => {
                     v.insert(PendingGroup {
                         join_keys: source.join_keys.clone(),
                         assignments: assignments.to_vec(),
@@ -1073,7 +1037,7 @@ impl DmlCoalescer {
     /// Drain every pending group: clamp the widened window to the flush
     /// watermark, split into duplicate-key-free rounds, and run one merge per
     /// round. Failed groups are re-queued (merging with anything enqueued
-    /// meanwhile) up to `MAX_DRAIN_ATTEMPTS`, then dropped loudly.
+    /// meanwhile) up to `MAX_DRAIN_ATTEMPTS`, then quarantined.
     pub async fn drain(&self, db: &crate::database::Database) {
         let _serial = self.drain_lock.lock().await;
         let groups: Vec<(GroupKey, PendingGroup)> = {
@@ -1092,13 +1056,10 @@ impl DmlCoalescer {
                     Some(ps) => ps.iter().map(|p| layer.delta_flushed_watermark(p, &key.table_name)).max().unwrap_or(i64::MIN),
                     None => layer.delta_flushed_watermark(&key.project_id, &key.table_name),
                 };
-                match clamp_decomposed(&mut group.predicate, wm) {
-                    ClampAction::Skip => {
-                        crate::metrics::record_dml_delta_leg_skipped();
-                        debug!("dml coalesce: skipping {}/{} group — window entirely above flush watermark", key.project_id, key.table_name);
-                        continue;
-                    }
-                    ClampAction::Unchanged | ClampAction::Clamped => {}
+                if matches!(clamp_decomposed(&mut group.predicate, wm), ClampAction::Skip) {
+                    crate::metrics::record_dml_delta_leg_skipped();
+                    debug!("dml coalesce: skipping {}/{} group — window entirely above flush watermark", key.project_id, key.table_name);
+                    continue;
                 }
             }
             // A failure in any prep step (schema drift within a
@@ -1131,22 +1092,20 @@ impl DmlCoalescer {
                 }
             };
             let predicate = group.predicate.reconstruct(group.time_col);
-            let mut failed = None;
             // Chunk each round to bound per-MERGE memory (see MAX_MERGE_ROWS).
-            for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
-                let source = UpdateSource { batch: round, schema: group.schema.clone(), join_keys: group.join_keys.clone() };
-                match merge_bisect(db, &key.table_name, &key.project_id, predicate.clone(), group.assignments.clone(), source, group.session.clone()).await {
-                    Ok(rows) => {
-                        crate::metrics::record_dml_coalesce_merge();
-                        debug!("dml coalesce: merged {statements} stmts for {}/{} — {rows} rows updated", key.project_id, key.table_name);
-                    }
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
+            // Sequential awaits with `?`: the first failure abandons the group.
+            let outcome = async {
+                for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
+                    let source = UpdateSource { batch: round, schema: group.schema.clone(), join_keys: group.join_keys.clone() };
+                    let rows =
+                        merge_bisect(db, &key.table_name, &key.project_id, predicate.clone(), group.assignments.clone(), source, group.session.clone()).await?;
+                    crate::metrics::record_dml_coalesce_merge();
+                    debug!("dml coalesce: merged {statements} stmts for {}/{} — {rows} rows updated", key.project_id, key.table_name);
                 }
+                Ok::<(), DataFusionError>(())
             }
-            if let Some(e) = failed {
+            .await;
+            if let Err(e) = outcome {
                 group.attempts += 1;
                 if group.attempts >= MAX_DRAIN_ATTEMPTS {
                     // Park, don't drop: the mem leg already applied and the
@@ -1181,15 +1140,13 @@ impl DmlCoalescer {
         let rows: usize = group.batches.iter().map(|(b, _)| b.num_rows()).sum();
         let mut groups = self.groups.lock().expect("dml coalescer mutex poisoned");
         match groups.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut g) => {
+            Entry::Occupied(mut g) => {
                 let newer = g.get_mut();
-                let mut batches = group.batches;
-                batches.append(&mut newer.batches);
-                newer.batches = batches;
+                newer.batches = group.batches.into_iter().chain(std::mem::take(&mut newer.batches)).collect();
                 newer.predicate.widen(&group.predicate);
                 newer.attempts = newer.attempts.max(group.attempts);
             }
-            std::collections::hash_map::Entry::Vacant(v) => {
+            Entry::Vacant(v) => {
                 v.insert(group);
             }
         }
@@ -1589,8 +1546,10 @@ mod tests {
                 DecomposedPredicate::decompose(Some(&pred), "timestamp")
             })
             .collect();
-        let mut predicate = decomposed[0].clone();
-        decomposed[1..].iter().for_each(|d| predicate.widen(d));
+        let predicate = decomposed[1..].iter().fold(decomposed[0].clone(), |mut p, d| {
+            p.widen(d);
+            p
+        });
         PendingGroup {
             join_keys: vec![("id".into(), "id".into())],
             assignments: vec![("n".into(), lit(9i64))],

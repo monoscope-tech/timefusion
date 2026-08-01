@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use datafusion::{
     common::{
-        Column, Result,
+        Column, DFSchema, Result, TableReference, plan_datafusion_err,
         tree_node::{Transformed, TreeNode},
     },
     config::ConfigOptions,
@@ -68,55 +68,48 @@ fn expand_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 }
 
 #[allow(deprecated)] // Expr::Wildcard is the actual variant the SQL planner emits today (#7765 plans to replace it, not gone yet)
-fn expand_in_expr(expr: Expr, input_schemas: &[Arc<datafusion::common::DFSchema>]) -> Result<Transformed<Expr>> {
+fn expand_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transformed<Expr>> {
     let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
         return Ok(Transformed::no(expr));
     };
-
     // Cheap up-front check: any qualified wildcard in args at all?
-    let has_qualified_wildcard = args.iter().any(|a| matches!(a, Expr::Wildcard { qualifier: Some(_), .. }));
-    if !has_qualified_wildcard {
+    if !args.iter().any(|a| matches!(a, Expr::Wildcard { qualifier: Some(_), .. })) {
         return Ok(Transformed::no(Expr::ScalarFunction(ScalarFunction { func, args })));
     }
+    let args = args
+        .into_iter()
+        .map(|arg| match arg {
+            Expr::Wildcard { qualifier: Some(q), .. } => expand_qualifier(&q, input_schemas),
+            other => Ok(vec![other]),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .concat();
+    Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction { func, args })))
+}
 
-    let mut new_args: Vec<Expr> = Vec::with_capacity(args.len());
-    for arg in args {
-        let Expr::Wildcard { qualifier: Some(qualifier), .. } = &arg else {
-            new_args.push(arg);
-            continue;
-        };
-
-        // Find the input schema that owns this qualifier and emit one column
-        // expression per field, in declared order. SQL forbids duplicate qualifier
-        // names in the same scope, so first-match-wins is unambiguous — DataFusion
-        // would already have rejected the plan earlier if two schemas shared a name.
-        let mut expanded = false;
-        for schema in input_schemas {
-            let indices = schema.fields_indices_with_qualified(qualifier);
-            if indices.is_empty() {
-                continue;
-            }
-            for idx in indices {
-                let (q, f) = schema.qualified_field(idx);
-                new_args.push(Expr::Column(Column::new(q.cloned(), f.name())));
-            }
-            expanded = true;
-            break;
-        }
-        if !expanded {
-            return datafusion::common::plan_err!("Unknown qualifier in function argument: {qualifier}");
-        }
-    }
-
-    // `has_qualified_wildcard` was true above, and any qualifier we couldn't expand
-    // returned via plan_err! — so reaching here means at least one wildcard arg was
-    // replaced. Transformed::yes is the right signal unconditionally.
-    Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction { func, args: new_args })))
+/// Columns of the first input schema owning `qualifier`, in declared order. SQL forbids
+/// duplicate qualifier names in one scope, so first-match-wins is unambiguous — DataFusion
+/// would already have rejected the plan if two schemas shared a name.
+fn expand_qualifier(qualifier: &TableReference, input_schemas: &[Arc<DFSchema>]) -> Result<Vec<Expr>> {
+    input_schemas
+        .iter()
+        .map(|schema| {
+            schema
+                .fields_indices_with_qualified(qualifier)
+                .into_iter()
+                .map(|idx| {
+                    let (q, f) = schema.qualified_field(idx);
+                    Expr::Column(Column::new(q.cloned(), f.name()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .find(|cols| !cols.is_empty())
+        .ok_or_else(|| plan_datafusion_err!("Unknown qualifier in function argument: {qualifier}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use datafusion::{execution::session_state::SessionStateBuilder, prelude::SessionContext};
+    use datafusion::{arrow::array::StringViewArray, execution::session_state::SessionStateBuilder, prelude::SessionContext};
 
     use super::*;
 
@@ -133,15 +126,17 @@ mod tests {
         ctx
     }
 
+    /// First row of the single output column, as the JSON text `jsonb_build_array` produces.
+    async fn first_json(sql: &str) -> String {
+        let batches = ctx_with_rule().sql(sql).await.expect("plan ok").collect().await.expect("exec ok");
+        batches[0].column(0).as_any().downcast_ref::<StringViewArray>().expect("StringViewArray").value(0).to_string()
+    }
+
     /// End-to-end: the exact shape monoscope wants — `jsonb_build_array(sub.*)`
     /// expands to the inner SELECT's column values in declared order.
     #[tokio::test]
     async fn jsonb_build_array_expands_qualified_wildcard() {
-        let ctx = ctx_with_rule();
-        let df = ctx.sql("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a, 'x' AS b, true AS c) sub").await.expect("plan ok");
-        let batches = df.collect().await.expect("exec ok");
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
-        assert_eq!(col.value(0), r#"[1,"x",true]"#);
+        assert_eq!(first_json("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a, 'x' AS b, true AS c) sub").await, r#"[1,"x",true]"#);
     }
 
     /// `sub` doesn't exist at this scope — DataFusion's SQL planner catches this
@@ -160,29 +155,20 @@ mod tests {
     /// and concatenate the column lists in argument order.
     #[tokio::test]
     async fn multiple_qualifiers_in_one_call() {
-        let ctx = ctx_with_rule();
-        let df = ctx
-            .sql(
-                "SELECT jsonb_build_array(a.*, b.*) \
-                 FROM (SELECT 1 AS x, 2 AS y) a \
-                 CROSS JOIN (SELECT 'p' AS p, 'q' AS q) b",
-            )
-            .await
-            .expect("plan ok");
-        let batches = df.collect().await.expect("exec ok");
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
-        assert_eq!(col.value(0), r#"[1,2,"p","q"]"#);
+        let json = first_json(
+            "SELECT jsonb_build_array(a.*, b.*) \
+             FROM (SELECT 1 AS x, 2 AS y) a \
+             CROSS JOIN (SELECT 'p' AS p, 'q' AS q) b",
+        )
+        .await;
+        assert_eq!(json, r#"[1,2,"p","q"]"#);
     }
 
     /// Mixed wildcard and literal args — non-wildcard args must be preserved in
     /// their original position; the expansion only replaces the wildcard slot.
     #[tokio::test]
     async fn mixes_wildcard_with_other_args() {
-        let ctx = ctx_with_rule();
-        let df = ctx.sql("SELECT jsonb_build_array(0, sub.*, 99) FROM (SELECT 1 AS a, 2 AS b) sub").await.expect("plan ok");
-        let batches = df.collect().await.expect("exec ok");
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
-        assert_eq!(col.value(0), r#"[0,1,2,99]"#);
+        assert_eq!(first_json("SELECT jsonb_build_array(0, sub.*, 99) FROM (SELECT 1 AS a, 2 AS b) sub").await, r#"[0,1,2,99]"#);
     }
 
     /// `outer(inner(sub.*))` — transform_up visits the inner ScalarFunction first,
@@ -190,10 +176,6 @@ mod tests {
     /// the resolved column args.
     #[tokio::test]
     async fn nested_function_calls_expand_inside_out() {
-        let ctx = ctx_with_rule();
-        let df = ctx.sql("SELECT jsonb_build_array(jsonb_build_array(sub.*)) FROM (SELECT 1 AS a, 2 AS b) sub").await.expect("plan ok");
-        let batches = df.collect().await.expect("exec ok");
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
-        assert_eq!(col.value(0), r#"[[1,2]]"#);
+        assert_eq!(first_json("SELECT jsonb_build_array(jsonb_build_array(sub.*)) FROM (SELECT 1 AS a, 2 AS b) sub").await, r#"[[1,2]]"#);
     }
 }

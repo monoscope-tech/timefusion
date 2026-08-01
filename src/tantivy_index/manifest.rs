@@ -8,12 +8,14 @@
 //! check on read. Good enough for low-frequency manifest writes; if multiple
 //! writers race, last-writer-wins (entries are idempotent upserts).
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use serde::{Deserialize, Serialize};
+
+use crate::mem_buffer::TableKey;
 
 pub const MANIFEST_PREFIX: &str = "index_manifests";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -64,24 +66,19 @@ pub fn manifest_path(table: &str, project_id: &str) -> ObjPath {
 }
 
 pub async fn load(store: &dyn ObjectStore, table: &str, project_id: &str) -> Result<Manifest> {
-    let p = manifest_path(table, project_id);
-    match store.get(&p).await {
-        Ok(result) => {
-            let bytes = result.bytes().await.context("read manifest bytes")?;
-            let m: Manifest = serde_json::from_slice(&bytes).context("parse manifest json")?;
-            Ok(m)
-        }
+    match store.get(&manifest_path(table, project_id)).await {
+        Ok(result) => serde_json::from_slice(&result.bytes().await.context("read manifest bytes")?).context("parse manifest json"),
         Err(object_store::Error::NotFound { .. }) => Ok(Manifest::default()),
         Err(e) => Err(e).context("load manifest"),
     }
 }
 
 pub async fn save(store: &dyn ObjectStore, table: &str, project_id: &str, manifest: &Manifest) -> Result<()> {
-    let p = manifest_path(table, project_id);
     let body = serde_json::to_vec_pretty(manifest).context("serialize manifest")?;
-    store.put(&p, body.into()).await.context("put manifest")?;
-    Ok(())
+    store.put(&manifest_path(table, project_id), body.into()).await.context("put manifest").map(drop)
 }
+
+type ManifestLocks = dashmap::DashMap<TableKey, Arc<tokio::sync::Mutex<()>>>;
 
 /// Load the manifest, apply `f`, and save it back. The shared load/save
 /// skeleton behind `upsert` and `remove_many`. Serialized per
@@ -89,11 +86,9 @@ pub async fn save(store: &dyn ObjectStore, table: &str, project_id: &str, manife
 /// manifest would otherwise interleave load/save and drop each other's
 /// entries (last-writer-wins), silently un-covering files and disabling
 /// the prefilter via the coverage gate.
-type ManifestLocks = dashmap::DashMap<(String, String), std::sync::Arc<tokio::sync::Mutex<()>>>;
-
 async fn mutate<F: FnOnce(&mut Manifest)>(store: &dyn ObjectStore, table: &str, project_id: &str, f: F) -> Result<()> {
     static LOCKS: std::sync::OnceLock<ManifestLocks> = std::sync::OnceLock::new();
-    let lock = LOCKS.get_or_init(Default::default).entry((table.to_string(), project_id.to_string())).or_default().clone();
+    let lock = LOCKS.get_or_init(Default::default).entry((table.into(), project_id.into())).or_default().clone();
     let _guard = lock.lock().await;
     let mut m = load(store, table, project_id).await?;
     f(&mut m);
@@ -101,6 +96,24 @@ async fn mutate<F: FnOnce(&mut Manifest)>(store: &dyn ObjectStore, table: &str, 
 }
 
 /// Idempotent upsert: load, mutate, save.
+impl ManifestEntry {
+    /// Entry recorded when the index build itself failed: no index, no rows,
+    /// but the covered files are still tracked so GC can reap it later.
+    pub fn failed(error: String, covered_files: Vec<String>) -> Self {
+        Self {
+            index: None,
+            rows: 0,
+            built_at: Utc::now(),
+            schema_version: SCHEMA_VERSION,
+            min_timestamp_micros: None,
+            max_timestamp_micros: None,
+            error: Some(error),
+            covered_files,
+            ordinals_valid: false,
+        }
+    }
+}
+
 pub async fn upsert(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_key: &str, entry: ManifestEntry) -> Result<()> {
     mutate(store, table, project_id, |m| {
         m.entries.insert(parquet_key.to_string(), entry);

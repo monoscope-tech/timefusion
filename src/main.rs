@@ -27,6 +27,7 @@ pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,l
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use timefusion::{
@@ -43,49 +44,11 @@ fn main() -> anyhow::Result<()> {
     // Initialize environment before any threads spawn
     dotenv().ok();
 
+    let subcommand = std::env::args().nth(1);
     // CLI helper: `timefusion encrypt-secret <plaintext>` — prints ciphertext
-    // for use in `timefusion_projects` rows, then exits.
-    if std::env::args().nth(1).as_deref() == Some("encrypt-secret") {
+    // for use in `timefusion_projects` rows, then exits. Needs no config.
+    if subcommand.as_deref() == Some("encrypt-secret") {
         return secret_crypto::run_cli();
-    }
-
-    // CLI helper: `timefusion optimize [--table T] [--date D | --older-than-hours N | --all]`
-    // Runs a one-off compaction of old `date=` partitions, then exits. Run it on
-    // a workstation (not the prod box) pointed at prod storage to knock down the
-    // file-count backlog without adding memory pressure to the live server — it
-    // commits via the same S3/R2 conditional-put (If-None-Match) coordination as
-    // the live server, so concurrent commits conflict-detect safely (OCC retry).
-    // CLI helper: `timefusion redrive-dml [--dir PATH] [--dry-run]` — replay
-    // parked quarantine/dml enrichment groups (see timefusion::dml_coalescer::redrive_dml_quarantine).
-    if std::env::args().nth(1).as_deref() == Some("redrive-dml") {
-        dotenv().ok();
-        let cfg = config::init_config().expect("config load failed");
-        return tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-                .try_init();
-            let mut dir = cfg.core.wal_dir().join(timefusion::wal::QUARANTINE_DIR_NAME).join("dml");
-            let mut dry_run = false;
-            let mut it = std::env::args().skip(2);
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--dir" => dir = it.next().map(std::path::PathBuf::from).expect("--dir needs a value"),
-                    "--dry-run" => dry_run = true,
-                    other => anyhow::bail!("unknown argument: {other} (usage: timefusion redrive-dml [--dir PATH] [--dry-run])"),
-                }
-            }
-            let db = Arc::new(Database::with_config(Arc::new(cfg.clone())).await?);
-            let (ok, skipped) = timefusion::dml_coalescer::redrive_dml_quarantine(&db, &dir, dry_run).await;
-            println!("redrive-dml: {ok} recovered, {skipped} left parked (dir {dir:?})");
-            db.shutdown().await?;
-            Ok(())
-        });
-    }
-
-    if std::env::args().nth(1).as_deref() == Some("optimize") {
-        let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
-        return tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run_optimize_cli(cfg));
     }
 
     // Initialize global config from environment - validates all settings upfront
@@ -95,8 +58,39 @@ fn main() -> anyhow::Result<()> {
     // SAFETY: No threads exist yet - we're before tokio::runtime::Builder
     unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
-    // Build and run Tokio runtime after env vars are set
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async_main(cfg))
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    match subcommand.as_deref() {
+        Some("redrive-dml") => rt.block_on(run_redrive_dml_cli(cfg)),
+        Some("optimize") => rt.block_on(run_optimize_cli(cfg)),
+        _ => rt.block_on(async_main(cfg)),
+    }
+}
+
+fn init_cli_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .try_init();
+}
+
+/// `timefusion redrive-dml [--dir PATH] [--dry-run]` — replay parked quarantine/dml
+/// enrichment groups (see [`timefusion::dml_coalescer::redrive_dml_quarantine`]).
+async fn run_redrive_dml_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
+    init_cli_tracing();
+    // Two-token flags need lookahead into the arg iterator, so this stays a loop.
+    let mut dir = cfg.core.wal_dir().join(timefusion::wal::QUARANTINE_DIR_NAME).join("dml");
+    let mut dry_run = false;
+    let mut it = std::env::args().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dir" => dir = it.next().map(std::path::PathBuf::from).context("--dir needs a value")?,
+            "--dry-run" => dry_run = true,
+            other => anyhow::bail!("unknown argument: {other} (usage: timefusion redrive-dml [--dir PATH] [--dry-run])"),
+        }
+    }
+    let db = Arc::new(Database::with_config(Arc::new(cfg.clone())).await?);
+    let (ok, skipped) = timefusion::dml_coalescer::redrive_dml_quarantine(&db, &dir, dry_run).await;
+    println!("redrive-dml: {ok} recovered, {skipped} left parked (dir {dir:?})");
+    db.shutdown().await
 }
 
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
@@ -208,32 +202,29 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         .with_delta_writer(delta_write_callback)
         .with_coalesced_delta_writer(timefusion::bootstrap::coalesced_delta_write_callback(&db));
     info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
-    let mut tantivy_svc_for_metrics: Option<Arc<timefusion::tantivy_index::service::TantivyIndexService>> = None;
     let indexed_tables = cfg.tantivy.indexed_tables();
-    if !indexed_tables.is_empty() {
-        let bucket = cfg.aws.aws_s3_bucket.clone().unwrap_or_default();
-        if !bucket.is_empty() {
-            let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
-            let storage_opts = cfg.aws.build_storage_options(None);
-            let obj_store = db.create_object_store(&storage_uri, &storage_opts).await?;
-            let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
-            layer = layer.with_tantivy_indexer(svc.clone().callback());
-            let cache_root = cfg.core.timefusion_data_dir.clone();
-            let search = Arc::new(timefusion::tantivy_index::search::TantivySearchService::new(obj_store, cache_root));
-            db = db.with_tantivy_search(search).with_tantivy_indexer(svc.clone());
-            tantivy_svc_for_metrics = Some(svc);
-            info!("Tantivy sidecar indexes active for tables: {:?}", indexed_tables);
-        } else {
-            error!("Schema declares indexed columns but AWS_S3_BUCKET is unset — Tantivy disabled, queries will scan");
-        }
-    }
+    let bucket = cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default();
+    let tantivy_svc_for_metrics = if indexed_tables.is_empty() {
+        None
+    } else if bucket.is_empty() {
+        error!("Schema declares indexed columns but AWS_S3_BUCKET is unset — Tantivy disabled, queries will scan");
+        None
+    } else {
+        let storage_uri = format!("s3://{bucket}/{}/tantivy", cfg.core.timefusion_table_prefix);
+        let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+        let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
+        layer = layer.with_tantivy_indexer(svc.clone().callback());
+        let search = Arc::new(timefusion::tantivy_index::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone()));
+        db = db.with_tantivy_search(search).with_tantivy_indexer(svc.clone());
+        info!("Tantivy sidecar indexes active for tables: {:?}", indexed_tables);
+        Some(svc)
+    };
     let buffered_layer = Arc::new(layer);
 
     // Initialize OpenTelemetry metrics — observable gauges read snapshot_stats()
     // each export cycle (30s), keeping the hot path untouched. Weak ref so
     // metrics don't extend the layer's lifetime.
-    let tantivy_weak = tantivy_svc_for_metrics.as_ref().map(Arc::downgrade);
-    if let Err(e) = timefusion::metrics::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer), tantivy_weak) {
+    if let Err(e) = timefusion::metrics::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer), tantivy_svc_for_metrics.as_ref().map(Arc::downgrade)) {
         error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
     }
 
@@ -244,11 +235,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // shorter) Delta verifier to catch commits made after the last snapshot.
     let wal_ref = buffered_layer.wal();
     let t_snap = std::time::Instant::now();
-    let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
-        // Surfaced in the boot log only — not gating the skip. See CursorSnapshot
-        // docs for the single-writer assumption and the `rm` escape hatch.
-        // Backwards clock skew (NTP correction, snapshot ported across hosts)
-        // is clamped to 0 by `saturating_sub` rather than wrapping negative.
+    let skip_delta_scan = wal_ref.load_cursor_snapshot().is_some_and(|snap| {
+        // age_secs is surfaced in the boot log only — not gating the skip. See
+        // CursorSnapshot docs for the single-writer assumption and the `rm`
+        // escape hatch. Backwards clock skew (NTP correction, snapshot ported
+        // across hosts) is clamped to 0 by `saturating_sub`, not wrapped negative.
         let age_secs = timefusion::clock::now_micros().saturating_sub(snap.written_at_micros) / 1_000_000;
         match wal_ref.restore_cursor_snapshot(&snap) {
             Ok(tables_advanced) => {
@@ -266,9 +257,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 false
             }
         }
-    } else {
-        false
-    };
+    });
     info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
     if skip_delta_scan {
         info!("Skipping Delta-derived cursor reconciliation (cursor snapshot is clean)");
@@ -332,7 +321,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // BufferedWriteLayer flush isn't racing fresh inserts. Already-accepted
     // connections finish on their own spawned tasks.
     let pgwire_shutdown = tokio_util::sync::CancellationToken::new();
-    let pg_task = tokio::spawn({
+    // `mut` so the shutdown select! below can borrow it for early-failure
+    // detection while leaving ownership for the drain phase.
+    let mut pg_task = tokio::spawn({
         let shutdown = pgwire_shutdown.clone();
         let scan_metrics = Some(db.scan_metrics.clone());
         let db_for_pg = Arc::clone(&db);
@@ -364,43 +355,35 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // compares against this env var. Same fail-secure posture as
     // PGWIRE_PASSWORD — opt out for local dev only via
     // TIMEFUSION_ALLOW_INSECURE_AUTH=true.
-    let grpc_token = {
-        let allow_insecure = config::is_insecure_auth_allowed();
-        match (&cfg.core.grpc_token, allow_insecure) {
-            (Some(t), _) if !t.is_empty() => Some(t.clone()),
-            (_, true) => {
-                warn!("GRPC_TOKEN unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — gRPC ingest accepts any client. Local dev ONLY.");
-                None
-            }
-            _ => {
-                return Err(anyhow::anyhow!("GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)"));
-            }
+    let grpc_token = match (&cfg.core.grpc_token, config::is_insecure_auth_allowed()) {
+        (Some(t), _) if !t.is_empty() => Some(t.clone()),
+        (_, true) => {
+            warn!("GRPC_TOKEN unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — gRPC ingest accepts any client. Local dev ONLY.");
+            None
         }
+        _ => return Err(anyhow::anyhow!("GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)")),
     };
     // gRPC shutdown signal: tonic's `serve_with_shutdown` polls this future
     // and stops accepting new requests once it resolves. In-flight requests
     // are then awaited up to the server's drain timeout.
     let grpc_shutdown = tokio_util::sync::CancellationToken::new();
-    let grpc_shutdown_for_task = grpc_shutdown.clone();
-    let db_for_grpc = Arc::clone(&db);
-    let grpc_task = tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
-        info!("Starting gRPC ingestion server on port: {}", grpc_port);
-        let svc = timefusion::grpc_handlers::IngestService::new(db_for_grpc, grpc_token).into_server();
-        let serve = tonic::transport::Server::builder().add_service(svc).serve_with_shutdown(addr, async move {
-            grpc_shutdown_for_task.cancelled().await;
-            info!("gRPC server: shutdown signal received, draining in-flight requests");
-        });
-        if let Err(e) = serve.await {
-            error!("gRPC server error: {}", e);
-        } else {
-            info!("gRPC server: shutdown complete");
+    let grpc_task = tokio::spawn({
+        let shutdown = grpc_shutdown.clone();
+        let db_for_grpc = Arc::clone(&db);
+        async move {
+            let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
+            info!("Starting gRPC ingestion server on port: {}", grpc_port);
+            let svc = timefusion::grpc_handlers::IngestService::new(db_for_grpc, grpc_token).into_server();
+            let serve = tonic::transport::Server::builder().add_service(svc).serve_with_shutdown(addr, async move {
+                shutdown.cancelled().await;
+                info!("gRPC server: shutdown signal received, draining in-flight requests");
+            });
+            match serve.await {
+                Err(e) => error!("gRPC server error: {}", e),
+                Ok(()) => info!("gRPC server: shutdown complete"),
+            }
         }
     });
-
-    // Store references for shutdown
-    let db_for_shutdown = db.clone();
-    let buffered_layer_for_shutdown = Arc::clone(&buffered_layer);
 
     // Catch SIGTERM (k8s rolling restart) in addition to SIGINT (Ctrl-C).
     // Without SIGTERM handling, k8s sends SIGKILL after the grace period
@@ -421,7 +404,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Wait for shutdown signal. Borrow `pg_task` so we can still await it
     // in the drain phase below — the select! only watches it for early
     // failure, not for ownership.
-    let mut pg_task = pg_task;
     tokio::select! {
         res = &mut pg_task => {
             match res {
@@ -441,7 +423,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // before the buffered-layer flush, not compete with it and then outlive the
     // Foyer cache (a running sweep hitting a closed cache previously hung
     // shutdown until the orchestrator SIGKILLed us after the stop grace).
-    db_for_shutdown.cancel_maintenance();
+    db.cancel_maintenance();
 
     // Drain order matters:
     // 0. Stop PGWire from accepting new connections. Without this, the
@@ -475,7 +457,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         Err(_) => error!("gRPC drain exceeded its slice of the stop grace — proceeding; in-flight requests may be reset"),
     }
 
-    if let Err(e) = buffered_layer_for_shutdown.shutdown_by(deadline).await {
+    if let Err(e) = buffered_layer.shutdown_by(deadline).await {
         error!("Error during buffered layer shutdown: {}", e);
     }
     sleep(Duration::from_millis(500)).await;
@@ -485,7 +467,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // can block on a slow Delta/S3 backend (DML drain, foyer `close()`) is
     // bounded by it, so process exit and `wal.lock` release stay inside the
     // orchestrator's SIGTERM→SIGKILL window (issue #82).
-    if let Err(e) = db_for_shutdown.shutdown_by(deadline).await {
+    if let Err(e) = db.shutdown_by(deadline).await {
         error!("Error during database shutdown: {}", e);
     }
 
@@ -500,12 +482,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 /// One-off compaction CLI (`timefusion optimize [...]`). Compacts old `date=`
 /// partitions — those outside the scheduled 48h Z-order window that the periodic
 /// job never reaches — using `Database::compact_date` per partition. Intended to
-/// run off-box against prod storage so it doesn't load the live server's memory.
+/// run off-box against prod storage so it doesn't load the live server's memory —
+/// it commits via the same S3/R2 conditional-put (If-None-Match) coordination as the
+/// live server, so concurrent commits conflict-detect safely (OCC retry).
 async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
-    use anyhow::Context;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-        .try_init();
+    init_cli_tracing();
 
     let mut table = "otel_logs_and_spans".to_string();
     let mut only_date: Option<chrono::NaiveDate> = None;
@@ -517,6 +498,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut consolidate = false;
     let mut dedup = false;
     let mut target_size_mb: Option<i64> = None;
+    // Two-token flags need lookahead into the arg iterator, so this stays a loop.
     let mut it = std::env::args().skip(2);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -562,18 +544,19 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // --dry-run: list candidate partitions + file counts, mutate nothing.
     if dry_run {
-        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        let uris: Vec<String> = table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default();
         println!("DRY RUN — {} candidate partition(s) of '{}' ({}):", dates.len(), table, scope);
-        let mut total = 0usize;
         let pid_frag = project.as_deref().map_or(String::new(), |p| format!("project_id={p}/"));
-        for d in &dates {
-            let n = uris.iter().filter(|u| u.contains(&pid_frag) && u.contains(&format!("date={d}"))).count();
-            total += n;
-            println!("  date={d}: {n} files");
-        }
+        let total: usize = dates
+            .iter()
+            .map(|d| {
+                let n = uris.iter().filter(|u| u.contains(&pid_frag) && u.contains(&format!("date={d}"))).count();
+                println!("  date={d}: {n} files");
+                n
+            })
+            .sum();
         println!("total {total} files across {} candidate partition(s) (no changes made)", dates.len());
-        db.shutdown().await?;
-        return Ok(());
+        return db.shutdown().await;
     }
 
     println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
@@ -583,9 +566,10 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         // busy day's tens of GB never sit in one merge. Oldest event-time
         // slices rewrite first; incremental per-run commits make an
         // interrupted run resumable.
+        const MAX_ATTEMPTS: u64 = 5;
         for d in &dates {
-            let projects = match project.clone() {
-                Some(p) => vec![p],
+            let projects = match &project {
+                Some(p) => vec![p.clone()],
                 None => db.partition_projects(&table_ref, *d).await?,
             };
             if consolidate {
@@ -595,12 +579,12 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
                     // Committed runs persist across attempts (excluded from
                     // re-selection), so retrying after a transient S3/OCC error
                     // resumes at the next slice rather than restarting.
-                    for attempt in 1..=5 {
+                    for attempt in 1..=MAX_ATTEMPTS {
                         match db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p)).await {
                             Ok(()) => break,
-                            Err(e) if attempt < 5 => {
+                            Err(e) if attempt < MAX_ATTEMPTS => {
                                 eprintln!("  consolidate date={d} project={p}: attempt {attempt} failed, retrying: {e}");
-                                tokio::time::sleep(std::time::Duration::from_secs(5 * attempt)).await;
+                                sleep(Duration::from_secs(5 * attempt)).await;
                             }
                             Err(e) => eprintln!("  consolidate date={d} project={p}: FAILED after {attempt} attempts: {e}"),
                         }
@@ -616,9 +600,9 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 }
             }
         }
-        db.shutdown().await?;
-        return Ok(());
+        return db.shutdown().await;
     }
+    // Effectful loop: each partition awaits a compaction and prints as it lands.
     let (mut tot_r, mut tot_a) = (0u64, 0u64);
     for d in &dates {
         match db.compact_date_concurrent(&table_ref, &table, *d, project.as_deref(), concurrency).await {
@@ -631,7 +615,5 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     }
     println!("done: {tot_r} files removed, {tot_a} files added across {} partition(s)", dates.len());
-
-    db.shutdown().await?;
-    Ok(())
+    db.shutdown().await
 }
