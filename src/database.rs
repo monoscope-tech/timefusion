@@ -6051,7 +6051,7 @@ impl Database {
         // partition_bytes/target passes.
         // Backstop for the full sweep; the catch-up caller passes a small budget
         // so one tick's work fits between restarts.
-        let max_passes = max_passes.min(128).max(1);
+        let max_passes = max_passes.clamp(1, 128);
         for project_id in Self::hot_project_ids(&uris, date).into_iter().filter(|p| only_project.is_none_or(|only| only == p)) {
             let partition_filters =
                 vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
