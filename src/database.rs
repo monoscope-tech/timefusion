@@ -10509,6 +10509,11 @@ impl TableProvider for ProjectRoutingTable {
                 let sortable = vec![true; plans.len()];
                 match crate::optimizers::ordered_children(&plans, &req, None, &sortable, false)? {
                     Some(ordered) => {
+                        // At least one leg needed sorting. Cheap for the
+                        // in-memory legs; the alarm is the DELTA leg — see the
+                        // metric's docs for why zero is the precondition for
+                        // enabling `version_append` on a busy table.
+                        crate::metrics::maintenance_stats().mor_delta_leg_sorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         plans = ordered;
                         merge_req = Some(req);
                     }

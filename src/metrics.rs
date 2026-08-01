@@ -557,6 +557,18 @@ pub struct MaintenanceStats {
     /// Chronic nonzero = compaction is being starved, not protected.
     pub light_optimize_wal_yields: AtomicU64,
     pub light_optimize_memory_brakes: AtomicU64,
+    /// Scans on a `version_append` table where the Delta leg did NOT already
+    /// satisfy keep-greatest's ordering, so a `SortExec` was injected over it.
+    ///
+    /// Zero is the healthy state and the PRECONDITION for turning
+    /// `version_append` on for a busy table: the sort is per-partition and
+    /// spillable, but prod's `otel_logs_and_spans` scans read 48 file groups
+    /// (2026-08-01), and 48 concurrent sorts over a measured 145MB peak batch is
+    /// the 2026-07-20 wide-scan OOM shape. Nonzero here means the partition
+    /// carries files without an honest sorted footer — today that is the DML
+    /// rewrite path (`dml_writer_properties` passes `declare_sorted=false`),
+    /// which merge-on-read removes by construction.
+    pub mor_delta_leg_sorts: AtomicU64,
     /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
     /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
     /// outrunning flush often enough that compaction is running at the floor.
@@ -623,6 +635,7 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     dedup_waves_committed: AtomicU64::new(0),
     light_optimize_wal_yields: AtomicU64::new(0),
     light_optimize_memory_brakes: AtomicU64::new(0),
+    mor_delta_leg_sorts: AtomicU64::new(0),
     light_optimize_ticks_degraded: AtomicU64::new(0),
     dirty_bin_queue_depth: AtomicU64::new(0),
     dirty_bin_enqueued: AtomicU64::new(0),
