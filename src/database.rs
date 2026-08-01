@@ -1991,7 +1991,19 @@ impl Database {
     /// recompress to rewrite them to zstd.
     pub(crate) fn dml_writer_properties(&self, table_name: &str) -> WriterProperties {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, false)
+        // `declare_sorted=true` is HONEST here only because the DV-merge path
+        // now sorts its appended rows by these same keys before writing
+        // (`MergeDvUpdate::append_sort_by`, fork rev 94f9cfe4). Before that the
+        // appended file carried the join's row order and had to declare
+        // nothing — and ONE such file disabled the reader's all-or-nothing
+        // footer ordering for the whole partition, which is how a
+        // continuously-enriched table lost its top-N pushdown permanently
+        // (measured prod 2026-08-01: a 1-row DML file among 24 sorted ones).
+        //
+        // Load-bearing pair: if the sort is ever removed from the append path,
+        // this must go back to `false` or the footer starts lying and the
+        // reader will merge on an order the file does not have.
+        self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, true)
     }
 
     /// Updates a DeltaTable and handles errors consistently

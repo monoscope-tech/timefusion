@@ -1274,6 +1274,17 @@ pub async fn perform_delta_merge_update(
                         target_alias: "target".to_string(),
                         source_alias: "source".to_string(),
                         writer_properties: Some(writer_properties),
+                        // Sort the appended rows by the table's sort keys so the
+                        // file's footer can declare them. Unsorted, ONE such
+                        // file disables the reader's all-or-nothing footer
+                        // ordering for the whole partition — measured on prod
+                        // 2026-08-01, a 1-row DML file cost a tenant its top-N
+                        // pushdown while its other 24 files were all sorted.
+                        // Enrichment writes these continuously, so compaction
+                        // cannot sweep them faster than they arrive.
+                        append_sort_by: crate::schema_loader::get_schema(table_name)
+                            .map(|s| s.sorting_columns.iter().map(|c| (c.name.clone(), c.descending, c.nulls_first)).collect())
+                            .unwrap_or_default(),
                         // Sound here and only here: every perform_delta_merge_update
                         // caller ran the mem leg first (DmlContext::execute), so
                         // concurrently flushed rows already carry post-DML values.
