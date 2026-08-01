@@ -71,6 +71,7 @@ pub struct E2eEnvBuilder {
     dml_coalesce_secs: u64,
     page_row_count_limit: Option<usize>,
     hot_tier_retention_hours: u64,
+    sort_skip_bytes: Option<usize>,
 }
 
 impl Default for E2eEnvBuilder {
@@ -91,6 +92,7 @@ impl Default for E2eEnvBuilder {
             // Mirrors the prod default: the local hot tier is OFF unless a test
             // asks for it (`with_hot_tier`).
             hot_tier_retention_hours: 0,
+            sort_skip_bytes: None,
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
@@ -126,6 +128,13 @@ impl E2eEnvBuilder {
     /// nothing and the assertion reads as a product bug.
     pub fn with_hot_tier(mut self, hours: u64) -> Self {
         self.hot_tier_retention_hours = hours;
+        self
+    }
+    /// Shrink the in-process sort budget (in-memory Arrow bytes) so a test can
+    /// reproduce a bin that exceeds it — the production shape, where a 256 MB
+    /// FILE-byte compaction target is ~17x over a 256 MB in-memory budget.
+    pub fn with_sort_skip_bytes(mut self, bytes: usize) -> Self {
+        self.sort_skip_bytes = Some(bytes);
         self
     }
     pub fn with_foyer_enabled(mut self) -> Self {
@@ -266,6 +275,7 @@ impl E2eEnvBuilder {
             dml_merge_key_prune: self.dml_merge_key_prune,
             dml_coalesce_secs: self.dml_coalesce_secs,
             hot_tier_retention_hours: self.hot_tier_retention_hours,
+            sort_skip_bytes: self.sort_skip_bytes,
             page_row_count_limit: self.page_row_count_limit,
             test_id: &test_id,
         });
@@ -367,6 +377,7 @@ impl E2eEnv {
             dml_merge_key_prune: self.builder.dml_merge_key_prune,
             dml_coalesce_secs: self.builder.dml_coalesce_secs,
             hot_tier_retention_hours: self.builder.hot_tier_retention_hours,
+            sort_skip_bytes: self.builder.sort_skip_bytes,
             page_row_count_limit: self.builder.page_row_count_limit,
             test_id: &self.test_id,
         });
@@ -476,6 +487,7 @@ struct BuildCfgArgs<'a> {
     dml_coalesce_secs: u64,
     page_row_count_limit: Option<usize>,
     hot_tier_retention_hours: u64,
+    sort_skip_bytes: Option<usize>,
     test_id: &'a str,
 }
 
@@ -504,6 +516,9 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
     cfg.buffer.timefusion_hot_tier_retention_hours = args.hot_tier_retention_hours;
+    if let Some(b) = args.sort_skip_bytes {
+        cfg.maintenance.timefusion_sort_skip_bytes = b;
+    }
     if let Some(rows) = args.page_row_count_limit {
         cfg.parquet.timefusion_page_row_count_limit = rows;
     }

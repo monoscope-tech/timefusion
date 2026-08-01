@@ -4288,7 +4288,7 @@ impl Database {
         // SortingColumn footer is honest and the page index localizes the lead
         // key. `sorted` is false when a schema-evolved bucket can't be combined
         // (we then write unsorted) — declare the footer only when it's true.
-        let (batches, sorted) = sort_batches_by_schema(schema, batches);
+        let (batches, sorted) = sort_batches_by_schema(schema, batches, self.config.maintenance.timefusion_sort_skip_bytes);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
         let staging_table = { table_ref.read().await.clone() };
@@ -6515,7 +6515,7 @@ impl Database {
                     // Variant struct columns may still be BinaryView if the partition
                     // mixes tiers — cast to Binary so the write accepts the schema.
                     let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-                    let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
+                    let (deduped, sorted) = sort_batches_by_schema(schema, deduped, self.config.maintenance.timefusion_sort_skip_bytes);
                     let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
                     let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                         .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
@@ -7073,7 +7073,13 @@ impl Database {
     /// `TIMEFUSION_LIGHT_OPTIMIZE_ENABLED=false` remains the incident kill switch.
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
-        let today = Utc::now().date_naive();
+        // `crate::clock`, not `Utc::now()`: the hot tail scopes itself to TODAY's
+        // partition and to an event-time seal window, so a wall-clock read here
+        // makes the whole pass unreachable from the virtual-time e2e harness —
+        // which is why this path had no end-to-end coverage and shipped writing
+        // every output unsorted. In production the clock IS the wall clock.
+        let today = crate::clock::now_micros();
+        let today = chrono::DateTime::from_timestamp_micros(today).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let today_str = today.to_string();
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
@@ -7248,18 +7254,31 @@ impl Database {
             // accumulate entries.
             let bin_table = format!("hot_bin_{}", uuid::Uuid::new_v4().simple());
             ctx.register_table(&bin_table, Arc::new(provider))?;
-            let read = ctx.sql(&format!("SELECT * FROM {bin_table}")).await;
-            let batches_res = match read {
-                Ok(df) => df.collect().await,
-                Err(e) => Err(e),
-            };
-            let _ = ctx.deregister_table(&bin_table);
-            let batches: Vec<RecordBatch> = batches_res?;
-            if batches.iter().all(|b| b.num_rows() == 0) {
-                return Ok(());
-            }
-            let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-            let (batches, sorted) = sort_batches_by_schema(schema, batches);
+            // ORDER BY in the PLAN, streamed — not `collect()` + an in-process
+            // Arrow lexsort.
+            //
+            // `sort_batches_by_schema` refuses to sort past `SORT_SKIP_BYTES`
+            // (256 MB of in-memory Arrow) and silently returns `sorted=false`.
+            // A hot bin is packed to `light_optimize_target_size` — 256 MB of
+            // FILE bytes — and prod's zstd ratio is ~17x, so EVERY bin arrived
+            // ~17x over that threshold and every hot-tail output was written
+            // unsorted: measured 2026-08-01, 0 of the 8 largest files in a live
+            // partition declared `sorting_columns`. One such file is enough,
+            // because the reader's `derive_common_ordering` is all-or-nothing —
+            // so the scan lost its declared ordering, which cost the streaming
+            // top-N pushdown AND forced `DedupExec` into its unbounded
+            // `full-set` seen-set, the per-query memory behind the OOM/restart
+            // cycle.
+            //
+            // Sorting in the plan fixes both halves: DataFusion merges the
+            // already-sorted inputs with a `SortPreservingMergeExec` (one batch
+            // per file, independent of bin size) and falls back to a SortExec
+            // that spills into the light pool where they are not — instead of
+            // materialising the whole bin 2-3x with no pool and no spill. The
+            // footer declaration is then honest by construction.
+            let order_by = schema_order_by_clause(schema);
+            let sorted = !order_by.is_empty();
+            let read = ctx.sql(&format!("SELECT * FROM {bin_table}{order_by}")).await;
             // Intermediate tier: this output is rewritten tonight by
             // consolidate/recompress, so it isn't worth max compression.
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
@@ -7267,9 +7286,24 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
                 .with_writer_properties(writer_properties);
             let target_schema = writer.arrow_schema();
-            for b in batches {
-                let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
+            let mut stream = match read {
+                Ok(df) => df.execute_stream().await,
+                Err(e) => Err(e),
+            }?;
+            let mut rows_staged = 0usize;
+            while let Some(batch) = stream.next().await {
+                let batch = cast_variant_columns_to_binary(batch?)?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                rows_staged += batch.num_rows();
+                let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                 writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
+            }
+            drop(stream);
+            let _ = ctx.deregister_table(&bin_table);
+            if rows_staged == 0 {
+                return Ok(());
             }
             adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(|mut add| {
                 // Tag the output so the next tick's selection treats it as a
@@ -8503,7 +8537,11 @@ fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema_loader
     take_record_batch(batch, &indices)
 }
 
-fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (FlushBatches, bool) {
+/// Default in-process sort budget for the FLUSH path, in in-memory Arrow bytes.
+/// Compaction must not reuse it — see the note in `sort_batches_by_schema`.
+pub(crate) const DEFAULT_SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
+
+fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>, skip_over_bytes: usize) -> (FlushBatches, bool) {
     use arrow::{
         compute::{SortOptions, concat_batches},
         row::{RowConverter, SortField},
@@ -8512,6 +8550,13 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     if batches.is_empty() || schema.sorting_columns.is_empty() {
         return unsorted(batches);
     }
+    // `skip_over_bytes` is the caller's budget for an IN-PROCESS sort, measured
+    // in in-memory Arrow bytes — NOT file bytes. The two differ by the zstd
+    // ratio, ~17x on prod otel data, which is exactly how a compaction path
+    // packing to a 256 MB FILE target silently blew a 256 MB in-memory budget on
+    // every single bin (see `stage_hot_bin`). A caller that sorts in a
+    // DataFusion plan instead should not be using this function at all.
+    //
     // Skip the in-flight sort for very large coalesced groups (bulk backfill):
     // concat + lexsort + take materializes the whole group 2-3x on the flush
     // path — a serial CPU + RSS spike that, multiplied by flush_parallelism,
@@ -8520,9 +8565,8 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     // scheduled compaction re-sort/Z-order. Steady-state per-(project,table)
     // groups stay well under the threshold, keeping their sorted footer +
     // compression; only giant backfill coalesces trip it.
-    const SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
     let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-    if total_bytes > SORT_SKIP_BYTES {
+    if total_bytes > skip_over_bytes {
         return unsorted(batches);
     }
     let first_schema = batches[0].schema();
@@ -9004,7 +9048,7 @@ fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
 /// at 2-7s and never warmed while 3h (stable older files) did (prod 2026-07-21).
 fn seal_micros_now() -> i64 {
     const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
-    Utc::now().timestamp_micros() - SEAL_LAG_MICROS
+    crate::clock::now_micros() - SEAL_LAG_MICROS
 }
 
 /// The metadata one planner walk collects per candidate file. Decoupling
@@ -10951,7 +10995,7 @@ mod writer_properties_tests {
             let _ = Int32Array::from(vec![0]); // keep the import honest for dictionary key typing
 
             let (want, want_sorted) = sort_batches_by_schema_reference(&sch, batches.clone());
-            let (got, got_sorted) = sort_batches_by_schema(&sch, batches);
+            let (got, got_sorted) = sort_batches_by_schema(&sch, batches, DEFAULT_SORT_SKIP_BYTES);
             if matches!(got, FlushBatches::Merge(_)) {
                 merged_paths += 1;
             }
@@ -10992,7 +11036,7 @@ mod writer_properties_tests {
             .collect();
         let sch = schema_with(vec![], vec!["timestamp"]);
         let (want, _) = sort_batches_by_schema_reference(&sch, batches.clone());
-        let (got, sorted) = sort_batches_by_schema(&sch, batches);
+        let (got, sorted) = sort_batches_by_schema(&sch, batches, DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         assert!(matches!(got, FlushBatches::Merge(_)), "this input must take the streaming path");
         assert_eq!(render(&want, None), render(&drain(got), None));
@@ -11009,7 +11053,7 @@ mod writer_properties_tests {
         // merge must hand the writer several chunks instead of one big batch.
         let mk =
             |off: i64| RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from((0..100_000).map(|i| i * 2 + off).rev().collect::<Vec<_>>()))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![mk(0), mk(1)]);
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![mk(0), mk(1)], DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         let chunks = drain(out);
         assert!(chunks.len() > 1, "output must be chunked, not one 200k-row batch");
@@ -11055,7 +11099,7 @@ mod writer_properties_tests {
         )
         .unwrap();
 
-        let (out, sorted) = sort_batches_by_schema(&sch, vec![batch_a, batch_b]);
+        let (out, sorted) = sort_batches_by_schema(&sch, vec![batch_a, batch_b], DEFAULT_SORT_SKIP_BYTES);
         let out = drain(out);
 
         assert!(sorted, "heterogeneous bucket must still be reported sorted so the footer is declared");
@@ -11272,14 +11316,14 @@ mod writer_properties_tests {
         let s = std::sync::Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
         let b1 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![3, 1]))]).unwrap();
         let b2 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![2, 0]))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2], DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         let out = drain(out);
         assert_eq!(out.len(), 1);
         let col = out[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(col.values(), &[0, 1, 2, 3]);
         // No declared sort columns → input returned untouched, sorted=false.
-        let (passthrough, sorted) = sort_batches_by_schema(&schema_with(vec![], vec![]), vec![out[0].clone(), out[0].clone()]);
+        let (passthrough, sorted) = sort_batches_by_schema(&schema_with(vec![], vec![]), vec![out[0].clone(), out[0].clone()], DEFAULT_SORT_SKIP_BYTES);
         assert!(!sorted);
         assert_eq!(drain(passthrough).len(), 2);
     }
@@ -11300,7 +11344,7 @@ mod writer_properties_tests {
         let b1 = RecordBatch::try_new(s1, vec![std::sync::Arc::new(Int64Array::from(vec![2, 1]))]).unwrap();
         let b2 =
             RecordBatch::try_new(s2, vec![std::sync::Arc::new(Int64Array::from(vec![3])), std::sync::Arc::new(StringArray::from(vec![Some("x")]))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2], DEFAULT_SORT_SKIP_BYTES);
         let out = drain(out);
         assert!(sorted, "mixed-schema bucket is unified and sorted, not left unsorted");
         assert_eq!(out.len(), 1, "batches unified into one sorted file");
