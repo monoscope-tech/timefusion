@@ -698,7 +698,24 @@ const_default!(d_compact_min_files: usize = 5);
 // opens ≈ 1.2s). A larger target collapses today's sealed slices into a few
 // large event-time-disjoint runs so recent queries open a handful of files.
 const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
-const_default!(d_sort_skip_bytes: usize = 256 * MIB);
+// 4 GiB (was 256 MiB). The 256 MiB guard was written for an implementation that
+// concatenated the whole group and did one `lexsort + take` — a 2-3x
+// materialisation. The current path does neither: `sort_one_batch` sorts each
+// batch independently (and skips the `take` entirely when a batch is already
+// ordered, the common append-ordered case), then a heap k-way merge drains the
+// runs, replacing each with an empty batch so its payload frees mid-merge. Peak
+// is therefore ~1x the bucket plus the encoded sort keys, not 2-3x.
+//
+// The old value was doing real damage: prod flush files reached ~170 MB
+// compressed (~2.9 GB in memory at the measured ~17x zstd ratio), so a
+// high-volume tenant tripped it on ordinary flushes and wrote them UNSORTED.
+// One unsorted file disables the reader's all-or-nothing footer ordering for
+// every scan touching the partition, which costs the streaming top-N pushdown
+// and forces DedupExec into its unbounded seen-set.
+//
+// Still a ceiling, not a removal: a pathological bulk-backfill coalesce should
+// bail rather than hold a huge run set, and this stays the incident knob.
+const_default!(d_sort_skip_bytes: usize = 4 * GIB);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB

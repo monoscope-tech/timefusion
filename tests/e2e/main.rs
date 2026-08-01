@@ -11,6 +11,7 @@ mod deletion_vectors;
 mod dml_compression;
 mod eviction;
 mod flush_lifecycle;
+mod flush_sort_cost;
 mod flush_warm;
 mod hash_enrichment;
 mod hot_tail_sorted_footer;

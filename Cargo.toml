@@ -152,6 +152,10 @@ name = "sort_layout_benchmarks"
 harness = false
 
 [[bench]]
+name = "sort_strategy_benchmarks"
+harness = false
+
+[[bench]]
 name = "dedup_benchmarks"
 harness = false
 
