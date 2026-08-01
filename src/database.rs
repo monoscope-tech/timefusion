@@ -5478,9 +5478,13 @@ impl Database {
     /// it goes first within the round).
     /// TODO: weight the debt score by read traffic — a partition nobody queries
     /// is deferred work, not urgent work (needs per-project query counters).
-    fn select_all_hot_bins(table: &DeltaTable, today_str: &str, target_size: i64, min_files: usize, sorted_run_cap: i64) -> Result<Vec<(String, Vec<String>)>> {
+    fn select_all_hot_bins(
+        table: &DeltaTable, schema: &crate::schema_loader::TableSchema, today_str: &str, target_size: i64, min_files: usize, sorted_run_cap: i64,
+    ) -> Result<Vec<(String, Vec<String>)>> {
         let date_marker = format!("date={today_str}/");
         let seal = seal_micros_now();
+        // Only a table that declares a sort order has a footer to repair.
+        let repairable = !schema.sorting_columns.is_empty();
         let cap = target_size.max(1);
         let converged = cap - cap / 8;
         let per_project = table
@@ -5490,11 +5494,27 @@ impl Database {
             .filter(|file| file.path().contains(&date_marker))
             // Tag-first: both exclusions are pure metadata, so a converged file
             // or an over-cap sorted run never reaches the stats parse.
-            .filter(|file| file.size() < converged && (file.size() < sorted_run_cap || !is_sorted_run(&file.tags())))
             .filter_map(|file| {
+                let (size, sorted_run) = (file.size(), is_sorted_run(&file.tags()));
+                // A converged file is normally done — EXCEPT when it is converged
+                // and UNSORTED. Such a file declares no `sorting_columns`, and one
+                // of them disables the reader's all-or-nothing footer ordering for
+                // every scan that touches it (costing the streaming top-N pushdown
+                // and bounded dedup). Nothing else repairs it: the daily
+                // consolidate/recompress crons rarely survive this process's restart
+                // cadence, so hot-tail is the only pass that runs often enough to be
+                // relied on. `select_tail_bin` admits at most one per bin, so the
+                // backlog drains over ticks instead of rewriting several
+                // hundred-megabyte files at once.
+                let converged_done = size >= converged && (sorted_run || !repairable);
+                let over_cap_run = size >= sorted_run_cap && sorted_run;
+                if converged_done || over_cap_run {
+                    return None;
+                }
+                // `stats()` is reached only past both tag/size exclusions.
                 let path = file.path();
                 let project_id = path.split('/').find_map(|s| s.strip_prefix("project_id=")).filter(|p| !p.is_empty()).map(str::to_owned)?;
-                Some((project_id, TailAdd::from_stats(path.into_owned(), file.size(), false, file.stats().as_deref())))
+                Some((project_id, TailAdd::from_stats(path.into_owned(), size, sorted_run, file.stats().as_deref())))
             })
             .fold(HashMap::<String, Vec<TailAdd>>::new(), |mut per_project, (project_id, add)| {
                 per_project.entry(project_id).or_default().push(add);
@@ -7024,7 +7044,7 @@ impl Database {
         // wrote. Bins are ordered by compaction debt.
         let mut planned = {
             let table = table_ref.read().await;
-            Self::select_all_hot_bins(&table, &today_str, target_size, min_files, target_size / 2)?
+            Self::select_all_hot_bins(&table, schema, &today_str, target_size, min_files, target_size / 2)?
         };
         // Rotation cursor: start where the last truncated tick stopped so the
         // same tail is never skipped twice in a row (a truncated tick otherwise
@@ -7096,7 +7116,7 @@ impl Database {
                     if round + 1 < MAX_WAVES && std::time::Instant::now() < deadline {
                         let next = {
                             let table = table_ref.read().await;
-                            Self::select_all_hot_bins(&table, today_str, target_size, min_files, target_size / 2).unwrap_or_default()
+                            Self::select_all_hot_bins(&table, schema, today_str, target_size, min_files, target_size / 2).unwrap_or_default()
                         };
                         *plan.lock().await = next.into_iter().collect();
                     }
@@ -9038,25 +9058,37 @@ impl TailAdd {
 pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64) -> Vec<String> {
     let cap = target_size.max(1);
     let converged = cap - cap / 8;
-    let mut fresh: Vec<(&str, i64, i64)> = adds
+    // An oversized file that is NOT a sorted run is a REPAIR candidate, not a
+    // converged one: it declares no `sorting_columns`, and one such file
+    // disables the reader's all-or-nothing footer ordering for the whole scan.
+    // Exactly one is admitted per bin (`repair_budget`) so a backlog of
+    // hundred-megabyte files drains across ticks rather than in one rewrite.
+    let is_repair = |add: &TailAdd| add.size >= converged && !add.is_sorted_run;
+    let mut fresh: Vec<(&str, i64, i64, bool)> = adds
         .iter()
         .filter(|add| add.size < sorted_run_cap || !add.is_sorted_run)
-        .filter(|add| add.size < converged)
+        .filter(|add| add.size < converged || is_repair(add))
         .filter_map(|add| match add.event_range {
-            Some((min, max)) if max <= seal_micros => Some((add.path.as_str(), min, add.size)),
+            Some((min, max)) if max <= seal_micros => Some((add.path.as_str(), min, add.size, is_repair(add))),
             _ => None,
         })
         .collect();
-    if fresh.len() < min_files {
+    // A lone repair file is real work — it is the only way an oversized
+    // unsorted file ever gets rewritten — so it does not need `min_files`
+    // company to justify a pass.
+    let repairs_present = fresh.iter().any(|(_, _, _, repair)| *repair);
+    if fresh.len() < min_files && !repairs_present {
         return vec![];
     }
-    fresh.sort_unstable_by_key(|(_, min, _)| *min);
+    fresh.sort_unstable_by_key(|(_, min, _, _)| *min);
     // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
     // per tick. Small commit converges quickly and shrinks the conflict window;
     // later ticks pack the next (strictly later) slice.
     let mut bytes = 0i64;
     let mut files: Vec<String> = vec![];
-    for (path, _, size) in fresh {
+    for (path, _, size, repair) in fresh.iter().filter(|(_, _, _, r)| !*r) {
+        let (path, size) = (*path, *size);
+        let _ = repair;
         if !files.is_empty() && bytes + size > cap {
             // A lone-file slice is already a run — rewriting it is pure churn.
             // Skip past it to the next time slice instead of wedging the pass
@@ -9072,6 +9104,17 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     }
     if files.len() < 2 {
         files.clear();
+    }
+    // Repair runs in the GAPS, never against the primary path: only once a
+    // project has no packable slice left does a tick spend itself rewriting one
+    // oversized unsorted file. Preempting normal packing would starve it while
+    // a backlog of legacy files drained. Steady state is exactly when the gaps
+    // appear — the sub-target backlog is packed into converged runs, and the
+    // leftover poison files are what remain.
+    if files.is_empty()
+        && let Some((path, _, _, _)) = fresh.iter().find(|(_, _, _, repair)| *repair)
+    {
+        return vec![path.to_string()];
     }
     files
 }
@@ -11883,6 +11926,30 @@ mod tests {
         // alone is a 1→1 rewrite forever.
         let converged = vec![f("big", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
         assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL), vec!["a", "b"]);
+
+        // REPAIR: an oversized file that is NOT a sorted run declares no
+        // `sorting_columns`, and one of those disables the reader's
+        // all-or-nothing footer ordering for every scan touching the partition.
+        // Nothing else rewrites it — hot-tail used to skip it as converged, and
+        // the daily crons rarely survive this process's restart cadence. So it
+        // is repaired, but only in the GAPS: while a project still has a
+        // packable slice, that slice wins.
+        let poisoned = vec![f("big_unsorted", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
+        assert_eq!(super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL), vec!["a", "b"], "normal packing must not be starved by a pending repair");
+        let only_poison = vec![f("big_unsorted", 900, false, 1, 2)];
+        assert_eq!(
+            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL),
+            vec!["big_unsorted"],
+            "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files"
+        );
+        // ...and exactly one per bin, so a backlog drains across ticks instead
+        // of rewriting several hundred-megabyte files in a single pass.
+        let many_poison = vec![f("p1", 900, false, 1, 2), f("p2", 950, false, 3, 4), f("p3", 800, false, 5, 6)];
+        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL).len(), 1, "one repair per bin");
+        // A converged file that IS a sorted run stays done — repairing it would
+        // be a 1->1 rewrite forever.
+        let healthy = vec![f("big_sorted", 900, true, 1, 2)];
+        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL).is_empty(), "a converged sorted run is never re-selected");
 
         // Sorted runs fold only while under the cap; an over-cap run is excluded.
         let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
