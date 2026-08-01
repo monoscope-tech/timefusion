@@ -50,7 +50,7 @@ async fn name_of(client: &tokio_postgres::Client, id: &str) -> anyhow::Result<Op
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> anyhow::Result<()> {
-    let mut env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+    let env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
     let client = env.pg_client().await?;
 
     // All eight rows share one bucket, so the updated row's window is exactly
@@ -98,7 +98,7 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_appends_a_tombstone_that_hides_only_its_own_key() -> anyhow::Result<()> {
-    let mut env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+    let env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
     let client = env.pg_client().await?;
 
     for i in 0..4 {
