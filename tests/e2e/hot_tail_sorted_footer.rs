@@ -101,3 +101,86 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
 
     Ok(())
 }
+
+/// The REPAIR half: a file that is already "converged" (>= 7/8 of target) but
+/// carries no sorted footer must be rewritten anyway.
+///
+/// Prod 2026-08-01 had 265-778MB files in exactly that state. Hot-tail skipped
+/// them as converged, and the daily consolidate/recompress crons that would
+/// have fixed them had not run in 24h — a job firing at 02:30 rarely survives a
+/// process restarting every 30-120 minutes. So nothing repaired them, and one
+/// of them is enough to disable the reader's all-or-nothing footer ordering for
+/// every scan touching the partition.
+///
+/// The target size is shrunk so a test-sized file lands in the same state.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow::Result<()> {
+    let bucket_secs = 60u64;
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_optimize_sort_by()
+        // Every flush output is unsorted (the large-coalesced-bucket shape)...
+        .with_sort_skip_bytes(0)
+        // ...and counts as converged, so the ONLY way it is ever rewritten is
+        // the repair path.
+        .with_light_optimize_target(1024)
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+
+    let sec = 1_000_000i64;
+    let base = FROZEN_START_MICROS - 1800 * sec;
+    for b in 0..6i64 {
+        for i in 0..3i64 {
+            let idx = b * 3 + i;
+            insert_at(&client, &format!("r-{idx}"), base + idx * 20 * sec).await?;
+        }
+        env.advance(Duration::from_secs(bucket_secs * 2));
+        env.force_flush().await?;
+    }
+    clock::set_micros(FROZEN_START_MICROS);
+
+    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let before: Vec<String> = {
+        let t = table_ref.read().await;
+        t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect()
+    };
+    assert!(!before.is_empty(), "the fixture must have produced files to repair");
+
+    // Several ticks: repair takes ONE file per bin and only once a project has
+    // no packable slice left, so a backlog drains gradually by design.
+    for _ in 0..6 {
+        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans").await?;
+    }
+
+    let after: Vec<String> = {
+        let t = table_ref.read().await;
+        t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect()
+    };
+    let rewritten = before.iter().filter(|p| !after.contains(p)).count();
+    assert!(
+        rewritten > 0,
+        "a converged-but-unsorted file must be rewritten by the repair pass — otherwise nothing ever restores the \
+         partition's footer ordering. before={before:?} after={after:?}"
+    );
+
+    // The repair must converge: once rewritten the output is a tagged sorted
+    // run, so further ticks must stop touching it. Without that this is an
+    // infinite 1->1 rewrite loop.
+    let settled: Vec<String> = {
+        for _ in 0..3 {
+            env.db().optimize_table_light(&table_ref, "otel_logs_and_spans").await?;
+        }
+        let t = table_ref.read().await;
+        t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect()
+    };
+    let churn = after.iter().filter(|p| !settled.contains(p)).count();
+    assert_eq!(churn, 0, "repair must be one-time: a rewritten file carries SORTED_RUN_TAG and is never re-selected");
+
+    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(count, 18, "the repair must not lose or duplicate rows");
+
+    Ok(())
+}

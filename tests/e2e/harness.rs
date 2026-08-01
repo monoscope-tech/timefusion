@@ -72,6 +72,7 @@ pub struct E2eEnvBuilder {
     page_row_count_limit: Option<usize>,
     hot_tier_retention_hours: u64,
     sort_skip_bytes: Option<usize>,
+    light_optimize_target_size: Option<i64>,
 }
 
 impl Default for E2eEnvBuilder {
@@ -93,6 +94,7 @@ impl Default for E2eEnvBuilder {
             // asks for it (`with_hot_tier`).
             hot_tier_retention_hours: 0,
             sort_skip_bytes: None,
+            light_optimize_target_size: None,
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
@@ -135,6 +137,12 @@ impl E2eEnvBuilder {
     /// FILE-byte compaction target is ~17x over a 256 MB in-memory budget.
     pub fn with_sort_skip_bytes(mut self, bytes: usize) -> Self {
         self.sort_skip_bytes = Some(bytes);
+        self
+    }
+    /// Shrink the hot-tail compaction target so a test-sized file counts as
+    /// "converged" (>= 7/8 of target) — the state a 265-778MB prod file is in.
+    pub fn with_light_optimize_target(mut self, bytes: i64) -> Self {
+        self.light_optimize_target_size = Some(bytes);
         self
     }
     pub fn with_foyer_enabled(mut self) -> Self {
@@ -276,6 +284,7 @@ impl E2eEnvBuilder {
             dml_coalesce_secs: self.dml_coalesce_secs,
             hot_tier_retention_hours: self.hot_tier_retention_hours,
             sort_skip_bytes: self.sort_skip_bytes,
+            light_optimize_target_size: self.light_optimize_target_size,
             page_row_count_limit: self.page_row_count_limit,
             test_id: &test_id,
         });
@@ -378,6 +387,7 @@ impl E2eEnv {
             dml_coalesce_secs: self.builder.dml_coalesce_secs,
             hot_tier_retention_hours: self.builder.hot_tier_retention_hours,
             sort_skip_bytes: self.builder.sort_skip_bytes,
+            light_optimize_target_size: self.builder.light_optimize_target_size,
             page_row_count_limit: self.builder.page_row_count_limit,
             test_id: &self.test_id,
         });
@@ -488,6 +498,7 @@ struct BuildCfgArgs<'a> {
     page_row_count_limit: Option<usize>,
     hot_tier_retention_hours: u64,
     sort_skip_bytes: Option<usize>,
+    light_optimize_target_size: Option<i64>,
     test_id: &'a str,
 }
 
@@ -518,6 +529,9 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.buffer.timefusion_hot_tier_retention_hours = args.hot_tier_retention_hours;
     if let Some(b) = args.sort_skip_bytes {
         cfg.maintenance.timefusion_sort_skip_bytes = b;
+    }
+    if let Some(t) = args.light_optimize_target_size {
+        cfg.maintenance.timefusion_light_optimize_target_size = t;
     }
     if let Some(rows) = args.page_row_count_limit {
         cfg.parquet.timefusion_page_row_count_limit = rows;
