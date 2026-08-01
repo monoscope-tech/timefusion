@@ -9215,8 +9215,31 @@ where
             }
             None => {}
         }
-        let outcomes: Vec<(String, Result<BinOutcome<T>>)> =
-            futures::stream::iter(std::mem::take(&mut pending)).map(|project_id| op(project_id, round)).buffer_unordered(concurrency).collect().await;
+        // Admission control INSIDE the round. The `should_pause` above guards
+        // only the round BOUNDARY, but the memory a round costs is allocated by
+        // the staging below — prod 2026-08-01 watched RSS go 50GB → 110GB
+        // (cgroup 128GB) inside one round while the brake, sampled only between
+        // rounds, never got the chance to fire; it recorded its first Stop after
+        // the round had already landed. `buffer_unordered` polls this closure as
+        // it admits each bin, so sampling here stops a round taking on NEW work
+        // the moment it crosses the line. Bins already in flight still finish —
+        // aborting them would waste the sort that is holding the memory.
+        // Deferred projects stay `pending`, so the next round's boundary check
+        // truncates the tick and rotates the cursor exactly as a brake there
+        // would have.
+        let outcomes: Vec<(String, Result<BinOutcome<T>>)> = futures::stream::iter(std::mem::take(&mut pending))
+            .map(|project_id| {
+                let (op, deferred) = (&op, matches!(should_pause(), Some(Brake::Stop(_))));
+                async move {
+                    match deferred {
+                        true => (project_id, Ok(BinOutcome::Retry)),
+                        false => op(project_id, round).await,
+                    }
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
         // Carry forward projects that still have work; converged or failed
         // projects drop out for the rest of the tick.
         let mut staged = Vec::with_capacity(outcomes.len());
@@ -12296,6 +12319,50 @@ mod tests {
         .await;
         assert_eq!(failed, 0);
         assert_eq!(*truncated.lock().unwrap(), vec![(0, 2)], "must truncate on round 0 with both projects still pending");
+    }
+
+    /// Prod 2026-08-01: RSS went 50GB → 110GB (cgroup 128GB) INSIDE one round,
+    /// and the brake — sampled only at the round boundary — recorded its first
+    /// `Stop` after that round had already landed. A brake that can only fire
+    /// between rounds cannot bound the memory a round allocates, so it must also
+    /// gate ADMISSION of each bin within the round.
+    ///
+    /// A brake that engages after the round starts must therefore stop new bins
+    /// from being admitted, leaving them pending for the boundary check to
+    /// truncate — not run the whole round anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_robin_bins_stops_admitting_bins_when_the_brake_engages_mid_round() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new()));
+        // Healthy at the round boundary; trips as soon as the first bin is
+        // admitted — the shape of a wave whose own staging exhausts memory.
+        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen, sink, gate) = (calls.clone(), truncated.clone(), admitted.clone());
+        super::round_robin_bins(
+            vec!["a".into(), "b".into(), "c".into()],
+            3,
+            1, // serial admission, so the trip point is deterministic
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.to_vec())),
+            move || (gate.load(std::sync::atomic::Ordering::SeqCst) > 0).then_some(super::Brake::Stop("mem")),
+            |project_id, _round| {
+                let (seen, admitted) = (seen.clone(), admitted.clone());
+                async move {
+                    admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    seen.lock().unwrap().push(project_id.clone());
+                    (project_id, Ok(super::BinOutcome::Staged(())))
+                }
+            },
+            |_bins, _round| async { 0 },
+        )
+        .await;
+
+        assert_eq!(*calls.lock().unwrap(), vec!["a".to_string()], "only the bin admitted before the brake tripped may run");
+        assert_eq!(
+            *truncated.lock().unwrap(),
+            vec![(1, vec!["a".to_string(), "b".to_string(), "c".to_string()])],
+            "the deferred bins stay pending and the NEXT round's boundary check truncates the tick"
+        );
     }
 
     /// Prod 2026-07-29: a permanently-engaged WAL brake truncated every tick at
