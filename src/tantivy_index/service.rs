@@ -133,6 +133,9 @@ impl TantivyIndexService {
     /// (index=None, error set) and returns the error. Shared by the flush
     /// callback (random bucket key + flat path) and `build_index_for_file`
     /// (parquet-rel key + partition-mirrored path).
+    // Still 8 with `&self` even after `(ordinals_valid, merge)` folded into
+    // `source`; the rest are independent identifiers, not a cohesive struct.
+    #[allow(clippy::too_many_arguments)]
     async fn build_pack_upload(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
         batches: Vec<arrow::record_batch::RecordBatch>, source: IndexSource,

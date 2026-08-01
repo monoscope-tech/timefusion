@@ -6417,7 +6417,7 @@ impl Database {
                         // Contiguous bucket range per shard (even ±1); string compare of
                         // zero-padded lowercase hex == numeric order.
                         let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
-                        let upper = (hi < DEDUP_BUCKET_COUNT).then(|| format!(" AND {bucket_expr} < '{hi:02x}'")).unwrap_or_default();
+                        let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < '{hi:02x}'") } else { String::new() };
                         format!(" AND {bucket_expr} >= '{lo:02x}'{upper}")
                     } else {
                         String::new()
@@ -8471,6 +8471,8 @@ fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema_loader
 
 /// Default in-process sort budget for the FLUSH path, in in-memory Arrow bytes.
 /// Compaction must not reuse it — see the note in `sort_batches_by_schema`.
+/// Test-only: production callers pass `maintenance.timefusion_sort_skip_bytes`.
+#[cfg(test)]
 pub(crate) const DEFAULT_SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
 
 fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>, skip_over_bytes: usize) -> (FlushBatches, bool) {

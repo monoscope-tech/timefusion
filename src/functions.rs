@@ -561,10 +561,13 @@ impl ScalarUDFImpl for ToCharUDF {
     }
 }
 
+/// Raw timestamp ticks and the array's ticks-per-second — see `timestamp_ticks`.
+type TimestampTicks<'a> = (Box<dyn Iterator<Item = Option<i64>> + 'a>, i64);
+
 /// Downcast a µs/ns timestamp array to its raw ticks plus the array's
 /// ticks-per-second, so callers stay unit-agnostic. `label` names the argument
 /// in the error message.
-fn timestamp_ticks<'a>(array: &'a ArrayRef, label: &str) -> datafusion::error::Result<(Box<dyn Iterator<Item = Option<i64>> + 'a>, i64)> {
+fn timestamp_ticks<'a>(array: &'a ArrayRef, label: &str) -> datafusion::error::Result<TimestampTicks<'a>> {
     if let Some(ts) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
         Ok((Box::new(ts.iter()), 1_000_000))
     } else if let Some(ts) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {

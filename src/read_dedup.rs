@@ -765,7 +765,8 @@ mod tests {
     }
 
     impl CountingExec {
-        fn new(pulled: Arc<std::sync::atomic::AtomicUsize>, n: i64) -> Arc<dyn ExecutionPlan> {
+        // Not `new`: this hands back an erased `Arc<dyn ExecutionPlan>`, not Self.
+        fn arc(pulled: Arc<std::sync::atomic::AtomicUsize>, n: i64) -> Arc<dyn ExecutionPlan> {
             use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
             let schema = vbatch(&["a"], &[0], &[Some(0)]).schema();
             let eq = datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), [col_asc("ts", 1)]);
@@ -812,7 +813,7 @@ mod tests {
     async fn keep_greatest_limit_terminates_early() {
         use datafusion::physical_plan::{collect, limit::GlobalLimitExec};
         let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let src = CountingExec::new(pulled.clone(), 1_000_000);
+        let src = CountingExec::arc(pulled.clone(), 1_000_000);
         let dedup = Arc::new(DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap());
         let plan = Arc::new(GlobalLimitExec::new(dedup, 0, Some(5)));
         let out = collect(plan, Arc::new(TaskContext::default())).await.unwrap();

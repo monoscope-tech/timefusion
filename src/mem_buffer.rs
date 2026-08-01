@@ -2441,9 +2441,11 @@ impl TableBuffer {
             // batches while a snapshot is airborne, leaving `pinned > len`.
             let pinned = bucket.flush_pinned_prefix.load(Ordering::Relaxed).min(g.len());
             // First index of the trailing all-small run (never below `pinned`).
-            let tail_start = (g.len() > MAX_BATCH_COUNT_PER_BUCKET)
-                .then(|| pinned + g[pinned..].iter().rposition(|b| estimate_batch_size(b) > MAX_BATCH_BYTES_FOR_COALESCE).map_or(0, |i| i + 1))
-                .unwrap_or(g.len());
+            let tail_start = if g.len() > MAX_BATCH_COUNT_PER_BUCKET {
+                pinned + g[pinned..].iter().rposition(|b| estimate_batch_size(b) > MAX_BATCH_BYTES_FOR_COALESCE).map_or(0, |i| i + 1)
+            } else {
+                g.len()
+            };
             if g.len() - tail_start <= MAX_BATCH_COUNT_PER_BUCKET {
                 0
             } else {
