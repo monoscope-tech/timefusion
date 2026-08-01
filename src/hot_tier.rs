@@ -26,7 +26,7 @@
 //! the Delta leg. Nothing here may fail a query.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -43,10 +43,10 @@ use arrow::{
 };
 use arrow_ipc::{Block, convert::fb_to_schema, reader::FileDecoder, reader::read_footer_length, root_as_footer, writer::FileWriter, writer::IpcWriteOptions};
 use dashmap::DashMap;
-use datafusion::logical_expr::Expr;
+use datafusion::{logical_expr::Expr, physical_expr::PhysicalExpr};
 use tracing::{debug, info, warn};
 
-use crate::mem_buffer::{TableKey, compile_filter_conjunction, filter_snapshot, overlaps};
+use crate::mem_buffer::{TableKey, compile_filter_conjunction, filter_snapshot, overlaps, table_key};
 
 /// Reconcile a demoted file's schema with the table's, tolerating ONLY a
 /// nullability difference: names, order and data types must match exactly.
@@ -69,7 +69,8 @@ fn align_nullability(batches: &[RecordBatch], schema: &SchemaRef) -> Option<Vec<
         return None;
     }
     // Only columns the table tightens need checking; widening is always safe.
-    let tightened: Vec<usize> = schema.fields().iter().enumerate().filter(|(i, w)| !w.is_nullable() && have.field(*i).is_nullable()).map(|(i, _)| i).collect();
+    let tightened: Vec<usize> =
+        schema.fields().iter().enumerate().filter_map(|(i, w)| (!w.is_nullable() && have.field(i).is_nullable()).then_some(i)).collect();
     batches
         .iter()
         .map(|b| tightened.iter().all(|&i| b.column(i).null_count() == 0).then(|| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).ok())?)
@@ -326,30 +327,55 @@ fn safe_component(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && s != "." && s != ".." && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Readable entries of one directory; an unreadable directory is simply empty
+/// (the tier is a cache — a walk failure costs warmth, never correctness).
+fn dir_entries(dir: impl AsRef<Path>) -> impl Iterator<Item = fs::DirEntry> {
+    fs::read_dir(dir).into_iter().flatten().flatten()
+}
+
+/// A directory entry's name (as a `TableKey` half) and path, if it is UTF-8.
+fn named(d: fs::DirEntry) -> Option<(Arc<str>, PathBuf)> {
+    Some((Arc::<str>::from(d.file_name().to_str()?), d.path()))
+}
+
+/// `(end_ts, bytes)` of the files a GC pass would keep on age alone.
+fn live_files(files: &BTreeMap<(i64, u64), HotBucketMeta>, cutoff: i64) -> impl Iterator<Item = (i64, u64)> + '_ {
+    files.values().filter(move |m| m.end_ts > cutoff).map(|m| (m.end_ts, m.bytes))
+}
+
+/// `retain` that hands back what it removed — the shape both invalidation and
+/// GC need (drop from the index, then unlink the files off the lock).
+fn drop_unless(files: &mut BTreeMap<(i64, u64), HotBucketMeta>, keep: impl Fn(&HotBucketMeta) -> bool) -> Vec<HotBucketMeta> {
+    let mut dropped = Vec::new();
+    files.retain(|_, m| {
+        keep(m) || {
+            dropped.push(m.clone());
+            false
+        }
+    });
+    dropped
+}
+
 fn parse_meta(path: PathBuf, bytes: u64) -> Option<HotBucketMeta> {
     if path.extension()?.to_str()? != EXT {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
-    let mut parts = stem.split('_');
-    let (bucket_id, min_ts, end_ts, seq) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
     // The stamp is an OPTIONAL 5th component so a tier written before the
     // version gate existed still rescans (as `max_stamp: None`), and so a
     // rollback to a binary that rejects it degrades to "file absent" rather
     // than to a mis-parsed range.
-    let max_stamp = match parts.next() {
-        Some(s) => Some(s.parse().ok()?),
-        None => None,
+    let (bucket_id, min_ts, end_ts, seq, stamp) = match stem.split('_').collect::<Vec<_>>()[..] {
+        [bucket_id, min_ts, end_ts, seq] => (bucket_id, min_ts, end_ts, seq, None),
+        [bucket_id, min_ts, end_ts, seq, stamp] => (bucket_id, min_ts, end_ts, seq, Some(stamp)),
+        _ => return None,
     };
-    if parts.next().is_some() {
-        return None;
-    }
     Some(HotBucketMeta {
         bucket_id: bucket_id.parse().ok()?,
         min_ts: min_ts.parse().ok()?,
         end_ts: end_ts.parse().ok()?,
         seq: seq.parse().ok()?,
-        max_stamp,
+        max_stamp: stamp.map(str::parse).transpose().ok()?,
         bytes,
         path,
     })
@@ -400,7 +426,7 @@ impl HotTier {
         if self.retention.is_none() || min_ts > max_ts || batches.iter().all(|b| b.num_rows() == 0) {
             return;
         }
-        let key: TableKey = (Arc::from(project_id), Arc::from(table_name));
+        let key = table_key(project_id, table_name);
         let health = self.health(&key);
         if health.suppressed() {
             return;
@@ -479,8 +505,7 @@ impl HotTier {
     /// window, as query filters report it; `None` = everything. Oldest bucket
     /// first.
     pub fn buckets_in_range(&self, project_id: &str, table_name: &str, query_range: Option<(i64, i64)>) -> Vec<HotBucketMeta> {
-        let key: TableKey = (Arc::from(project_id), Arc::from(table_name));
-        let Some(entry) = self.index.get(&key) else { return Vec::new() };
+        let Some(entry) = self.index.get(&table_key(project_id, table_name)) else { return Vec::new() };
         entry.values().filter(|m| query_range.is_none_or(|(lo, hi)| overlaps(m.range(), (lo, hi.saturating_add(1))))).cloned().collect()
     }
 
@@ -535,68 +560,17 @@ impl HotTier {
         let cols = plan_columns(projection, filters, schema);
         let filter_schema = cols.as_ref().map_or_else(|| schema.clone(), |c| c.schema.clone());
         let pred = compile_filter_conjunction(filters, &filter_schema).ok().flatten();
+        // Imperative: `used` is a running total whose overflow must stop the
+        // walk, and each step is a counted/logged side effect.
         let (mut partitions, mut ranges, mut used, mut gate) = (Vec::new(), Vec::new(), 0u64, None::<i64>);
         for meta in metas {
-            if mem_ranges.iter().any(|r| overlaps(meta.range(), *r)) {
-                self.mem_skipped.fetch_add(1, Relaxed);
-                continue;
-            }
-            let Some(batches) = self.read_file(&meta.path) else { continue };
-            // A file that decodes to NOTHING would pass the schema check below
-            // (`first()` is None), push its range, and contribute no rows — the
-            // one shape that silently excludes a window from Delta and serves
-            // it from nowhere. `demote` rejects all-empty input so this is
-            // unreachable today; the coverage contract must not depend on that.
-            if batches.is_empty() {
-                self.read_misses.fetch_add(1, Relaxed);
-                continue;
-            }
-            // One schema per IPC file by construction, so one compare per file.
-            // Drift (a column added since the demotion) breaks the
-            // `MemorySourceConfig` contract — treat the file as absent.
-            //
-            // Nullability alone is NOT drift. Prod 2026-07-31: demoted batches
-            // carried `timestamp` nullable while the table declares it NOT
-            // NULL, so strict field equality rejected 100% of reads — the tier
-            // served zero rows while files/bytes/writes all looked healthy
-            // (caught only by `schema_drift_total` == `read_hits_total`).
-            // Re-stamp instead, once the data proves it satisfies the stricter
-            // schema.
-            //
-            // The root cause was upstream — MemBuffer pinned whatever
-            // nullability the first batch to arrive happened to carry — and is
-            // fixed at the source in `mem_buffer::align_nullability`. This stays
-            // as tolerance for files demoted by an older binary.
-            let batches = match align_nullability(batches.as_ref(), schema) {
-                Some(b) => b,
-                None => {
-                    self.schema_drift.fetch_add(1, Relaxed);
-                    continue;
-                }
-            };
-            let batches = std::sync::Arc::new(batches);
-            // Project BEFORE filtering: `filter_record_batch` heap-copies every
-            // column it is handed, so an unprojected filter would materialize
-            // `body`/`attributes` for the whole hot window on a 3-column query.
-            let projected = match &cols {
-                Some(c) => batches.iter().map(|b| b.project(&c.needed)).collect::<Result<Vec<_>, _>>(),
-                None => Ok(batches.as_ref().clone()),
-            };
-            // A failure here must not leave the range excluded from Delta.
-            let Ok(projected) = projected else { continue };
-            let filtered = filter_snapshot(projected, &pred);
-            // Cut the predicate-only columns back off (positions are `0..n` by
-            // construction in `plan_columns`, so this cannot fail).
-            let filtered: Vec<RecordBatch> = match cols.as_ref().and_then(|c| c.output.as_ref()) {
-                Some(out) => filtered.iter().flat_map(|b| b.project(out)).collect(),
-                None => filtered,
-            };
+            let Some(filtered) = self.materialize(meta, mem_ranges, cols.as_ref(), &pred, schema) else { continue };
             // The hot leg is materialized at PLAN time into a
             // `MemorySourceConfig` — no memory pool, no `GatedScanExec`, no
             // spill. `limits.leg_budget_bytes` is therefore the only thing
             // bounding it, and it is charged on the post-filter bytes actually
             // retained (`filter_record_batch` heap-copies, so these are real
-            // allocations, unlike the zero-copy `batches` above).
+            // allocations, unlike the zero-copy decode they came from).
             //
             // Range and partition are pushed TOGETHER, after the check: a file
             // whose rows we refuse to hold must also not be excluded from the
@@ -622,6 +596,62 @@ impl HotTier {
             }
         }
         HotLeg { partitions, ranges, version_gate: gate }
+    }
+
+    /// One file's contribution to the leg, projected and filtered. `None` =
+    /// unusable, which by the coverage contract means NO rows AND no exclusion
+    /// range, so that window falls through to Delta intact.
+    fn materialize(
+        &self, meta: &HotBucketMeta, mem_ranges: &[(i64, i64)], cols: Option<&LegColumns>, pred: &Option<Arc<dyn PhysicalExpr>>, schema: &SchemaRef,
+    ) -> Option<Vec<RecordBatch>> {
+        if mem_ranges.iter().any(|r| overlaps(meta.range(), *r)) {
+            self.mem_skipped.fetch_add(1, Relaxed);
+            return None;
+        }
+        let batches = self.read_file(&meta.path)?;
+        // A file that decodes to NOTHING would pass the schema check below
+        // (`first()` is None), report its range and contribute no rows — the one
+        // shape that silently excludes a window from Delta and serves it from
+        // nowhere. `demote` rejects all-empty input so this is unreachable
+        // today; the coverage contract must not depend on that.
+        if batches.is_empty() {
+            self.read_misses.fetch_add(1, Relaxed);
+            return None;
+        }
+        // One schema per IPC file by construction, so one compare per file.
+        // Drift (a column added since the demotion) breaks the
+        // `MemorySourceConfig` contract — treat the file as absent.
+        //
+        // Nullability alone is NOT drift. Prod 2026-07-31: demoted batches
+        // carried `timestamp` nullable while the table declares it NOT NULL, so
+        // strict field equality rejected 100% of reads — the tier served zero
+        // rows while files/bytes/writes all looked healthy (caught only by
+        // `schema_drift_total` == `read_hits_total`). Re-stamp instead, once the
+        // data proves it satisfies the stricter schema.
+        //
+        // The root cause was upstream — MemBuffer pinned whatever nullability
+        // the first batch to arrive happened to carry — and is fixed at the
+        // source in `mem_buffer::align_nullability`. This stays as tolerance for
+        // files demoted by an older binary.
+        let Some(batches) = align_nullability(batches.as_ref(), schema) else {
+            self.schema_drift.fetch_add(1, Relaxed);
+            return None;
+        };
+        // Project BEFORE filtering: `filter_record_batch` heap-copies every
+        // column it is handed, so an unprojected filter would materialize
+        // `body`/`attributes` for the whole hot window on a 3-column query.
+        // A failure here must not leave the range excluded from Delta.
+        let projected = match cols {
+            Some(c) => batches.iter().map(|b| b.project(&c.needed)).collect::<Result<Vec<_>, _>>().ok()?,
+            None => batches,
+        };
+        let filtered = filter_snapshot(projected, pred);
+        // Cut the predicate-only columns back off (positions are `0..n` by
+        // construction in `plan_columns`, so this cannot fail).
+        Some(match cols.and_then(|c| c.output.as_ref()) {
+            Some(out) => filtered.iter().flat_map(|b| b.project(out)).collect(),
+            None => filtered,
+        })
     }
 
     /// Zero-copy read of one demoted file, memoized. `None` = treat as absent
@@ -698,7 +728,7 @@ impl HotTier {
     /// gone. Move either and stale rows come back — silently.
     pub fn invalidate(&self, project_id: &str, table_name: &str) {
         self.invalidations_full.fetch_add(1, Relaxed);
-        let key: TableKey = (Arc::from(project_id), Arc::from(table_name));
+        let key = table_key(project_id, table_name);
         let paths = self.index.remove(&key).map(|(_, m)| m.into_values().map(|m| m.path).collect()).unwrap_or_default();
         self.drop_files(&key, paths);
     }
@@ -713,18 +743,10 @@ impl HotTier {
     /// cache miss, under-invalidating resurrects a stale row.
     pub fn invalidate_range(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) {
         self.invalidations_ranged.fetch_add(1, Relaxed);
-        let key: TableKey = (Arc::from(project_id), Arc::from(table_name));
+        let key = table_key(project_id, table_name);
         let paths = {
             let Some(mut entry) = self.index.get_mut(&key) else { return };
-            let mut doomed = Vec::new();
-            entry.retain(|_, m| {
-                if overlaps(m.range(), (lo, hi)) {
-                    doomed.push(m.path.clone());
-                    return false;
-                }
-                true
-            });
-            doomed
+            drop_unless(entry.value_mut(), |m| !overlaps(m.range(), (lo, hi))).into_iter().map(|m| m.path).collect()
         };
         self.index.remove_if(&key, |_, v| v.is_empty());
         self.drop_files(&key, paths);
@@ -748,9 +770,9 @@ impl HotTier {
         // then boot `rescan` resurrects a pre-DML file whose stale rows shadow
         // the corrected Delta rows for the whole retention window. Cheap: one
         // fsync per table dir per DML, off the query path.
-        for dir in paths.iter().filter_map(|p| p.parent()).collect::<std::collections::BTreeSet<_>>() {
+        paths.iter().filter_map(|p| p.parent()).collect::<BTreeSet<_>>().into_iter().for_each(|dir| {
             let _ = fs::File::open(dir).and_then(|d| d.sync_all());
-        }
+        });
         let health = self.health(key);
         health.wasted.fetch_add(wasted, Relaxed);
         self.judge(key, &health);
@@ -772,30 +794,26 @@ impl HotTier {
         self.index.clear();
         self.decoded.clear();
         self.memo_bytes.store(0, Relaxed);
-        let (mut files, mut max_seq) = (0usize, 0u64);
-        let Ok(projects) = fs::read_dir(&self.root) else { return };
-        for project in projects.flatten() {
-            let Some(pid) = project.file_name().to_str().map(Arc::<str>::from) else { continue };
-            let Ok(tables) = fs::read_dir(project.path()) else { continue };
-            for table in tables.flatten() {
-                let Some(tname) = table.file_name().to_str().map(Arc::<str>::from) else { continue };
-                let Ok(entries) = fs::read_dir(table.path()) else { continue };
-                for e in entries.flatten() {
+        let files = dir_entries(&self.root)
+            .filter_map(named)
+            .flat_map(|(pid, dir)| dir_entries(dir).filter_map(named).map(move |(tname, dir)| ((pid.clone(), tname), dir)))
+            .flat_map(|(key, dir)| {
+                dir_entries(dir).filter_map(move |e| {
                     let path = e.path();
                     // A `*.arrow.tmp` is ours and, at boot, definitionally dead
                     // (a demotion that never reached its rename).
                     if path.extension().is_some_and(|x| x == "tmp") {
                         let _ = fs::remove_file(&path);
-                        continue;
+                        return None;
                     }
-                    let Some(meta) = parse_meta(path, e.metadata().map(|m| m.len()).unwrap_or(0)) else { continue };
-                    max_seq = max_seq.max(meta.seq + 1);
-                    files += 1;
-                    self.index.entry((pid.clone(), tname.clone())).or_default().insert((meta.bucket_id, meta.seq), meta);
-                }
-            }
-        }
-        self.seq.fetch_max(max_seq, Relaxed);
+                    Some((key.clone(), parse_meta(path, e.metadata().map(|m| m.len()).unwrap_or(0))?))
+                })
+            })
+            .fold(0usize, |n, (key, meta)| {
+                self.seq.fetch_max(meta.seq + 1, Relaxed);
+                self.index.entry(key).or_default().insert((meta.bucket_id, meta.seq), meta);
+                n + 1
+            });
         if files > 0 {
             info!("hot tier rescan: {files} file(s) across {} table(s) in {:?}", self.index.len(), self.root);
         }
@@ -807,50 +825,49 @@ impl HotTier {
     /// a single `retain`; a disabled tier has no window at all, which makes the
     /// cutoff infinite and sweeps the directory clean.
     pub fn gc(&self, now_micros: i64) {
-        let mut cutoff = self.retention.map_or(i64::MAX, |r| now_micros - r.as_micros() as i64);
+        let age_cutoff = self.retention.map_or(i64::MAX, |r| now_micros - r.as_micros() as i64);
         // The full file list is only worth building when actually over the cap.
-        let total: u64 = self.index.iter().map(|e| e.values().filter(|m| m.end_ts > cutoff).map(|m| m.bytes).sum::<u64>()).sum();
-        if total > self.limits.max_disk_bytes {
-            let mut live: Vec<(i64, u64)> =
-                self.index.iter().flat_map(|e| e.values().filter(|m| m.end_ts > cutoff).map(|m| (m.end_ts, m.bytes)).collect::<Vec<_>>()).collect();
-            live.sort_unstable();
-            let mut excess = total - self.limits.max_disk_bytes;
-            for (end_ts, bytes) in live {
-                if excess == 0 {
-                    break;
-                }
-                excess = excess.saturating_sub(bytes);
-                cutoff = end_ts;
+        let total: u64 = self.index.iter().map(|e| live_files(e.value(), age_cutoff).map(|(_, bytes)| bytes).sum::<u64>()).sum();
+        let cutoff = match total.checked_sub(self.limits.max_disk_bytes).filter(|excess| *excess > 0) {
+            // Raise the cutoff over the oldest files until the excess is covered.
+            Some(excess) => {
+                let mut sorted: Vec<(i64, u64)> = self.index.iter().flat_map(|e| live_files(e.value(), age_cutoff).collect::<Vec<_>>()).collect();
+                sorted.sort_unstable();
+                sorted
+                    .into_iter()
+                    .scan(excess, |left, (end_ts, bytes)| {
+                        (*left > 0).then(|| {
+                            *left = left.saturating_sub(bytes);
+                            end_ts
+                        })
+                    })
+                    .last()
+                    .unwrap_or(age_cutoff)
             }
-        }
+            None => age_cutoff,
+        };
         // Collect under the shard guards but unlink AFTER dropping them — N
         // unlink syscalls inside a write guard block every concurrent query's
         // range lookup for the duration.
-        let (mut doomed, mut freed) = (Vec::new(), 0u64);
-        for mut entry in self.index.iter_mut() {
-            entry.value_mut().retain(|_, m| {
-                if m.end_ts <= cutoff {
-                    doomed.push(m.path.clone());
-                    freed += m.bytes;
-                    return false;
-                }
-                true
-            });
-        }
+        let dropped: Vec<HotBucketMeta> = self.index.iter_mut().flat_map(|mut e| drop_unless(e.value_mut(), |m| m.end_ts > cutoff)).collect();
         self.index.retain(|_, v| !v.is_empty());
-        if !doomed.is_empty() {
-            self.gc_deleted.fetch_add(doomed.len() as u64, Relaxed);
+        if !dropped.is_empty() {
+            let freed: u64 = dropped.iter().map(|m| m.bytes).sum();
+            self.gc_deleted.fetch_add(dropped.len() as u64, Relaxed);
             self.gc_bytes_freed.fetch_add(freed, Relaxed);
-            debug!("hot tier GC: unlinked {} file(s), freed {freed} bytes", doomed.len());
-            self.unlink(&doomed);
+            debug!("hot tier GC: unlinked {} file(s), freed {freed} bytes", dropped.len());
+            self.unlink(&dropped.into_iter().map(|m| m.path).collect::<Vec<_>>());
         }
     }
 
     pub fn stats(&self) -> HotTierStats {
         let (files, bytes) = self.index.iter().fold((0usize, 0u64), |(f, b), e| (f + e.len(), b + e.values().map(|m| m.bytes).sum::<u64>()));
         let now = crate::clock::now_micros();
-        let mut suppressed: Vec<_> =
-            self.health.iter().filter_map(|e| (e.until.load(Relaxed) > now).then(|| (e.key().clone(), (e.until.load(Relaxed) - now) / 1_000_000))).collect();
+        let mut suppressed: Vec<_> = self
+            .health
+            .iter()
+            .filter_map(|e| Some(e.until.load(Relaxed) - now).filter(|left| *left > 0).map(|left| (e.key().clone(), left / 1_000_000)))
+            .collect();
         suppressed.sort_unstable();
         let suppressed_tables = suppressed.len();
         suppressed.truncate(MAX_SUPPRESSED_ROWS);
@@ -895,15 +912,14 @@ struct LegColumns {
 /// column and filter full-width, exactly like the MemBuffer leg.
 fn plan_columns(projection: Option<&[usize]>, filters: &[Expr], schema: &SchemaRef) -> Option<LegColumns> {
     let requested = projection?;
-    let mut needed = requested.to_vec();
-    for f in filters {
-        for c in f.column_refs() {
-            let i = schema.index_of(&c.name).ok()?;
-            if !needed.contains(&i) {
-                needed.push(i);
-            }
+    let extra: Vec<usize> = filters.iter().flat_map(|f| f.column_refs()).map(|c| schema.index_of(&c.name).ok()).collect::<Option<Vec<_>>>()?;
+    // Requested columns keep their positions; predicate-only ones follow, once.
+    let needed: Vec<usize> = requested.iter().copied().chain(extra).fold(Vec::new(), |mut acc, i| {
+        if !acc.contains(&i) {
+            acc.push(i);
         }
-    }
+        acc
+    });
     let output = (needed.len() > requested.len()).then(|| (0..requested.len()).collect());
     let schema = Arc::new(schema.project(&needed).ok()?);
     Some(LegColumns { needed, schema, output })
@@ -934,18 +950,8 @@ fn decode_file(path: &Path, require_alignment: bool) -> anyhow::Result<Vec<Recor
         anyhow::ensure!(offset.checked_add(block_len).is_some_and(|end| end <= len), "IPC block out of bounds (torn file)");
         Ok(buffer.slice_with_length(offset, block_len))
     };
-    for block in footer.dictionaries().iter().flatten() {
-        let data = slice(block)?;
-        decoder.read_dictionary(block, &data)?;
-    }
-    let mut out = Vec::new();
-    for block in footer.recordBatches().iter().flatten() {
-        let data = slice(block)?;
-        if let Some(batch) = decoder.read_record_batch(block, &data)? {
-            out.push(batch);
-        }
-    }
-    Ok(out)
+    footer.dictionaries().iter().flatten().try_for_each(|b| anyhow::Ok(decoder.read_dictionary(b, &slice(b)?)?))?;
+    footer.recordBatches().iter().flatten().map(|b| anyhow::Ok(decoder.read_record_batch(b, &slice(b)?)?)).filter_map(Result::transpose).collect()
 }
 
 #[cfg(test)]

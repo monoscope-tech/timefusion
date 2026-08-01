@@ -67,15 +67,15 @@ where
     F: FnMut(RecordBatch) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    let reader = StreamReader::try_new(Cursor::new(bytes), None).context("arrow ipc reader")?;
+    // Imperative: each item awaits the sink and short-circuits on error, and the
+    // one-batch-alive-at-a-time property depends on not collecting the reader.
     let mut count = 0usize;
-    for batch in reader {
+    for batch in StreamReader::try_new(Cursor::new(bytes), None).context("arrow ipc reader")? {
         let batch = batch.context("arrow ipc decode")?;
-        if batch.num_rows() == 0 {
-            continue;
+        if batch.num_rows() > 0 {
+            sink(batch).await?;
+            count += 1;
         }
-        sink(batch).await?;
-        count += 1;
     }
     Ok(count)
 }
@@ -97,24 +97,15 @@ impl Ingest for IngestService {
             let mut acks = inbound
                 .map(|item| {
                     let db = Arc::clone(&db);
-                    async move {
-                        match item {
-                            Ok(msg) => Ok(process_one(&db, msg).await),
-                            Err(e) => Err(e),
-                        }
-                    }
+                    async move { Ok(process_one(&db, item?).await) }
                 })
                 .buffer_unordered(STREAM_CONCURRENCY);
 
             while let Some(result) = acks.next().await {
-                let send = match result {
-                    Ok(ack) => {
-                        debug!(seq = ack.seq, status = ?ack.status, pct = ack.mem_pressure_pct, "grpc write ack");
-                        tx.send(Ok(ack)).await
-                    }
-                    Err(e) => tx.send(Err(e)).await,
-                };
-                if send.is_err() {
+                if let Ok(ack) = &result {
+                    debug!(seq = ack.seq, status = ?ack.status, pct = ack.mem_pressure_pct, "grpc write ack");
+                }
+                if tx.send(result).await.is_err() {
                     warn!("grpc client dropped stream mid-flight");
                     break;
                 }
@@ -126,28 +117,22 @@ impl Ingest for IngestService {
 }
 
 async fn process_one(db: &Database, msg: WriteBatch) -> WriteAck {
-    let seq = msg.seq;
-    let pressure = db.buffered_layer().map(|l| l.pressure_pct()).unwrap_or(0);
+    let WriteBatch { seq, project_id, table_name, arrow_ipc } = msg;
+    let pressure = db.buffered_layer().map_or(0, |l| l.pressure_pct());
+    let ack = |status: AckStatus, error: String| WriteAck { seq, status: status as i32, mem_pressure_pct: pressure, error };
 
     // Soft backpressure: refuse before the hard limit so clients throttle gracefully.
     if pressure >= RETRY_PRESSURE_PCT {
-        return WriteAck {
-            seq,
-            status: AckStatus::Retry as i32,
-            mem_pressure_pct: pressure,
-            error: format!("mem pressure {pressure}% ≥ {RETRY_PRESSURE_PCT}%"),
-        };
+        return ack(AckStatus::Retry, format!("mem pressure {pressure}% ≥ {RETRY_PRESSURE_PCT}%"));
     }
 
     // Stream batches into the buffered layer one at a time so peak memory per
     // request is one decoded batch (plus the encoded payload), not the entire
     // decoded set. Any decode or insert error fails the whole request — the
-    // client retries the seq.
-    let project_id = msg.project_id;
-    let table_name = msg.table_name;
-    let result = decode_and_insert(&msg.arrow_ipc, |batch| {
-        let project_id = project_id.clone();
-        let table_name = table_name.clone();
+    // client retries the seq. The per-batch clones are required: the sink's
+    // future must own its inputs (it cannot borrow the closure's captures).
+    let inserted = decode_and_insert(&arrow_ipc, |batch| {
+        let (project_id, table_name) = (project_id.clone(), table_name.clone());
         async move {
             db.insert_records_batch(&project_id, &table_name, vec![batch], false, None).await?;
             Ok(())
@@ -155,15 +140,11 @@ async fn process_one(db: &Database, msg: WriteBatch) -> WriteAck {
     })
     .await;
 
-    match result {
-        Ok(0) => ack_err(seq, pressure, "empty arrow ipc payload"),
-        Ok(_) => WriteAck { seq, status: AckStatus::Ok as i32, mem_pressure_pct: pressure, error: String::new() },
-        Err(e) => ack_err(seq, pressure, &format!("decode/insert: {e:#}")),
+    match inserted {
+        Ok(0) => ack(AckStatus::Reject, "empty arrow ipc payload".into()),
+        Ok(_) => ack(AckStatus::Ok, String::new()),
+        Err(e) => ack(AckStatus::Reject, format!("decode/insert: {e:#}")),
     }
-}
-
-fn ack_err(seq: u64, pressure: u32, err: &str) -> WriteAck {
-    WriteAck { seq, status: AckStatus::Reject as i32, mem_pressure_pct: pressure, error: err.into() }
 }
 
 /// Constant-time bearer-token check. When `expected` is `None`, auth is open.
@@ -172,12 +153,8 @@ fn ack_err(seq: u64, pressure: u32, err: &str) -> WriteAck {
 /// that `ct_eq` on raw bytes would leak via the early length-mismatch exit.
 fn verify_bearer(expected: Option<&str>, got: Option<&str>) -> Result<(), Status> {
     let Some(expected) = expected else { return Ok(()) };
-    let Some(got) = got else {
-        return Err(Status::unauthenticated("invalid or missing bearer token"));
-    };
-    let e = Sha256::digest(expected.as_bytes());
-    let g = Sha256::digest(got.as_bytes());
-    if bool::from(e.ct_eq(&g)) { Ok(()) } else { Err(Status::unauthenticated("invalid or missing bearer token")) }
+    let digest = |s: &str| Sha256::digest(s.as_bytes());
+    got.is_some_and(|g| bool::from(digest(g).ct_eq(&digest(expected)))).then_some(()).ok_or_else(|| Status::unauthenticated("invalid or missing bearer token"))
 }
 
 #[cfg(test)]

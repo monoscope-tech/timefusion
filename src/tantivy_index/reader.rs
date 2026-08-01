@@ -18,7 +18,7 @@ use tantivy::{
 
 use crate::tantivy_index::{
     schema::{ID_FIELD, NGRAM3_TOKENIZER, ROW_ORDINAL_FIELD, TS_FIELD},
-    udf::TextMatchPred,
+    udf::{PredNode, TextMatchPred},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -42,13 +42,7 @@ pub enum PredsQuery {
 
 /// Compile `preds` (implicitly AND-ed) into one tantivy query for `index`.
 pub fn build_preds_query(index: &Index, preds: &[TextMatchPred]) -> Result<PredsQuery> {
-    if preds.is_empty() {
-        return Err(anyhow!("no predicates"));
-    }
-    let node = match preds.len() {
-        1 => crate::tantivy_index::udf::PredNode::Leaf(preds[0].clone()),
-        _ => crate::tantivy_index::udf::PredNode::And(preds.iter().cloned().map(crate::tantivy_index::udf::PredNode::Leaf).collect()),
-    };
+    let node = PredNode::from_preds(preds).ok_or_else(|| anyhow!("no predicates"))?;
     build_node_query(index, &node)
 }
 
@@ -57,9 +51,8 @@ pub fn build_preds_query(index: &Index, preds: &[TextMatchPred]) -> Result<Preds
 /// across tokens — critical for n-gram: "hello" tokenizes into trigrams
 /// `hel`,`ell`,`llo` and ALL must match (a single matching trigram doesn't
 /// imply substring presence).
-pub fn build_node_query(index: &Index, node: &crate::tantivy_index::udf::PredNode) -> Result<PredsQuery> {
-    use crate::tantivy_index::udf::PredNode;
-    let q = match node {
+pub fn build_node_query(index: &Index, node: &PredNode) -> Result<PredsQuery> {
+    let q: Box<dyn Query> = match node {
         PredNode::Leaf(p) => {
             let schema = index.schema();
             let Ok(field) = schema.get_field(&p.column) else {
@@ -69,13 +62,12 @@ pub fn build_node_query(index: &Index, node: &crate::tantivy_index::udf::PredNod
                 FieldType::Str(o) => o.get_indexing_options().map(|i| i.tokenizer().to_string()),
                 _ => None,
             };
-            let ngram = tokenizer.as_deref() == Some(NGRAM3_TOKENIZER);
             match &tokenizer {
                 // On ngram3 a trailing `*` is only a routing marker (prefix ⊆
                 // substring), so the literal can always be analyzed. On raw/
                 // default it carries real prefix semantics that a conjunction of
                 // whole terms would UNDER-match, so those keep the parser.
-                Some(tok) if ngram || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
+                Some(tok) if tok.as_str() == NGRAM3_TOKENIZER || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
                 _ => {
                     let mut qp = QueryParser::for_index(index, vec![field]);
                     qp.set_conjunction_by_default();
@@ -85,13 +77,18 @@ pub fn build_node_query(index: &Index, node: &crate::tantivy_index::udf::PredNod
         }
         PredNode::And(kids) | PredNode::Or(kids) => {
             let occur = if matches!(node, PredNode::And(_)) { Occur::Must } else { Occur::Should };
-            let mut subs: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(kids.len());
-            for k in kids {
-                match build_node_query(index, k)? {
-                    PredsQuery::MissingField => return Ok(PredsQuery::MissingField),
-                    PredsQuery::Query(q) => subs.push((occur, q)),
-                }
-            }
+            // Collecting into `Result<Option<_>>` short-circuits on both errors
+            // and the first unanswerable child.
+            let subs = kids
+                .iter()
+                .map(|k| {
+                    build_node_query(index, k).map(|r| match r {
+                        PredsQuery::Query(q) => Some((occur, q)),
+                        PredsQuery::MissingField => None,
+                    })
+                })
+                .collect::<Result<Option<Vec<_>>>>()?;
+            let Some(subs) = subs else { return Ok(PredsQuery::MissingField) };
             Box::new(BooleanQuery::new(subs))
         }
     };
@@ -117,25 +114,27 @@ pub fn build_node_query(index: &Index, node: &crate::tantivy_index::udf::PredNod
 /// no token at all errors out into a full scan.
 fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str) -> Result<Box<dyn Query>> {
     let mut analyzer = index.tokenizers().get(tokenizer).ok_or_else(|| anyhow!("tokenizer {tokenizer} not registered"))?;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     // ngram3 keeps the parser's whitespace-AND behaviour (each word required
     // independently, short words dropped). The other tokenizers must see the
     // WHOLE literal: `default` splits it itself, and `raw` indexes the value as
     // one token, so pre-splitting it would under-match.
     let words: Vec<&str> = if tokenizer == NGRAM3_TOKENIZER { query.split_whitespace().collect() } else { vec![query] };
-    for word in words {
+    let mut seen: HashSet<String> = HashSet::new();
+    let clauses: Vec<(Occur, Box<dyn Query>)> = words
+        .iter()
         // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
         // field a prefix match is a subset of the substring match, so dropping
         // the marker keeps the prefilter a superset. (Non-ngram3 `*` queries
-        // never reach here — see the caller.)
-        let mut stream = analyzer.token_stream(word.trim_end_matches('*'));
-        stream.process(&mut |t| {
-            if seen.insert(t.text.clone()) {
-                clauses.push((Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, &t.text), IndexRecordOption::Basic)) as Box<dyn Query>));
-            }
-        });
-    }
+        // never reach here — see the caller.) `process` sinks into a Vec because
+        // tantivy hands tokens to an `FnMut` sink, not an iterator.
+        .flat_map(|word| {
+            let mut terms = Vec::new();
+            analyzer.token_stream(word.trim_end_matches('*')).process(&mut |t| terms.push(t.text.clone()));
+            terms
+        })
+        .filter(|t| seen.insert(t.clone()))
+        .map(|t| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, &t), IndexRecordOption::Basic)) as Box<dyn Query>))
+        .collect();
     if clauses.is_empty() {
         return Err(anyhow!("query '{query}' produces no {tokenizer} terms"));
     }
@@ -158,43 +157,55 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
     let ts_field = schema.get_field(TS_FIELD).map_err(|e| anyhow!("missing _timestamp: {e}"))?;
     let id_field = schema.get_field(ID_FIELD).map_err(|e| anyhow!("missing _id: {e}"))?;
 
-    let cap = limit.unwrap_or(1_000_000);
-    let top = searcher.search(query, &TopDocs::with_limit(cap)).map_err(|e| anyhow!("search: {e}"))?;
+    const HIT_CAP: usize = 1_000_000;
+    let top = searcher.search(query, &TopDocs::with_limit(limit.unwrap_or(HIT_CAP))).map_err(|e| anyhow!("search: {e}"))?;
     // Per-segment fast-field columns, resolved lazily on first hit in that
     // segment. `None` in the outer Option = not yet resolved; inner `None`
     // = this segment has no fast `_id` (pre-fast-field index) → doc store.
     type FfCols = (tantivy::columnar::Column<i64>, tantivy::columnar::StrColumn, Option<tantivy::columnar::Column<u64>>);
     let mut ff_cols: Vec<Option<Option<FfCols>>> = vec![None; searcher.segment_readers().len()];
-    let mut hits = Vec::with_capacity(top.len());
+    // `id_buf` is reused across hits so the fast path allocates once per hit
+    // (the `clone` into the Hit) instead of twice.
     let mut id_buf = String::new();
-    for (_score, addr) in top {
-        let seg = addr.segment_ord as usize;
-        let cols = ff_cols[seg].get_or_insert_with(|| {
-            let ff = searcher.segment_reader(addr.segment_ord).fast_fields();
-            match (ff.i64(TS_FIELD), ff.str(ID_FIELD)) {
-                (Ok(ts), Ok(Some(id))) => Some((ts, id, ff.u64(ROW_ORDINAL_FIELD).ok())),
-                _ => None,
-            }
-        });
-        if let Some((ts_col, id_col, ord_col)) = cols {
-            let ts = ts_col.first(addr.doc_id);
-            let ord = id_col.term_ords(addr.doc_id).next();
-            if let (Some(ts), Some(ord)) = (ts, ord) {
-                id_buf.clear();
-                if id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))? {
-                    hits.push(Hit { timestamp_micros: ts, id: id_buf.clone(), row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)) });
-                    continue;
+    top.into_iter()
+        .map(|(_score, addr)| {
+            let cols = ff_cols[addr.segment_ord as usize].get_or_insert_with(|| {
+                let ff = searcher.segment_reader(addr.segment_ord).fast_fields();
+                match (ff.i64(TS_FIELD), ff.str(ID_FIELD)) {
+                    (Ok(ts), Ok(Some(id))) => Some((ts, id, ff.u64(ROW_ORDINAL_FIELD).ok())),
+                    _ => None,
+                }
+            });
+            // `None` = no fast columns for this segment, or this doc carries no
+            // value for them (shouldn't happen for required fields) — either way
+            // fall back to the doc store.
+            let fast = match cols {
+                Some((ts_col, id_col, ord_col)) => match (ts_col.first(addr.doc_id), id_col.term_ords(addr.doc_id).next()) {
+                    (Some(ts), Some(ord)) => {
+                        id_buf.clear();
+                        id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))?.then(|| Hit {
+                            timestamp_micros: ts,
+                            id: id_buf.clone(),
+                            row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)),
+                        })
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
+            match fast {
+                Some(hit) => Ok(hit),
+                None => {
+                    let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
+                    Ok(Hit {
+                        timestamp_micros: doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?,
+                        id: doc.get_first(id_field).and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| anyhow!("hit missing _id"))?,
+                        row_ordinal: None,
+                    })
                 }
             }
-            // Fast columns exist but this doc lacks values (shouldn't happen
-            // for required fields) — fall through to the doc store.
-        }
-        let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
-        let ts = doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?;
-        let id = doc.get_first(id_field).and_then(|v| v.as_str()).map(|s| s.to_string()).ok_or_else(|| anyhow!("hit missing _id"))?;
-        hits.push(Hit { timestamp_micros: ts, id, row_ordinal: None });
-    }
-    Ok(hits)
+        })
+        .collect()
 }
 
 #[cfg(test)]

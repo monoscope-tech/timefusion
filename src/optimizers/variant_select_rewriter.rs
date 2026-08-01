@@ -22,25 +22,30 @@
 //!    so intermediate `variant_get` / `jsonb_path_exists` etc. operate
 //!    on the binary Variant.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
-    arrow::datatypes::{Field, Schema},
+    arrow::datatypes::{DataType, Field},
     catalog::default_table_source::DefaultTableSource,
     common::{
-        DFSchema, DFSchemaRef, Result,
+        Column, DFSchema, DFSchemaRef, Result,
         tree_node::{Transformed, TreeNode},
     },
     config::ConfigOptions,
     logical_expr::{
-        Expr, ExprSchemable, LogicalPlan, Operator, Projection, TableScan,
-        expr::{BinaryExpr, Cast, InList, ScalarFunction},
+        Distinct, Expr, ExprSchemable, LogicalPlan, Operator, Projection, ScalarUDF, TableScan,
+        expr::{BinaryExpr, Cast, InList, Like, ScalarFunction},
     },
     optimizer::AnalyzerRule,
+    sql::TableReference,
 };
 use tracing::{debug, warn};
 
-use crate::{database::ProjectRoutingTable, functions::VariantToJsonExtUdf, schema_loader::is_variant_type};
+use crate::{
+    database::ProjectRoutingTable,
+    functions::{VariantToJsonExtUdf, variant_to_json_udf},
+    schema_loader::is_variant_type,
+};
 
 #[derive(Debug, Default)]
 pub struct VariantSelectRewriter;
@@ -152,33 +157,25 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         return Ok(Transformed::no(plan));
     };
     // Source must be a DefaultTableSource around ProjectRoutingTable.
-    let Some(default_src) = scan.source.downcast_ref::<DefaultTableSource>() else {
-        return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
-    };
-    let Some(routing) = default_src.table_provider.downcast_ref::<ProjectRoutingTable>() else {
+    let Some(routing) = scan.source.downcast_ref::<DefaultTableSource>().and_then(|src| src.table_provider.downcast_ref::<ProjectRoutingTable>()) else {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     };
     // Fast path: if no Utf8View columns are projected, there can be no
     // Variant columns to un-lie about — bail before the HashMap+clones.
-    //
-    // Note: this is an over-approximation. A scan that projects a genuine
-    // (non-Variant) Utf8View column alongside zero Variant columns will
-    // still fall through to the full pass below; the `changed` flag at
-    // line ~106 then returns `Transformed::no` and the only cost is the
-    // wasted HashMap build. Tightening this to "any Utf8View column has a
-    // Variant counterpart in real_schema" would require a second pass over
-    // `real`, which isn't worth it for the common case (Variant scans).
+    // Over-approximates: a genuine non-Variant Utf8View column still falls
+    // through to the map build below, which then finds no Variant counterpart
+    // and bails — cheap enough for the common case (Variant scans).
     let lying_schema = scan.projected_schema.as_arrow();
-    use datafusion::arrow::datatypes::DataType;
     if !lying_schema.fields().iter().any(|f| matches!(f.data_type(), DataType::Utf8View)) {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     }
 
+    // Every Variant column of the real schema, by name (O(n) lookup below).
     let real = routing.real_schema();
-    // Build a patched arrow Schema where every Utf8View column whose
-    // real-schema counterpart is Variant gets the Variant data type back.
-    // O(n) lookup via a name→field map.
-    //
+    let variant_by_name: HashMap<&str, &Arc<Field>> = real.fields().iter().filter(|f| is_variant_type(f.data_type())).map(|f| (f.name().as_str(), f)).collect();
+    if !lying_schema.fields().iter().any(|f| variant_by_name.contains_key(f.name().as_str())) {
+        return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+    }
     // We restore only the Variant Struct{Binary,Binary} *type*, with EMPTY
     // field metadata — NOT `Arc::clone(real_field)`, which would carry the
     // `ARROW:extension:name = arrow.parquet.variant` marker. The physical scan
@@ -190,26 +187,13 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     // matched. The extension marker is only needed on the write path
     // (delta-rs / parquet-variant-compute); Variant detection at read time is
     // structural (`is_variant_type`), so dropping it here is safe.
-    let real_by_name: std::collections::HashMap<&str, &Arc<Field>> = real.fields().iter().map(|f| (f.name().as_str(), f)).collect();
-    let mut patched_fields: Vec<Arc<Field>> = Vec::with_capacity(lying_schema.fields().len());
-    let mut changed = false;
-    for f in lying_schema.fields() {
-        match real_by_name.get(f.name().as_str()) {
-            Some(real_field) if is_variant_type(real_field.data_type()) => {
-                patched_fields.push(Arc::new(Field::new(f.name(), real_field.data_type().clone(), real_field.is_nullable())));
-                changed = true;
-            }
-            _ => patched_fields.push(f.clone()),
-        }
-    }
-    if !changed {
-        return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
-    }
-    let patched_arrow = Arc::new(Schema::new_with_metadata(patched_fields, lying_schema.metadata().clone()));
+    let patched_fields = lying_schema.fields().iter().map(|f| match variant_by_name.get(f.name().as_str()) {
+        Some(rf) => Arc::new(Field::new(f.name(), rf.data_type().clone(), rf.is_nullable())),
+        None => f.clone(),
+    });
     // Preserve the original DFSchema's column qualifiers (e.g. table aliases).
-    let qualifiers: Vec<_> = scan.projected_schema.iter().map(|(q, _)| q.cloned()).collect();
-    let mut zipped: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = qualifiers.into_iter().zip(patched_arrow.fields().iter().cloned()).collect();
-    let new_df: DFSchemaRef = Arc::new(DFSchema::new_with_metadata(std::mem::take(&mut zipped), patched_arrow.metadata().clone())?);
+    let qualified: Vec<(Option<TableReference>, Arc<Field>)> = scan.projected_schema.iter().map(|(q, _)| q.cloned()).zip(patched_fields).collect();
+    let new_df: DFSchemaRef = Arc::new(DFSchema::new_with_metadata(qualified, lying_schema.metadata().clone())?);
     debug!(target: "variant_select_rewriter", "patched TableScan({}) schema → Variant", scan.table_name);
     Ok(Transformed::yes(LogicalPlan::TableScan(TableScan { projected_schema: new_df, ..scan })))
 }
@@ -229,30 +213,33 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 /// accessors keep their own lowering (`VariantAwareExprPlanner`) and are not
 /// touched here.
 fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
-    let inputs = plan.inputs();
-    if inputs.is_empty() {
-        return Ok(plan); // leaf (TableScan / Values) — no input columns to coerce against
-    }
     // Merge every input schema so column refs in this node's exprs resolve to
     // their (now Variant-restored) types. Single input for Filter/Projection;
-    // multiple for joins whose ON clause may touch a Variant column.
-    let mut schema = DFSchema::empty();
-    for input in &inputs {
-        schema.merge(input.schema().as_ref());
-    }
+    // multiple for joins whose ON clause may touch a Variant column. Leaves
+    // (TableScan / Values) merge to nothing and fall out of the fast path.
+    let schema = plan.inputs().iter().fold(DFSchema::empty(), |mut acc, input| {
+        acc.merge(input.schema().as_ref());
+        acc
+    });
     // Fast path: no Variant column in scope → nothing to coerce.
     if !schema.fields().iter().any(|f| is_variant_type(f.data_type())) {
         return Ok(plan);
     }
-    let to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonExtUdf::default()));
+    let to_json = variant_to_json_udf();
     plan.map_expressions(|expr| expr.transform_up(|e| coerce_expr(e, &schema, &to_json))).map(|t| t.data)
 }
 
 /// Bottom-up rewrite of a single expression: wrap any Variant operand that sits
 /// in a scalar-text position with `variant_to_json`. Idempotent — an
 /// already-wrapped operand types as `Utf8` and `is_variant_expr` returns false.
-fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<datafusion::logical_expr::ScalarUDF>) -> Result<Transformed<Expr>> {
+fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<ScalarUDF>) -> Result<Transformed<Expr>> {
     let wrap = |x: Expr| Expr::ScalarFunction(ScalarFunction { func: to_json.clone(), args: vec![x] });
+    // Box::new(wrap(*l.expr)) can't be written as struct-update (`..l`) — that
+    // would read a partially moved `l` — so rebind through a local mut.
+    let wrap_like = |mut l: Like| {
+        l.expr = Box::new(wrap(*l.expr));
+        l
+    };
     match e {
         // CAST(variant AS text) → CAST(variant_to_json(variant) AS <same text type>).
         // Covers monoscope's `body::text` and its `COALESCE(NULLIF(body::text, ''),
@@ -270,16 +257,10 @@ fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<datafusion::logical_exp
             let right = if is_variant_expr(&right, schema) { Box::new(wrap(*right)) } else { right };
             Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr { left, op, right })))
         }
-        // LIKE / ILIKE / NOT LIKE / NOT ILIKE.
-        Expr::Like(mut like) if is_variant_expr(&like.expr, schema) => {
-            like.expr = Box::new(wrap(*like.expr));
-            Ok(Transformed::yes(Expr::Like(like)))
-        }
-        // SIMILAR TO.
-        Expr::SimilarTo(mut like) if is_variant_expr(&like.expr, schema) => {
-            like.expr = Box::new(wrap(*like.expr));
-            Ok(Transformed::yes(Expr::SimilarTo(like)))
-        }
+        // LIKE / ILIKE / NOT LIKE / NOT ILIKE, and SIMILAR TO — same payload,
+        // different constructor.
+        Expr::Like(l) if is_variant_expr(&l.expr, schema) => Ok(Transformed::yes(Expr::Like(wrap_like(l)))),
+        Expr::SimilarTo(l) if is_variant_expr(&l.expr, schema) => Ok(Transformed::yes(Expr::SimilarTo(wrap_like(l)))),
         // IN (str, …).
         Expr::InList(InList { expr, list, negated }) if is_variant_expr(&expr, schema) => {
             Ok(Transformed::yes(Expr::InList(InList { expr: Box::new(wrap(*expr)), list, negated })))
@@ -288,9 +269,8 @@ fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<datafusion::logical_exp
     }
 }
 
-fn is_text_type(dt: &datafusion::arrow::datatypes::DataType) -> bool {
-    use datafusion::arrow::datatypes::DataType::{LargeUtf8, Utf8, Utf8View};
-    matches!(dt, Utf8 | Utf8View | LargeUtf8)
+fn is_text_type(dt: &DataType) -> bool {
+    matches!(dt, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)
 }
 
 fn is_text_comparison_op(op: Operator) -> bool {
@@ -343,45 +323,35 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
             return Ok(plan);
         }
         let d = depth + 1;
+        // Recurse into a node's single input in place, leaving the parent's own
+        // fields (and cached schema) untouched.
+        let down = |input: Arc<LogicalPlan>| -> Result<Arc<LogicalPlan>> { Ok(Arc::new(peel(Arc::unwrap_or_clone(input), d)?)) };
         match plan {
             LogicalPlan::Sort(mut s) => {
-                let inner = Arc::unwrap_or_clone(s.input);
-                s.input = Arc::new(peel(inner, d)?);
+                s.input = down(s.input)?;
                 Ok(LogicalPlan::Sort(s))
             }
             LogicalPlan::Limit(mut l) => {
-                let inner = Arc::unwrap_or_clone(l.input);
-                l.input = Arc::new(peel(inner, d)?);
+                l.input = down(l.input)?;
                 Ok(LogicalPlan::Limit(l))
             }
-            LogicalPlan::Distinct(dist) => {
-                use datafusion::logical_expr::Distinct;
-                match dist {
-                    Distinct::All(input) => {
-                        let inner = Arc::unwrap_or_clone(input);
-                        Ok(LogicalPlan::Distinct(Distinct::All(Arc::new(peel(inner, d)?))))
-                    }
-                    Distinct::On(mut on) => {
-                        let inner = Arc::unwrap_or_clone(on.input);
-                        on.input = Arc::new(peel(inner, d)?);
-                        Ok(LogicalPlan::Distinct(Distinct::On(on)))
-                    }
-                }
+            LogicalPlan::Distinct(Distinct::All(input)) => Ok(LogicalPlan::Distinct(Distinct::All(down(input)?))),
+            LogicalPlan::Distinct(Distinct::On(mut on)) => {
+                on.input = down(on.input)?;
+                Ok(LogicalPlan::Distinct(Distinct::On(on)))
             }
             LogicalPlan::SubqueryAlias(mut s) => {
-                let inner = Arc::unwrap_or_clone(s.input);
-                s.input = Arc::new(peel(inner, d)?);
+                s.input = down(s.input)?;
                 Ok(LogicalPlan::SubqueryAlias(s))
             }
+            // Some DataFusion rewrite passes promote a Filter above the
+            // outermost Projection. Peel through it so Variant columns still
+            // reach the wire wrapped, not as raw binary.
             LogicalPlan::Filter(mut f) => {
-                // Some DataFusion rewrite passes promote a Filter above the
-                // outermost Projection. Peel through it so Variant columns
-                // still reach the wire wrapped, not as raw binary.
-                let inner = Arc::unwrap_or_clone(f.input);
-                f.input = Arc::new(peel(inner, d)?);
+                f.input = down(f.input)?;
                 Ok(LogicalPlan::Filter(f))
             }
-            LogicalPlan::Projection(proj) => Ok(wrap_projection(proj)?),
+            LogicalPlan::Projection(proj) => wrap_projection(proj),
             // Union/Intersect/Except/Aggregate/Join/Window/etc. — anything we
             // can't peel through. We don't descend (would need branch-aware
             // rewriting that handles set ops, joins, aggregates differently),
@@ -403,46 +373,35 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// schema accounting stays identical (same names, same qualifiers).
 fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     let schema = plan.schema().clone();
-    let variant_cols: Vec<usize> = schema.fields().iter().enumerate().filter(|(_, f)| is_variant_type(f.data_type())).map(|(i, _)| i).collect();
-    if variant_cols.is_empty() {
+    let variant_cols = schema.fields().iter().filter(|f| is_variant_type(f.data_type())).count();
+    if variant_cols == 0 {
         return Ok(plan);
     }
-    let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonExtUdf::default()));
+    let variant_to_json = variant_to_json_udf();
     let exprs: Vec<Expr> = schema
         .iter()
         .map(|(qualifier, field)| {
-            let col = Expr::Column(datafusion::common::Column::new(qualifier.cloned(), field.name().clone()));
+            let col = Expr::Column(Column::new(qualifier.cloned(), field.name().clone()));
             if is_variant_type(field.data_type()) { wrap_with_variant_to_json(&col, &variant_to_json).alias(field.name()) } else { col }
         })
         .collect();
-    debug!(
-        target: "variant_select_rewriter",
-        "added root Projection over un-peelable plan: wrapped {} Variant column(s)",
-        variant_cols.len()
-    );
+    debug!(target: "variant_select_rewriter", "added root Projection over un-peelable plan: wrapped {variant_cols} Variant column(s)");
     Ok(LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(plan))?))
 }
 
 fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
     let input_schema = proj.input.schema().clone();
-    let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonExtUdf::default()));
-    let mut wrapped = 0usize;
-    let new_exprs: Vec<Expr> = proj
-        .expr
-        .iter()
-        .map(|expr| {
-            if is_variant_expr(expr, &input_schema) {
-                wrapped += 1;
-                wrap_with_variant_to_json(expr, &variant_to_json)
-            } else {
-                expr.clone()
-            }
-        })
-        .collect();
+    let wrapped = proj.expr.iter().filter(|e| is_variant_expr(e, &input_schema)).count();
     if wrapped == 0 {
         return Ok(LogicalPlan::Projection(proj));
     }
-    debug!(target: "variant_select_rewriter", "wrapped {} Variant exprs at root projection", wrapped);
+    let variant_to_json = variant_to_json_udf();
+    let new_exprs: Vec<Expr> = proj
+        .expr
+        .iter()
+        .map(|expr| if is_variant_expr(expr, &input_schema) { wrap_with_variant_to_json(expr, &variant_to_json) } else { expr.clone() })
+        .collect();
+    debug!(target: "variant_select_rewriter", "wrapped {wrapped} Variant exprs at root projection");
     Ok(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?))
 }
 
@@ -451,23 +410,16 @@ fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
     // already-wrapped call. Match by concrete UDF type (TypeId) rather than
     // by string name — renaming the UDF or registering another UDF with the
     // same name would otherwise silently break this check.
-    if let Expr::ScalarFunction(sf) = expr
-        && sf.func.inner().downcast_ref::<VariantToJsonExtUdf>().is_some()
-    {
-        return false;
-    }
-    expr.get_type(schema).map(|dt| is_variant_type(&dt)).unwrap_or(false)
+    !matches!(expr, Expr::ScalarFunction(sf) if sf.func.inner().downcast_ref::<VariantToJsonExtUdf>().is_some())
+        && expr.get_type(schema).is_ok_and(|dt| is_variant_type(&dt))
 }
 
-fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<datafusion::logical_expr::ScalarUDF>) -> Expr {
-    let (inner, alias) = match expr {
-        Expr::Alias(a) => (a.expr.as_ref().clone(), Some(a.name.clone())),
-        _ => (expr.clone(), None),
-    };
-    let wrapped = Expr::ScalarFunction(ScalarFunction { func: udf.clone(), args: vec![inner] });
-    match alias {
-        Some(name) => wrapped.alias(name),
-        None => wrapped,
+fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<ScalarUDF>) -> Expr {
+    let wrap = |inner: Expr| Expr::ScalarFunction(ScalarFunction { func: udf.clone(), args: vec![inner] });
+    match expr {
+        // Keep the alias outermost so the output column name is unchanged.
+        Expr::Alias(a) => wrap(a.expr.as_ref().clone()).alias(a.name.clone()),
+        other => wrap(other.clone()),
     }
 }
 
@@ -476,8 +428,6 @@ mod peel_tests {
     //! Unit tests for `wrap_root_projection` peel logic. These exercise the
     //! Sort / Limit / Distinct / SubqueryAlias / Filter branches and the
     //! MAX_PEEL guard without standing up a server.
-    use std::collections::HashMap;
-
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         common::DFSchema,
@@ -487,14 +437,12 @@ mod peel_tests {
     use super::*;
 
     fn variant_field(name: &str) -> Field {
-        let mut md = HashMap::new();
-        md.insert("ARROW:extension:name".to_string(), "arrow.parquet.variant".to_string());
         Field::new(
             name,
             DataType::Struct(vec![Arc::new(Field::new("metadata", DataType::Binary, false)), Arc::new(Field::new("value", DataType::Binary, false))].into()),
             true,
         )
-        .with_metadata(md)
+        .with_metadata(HashMap::from([(crate::schema_loader::VARIANT_EXT_KEY.to_string(), crate::schema_loader::VARIANT_EXT_VALUE.to_string())]))
     }
 
     fn variant_projection() -> LogicalPlan {
@@ -522,7 +470,7 @@ mod peel_tests {
             if let LogicalPlan::Projection(proj) = p {
                 return proj.expr.first();
             }
-            p.inputs().into_iter().find_map(|i| find(i))
+            p.inputs().into_iter().find_map(find)
         }
         find(plan).expect("expected a Projection in the plan")
     }
@@ -579,10 +527,7 @@ mod peel_tests {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                let mut plan = variant_projection();
-                for i in 0..300 {
-                    plan = LogicalPlanBuilder::from(plan).alias(format!("a{i}")).unwrap().build().unwrap();
-                }
+                let plan = (0..300).fold(variant_projection(), |p, i| LogicalPlanBuilder::from(p).alias(format!("a{i}")).unwrap().build().unwrap());
                 let out = analyze(plan);
                 assert!(!is_variant_to_json_call(first_projection_expr(&out)));
             })

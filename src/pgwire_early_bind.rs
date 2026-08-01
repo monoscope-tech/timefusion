@@ -26,11 +26,11 @@ const GSS_REQUEST_CODE: u32 = GssEncRequest::BODY_MAGIC_NUMBER as u32;
 /// bounds the work a malformed/hostile client can force on us.
 const MAX_STARTUP_BYTES: u64 = 64 * 1024;
 const STARTUP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for the over-cap fast path: response write only, no startup drain.
+const CAP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Hard cap on concurrent early-bind handlers. A thundering-herd reconnect
 /// storm during startup could otherwise spawn unbounded tasks, each holding
-/// a socket FD for up to STARTUP_READ_TIMEOUT. Excess connections are accepted
-/// and immediately dropped (closing the socket); clients see this as a reset
-/// and retry, same as if the kernel had dropped the SYN.
+/// a socket FD for up to STARTUP_READ_TIMEOUT.
 const MAX_CONCURRENT_EARLY_HANDLERS: usize = 512;
 
 /// Run the 57P03 acceptor on `listener` until `shutdown` is cancelled.
@@ -46,32 +46,24 @@ async fn accept_loop(listener: &TcpListener, shutdown: CancellationToken, max_ha
             biased;
             _ = shutdown.cancelled() => return,
             res = listener.accept() => match res {
-                Ok((mut sock, addr)) => {
-                    let permit = match Arc::clone(&permits).try_acquire_owned() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            // Capacity exhausted (probable reconnect storm). Send the
-                            // canned 57P03 frame and close — dropping the socket without
-                            // a response would RST, which Hasql/libpq treat as
-                            // ECONNREFUSED (the exact failure mode this responder exists
-                            // to avoid). The fast-path task skips the 10s startup wait
-                            // so it's bounded by accept rate × write latency (~ms).
+                Ok((sock, addr)) => {
+                    // Over the cap (probable reconnect storm) we still send the canned
+                    // 57P03 frame — dropping the socket unanswered would RST, which
+                    // Hasql/libpq treat as ECONNREFUSED, the exact failure mode this
+                    // responder exists to avoid — but skip the startup drain so the task
+                    // is bounded by accept rate × write latency (~ms).
+                    let permit = Arc::clone(&permits).try_acquire_owned().ok();
+                    let (limit, drain) = match &permit {
+                        Some(_) => (STARTUP_READ_TIMEOUT, true),
+                        None => {
                             warn!("early-bind: at {max_handlers}-handler cap, fast-responding to {addr}");
-                            let resp = Arc::clone(&response);
-                            tokio::spawn(async move {
-                                let _ = tokio::time::timeout(Duration::from_secs(1), async move {
-                                    let _ = sock.write_all(&resp).await;
-                                    let _ = sock.shutdown().await;
-                                })
-                                .await;
-                            });
-                            continue;
+                            (CAP_RESPONSE_TIMEOUT, false)
                         }
                     };
                     let resp = Arc::clone(&response);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        match tokio::time::timeout(STARTUP_READ_TIMEOUT, handle_one(sock, &resp)).await {
+                        match tokio::time::timeout(limit, handle_one(sock, &resp, drain)).await {
                             Err(_) => debug!("early-bind: timeout waiting for startup from {addr}"),
                             Ok(Err(e)) => debug!("early-bind: short-circuit conn from {addr}: {e}"),
                             Ok(Ok(())) => {}
@@ -84,21 +76,23 @@ async fn accept_loop(listener: &TcpListener, shutdown: CancellationToken, max_ha
     }
 }
 
-async fn handle_one(mut sock: TcpStream, response: &[u8]) -> io::Result<()> {
+async fn handle_one(mut sock: TcpStream, response: &[u8], drain_startup: bool) -> io::Result<()> {
     // SSL/GSS negotiation precedes the real StartupMessage; both are 8 bytes
     // (length + magic). Drain whichever shape arrives, then send 57P03.
     // pg length fields include the 4-byte length itself. In the non-SSL branch
     // we've also consumed the 4-byte code → drain `len - 8`; in the SSL/GSS
     // branch we've consumed only the length of the *real* startup → drain
     // `real_len - 4`.
-    let len = sock.read_u32().await? as u64;
-    let code = sock.read_u32().await?;
-    if code == SSL_REQUEST_CODE || code == GSS_REQUEST_CODE {
-        sock.write_all(b"N").await?;
-        let real_len = sock.read_u32().await? as u64;
-        drain_body(&mut sock, real_len.checked_sub(4)).await?;
-    } else {
-        drain_body(&mut sock, len.checked_sub(8)).await?;
+    if drain_startup {
+        let len = sock.read_u32().await? as u64;
+        let remaining = match sock.read_u32().await? {
+            SSL_REQUEST_CODE | GSS_REQUEST_CODE => {
+                sock.write_all(b"N").await?;
+                (sock.read_u32().await? as u64).checked_sub(4)
+            }
+            _ => len.checked_sub(8),
+        };
+        drain_body(&mut sock, remaining).await?;
     }
 
     sock.write_all(response).await?;
@@ -111,26 +105,17 @@ async fn drain_body(sock: &mut TcpStream, remaining: Option<u64>) -> io::Result<
     if n > MAX_STARTUP_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("startup body {n} exceeds {MAX_STARTUP_BYTES}-byte cap")));
     }
-    tokio::io::copy(&mut sock.take(n), &mut tokio::io::sink()).await?;
-    Ok(())
+    tokio::io::copy(&mut sock.take(n), &mut tokio::io::sink()).await.map(drop)
 }
 
 /// Wire format: `Byte1('E') Int32(length) [Byte1(tag) String(value)]* Byte1(0)`
 fn build_starting_up_response() -> Vec<u8> {
-    let mut body: Vec<u8> = Vec::with_capacity(96);
-    for (tag, value) in [(b'S', "FATAL"), (b'V', "FATAL"), (b'C', "57P03"), (b'M', "the database system is starting up")] {
-        body.push(tag);
-        body.extend_from_slice(value.as_bytes());
-        body.push(0);
-    }
-    body.push(0);
-
-    let length = (body.len() + 4) as u32;
-    let mut msg = Vec::with_capacity(1 + 4 + body.len());
-    msg.push(b'E');
-    msg.extend_from_slice(&length.to_be_bytes());
-    msg.extend_from_slice(&body);
-    msg
+    let body: Vec<u8> = [(b'S', "FATAL"), (b'V', "FATAL"), (b'C', "57P03"), (b'M', "the database system is starting up")]
+        .into_iter()
+        .flat_map(|(tag, value)| [tag].into_iter().chain(value.bytes()).chain([0]))
+        .chain([0])
+        .collect();
+    [b'E'].into_iter().chain(((body.len() + 4) as u32).to_be_bytes()).chain(body).collect()
 }
 
 #[cfg(test)]
@@ -151,12 +136,21 @@ mod tests {
     }
 
     async fn spawn_acceptor() -> (u16, CancellationToken, tokio::task::JoinHandle<()>) {
+        spawn_acceptor_with(MAX_CONCURRENT_EARLY_HANDLERS).await
+    }
+
+    async fn spawn_acceptor_with(max_handlers: usize) -> (u16, CancellationToken, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
-        let task = tokio::spawn(async move { run_until_ready(&listener, token).await });
+        let task = tokio::spawn(async move { accept_loop(&listener, token, max_handlers).await });
         (port, shutdown, task)
+    }
+
+    async fn assert_closed(client: &mut TcpStream, why: &str) {
+        let mut tail = [0u8; 1];
+        assert_eq!(client.read(&mut tail).await.unwrap(), 0, "{why}");
     }
 
     async fn assert_57p03(client: &mut TcpStream) {
@@ -178,8 +172,7 @@ mod tests {
         client.write_all(&8u32.to_be_bytes()).await.unwrap();
         client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         assert_57p03(&mut client).await;
-        let mut tail = [0u8; 1];
-        assert_eq!(client.read(&mut tail).await.unwrap(), 0, "server must close after error");
+        assert_closed(&mut client, "server must close after error").await;
         shutdown.cancel();
         let _ = task.await;
     }
@@ -195,8 +188,7 @@ mod tests {
         client.write_all(&8u32.to_be_bytes()).await.unwrap();
         client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         assert_57p03(&mut client).await;
-        let mut tail = [0u8; 1];
-        assert_eq!(client.read(&mut tail).await.unwrap(), 0, "server must close after error");
+        assert_closed(&mut client, "server must close after error").await;
         shutdown.cancel();
         let _ = task.await;
     }
@@ -234,23 +226,17 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         // No bytes sent; advance virtual time past the timeout.
         tokio::time::advance(STARTUP_READ_TIMEOUT + Duration::from_secs(1)).await;
-        let mut tail = [0u8; 1];
-        assert_eq!(client.read(&mut tail).await.unwrap(), 0, "server must close after timeout");
+        assert_closed(&mut client, "server must close after timeout").await;
         shutdown.cancel();
         let _ = task.await;
     }
 
-    /// At the handler cap, excess connections still receive 57P03 (sent
-    /// synchronously via try_write) rather than RST — Hasql/libpq treat RST
-    /// as ECONNREFUSED, which is the failure mode this responder exists to
-    /// avoid.
+    /// At the handler cap, excess connections still receive 57P03 rather than
+    /// RST — Hasql/libpq treat RST as ECONNREFUSED, which is the failure mode
+    /// this responder exists to avoid.
     #[tokio::test]
-    async fn cap_serves_57p03_synchronously_without_spawning() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let shutdown = CancellationToken::new();
-        let token = shutdown.clone();
-        let task = tokio::spawn(async move { accept_loop(&listener, token, 1).await });
+    async fn cap_serves_57p03_without_waiting_for_startup() {
+        let (port, shutdown, task) = spawn_acceptor_with(1).await;
 
         // First connection holds the only permit — never sends startup, so it
         // sits inside handle_one's read awaiting bytes.

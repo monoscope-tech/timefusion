@@ -17,13 +17,13 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::{
-    array::{Array, ArrayRef, AsArray, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray},
+    array::{Array, ArrayRef, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
 use parquet_variant_compute::VariantArray;
 use parquet_variant_json::VariantToJson;
-use tantivy::{Index, IndexWriter, doc, merge_policy::NoMergePolicy, schema::Schema as TSchema};
+use tantivy::{Index, IndexWriter, doc, merge_policy::NoMergePolicy};
 use tracing::{debug, warn};
 
 use crate::{
@@ -100,10 +100,8 @@ pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatc
     // in-flight segment flush, i.e. *while* documents are still being added.
     writer.set_merge_policy(Box::new(NoMergePolicy));
     let mut stats = IndexBuildStats::default();
-    for batch in batches {
-        index_batch(built, &mut writer, batch, &mut stats)?;
-        stats.batches += 1;
-    }
+    batches.iter().try_for_each(|batch| index_batch(built, &mut writer, batch, &mut stats))?;
+    stats.batches = batches.len() as u32;
     writer.commit().context("tantivy commit")?;
     let segment_ids = index.searchable_segment_ids().map_err(|e| anyhow!("list segments: {e}"))?;
     stats.segments = segment_ids.len();
@@ -139,7 +137,12 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
         .ok_or_else(|| anyhow!("timestamp column is not TimestampMicrosecondArray (got {:?})", batch.column(ts_idx).data_type()))?;
-    let id_extract = string_extractor(batch.column(id_idx))?;
+    let id_col = batch.column(id_idx);
+    let id_kind = match id_col.data_type() {
+        DataType::Utf8 => ColKind::Utf8,
+        DataType::Utf8View => ColKind::Utf8View,
+        other => bail!("id column must be Utf8/Utf8View, got {other:?}"),
+    };
 
     // Pre-resolve user-field columns once per batch.
     struct UserCol<'a> {
@@ -147,25 +150,24 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
         column: &'a ArrayRef,
         kind: ColKind,
     }
-    let mut user_cols: Vec<UserCol> = Vec::new();
-    for (name, uf) in &built.user_fields {
-        let Ok(idx) = schema.index_of(name) else { continue };
-        let kind = ColKind::detect(batch.column(idx).data_type(), uf.source.tantivy.as_ref().and_then(|t| t.flatten.as_deref()))?;
-        user_cols.push(UserCol { field: uf.field, column: batch.column(idx), kind });
-    }
+    let user_cols: Vec<UserCol> = built
+        .user_fields
+        .iter()
+        .filter_map(|(name, uf)| schema.index_of(name).ok().map(|idx| (batch.column(idx), uf)))
+        .map(|(column, uf)| {
+            Ok(UserCol { field: uf.field, column, kind: ColKind::detect(column.data_type(), uf.source.tantivy.as_ref().and_then(|t| t.flatten.as_deref()))? })
+        })
+        .collect::<Result<_>>()?;
 
     for row in 0..batch.num_rows() {
         let ts = ts_col.value(row);
         stats.min_timestamp_micros = Some(stats.min_timestamp_micros.map_or(ts, |m| m.min(ts)));
         stats.max_timestamp_micros = Some(stats.max_timestamp_micros.map_or(ts, |m| m.max(ts)));
-        let id = id_extract(row).unwrap_or_default();
+        let id = id_kind.extract(id_col, row)?.unwrap_or_default();
         // stats.rows counts docs already added → the global ordinal of this
         // one, valid as a parquet row index only for read-back builds.
         let mut doc = doc!(built.timestamp => ts, built.id => id, built.row_ordinal => stats.rows);
         for uc in &user_cols {
-            if uc.column.is_null(row) {
-                continue;
-            }
             if let Some(text) = uc.kind.extract(uc.column, row)?
                 && !text.is_empty()
             {
@@ -201,52 +203,29 @@ impl ColKind {
     }
 
     fn extract(&self, col: &ArrayRef, row: usize) -> Result<Option<String>> {
+        if col.is_null(row) {
+            return Ok(None);
+        }
         Ok(match self {
-            Self::Utf8 => col.as_any().downcast_ref::<StringArray>().map(|a| a.value(row).to_string()),
-            Self::Utf8View => col.as_any().downcast_ref::<StringViewArray>().map(|a| a.value(row).to_string()),
-            Self::ListUtf8 => list_to_text(col.as_any().downcast_ref::<ListArray>().context("list cast")?, row)?,
+            Self::Utf8 => Some(col.as_any().downcast_ref::<StringArray>().context("utf8 cast")?.value(row).to_string()),
+            Self::Utf8View => Some(col.as_any().downcast_ref::<StringViewArray>().context("utf8view cast")?.value(row).to_string()),
+            Self::ListUtf8 => Some(list_to_text(col.as_any().downcast_ref::<ListArray>().context("list cast")?, row)?),
             Self::VariantJson => variant_to_text(col, row, false)?,
             Self::VariantKv => variant_to_text(col, row, true)?,
         })
     }
 }
 
-fn string_extractor(col: &ArrayRef) -> Result<Box<dyn Fn(usize) -> Option<String> + '_>> {
-    Ok(match col.data_type() {
-        DataType::Utf8 => {
-            let a = col.as_string::<i32>();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
-        }
-        DataType::Utf8View => {
-            let a = col.as_string_view();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
-        }
-        other => bail!("id column must be Utf8/Utf8View, got {other:?}"),
-    })
-}
-
-fn list_to_text(arr: &ListArray, row: usize) -> Result<Option<String>> {
-    if arr.is_null(row) {
-        return Ok(None);
-    }
+fn list_to_text(arr: &ListArray, row: usize) -> Result<String> {
     let inner = arr.value(row);
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(s) = inner.as_any().downcast_ref::<StringArray>() {
-        for i in 0..s.len() {
-            if !s.is_null(i) {
-                parts.push(s.value(i).to_string());
-            }
-        }
+    let parts: Vec<&str> = if let Some(s) = inner.as_any().downcast_ref::<StringArray>() {
+        s.iter().flatten().collect()
     } else if let Some(s) = inner.as_any().downcast_ref::<StringViewArray>() {
-        for i in 0..s.len() {
-            if !s.is_null(i) {
-                parts.push(s.value(i).to_string());
-            }
-        }
+        s.iter().flatten().collect()
     } else {
-        bail!("list element type unsupported for tantivy: {:?}", inner.data_type());
-    }
-    Ok(Some(parts.join(" ")))
+        bail!("list element type unsupported for tantivy: {:?}", inner.data_type())
+    };
+    Ok(parts.join(" "))
 }
 
 /// Render one Variant row to text. `kv=false` → canonical JSON (the same
@@ -301,11 +280,6 @@ fn flatten_kv(v: &serde_json::Value, prefix: &str, out: &mut String) {
             }
         }
     }
-}
-
-/// Returns the schema attached to a tantivy index (helper for tests).
-pub fn index_schema(index: &Index) -> TSchema {
-    index.schema()
 }
 
 #[cfg(test)]

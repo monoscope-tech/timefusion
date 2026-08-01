@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    hash::Hash,
+    sync::{Arc, LazyLock},
+};
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Utc};
@@ -6,7 +9,7 @@ use chrono_tz::Tz;
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, StringViewBuilder, TimestampMicrosecondArray,
+            Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
             TimestampNanosecondArray,
         },
         datatypes::{DataType, Field, FieldRef, TimeUnit},
@@ -30,25 +33,26 @@ use crate::{errors::arrow_err, optimizers::extract_utf8_string, schema_loader::i
 /// etc.). `label` names the argument in error messages.
 fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error::Result<String> {
     let not_utf8 = || DataFusionError::Execution(format!("{label} must be a UTF8 string"));
-    let not_scalar = || DataFusionError::Execution(format!("{label} must be a scalar value"));
     match arg {
         ColumnarValue::Scalar(scalar) => extract_utf8_string(scalar).ok_or_else(not_utf8),
-        ColumnarValue::Array(arr) => {
-            // `&&` short-circuits so is_null(0) is never called on an empty array.
-            if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
-                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
-            } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
-            } else {
-                Err(not_utf8())
-            }
-        }
+        // `||` short-circuits so is_null(0) is never called on an empty array.
+        ColumnarValue::Array(arr) if arr.len() != 1 || arr.is_null(0) => Err(DataFusionError::Execution(format!("{label} must be a scalar value"))),
+        ColumnarValue::Array(arr) => extract_utf8_string(&ScalarValue::try_from_array(arr, 0)?).ok_or_else(not_utf8),
     }
 }
 
-/// Emits the three boilerplate `ScalarUDFImpl` methods (`as_any`, `name`,
-/// `signature`) shared by every UDF in this module that stores its `Signature`
-/// in a `signature` field. `return_type` / `invoke_with_args` stay per-impl.
+/// The `Array(a) => a.clone(), Scalar(s) => s.to_array()?` dance every UDF here
+/// repeats. Scalars materialize length-1, matching the pre-existing behavior.
+fn as_array(v: &ColumnarValue) -> datafusion::error::Result<ArrayRef> {
+    match v {
+        ColumnarValue::Array(a) => Ok(a.clone()),
+        ColumnarValue::Scalar(s) => s.to_array(),
+    }
+}
+
+/// Emits the boilerplate `ScalarUDFImpl` `name`/`signature` methods shared by
+/// every UDF in this module that stores its `Signature` in a `signature` field.
+/// `return_type` / `invoke_with_args` stay per-impl.
 macro_rules! scalar_udf_boilerplate {
     ($name:literal) => {
         fn name(&self) -> &str {
@@ -117,19 +121,14 @@ impl ExprPlanner for VariantAwareExprPlanner {
 
         // Recursively collect path components from chained operators
         let (base_expr, mut path_parts) = collect_arrow_chain(&expr.left);
-        if let Some(component) = extract_path_component(&expr.right) {
-            path_parts.push(component);
-        } else {
+        let Some(component) = extract_path_component(&expr.right) else {
             return Ok(PlannerResult::Original(expr));
-        }
+        };
+        path_parts.push(component);
 
-        // Check if base column is Variant type
         if !is_variant_column(&base_expr, schema) {
             return Ok(PlannerResult::Original(expr)); // Let JSON planner handle
         }
-
-        // Build dot-path: ["user", "name"] → "user.name", ["items", Index(0)] → "items[0]"
-        let full_path = build_variant_path(&path_parts);
 
         // Build the variant_get(base, '<path>') call. For `->` we return the
         // Variant leaf so chained `->` keeps working. For `->>` we'd previously
@@ -140,20 +139,20 @@ impl ExprPlanner for VariantAwareExprPlanner {
         //   variant_get(col, path) → Variant
         //   variant_to_json(...)   → JSON-encoded text (Utf8)
         //   json_to_pg_text(...)   → Postgres ->> text
-        let variant_get_udf = ScalarUDF::from(VariantGetExtUdf::default());
-        let path_literal = Expr::Literal(ScalarValue::Utf8(Some(full_path.clone())), None);
-        let get_args = vec![base_expr.clone(), path_literal];
-        let variant_leaf = Expr::ScalarFunction(ScalarFunction { func: Arc::new(variant_get_udf), args: get_args });
+        let path_literal = Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path_parts))), None);
+        // Render the alias base before `base_expr` is moved into the call args.
+        let base_repr = expr_repr(&base_expr);
+        let variant_leaf = Expr::ScalarFunction(ScalarFunction { func: variant_get_udf(), args: vec![base_expr, path_literal] });
         let result = if is_long_arrow {
-            let to_json = Expr::ScalarFunction(ScalarFunction { func: Arc::new(ScalarUDF::from(VariantToJsonExtUdf::default())), args: vec![variant_leaf] });
-            Expr::ScalarFunction(ScalarFunction { func: Arc::new(ScalarUDF::from(JsonToPgTextUdf::default())), args: vec![to_json] })
+            let to_json = Expr::ScalarFunction(ScalarFunction { func: variant_to_json_udf(), args: vec![variant_leaf] });
+            Expr::ScalarFunction(ScalarFunction { func: json_to_pg_text_udf(), args: vec![to_json] })
         } else {
             variant_leaf
         };
 
         // Create alias to preserve original SQL representation
         let op_str = if is_long_arrow { "->>" } else { "->" };
-        let alias_name = format!("{} {} {}", expr_repr(&base_expr), op_str, path_repr(&path_parts));
+        let alias_name = format!("{base_repr} {op_str} {}", path_repr(&path_parts));
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(result, None::<&str>, alias_name))))
     }
 }
@@ -163,9 +162,7 @@ fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
     match expr {
         Expr::BinaryExpr(binary) if matches!(binary.op, datafusion::logical_expr::Operator::Arrow) => {
             let (base, mut parts) = collect_arrow_chain(&binary.left);
-            if let Some(component) = extract_path_component(&binary.right) {
-                parts.push(component);
-            }
+            parts.extend(extract_path_component(&binary.right)); // Option is an iterator
             (base, parts)
         }
         Expr::Alias(alias) => collect_arrow_chain(&alias.expr),
@@ -175,16 +172,16 @@ fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
 
 /// Extract path component from expression (string literal or integer)
 fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(PathComponent::Field(s.clone())),
-        Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => Some(PathComponent::Field(s.clone())),
-        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Some(PathComponent::Field(s.clone())),
-        Expr::Literal(ScalarValue::Int64(Some(i)), _) => Some(PathComponent::Index(*i)),
-        Expr::Literal(ScalarValue::Int32(Some(i)), _) => Some(PathComponent::Index(*i as i64)),
-        Expr::Literal(ScalarValue::UInt64(Some(i)), _) => Some(PathComponent::Index(*i as i64)),
-        Expr::Literal(ScalarValue::UInt32(Some(i)), _) => Some(PathComponent::Index(*i as i64)),
-        _ => None,
-    }
+    let Expr::Literal(v, _) = expr else { return None };
+    extract_utf8_string(v).map(PathComponent::Field).or_else(|| {
+        Some(PathComponent::Index(match v {
+            ScalarValue::Int64(Some(i)) => *i,
+            ScalarValue::Int32(Some(i)) => (*i).into(),
+            ScalarValue::UInt32(Some(i)) => (*i).into(),
+            ScalarValue::UInt64(Some(i)) => i64::try_from(*i).ok()?,
+            _ => return None,
+        }))
+    })
 }
 
 /// Check if expression evaluates to a Variant type
@@ -197,10 +194,9 @@ fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
         // datafusion-functions-json (json_get/json_as_text) and blow up once the
         // analyzer restores the Variant struct. On a base column the tag is only ever
         // set on Variant columns (UDF-output `tf.pg_type` tags live on expressions).
-        Expr::Column(col) => schema
-            .field_from_column(col)
-            .map(|f| is_variant_type(f.data_type()) || f.metadata().get("tf.pg_type").map(|v| v == "jsonb").unwrap_or(false))
-            .unwrap_or(false),
+        Expr::Column(col) => {
+            schema.field_from_column(col).is_ok_and(|f| is_variant_type(f.data_type()) || f.metadata().get("tf.pg_type").is_some_and(|v| v == "jsonb"))
+        }
         // Unwrap aliases
         Expr::Alias(alias) => is_variant_column(&alias.expr, schema),
         // Check if it's a call to a variant-producing function
@@ -218,29 +214,22 @@ fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
             )
         }
         // Try to get the type for other expressions
-        _ => expr.get_type(schema).map(|dt| is_variant_type(&dt)).unwrap_or(false),
+        _ => expr.get_type(schema).is_ok_and(|dt| is_variant_type(&dt)),
     }
 }
 
-/// Build variant_get path string from components
+/// Build variant_get path string from components:
+/// `["user", "name"]` → `user.name`, `["items", Index(0)]` → `items[0]`.
 fn build_variant_path(parts: &[PathComponent]) -> String {
-    let mut path = String::new();
-    for (i, part) in parts.iter().enumerate() {
-        match part {
-            PathComponent::Field(name) => {
-                if i > 0 {
-                    path.push('.');
-                }
-                path.push_str(name);
-            }
-            PathComponent::Index(idx) => {
-                path.push('[');
-                path.push_str(&idx.to_string());
-                path.push(']');
-            }
-        }
-    }
-    path
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| match part {
+            PathComponent::Field(name) if i > 0 => format!(".{name}"),
+            PathComponent::Field(name) => name.clone(),
+            PathComponent::Index(idx) => format!("[{idx}]"),
+        })
+        .collect()
 }
 
 /// Generate SQL-like representation for expression (for alias)
@@ -257,7 +246,7 @@ fn path_repr(parts: &[PathComponent]) -> String {
     parts
         .iter()
         .map(|p| match p {
-            PathComponent::Field(s) => format!("'{}'", s),
+            PathComponent::Field(s) => format!("'{s}'"),
             PathComponent::Index(i) => i.to_string(),
         })
         .collect::<Vec<_>>()
@@ -290,32 +279,25 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        use datafusion::arrow::compute::cast;
-        let arr = match args.args.into_iter().next().unwrap() {
-            ColumnarValue::Array(a) => a,
-            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
+        let [arg] = args.args.as_slice() else {
+            return Err(DataFusionError::Execution("json_to_pg_text requires exactly 1 argument".into()));
         };
+        let arr = arg.to_array(args.number_rows)?;
         // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
         // concrete shape, single pass over rows.
-        let utf8 = cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
+        let utf8 = datafusion::arrow::compute::cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
         let strs = utf8.as_any().downcast_ref::<StringArray>().ok_or_else(|| DataFusionError::Execution("json_to_pg_text: cast to Utf8 failed".into()))?;
+        // Builder (not a `collect()` into StringArray) so the common non-string
+        // case appends the borrowed `&str` without a per-row String alloc.
         let mut b = datafusion::arrow::array::StringBuilder::with_capacity(strs.len(), strs.value_data().len());
-        for i in 0..strs.len() {
-            if strs.is_null(i) {
-                b.append_null();
-                continue;
-            }
-            // Parse via serde_json so escape sequences resolve correctly and
-            // false-positive shapes like '"a"+"b"' don't trigger naive unquoting.
-            // JSON null → SQL NULL; JSON string → its raw text; anything else
-            // (number, bool, object, array) → its JSON literal text (per Postgres ->>).
-            let s = strs.value(i);
-            match serde_json::from_str::<JsonValue>(s) {
-                Ok(JsonValue::Null) => b.append_null(),
-                Ok(JsonValue::String(inner)) => b.append_value(&inner),
-                Ok(_) | Err(_) => b.append_value(s),
-            }
-        }
+        // Parse via serde_json so escape sequences resolve correctly and false-positive
+        // shapes like '"a"+"b"' don't trigger naive unquoting. JSON null → SQL NULL;
+        // JSON string → its raw text; anything else → its JSON literal text (per PG ->>).
+        strs.iter().for_each(|opt| match opt.map(|s| (s, serde_json::from_str::<JsonValue>(s))) {
+            None | Some((_, Ok(JsonValue::Null))) => b.append_null(),
+            Some((_, Ok(JsonValue::String(inner)))) => b.append_value(&inner),
+            Some((s, _)) => b.append_value(s),
+        });
         Ok(ColumnarValue::Array(Arc::new(b.finish())))
     }
 }
@@ -328,9 +310,8 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
 /// `fields()`), but is stripped on the way to the physical executor's
 /// per-row Field — so any SELECT touching a Variant column would panic at
 /// execution time. We re-stamp the marker here right before delegating.
-fn stamp_variant_field(f: &Arc<datafusion::arrow::datatypes::Field>) -> Arc<datafusion::arrow::datatypes::Field> {
-    const EXT_KEY: &str = "ARROW:extension:name";
-    const EXT_VAL: &str = "arrow.parquet.variant";
+fn stamp_variant_field(f: &FieldRef) -> FieldRef {
+    use crate::schema_loader::{VARIANT_EXT_KEY as EXT_KEY, VARIANT_EXT_VALUE as EXT_VAL};
     if !is_variant_type(f.data_type()) || f.metadata().get(EXT_KEY).map(String::as_str) == Some(EXT_VAL) {
         return f.clone();
     }
@@ -345,15 +326,9 @@ fn stamp_variant_field(f: &Arc<datafusion::arrow::datatypes::Field>) -> Arc<data
 /// `JSONB_OUT` tags the output Field with `tf.pg_type = jsonb` so bare
 /// Variant columns (wrapped by VariantPgwireRootWrap) surface PG OID 3802
 /// over the wire instead of text — strict drivers (hasql) reject text.
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Default)]
 pub struct VariantExtWrapper<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool = false> {
     inner: U,
-}
-
-impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool> Default for VariantExtWrapper<U, JSONB_OUT> {
-    fn default() -> Self {
-        Self { inner: U::default() }
-    }
 }
 
 impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool> ScalarUDFImpl for VariantExtWrapper<U, JSONB_OUT> {
@@ -370,7 +345,7 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
     // computes the output Field shape from arg types via this method, so
     // we must forward it rather than rely on the default that calls
     // return_type.
-    fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
+    fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
         let f = self.inner.return_field_from_args(args)?;
         if !JSONB_OUT {
             return Ok(f);
@@ -383,10 +358,7 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
         self.inner.coerce_types(arg_types)
     }
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        use datafusion::arrow::{
-            compute::cast,
-            datatypes::{DataType, Field},
-        };
+        use datafusion::arrow::compute::cast;
         // The official datafusion-variant UDFs declare a BinaryView Variant output but
         // pass the input `metadata` buffer through unchanged. TF stores Variants as
         // Struct(Binary, Binary) (delta-kernel / delta-rs fork requirement), so a
@@ -395,6 +367,7 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
         // "result_data_type == expected_type" assertion fires. Coerce Variant args to
         // BinaryView here so the inner UDF is internally consistent; TF's on-disk /
         // MemBuffer representation stays Binary.
+        // Indexed loop: rewrites `args.args[i]` / `args.arg_fields[i]` in place.
         for i in 0..args.args.len() {
             let field = args.arg_fields[i].clone();
             let DataType::Struct(inner) = field.data_type() else { continue };
@@ -407,13 +380,9 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
                     let dt = if matches!(f.data_type(), DataType::Binary) { DataType::BinaryView } else { f.data_type().clone() };
                     Arc::new(Field::new(f.name(), dt, f.is_nullable()))
                 })
-                .collect::<Vec<_>>()
-                .into();
+                .collect();
             let bv = DataType::Struct(bv_fields);
-            let arr = match &args.args[i] {
-                ColumnarValue::Array(a) => a.clone(),
-                ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
-            };
+            let arr = args.args[i].to_array(args.number_rows)?;
             let casted = cast(&arr, &bv).map_err(|e| datafusion::error::DataFusionError::Execution(format!("variant BinaryView coerce: {e}")))?;
             args.args[i] = ColumnarValue::Array(casted);
             args.arg_fields[i] = Arc::new(Field::new(field.name(), bv, field.is_nullable()).with_metadata(field.metadata().clone()));
@@ -423,9 +392,26 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
     }
 }
 
-use std::hash::Hash;
 pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJsonUdf, true>;
 pub type VariantGetExtUdf = VariantExtWrapper<datafusion_variant::VariantGetUdf>;
+
+/// Process-wide singletons for the Variant UDFs the analyzer rules splice into
+/// plans. They are stateless, so the rules clone one `Arc` per plan instead of
+/// allocating a fresh `ScalarUDF` per rewritten expression.
+macro_rules! shared_udf {
+    ($(#[$m:meta])* $vis:vis $name:ident: $ty:ty) => {
+        $(#[$m])*
+        $vis fn $name() -> Arc<ScalarUDF> {
+            static UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| Arc::new(ScalarUDF::from(<$ty>::default())));
+            Arc::clone(&UDF)
+        }
+    };
+}
+
+shared_udf!(pub variant_to_json_udf: VariantToJsonExtUdf);
+shared_udf!(pub variant_get_udf: VariantGetExtUdf);
+shared_udf!(pub json_to_variant_udf: datafusion_variant::JsonToVariantUdf);
+shared_udf!(pub json_to_pg_text_udf: JsonToPgTextUdf);
 
 /// Register all custom PostgreSQL-compatible functions
 /// Collapse the repetitive `ctx.register_udf(ScalarUDF::from(T))` calls for
@@ -463,13 +449,13 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
         datafusion_variant::VariantObjectConstruct::default(),
         datafusion_variant::VariantObjectInsert::default(),
         JsonbPathExistsUDF::new(),
+        ApproxPercentileUDF::new(),
     );
 
     // create_udf-based UDFs that carry construction logic.
     ctx.register_udf(create_jsonb_array_elements_udf());
     ctx.register_udf(create_time_bucket_udf());
     ctx.register_udaf(create_percentile_agg_udaf());
-    ctx.register_udf(create_approx_percentile_udf());
 
     // text_match(col, 'query') for tantivy-accelerated full-text search. Naive
     // substring fallback keeps correctness when tantivy is disabled or when
@@ -480,7 +466,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     // production deployment can't have its eviction/flush clock yanked by
     // a stray SQL session. Required by the long-duration bench harness in
     // `bench/timeseries_lifecycle.py` to simulate hours in seconds.
-    if std::env::var("TIMEFUSION_ENABLE_TEST_UDFS").map(|v| v == "true" || v == "1").unwrap_or(false) {
+    if std::env::var("TIMEFUSION_ENABLE_TEST_UDFS").is_ok_and(|v| v == "true" || v == "1") {
         ctx.register_udf(create_set_clock_udf());
         ctx.register_udf(create_advance_clock_udf());
         ctx.register_udf(create_now_micros_udf());
@@ -511,60 +497,40 @@ pub fn function_registry() -> Result<Arc<FnRegistry>> {
 
 /// `timefusion_set_clock(rfc3339_text)` → bigint micros-since-epoch.
 fn create_set_clock_udf() -> ScalarUDF {
-    use datafusion::arrow::{
-        array::{Int64Array, StringArray},
-        datatypes::DataType,
-    };
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
-        let arr = match &args[0] {
-            ColumnarValue::Array(a) => a.clone(),
-            ColumnarValue::Scalar(s) => s.to_array()?,
-        };
+        let arr = as_array(&args[0])?;
         let s = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| DataFusionError::Execution("timefusion_set_clock expects Utf8".into()))?;
-        let mut b = Int64Array::builder(s.len());
-        for i in 0..s.len() {
-            if s.is_null(i) {
-                b.append_null();
-                continue;
-            }
-            let t =
-                chrono::DateTime::parse_from_rfc3339(s.value(i)).map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))?.timestamp_micros();
-            b.append_value(crate::clock::set_micros(t));
-        }
-        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+        let out: Int64Array = s
+            .iter()
+            .map(|v| {
+                v.map(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|t| crate::clock::set_micros(t.timestamp_micros()))
+                        .map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))
+                })
+                .transpose()
+            })
+            .collect::<datafusion::error::Result<_>>()?;
+        Ok(ColumnarValue::Array(Arc::new(out)))
     });
     create_udf("timefusion_set_clock", vec![DataType::Utf8], DataType::Int64, Volatility::Volatile, fun)
 }
 
 /// `timefusion_advance_clock(delta_micros)` → new bigint micros.
 fn create_advance_clock_udf() -> ScalarUDF {
-    use datafusion::arrow::{array::Int64Array, datatypes::DataType};
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
-        let arr = match &args[0] {
-            ColumnarValue::Array(a) => a.clone(),
-            ColumnarValue::Scalar(s) => s.to_array()?,
-        };
+        let arr = as_array(&args[0])?;
         let d = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| DataFusionError::Execution("timefusion_advance_clock expects Int64".into()))?;
-        let mut b = Int64Array::builder(d.len());
-        for i in 0..d.len() {
-            if d.is_null(i) {
-                b.append_null();
-            } else {
-                b.append_value(crate::clock::advance_micros(d.value(i)));
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+        let out: Int64Array = d.iter().map(|v| v.map(crate::clock::advance_micros)).collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
     });
     create_udf("timefusion_advance_clock", vec![DataType::Int64], DataType::Int64, Volatility::Volatile, fun)
 }
 
 /// `timefusion_now_micros()` → current clock value (frozen or wall).
 fn create_now_micros_udf() -> ScalarUDF {
-    use datafusion::arrow::{array::Int64Array, datatypes::DataType};
-    let fun: ScalarFunctionImplementation = Arc::new(move |_args: &[ColumnarValue]| {
-        let v = crate::clock::now_micros();
-        Ok(ColumnarValue::Array(Arc::new(Int64Array::from(vec![v]))))
-    });
+    let fun: ScalarFunctionImplementation =
+        Arc::new(move |_args: &[ColumnarValue]| Ok(ColumnarValue::Array(Arc::new(Int64Array::from(vec![crate::clock::now_micros()])))));
     create_udf("timefusion_now_micros", vec![], DataType::Int64, Volatility::Volatile, fun)
 }
 
@@ -587,62 +553,57 @@ impl ScalarUDFImpl for ToCharUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let args = args.args;
-        if args.len() != 2 {
+        let [ts, fmt] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("to_char requires exactly 2 arguments: timestamp and format string".to_string()));
-        }
-
-        // Extract timestamp array
-        let timestamp_array = match &args[0] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
         };
-
-        // Extract format string
-        let format_str = extract_scalar_string(&args[1], "Format string")?;
-
-        let result = format_timestamps(&timestamp_array, &format_str)?;
-        Ok(ColumnarValue::Array(result))
+        let format_str = extract_scalar_string(fmt, "Format string")?;
+        Ok(ColumnarValue::Array(format_timestamps(&as_array(ts)?, &format_str)?))
     }
+}
+
+/// Raw timestamp ticks and the array's ticks-per-second — see `timestamp_ticks`.
+type TimestampTicks<'a> = (Box<dyn Iterator<Item = Option<i64>> + 'a>, i64);
+
+/// Downcast a µs/ns timestamp array to its raw ticks plus the array's
+/// ticks-per-second, so callers stay unit-agnostic. `label` names the argument
+/// in the error message.
+fn timestamp_ticks<'a>(array: &'a ArrayRef, label: &str) -> datafusion::error::Result<TimestampTicks<'a>> {
+    if let Some(ts) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        Ok((Box::new(ts.iter()), 1_000_000))
+    } else if let Some(ts) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        Ok((Box::new(ts.iter()), 1_000_000_000))
+    } else {
+        Err(DataFusionError::Execution(format!("{label} must be a timestamp")))
+    }
+}
+
+/// Map each tick of a timestamp array through `f(tick, ticks_per_second)` and
+/// rebuild a timestamp array of the same unit, carrying `tz` (None = naive).
+fn map_timestamps(
+    array: &ArrayRef, tz: Option<&str>, label: &str, f: impl Fn(i64, i64) -> datafusion::error::Result<i64>,
+) -> datafusion::error::Result<ArrayRef> {
+    let (ticks, per_sec) = timestamp_ticks(array, label)?;
+    let raw: Int64Array = ticks.map(|v| v.map(|v| f(v, per_sec)).transpose()).collect::<datafusion::error::Result<_>>()?;
+    let unit = if per_sec == 1_000_000 { TimeUnit::Microsecond } else { TimeUnit::Nanosecond };
+    datafusion::arrow::compute::cast(&raw, &DataType::Timestamp(unit, tz.map(Arc::from))).map_err(arrow_err)
 }
 
 /// Format timestamps according to PostgreSQL format patterns
 fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion::error::Result<ArrayRef> {
     let parts = parse_pg_format(format_str);
-    let mut builder = StringViewBuilder::new();
-
-    let format_fn = |timestamp_us: i64| -> datafusion::error::Result<String> {
-        DateTime::<Utc>::from_timestamp_micros(timestamp_us)
-            .ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))
-            .map(|dt| render_pg_format(&parts, &dt))
-    };
-
-    match timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        Some(timestamps) => {
-            for i in 0..timestamps.len() {
-                if timestamps.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(&format_fn(timestamps.value(i))?);
-                }
-            }
-        }
-        None => match timestamp_array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-            Some(timestamps) => {
-                for i in 0..timestamps.len() {
-                    if timestamps.is_null(i) {
-                        builder.append_null();
-                    } else {
-                        let timestamp_us = timestamps.value(i) / 1000; // Convert nanos to micros
-                        builder.append_value(&format_fn(timestamp_us)?);
-                    }
-                }
-            }
-            None => return Err(DataFusionError::Execution("First argument must be a timestamp".to_string())),
-        },
-    }
-
-    Ok(Arc::new(builder.finish()))
+    let (ticks, per_sec) = timestamp_ticks(timestamp_array, "First argument")?;
+    let per_micro = per_sec / 1_000_000;
+    let out: StringViewArray = ticks
+        .map(|v| {
+            v.map(|t| {
+                DateTime::<Utc>::from_timestamp_micros(t / per_micro)
+                    .ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))
+                    .map(|dt| render_pg_format(&parts, &dt))
+            })
+            .transpose()
+        })
+        .collect::<datafusion::error::Result<_>>()?;
+    Ok(Arc::new(out))
 }
 
 /// One segment of a parsed Postgres format string. Most tokens collapse to a
@@ -660,27 +621,21 @@ enum FmtPart {
 
 /// Render a parsed Postgres format against a `DateTime<Utc>`.
 fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    for part in parts {
-        match part {
-            FmtPart::Chrono(spec) => {
-                let _ = write!(out, "{}", dt.format(spec));
-            }
-            FmtPart::PgD => {
-                // chrono `num_days_from_sunday` is 0=Sun..6=Sat; Postgres `D` is 1..7.
-                let _ = write!(out, "{}", dt.weekday().num_days_from_sunday() + 1);
-            }
+    parts
+        .iter()
+        .map(|part| match part {
+            FmtPart::Chrono(spec) => dt.format(spec).to_string(),
+            // chrono `num_days_from_sunday` is 0=Sun..6=Sat; Postgres `D` is 1..7.
+            FmtPart::PgD => (dt.weekday().num_days_from_sunday() + 1).to_string(),
+            // Abbreviated English weekday is ASCII-only, so to_ascii_uppercase suffices
+            // and avoids the locale-aware Unicode case-folding overhead of to_uppercase.
             FmtPart::PgDY => {
-                // Abbreviated English weekday is ASCII-only, so to_ascii_uppercase suffices
-                // and avoids the locale-aware Unicode case-folding overhead of to_uppercase.
                 let mut s = dt.format("%a").to_string();
                 s.make_ascii_uppercase();
-                out.push_str(&s);
+                s
             }
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 /// Parse a PostgreSQL `to_char` format string into a sequence of render parts.
@@ -841,118 +796,49 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let args = args.args;
-        if args.len() != 2 {
+        let [ts, tz] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("AT TIME ZONE requires exactly 2 arguments: timestamp and timezone".to_string()));
-        }
-
-        // Extract timestamp array
-        let timestamp_array = match &args[0] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
         };
-
-        // Extract timezone string
-        let tz_str = extract_scalar_string(&args[1], "Timezone")?;
-
-        let result = convert_timezone(&timestamp_array, &tz_str)?;
-        Ok(ColumnarValue::Array(result))
+        let tz_str = extract_scalar_string(tz, "Timezone")?;
+        Ok(ColumnarValue::Array(convert_timezone(&as_array(ts)?, &tz_str)?))
     }
 }
 
-/// Convert timestamps to a different timezone
-/// This adjusts the timestamp so that when formatted as UTC, it displays the local time
+/// Convert timestamps to a different timezone: shift each value by the target
+/// zone's UTC offset so that rendering it as UTC displays the local time.
 fn convert_timezone(timestamp_array: &ArrayRef, tz_str: &str) -> datafusion::error::Result<ArrayRef> {
     use chrono::Offset;
-
-    // Parse timezone
-    let tz: Tz = tz_str.parse().map_err(|_| DataFusionError::Execution(format!("Invalid timezone: {}", tz_str)))?;
-
-    // Handle microsecond timestamps (which is what we're using)
-    if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        let mut builder = TimestampMicrosecondArray::builder(timestamps.len());
-
-        for i in 0..timestamps.len() {
-            if timestamps.is_null(i) {
-                builder.append_null();
-            } else {
-                let timestamp_us = timestamps.value(i);
-                let datetime =
-                    DateTime::<Utc>::from_timestamp_micros(timestamp_us).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))?;
-
-                // Get the local time in target timezone
-                let local_time = datetime.with_timezone(&tz);
-                // Get the offset from UTC in seconds
-                let offset_secs = local_time.offset().fix().local_minus_utc() as i64;
-                // Adjust the timestamp so that when formatted as UTC, it shows local time
-                let adjusted_us = timestamp_us + (offset_secs * 1_000_000);
-                builder.append_value(adjusted_us);
-            }
-        }
-
-        Ok(Arc::new(builder.finish()))
-    } else if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        let mut builder = TimestampNanosecondArray::builder(timestamps.len());
-
-        for i in 0..timestamps.len() {
-            if timestamps.is_null(i) {
-                builder.append_null();
-            } else {
-                let timestamp_ns = timestamps.value(i);
-                let datetime = DateTime::<Utc>::from_timestamp_nanos(timestamp_ns);
-
-                // Get the local time in target timezone
-                let local_time = datetime.with_timezone(&tz);
-                // Get the offset from UTC in seconds
-                let offset_secs = local_time.offset().fix().local_minus_utc() as i64;
-                // Adjust the timestamp so that when formatted as UTC, it shows local time
-                let adjusted_ns = timestamp_ns + (offset_secs * 1_000_000_000);
-                builder.append_value(adjusted_ns);
-            }
-        }
-
-        Ok(Arc::new(builder.finish()))
-    } else {
-        Err(DataFusionError::Execution("First argument must be a timestamp".to_string()))
-    }
+    let tz: Tz = tz_str.parse().map_err(|_| DataFusionError::Execution(format!("Invalid timezone: {tz_str}")))?;
+    // `per_sec` is the array's ticks-per-second, so the same shift works for µs and ns.
+    map_timestamps(timestamp_array, None, "First argument", |v, per_sec| {
+        let dt =
+            DateTime::<Utc>::from_timestamp_micros(v / (per_sec / 1_000_000)).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))?;
+        Ok(v + dt.with_timezone(&tz).offset().fix().local_minus_utc() as i64 * per_sec)
+    })
 }
 
-/// Create the jsonb_array_elements UDF to unnest JSON arrays
+/// `jsonb_array_elements` placeholder: unnesting a JSON array into rows needs
+/// DataFusion table-function support, so the UDF exists only to give callers a
+/// clear "not implemented" instead of "unknown function".
 fn create_jsonb_array_elements_udf() -> ScalarUDF {
-    // Note: This is a placeholder implementation
-    // A full implementation would require table function support in DataFusion
-    // For now, we'll create a function that extracts array elements as a string
-    let jsonb_array_elements_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-        if args.len() != 1 {
-            return Err(DataFusionError::Execution("jsonb_array_elements requires exactly 1 argument".to_string()));
-        }
-
-        // For now, return a not implemented error
-        // A proper implementation would require table function support
-        not_impl_err!("jsonb_array_elements is not yet fully implemented - requires table function support")
-    });
-
-    create_udf("jsonb_array_elements", vec![DataType::Utf8View], DataType::Utf8View, Volatility::Immutable, jsonb_array_elements_fn)
+    let stub: ScalarFunctionImplementation =
+        Arc::new(move |_: &[ColumnarValue]| not_impl_err!("jsonb_array_elements is not yet fully implemented - requires table function support"));
+    create_udf("jsonb_array_elements", vec![DataType::Utf8View], DataType::Utf8View, Volatility::Immutable, stub)
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
-    aliases: Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
-        Self { signature: Signature::variadic_any(Volatility::Immutable), aliases: vec![] }
+        Self { signature: Signature::variadic_any(Volatility::Immutable) }
     }
 }
 
 impl ScalarUDFImpl for JsonBuildArrayUDF {
     scalar_udf_boilerplate!("json_build_array");
-
-    fn aliases(&self) -> &[String] {
-        &self.aliases
-    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -971,75 +857,50 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
         // Convert each argument column ONCE up front. Converting inside the
         // row loop is O(rows² × args) — observed as ~0.6ms/row × millions of
         // rows, enough to OOM prod on a wide-window span-list query.
-        let cols = args
-            .iter()
-            .map(|arg| match arg {
-                ColumnarValue::Array(array) => array_to_json_values(array),
-                ColumnarValue::Scalar(scalar) => array_to_json_values(&scalar.to_array()?),
-            })
-            .collect::<datafusion::error::Result<Vec<_>>>()?;
+        let cols = args.iter().map(|arg| array_to_json_values(&as_array(arg)?)).collect::<datafusion::error::Result<Vec<_>>>()?;
 
-        let mut builder = StringViewBuilder::with_capacity(num_rows);
-        for row_idx in 0..num_rows {
+        let out = StringViewArray::from_iter_values((0..num_rows).map(|row_idx| {
             // len-1 columns are broadcast scalars
-            let row = cols.iter().map(|c| c[if c.len() == 1 { 0 } else { row_idx }].clone()).collect();
-            builder.append_value(JsonValue::Array(row).to_string());
-        }
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+            let row: Vec<JsonValue> = cols.iter().map(|c| c[if c.len() == 1 { 0 } else { row_idx }].clone()).collect();
+            JsonValue::Array(row).to_string()
+        }));
+        Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
-    aliases: Vec<String>,
 }
 
 impl ToJsonUDF {
     fn new() -> Self {
-        Self { signature: Signature::any(1, Volatility::Immutable), aliases: vec![] }
+        Self { signature: Signature::any(1, Volatility::Immutable) }
     }
 }
 
 impl ScalarUDFImpl for ToJsonUDF {
     scalar_udf_boilerplate!("to_json");
 
-    fn aliases(&self) -> &[String] {
-        &self.aliases
-    }
-
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let args = args.args;
-        if args.len() != 1 {
+        let [arg] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("to_json requires exactly 1 argument".to_string()));
-        }
-
-        let array = match &args[0] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
         };
-
-        let json_values = array_to_json_values(&array)?;
-        let mut builder = StringViewBuilder::with_capacity(json_values.len());
-
-        for value in json_values {
-            builder.append_value(value.to_string());
-        }
-
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        let out = StringViewArray::from_iter_values(array_to_json_values(&as_array(arg)?)?.iter().map(JsonValue::to_string));
+        Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
 
 // JSONB-tagged wrappers around the JSON UDFs. Output stays Utf8View, but the
 // returned Field carries `tf.pg_type = jsonb` so the patched vendor/arrow-pg
 // surfaces PG OID 3802 and prepends the 0x01 binary jsonb version byte.
-fn jsonb_tagged_field(data_type: DataType) -> Arc<datafusion::arrow::datatypes::Field> {
+fn jsonb_tagged_field() -> FieldRef {
     let meta = [("tf.pg_type".to_string(), "jsonb".to_string())].into_iter().collect();
-    Arc::new(datafusion::arrow::datatypes::Field::new("", data_type, true).with_metadata(meta))
+    Arc::new(Field::new("", DataType::Utf8View, true).with_metadata(meta))
 }
 
 macro_rules! jsonb_wrapper {
@@ -1063,10 +924,8 @@ macro_rules! jsonb_wrapper {
             fn return_type(&self, a: &[DataType]) -> datafusion::error::Result<DataType> {
                 self.inner.return_type(a)
             }
-            fn return_field_from_args(
-                &self, _: datafusion::logical_expr::ReturnFieldArgs,
-            ) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
-                Ok(jsonb_tagged_field(DataType::Utf8View))
+            fn return_field_from_args(&self, _: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
+                Ok(jsonb_tagged_field())
             }
             fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
                 self.inner.invoke_with_args(args)
@@ -1096,60 +955,23 @@ impl ScalarUDFImpl for ExtractEpochUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let args = args.args;
-        if args.len() != 1 {
+        let [arg] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("extract_epoch requires exactly 1 argument".to_string()));
-        }
-
-        let array = match &args[0] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
         };
-
-        let result = if let Some(timestamps) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-            let mut builder = Float64Array::builder(timestamps.len());
-            for i in 0..timestamps.len() {
-                if timestamps.is_null(i) {
-                    builder.append_null();
-                } else {
-                    let timestamp_us = timestamps.value(i);
-                    let epoch_seconds = timestamp_us as f64 / 1_000_000.0;
-                    builder.append_value(epoch_seconds);
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        } else if let Some(timestamps) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-            let mut builder = Float64Array::builder(timestamps.len());
-            for i in 0..timestamps.len() {
-                if timestamps.is_null(i) {
-                    builder.append_null();
-                } else {
-                    let timestamp_ns = timestamps.value(i);
-                    let epoch_seconds = timestamp_ns as f64 / 1_000_000_000.0;
-                    builder.append_value(epoch_seconds);
-                }
-            }
-            Arc::new(builder.finish()) as ArrayRef
-        } else {
-            return Err(DataFusionError::Execution("extract_epoch requires a timestamp argument".to_string()));
-        };
-
-        Ok(ColumnarValue::Array(result))
+        let array = as_array(arg)?;
+        // Divide in the array's own unit so nanosecond inputs keep sub-µs precision.
+        let (ticks, per_sec) = timestamp_ticks(&array, "extract_epoch argument")?;
+        let secs: Float64Array = ticks.map(|v| v.map(|t| t as f64 / per_sec as f64)).collect();
+        Ok(ColumnarValue::Array(Arc::new(secs)))
     }
 }
 
-/// Downcast `array` to a primitive Arrow array and push each element into
-/// `values` as `json!(value)`, mapping nulls to `JsonValue::Null`.
-macro_rules! push_json_primitive {
-    ($array:expr, $values:expr, $ty:ty, $tyname:literal) => {{
-        let arr = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| DataFusionError::Execution(concat!("Failed to downcast to ", $tyname).to_string()))?;
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                $values.push(JsonValue::Null);
-            } else {
-                $values.push(json!(arr.value(i)));
-            }
-        }
+/// Downcast `array` to a primitive Arrow array and map each element to
+/// `json!(value)`, nulls to `JsonValue::Null`.
+macro_rules! json_primitives {
+    ($array:expr, $ty:ty) => {{
+        let arr = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| DataFusionError::Execution(format!("Failed to downcast to {}", stringify!($ty))))?;
+        arr.iter().map(|v| v.map_or(JsonValue::Null, |x| json!(x))).collect()
     }};
 }
 
@@ -1163,112 +985,68 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
 /// (attributes, events, links) need it — while list elements must stay JSON
 /// strings (`to_jsonb(text[])`), so list recursion always passes `false`.
 fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
-    let mut values = Vec::with_capacity(array.len());
-
-    match array.data_type() {
+    Ok(match array.data_type() {
         DataType::Utf8View => {
-            let string_array = array
+            let strs = array
                 .as_any()
                 .downcast_ref::<StringViewArray>()
                 .ok_or_else(|| DataFusionError::Execution("Failed to downcast to StringViewArray".to_string()))?;
-            for i in 0..string_array.len() {
-                if string_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    let s = string_array.value(i);
-                    // Sniff JSON only at the top level: Variant/Utf8 columns holding JSON
-                    // (attributes, events) must surface as real JSON. Inside List(Utf8)
-                    // (e.g. summary text[]) PG keeps elements as JSON *strings*.
-                    let val = if sniff_json && ((s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))) {
-                        serde_json::from_str(s).unwrap_or_else(|_| JsonValue::String(s.to_string()))
-                    } else {
-                        JsonValue::String(s.to_string())
-                    };
-                    values.push(val);
-                }
-            }
+            // Sniff JSON only at the top level: Variant/Utf8 columns holding JSON
+            // (attributes, events) must surface as real JSON. Inside List(Utf8)
+            // (e.g. summary text[]) PG keeps elements as JSON *strings*.
+            let looks_json = |s: &str| (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'));
+            strs.iter()
+                .map(|v| match v {
+                    None => JsonValue::Null,
+                    Some(s) if sniff_json && looks_json(s) => serde_json::from_str(s).unwrap_or_else(|_| JsonValue::String(s.to_string())),
+                    Some(s) => JsonValue::String(s.to_string()),
+                })
+                .collect()
         }
-        DataType::Int64 => push_json_primitive!(array, values, Int64Array, "Int64Array"),
-        DataType::Float64 => push_json_primitive!(array, values, Float64Array, "Float64Array"),
-        DataType::Boolean => push_json_primitive!(array, values, BooleanArray, "BooleanArray"),
+        DataType::Int64 => json_primitives!(array, Int64Array),
+        DataType::Float64 => json_primitives!(array, Float64Array),
+        DataType::Boolean => json_primitives!(array, BooleanArray),
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let timestamp_array = array
+            let ts = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| DataFusionError::Execution("Failed to downcast to TimestampMicrosecondArray".to_string()))?;
-            for i in 0..timestamp_array.len() {
-                if timestamp_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    let timestamp_us = timestamp_array.value(i);
-                    let datetime =
-                        DateTime::<Utc>::from_timestamp_micros(timestamp_us).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))?;
-                    values.push(JsonValue::String(datetime.to_rfc3339()));
-                }
-            }
+            ts.iter()
+                .map(|v| match v {
+                    None => Ok(JsonValue::Null),
+                    Some(us) => DateTime::<Utc>::from_timestamp_micros(us)
+                        .map(|dt| JsonValue::String(dt.to_rfc3339()))
+                        .ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string())),
+                })
+                .collect::<datafusion::error::Result<_>>()?
         }
-        DataType::List(_) => push_list_json::<i32>(array, &mut values)?,
-        DataType::LargeList(_) => push_list_json::<i64>(array, &mut values)?,
-        DataType::FixedSizeList(field, _) => {
-            let as_list = datafusion::arrow::compute::cast(array, &DataType::List(field.clone()))?;
-            push_list_json::<i32>(&as_list, &mut values)?
-        }
-        _ => {
-            // For other types, try to convert to string
-            let string_array = datafusion::arrow::compute::cast(array, &DataType::Utf8View)?;
-            return array_to_json_values_inner(&string_array, sniff_json);
-        }
-    }
-
-    Ok(values)
+        DataType::List(_) => list_to_json_values::<i32>(array)?,
+        DataType::LargeList(_) => list_to_json_values::<i64>(array)?,
+        DataType::FixedSizeList(field, _) => list_to_json_values::<i32>(&datafusion::arrow::compute::cast(array, &DataType::List(field.clone()))?)?,
+        // Anything else: render through its string form.
+        _ => return array_to_json_values_inner(&datafusion::arrow::compute::cast(array, &DataType::Utf8View)?, sniff_json),
+    })
 }
 
-fn push_list_json<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef, values: &mut Vec<JsonValue>) -> datafusion::error::Result<()> {
+fn list_to_json_values<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
     let list_array = array
         .as_any()
         .downcast_ref::<datafusion::arrow::array::GenericListArray<O>>()
         .ok_or_else(|| DataFusionError::Execution("Failed to downcast to list array".to_string()))?;
-    for i in 0..list_array.len() {
-        if list_array.is_null(i) {
-            values.push(JsonValue::Null);
-        } else {
-            // Always sniff_json=false: PG's to_jsonb(text[]) keeps elements as JSON strings.
-            values.push(JsonValue::Array(array_to_json_values_inner(&list_array.value(i), false)?));
-        }
-    }
-    Ok(())
+    // Always sniff_json=false: PG's to_jsonb(text[]) keeps elements as JSON strings.
+    (0..list_array.len())
+        .map(|i| if list_array.is_null(i) { Ok(JsonValue::Null) } else { array_to_json_values_inner(&list_array.value(i), false).map(JsonValue::Array) })
+        .collect()
 }
 
 /// Create the time_bucket UDF for time-series bucketing (similar to TimescaleDB)
 fn create_time_bucket_udf() -> ScalarUDF {
     let time_bucket_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-        if args.len() != 2 {
+        let [interval, ts] = args else {
             return Err(DataFusionError::Execution("time_bucket requires exactly 2 arguments: interval and timestamp".to_string()));
-        }
-
-        // Extract interval string
-        let interval_str = match &args[0] {
-            ColumnarValue::Scalar(scalar) => {
-                extract_utf8_string(scalar).ok_or_else(|| DataFusionError::Execution("Interval must be a UTF8 string".to_string()))?
-            }
-            ColumnarValue::Array(_) => {
-                return Err(DataFusionError::Execution("Interval must be a scalar value".to_string()));
-            }
         };
-
-        // Parse the interval to get bucket size in microseconds
-        let bucket_size_micros = parse_interval_to_micros(&interval_str)?;
-
-        // Extract timestamp array
-        let timestamp_array = match &args[1] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
-        };
-
-        // Bucket the timestamps
-        let result = bucket_timestamps(&timestamp_array, bucket_size_micros)?;
-
-        Ok(ColumnarValue::Array(result))
+        let bucket_size_micros = parse_interval_to_micros(&extract_scalar_string(interval, "Interval")?)?;
+        Ok(ColumnarValue::Array(bucket_timestamps(&as_array(ts)?, bucket_size_micros)?))
     });
 
     create_udf(
@@ -1282,82 +1060,36 @@ fn create_time_bucket_udf() -> ScalarUDF {
 
 /// Parse interval string to microseconds
 fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64> {
-    let trimmed = interval_str.trim();
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-    let (value, unit) = match parts.as_slice() {
-        [value_str, unit_str] => {
-            let value = value_str.parse::<i64>().map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
-            (value, unit_str.to_lowercase())
-        }
-        [combined] => {
-            let split_pos = combined
-                .chars()
-                .position(|c| c.is_alphabetic())
-                .ok_or_else(|| DataFusionError::Execution("Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string()))?;
-
-            let (num_str, unit_str) = combined.split_at(split_pos);
-            let value = num_str.parse::<i64>().map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
-            (value, unit_str.to_lowercase())
-        }
-        _ => {
-            return Err(DataFusionError::Execution("Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string()));
-        }
+    let bad_format = || DataFusionError::Execution("Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string());
+    let parts: Vec<&str> = interval_str.split_whitespace().collect();
+    let (num_str, unit_str) = match *parts.as_slice() {
+        [value, unit] => (value, unit),
+        // `find` yields a byte index, so `split_at` stays on a char boundary.
+        [combined] => combined.split_at(combined.find(char::is_alphabetic).ok_or_else(bad_format)?),
+        _ => return Err(bad_format()),
     };
 
-    let micros_per_unit = match unit.as_str() {
+    let value = num_str.parse::<i64>().map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
+    let micros_per_unit = match unit_str.to_lowercase().as_str() {
         "second" | "seconds" | "sec" | "secs" | "s" => 1_000_000,
         "minute" | "minutes" | "min" | "mins" | "m" => 60_000_000,
         "hour" | "hours" | "hr" | "hrs" | "h" => 3_600_000_000,
         "day" | "days" | "d" => 86_400_000_000,
         "week" | "weeks" | "w" => 604_800_000_000,
-        _ => {
-            return Err(DataFusionError::Execution(format!(
-                "Unsupported time unit: {}. Supported units: second(s), minute(s), hour(s), day(s), week(s)",
-                unit
-            )));
+        unit => {
+            return Err(DataFusionError::Execution(format!("Unsupported time unit: {unit}. Supported units: second(s), minute(s), hour(s), day(s), week(s)")));
         }
     };
-
-    Ok(value * micros_per_unit)
+    value.checked_mul(micros_per_unit).ok_or_else(|| DataFusionError::Execution(format!("Interval '{interval_str}' overflows")))
 }
 
 /// Bucket timestamps to the nearest bucket boundary
 fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> datafusion::error::Result<ArrayRef> {
-    if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        let mut builder = TimestampMicrosecondArray::builder(timestamps.len()).with_timezone("UTC");
-
-        for i in 0..timestamps.len() {
-            if timestamps.is_null(i) {
-                builder.append_null();
-            } else {
-                let timestamp_us = timestamps.value(i);
-                // Calculate the bucket: floor(timestamp / bucket_size) * bucket_size
-                let bucket = (timestamp_us / bucket_size_micros) * bucket_size_micros;
-                builder.append_value(bucket);
-            }
-        }
-
-        Ok(Arc::new(builder.finish()))
-    } else if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        let mut builder = TimestampNanosecondArray::builder(timestamps.len()).with_timezone("UTC");
-        let bucket_size_nanos = bucket_size_micros * 1000;
-
-        for i in 0..timestamps.len() {
-            if timestamps.is_null(i) {
-                builder.append_null();
-            } else {
-                let timestamp_ns = timestamps.value(i);
-                // Calculate the bucket: floor(timestamp / bucket_size) * bucket_size
-                let bucket = (timestamp_ns / bucket_size_nanos) * bucket_size_nanos;
-                builder.append_value(bucket);
-            }
-        }
-
-        Ok(Arc::new(builder.finish()))
-    } else {
-        Err(DataFusionError::Execution("Argument must be a timestamp".to_string()))
-    }
+    // floor(timestamp / bucket_size) * bucket_size, in the array's own unit.
+    map_timestamps(timestamp_array, Some("UTC"), "Argument", |v, per_sec| {
+        let size = bucket_size_micros * (per_sec / 1_000_000);
+        Ok((v / size) * size)
+    })
 }
 
 /// Create the percentile_agg UDAF for building t-digest summaries
@@ -1367,70 +1099,67 @@ fn create_percentile_agg_udaf() -> AggregateUDF {
         vec![DataType::Float64],
         Arc::new(DataType::Binary),
         Volatility::Immutable,
-        Arc::new(|_| Ok(Box::new(PercentileAccumulator::new()))),
+        Arc::new(|_| Ok(Box::<PercentileAccumulator>::default())),
         Arc::new(vec![DataType::Binary]), // State type should match return type
     )
 }
 
+const TDIGEST_MAX_CENTROIDS: usize = 200;
+
 /// Wrapper for the bounded, mergeable t-digest state exchanged between partial
 /// and final aggregates. Its binary representation contains centroids, never
 /// the raw input values.
-const TDIGEST_MAX_CENTROIDS: usize = 200;
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 struct TDigestWrapper {
     digest: Option<TDigest>,
 }
 
 impl TDigestWrapper {
-    fn new() -> Self {
-        Self { digest: None }
-    }
-
-    fn insert_batch(&mut self, mut values: Vec<f64>) {
-        values.retain(|value| value.is_finite());
+    fn insert_batch(&mut self, values: impl IntoIterator<Item = f64>) {
+        let values: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
         if values.is_empty() {
             return;
         }
         let mut digest = TDigest::from_values(values);
         digest.compress(TDIGEST_MAX_CENTROIDS);
-        self.merge_digest(digest);
+        self.merge_digest(&digest);
     }
 
     fn merge(&mut self, other: &TDigestWrapper) {
-        if let Some(digest) = other.digest.clone() {
+        if let Some(digest) = &other.digest {
             self.merge_digest(digest);
         }
     }
 
-    fn merge_digest(&mut self, digest: TDigest) {
-        let mut digest = match self.digest.take() {
-            Some(current) => current.merge(&digest),
-            None => digest,
-        };
-        digest.compress(TDIGEST_MAX_CENTROIDS);
-        self.digest = Some(digest);
+    fn merge_digest(&mut self, digest: &TDigest) {
+        // Only clones when this wrapper is still empty.
+        let mut merged = self.digest.as_ref().map_or_else(|| digest.clone(), |current| current.merge(digest));
+        merged.compress(TDIGEST_MAX_CENTROIDS);
+        self.digest = Some(merged);
     }
 
     fn to_digest(&self) -> Option<TDigest> {
         self.digest.clone()
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
-        let centroids: Vec<(f64, f64)> =
-            self.digest.as_ref().map(|digest| digest.centroids().iter().map(|centroid| (centroid.mean, centroid.weight)).collect()).unwrap_or_default();
-        bincode::encode_to_vec(centroids, bincode::config::standard()).unwrap_or_default()
+    fn to_bytes(&self) -> datafusion::error::Result<Vec<u8>> {
+        let centroids: Vec<(f64, f64)> = self.digest.iter().flat_map(|d| d.centroids().iter().map(|c| (c.mean, c.weight))).collect();
+        // Never swallow the encode failure: an empty payload would silently become an
+        // empty digest downstream and skew every percentile.
+        bincode::encode_to_vec(centroids, bincode::config::standard()).map_err(|e| DataFusionError::Execution(format!("Failed to serialize t-digest: {e}")))
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let centroids: Vec<(f64, f64)> = bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|e| format!("Failed to deserialize: {e}"))?.0;
+    fn from_bytes(bytes: &[u8]) -> datafusion::error::Result<Self> {
+        let centroids: Vec<(f64, f64)> = bincode::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| DataFusionError::Execution(format!("Failed to deserialize t-digest: {e}")))?
+            .0;
         let centroids: Vec<tdigests::Centroid> = centroids
             .into_iter()
             .filter(|(mean, weight)| mean.is_finite() && *weight > 0.0)
             .map(|(mean, weight)| tdigests::Centroid::new(mean, weight))
             .collect();
         if centroids.is_empty() {
-            return Ok(Self::new());
+            return Ok(Self::default());
         }
         let mut digest = TDigest::from_centroids(centroids);
         digest.compress(TDIGEST_MAX_CENTROIDS);
@@ -1443,35 +1172,22 @@ impl TDigestWrapper {
 }
 
 /// Accumulator for percentile_agg that builds a t-digest
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PercentileAccumulator {
     digest: TDigestWrapper,
 }
 
-impl PercentileAccumulator {
-    fn new() -> Self {
-        Self { digest: TDigestWrapper::new() }
-    }
-}
-
 impl Accumulator for PercentileAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::error::Result<()> {
-        if values.is_empty() {
-            return Ok(());
-        }
-
-        let array = &values[0];
-        let float_array =
+        let Some(array) = values.first() else { return Ok(()) };
+        let floats =
             array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| DataFusionError::Execution("percentile_agg expects Float64 values".to_string()))?;
-
-        self.digest.insert_batch((0..float_array.len()).filter(|&i| !float_array.is_null(i)).map(|i| float_array.value(i)).collect());
+        self.digest.insert_batch(floats.iter().flatten());
         Ok(())
     }
 
     fn evaluate(&mut self) -> datafusion::error::Result<ScalarValue> {
-        // Serialize the t-digest wrapper to binary
-        let bytes = self.digest.to_bytes();
-        Ok(ScalarValue::Binary(Some(bytes)))
+        Ok(ScalarValue::Binary(Some(self.digest.to_bytes()?)))
     }
 
     fn size(&self) -> usize {
@@ -1479,39 +1195,20 @@ impl Accumulator for PercentileAccumulator {
     }
 
     fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
-        // Return the serialized state
         self.evaluate().map(|v| vec![v])
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
-        if states.is_empty() {
-            return Ok(());
-        }
-
-        let array = &states[0];
-        let binary_array =
-            array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("Expected binary array for merge".to_string()))?;
-
-        for i in 0..binary_array.len() {
-            if !binary_array.is_null(i) {
-                let bytes = binary_array.value(i);
-                let other_digest = TDigestWrapper::from_bytes(bytes).map_err(DataFusionError::Execution)?;
-
-                self.digest.merge(&other_digest);
-            }
-        }
-
-        Ok(())
+        let Some(array) = states.first() else { return Ok(()) };
+        let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("Expected binary array for merge".to_string()))?;
+        binary.iter().flatten().try_for_each(|bytes| {
+            self.digest.merge(&TDigestWrapper::from_bytes(bytes)?);
+            Ok(())
+        })
     }
 }
 
-/// Create the approx_percentile UDF for extracting percentiles from t-digest
-fn create_approx_percentile_udf() -> ScalarUDF {
-    let udf = ApproxPercentileUDF::new();
-    ScalarUDF::new_from_impl(udf)
-}
-
-/// UDF implementation for approx_percentile
+/// UDF implementation for approx_percentile: extracts a percentile from a t-digest.
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ApproxPercentileUDF {
     signature: Signature,
@@ -1531,68 +1228,41 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        if args.args.len() != 2 {
+        let [pct_arg, digest_arg] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("approx_percentile requires exactly 2 arguments: percentile and t-digest".to_string()));
-        }
-
-        // Determine the result size based on the digest array (which comes from GROUP BY)
-        let digest_size = match &args.args[1] {
+        };
+        // Result size follows the digest column (which comes from GROUP BY).
+        let num_rows = match digest_arg {
             ColumnarValue::Array(array) => array.len(),
             ColumnarValue::Scalar(_) => 1,
         };
+        let percentile_array = pct_arg.to_array(num_rows)?;
+        let digest_array = digest_arg.to_array(num_rows)?;
 
-        let percentile_array = match &args.args[0] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(digest_size)?,
-        };
-
-        let digest_array = match &args.args[1] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(digest_size)?,
-        };
-
-        let percentile_values = percentile_array
+        let percentiles = percentile_array
             .as_any()
             .downcast_ref::<Float64Array>()
             .ok_or_else(|| DataFusionError::Execution("First argument must be a percentile (Float64)".to_string()))?;
-
-        let digest_values = digest_array
+        let digests = digest_array
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| DataFusionError::Execution("Second argument must be a t-digest (Binary)".to_string()))?;
 
-        // Ensure we process the correct number of rows
-        let num_rows = digest_array.len();
-        let mut builder = Float64Array::builder(num_rows);
-
-        for i in 0..num_rows {
-            if percentile_values.is_null(i) || digest_values.is_null(i) {
-                builder.append_null();
-            } else {
-                let percentile = percentile_values.value(i);
-
-                // Validate percentile is between 0 and 1
-                if !(0.0..=1.0).contains(&percentile) {
-                    return Err(DataFusionError::Execution(format!("Percentile must be between 0 and 1, got {}", percentile)));
-                }
-
-                let digest_bytes = digest_values.value(i);
-                let wrapper = TDigestWrapper::from_bytes(digest_bytes).map_err(DataFusionError::Execution)?;
-
-                match wrapper.to_digest() {
-                    Some(digest) => {
-                        let value = digest.estimate_quantile(percentile);
-                        builder.append_value(value);
+        // None → SQL NULL (null input, or a digest that saw no values).
+        let out: Float64Array = percentiles
+            .iter()
+            .zip(digests.iter())
+            .map(|(pct, bytes)| match (pct, bytes) {
+                (Some(pct), Some(bytes)) => {
+                    if !(0.0..=1.0).contains(&pct) {
+                        return Err(DataFusionError::Execution(format!("Percentile must be between 0 and 1, got {pct}")));
                     }
-                    None => {
-                        // No values in the digest, return NULL
-                        builder.append_null();
-                    }
+                    Ok(TDigestWrapper::from_bytes(bytes)?.to_digest().map(|d| d.estimate_quantile(pct)))
                 }
-            }
-        }
-
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+                _ => Ok(None),
+            })
+            .collect::<datafusion::error::Result<_>>()?;
+        Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
 
@@ -1622,34 +1292,22 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        if args.args.len() != 2 {
+        let [json, path] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("jsonb_path_exists requires exactly 2 arguments: json/variant and jsonpath".to_string()));
-        }
-
-        let json_array = match &args.args[0] {
-            ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
         };
-
-        let path_str = match &args.args[1] {
+        let json_array = as_array(json)?;
+        let path_str = match path {
             ColumnarValue::Scalar(scalar) => extract_utf8_string(scalar).ok_or_else(|| DataFusionError::Execution("JSONPath must be a string".to_string()))?,
-            ColumnarValue::Array(_) => {
-                return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string()));
-            }
+            ColumnarValue::Array(_) => return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string())),
         };
 
-        // Parse the JSONPath expression (PG SQL/JSON-path dialect)
-        let json_path = sql_json_path::JsonPath::new(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {}", e)))?;
-
-        // Process based on input type
+        // PG SQL/JSON-path dialect.
+        let json_path = sql_json_path::JsonPath::new(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {e}")))?;
         let result = if is_variant_type(json_array.data_type()) {
-            // Handle Variant struct type
             evaluate_jsonpath_on_variant(&json_array, &json_path, &path_str)?
         } else {
-            // Handle JSON string type
             evaluate_jsonpath_on_json_string(&json_array, &json_path)?
         };
-
         Ok(ColumnarValue::Array(result))
     }
 }
@@ -1662,7 +1320,7 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Re
     use parquet_variant::Variant;
 
     if depth > MAX_VARIANT_DEPTH {
-        return Err(DataFusionError::Execution(format!("Variant nesting depth exceeds limit of {}", MAX_VARIANT_DEPTH)));
+        return Err(DataFusionError::Execution(format!("Variant nesting depth exceeds limit of {MAX_VARIANT_DEPTH}")));
     }
 
     Ok(match variant {
@@ -1688,17 +1346,10 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Re
         Variant::Binary(bytes) => json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
         Variant::String(s) => JsonValue::String(s.to_string()),
         Variant::ShortString(s) => JsonValue::String(s.to_string()),
-        Variant::Object(obj) => {
-            let mut map = serde_json::Map::new();
-            for (key, value) in obj.iter() {
-                map.insert(key.to_string(), variant_to_serde_json(&value, depth + 1)?);
-            }
-            JsonValue::Object(map)
-        }
-        Variant::List(list) => {
-            let items: Vec<JsonValue> = list.iter().map(|v| variant_to_serde_json(&v, depth + 1)).collect::<Result<_, _>>()?;
-            JsonValue::Array(items)
-        }
+        Variant::Object(obj) => JsonValue::Object(
+            obj.iter().map(|(key, value)| Ok((key.to_string(), variant_to_serde_json(&value, depth + 1)?))).collect::<Result<_, DataFusionError>>()?,
+        ),
+        Variant::List(list) => JsonValue::Array(list.iter().map(|v| variant_to_serde_json(&v, depth + 1)).collect::<Result<_, _>>()?),
     })
 }
 
@@ -1706,15 +1357,15 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Re
 /// Delta-rs/Parquet may yield either representation depending on
 /// `schema_force_view_types`, so variant decoding handles both transparently.
 enum BinaryAccessor<'a> {
-    Binary(&'a datafusion::arrow::array::BinaryArray),
-    View(&'a datafusion::arrow::array::BinaryViewArray),
+    Binary(&'a BinaryArray),
+    View(&'a BinaryViewArray),
 }
 
 impl<'a> BinaryAccessor<'a> {
     fn try_new(col: &'a ArrayRef, field: &str) -> datafusion::error::Result<Self> {
-        if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::BinaryArray>() {
+        if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
             Ok(Self::Binary(a))
-        } else if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::BinaryViewArray>() {
+        } else if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
             Ok(Self::View(a))
         } else {
             Err(DataFusionError::Execution(format!("Variant {field} column is not Binary or BinaryView (got {:?})", col.data_type())))
@@ -1751,15 +1402,8 @@ fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &sql_json_path::Jso
         // A NULL input row → NULL (SQL semantics, matches the fallback path and PG);
         // a present row → path exists ↔ extracted is non-null. `extracted.is_null(i)`
         // alone can't tell the two apart, so gate on the input's null buffer.
-        let mut builder = BooleanArray::builder(extracted.len());
-        for i in 0..extracted.len() {
-            if array.is_null(i) {
-                builder.append_null();
-            } else {
-                builder.append_value(!extracted.is_null(i));
-            }
-        }
-        return Ok(Arc::new(builder.finish()));
+        let out: BooleanArray = (0..extracted.len()).map(|i| (!array.is_null(i)).then(|| !extracted.is_null(i))).collect();
+        return Ok(Arc::new(out));
     }
 
     // Fallback: complex JSONPath (filters, recursive descent, etc.) — walk the
@@ -1781,18 +1425,18 @@ fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &sql_json_path::Jso
     let value_col = struct_array.column_by_name("value").ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
     let metadata_binary = BinaryAccessor::try_new(metadata_col, "metadata")?;
     let value_binary = BinaryAccessor::try_new(value_col, "value")?;
-    let mut builder = BooleanArray::builder(struct_array.len());
-    for i in 0..struct_array.len() {
-        if struct_array.is_null(i) {
-            builder.append_null();
-            continue;
-        }
-        let variant = Variant::new(metadata_binary.value(i), value_binary.value(i));
-        let json_value = variant_to_serde_json(&variant, 0)?;
-        // Lax mode (PG default): a data-dependent eval error is an empty match, not a query failure.
-        builder.append_value(json_path.exists(&json_value).unwrap_or(false));
-    }
-    Ok(Arc::new(builder.finish()))
+    // Lax mode (PG default): a data-dependent eval error is an empty match, not a query failure.
+    let out: BooleanArray = (0..struct_array.len())
+        .map(|i| {
+            if struct_array.is_null(i) {
+                Ok(None)
+            } else {
+                variant_to_serde_json(&Variant::new(metadata_binary.value(i), value_binary.value(i)), 0)
+                    .map(|json| Some(json_path.exists(&json).unwrap_or(false)))
+            }
+        })
+        .collect::<datafusion::error::Result<_>>()?;
+    Ok(Arc::new(out))
 }
 
 /// Convert a simple JSONPath (`$.a.b[0].c`) to a `parquet_variant::VariantPath`.
@@ -1863,20 +1507,20 @@ mod tests {
 
     #[test]
     fn percentile_agg_state_is_bounded() {
-        let mut digest = TDigestWrapper::new();
-        digest.insert_batch((0..100_000).map(|value| value as f64).collect());
-        assert!(digest.to_bytes().len() < 10_000, "percentile state must not grow with input rows");
+        let mut digest = TDigestWrapper::default();
+        digest.insert_batch((0..100_000).map(|value| value as f64));
+        assert!(digest.to_bytes().unwrap().len() < 10_000, "percentile state must not grow with input rows");
     }
 
     #[test]
     fn percentile_agg_merge_preserves_tail_estimate() {
-        let mut left = TDigestWrapper::new();
-        let mut right = TDigestWrapper::new();
-        left.insert_batch((0..50_000).map(|value| value as f64).collect());
-        right.insert_batch((50_000..100_000).map(|value| value as f64).collect());
+        let mut left = TDigestWrapper::default();
+        let mut right = TDigestWrapper::default();
+        left.insert_batch((0..50_000).map(|value| value as f64));
+        right.insert_batch((50_000..100_000).map(|value| value as f64));
         left.merge(&right);
 
-        assert!(left.to_bytes().len() < 10_000);
+        assert!(left.to_bytes().unwrap().len() < 10_000);
         assert!((left.to_digest().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0);
     }
 
@@ -2024,7 +1668,7 @@ mod tests {
             args: vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
             arg_fields: vec![],
             number_rows: n,
-            return_field: Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
+            return_field: Arc::new(Field::new("", DataType::Utf8View, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
         let start = std::time::Instant::now();
@@ -2037,51 +1681,46 @@ mod tests {
 
     #[test]
     fn test_empty_tdigest_wrapper() {
-        // Test that empty TDigestWrapper doesn't panic
-        let wrapper = TDigestWrapper::new();
-        assert!(wrapper.to_digest().is_none());
-
-        // Test with values
-        let mut wrapper_with_values = TDigestWrapper::new();
-        wrapper_with_values.insert_batch(vec![10.0, 20.0]);
-        assert!(wrapper_with_values.to_digest().is_some());
+        assert!(TDigestWrapper::default().to_digest().is_none());
+        let mut wrapper = TDigestWrapper::default();
+        wrapper.insert_batch(vec![10.0, 20.0]);
+        assert!(wrapper.to_digest().is_some());
     }
 
     #[test]
     fn test_parse_interval_to_micros() {
-        // Test format with spaces
-        assert_eq!(parse_interval_to_micros("1 second").unwrap(), 1_000_000);
-        assert_eq!(parse_interval_to_micros("5 seconds").unwrap(), 5_000_000);
-        assert_eq!(parse_interval_to_micros("1 minute").unwrap(), 60_000_000);
-        assert_eq!(parse_interval_to_micros("5 minutes").unwrap(), 300_000_000);
-        assert_eq!(parse_interval_to_micros("1 hour").unwrap(), 3_600_000_000);
-        assert_eq!(parse_interval_to_micros("2 hours").unwrap(), 7_200_000_000);
-        assert_eq!(parse_interval_to_micros("1 day").unwrap(), 86_400_000_000);
-        assert_eq!(parse_interval_to_micros("1 week").unwrap(), 604_800_000_000);
-
-        // Test different unit formats with spaces
-        assert_eq!(parse_interval_to_micros("5 min").unwrap(), 300_000_000);
-        assert_eq!(parse_interval_to_micros("5 mins").unwrap(), 300_000_000);
-        assert_eq!(parse_interval_to_micros("5 m").unwrap(), 300_000_000);
-
-        // Test format without spaces
-        assert_eq!(parse_interval_to_micros("1second").unwrap(), 1_000_000);
-        assert_eq!(parse_interval_to_micros("5seconds").unwrap(), 5_000_000);
-        assert_eq!(parse_interval_to_micros("1minute").unwrap(), 60_000_000);
-        assert_eq!(parse_interval_to_micros("5minutes").unwrap(), 300_000_000);
-        assert_eq!(parse_interval_to_micros("30m").unwrap(), 1_800_000_000);
-        assert_eq!(parse_interval_to_micros("1h").unwrap(), 3_600_000_000);
-        assert_eq!(parse_interval_to_micros("2h").unwrap(), 7_200_000_000);
-        assert_eq!(parse_interval_to_micros("1d").unwrap(), 86_400_000_000);
-        assert_eq!(parse_interval_to_micros("1w").unwrap(), 604_800_000_000);
-        assert_eq!(parse_interval_to_micros("5min").unwrap(), 300_000_000);
-        assert_eq!(parse_interval_to_micros("5mins").unwrap(), 300_000_000);
-        assert_eq!(parse_interval_to_micros("5s").unwrap(), 5_000_000);
-
-        // Test error cases
-        assert!(parse_interval_to_micros("invalid").is_err());
-        assert!(parse_interval_to_micros("5").is_err());
-        assert!(parse_interval_to_micros("abc minutes").is_err());
-        assert!(parse_interval_to_micros("m5").is_err()); // unit before number
+        // Both spellings — `N unit` and the space-less `Nunit` — for every unit alias.
+        let cases: &[(&str, i64)] = &[
+            ("1 second", 1_000_000),
+            ("5 seconds", 5_000_000),
+            ("1 minute", 60_000_000),
+            ("5 minutes", 300_000_000),
+            ("1 hour", 3_600_000_000),
+            ("2 hours", 7_200_000_000),
+            ("1 day", 86_400_000_000),
+            ("1 week", 604_800_000_000),
+            ("5 min", 300_000_000),
+            ("5 mins", 300_000_000),
+            ("5 m", 300_000_000),
+            ("1second", 1_000_000),
+            ("5seconds", 5_000_000),
+            ("1minute", 60_000_000),
+            ("5minutes", 300_000_000),
+            ("30m", 1_800_000_000),
+            ("1h", 3_600_000_000),
+            ("2h", 7_200_000_000),
+            ("1d", 86_400_000_000),
+            ("1w", 604_800_000_000),
+            ("5min", 300_000_000),
+            ("5mins", 300_000_000),
+            ("5s", 5_000_000),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_interval_to_micros(input).unwrap(), *expected, "interval: {input}");
+        }
+        // No unit, no number, non-numeric value, unit-before-number, and overflow.
+        for bad in ["invalid", "5", "abc minutes", "m5", "9223372036854 weeks"] {
+            assert!(parse_interval_to_micros(bad).is_err(), "expected error for: {bad}");
+        }
     }
 }

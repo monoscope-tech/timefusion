@@ -7,7 +7,11 @@ mod variant_select_rewriter;
 mod wildcard_fn_arg_expander;
 
 use datafusion::{
-    logical_expr::{BinaryExpr, Expr, Operator},
+    logical_expr::{
+        BinaryExpr, Expr, Operator,
+        expr::{Cast, TryCast},
+    },
+    prelude::col,
     scalar::ScalarValue,
 };
 pub use defer_expensive_projection::DeferExpensiveProjection;
@@ -17,6 +21,13 @@ pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
 pub use variant_select_rewriter::{VariantScanSchemaRestore, VariantSelectRewriter};
 pub use wildcard_fn_arg_expander::WildcardFnArgExpander;
+
+/// Explicit `Any` upcast for physical-plan nodes: `PhysicalExpr`'s `as_any`
+/// collides with downcast-rs's blanket method in this crate's scope, and
+/// `ExecutionPlan` exposes no `as_any` trait method in this build.
+pub fn downcast<T: 'static>(any: &dyn std::any::Any) -> Option<&T> {
+    any.downcast_ref()
+}
 
 /// Extract the string from a Utf8/Utf8View/LargeUtf8 scalar literal.
 pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
@@ -33,21 +44,44 @@ pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
 pub fn is_col_through_cast(expr: &Expr, name: &str) -> bool {
     match expr {
         Expr::Column(c) => c.name == name,
-        Expr::Cast(c) => is_col_through_cast(c.expr.as_ref(), name),
-        Expr::TryCast(c) => is_col_through_cast(c.expr.as_ref(), name),
+        Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => is_col_through_cast(expr, name),
         _ => false,
     }
 }
 
+/// Peel `Cast`/`TryCast` wrappers off a literal. Extended-protocol param
+/// binding plus TypeCoercion wraps a timestamp bound in a Cast when the param's
+/// unit differs from the µs column (e.g. `ts >= CAST($1 AS Timestamp(us))`),
+/// which otherwise hid the literal and silently disabled date pruning for
+/// ~6% of prod hash-enrichment merges (full 207 GB scans).
+pub fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
+    match expr {
+        Expr::Literal(scalar, _) => Some(scalar),
+        Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => unwrap_literal(expr),
+        _ => None,
+    }
+}
+
+/// Timestamp scalar of any unit → microseconds since epoch.
+pub fn scalar_micros(v: &ScalarValue) -> Option<i64> {
+    Some(match v {
+        ScalarValue::TimestampSecond(Some(s), _) => s.checked_mul(1_000_000)?,
+        ScalarValue::TimestampMillisecond(Some(ms), _) => ms.checked_mul(1_000)?,
+        ScalarValue::TimestampMicrosecond(Some(us), _) => *us,
+        ScalarValue::TimestampNanosecond(Some(ns), _) => ns.div_euclid(1_000),
+        _ => return None,
+    })
+}
+
 /// Reverse a comparison operator for swapped operands (`lit < col` ≡ `col > lit`).
 /// Non-comparison operators pass through unchanged.
-pub fn swap_comparison(op: &Operator) -> Operator {
+pub fn swap_comparison(op: Operator) -> Operator {
     match op {
         Operator::Gt => Operator::Lt,
         Operator::GtEq => Operator::LtEq,
         Operator::Lt => Operator::Gt,
         Operator::LtEq => Operator::GtEq,
-        other => *other,
+        other => other,
     }
 }
 
@@ -64,39 +98,16 @@ pub mod time_range_partition_pruner {
     /// `"event_time"`). Non-matching columns are skipped — pruning only fires for
     /// the table's declared time column.
     pub fn timestamp_to_date_filters(expr: &Expr, time_column: &str) -> Vec<Expr> {
-        // Unwrap Cast/TryCast around a literal: extended-protocol param binding
-        // plus TypeCoercion wraps the timestamp bound in a Cast when the param's
-        // unit differs from the µs column (e.g. `ts >= CAST($1 AS Timestamp(us))`),
-        // which otherwise hid the literal and silently disabled date pruning for
-        // ~6% of prod hash-enrichment merges (full 207 GB scans).
-        fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
-            match expr {
-                Expr::Literal(scalar, _) => Some(scalar),
-                Expr::Cast(c) => unwrap_literal(c.expr.as_ref()),
-                Expr::TryCast(c) => unwrap_literal(c.expr.as_ref()),
-                _ => None,
-            }
-        }
         let date_filter = |expr: &Expr, op: Operator| {
-            let scalar = unwrap_literal(expr)?;
-            let ts_nanos = match scalar {
-                ScalarValue::TimestampNanosecond(Some(ts), _) => *ts,
-                ScalarValue::TimestampMicrosecond(Some(ts), _) => ts.checked_mul(1_000)?,
-                ScalarValue::TimestampMillisecond(Some(ts), _) => ts.checked_mul(1_000_000)?,
-                ScalarValue::TimestampSecond(Some(ts), _) => ts.checked_mul(1_000_000_000)?,
-                _ => return None,
-            };
-            let date = chrono::DateTime::from_timestamp_nanos(ts_nanos).date_naive();
+            let date = chrono::DateTime::from_timestamp_micros(scalar_micros(unwrap_literal(expr)?)?)?.date_naive();
             let days_since_epoch = (date.and_hms_opt(0, 0, 0)?.and_utc().timestamp() / 86400) as i32;
-            let date_lit = Expr::Literal(ScalarValue::Date32(Some(days_since_epoch)), None);
-            let date_col = Expr::Column(datafusion::common::Column::new_unqualified("date"));
             let date_op = match op {
                 Operator::Gt | Operator::GtEq => Operator::GtEq,
                 Operator::Lt | Operator::LtEq => Operator::LtEq,
                 Operator::Eq => Operator::Eq,
                 _ => return None,
             };
-            Some(Expr::BinaryExpr(BinaryExpr::new(Box::new(date_col), date_op, Box::new(date_lit))))
+            Some(Expr::BinaryExpr(BinaryExpr::new(Box::new(col("date")), date_op, Box::new(Expr::Literal(ScalarValue::Date32(Some(days_since_epoch)), None)))))
         };
 
         match expr {
@@ -104,7 +115,7 @@ pub mod time_range_partition_pruner {
                 let (lit_expr, op) = if is_col_through_cast(left.as_ref(), time_column) {
                     (right.as_ref(), *op)
                 } else if is_col_through_cast(right.as_ref(), time_column) {
-                    (left.as_ref(), swap_comparison(op))
+                    (left.as_ref(), swap_comparison(*op))
                 } else {
                     return vec![];
                 };
@@ -128,17 +139,13 @@ pub mod time_range_partition_pruner {
     /// ANDing them prunes files without ever excluding a matching row.
     /// Returns the predicate unchanged when no date filter can be derived.
     pub fn with_date_partition_filters(predicate: Expr, time_column: &str) -> Expr {
-        fn walk(expr: &Expr, time_column: &str, out: &mut Vec<Expr>) {
+        fn walk(expr: &Expr, time_column: &str) -> Vec<Expr> {
             match expr {
-                Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
-                    walk(left, time_column, out);
-                    walk(right, time_column, out);
-                }
-                other => out.extend(timestamp_to_date_filters(other, time_column)),
+                Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => [left, right].into_iter().flat_map(|e| walk(e, time_column)).collect(),
+                other => timestamp_to_date_filters(other, time_column),
             }
         }
-        let mut date_filters = Vec::new();
-        walk(&predicate, time_column, &mut date_filters);
+        let date_filters = walk(&predicate, time_column); // bound separately: `predicate` is moved into the fold below
         date_filters.into_iter().fold(predicate, Expr::and)
     }
 
@@ -149,11 +156,7 @@ pub mod time_range_partition_pruner {
     /// didn't fire (a shape gap → full partition scan).
     pub fn extract_date_bounds(expr: &Expr) -> Vec<(Operator, i32)> {
         match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
-                let mut v = extract_date_bounds(left);
-                v.extend(extract_date_bounds(right));
-                v
-            }
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => [left, right].into_iter().flat_map(|e| extract_date_bounds(e)).collect(),
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(c), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if c.name == "date" => vec![(*op, *day)],
                 _ => vec![],
@@ -163,7 +166,6 @@ pub mod time_range_partition_pruner {
     }
 }
 
-/// Utilities for checking project_id filters
 /// Extract the literal `project_id` value from an expression tree.
 ///
 /// Walks the same shapes `ProjectIdPushdown::contains_project_id` recognises:
@@ -215,13 +217,11 @@ impl ProjectIdPushdown {
 
 #[cfg(test)]
 mod tests {
+    use super::time_range_partition_pruner::{extract_date_bounds, timestamp_to_date_filters, with_date_partition_filters};
     use super::*;
     use datafusion::{
         arrow::datatypes::{DataType, TimeUnit},
-        logical_expr::{
-            Between,
-            expr::{Cast, TryCast},
-        },
+        logical_expr::Between,
     };
 
     fn timestamp(micros: i64) -> Expr {
@@ -229,22 +229,13 @@ mod tests {
     }
 
     fn date_filters(expr: Expr) -> Vec<(Operator, i32)> {
-        time_range_partition_pruner::timestamp_to_date_filters(&expr, "timestamp")
-            .into_iter()
-            .map(|expr| match expr {
-                Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (*left, *right) {
-                    (Expr::Column(col), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if col.name == "date" => (op, day),
-                    _ => panic!("unexpected date filter"),
-                },
-                _ => panic!("unexpected date filter"),
-            })
-            .collect()
+        timestamp_to_date_filters(&expr, "timestamp").iter().flat_map(extract_date_bounds).collect()
     }
 
     #[test]
     fn timestamp_between_derives_two_inclusive_date_bounds() {
         let expr = Expr::Between(Between::new(
-            Box::new(Expr::Column(datafusion::common::Column::new_unqualified("timestamp"))),
+            Box::new(col("timestamp")),
             false,
             Box::new(timestamp(1_704_067_200_000_000)),
             Box::new(timestamp(1_704_240_000_000_000)),
@@ -255,7 +246,7 @@ mod tests {
 
     #[test]
     fn timestamp_comparisons_support_units_casts_and_reversed_operands() {
-        let timestamp_col = Expr::Column(datafusion::common::Column::new_unqualified("timestamp"));
+        let timestamp_col = col("timestamp");
         let cast_timestamp = Expr::Cast(Cast::new(Box::new(timestamp_col.clone()), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
         let try_cast_timestamp = Expr::TryCast(TryCast::new(Box::new(timestamp_col.clone()), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
         let start = 1_704_067_200_000_000i64;
@@ -294,48 +285,34 @@ mod tests {
         }
     }
 
-    /// Collect every `date <op> Date32` conjunct in an AND-tree.
-    fn all_date_bounds(expr: &Expr) -> Vec<(Operator, i32)> {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
-                let mut v = all_date_bounds(left);
-                v.extend(all_date_bounds(right));
-                v
-            }
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if col.name == "date" => vec![(*op, *day)],
-                _ => vec![],
-            },
-            _ => vec![],
-        }
-    }
-
     /// Regression for the 2026-07-17 prod OOM: the monoscope hash-enrichment
     /// UPDATE-2 predicate (`project_id = ? AND timestamp >= ? AND timestamp < ?`)
     /// must gain `date` partition bounds so the Delta merge prunes files instead
     /// of scanning all 2704 partitions.
     #[test]
     fn monoscope_update_predicate_gains_date_partition_bounds() {
-        use datafusion::prelude::col;
         let start = 1_704_067_200_000_000i64; // 2024-01-01 → day 19_723
         let end = 1_704_240_000_000_000i64; //   2024-01-03 → day 19_725
-        let ts = || Expr::Column(datafusion::common::Column::new_unqualified("timestamp"));
+        let ts = || col("timestamp");
         let predicate = col("project_id")
             .eq(Expr::Literal(ScalarValue::Utf8(Some("p".into())), None))
             .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::GtEq, Box::new(timestamp(start)))))
             .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::Lt, Box::new(timestamp(end)))));
 
         // Bug: no `date` bounds derived from the raw timestamp predicate.
-        assert!(all_date_bounds(&predicate).is_empty());
+        assert!(extract_date_bounds(&predicate).is_empty());
 
-        let augmented = time_range_partition_pruner::with_date_partition_filters(predicate.clone(), "timestamp");
-        let mut bounds = all_date_bounds(&augmented);
-        bounds.sort_by_key(|(_, day)| *day);
+        let augmented = with_date_partition_filters(predicate, "timestamp");
+        let bounds = {
+            let mut b = extract_date_bounds(&augmented); // sorted: derivation order isn't part of the contract
+            b.sort_by_key(|(_, day)| *day);
+            b
+        };
         assert_eq!(bounds, vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)]);
 
         // No time-column bounds → predicate returned untouched.
         let no_ts = col("project_id").eq(Expr::Literal(ScalarValue::Utf8(Some("p".into())), None));
-        assert!(all_date_bounds(&time_range_partition_pruner::with_date_partition_filters(no_ts.clone(), "timestamp")).is_empty());
+        assert!(extract_date_bounds(&with_date_partition_filters(no_ts, "timestamp")).is_empty());
     }
 
     /// Regression for the 2026-07-20 prod finding: ~6% of hash-enrichment merges
@@ -345,7 +322,7 @@ mod tests {
     #[test]
     fn cast_wrapped_timestamp_literal_still_derives_date_bounds() {
         let start = 1_704_067_200_000_000i64; // 2024-01-01 → day 19_723
-        let ts_col = Expr::Column(datafusion::common::Column::new_unqualified("timestamp"));
+        let ts_col = col("timestamp");
         // `timestamp >= CAST($1 AS Timestamp(ns))` where the bound param arrived as µs.
         let cast_lit = Expr::Cast(Cast::new(Box::new(timestamp(start)), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
         let expr = Expr::BinaryExpr(BinaryExpr::new(Box::new(ts_col), Operator::GtEq, Box::new(cast_lit)));

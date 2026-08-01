@@ -1,15 +1,18 @@
 //! High-level glue: a `TantivyIndexService` that owns the object_store
 //! handle and produces the `TantivyIndexCallback` used by `BufferedWriteLayer`.
 //!
-//! Index keying: each flushed bucket produces one index, identified by a
-//! fresh UUID. The manifest entry maps `bucket_key` → index blob URI.
-//! `bucket_key` = `"bucket-{min_ts_micros}-{uuid}"`. The read-side resolves
+//! Index keying: a commit that added exactly one parquet file is keyed by that
+//! file's table-relative path (partition-mirrored blob); anything else falls
+//! back to a fresh `"bucket-{uuid}"` key. The read-side resolves
 //! manifest entries by intersecting their `[min_ts, max_ts]` with the query's
 //! time predicates (or scans the full manifest for full-text predicates).
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicI64, Ordering},
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -29,15 +32,38 @@ use crate::{
     },
 };
 
+/// Where the indexed batches came from — fixes both `_row_ordinal` validity
+/// and the merge cadence.
+#[derive(Debug, Clone, Copy)]
+enum IndexSource {
+    /// Flush path: batches are indexed BEFORE the Delta writer's sort, so doc
+    /// order ≠ parquet row order and ordinals must not drive row selection.
+    /// Merging is deferred to keep it off the ingest path.
+    Flush,
+    /// Read back from the committed parquet in row order (post-optimize
+    /// reindex, startup backfill, post-WAL-recovery reindex) — ordinals are
+    /// valid parquet row indexes, and since every such caller is already a
+    /// maintenance task, this rebuild IS the merge the flush path deferred.
+    Committed,
+}
+
+impl IndexSource {
+    fn ordinals_and_merge(self) -> (bool, MergeMode) {
+        match self {
+            Self::Flush => (false, MergeMode::Deferred),
+            Self::Committed => (true, MergeMode::Now),
+        }
+    }
+}
+
 /// Owns the object store + tantivy config and produces a callback.
 #[derive(Debug)]
 pub struct TantivyIndexService {
     pub object_store: Arc<dyn ObjectStore>,
     pub config: Arc<TantivyConfig>,
     /// Max `max_timestamp_micros` across every index this process has
-    /// successfully published. Feeds the `index_lag_seconds` gauge. Loaded
-    /// from manifests on first observation (lazy) and updated after each
-    /// successful build_and_publish.
+    /// successfully published; `i64::MIN` until the first one. Feeds the
+    /// `index_lag_seconds` gauge.
     newest_indexed_micros: AtomicI64,
 }
 
@@ -46,23 +72,10 @@ impl TantivyIndexService {
         Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN) }
     }
 
-    /// Newest indexed timestamp seen so far (microseconds). `None` if the
-    /// service has never published or warm-loaded any index.
+    /// Newest indexed timestamp seen so far (microseconds). `None` until this
+    /// process has published an index.
     pub fn newest_indexed_micros(&self) -> Option<i64> {
-        let v = self.newest_indexed_micros.load(Ordering::Relaxed);
-        if v == i64::MIN { None } else { Some(v) }
-    }
-
-    fn observe_newest(&self, ts_micros: Option<i64>) {
-        if let Some(ts) = ts_micros {
-            let mut cur = self.newest_indexed_micros.load(Ordering::Relaxed);
-            while ts > cur {
-                match self.newest_indexed_micros.compare_exchange_weak(cur, ts, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => break,
-                    Err(v) => cur = v,
-                }
-            }
-        }
+        Some(self.newest_indexed_micros.load(Ordering::Relaxed)).filter(|&v| v != i64::MIN)
     }
 
     /// Build the callback to attach via `BufferedWriteLayer::with_tantivy_indexer`.
@@ -70,10 +83,7 @@ impl TantivyIndexService {
         Arc::new(move |project_id, table_name, batches, added_files| {
             let svc = self.clone();
             Box::pin(async move {
-                if !svc.config.is_table_indexed(&table_name) {
-                    return Ok(());
-                }
-                if batches.is_empty() {
+                if batches.is_empty() || !svc.config.is_table_indexed(&table_name) {
                     return Ok(());
                 }
                 svc.build_and_publish(&project_id, &table_name, batches, added_files).await
@@ -89,18 +99,15 @@ impl TantivyIndexService {
         // Multi-file commits keep the legacy one-blob-covers-all shape — rows
         // can't be attributed to files without re-deriving the partition
         // split, and a multi-covered entry is still correct for coverage.
-        if added_files.len() == 1
-            && let Some(rel) = parquet_rel_of_uri(&added_files[0])
-        {
-            let rel = rel.to_string();
-            let path = store::index_path_for_parquet(table_name, &rel);
-            // ordinals_valid=false: flush batches are indexed BEFORE the
-            // Delta writer's sort, so doc order ≠ parquet row order.
-            return self.build_pack_upload(table_name, project_id, &rel, path, added_files, batches, false, MergeMode::Deferred).await;
+        let (key, path) = match added_files.as_slice() {
+            [uri] => parquet_rel_of_uri(uri).map(|rel| (rel.to_string(), store::index_path_for_parquet(table_name, rel))),
+            _ => None,
         }
-        let bucket_uuid = Uuid::new_v4().to_string();
-        let path = store::blob_path(table_name, project_id, &bucket_uuid);
-        self.build_pack_upload(table_name, project_id, &bucket_key(&bucket_uuid), path, added_files, batches, false, MergeMode::Deferred).await
+        .unwrap_or_else(|| {
+            let uuid = Uuid::new_v4().to_string();
+            (format!("bucket-{uuid}"), store::blob_path(table_name, project_id, &uuid))
+        });
+        self.build_pack_upload(table_name, project_id, &key, path, added_files, batches, IndexSource::Flush).await
     }
 
     /// Build & publish an index for a single already-committed parquet file,
@@ -118,14 +125,7 @@ impl TantivyIndexService {
             return Ok(());
         }
         let path = store::index_path_for_parquet(table_name, parquet_rel);
-        // ordinals_valid=true: batches came from the committed parquet in row
-        // order, so `_row_ordinal` is a valid parquet row index.
-        //
-        // MergeMode::Now: every caller of this (post-optimize reindex, startup
-        // backfill, post-WAL-recovery reindex) is already a maintenance task off
-        // the ingest path — so this rebuild IS the merge cadence that collapses
-        // the multi-segment blobs the flush path deferred.
-        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], batches, true, MergeMode::Now).await
+        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], batches, IndexSource::Committed).await
     }
 
     /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
@@ -133,15 +133,18 @@ impl TantivyIndexService {
     /// (index=None, error set) and returns the error. Shared by the flush
     /// callback (random bucket key + flat path) and `build_index_for_file`
     /// (parquet-rel key + partition-mirrored path).
+    // Still 8 with `&self` even after `(ordinals_valid, merge)` folded into
+    // `source`; the rest are independent identifiers, not a cohesive struct.
     #[allow(clippy::too_many_arguments)]
     async fn build_pack_upload(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
-        batches: Vec<arrow::record_batch::RecordBatch>, ordinals_valid: bool, merge: MergeMode,
+        batches: Vec<arrow::record_batch::RecordBatch>, source: IndexSource,
     ) -> Result<()> {
-        let svc_table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?.clone();
+        let (ordinals_valid, merge) = source.ordinals_and_merge();
+        let svc_table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
         let level = self.config.compression_level();
         let pack_result = tokio::task::spawn_blocking(move || {
-            let (blob, stats) = store::build_and_pack(&svc_table, &batches, level, merge)?;
+            let (blob, stats) = store::build_and_pack(svc_table, &batches, level, merge)?;
             // Guard against publishing a corrupt archive (see store::verify_blob).
             store::verify_blob(&blob).context("verify packed blob")?;
             Ok::<_, anyhow::Error>((blob, stats))
@@ -151,17 +154,7 @@ impl TantivyIndexService {
         let (blob, stats) = match pack_result {
             Ok(v) => v,
             Err(e) => {
-                let entry = ManifestEntry {
-                    index: None,
-                    rows: 0,
-                    built_at: Utc::now(),
-                    schema_version: manifest::SCHEMA_VERSION,
-                    min_timestamp_micros: None,
-                    max_timestamp_micros: None,
-                    error: Some(format!("build failed: {e}")),
-                    covered_files: covered_files.clone(),
-                    ordinals_valid: false,
-                };
+                let entry = ManifestEntry::failed(format!("build failed: {e}"), covered_files);
                 let _ = manifest::upsert(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await;
                 warn!("tantivy build failed for {project_id}/{table_name}: {e}");
                 return Err(e);
@@ -181,32 +174,12 @@ impl TantivyIndexService {
             ordinals_valid,
         };
         manifest::upsert(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await?;
-        self.observe_newest(stats.max_timestamp_micros);
+        if let Some(ts) = stats.max_timestamp_micros {
+            self.newest_indexed_micros.fetch_max(ts, Ordering::Relaxed);
+        }
         Ok(())
     }
-}
 
-fn bucket_key(uuid: &str) -> String {
-    format!("bucket-{uuid}")
-}
-
-/// Table-relative parquet path from an absolute add-file URI, anchored at the
-/// `project_id=` partition segment (all indexed tables partition by
-/// [project_id, date]). `None` for URIs that don't follow the layout —
-/// callers fall back to the legacy flat blob path.
-pub fn parquet_rel_of_uri(uri: &str) -> Option<&str> {
-    let idx = uri.find("project_id=")?;
-    let rel = &uri[idx..];
-    rel.ends_with(".parquet").then_some(rel)
-}
-
-/// project_id encoded in an add-file URI's partition segment.
-pub fn project_id_of_uri(uri: &str) -> Option<&str> {
-    let rel = &uri[uri.find("project_id=")? + "project_id=".len()..];
-    rel.split('/').next().filter(|s| !s.is_empty())
-}
-
-impl TantivyIndexService {
     /// Targeted compaction GC: drop manifest entries whose `covered_files`
     /// reference any parquet URI no longer present in `live_uris`. Entries
     /// whose covered files are fully alive are preserved (their index still
@@ -219,36 +192,42 @@ impl TantivyIndexService {
     /// correctness-preserving choice; queries fall back to a full scan + UDF
     /// post-filter until the next flush rebuilds.
     pub async fn gc_after_compaction(&self, table: &str, project_id: &str, live_uris: &[String]) -> Result<GcReport> {
-        use std::collections::HashSet;
-        let live: HashSet<&str> = live_uris.iter().map(|s| s.as_str()).collect();
+        let live: HashSet<&str> = live_uris.iter().map(String::as_str).collect();
         let mut m = manifest::load(self.object_store.as_ref(), table, project_id).await?;
-        let mut report = GcReport::default();
-        let keys: Vec<String> = m.entries.keys().cloned().collect();
-        for key in keys {
-            let entry = m.entries.get(&key).cloned().unwrap();
-            let stale = entry.covered_files.is_empty() || entry.covered_files.iter().any(|u| !live.contains(u.as_str()));
-            if !stale {
-                report.kept += 1;
-                continue;
-            }
-            if let Some(blob) = &entry.index {
-                let path = object_store::path::Path::from(blob.clone());
-                match store::delete(self.object_store.as_ref(), &path).await {
-                    Ok(()) => report.blobs_deleted += 1,
-                    Err(e) => {
-                        warn!("gc: failed to delete {blob}: {e}");
-                        report.blob_delete_errors += 1;
-                    }
+        let (stale, kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut m.entries)
+            .into_iter()
+            .partition(|(_, e)| e.covered_files.is_empty() || e.covered_files.iter().any(|u| !live.contains(u.as_str())));
+        let mut report = GcReport { kept: kept.len(), entries_removed: stale.len(), ..Default::default() };
+        m.entries = kept;
+        // Effectful: one delete per stale blob, each awaited.
+        for blob in stale.into_values().filter_map(|e| e.index) {
+            match store::delete(self.object_store.as_ref(), &object_store::path::Path::from(blob.as_str())).await {
+                Ok(()) => report.blobs_deleted += 1,
+                Err(e) => {
+                    warn!("gc: failed to delete {blob}: {e}");
+                    report.blob_delete_errors += 1;
                 }
             }
-            m.entries.remove(&key);
-            report.entries_removed += 1;
         }
         if report.entries_removed > 0 {
             manifest::save(self.object_store.as_ref(), table, project_id, &m).await?;
         }
         Ok(report)
     }
+}
+
+/// Table-relative parquet path from an absolute add-file URI, anchored at the
+/// `project_id=` partition segment (all indexed tables partition by
+/// [project_id, date]). `None` for URIs that don't follow the layout —
+/// callers fall back to the legacy flat blob path.
+pub fn parquet_rel_of_uri(uri: &str) -> Option<&str> {
+    let rel = &uri[uri.find("project_id=")?..];
+    rel.ends_with(".parquet").then_some(rel)
+}
+
+/// project_id encoded in an add-file URI's partition segment.
+pub fn project_id_of_uri(uri: &str) -> Option<&str> {
+    uri.split_once("project_id=")?.1.split('/').next().filter(|s| !s.is_empty())
 }
 
 #[derive(Debug, Default, Clone)]

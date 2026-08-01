@@ -1,8 +1,11 @@
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use datafusion::{
-    arrow::{array::Array, datatypes::SchemaRef},
+    arrow::{array::Int64Array, compute::sum},
     common::{Statistics, stats::Precision},
 };
 use deltalake::DeltaTable;
@@ -10,152 +13,91 @@ use lru::LruCache;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+const DEFAULT_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(50).unwrap();
+
 /// Cache entry for basic table statistics
 #[derive(Clone, Debug)]
 pub struct CachedStatistics {
     pub stats: Statistics,
-    pub timestamp: std::time::Instant,
+    pub timestamp: Instant,
     pub version: u64,
 }
 
-/// Simplified statistics extractor for Delta Lake tables
-/// Only extracts basic row count and byte size statistics
+/// Simplified statistics extractor for Delta Lake tables: row count and byte
+/// size only, cached per `(project_id, table_name)` and keyed on Delta version.
 #[derive(Debug)]
 pub struct DeltaStatisticsExtractor {
-    cache: Arc<RwLock<LruCache<String, CachedStatistics>>>,
-    cache_ttl_seconds: u64,
+    cache: RwLock<LruCache<String, CachedStatistics>>,
+    cache_ttl: Duration,
     page_row_limit: usize,
 }
 
 impl DeltaStatisticsExtractor {
     pub fn new(cache_size: usize, cache_ttl_seconds: u64, page_row_limit: usize) -> Self {
-        let cache = LruCache::new(NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(50).unwrap()));
-        Self { cache: Arc::new(RwLock::new(cache)), cache_ttl_seconds, page_row_limit }
+        Self {
+            cache: RwLock::new(LruCache::new(NonZeroUsize::new(cache_size).unwrap_or(DEFAULT_CACHE_SIZE))),
+            cache_ttl: Duration::from_secs(cache_ttl_seconds),
+            page_row_limit,
+        }
     }
 
     /// Extract basic statistics from a Delta table (row count and byte size only)
-    pub async fn extract_statistics(&self, table: &DeltaTable, project_id: &str, table_name: &str, _schema: &SchemaRef) -> Result<Statistics> {
-        let cache_key = format!("{}:{}", project_id, table_name);
+    pub async fn extract_statistics(&self, table: &DeltaTable, project_id: &str, table_name: &str) -> Result<Statistics> {
+        let cache_key = cache_key(project_id, table_name);
+        let version = table.version().unwrap_or(0);
 
-        // Check cache first
+        if let Some(stats) =
+            self.cache.read().await.peek(&cache_key).filter(|c| c.version == version && c.timestamp.elapsed() < self.cache_ttl).map(|c| c.stats.clone())
         {
-            let cache = self.cache.read().await;
-            if let Some(cached) = cache.peek(&cache_key) {
-                let elapsed = cached.timestamp.elapsed().as_secs();
-                let current_version = table.version().unwrap_or(0);
-
-                if elapsed < self.cache_ttl_seconds && cached.version == current_version {
-                    debug!("Statistics cache hit for {} (version {})", cache_key, current_version);
-                    return Ok(cached.stats.clone());
-                }
-            }
+            debug!(%cache_key, version, "statistics cache hit");
+            return Ok(stats);
         }
 
-        debug!("Extracting basic statistics for {}", cache_key);
+        let (num_files, num_rows, total_byte_size) = table_stats(table, self.page_row_limit)?;
+        let stats = Statistics { num_rows: Precision::Inexact(num_rows), total_byte_size: Precision::Exact(total_byte_size), column_statistics: vec![] };
 
-        // Get table metadata
-        let version = table.version();
-        let num_files = table.get_file_uris()?.count();
+        info!(%cache_key, num_rows, total_byte_size, num_files, "extracted basic statistics");
 
-        // Calculate row count and byte size from Delta metadata
-        let (num_rows, total_byte_size) = self.calculate_table_stats(table).await?;
-
-        // Create basic statistics without column-level details
-        let stats = Statistics {
-            num_rows: Precision::Inexact(num_rows as usize),
-            total_byte_size: Precision::Exact(total_byte_size as usize),
-            column_statistics: vec![], // No column statistics needed
-        };
-
-        // Update cache
-        {
-            let mut cache = self.cache.write().await;
-            cache.put(cache_key.clone(), CachedStatistics { stats: stats.clone(), timestamp: std::time::Instant::now(), version: version.unwrap_or(0) });
-        }
-
-        info!("Extracted basic statistics for {}: {} rows, {} bytes, {} files", cache_key, num_rows, total_byte_size, num_files);
+        self.cache.write().await.put(cache_key, CachedStatistics { stats: stats.clone(), timestamp: Instant::now(), version });
 
         Ok(stats)
     }
 
-    /// Calculate table-level statistics using add_actions_table
-    async fn calculate_table_stats(&self, table: &DeltaTable) -> Result<(u64, u64)> {
-        let table_uri = table.table_url();
-        let snapshot = table.snapshot().context("Failed to get Delta table snapshot")?;
-
-        let actions_batch = snapshot.add_actions_table(true).with_context(|| format!("Failed to get add actions for table at {}", table_uri))?;
-
-        let mut total_rows = 0u64;
-        let mut total_bytes = 0u64;
-        let num_files = actions_batch.num_rows() as u64;
-
-        // Try to get size_bytes column
-        if let Some(size_col) = actions_batch.column_by_name("size_bytes")
-            && let Some(int_array) = size_col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>()
-        {
-            for i in 0..int_array.len() {
-                if !int_array.is_null(i) {
-                    total_bytes += int_array.value(i) as u64;
-                }
-            }
-        }
-
-        // Try to get numRecords from stats column if available
-        if let Some(stats_col) = actions_batch.column_by_name("stats.numRecords") {
-            if let Some(int_array) = stats_col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
-                for i in 0..int_array.len() {
-                    if !int_array.is_null(i) {
-                        total_rows += int_array.value(i) as u64;
-                    }
-                }
-            }
-        } else {
-            // Fallback: estimate rows based on file count
-            total_rows = num_files * self.page_row_limit as u64;
-        }
-
-        Ok((total_rows, total_bytes))
-    }
-
-    /// Clear the statistics cache
     pub async fn clear_cache(&self) {
-        let mut cache = self.cache.write().await;
-        cache.clear();
+        self.cache.write().await.clear();
         info!("Statistics cache cleared");
     }
 
-    /// Get cache size
-    pub async fn cache_size(&self) -> usize {
-        let cache = self.cache.read().await;
-        cache.len()
-    }
-
-    /// Invalidate specific table statistics
+    /// Drop the cached entry for one table so the next extraction recomputes it.
     pub async fn invalidate(&self, project_id: &str, table_name: &str) {
-        let cache_key = format!("{}:{}", project_id, table_name);
-        let mut cache = self.cache.write().await;
-        if let Some(removed) = cache.pop(&cache_key) {
-            debug!("Invalidated statistics for {} (was version {})", cache_key, removed.version);
+        let cache_key = cache_key(project_id, table_name);
+        if let Some(removed) = self.cache.write().await.pop(&cache_key) {
+            debug!(%cache_key, version = removed.version, "invalidated statistics");
         }
     }
 
-    /// Get cache statistics for monitoring
+    /// Get cache statistics for monitoring: `(used, capacity)`
     pub async fn get_cache_stats(&self) -> (usize, usize) {
         let cache = self.cache.read().await;
         (cache.len(), cache.cap().get())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn cache_key(project_id: &str, table_name: &str) -> String {
+    format!("{project_id}:{table_name}")
+}
 
-    #[tokio::test]
-    async fn test_statistics_cache() {
-        let extractor = DeltaStatisticsExtractor::new(10, 300, 20_000);
-        assert_eq!(extractor.cache_size().await, 0);
+/// Table-level `(files, rows, bytes)` summed from the flattened add-actions batch.
+/// Falls back to `files × page_row_limit` when the snapshot carries no
+/// `stats.numRecords` column.
+fn table_stats(table: &DeltaTable, page_row_limit: usize) -> Result<(usize, usize, usize)> {
+    let snapshot = table.snapshot().context("Failed to get Delta table snapshot")?;
+    let actions = snapshot.add_actions_table(true).with_context(|| format!("Failed to get add actions for table at {}", table.table_url()))?;
 
-        extractor.invalidate("project1", "table1").await;
-        assert_eq!(extractor.cache_size().await, 0);
-    }
+    // `None` distinguishes "column absent" (→ fallback) from "present but empty/unsummable" (→ 0).
+    let sum_i64 = |name| actions.column_by_name(name).map(|c| c.as_any().downcast_ref::<Int64Array>().and_then(sum).unwrap_or(0).max(0) as usize);
+
+    let num_files = actions.num_rows();
+    let rows = sum_i64("stats.numRecords").unwrap_or_else(|| num_files.saturating_mul(page_row_limit));
+    Ok((num_files, rows, sum_i64("size_bytes").unwrap_or(0)))
 }

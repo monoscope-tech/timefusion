@@ -12,15 +12,22 @@
 //! entries never need invalidation, only eviction).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
-use futures::StreamExt;
-use object_store::ObjectStore;
+use dashmap::DashMap;
+use futures::{StreamExt, TryStreamExt};
+use lru::LruCache;
+use object_store::{ObjectStore, path::Path as ObjPath};
+use parking_lot::Mutex;
 use tantivy::{Index, IndexReader};
 
 use crate::tantivy_index::{
@@ -31,11 +38,11 @@ use crate::tantivy_index::{
 };
 
 /// Open (Index, IndexReader) pairs kept hot across queries.
-const READER_CACHE_ENTRIES: usize = 256;
+const READER_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 /// Staleness bound on the per-service parsed-manifest cache. A stale
 /// manifest only under-reports coverage (prefilter skipped, full scan) or
 /// points at a deleted blob (download error → full scan) — never wrong rows.
-const MANIFEST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+const MANIFEST_CACHE_TTL: Duration = Duration::from_secs(5);
 /// Concurrent per-index download+search tasks within one query.
 const SEARCH_CONCURRENCY: usize = 8;
 
@@ -53,19 +60,19 @@ pub struct SearchResult {
     /// so the caller skips the prefilter (full scan). Collected over ALL
     /// successful entries (not just opened ones) because a time-pruned entry
     /// still legitimately covers its file — its rows are simply out of window.
-    pub covered_files: std::collections::HashSet<String>,
+    pub covered_files: HashSet<String>,
     /// Parquet URIs whose covering index was queried and returned ZERO hits,
     /// minus any URI also covered by an entry that hit, was unqueried, or
     /// lacked a field. With the coverage gate passed, these files provably
     /// contain no matching rows — the scan can skip them entirely
     /// (file-level pruning), a strictly stronger cut than the id IN-list.
-    pub zero_hit_files: std::collections::HashSet<String>,
+    pub zero_hit_files: HashSet<String>,
     /// Per-parquet-URI matching row ordinals, for entries that (a) cover
     /// exactly one file and (b) were built in parquet row order
     /// (`ordinals_valid`). Feeds the scan's per-file `ParquetAccessPlan`
     /// (row-selection pushdown) — files absent here simply scan normally
     /// under the id IN-list, so this can only narrow, never drop.
-    pub row_selections: std::collections::HashMap<String, Vec<u64>>,
+    pub row_selections: HashMap<String, Vec<u64>>,
     /// True if any **in-window** index (one that wasn't time-pruned) lacks a
     /// queried field. `covered_files` is field-independent (an entry covers its
     /// file for all of the current schema's indexed columns), so it can't catch
@@ -80,23 +87,17 @@ pub struct SearchResult {
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
     pub cache_root: PathBuf,
-    readers: parking_lot::Mutex<lru::LruCache<String, (Index, IndexReader)>>,
+    readers: Mutex<LruCache<String, (Index, IndexReader)>>,
     /// TTL cache of parsed manifests, keyed (table, project). Per-service
     /// (not global) so distinct object stores never cross-contaminate.
-    manifests: dashmap::DashMap<(String, String), (std::time::Instant, Arc<manifest::Manifest>)>,
+    manifests: DashMap<(String, String), (Instant, Arc<manifest::Manifest>)>,
     /// Cold `open_index` calls — observability for the reader cache.
-    pub index_opens: std::sync::atomic::AtomicU64,
+    pub index_opens: AtomicU64,
 }
 
 impl TantivySearchService {
     pub fn new(object_store: Arc<dyn ObjectStore>, cache_root: PathBuf) -> Self {
-        Self {
-            object_store,
-            cache_root,
-            readers: parking_lot::Mutex::new(lru::LruCache::new(NonZeroUsize::new(READER_CACHE_ENTRIES).expect("nonzero"))),
-            manifests: dashmap::DashMap::new(),
-            index_opens: std::sync::atomic::AtomicU64::new(0),
-        }
+        Self { object_store, cache_root, readers: Mutex::new(LruCache::new(READER_CACHE_ENTRIES)), manifests: DashMap::new(), index_opens: AtomicU64::new(0) }
     }
 
     /// Single-predicate convenience used by tests/tools.
@@ -129,36 +130,20 @@ impl TantivySearchService {
         if m.entries.is_empty() {
             return Ok(None);
         }
-        let mut covered_files: HashSet<String> = HashSet::new();
-        // (file_uuid, blob_path, rows, entry covered_files, ordinals_valid)
-        // surviving the time-prune.
-        let mut work: Vec<(String, String, u64, Vec<String>, bool)> = Vec::new();
-        for (key, entry) in &m.entries {
-            if entry.schema_version != manifest::SCHEMA_VERSION {
-                continue;
-            }
-            // Coverage accounting: a successful entry covers its files for the
-            // gate regardless of the time-prune window (see SearchResult docs).
-            if entry.index.is_some() && entry.error.is_none() {
-                covered_files.extend(entry.covered_files.iter().cloned());
-            }
-            // Time-prune: skip indexes whose timestamp span can't overlap the
-            // query window (no blob download). Conservative on unknown bounds.
-            if !entry_overlaps(entry.min_timestamp_micros, entry.max_timestamp_micros, time_range) {
-                continue;
-            }
-            let Some(blob_path) = entry.index.as_ref() else {
-                continue;
-            };
-            let file_uuid = key.strip_prefix("bucket-").unwrap_or(key);
-            work.push((
-                file_uuid.to_string(),
-                blob_path.clone(),
-                entry.rows,
-                entry.covered_files.clone(),
-                entry.ordinals_valid && entry.covered_files.len() == 1,
-            ));
-        }
+        let current = || m.entries.iter().filter(|(_, e)| e.schema_version == manifest::SCHEMA_VERSION);
+        // Coverage ignores the time-prune below: a pruned entry still covers its
+        // file, its rows are merely out of window (see SearchResult docs).
+        let covered_files: HashSet<String> =
+            current().filter(|(_, e)| e.index.is_some() && e.error.is_none()).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
+        // Time-prune: skip indexes whose timestamp span can't overlap the query
+        // window (no blob download). Conservative on unknown bounds.
+        // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid).
+        let work: Vec<_> = current()
+            .filter_map(|(key, e)| {
+                let blob_path = e.index.as_ref().filter(|_| entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range))?;
+                Some((file_uuid(key).to_string(), blob_path.clone(), e.rows, e.covered_files.clone(), e.ordinals_valid && e.covered_files.len() == 1))
+            })
+            .collect();
 
         // One download+open+search task per index, SEARCH_CONCURRENCY-wide.
         // `None` hits = the index lacks a queried field (coverage gap).
@@ -172,16 +157,18 @@ impl TantivySearchService {
         }))
         .buffer_unordered(SEARCH_CONCURRENCY);
 
+        // Imperative: seven interdependent accumulators plus an early abort once
+        // `max_hits` is exceeded — a fold would only hide the control flow.
         let mut all_hits: Vec<Hit> = Vec::new();
         let mut seen: HashSet<(i64, String)> = HashSet::new();
-        let mut usable_entries = 0usize;
+        let mut any_usable = false;
         let mut indexed_rows: u64 = 0;
         let mut field_coverage_gap = false;
         let mut zero_hit_files: HashSet<String> = HashSet::new();
         // Files covered by a hitting or field-gapped entry can never be
         // pruned, even if another (double-covering) entry saw zero hits.
         let mut unprunable_files: HashSet<String> = HashSet::new();
-        let mut row_selections: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+        let mut row_selections: HashMap<String, Vec<u64>> = HashMap::new();
         // Files where some covering entry can't express its hits as ordinals
         // — a partial selection would UNDER-select, so drop theirs entirely.
         let mut unselectable_files: HashSet<String> = HashSet::new();
@@ -198,10 +185,9 @@ impl TantivySearchService {
             };
             indexed_rows = indexed_rows.saturating_add(rows);
             if ordinals_valid && hits.iter().all(|h| h.row_ordinal.is_some()) {
-                // covered_files.len()==1 guaranteed by the work-item gate.
-                if let Some(uri) = entry_covered.first()
-                    && !hits.is_empty()
-                {
+                // covered_files.len()==1 guaranteed by the work-item gate; the
+                // empty-hits filter avoids materializing an empty selection.
+                if let Some(uri) = entry_covered.first().filter(|_| !hits.is_empty()) {
                     row_selections.entry(uri.clone()).or_default().extend(hits.iter().filter_map(|h| h.row_ordinal));
                 }
             } else {
@@ -213,17 +199,16 @@ impl TantivySearchService {
                 unprunable_files.extend(entry_covered);
             }
             for h in hits {
-                let dedup_key = (h.timestamp_micros, h.id.clone());
-                if seen.insert(dedup_key) {
+                if seen.insert((h.timestamp_micros, h.id.clone())) {
                     all_hits.push(h);
                     if all_hits.len() > max_hits {
                         return Ok(None);
                     }
                 }
             }
-            usable_entries += 1;
+            any_usable = true;
         }
-        if usable_entries == 0 {
+        if !any_usable {
             return Ok(None);
         }
         zero_hit_files.retain(|f| !unprunable_files.contains(f));
@@ -236,25 +221,25 @@ impl TantivySearchService {
     /// download cliff after a restart into a background cost. Best-effort:
     /// individual blob failures are skipped.
     pub async fn warm_recent(&self, table: &str, days: u32) -> Result<usize> {
-        use futures::TryStreamExt;
         let cutoff = crate::clock::now_micros() - i64::from(days) * 86_400_000_000;
-        let prefix = object_store::path::Path::from(format!("{}/{table}", manifest::MANIFEST_PREFIX));
-        let objs: Vec<object_store::ObjectMeta> = self.object_store.list(Some(&prefix)).try_collect().await?;
+        let prefix = ObjPath::from(format!("{}/{table}", manifest::MANIFEST_PREFIX));
+        let objs: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
+        // Imperative: every step is awaited IO whose failures are individually skipped.
         let mut warmed = 0usize;
         for meta in objs.iter().filter(|m| m.location.as_ref().ends_with("/manifest.json")) {
-            let parts: Vec<&str> = meta.location.as_ref().split('/').collect();
-            let Some(project) = parts.len().checked_sub(2).and_then(|i| parts.get(i)) else {
+            // .../{project}/manifest.json
+            let Some(project) = meta.location.as_ref().rsplit('/').nth(1) else {
                 continue;
             };
             let Ok(m) = manifest::load(self.object_store.as_ref(), table, project).await else {
                 continue;
             };
-            for (key, e) in &m.entries {
-                let Some(blob) = &e.index else { continue };
-                if e.schema_version != manifest::SCHEMA_VERSION || e.max_timestamp_micros.is_none_or(|mx| mx < cutoff) {
-                    continue;
-                }
-                let uuid = key.strip_prefix("bucket-").unwrap_or(key);
+            let recent = m
+                .entries
+                .iter()
+                .filter(|(_, e)| e.schema_version == manifest::SCHEMA_VERSION && e.max_timestamp_micros.is_some_and(|mx| mx >= cutoff))
+                .filter_map(|(key, e)| Some((file_uuid(key), e.index.as_ref()?)));
+            for (uuid, blob) in recent {
                 if self.ensure_cached(table, project, uuid, blob).await.is_ok() {
                     warmed += 1;
                 }
@@ -267,13 +252,11 @@ impl TantivySearchService {
     /// argument). Removes the per-query S3 GET + JSON parse.
     async fn load_manifest_cached(&self, table: &str, project_id: &str) -> Result<Arc<manifest::Manifest>> {
         let key = (table.to_string(), project_id.to_string());
-        if let Some(e) = self.manifests.get(&key)
-            && e.value().0.elapsed() < MANIFEST_CACHE_TTL
-        {
-            return Ok(e.value().1.clone());
+        if let Some(m) = self.manifests.get(&key).filter(|e| e.0.elapsed() < MANIFEST_CACHE_TTL).map(|e| e.1.clone()) {
+            return Ok(m);
         }
         let m = Arc::new(manifest::load(self.object_store.as_ref(), table, project_id).await?);
-        self.manifests.insert(key, (std::time::Instant::now(), m.clone()));
+        self.manifests.insert(key, (Instant::now(), m.clone()));
         Ok(m)
     }
 
@@ -284,27 +267,27 @@ impl TantivySearchService {
         }
         let index = store::open_index(dir)?;
         let reader = index.reader().map_err(|e| anyhow!("open reader: {e}"))?;
-        self.index_opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.index_opens.fetch_add(1, Ordering::Relaxed);
         self.readers.lock().put(blob_path.to_string(), (index.clone(), reader.clone()));
         Ok((index, reader))
     }
 
     async fn ensure_cached(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> Result<PathBuf> {
         let dir = store::local_cache_path(&self.cache_root, table, project_id, file_uuid);
-        if dir.join("meta.json").exists() || has_any_segment(&dir) {
+        if has_any_segment(&dir) {
             return Ok(dir);
         }
         // Fetch blob and unpack into a temp dir adjacent to the cache, then rename.
-        let blob = store::download(self.object_store.as_ref(), &object_store::path::Path::from(blob_path.to_string())).await?;
+        let blob = store::download(self.object_store.as_ref(), &ObjPath::from(blob_path)).await?;
         let parent = dir.parent().ok_or_else(|| anyhow!("cache path has no parent"))?;
         std::fs::create_dir_all(parent).context("mkdir cache parent")?;
         let tmp = tempfile::TempDir::new_in(parent).context("tempdir for unpack")?;
         store::unpack_to_dir(&blob, tmp.path())?;
         // Best-effort rename. If another worker beat us, drop ours and use theirs.
-        match std::fs::rename(tmp.path(), &dir) {
-            Ok(()) => {
-                std::mem::forget(tmp);
-            }
+        // Bound in a `let` so the `tmp.path()` borrow ends before the arms move `tmp`.
+        let renamed = std::fs::rename(tmp.path(), &dir);
+        match renamed {
+            Ok(()) => drop(tmp.keep()),  // disarm cleanup: the dir now lives at `dir`
             Err(_) if dir.exists() => {} // someone else won the race
             Err(e) => return Err(e).context("rename into cache"),
         }
@@ -319,21 +302,24 @@ impl TantivySearchService {
 /// everything. Correctness rests on this never returning `false` for an entry
 /// that covers an in-window row.
 fn entry_overlaps(min: Option<i64>, max: Option<i64>, range: Option<(i64, i64)>) -> bool {
-    let Some((lo, hi)) = range else { return true };
-    let emin = min.unwrap_or(i64::MIN);
-    let emax = max.unwrap_or(i64::MAX);
-    emax >= lo && emin <= hi
+    range.is_none_or(|(lo, hi)| max.unwrap_or(i64::MAX) >= lo && min.unwrap_or(i64::MIN) <= hi)
 }
 
+/// Strips the manifest key's `bucket-` tag to recover the bare file UUID
+/// (see `service.rs`'s `bucket_key` format).
+fn file_uuid(key: &str) -> &str {
+    key.strip_prefix("bucket-").unwrap_or(key)
+}
+
+/// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
 fn has_any_segment(dir: &Path) -> bool {
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("seg") || entry.file_name().to_string_lossy() == "meta.json" {
-                return true;
-            }
-        }
-    }
-    false
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("seg") || name == "meta.json"
+        })
+    })
 }
 
 #[cfg(test)]

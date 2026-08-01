@@ -1,12 +1,12 @@
 /// Initialize tracing for tests. Call at start of test functions.
 /// Uses try_init() so multiple calls are safe.
 pub fn init_test_logging() {
-    use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap())).with_test_writer().try_init();
+    use tracing_subscriber::{EnvFilter, filter::LevelFilter};
+    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into())).with_test_writer().try_init();
 }
 
 pub mod test_helpers {
-    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+    use std::{path::PathBuf, sync::Arc};
 
     use arrow_json::ReaderBuilder;
     use datafusion::arrow::{
@@ -84,12 +84,16 @@ pub mod test_helpers {
         let prev = std::env::var_os("WALRUS_DATA_DIR");
         assert!(!HELD.swap(true, Ordering::Acquire), "walrus_env_guard already held by another test — add #[serial] to the caller");
         let guard = scopeguard::guard(prev, |prev| {
+            // SAFETY: HELD is swapped false only here, after restoring the var, so no other
+            // thread holding the guard's #[serial] contract can observe a torn env value.
             match prev {
                 Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
                 None => unsafe { std::env::remove_var("WALRUS_DATA_DIR") },
             }
             HELD.store(false, Ordering::Release);
         });
+        // SAFETY: HELD was just claimed above and #[serial] on the caller guarantees no
+        // other thread reads/writes this env var concurrently.
         unsafe { std::env::set_var("WALRUS_DATA_DIR", dir) };
         guard
     }
@@ -98,15 +102,12 @@ pub mod test_helpers {
     /// all active files. Bypasses the routed scan path entirely — unlike a
     /// `query_delta_only` COUNT, it is NOT collapsed by the read-side `DedupExec`,
     /// so it reflects on-disk duplicates (what the dedup *sweep* tests assert).
-    pub async fn delta_physical_row_count(table_ref: &Arc<tokio::sync::RwLock<deltalake::DeltaTable>>) -> anyhow::Result<i64> {
-        use datafusion::arrow::{
-            array::{Array, AsArray},
-            datatypes::Int64Type,
-        };
+    pub async fn delta_physical_row_count(table_ref: &tokio::sync::RwLock<deltalake::DeltaTable>) -> anyhow::Result<i64> {
+        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
         let guard = table_ref.read().await;
         let batch = guard.snapshot()?.add_actions_table(true)?;
         let arr = batch.column_by_name("num_records").ok_or_else(|| anyhow::anyhow!("add_actions_table missing num_records"))?.as_primitive::<Int64Type>();
-        Ok((0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i)).sum())
+        Ok(arr.iter().flatten().sum())
     }
 
     /// Build a BufferedWriteLayer for tests/benches without repeating the registry boilerplate.
@@ -115,19 +116,18 @@ pub mod test_helpers {
     }
 
     /// Collect a string column out of a layer query result as `Vec<String>`,
-    /// casting through Utf8 so Utf8View/Utf8 storage both work. Collapses the
-    /// cast/downcast/flat_map plumbing the WAL-watermark regression tests
-    /// would otherwise each repeat.
+    /// casting through Utf8 so Utf8View/Utf8 storage both work. Nulls are
+    /// skipped, so a shorter-than-expected result means null cells — assert on
+    /// `.len()` when that matters.
     pub fn query_col_strings(layer: &crate::buffered_write_layer::BufferedWriteLayer, project: &str, table: &str, col: &str) -> Vec<String> {
-        use datafusion::arrow::{array::StringArray, datatypes::DataType};
+        use datafusion::arrow::array::AsArray;
         layer
             .query(project, table, &[])
             .unwrap()
             .iter()
             .flat_map(|b| {
-                let arr = datafusion::arrow::compute::cast(b.column(b.schema().index_of(col).unwrap()), &DataType::Utf8).unwrap();
-                let arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
-                (0..b.num_rows()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+                let arr = cast(b.column_by_name(col).unwrap(), &DataType::Utf8).unwrap();
+                arr.as_string::<i32>().iter().flatten().map(str::to_string).collect::<Vec<_>>()
             })
             .collect()
     }
@@ -140,7 +140,7 @@ pub mod test_helpers {
     pub fn json_to_batch_for(table: &str, records: Vec<Value>) -> anyhow::Result<RecordBatch> {
         let target_schema = crate::schema_loader::get_schema(table).ok_or_else(|| anyhow::anyhow!("unknown table `{table}`"))?.schema_ref();
 
-        // Create a schema for reading JSON with Utf8 (which arrow-json produces)
+        // arrow-json only produces Utf8, so read into a Utf8-flavoured mirror of the target schema and cast back.
         let json_read_schema = Arc::new(Schema::new(
             target_schema
                 .fields()
@@ -156,33 +156,17 @@ pub mod test_helpers {
                 .collect::<Vec<_>>(),
         ));
 
-        let json_data = records.into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n");
+        let json_data = records.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
 
         let batch = ReaderBuilder::new(json_read_schema)
             .build(std::io::Cursor::new(json_data.as_bytes()))?
             .next()
             .ok_or_else(|| anyhow::anyhow!("Failed to read batch"))??;
 
-        // Cast columns to target schema types (Utf8 -> Utf8View)
-        let columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = batch
-            .columns()
-            .iter()
-            .zip(target_schema.fields())
-            .map(|(col, field)| if col.data_type() != field.data_type() { cast(col, field.data_type()).unwrap_or_else(|_| col.clone()) } else { col.clone() })
-            .collect();
+        let columns =
+            batch.columns().iter().zip(target_schema.fields()).map(|(col, field)| cast(col, field.data_type()).unwrap_or_else(|_| col.clone())).collect();
 
         Ok(RecordBatch::try_new(target_schema, columns)?)
-    }
-
-    pub fn create_default_record() -> HashMap<String, Value> {
-        get_default_schema()
-            .fields
-            .iter()
-            .map(|field| {
-                let value = if field.data_type == "List(Utf8)" { json!([]) } else { Value::Null };
-                (field.name.clone(), value)
-            })
-            .collect()
     }
 
     pub fn test_span(id: &str, name: &str, project_id: &str) -> Value {
@@ -200,22 +184,19 @@ pub mod test_helpers {
             "project_id": project_id,
             "date": date,
             "hashes": [],
-            "summary": vec![format!("Test span: {}", name)]
+            "summary": [format!("Test span: {name}")]
         })
     }
 
     /// Read a string cell from any String/LargeString/StringView array; panics on other types.
     pub fn array_get_str(arr: &dyn datafusion::arrow::array::Array, idx: usize) -> String {
-        use datafusion::arrow::array::{LargeStringArray, StringArray, StringViewArray};
-        let any = arr.as_any();
-        if let Some(a) = any.downcast_ref::<StringViewArray>() {
-            a.value(idx).to_string()
-        } else if let Some(a) = any.downcast_ref::<StringArray>() {
-            a.value(idx).to_string()
-        } else if let Some(a) = any.downcast_ref::<LargeStringArray>() {
-            a.value(idx).to_string()
-        } else {
-            panic!("Expected string array but got {:?}", arr.data_type());
+        use datafusion::arrow::array::AsArray;
+        match arr.data_type() {
+            DataType::Utf8View => arr.as_string_view().value(idx),
+            DataType::Utf8 => arr.as_string::<i32>().value(idx),
+            DataType::LargeUtf8 => arr.as_string::<i64>().value(idx),
+            dt => panic!("expected string array but got {dt:?}"),
         }
+        .to_string()
     }
 }

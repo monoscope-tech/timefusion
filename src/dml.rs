@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -8,29 +12,41 @@ use datafusion::{
         datatypes::{DataType, Field, Schema, SchemaRef},
     },
     catalog::Session,
-    common::{Column, JoinType, Result},
+    common::{
+        Column, JoinType, Result,
+        tree_node::{Transformed, TreeNode},
+    },
     error::DataFusionError,
     execution::{
         SendableRecordBatchStream, SessionStateBuilder, TaskContext,
         context::{QueryPlanner, SessionState},
     },
-    logical_expr::{BinaryExpr, Expr, Join, LogicalPlan, Operator, WriteOp},
+    logical_expr::{Expr, Join, LogicalPlan, WriteOp, utils::split_conjunction},
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tracing::{Instrument, debug, error, field::Empty, info, instrument, warn};
 
 use crate::{
     buffered_write_layer::BufferedWriteLayer,
     database::Database,
     errors::{arrow_err, exec_err},
+    optimizers::extract_project_id_from_expr,
 };
 
 /// Hard cap on the number of source rows we'll materialize for an `UPDATE ... FROM`.
 /// Beyond this we error rather than blowing memory; the caller must page or pre-aggregate.
 const MAX_UPDATE_SOURCE_ROWS: usize = 1_000_000;
 const SLOW_DML_PHASE_US: u64 = 1_000_000;
+
+/// Emit the shared `dml.slow_phase` line when `started` has exceeded the threshold.
+fn log_slow_phase(phase: &'static str, table_name: &str, project_id: &str, started: Instant, rows: Option<u64>) {
+    let duration_us = started.elapsed().as_micros() as u64;
+    if duration_us >= SLOW_DML_PHASE_US {
+        info!(event = "dml.slow_phase", phase, table.name = table_name, project_id, duration_us, rows, "slow DML phase");
+    }
+}
 
 /// Build a clean SessionState with config + runtime from the given session but with
 /// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
@@ -175,6 +191,9 @@ impl QueryPlanner for DmlQueryPlanner {
 /// stashes the *other* side's `LogicalPlan` for later async materialization. The
 /// walk then continues down the target side as a plain `UPDATE`.
 fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: bool) -> Result<DmlInfo> {
+    // Imperative descent: each node kind updates a different slot of the state and
+    // the walk is not a fixed-length iteration, so a fold would just thread the same
+    // four fields by hand. Iterative (not recursive) — plan trees can be deep.
     let mut current_plan = input;
     let mut predicate = None;
     let mut assignments = None;
@@ -186,7 +205,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
             LogicalPlan::Projection(proj) if extract_assignments => {
                 match &mut assignments {
                     // First Projection encountered: real UPDATE assignments.
-                    None => assignments = Some(extract_assignments_from_projection(proj)?),
+                    None => assignments = Some(extract_assignments_from_projection(proj)),
                     // Nested Projection (DataFusion CSE introduces one that defines
                     // `__common_expr_*`). Inline its aliases into our assignments so
                     // references to those synthetic columns resolve when we evaluate
@@ -197,7 +216,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
             }
             LogicalPlan::Filter(filter) => {
                 predicate = Some(filter.predicate.clone());
-                project_id = extract_project_id(&filter.predicate).unwrap_or(project_id);
+                project_id = extract_project_id_from_expr(&filter.predicate).unwrap_or(project_id);
                 current_plan = filter.input.as_ref();
             }
             LogicalPlan::Join(join) if extract_assignments => {
@@ -218,10 +237,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 // expression, and the MemBuffer hash-join evaluates it
                 // against the widened batch.
                 if let Some(jf) = &join.filter {
-                    predicate = Some(match predicate.take() {
-                        None => jf.clone(),
-                        Some(existing) => Expr::BinaryExpr(BinaryExpr { left: Box::new(existing), op: Operator::And, right: Box::new(jf.clone()) }),
-                    });
+                    predicate = Some(predicate.take().map_or_else(|| jf.clone(), |existing| existing.and(jf.clone())));
                 }
                 source_plan = Some(UpdateSourcePlan { plan: source_side.clone(), join_keys: keys });
                 current_plan = target_side;
@@ -232,18 +248,9 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 current_plan = alias.input.as_ref();
             }
             LogicalPlan::TableScan(scan) => {
-                project_id = scan.filters.iter().find_map(extract_project_id).unwrap_or(project_id);
+                project_id = scan.filters.iter().find_map(extract_project_id_from_expr).unwrap_or(project_id);
 
-                predicate = predicate.or_else(|| {
-                    (!scan.filters.is_empty())
-                        .then(|| {
-                            scan.filters
-                                .iter()
-                                .cloned()
-                                .reduce(|acc, filter| Expr::BinaryExpr(BinaryExpr { left: Box::new(acc), op: Operator::And, right: Box::new(filter) }))
-                        })
-                        .flatten()
-                });
+                predicate = predicate.or_else(|| scan.filters.iter().cloned().reduce(Expr::and));
                 break;
             }
             other => {
@@ -269,16 +276,13 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
 /// Walk a [`LogicalPlan`] tree until we hit a `TableScan`. Returns the matched
 /// scan's qualified name or `None` if no scan is reachable.
 fn find_table_scan_name(plan: &LogicalPlan) -> Option<String> {
-    use std::collections::VecDeque;
-    let mut q: VecDeque<&LogicalPlan> = VecDeque::new();
-    q.push_back(plan);
+    // Iterative BFS rather than recursion: plan trees can be arbitrarily deep and Rust has no TCO.
+    let mut q = VecDeque::from([plan]);
     while let Some(p) = q.pop_front() {
         if let LogicalPlan::TableScan(scan) = p {
             return Some(scan.table_name.to_string());
         }
-        for child in p.inputs() {
-            q.push_back(child);
-        }
+        q.extend(p.inputs());
     }
     None
 }
@@ -304,21 +308,20 @@ fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(
 
     let (target_side, source_side) = if target_is_left { (join.left.as_ref(), join.right.as_ref()) } else { (join.right.as_ref(), join.left.as_ref()) };
 
+    let bare = |e: &Expr| {
+        expr_to_bare_col(e).ok_or_else(|| DataFusionError::NotImplemented(format!("UPDATE ... FROM join key must be a plain column reference, got: {e}")))
+    };
     // `join.on` is Vec<(left_expr, right_expr)>. Flip if target was on the right.
-    let join_keys: Result<Vec<(String, String)>> = join
+    let join_keys = join
         .on
         .iter()
         .map(|(l, r)| {
             let (tgt_expr, src_expr) = if target_is_left { (l, r) } else { (r, l) };
-            let tgt_col = expr_to_bare_col(tgt_expr)
-                .ok_or_else(|| DataFusionError::NotImplemented(format!("UPDATE ... FROM join key must be a plain column reference, got: {tgt_expr}")))?;
-            let src_col = expr_to_bare_col(src_expr)
-                .ok_or_else(|| DataFusionError::NotImplemented(format!("UPDATE ... FROM join key must be a plain column reference, got: {src_expr}")))?;
-            Ok((tgt_col, src_col))
+            Ok((bare(tgt_expr)?, bare(src_expr)?))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
-    Ok((target_side, source_side, join_keys?))
+    Ok((target_side, source_side, join_keys))
 }
 
 /// Pull a bare column name (drop any table qualifier) from an `Expr::Column`.
@@ -348,24 +351,21 @@ async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &Se
     let schema = phys.schema();
     let task_ctx = Arc::new(TaskContext::from(session_state));
 
-    // The source plan may be multi-partition; collect each into a Vec then concat.
-    let partition_count = phys.properties().partitioning.partition_count();
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    let mut total_rows = 0usize;
-    for p in 0..partition_count {
-        let mut stream = phys.execute(p, task_ctx.clone())?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            total_rows += batch.num_rows();
-            if total_rows > MAX_UPDATE_SOURCE_ROWS {
+    // The source plan may be multi-partition; stream each in turn (lazily, one at
+    // a time) and cap as we go so an oversized source never fully materializes.
+    let (total_rows, batches) = futures::stream::iter((0..phys.properties().partitioning.partition_count()).map(|p| phys.execute(p, task_ctx.clone())))
+        .try_flatten()
+        .try_fold((0usize, Vec::new()), |(rows, mut acc), batch| async move {
+            let rows = rows + batch.num_rows();
+            if rows > MAX_UPDATE_SOURCE_ROWS {
                 return Err(DataFusionError::Execution(format!(
-                    "UPDATE ... FROM source exceeded the {} row cap; refine the source query or page the update",
-                    MAX_UPDATE_SOURCE_ROWS
+                    "UPDATE ... FROM source exceeded the {MAX_UPDATE_SOURCE_ROWS} row cap; refine the source query or page the update"
                 )));
             }
-            batches.push(batch);
-        }
-    }
+            acc.push(batch);
+            Ok((rows, acc))
+        })
+        .await?;
 
     let combined = concat_batches(&schema, &batches).map_err(arrow_err)?;
     let duration_us = started.elapsed().as_micros() as u64;
@@ -384,16 +384,15 @@ async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &Se
     Ok(UpdateSource { batch: combined, schema, join_keys: sp.join_keys })
 }
 
-/// Extract assignments from projection
-fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projection) -> Result<Vec<(String, Expr)>> {
-    Ok(proj
-        .expr
+/// Extract UPDATE assignments from a projection: aliased exprs that actually
+/// change the column (a bare `col AS col` passthrough is not an assignment).
+fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projection) -> Vec<(String, Expr)> {
+    proj.expr
         .iter()
         .zip(proj.schema.fields())
         .filter_map(|(expr, field)| {
             let field_name = field.name();
             match expr {
-                Expr::Column(col) if col.name == *field_name => None,
                 Expr::Alias(alias) if alias.name == *field_name => {
                     (!matches!(&*alias.expr, Expr::Column(col) if col.name == *field_name)).then(|| (field_name.clone(), (*alias.expr).clone()))
                 }
@@ -401,50 +400,39 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
                 _ => Some((field_name.clone(), expr.clone())),
             }
         })
-        .collect())
+        .collect()
 }
-
-use crate::optimizers::extract_project_id_from_expr as extract_project_id;
 
 /// Inline aliases from a nested (CSE) Projection into the existing UPDATE assignment
 /// exprs. Without this, refs like `__common_expr_1` survive into mem_buffer's physical
 /// expr evaluation against the bare table schema and fail with "Column not found".
 fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assignments: &mut [(String, Expr)]) -> Result<()> {
-    use std::collections::HashMap;
-
-    use datafusion::common::tree_node::{Transformed, TreeNode};
-
-    let mut subs: HashMap<String, Expr> = HashMap::new();
-    for (expr, field) in proj.expr.iter().zip(proj.schema.fields()) {
-        match expr {
-            Expr::Alias(alias) if alias.name != *field.name() || alias.name.starts_with("__common_expr_") => {
-                subs.insert(alias.name.clone(), (*alias.expr).clone());
-            }
-            Expr::Alias(alias) => {
-                // Pass-through alias matching the field name and not a CSE synthetic — skip.
-                let _ = alias;
-            }
-            _ => {}
-        }
-    }
+    let subs: HashMap<&str, &Expr> = proj
+        .expr
+        .iter()
+        .zip(proj.schema.fields())
+        .filter_map(|(expr, field)| match expr {
+            Expr::Alias(a) if a.name != *field.name() || a.name.starts_with("__common_expr_") => Some((a.name.as_str(), a.expr.as_ref())),
+            _ => None,
+        })
+        .collect();
     if subs.is_empty() {
         return Ok(());
     }
-    for (_, value_expr) in assignments.iter_mut() {
-        let new_expr = value_expr
+    assignments.iter_mut().try_for_each(|(_, value_expr)| {
+        *value_expr = value_expr
             .clone()
             .transform(|e| match &e {
-                Expr::Column(col) => match subs.get(&col.name) {
-                    Some(replacement) => Ok(Transformed::yes(replacement.clone())),
-                    None => Ok(Transformed::no(e)),
-                },
+                Expr::Column(col) => Ok(match subs.get(col.name.as_str()) {
+                    Some(replacement) => Transformed::yes((*replacement).clone()),
+                    None => Transformed::no(e),
+                }),
                 _ => Ok(Transformed::no(e)),
             })
             .map(|t| t.data)
             .map_err(exec_err("Failed to inline CSE alias"))?;
-        *value_expr = new_expr;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Unified DML execution plan
@@ -571,17 +559,12 @@ impl ExecutionPlan for DmlExec {
         let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
         let schema_clone = schema.clone();
 
-        let op_type = self.op_type.clone();
-        let table_name = self.table_name.clone();
-        let project_id = self.project_id.clone();
-        let assignments = self.assignments.clone();
-        let predicate = self.predicate.clone();
-        let source = self.source.clone();
-        let database = self.database.clone();
-        let buffered_layer = self.buffered_layer.clone();
-        let session = self.session.clone();
+        // One clone of the (Arc-backed) plan instead of nine field clones; the
+        // future must own everything it touches.
+        let this = self.clone();
 
         let future = async move {
+            let DmlExec { op_type, table_name, project_id, predicate, assignments, source, database, buffered_layer, session, .. } = this;
             let result = match op_type {
                 DmlOperation::Update => {
                     perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, source, session, &span)
@@ -592,19 +575,12 @@ impl ExecutionPlan for DmlExec {
                 }
             };
 
-            if let Ok(rows) = &result {
-                span.record("rows.affected", rows);
-            }
-
             result
-                .and_then(|rows| {
-                    RecordBatch::try_new(schema_clone, vec![Arc::new(datafusion::arrow::array::UInt64Array::from(vec![rows]))])
-                        .map_err(|e| DataFusionError::External(Box::new(e)))
+                .inspect(|rows| {
+                    span.record("rows.affected", rows);
                 })
-                .map_err(|e| {
-                    error!("{} failed: {}", op_type.as_ref(), e);
-                    e
-                })
+                .and_then(|rows| RecordBatch::try_new(schema_clone, vec![Arc::new(datafusion::arrow::array::UInt64Array::from(vec![rows]))]).map_err(arrow_err))
+                .inspect_err(|e| error!("{} failed: {}", op_type.as_ref(), e))
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::once(future))))
@@ -619,7 +595,7 @@ struct DmlContext<'a> {
     predicate: Option<Expr>,
 }
 
-impl<'a> DmlContext<'a> {
+impl DmlContext<'_> {
     /// `delta_op` is a closure (not a bare Future) so its body — which may
     /// acquire a write lock and call `update_state` — is only constructed
     /// when there is committed data to operate on. It receives the
@@ -632,32 +608,24 @@ impl<'a> DmlContext<'a> {
         G: FnOnce(Option<Expr>) -> Fut,
         Fut: std::future::Future<Output = Result<u64>>,
     {
-        let mut total_rows = 0u64;
         let has_uncommitted = self.buffered_layer.is_some_and(|l| l.has_table(self.project_id, self.table_name));
 
-        if let Some(layer) = self.buffered_layer.filter(|_| has_uncommitted) {
-            let started = Instant::now();
-            total_rows += mem_op(layer, self.predicate.as_ref())?;
-            let duration_us = started.elapsed().as_micros() as u64;
-            if duration_us >= SLOW_DML_PHASE_US {
-                info!(
-                    event = "dml.slow_phase",
-                    phase = "mem_buffer_mutation",
-                    table.name = self.table_name,
-                    project_id = self.project_id,
-                    duration_us,
-                    rows = total_rows,
-                    "slow DML phase"
-                );
+        let mem_rows = match self.buffered_layer.filter(|_| has_uncommitted) {
+            Some(layer) => {
+                let started = Instant::now();
+                let rows = mem_op(layer, self.predicate.as_ref())?;
+                log_slow_phase("mem_buffer_mutation", self.table_name, self.project_id, started, Some(rows));
+                rows
             }
-        }
+            None => 0,
+        };
         debug!(
             "DML mem leg for {}/{}: layer_present={} table_in_buffer={} mem_rows={}",
             self.project_id,
             self.table_name,
             self.buffered_layer.is_some(),
             has_uncommitted,
-            total_rows
+            mem_rows
         );
 
         // Order the Delta leg AFTER any airborne flush commit of this table:
@@ -670,17 +638,7 @@ impl<'a> DmlContext<'a> {
         if let Some(layer) = self.buffered_layer {
             let started = Instant::now();
             layer.await_inflight_flushes(self.project_id, self.table_name).await;
-            let duration_us = started.elapsed().as_micros() as u64;
-            if duration_us >= SLOW_DML_PHASE_US {
-                info!(
-                    event = "dml.slow_phase",
-                    phase = "await_inflight_flush",
-                    table.name = self.table_name,
-                    project_id = self.project_id,
-                    duration_us,
-                    "slow DML phase"
-                );
-            }
+            log_slow_phase("await_inflight_flush", self.table_name, self.project_id, started, None);
         }
 
         // Check if there's committed data: either in custom project tables or unified tables.
@@ -695,11 +653,13 @@ impl<'a> DmlContext<'a> {
             custom_tables.contains_key(&(self.project_id.to_string(), self.table_name.to_string())) || unified_tables.contains_key(self.table_name)
         };
 
-        if has_committed && let Some(delta_pred) = delta_leg_predicate(self.buffered_layer, self.table_name, self.project_id, self.predicate.as_ref()) {
-            total_rows += delta_op(delta_pred).await?;
-        }
+        let delta_rows =
+            match has_committed.then(|| delta_leg_predicate(self.buffered_layer, self.table_name, self.project_id, self.predicate.as_ref())).flatten() {
+                Some(delta_pred) => delta_op(delta_pred).await?,
+                None => 0,
+            };
 
-        Ok(total_rows)
+        Ok(mem_rows + delta_rows)
     }
 }
 
@@ -716,17 +676,10 @@ fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
     }
     impl std::fmt::Write for Trunc {
         fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            let room = self.limit.saturating_sub(self.buf.len());
-            if s.len() <= room {
-                self.buf.push_str(s);
-            } else {
-                let mut n = room;
-                while !s.is_char_boundary(n) {
-                    n -= 1;
-                }
-                self.buf.push_str(&s[..n]);
-                self.truncated = true;
-            }
+            let room = self.limit.saturating_sub(self.buf.len()).min(s.len());
+            let n = (0..=room).rev().find(|&n| s.is_char_boundary(n)).unwrap_or(0);
+            self.buf.push_str(&s[..n]);
+            self.truncated |= n < s.len();
             Ok(())
         }
     }
@@ -774,11 +727,6 @@ fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_n
     Some(match base {
         Some(p) if partitions_by_date => {
             let augmented = crate::optimizers::time_range_partition_pruner::with_date_partition_filters(p, time_col);
-            // Diagnostic for the 2026-07-20 residual full-scans: log the derived
-            // `date` bounds. Empty bounds on a merge that has a time filter means
-            // the timestamp→date derivation missed the predicate shape → the leg
-            // scans every partition. Correlate with ScanMetadataCompleted's
-            // predicate_filtered=0 to find the un-pruned merges.
             // Diagnostic for the 2026-07-20 residual full-scans. One compact line
             // per merge: `days` is the span the derived `date` bounds cover.
             // Correlate with ScanMetadataCompleted.predicate_filtered:
@@ -1039,30 +987,26 @@ pub async fn perform_delta_update(
     // zstd tier for the rewrite: without it the UpdateBuilder writes SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
-    let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
+    perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
         let writer_properties = writer_properties.clone();
         async move {
-            let mut builder = delta_table.update().with_session_state(session).with_writer_properties(writer_properties).with_deletion_vectors(use_dv);
-
-            if let Some(pred) = predicate {
-                builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
-            }
-
-            for (column, value_expr) in assignments {
-                builder = builder.with_update(column, convert_expr_to_delta(&value_expr)?);
-            }
+            let builder = delta_table.update().with_session_state(session).with_writer_properties(writer_properties).with_deletion_vectors(use_dv);
+            let builder = match predicate {
+                Some(pred) => builder.with_predicate(convert_expr_to_delta(&pred)?),
+                None => builder,
+            };
+            let builder = assignments
+                .into_iter()
+                .try_fold(builder, |b, (column, value_expr)| -> Result<_> { Ok(b.with_update(column, convert_expr_to_delta(&value_expr)?)) })?;
 
             builder.await.map(|(table, metrics)| (table, metrics.num_updated_rows as u64)).map_err(exec_err("Failed to execute Delta UPDATE"))
         }
     })
-    .await;
-
-    if let Ok(rows) = &result {
+    .await
+    .inspect(|rows| {
         span.record("rows.updated", rows);
-    }
-
-    result
+    })
 }
 
 /// Perform Delta DELETE operation
@@ -1083,26 +1027,23 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
     // zstd tier for the rewrite: without it the DeleteBuilder writes SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
-    let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
+    perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, session) = (predicate.clone(), session.clone());
         let writer_properties = writer_properties.clone();
         async move {
-            let mut builder = delta_table.delete().with_session_state(session).with_writer_properties(writer_properties).with_deletion_vectors(use_dv);
-
-            if let Some(pred) = predicate {
-                builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
-            }
+            let builder = delta_table.delete().with_session_state(session).with_writer_properties(writer_properties).with_deletion_vectors(use_dv);
+            let builder = match predicate {
+                Some(pred) => builder.with_predicate(convert_expr_to_delta(&pred)?),
+                None => builder,
+            };
 
             builder.await.map(|(table, metrics)| (table, metrics.num_deleted_rows.unwrap_or(0) as u64)).map_err(exec_err("Failed to execute Delta DELETE"))
         }
     })
-    .await;
-
-    if let Ok(rows) = &result {
+    .await
+    .inspect(|rows| {
         span.record("rows.deleted", rows);
-    }
-
-    result
+    })
 }
 
 /// Max attempts for a DML Delta operation that loses an OCC race (e.g. a flush
@@ -1174,11 +1115,10 @@ where
 /// (e.g., `table.column` becomes just `column`). All other expression types (literals,
 /// binary ops, functions, etc.) pass through unchanged, preserving types like Utf8View.
 fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
-    use datafusion::common::tree_node::TreeNode;
     expr.clone()
         .transform(|e| match &e {
-            Expr::Column(col) => Ok(datafusion::common::tree_node::Transformed::yes(Expr::Column(Column::from_name(&col.name)))),
-            _ => Ok(datafusion::common::tree_node::Transformed::no(e)),
+            Expr::Column(col) => Ok(Transformed::yes(Expr::Column(Column::from_name(&col.name)))),
+            _ => Ok(Transformed::no(e)),
         })
         .map(|t| t.data)
         .map_err(exec_err("Failed to convert expression"))
@@ -1195,20 +1135,13 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
 /// - All other cols become bare `x`, leaving `MergeBuilder` to resolve them
 ///   against the target (target columns are unambiguous since source columns
 ///   were already routed above).
-fn requalify_for_merge(expr: Expr, source_cols: &std::collections::HashSet<String>, source_alias: &str, target_alias: &str) -> Result<Expr> {
-    use datafusion::common::tree_node::{Transformed, TreeNode};
+fn requalify_for_merge(expr: Expr, source_cols: &HashSet<String>, source_alias: &str, target_alias: &str) -> Result<Expr> {
     expr.transform(|e| match &e {
-        Expr::Column(c) => match c.relation.as_ref() {
-            Some(r) if r.table() == source_alias => Ok(Transformed::no(e)),
-            Some(r) if r.table() == target_alias => Ok(Transformed::no(e)),
-            _ => {
-                if source_cols.contains(&c.name) {
-                    Ok(Transformed::yes(Expr::Column(Column::new(Some(source_alias.to_string()), c.name.clone()))))
-                } else {
-                    Ok(Transformed::yes(Expr::Column(Column::from_name(c.name.clone()))))
-                }
-            }
-        },
+        Expr::Column(c) => Ok(match c.relation.as_ref() {
+            Some(r) if r.table() == source_alias || r.table() == target_alias => Transformed::no(e),
+            _ if source_cols.contains(&c.name) => Transformed::yes(Expr::Column(Column::new(Some(source_alias.to_string()), c.name.clone()))),
+            _ => Transformed::yes(Expr::Column(Column::from_name(c.name.clone()))),
+        }),
         _ => Ok(Transformed::no(e)),
     })
     .map(|t| t.data)
@@ -1230,36 +1163,17 @@ fn requalify_for_merge(expr: Expr, source_cols: &std::collections::HashSet<Strin
 /// The join_predicate still enforces the equi-keys and their non-null-ness, so
 /// dropping these from the file-pruning predicate is sound (pruning is only an
 /// optimization). Columns matched by NAME, per [`requalify_for_merge`]'s convention.
-fn strip_source_conjuncts(predicate: &Expr, strip_cols: &std::collections::HashSet<String>) -> Option<Expr> {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-    let mut conjuncts = Vec::new();
-    let mut stack = vec![predicate.clone()];
-    while let Some(e) = stack.pop() {
-        match e {
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
-                stack.push(*left);
-                stack.push(*right);
-            }
-            other => conjuncts.push(other),
-        }
-    }
-    conjuncts
-        .into_iter()
-        .rev()
-        .filter(|c| {
-            let mut hit = false;
-            let _ = c.apply(|e| {
-                if let Expr::Column(col) = e
-                    && strip_cols.contains(&col.name)
-                {
-                    hit = true;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-                Ok(TreeNodeRecursion::Continue)
-            });
-            !hit
-        })
-        .reduce(|acc, c| acc.and(c))
+fn strip_source_conjuncts(predicate: &Expr, strip_cols: &HashSet<String>) -> Option<Expr> {
+    split_conjunction(predicate).into_iter().filter(|c| !c.column_refs().iter().any(|col| strip_cols.contains(&col.name))).cloned().reduce(Expr::and)
+}
+
+/// Columns to strip from a DV merge's file-pruning predicate: the source columns
+/// plus the equi-key TARGET columns, EXCEPT partition columns — those resolve from
+/// partition values (no stats-schema gap), and stripping them would drop the
+/// coalescer fold's `project_id IN (...)` filter, un-pruning the merge scan back to
+/// every tenant's files in the window.
+fn dv_strip_cols(source_cols: &HashSet<String>, join_keys: &[(String, String)], partition_cols: &[String]) -> HashSet<String> {
+    source_cols.iter().cloned().chain(join_keys.iter().map(|(t, _)| t.clone())).filter(|c| !partition_cols.contains(c)).collect()
 }
 
 /// Build the join predicate that drives the merge: a conjunction of
@@ -1267,40 +1181,18 @@ fn strip_source_conjuncts(predicate: &Expr, strip_cols: &std::collections::HashS
 /// optional user predicate (which gets routed through [`requalify_for_merge`]
 /// so the user's source/target aliases resolve under `MergeBuilder`'s).
 fn build_join_predicate(
-    target_alias: &str, source_alias: &str, join_keys: &[(String, String)], extra: Option<&Expr>, source_cols: &std::collections::HashSet<String>,
+    target_alias: &str, source_alias: &str, join_keys: &[(String, String)], extra: Option<&Expr>, source_cols: &HashSet<String>,
 ) -> Result<Expr> {
     use datafusion::prelude::col;
-    let mut key_iter = join_keys.iter().map(|(t, s)| {
-        Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(col(format!("{target_alias}.{t}"))),
-            op: Operator::Eq,
-            right: Box::new(col(format!("{source_alias}.{s}"))),
-        })
-    });
-    let mut acc = key_iter.next().ok_or_else(|| DataFusionError::Plan("UPDATE ... FROM requires at least one join key".to_string()))?;
-    for next in key_iter {
-        acc = Expr::BinaryExpr(BinaryExpr { left: Box::new(acc), op: Operator::And, right: Box::new(next) });
-    }
-    if let Some(p) = extra {
-        let p = requalify_for_merge(p.clone(), source_cols, source_alias, target_alias)?;
-        acc = Expr::BinaryExpr(BinaryExpr { left: Box::new(acc), op: Operator::And, right: Box::new(p) });
-    }
-    Ok(acc)
-}
-
-/// Re-qualify assignment value exprs via [`requalify_for_merge`] so the
-/// user's source/target aliases address `MergeBuilder`'s `source` / `target`.
-fn requalify_assignments_for_merge(
-    assignments: Vec<(String, Expr)>, source_schema: &SchemaRef, source_alias: &str, target_alias: &str,
-) -> Result<Vec<(String, Expr)>> {
-    let source_cols: std::collections::HashSet<String> = source_schema.fields().iter().map(|f| f.name().clone()).collect();
-    assignments
-        .into_iter()
-        .map(|(col_name, expr)| {
-            let new_expr = requalify_for_merge(expr, &source_cols, source_alias, target_alias)?;
-            Ok((col_name, new_expr))
-        })
-        .collect()
+    let keys = join_keys
+        .iter()
+        .map(|(t, s)| col(format!("{target_alias}.{t}")).eq(col(format!("{source_alias}.{s}"))))
+        .reduce(Expr::and)
+        .ok_or_else(|| DataFusionError::Plan("UPDATE ... FROM requires at least one join key".to_string()))?;
+    Ok(match extra {
+        Some(p) => keys.and(requalify_for_merge(p.clone(), source_cols, source_alias, target_alias)?),
+        None => keys,
+    })
 }
 
 /// Perform Delta UPDATE ... FROM via [`deltalake::operations::merge::MergeBuilder`]
@@ -1332,24 +1224,25 @@ pub async fn perform_delta_merge_update(
     let _merge_permit = database.dml_merge_sem().acquire().await.map_err(exec_err("dml merge semaphore closed"))?;
 
     let span = tracing::Span::current();
-    let source_batch = source.batch.clone();
-    let source_schema = source.schema.clone();
-    let join_keys = source.join_keys.clone();
-    let source_cols: std::collections::HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
+    let source_cols: HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
 
-    // Re-qualify assignments AND predicate before moving into the closure so
-    // the user's source/target aliases address `MergeBuilder`'s `source` /
-    // `target` aliases.
-    let assignments = requalify_assignments_for_merge(assignments, &source.schema, "source", "target")?;
+    // Re-qualify assignments before moving into the closure so the user's
+    // source/target aliases address `MergeBuilder`'s `source` / `target`
+    // (the predicate is re-qualified inside `build_join_predicate`).
+    let assignments = assignments
+        .into_iter()
+        .map(|(col_name, expr)| Ok((col_name, requalify_for_merge(expr, &source_cols, "source", "target")?)))
+        .collect::<Result<Vec<_>>>()?;
 
     // Our zstd tier for the rewrite: without it the MergeBuilder writes SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
 
-    let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
+    perform_delta_operation(database, table_name, project_id, |delta_table| {
         // RecordBatch clones are Arc-backed (cheap); needed since the
         // operation may rerun after an OCC conflict.
-        let (source_batch, source_schema, join_keys, source_cols) = (source_batch.clone(), source_schema.clone(), join_keys.clone(), source_cols.clone());
+        let (source_batch, source_schema, join_keys, source_cols) =
+            (source.batch.clone(), source.schema.clone(), source.join_keys.clone(), source_cols.clone());
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
         // Cloned per attempt (the closure reruns on OCC conflict).
         let writer_properties = writer_properties.clone();
@@ -1362,17 +1255,10 @@ pub async fn perform_delta_merge_update(
             // the target/source aliases the DV op scans under.
             if use_dv {
                 use deltalake::operations::merge_dv::{MergeDvUpdate, merge_update_with_deletion_vectors};
-                // Strip source cols AND equi-key target cols from the file-pruning
-                // predicate (the latter carry the optimizer's IsNotNull(join-key)
-                // conjuncts the fork's stats scan can't resolve — prod drop bug).
-                // EXCEPT partition columns: they resolve from partition values (no
-                // stats-schema gap), and stripping them would drop the coalescer
-                // fold's `project_id IN (...)` filter — un-pruning the merge scan
-                // back to every tenant's files in the window.
+                // The equi-key target cols carry the optimizer's IsNotNull(join-key)
+                // conjuncts the fork's stats scan can't resolve — prod drop bug.
                 let partition_cols = crate::schema_loader::get_schema(table_name).map(|s| s.partitions.clone()).unwrap_or_default();
-                let mut strip_cols = source_cols.clone();
-                strip_cols.extend(join_keys.iter().map(|(t, _)| t.clone()));
-                strip_cols.retain(|c| !partition_cols.contains(c));
+                let strip_cols = dv_strip_cols(&source_cols, &join_keys, &partition_cols);
                 let target_predicate = predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &strip_cols));
                 let equi_keys = if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] };
                 return merge_update_with_deletion_vectors(
@@ -1416,42 +1302,31 @@ pub async fn perform_delta_merge_update(
             // Wrap the materialized source RecordBatch as a DataFrame. The
             // throwaway SessionContext only provides the DataFrame builder; merge
             // execution uses the session passed via `with_session_state`.
-            let ctx = datafusion::prelude::SessionContext::new();
-            let source_df = ctx.read_batch(source_batch).map_err(exec_err("Failed to wrap UPDATE FROM source as DataFrame"))?;
+            let source_df =
+                datafusion::prelude::SessionContext::new().read_batch(source_batch).map_err(exec_err("Failed to wrap UPDATE FROM source as DataFrame"))?;
 
-            let merge = delta_table
+            let (new_table, metrics) = delta_table
                 .merge(source_df, join_pred)
                 .with_source_alias("source")
                 .with_target_alias("target")
                 .with_session_state(session)
                 .with_writer_properties(writer_properties)
-                .with_safe_cast(true);
-
-            let merge = merge
-                .when_matched_update(|mut u| {
-                    for (col_name, value_expr) in &assignments {
-                        u = u.update(col_name.clone(), value_expr.clone());
-                    }
-                    u
-                })
-                .map_err(exec_err("when_matched_update failed"))?;
-
-            let (new_table, metrics) = merge.await.map_err(exec_err("Failed to execute Delta MERGE UPDATE"))?;
+                .with_safe_cast(true)
+                .when_matched_update(|u| assignments.iter().fold(u, |u, (col_name, value_expr)| u.update(col_name.clone(), value_expr.clone())))
+                .map_err(exec_err("when_matched_update failed"))?
+                .await
+                .map_err(exec_err("Failed to execute Delta MERGE UPDATE"))?;
             Ok((new_table, metrics.num_target_rows_updated as u64))
         }
     })
-    .await;
-
-    match &result {
-        Ok(rows) => {
-            span.record("rows.updated", rows);
-        }
-        // Diagnostic for the still-unreproduced "No field named ...context___span_id"
-        // schema failures (prod 2026-07-19): dump the exact predicates + keys so the
-        // next occurrence pins the plan shape that leaks a column into the scan.
-        Err(e) => warn!(target: "dml", "Delta MERGE-UPDATE failed for {project_id}/{table_name} keys={:?}: {e}", source.join_keys),
-    }
-    result
+    .await
+    .inspect(|rows| {
+        span.record("rows.updated", rows);
+    })
+    // Diagnostic for the still-unreproduced "No field named ...context___span_id"
+    // schema failures (prod 2026-07-19): dump the exact predicates + keys so the
+    // next occurrence pins the plan shape that leaks a column into the scan.
+    .inspect_err(|e| warn!(target: "dml", "Delta MERGE-UPDATE failed for {project_id}/{table_name} keys={:?}: {e}", source.join_keys))
 }
 
 #[cfg(test)]
@@ -1510,11 +1385,12 @@ mod strip_tests {
     #[test]
     fn partition_column_equi_key_conjuncts_survive_the_strip() {
         let source_cols: HashSet<String> = ["span_id", "trace_id", "tag", "project_id"].iter().map(|s| s.to_string()).collect();
-        let join_keys = [("context___span_id", "span_id"), ("context___trace_id", "trace_id"), ("project_id", "project_id")];
+        let join_keys: Vec<(String, String)> = [("context___span_id", "span_id"), ("context___trace_id", "trace_id"), ("project_id", "project_id")]
+            .iter()
+            .map(|(t, s)| (t.to_string(), s.to_string()))
+            .collect();
         let partition_cols = ["project_id".to_string(), "date".to_string()];
-        let mut strip_cols = source_cols.clone();
-        strip_cols.extend(join_keys.iter().map(|(t, _)| t.to_string()));
-        strip_cols.retain(|c| !partition_cols.contains(c));
+        let strip_cols = super::dv_strip_cols(&source_cols, &join_keys, &partition_cols);
 
         let pred =
             col("date").gt_eq(lit("2026-07-26")).and(col("project_id").in_list(vec![lit("p1"), lit("p2")], false)).and(col("context___span_id").is_not_null());

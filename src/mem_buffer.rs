@@ -77,29 +77,18 @@ pub fn set_bucket_duration_micros(micros: i64) {
 /// Compatible means: all existing fields must be present in incoming schema with same type,
 /// incoming schema may have additional nullable fields.
 fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
-    for existing_field in existing.fields() {
-        match incoming.field_with_name(existing_field.name()) {
-            Ok(incoming_field) => {
-                // Types must match (ignoring nullability - can become more lenient)
-                if !types_compatible(existing_field.data_type(), incoming_field.data_type()) {
-                    return false;
-                }
-            }
-            Err(_) => return false, // Existing field not found in incoming schema
-        }
+    // Every existing field must survive with a compatible type (nullability may loosen).
+    if !existing.fields().iter().all(|f| incoming.field_with_name(f.name()).is_ok_and(|i| types_compatible(f.data_type(), i.data_type()))) {
+        return false;
     }
-    // New fields in incoming schema are OK if nullable (for SchemaMode::Merge compatibility)
-    let mut new_fields = 0;
-    for incoming_field in incoming.fields() {
-        if existing.field_with_name(incoming_field.name()).is_err() {
-            if !incoming_field.is_nullable() {
-                return false; // New non-nullable field would break existing data
-            }
-            new_fields += 1;
-        }
+    // New fields are OK only if nullable (SchemaMode::Merge) — a new NOT NULL
+    // field would break the already-buffered rows.
+    let new_fields = incoming.fields().iter().filter(|f| existing.field_with_name(f.name()).is_err()).collect::<Vec<_>>();
+    if new_fields.iter().any(|f| !f.is_nullable()) {
+        return false;
     }
-    if new_fields > 0 {
-        info!("Schema evolution: {} new nullable field(s) added", new_fields);
+    if !new_fields.is_empty() {
+        info!("Schema evolution: {} new nullable field(s) added", new_fields.len());
     }
     true
 }
@@ -124,7 +113,6 @@ fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
 /// `null_count` is `None` when no data is available to check (schema-only
 /// alignment), in which case the declared nullability is taken as given.
 fn align_nullability(schema: &SchemaRef, declared: &SchemaRef, null_count: Option<&dyn Fn(usize) -> usize>) -> Option<SchemaRef> {
-    let mut changed = false;
     let fields: Vec<FieldRef> = schema
         .fields()
         .iter()
@@ -133,13 +121,13 @@ fn align_nullability(schema: &SchemaRef, declared: &SchemaRef, null_count: Optio
             let honest = |d: &Field| d.is_nullable() || null_count.is_none_or(|nc| nc(i) == 0);
             match declared.field_with_name(f.name()) {
                 Ok(d) if d.data_type() == f.data_type() && d.is_nullable() != f.is_nullable() && honest(d) => {
-                    changed = true;
                     Arc::new(f.as_ref().clone().with_nullable(d.is_nullable()))
                 }
                 _ => f.clone(),
             }
         })
         .collect();
+    let changed = fields.iter().zip(schema.fields()).any(|(new, old)| !Arc::ptr_eq(new, old));
     changed.then(|| Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())) as SchemaRef)
 }
 
@@ -157,25 +145,15 @@ fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
         // Timestamps: unit must match, timezone differences are allowed but logged
         (DataType::Timestamp(u1, tz1), DataType::Timestamp(u2, tz2)) => {
             if u1 == u2 && tz1 != tz2 {
-                tracing::debug!("Timestamp timezone mismatch: {:?} vs {:?} (allowed)", tz1, tz2);
+                debug!("Timestamp timezone mismatch: {:?} vs {:?} (allowed)", tz1, tz2);
             }
             u1 == u2
         }
         // Lists: check element types recursively
         (DataType::List(f1), DataType::List(f2)) | (DataType::LargeList(f1), DataType::LargeList(f2)) => types_compatible(f1.data_type(), f2.data_type()),
-        // Structs: all existing fields must be compatible
+        // Structs: all existing fields must be present and compatible
         (DataType::Struct(fields1), DataType::Struct(fields2)) => {
-            for f1 in fields1.iter() {
-                match fields2.iter().find(|f| f.name() == f1.name()) {
-                    Some(f2) => {
-                        if !types_compatible(f1.data_type(), f2.data_type()) {
-                            return false;
-                        }
-                    }
-                    None => return false, // Field missing in incoming
-                }
-            }
-            true
+            fields1.iter().all(|f1| fields2.iter().find(|f| f.name() == f1.name()).is_some_and(|f2| types_compatible(f1.data_type(), f2.data_type())))
         }
         // Maps: check key and value types
         (DataType::Map(f1, _), DataType::Map(f2, _)) => types_compatible(f1.data_type(), f2.data_type()),
@@ -192,10 +170,19 @@ fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
     }
 }
 
-/// Extract the min timestamp from a batch's "timestamp" column (if present).
-/// Returns None if no timestamp column exists or it's empty.
-pub fn extract_min_timestamp(batch: &RecordBatch) -> Option<i64> {
-    batch_timestamp_range(batch).map(|(min, _)| min)
+/// Widened schema for `UPDATE ... FROM`: target fields + source fields
+/// prefixed `source__`, all nullable on the source side (rows without a
+/// matching source row produce NULLs in source columns). Shared by
+/// [`MemBuffer::update_with_source`] and [`MemBuffer::update_with_source_by_sql`],
+/// which must build byte-identical schemas since the latter's SQL is parsed
+/// against this shape before being handed to the former.
+fn widen_schema_with_source(target_fields: &arrow::datatypes::Fields, source_fields: &arrow::datatypes::Fields) -> SchemaRef {
+    let widened_fields = target_fields
+        .iter()
+        .map(|f| (**f).clone())
+        .chain(source_fields.iter().map(|f| Field::new(format!("source__{}", f.name()), f.data_type().clone(), true)))
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(widened_fields))
 }
 
 /// (min, max) of the batch's `timestamp` column, if present.
@@ -209,6 +196,11 @@ pub fn batch_timestamp_range(batch: &RecordBatch) -> Option<(i64, i64)> {
 /// Table key type using Arc<str> for efficient cloning and comparison.
 /// Composite key of (project_id, table_name) for flattened lookup.
 pub type TableKey = (Arc<str>, Arc<str>);
+
+#[inline]
+pub fn table_key(project_id: &str, table_name: &str) -> TableKey {
+    (Arc::from(project_id), Arc::from(table_name))
+}
 
 pub struct MemBuffer {
     /// Flattened structure: (project_id, table_name) → TableBuffer
@@ -375,6 +367,23 @@ struct WalShardState {
     first_positions: Vec<Option<walrus_rust::WalPosition>>,
 }
 
+impl WalShardState {
+    /// Min-merge a hold for `shard`, growing the vec as needed. The hold is a
+    /// *floor*, so the earliest position ever seen for a shard wins.
+    fn merge(&mut self, shard: usize, pos: walrus_rust::WalPosition) {
+        if self.first_positions.len() <= shard {
+            self.first_positions.resize(shard + 1, None);
+        }
+        self.first_positions[shard] = Some(self.first_positions[shard].map_or(pos, |prev| prev.min(pos)));
+    }
+}
+
+/// Per-shard holds re-shaped to exactly `shards` entries (truncating extras,
+/// padding with `None`) so watermark indices always line up.
+fn pad_positions(src: &[Option<walrus_rust::WalPosition>], shards: usize) -> Vec<Option<walrus_rust::WalPosition>> {
+    (0..shards).map(|i| src.get(i).copied().flatten()).collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct FlushableBucket {
     pub project_id: String,
@@ -426,13 +435,13 @@ pub struct MemBufferStats {
     pub oldest_bucket_micros: Option<i64>,
 }
 
-/// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
-/// metadata for each column, and DashMap/Mutex slots when held in a TimeBucket.
-/// Empirically ~64 B for the batch + 96 B per column (ArrayData + Buffer headers).
 /// Drift (as a % of the recomputed truth) that [`MemBuffer::reconcile_estimated_bytes`]
 /// tolerates silently. Anything above it is logged at warn as an accounting bug.
 const MAX_TOLERATED_DRIFT_PCT: usize = 2;
 
+/// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
+/// metadata for each column, and DashMap/Mutex slots when held in a TimeBucket.
+/// Empirically ~64 B for the batch + 96 B per column (ArrayData + Buffer headers).
 const BATCH_FIXED_OVERHEAD: usize = 64;
 const PER_COLUMN_OVERHEAD: usize = 96;
 
@@ -647,19 +656,19 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
     // NULL and false both mean live; only `true` retires the key.
     let keep: std::collections::HashSet<u32> =
         chosen.into_values().filter(|&i| tombstones.as_ref().is_none_or(|f| !(f.is_valid(i as usize) && f.value(i as usize)))).collect();
-    // Filter each batch against its slice of the global row-index space.
-    let mut out = Vec::with_capacity(batches.len());
-    let mut base = 0u32;
-    for b in &batches {
-        let n = b.num_rows() as u32;
-        let mask = BooleanArray::from((0..n).map(|r| keep.contains(&(base + r))).collect::<Vec<bool>>());
-        base += n;
-        let kept = filter_record_batch(b, &mask)?;
-        if kept.num_rows() > 0 {
-            out.push(kept);
-        }
-    }
-    Ok(out)
+    // Filter each batch against its slice of the global row-index space
+    // (`scan` carries the running base offset).
+    Ok(batches
+        .iter()
+        .scan(0u32, |base, b| {
+            let n = b.num_rows() as u32;
+            Some((b, std::mem::replace(base, *base + n), n))
+        })
+        .map(|(b, base, n)| filter_record_batch(b, &BooleanArray::from((0..n).map(|r| keep.contains(&(base + r))).collect::<Vec<bool>>())))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|kept| kept.num_rows() > 0)
+        .collect())
 }
 
 /// Merge two arrays based on a boolean mask.
@@ -678,8 +687,7 @@ fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray)
 /// (column refs nested inside function args need a non-empty schema).
 /// `registry` resolves UDFs — required if the SQL has any function call.
 fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistry>) -> DFResult<Expr> {
-    let dialect = GenericDialect {};
-    let sql_expr = SqlParser::new(&dialect)
+    let sql_expr = SqlParser::new(&GenericDialect {})
         .try_with_sql(sql)
         .map_err(|e| datafusion::error::DataFusionError::SQL(e.into(), None))?
         .parse_expr()
@@ -690,8 +698,10 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistr
     // UPDATE...FROM (`array_concat(CASE ..., [tag])`) fails with "Could not plan
     // array literal" and quarantines — even after qualifier normalization.
     // VariantAwareExprPlanner first (matches live ordering for `->`/`->>`).
-    let mut expr_planners: Vec<Arc<dyn datafusion::logical_expr::planner::ExprPlanner>> = vec![Arc::new(crate::functions::VariantAwareExprPlanner)];
-    expr_planners.extend(datafusion::execution::SessionStateDefaults::default_expr_planners());
+    let expr_planners: Vec<Arc<dyn datafusion::logical_expr::planner::ExprPlanner>> =
+        std::iter::once(Arc::new(crate::functions::VariantAwareExprPlanner) as Arc<dyn datafusion::logical_expr::planner::ExprPlanner>)
+            .chain(datafusion::execution::SessionStateDefaults::default_expr_planners())
+            .collect();
     let context_provider = RegistryContextProvider { registry, expr_planners };
     let planner = SqlToRel::new(&context_provider);
     let expr = planner.sql_to_expr(sql_expr, schema, &mut Default::default())?;
@@ -706,7 +716,7 @@ struct RegistryContextProvider<'a> {
     expr_planners: Vec<Arc<dyn datafusion::logical_expr::planner::ExprPlanner>>,
 }
 
-impl<'a> datafusion::sql::planner::ContextProvider for RegistryContextProvider<'a> {
+impl datafusion::sql::planner::ContextProvider for RegistryContextProvider<'_> {
     fn get_table_source(&self, _: datafusion::sql::TableReference) -> DFResult<std::sync::Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::Plan("No table context".into()))
     }
@@ -748,49 +758,41 @@ impl<'a> datafusion::sql::planner::ContextProvider for RegistryContextProvider<'
 
 /// Extract min/max timestamp bounds from filter expressions for bucket pruning.
 fn extract_timestamp_range(filters: &[Expr]) -> (Option<i64>, Option<i64>) {
-    let (mut min_ts, mut max_ts) = (None, None);
-    for filter in filters {
-        if let Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr { left, op, right }) = filter {
-            let is_ts = matches!(left.as_ref(), Expr::Column(c) if c.name == "timestamp");
-            if !is_ts {
-                continue;
-            }
-            let ts = match right.as_ref() {
-                Expr::Literal(datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
-                Expr::Literal(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
-                Expr::Literal(datafusion::scalar::ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
-                Expr::Literal(datafusion::scalar::ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
-                _ => None,
-            };
-            if let Some(ts) = ts {
-                match op {
-                    datafusion::logical_expr::Operator::Gt | datafusion::logical_expr::Operator::GtEq => {
-                        min_ts = Some(min_ts.map_or(ts, |m: i64| m.max(ts)));
-                    }
-                    datafusion::logical_expr::Operator::Lt | datafusion::logical_expr::Operator::LtEq => {
-                        max_ts = Some(max_ts.map_or(ts, |m: i64| m.min(ts)));
-                    }
-                    datafusion::logical_expr::Operator::Eq => {
-                        min_ts = Some(ts);
-                        max_ts = Some(ts);
-                    }
-                    _ => {}
-                }
-            }
+    use datafusion::{
+        logical_expr::{BinaryExpr, Operator},
+        scalar::ScalarValue as SV,
+    };
+    filters.iter().fold((None, None), |bounds: (Option<i64>, Option<i64>), filter| {
+        let (min_ts, max_ts) = bounds;
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter else { return bounds };
+        if !matches!(left.as_ref(), Expr::Column(c) if c.name == "timestamp") {
+            return bounds;
         }
-    }
-    (min_ts, max_ts)
+        // Normalize every timestamp literal precision to micros.
+        let Expr::Literal(lit, _) = right.as_ref() else { return bounds };
+        let Some(ts) = (match lit {
+            SV::TimestampMicrosecond(Some(t), _) => Some(*t),
+            SV::TimestampNanosecond(Some(t), _) => Some(*t / 1000),
+            SV::TimestampMillisecond(Some(t), _) => Some(*t * 1000),
+            SV::TimestampSecond(Some(t), _) => Some(*t * 1_000_000),
+            _ => None,
+        }) else {
+            return bounds;
+        };
+        match op {
+            Operator::Gt | Operator::GtEq => (Some(min_ts.map_or(ts, |m: i64| m.max(ts))), max_ts),
+            Operator::Lt | Operator::LtEq => (min_ts, Some(max_ts.map_or(ts, |m: i64| m.min(ts)))),
+            Operator::Eq => (Some(ts), Some(ts)),
+            _ => bounds,
+        }
+    })
 }
 
 /// Compile filters into a single conjunction physical expression evaluated against `schema`.
 pub fn compile_filter_conjunction(filters: &[Expr], schema: &SchemaRef) -> DFResult<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> {
-    if filters.is_empty() {
-        return Ok(None);
-    }
+    let Some(conjunction) = filters.iter().cloned().reduce(datafusion::logical_expr::and) else { return Ok(None) };
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
-    let props = ExecutionProps::new();
-    let conjunction = filters.iter().cloned().reduce(datafusion::logical_expr::and).unwrap();
-    Ok(Some(create_physical_expr(&conjunction, &df_schema, &props)?))
+    Ok(Some(create_physical_expr(&conjunction, &df_schema, &ExecutionProps::new())?))
 }
 
 /// Filter a batch to rows whose `id` is in `ids`. Returns a fresh batch.
@@ -798,18 +800,15 @@ pub fn compile_filter_conjunction(filters: &[Expr], schema: &SchemaRef) -> DFRes
 /// returned unfiltered — the caller's predicate-based filter will catch
 /// any over-inclusion. Supports Utf8View, Utf8, and LargeUtf8 ID types.
 fn filter_batch_by_id_set(batch: &RecordBatch, ids: &std::collections::HashSet<String>) -> RecordBatch {
-    use arrow::array::{AsArray, BooleanArray, LargeStringArray, StringArray, StringViewArray};
+    use arrow::array::{AsArray, BooleanArray};
     let Some(arr) = batch.column_by_name("id") else { return batch.clone() };
-    let mask: BooleanArray = if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
-        (0..a.len()).map(|i| !a.is_null(i) && ids.contains(a.value(i))).collect()
-    } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-        (0..a.len()).map(|i| !a.is_null(i) && ids.contains(a.value(i))).collect()
-    } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
-        (0..a.len()).map(|i| !a.is_null(i) && ids.contains(a.value(i))).collect()
-    } else {
+    let hit = |v: Option<&str>| v.is_some_and(|s| ids.contains(s));
+    let mask: BooleanArray = match arr.data_type() {
+        DataType::Utf8View => arr.as_string_view().iter().map(hit).collect(),
+        DataType::Utf8 => arr.as_string::<i32>().iter().map(hit).collect(),
+        DataType::LargeUtf8 => arr.as_string::<i64>().iter().map(hit).collect(),
         // Unknown id type — let the original predicate handle the filtering.
-        let _ = arr.as_string_opt::<i32>(); // keep AsArray import live
-        return batch.clone();
+        _ => return batch.clone(),
     };
     filter_record_batch(batch, &mask).unwrap_or_else(|_| batch.clone())
 }
@@ -818,12 +817,11 @@ fn filter_batch_by_id_set(batch: &RecordBatch, ids: &std::collections::HashSet<S
 /// any evaluation error we return the original batch so DataFusion's FilterExec
 /// can finish the job.
 fn apply_predicate(batch: &RecordBatch, pred: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> RecordBatch {
-    let Ok(value) = pred.evaluate(batch) else { return batch.clone() };
-    let Ok(arr) = value.into_array(batch.num_rows()) else { return batch.clone() };
-    let Some(mask) = arr.as_any().downcast_ref::<BooleanArray>() else {
-        return batch.clone();
-    };
-    filter_record_batch(batch, mask).unwrap_or_else(|_| batch.clone())
+    pred.evaluate(batch)
+        .ok()
+        .and_then(|v| v.into_array(batch.num_rows()).ok())
+        .and_then(|arr| filter_record_batch(batch, arr.as_any().downcast_ref::<BooleanArray>()?).ok())
+        .unwrap_or_else(|| batch.clone())
 }
 
 /// Apply an optional compiled predicate to a bucket snapshot, dropping
@@ -874,21 +872,19 @@ pub fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
 }
 
 /// Check if a bucket's time range overlaps with the query range.
-fn bucket_overlaps_range(bucket: &TimeBucket, range: &(Option<i64>, Option<i64>)) -> bool {
-    let (min_filter, max_filter) = range;
-    if let Some(max) = max_filter {
-        let bucket_min = bucket.min_timestamp.load(Ordering::Relaxed);
-        if bucket_min != i64::MAX && bucket_min > *max {
-            return false;
-        }
-    }
-    if let Some(min) = min_filter {
-        let bucket_max = bucket.max_timestamp.load(Ordering::Relaxed);
-        if bucket_max != i64::MIN && bucket_max < *min {
-            return false;
-        }
-    }
-    true
+fn bucket_overlaps_range(bucket: &TimeBucket, (min_filter, max_filter): &(Option<i64>, Option<i64>)) -> bool {
+    // `&&` short-circuits, so an unbounded side never pays its atomic load.
+    // The sentinels (empty bucket) mean "unknown range" — never prune.
+    let starts_after = |max: i64| matches!(bucket.min_timestamp.load(Ordering::Relaxed), m if m != i64::MAX && m > max);
+    let ends_before = |min: i64| matches!(bucket.max_timestamp.load(Ordering::Relaxed), m if m != i64::MIN && m < min);
+    !max_filter.is_some_and(starts_after) && !min_filter.is_some_and(ends_before)
+}
+
+/// Does the YAML schema declare any tantivy-indexed field? Gates every
+/// text-match path: without one the per-bucket index build can only ever
+/// return None, so the caller falls straight back to the SQL predicate.
+fn has_indexed_fields(schema: &crate::schema_loader::TableSchema) -> bool {
+    schema.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed))
 }
 
 /// Strip table qualifiers from Column refs (e.g. `otel_logs_and_spans.timestamp` → `timestamp`)
@@ -935,7 +931,7 @@ impl MemBuffer {
     /// failed commit leaves a stale mark, which only costs that bucket the
     /// brief commit-then-drain exclusion at its eventual sealed flush.
     pub fn mark_force_flushed(&self, project_id: &str, table_name: &str, bucket_id: i64) {
-        self.force_flushed.entry(Self::make_key(project_id, table_name)).or_default().insert(bucket_id);
+        self.force_flushed.entry(table_key(project_id, table_name)).or_default().insert(bucket_id);
     }
 
     pub fn shards_per_topic(&self) -> usize {
@@ -978,12 +974,8 @@ impl MemBuffer {
         self.text_index_bytes.fetch_add(size, Ordering::Relaxed);
         // Evict LRU until under budget.
         while self.text_index_bytes.load(Ordering::Relaxed) > self.text_index_max_bytes {
-            match cache.pop_lru() {
-                Some((_, evicted)) => {
-                    self.text_index_bytes.fetch_sub(evicted.size_bytes, Ordering::Relaxed);
-                }
-                None => break,
-            }
+            let Some((_, evicted)) = cache.pop_lru() else { break };
+            self.text_index_bytes.fetch_sub(evicted.size_bytes, Ordering::Relaxed);
         }
         idx
     }
@@ -1025,7 +1017,7 @@ impl MemBuffer {
     /// Authoritative sum of every live bucket's `memory_bytes`. O(tables ×
     /// buckets) with a shard lock per table — NOT for the hot path; use
     /// [`Self::estimated_memory_bytes`] there.
-    pub fn recompute_memory_bytes(&self) -> usize {
+    pub(crate) fn recompute_memory_bytes(&self) -> usize {
         self.tables.iter().map(|t| t.value().buckets.iter().map(|b| b.value().memory_bytes.load(Ordering::Relaxed)).sum::<usize>()).sum()
     }
 
@@ -1044,7 +1036,7 @@ impl MemBuffer {
         let cached = self.estimated_bytes.swap(truth, Ordering::Relaxed);
         let drift = cached.abs_diff(truth);
         if drift > 0 && drift as u128 * 100 > truth.max(1) as u128 * MAX_TOLERATED_DRIFT_PCT as u128 {
-            tracing::warn!(
+            warn!(
                 target = "mem_buffer",
                 cached_bytes = cached,
                 recomputed_bytes = truth,
@@ -1059,61 +1051,52 @@ impl MemBuffer {
         timestamp_micros / bucket_duration_micros()
     }
 
-    #[inline]
-    fn make_key(project_id: &str, table_name: &str) -> TableKey {
-        (Arc::from(project_id), Arc::from(table_name))
-    }
-
     pub fn current_bucket_id() -> i64 {
-        let now_micros = crate::clock::now_micros();
-        Self::compute_bucket_id(now_micros)
+        Self::compute_bucket_id(crate::clock::now_micros())
     }
 
     /// Get or create a TableBuffer, returning a cached Arc reference.
     /// This is the preferred entry point for batch operations - cache the returned
     /// Arc<TableBuffer> and call insert_batch() directly to avoid repeated lookups.
     pub fn get_or_create_table(&self, project_id: &str, table_name: &str, schema: &SchemaRef) -> anyhow::Result<Arc<TableBuffer>> {
-        let key = Self::make_key(project_id, table_name);
+        let key = table_key(project_id, table_name);
+        let ensure_compatible = |existing: SchemaRef| -> anyhow::Result<()> {
+            if Arc::ptr_eq(&existing, schema) || schemas_compatible(&existing, schema) {
+                return Ok(());
+            }
+            warn!(
+                "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
+                project_id,
+                table_name,
+                existing.fields().len(),
+                schema.fields().len()
+            );
+            anyhow::bail!("Schema incompatible for {}.{}: field types don't match or new non-nullable field added", project_id, table_name)
+        };
 
         // Fast path: table exists
         if let Some(table) = self.tables.get(&key) {
-            let existing_schema = table.schema();
-            if !Arc::ptr_eq(&existing_schema, schema) && !schemas_compatible(&existing_schema, schema) {
-                warn!(
-                    "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
-                    project_id,
-                    table_name,
-                    existing_schema.fields().len(),
-                    schema.fields().len()
-                );
-                anyhow::bail!("Schema incompatible for {}.{}: field types don't match or new non-nullable field added", project_id, table_name);
-            }
+            ensure_compatible(table.schema())?;
             return Ok(Arc::clone(&table));
         }
 
         // Slow path: create table using entry API
-        let table = match self.tables.entry(key) {
+        match self.tables.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
-                let existing_schema = entry.get().schema();
-                if !Arc::ptr_eq(&existing_schema, schema) && !schemas_compatible(&existing_schema, schema) {
-                    anyhow::bail!("Schema incompatible for {}.{}: field types don't match or new non-nullable field added", project_id, table_name);
-                }
-                Arc::clone(entry.get())
+                ensure_compatible(entry.get().schema())?;
+                Ok(Arc::clone(entry.get()))
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let new_table = Arc::new(TableBuffer::new(schema.clone(), Arc::from(project_id), Arc::from(table_name)));
                 entry.insert(Arc::clone(&new_table));
-                new_table
+                Ok(new_table)
             }
-        };
-
-        Ok(table)
+        }
     }
 
     /// Get a TableBuffer if it exists (for read operations).
     fn get_table(&self, project_id: &str, table_name: &str) -> Option<Arc<TableBuffer>> {
-        let key = Self::make_key(project_id, table_name);
-        self.tables.get(&key).map(|t| Arc::clone(&t))
+        self.tables.get(&table_key(project_id, table_name)).map(|t| Arc::clone(&t))
     }
 
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
@@ -1146,7 +1129,7 @@ impl MemBuffer {
     /// marker can advance bucket-by-bucket as buckets drain (resumable replay)
     /// instead of freezing at the pre-recovery cursor.
     pub fn record_replay_hold(&self, project_id: &str, table_name: &str, timestamp_micros: i64, shard: usize, pos: walrus_rust::WalPosition) {
-        let key = Self::make_key(project_id, table_name);
+        let key = table_key(project_id, table_name);
         let Some(table) = self.tables.get(&key) else {
             return;
         };
@@ -1187,32 +1170,36 @@ impl MemBuffer {
     /// data. The flush path advances the read cursor to exactly this (or the
     /// write tail when no bucket holds a position).
     pub fn wal_holds(&self, project_id: &str, table_name: &str, shards_per_topic: usize) -> Vec<Option<walrus_rust::WalPosition>> {
-        let mut holds: Vec<Option<walrus_rust::WalPosition>> = vec![None; shards_per_topic];
-        if let Some(table) = self.get_table(project_id, table_name) {
-            for bucket in table.buckets.iter() {
-                for (shard, pos) in bucket.snapshot_wal_shard_state(shards_per_topic).into_iter().enumerate() {
-                    if let Some(pos) = pos {
-                        holds[shard] = Some(holds[shard].map_or(pos, |prev| prev.min(pos)));
-                    }
-                }
-            }
-        }
-        holds
+        let Some(table) = self.get_table(project_id, table_name) else { return vec![None; shards_per_topic] };
+        table.buckets.iter().fold(vec![None; shards_per_topic], |holds, bucket| {
+            holds
+                .into_iter()
+                .zip(bucket.snapshot_wal_shard_state(shards_per_topic))
+                .map(|(held, pos)| match (held, pos) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                })
+                .collect()
+        })
     }
 
     /// (project_id, table_name, bucket_id) for every bucket whose id passes
     /// `filter`. Drives the take-based flush paths.
     pub fn bucket_keys(&self, filter: impl Fn(i64) -> bool) -> Vec<(String, String, i64)> {
-        let mut out = Vec::new();
-        for t in self.tables.iter() {
-            let (project_id, table_name) = t.key();
-            for b in t.value().buckets.iter() {
-                if filter(*b.key()) {
-                    out.push((project_id.to_string(), table_name.to_string(), *b.key()));
-                }
-            }
-        }
-        out
+        self.tables
+            .iter()
+            .flat_map(|t| {
+                let (project_id, table_name) = t.key();
+                // Collect per table: the DashMap ref can't outlive this closure.
+                t.value()
+                    .buckets
+                    .iter()
+                    .map(|b| *b.key())
+                    .filter(|id| filter(*id))
+                    .map(|id| (project_id.to_string(), table_name.to_string(), id))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
@@ -1223,13 +1210,11 @@ impl MemBuffer {
         let schema = batches[0].schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
 
-        let mut total_delta = 0i64;
-        let mut touched_buckets: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        for batch in batches {
+        let (total_delta, touched_buckets) = batches.into_iter().try_fold((0i64, std::collections::HashSet::new()), |(delta, mut touched), batch| {
             let (sz, bucket_id) = table.insert_batch(batch, timestamp_micros, None)?;
-            total_delta += sz;
-            touched_buckets.insert(bucket_id);
-        }
+            touched.insert(bucket_id);
+            anyhow::Ok((delta + sz, touched))
+        })?;
         apply_signed_delta(&self.estimated_bytes, total_delta);
         for bucket_id in touched_buckets {
             self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
@@ -1253,15 +1238,10 @@ impl MemBuffer {
         let Some(node) = crate::tantivy_index::udf::PredNode::from_preds(preds) else {
             return Ok(None);
         };
-        let Some(table_schema) = crate::schema_loader::get_schema(table_name) else {
+        // Checking once here avoids the (always-None) per-bucket build.
+        let Some(table_schema) = crate::schema_loader::get_schema(table_name).filter(|s| has_indexed_fields(s)) else {
             return Ok(None);
         };
-        // Skip if the schema has no tantivy-indexed fields — the per-bucket
-        // build would just return None per-bucket anyway, but checking once
-        // here avoids the per-bucket overhead.
-        if !table_schema.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)) {
-            return Ok(None);
-        }
         let Some(table) = self.get_table(project_id, table_name) else {
             return Ok(None);
         };
@@ -1274,25 +1254,31 @@ impl MemBuffer {
         // dropped. For SQL routing use `query_partitioned_with_text_match`
         // which keeps snapshot+ids atomic per bucket. This method is kept
         // for tests + future read-only consumers (e.g. EXPLAIN).
-        let mut acc: Option<std::collections::HashSet<String>> = None;
-        let mut any_usable = false;
-        for bucket_entry in table.buckets.iter() {
-            let bucket_id = *bucket_entry.key();
-            let bucket = bucket_entry.value();
-            let key = Self::cache_key(project_id, table_name, bucket_id);
-            let (_snapshot, ids_opt) = self.search_with_snapshot(bucket, &key, table_schema, &node)?;
-            if let Some(ids) = ids_opt {
-                any_usable = true;
-                acc = Some(match acc.take() {
-                    None => ids,
-                    Some(mut prev) => {
-                        prev.extend(ids);
-                        prev
-                    }
-                });
-            }
-        }
-        if any_usable { Ok(acc) } else { Ok(None) }
+        // `None` = no bucket produced a usable index (caller falls back to the
+        // SQL predicate); `Some` = union of every usable bucket's hits.
+        table.buckets.iter().try_fold(None::<std::collections::HashSet<String>>, |acc, entry| {
+            let key = Self::cache_key(project_id, table_name, *entry.key());
+            let (_snapshot, ids) = self.search_with_snapshot(entry.value(), &key, table_schema, &node)?;
+            anyhow::Ok(match (acc, ids) {
+                (Some(mut prev), Some(ids)) => {
+                    prev.extend(ids);
+                    Some(prev)
+                }
+                (a, None) | (None, a) => a,
+            })
+        })
+    }
+
+    /// Any buffered rows for (project, table) whose timestamps could fall in
+    /// `[lo, hi]`? Bucket-granular (min/max check) — may report `true` for a
+    /// bucket whose actual rows all fall outside, which is the safe direction
+    /// for callers gating exact-count shortcuts.
+    pub fn has_rows_in_range(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> bool {
+        let Some(table) = self.get_table(project_id, table_name) else {
+            return false;
+        };
+        let range = (Some(lo), Some(hi));
+        table.buckets.iter().any(|b| b.value().row_count.load(Ordering::Relaxed) > 0 && bucket_overlaps_range(b.value(), &range))
     }
 
     /// Atomic MemBuffer query with text-match prefilter. For each bucket:
@@ -1306,106 +1292,18 @@ impl MemBuffer {
     ///
     /// When `node` is None or the table has no indexed fields, behaves
     /// exactly like `query_partitioned`.
-    /// Any buffered rows for (project, table) whose timestamps could fall in
-    /// `[lo, hi]`? Bucket-granular (min/max check) — may report `true` for a
-    /// bucket whose actual rows all fall outside, which is the safe direction
-    /// for callers gating exact-count shortcuts.
-    pub fn has_rows_in_range(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> bool {
-        let Some(table) = self.get_table(project_id, table_name) else {
-            return false;
-        };
-        let range = (Some(lo), Some(hi));
-        table.buckets.iter().any(|b| b.value().row_count.load(Ordering::Relaxed) > 0 && bucket_overlaps_range(b.value(), &range))
-    }
-
     #[instrument(skip(self, filters, node), fields(project_id, table_name))]
     pub fn query_partitioned_with_text_match(
         &self, project_id: &str, table_name: &str, filters: &[Expr], node: Option<&crate::tantivy_index::udf::PredNode>,
     ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
-        let Some(node) = node else {
-            return self.query_partitioned(project_id, table_name, filters);
-        };
-        let table_schema = crate::schema_loader::get_schema(table_name);
-        let has_indexed = table_schema.as_ref().is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)));
-        if !has_indexed {
-            return self.query_partitioned(project_id, table_name, filters);
-        }
-        let table_schema = table_schema.expect("has_indexed implies Some");
-
-        let mut partitions = Vec::new();
-        let ts_range = extract_timestamp_range(filters);
-
-        let Some(table) = self.get_table(project_id, table_name) else {
-            return Ok(partitions);
-        };
-        let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
-        let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
-        bucket_ids.sort();
-
-        for bucket_id in bucket_ids {
-            let Some(bucket) = table.buckets.get(&bucket_id) else { continue };
-            if !bucket_overlaps_range(&bucket, &ts_range) {
-                continue;
-            }
-            let key = Self::cache_key(project_id, table_name, bucket_id);
-            let (snapshot, ids_opt) = self.search_with_snapshot(&bucket, &key, table_schema, node)?;
-            if snapshot.is_empty() {
-                continue;
-            }
-
-            // Apply id IN ids (atomic with snapshot) when available; the
-            // rest of `filters` (including the original `=` / `LIKE` /
-            // `text_match` UDF call) runs afterwards via the compiled
-            // predicate. Without an id set, fall through to predicate-only.
-            let filtered: Vec<RecordBatch> = snapshot
-                .into_iter()
-                .filter_map(|b| {
-                    let b = if let Some(ids) = ids_opt.as_ref() { filter_batch_by_id_set(&b, ids) } else { b };
-                    if b.num_rows() == 0 {
-                        return None;
-                    }
-                    match &pred {
-                        Some(p) => {
-                            let out = apply_predicate(&b, p);
-                            (out.num_rows() > 0).then_some(out)
-                        }
-                        None => Some(b),
-                    }
-                })
-                .collect();
-
-            if !filtered.is_empty() {
-                partitions.push(filtered);
-            }
-        }
-        debug!("MemBuffer query_partitioned_with_text_match: project={}, table={}, partitions={}", project_id, table_name, partitions.len());
-        Ok(partitions)
+        // No preds or no indexed field ⇒ no prefilter ⇒ plain bucket scan.
+        self.scan_buckets(project_id, table_name, filters, crate::schema_loader::get_schema(table_name).filter(|s| has_indexed_fields(s)).zip(node))
     }
 
+    /// Flattened [`Self::query_partitioned`] — same rows, bucket partitioning dropped.
     #[instrument(skip(self, filters), fields(project_id, table_name))]
     pub fn query(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<Vec<RecordBatch>> {
-        let mut results = Vec::new();
-        let ts_range = extract_timestamp_range(filters);
-
-        if let Some(table) = self.get_table(project_id, table_name) {
-            // Pre-compile filters into a single physical predicate so each batch is
-            // filtered to matching rows before returning. Best-effort: anything that
-            // fails to compile is left for FilterExec on top to evaluate.
-            let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
-            for bucket_entry in table.buckets.iter() {
-                let bucket = bucket_entry.value();
-                if !bucket_overlaps_range(bucket, &ts_range) {
-                    continue;
-                }
-                // Hold the lock only long enough to clone Arc'd batch refs; release
-                // before filtering so writers / concurrent readers aren't blocked.
-                let snapshot: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
-                results.extend(filter_snapshot(snapshot, &pred));
-            }
-        }
-
-        debug!("MemBuffer query: project={}, table={}, batches={}", project_id, table_name, results.len());
-        Ok(results)
+        Ok(self.query_partitioned(project_id, table_name, filters)?.into_iter().flatten().collect())
     }
 
     /// Query and return partitioned data - one partition per time bucket.
@@ -1413,31 +1311,52 @@ impl MemBuffer {
     /// Optional filters enable timestamp-based bucket pruning.
     #[instrument(skip(self, filters), fields(project_id, table_name))]
     pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
-        let mut partitions = Vec::new();
+        self.scan_buckets(project_id, table_name, filters, None)
+    }
+
+    /// Bucket scan shared by both query entry points: prune by timestamp
+    /// range, snapshot each surviving bucket — atomically with its text-match
+    /// id set when `text` is given — then apply the compiled predicate.
+    /// Empty partitions are dropped.
+    fn scan_buckets(
+        &self, project_id: &str, table_name: &str, filters: &[Expr], text: Option<(&crate::schema_loader::TableSchema, &crate::tantivy_index::udf::PredNode)>,
+    ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
         let ts_range = extract_timestamp_range(filters);
+        let Some(table) = self.get_table(project_id, table_name) else { return Ok(Vec::new()) };
+        // Pre-compile filters into a single physical predicate so each batch is
+        // filtered to matching rows before returning. Best-effort: anything that
+        // fails to compile is left for FilterExec on top to evaluate.
+        let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
+        let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
+        bucket_ids.sort_unstable();
 
-        if let Some(table) = self.get_table(project_id, table_name) {
-            let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
-            let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
-            bucket_ids.sort();
+        let partitions = bucket_ids
+            .into_iter()
+            .filter_map(|bucket_id| table.buckets.get(&bucket_id).filter(|b| bucket_overlaps_range(b, &ts_range)).map(|b| (bucket_id, b)))
+            .map(|(bucket_id, bucket)| {
+                // Hold the lock only long enough to clone Arc'd batch refs (and,
+                // with a prefilter, to take the id set atomically with them);
+                // release before filtering so writers aren't blocked.
+                let (snapshot, ids) = match text {
+                    Some((schema, node)) => self.search_with_snapshot(&bucket, &Self::cache_key(project_id, table_name, bucket_id), schema, node)?,
+                    None => (bucket.batches.lock().to_vec(), None),
+                };
+                // Apply id IN ids (atomic with snapshot) when available; the
+                // rest of `filters` (including the original `=` / `LIKE` /
+                // `text_match` UDF call) runs afterwards via the compiled
+                // predicate. Without an id set, fall through to predicate-only.
+                let by_id = match ids {
+                    Some(ids) => snapshot.iter().map(|b| filter_batch_by_id_set(b, &ids)).filter(|b| b.num_rows() > 0).collect(),
+                    None => snapshot,
+                };
+                anyhow::Ok(filter_snapshot(by_id, &pred))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>();
 
-            for bucket_id in bucket_ids {
-                if let Some(bucket) = table.buckets.get(&bucket_id)
-                    && bucket_overlaps_range(&bucket, &ts_range)
-                {
-                    let snapshot: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
-                    if snapshot.is_empty() {
-                        continue;
-                    }
-                    let out = filter_snapshot(snapshot, &pred);
-                    if !out.is_empty() {
-                        partitions.push(out);
-                    }
-                }
-            }
-        }
-
-        debug!("MemBuffer query_partitioned: project={}, table={}, partitions={}", project_id, table_name, partitions.len());
+        debug!("MemBuffer scan_buckets: project={}, table={}, text_match={}, partitions={}", project_id, table_name, text.is_some(), partitions.len());
         Ok(partitions)
     }
 
@@ -1458,7 +1377,7 @@ impl MemBuffer {
             return Vec::new();
         };
         let current = Self::current_bucket_id();
-        let force_flushed = self.force_flushed.get(&Self::make_key(project_id, table_name));
+        let force_flushed = self.force_flushed.get(&table_key(project_id, table_name));
         let mut ranges: Vec<(i64, i64)> = table
             .buckets
             .iter()
@@ -1491,7 +1410,7 @@ impl MemBuffer {
             return None;
         }
         let mut wal_g = bucket.wal_shard_state.lock();
-        let batches: Vec<RecordBatch> = batches_g.iter().cloned().collect();
+        let batches: Vec<RecordBatch> = batches_g.to_vec();
         let wal_state = std::mem::take(&mut *wal_g);
         // Fence the snapshot prefix against insert-time coalesce (see field docs).
         bucket.flush_pinned_prefix.store(batches.len(), Ordering::Relaxed);
@@ -1500,17 +1419,13 @@ impl MemBuffer {
         let snapshot_gen = bucket.mutation_gen.load(Ordering::Relaxed);
         drop(wal_g);
         drop(batches_g);
-        let mut first_positions = vec![None; self.shards_per_topic];
-        for (i, p) in wal_state.first_positions.iter().take(self.shards_per_topic).enumerate() {
-            first_positions[i] = *p;
-        }
         Some(FlushableBucket {
             project_id: project_id.to_string(),
             table_name: table_name.to_string(),
             bucket_id,
             row_count: batches.iter().map(|b| b.num_rows()).sum(),
             batches,
-            wal_first_positions: first_positions,
+            wal_first_positions: pad_positions(&wal_state.first_positions, self.shards_per_topic),
             snapshot_gen,
             min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
             max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
@@ -1543,7 +1458,7 @@ impl MemBuffer {
     /// flush metrics only for drained buckets, since a dirty-kept bucket's
     /// rows are neither freed nor authoritative in Delta yet.
     pub fn finish_flushed_snapshot(&self, b: &FlushableBucket) -> bool {
-        let key = Self::make_key(&b.project_id, &b.table_name);
+        let key = table_key(&b.project_id, &b.table_name);
         // Source evaporated while airborne (evicted/reaped): the commit's
         // rows are durably in Delta and nothing remains to drain — count as
         // drained, same as the bucket-gone case below.
@@ -1602,8 +1517,7 @@ impl MemBuffer {
         if let Some((_, shell)) = &removed {
             sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
         }
-        let bucket_removed = removed.is_some();
-        if bucket_removed {
+        if removed.is_some() {
             if let Some(mut s) = self.force_flushed.get_mut(&key) {
                 s.remove(&b.bucket_id);
             }
@@ -1651,24 +1565,15 @@ impl MemBuffer {
     /// airborne DML pair isn't split; shells with an airborne snapshot are
     /// skipped.
     pub fn reap_expired_empty_buckets(&self, arrival_cutoff_micros: i64) -> usize {
+        let releasable = |b: &TimeBucket| b.batches.lock().is_empty() && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros;
         let mut reaped = 0usize;
         for table in self.tables.iter() {
-            let expired: Vec<i64> = table
-                .buckets
-                .iter()
-                .filter(|b| {
-                    b.batches.lock().is_empty()
-                        && b.flush_pinned_prefix.load(Ordering::Relaxed) == 0
-                        && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros
-                })
-                .map(|b| *b.key())
-                .collect();
+            let expired: Vec<i64> =
+                table.buckets.iter().filter(|b| releasable(b) && b.flush_pinned_prefix.load(Ordering::Relaxed) == 0).map(|b| *b.key()).collect();
             for id in expired {
                 // Re-check emptiness under the shard lock — a concurrent
                 // insert that repopulated the shell keeps it.
-                if let Some((_, shell)) =
-                    table.buckets.remove_if(&id, |_, b| b.batches.lock().is_empty() && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros)
-                {
+                if let Some((_, shell)) = table.buckets.remove_if(&id, |_, b| releasable(b)) {
                     // Residual bytes on a dropped shell must leave the total too.
                     sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
                     self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, id));
@@ -1741,19 +1646,13 @@ impl MemBuffer {
             sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
         }
 
-        // Pad to shards_per_topic so watermark indices line up.
-        let shards = self.shards_per_topic;
-        let mut first_positions = vec![None; shards];
-        for (i, p) in wal_state.first_positions.iter().take(shards).enumerate() {
-            first_positions[i] = *p;
-        }
         Some(FlushableBucket {
             project_id: project_id.to_string(),
             table_name: table_name.to_string(),
             bucket_id,
             batches,
             row_count,
-            wal_first_positions: first_positions,
+            wal_first_positions: pad_positions(&wal_state.first_positions, self.shards_per_topic),
             snapshot_gen: 0, // take removes rows; the gen check is snapshot-path-only
             min_timestamp,
             max_timestamp,
@@ -1794,17 +1693,8 @@ impl MemBuffer {
         let mut batches_g = bucket.batches.lock();
         let mut wal_g = bucket.wal_shard_state.lock();
         let added: usize = b.batches.iter().map(estimate_batch_size).sum();
-        for batch in &b.batches {
-            batches_g.push(batch.clone());
-        }
-        if wal_g.first_positions.len() < b.wal_first_positions.len() {
-            wal_g.first_positions.resize(b.wal_first_positions.len(), None);
-        }
-        for (i, p) in b.wal_first_positions.iter().enumerate() {
-            if let Some(pos) = p {
-                wal_g.first_positions[i] = Some(wal_g.first_positions[i].map_or(*pos, |prev| prev.min(*pos)));
-            }
-        }
+        batches_g.extend(b.batches.iter().cloned());
+        b.wal_first_positions.iter().enumerate().filter_map(|(i, p)| p.map(|p| (i, p))).for_each(|(i, pos)| wal_g.merge(i, pos));
         bucket.memory_bytes.fetch_add(added, Ordering::Relaxed);
         bucket.row_count.fetch_add(b.row_count, Ordering::Relaxed);
         // Replay the true range (monotonic widen) so restored rows stay visible
@@ -1824,15 +1714,7 @@ impl MemBuffer {
     /// Used by the eviction task to surface buckets that have aged past
     /// retention without being flushed (which means flushes are stuck).
     pub fn count_buckets_with_max_ts_before(&self, cutoff_micros: i64) -> usize {
-        let mut n = 0usize;
-        for t in self.tables.iter() {
-            for b in t.value().buckets.iter() {
-                if b.value().max_timestamp.load(Ordering::Relaxed) < cutoff_micros {
-                    n += 1;
-                }
-            }
-        }
-        n
+        self.tables.iter().map(|t| t.value().buckets.iter().filter(|b| b.value().max_timestamp.load(Ordering::Relaxed) < cutoff_micros).count()).sum()
     }
 
     #[instrument(skip(self))]
@@ -1863,16 +1745,9 @@ impl MemBuffer {
         // Drop empty TableBuffer entries so per-table metadata (schema Arc,
         // project/table name Arcs, DashMap shards) is reclaimed at scale.
         // `get_or_create_table` recreates a fresh entry on the next write.
-        let mut tables_dropped = 0usize;
-        for key in empty_table_keys {
-            if self.try_drop_empty_table(&key) {
-                tables_dropped += 1;
-            }
-        }
+        let tables_dropped = empty_table_keys.iter().filter(|key| self.try_drop_empty_table(key)).count();
 
-        if freed_bytes > 0 {
-            sub_saturating(&self.estimated_bytes, freed_bytes);
-        }
+        sub_saturating(&self.estimated_bytes, freed_bytes);
 
         // Evicted buckets can't mask Delta anymore — drop their marks too.
         self.force_flushed.retain(|_, s| {
@@ -1891,8 +1766,7 @@ impl MemBuffer {
 
     /// Check if a table exists in the buffer
     pub fn has_table(&self, project_id: &str, table_name: &str) -> bool {
-        let key = Self::make_key(project_id, table_name);
-        self.tables.contains_key(&key)
+        self.tables.contains_key(&table_key(project_id, table_name))
     }
 
     /// Delete rows matching the predicate from the buffer.
@@ -1911,62 +1785,45 @@ impl MemBuffer {
 
         let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props)).transpose()?;
 
-        let mut total_deleted = 0u64;
-        let mut total_freed = 0usize;
-
-        for mut bucket_entry in table.buckets.iter_mut() {
+        let (total_deleted, total_freed) = table.buckets.iter_mut().try_fold((0u64, 0usize), |(deleted, freed), mut bucket_entry| -> DFResult<_> {
             let bucket = bucket_entry.value_mut();
             let mut batches = bucket.batches.lock();
 
-            let mut new_batches = Vec::with_capacity(batches.len());
-            let mut bucket_freed = 0usize;
-            let mut bucket_rows_removed = 0usize;
-            for batch in batches.drain(..) {
-                let original_rows = batch.num_rows();
-                let original_size = estimate_batch_size(&batch);
-
-                let filtered_batch = if let Some(ref phys_pred) = physical_predicate {
-                    let result = phys_pred.evaluate(&batch)?;
-                    let mask = result.into_array(batch.num_rows())?;
-                    let bool_mask = mask
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?;
-                    // Invert mask: keep rows where predicate is FALSE
-                    let inverted = arrow::compute::not(bool_mask)?;
-                    filter_record_batch(&batch, &inverted)?
-                } else {
-                    // No predicate = delete all rows
-                    RecordBatch::new_empty(batch.schema())
-                };
-
-                let deleted = original_rows - filtered_batch.num_rows();
-                bucket_rows_removed += deleted;
-
-                if filtered_batch.num_rows() > 0 {
-                    let new_size = estimate_batch_size(&filtered_batch);
-                    bucket_freed += original_size.saturating_sub(new_size);
-                    new_batches.push(filtered_batch);
-                } else {
-                    bucket_freed += original_size;
-                }
-            }
+            let cap = batches.len();
+            let (new_batches, bucket_freed, rows_removed) =
+                batches.drain(..).try_fold((Vec::with_capacity(cap), 0usize, 0usize), |(mut kept, freed, removed), batch| -> DFResult<_> {
+                    let (rows, original_size) = (batch.num_rows(), estimate_batch_size(&batch));
+                    let survived = match physical_predicate.as_ref() {
+                        // Keep rows where the predicate is FALSE.
+                        Some(phys_pred) => {
+                            let mask = phys_pred.evaluate(&batch)?.into_array(rows)?;
+                            let mask = mask
+                                .as_any()
+                                .downcast_ref::<BooleanArray>()
+                                .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?;
+                            filter_record_batch(&batch, &arrow::compute::not(mask)?)?
+                        }
+                        // No predicate = delete all rows.
+                        None => RecordBatch::new_empty(batch.schema()),
+                    };
+                    let kept_rows = survived.num_rows();
+                    let freed = freed + if kept_rows > 0 { original_size.saturating_sub(estimate_batch_size(&survived)) } else { original_size };
+                    if kept_rows > 0 {
+                        kept.push(survived);
+                    }
+                    Ok((kept, freed, removed + rows - kept_rows))
+                })?;
 
             *batches = new_batches;
-            if bucket_rows_removed > 0 {
+            if rows_removed > 0 {
                 bucket.note_dml_mutation(wal_hold);
-                bucket.row_count.fetch_sub(bucket_rows_removed, Ordering::Relaxed);
+                bucket.row_count.fetch_sub(rows_removed, Ordering::Relaxed);
             }
-            if bucket_freed > 0 {
-                bucket_freed = sub_saturating(&bucket.memory_bytes, bucket_freed);
-            }
-            total_deleted += bucket_rows_removed as u64;
-            total_freed += bucket_freed;
-        }
+            // Mirror the CLAMPED bucket subtraction onto the MemBuffer total.
+            Ok((deleted + rows_removed as u64, freed + sub_saturating(&bucket.memory_bytes, bucket_freed)))
+        })?;
 
-        if total_freed > 0 {
-            sub_saturating(&self.estimated_bytes, total_freed);
-        }
+        sub_saturating(&self.estimated_bytes, total_freed);
 
         debug!("MemBuffer delete: project={}, table={}, rows_deleted={}", project_id, table_name, total_deleted);
         Ok(total_deleted)
@@ -2096,15 +1953,7 @@ impl MemBuffer {
             return Ok(0);
         };
         let target_schema = table.schema();
-
-        // Build widened schema: target fields + source fields prefixed `source__`,
-        // all nullable on the source side (rows without a matching source row
-        // produce NULLs in source columns).
-        let mut widened_fields: Vec<arrow::datatypes::Field> = target_schema.fields().iter().map(|f| (**f).clone()).collect();
-        for f in source.schema.fields() {
-            widened_fields.push(arrow::datatypes::Field::new(format!("source__{}", f.name()), f.data_type().clone(), true));
-        }
-        let widened_schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(widened_fields));
+        let widened_schema = widen_schema_with_source(target_schema.fields(), source.schema.fields());
         let widened_df_schema = DFSchema::try_from(widened_schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
@@ -2288,16 +2137,19 @@ impl MemBuffer {
                 // Preserved = rows NOT updated. Map the candidate-space predicate
                 // back to full-batch positions (candidates are the has_match rows
                 // in order), then one filter over the original batch.
-                let mut updated_full = vec![false; num_rows];
-                let mut c = 0usize;
-                for (i, u) in updated_full.iter_mut().enumerate() {
-                    if has_match.value(i) {
-                        if cand_pred.value(c) {
-                            *u = true;
-                        }
-                        c += 1;
-                    }
-                }
+                // The candidate cursor only advances on has_match rows —
+                // candidates are exactly those, in order (`&&` short-circuits).
+                let updated_full: Vec<bool> = (0..num_rows)
+                    .scan(0usize, |c, i| {
+                        Some(
+                            has_match.value(i) && {
+                                let hit = cand_pred.value(*c);
+                                *c += 1;
+                                hit
+                            },
+                        )
+                    })
+                    .collect();
                 let not_updated = arrow::compute::not(&BooleanArray::from(updated_full)).map_err(arrow_err)?;
                 let preserved = filter_record_batch(&batch, &not_updated).map_err(arrow_err)?;
 
@@ -2379,11 +2231,7 @@ impl MemBuffer {
         // Build the widened DFSchema the assignment SQL was originally parsed
         // against (target fields + source fields renamed with `source__`
         // prefix). Same shape as `update_with_source` constructs internally.
-        let mut widened_fields: Vec<arrow::datatypes::Field> = target_df_schema.fields().iter().map(|f| (**f).clone()).collect();
-        for f in source_batch.schema().fields() {
-            widened_fields.push(arrow::datatypes::Field::new(format!("source__{}", f.name()), f.data_type().clone(), true));
-        }
-        let widened_schema = Arc::new(arrow::datatypes::Schema::new(widened_fields));
+        let widened_schema = widen_schema_with_source(target_df_schema.fields(), source_batch.schema().fields());
         let widened_df_schema = DFSchema::try_from(widened_schema.as_ref().clone())?;
 
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &widened_df_schema, registry)).transpose()?;
@@ -2538,13 +2386,13 @@ impl TableBuffer {
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let new_size = estimate_batch_size(&batch);
-        // Accumulates every change this call makes to `bucket.memory_bytes`
-        // so the caller can mirror it exactly onto the MemBuffer total.
-        let mut net_delta = new_size as i64;
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
-        {
+        // Yields the coalesce's own change to `bucket.memory_bytes` (0 when it
+        // doesn't fire), which rides out in the returned net delta so the
+        // caller can mirror this call exactly onto the MemBuffer total.
+        let coalesce_delta: i64 = {
             let mut g = bucket.batches.lock();
             // Record the WAL cursor hold under the SAME lock as the batch
             // push: `take_bucket_for_flush` snapshots batches + holds under
@@ -2584,44 +2432,51 @@ impl TableBuffer {
             // either way. Propagating the error here used to leak the
             // pushed batch back to the caller as Err, who'd then retry
             // and insert a duplicate.
-            if g.len() > MAX_BATCH_COUNT_PER_BUCKET {
-                // Never fold across an airborne flush snapshot's prefix — see
-                // `flush_pinned_prefix` docs.
-                let pinned = bucket.flush_pinned_prefix.load(Ordering::Relaxed);
-                let mut tail_start = g.len();
-                while tail_start > pinned && estimate_batch_size(&g[tail_start - 1]) <= MAX_BATCH_BYTES_FOR_COALESCE {
-                    tail_start -= 1;
-                }
-                if g.len() - tail_start > MAX_BATCH_COUNT_PER_BUCKET {
-                    let schema = g[tail_start].schema();
-                    match arrow::compute::concat_batches(&schema, g[tail_start..].iter()) {
-                        Ok(combined) => {
-                            let folded_size: usize = g[tail_start..].iter().map(estimate_batch_size).sum();
-                            let combined_size = estimate_batch_size(&combined);
-                            g.truncate(tail_start);
-                            g.push(combined);
-                            // Read-modify-write via a signed delta, not
-                            // load+store: other paths (prefix drain) mutate
-                            // this atomic without holding `batches`, so a
-                            // store would clobber their subtraction. The
-                            // same delta rides out in `net_delta` so the
-                            // MemBuffer total tracks the shrinkage.
-                            let coalesce_delta = combined_size as i64 - folded_size as i64;
-                            apply_signed_delta(&bucket.memory_bytes, coalesce_delta);
-                            net_delta += coalesce_delta;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target = "mem_buffer",
-                                error = %e,
-                                bucket_batch_count = g.len(),
-                                "coalesce concat_batches failed; continuing without coalesce (bucket data intact)"
-                            );
-                        }
+            //
+            // The `g.len()` gate also keeps the tail-run scan (one
+            // `estimate_batch_size` per trailing batch) off every insert.
+            //
+            // Never fold across an airborne flush snapshot's prefix — see
+            // `flush_pinned_prefix` docs. Clamped: a DML can drop emptied
+            // batches while a snapshot is airborne, leaving `pinned > len`.
+            let pinned = bucket.flush_pinned_prefix.load(Ordering::Relaxed).min(g.len());
+            // First index of the trailing all-small run (never below `pinned`).
+            let tail_start = if g.len() > MAX_BATCH_COUNT_PER_BUCKET {
+                pinned + g[pinned..].iter().rposition(|b| estimate_batch_size(b) > MAX_BATCH_BYTES_FOR_COALESCE).map_or(0, |i| i + 1)
+            } else {
+                g.len()
+            };
+            if g.len() - tail_start <= MAX_BATCH_COUNT_PER_BUCKET {
+                0
+            } else {
+                let schema = g[tail_start].schema();
+                match arrow::compute::concat_batches(&schema, g[tail_start..].iter()) {
+                    Ok(combined) => {
+                        let folded_size: usize = g[tail_start..].iter().map(estimate_batch_size).sum();
+                        let combined_size = estimate_batch_size(&combined);
+                        g.truncate(tail_start);
+                        g.push(combined);
+                        // Read-modify-write via a signed delta, not load+store:
+                        // other paths (prefix drain) mutate this atomic without
+                        // holding `batches`, so a store would clobber their
+                        // subtraction. The same delta rides out to the caller so
+                        // the MemBuffer total tracks the shrinkage.
+                        let delta = combined_size as i64 - folded_size as i64;
+                        apply_signed_delta(&bucket.memory_bytes, delta);
+                        delta
+                    }
+                    Err(e) => {
+                        warn!(
+                            target = "mem_buffer",
+                            error = %e,
+                            bucket_batch_count = g.len(),
+                            "coalesce concat_batches failed; continuing without coalesce (bucket data intact)"
+                        );
+                        0
                     }
                 }
             }
-        }
+        };
         // `row_count` and the min/max timestamps update OUTSIDE the bucket
         // lock. This is intentional: a concurrent reader that snapshots the
         // batches Vec between the lock release and these atomic stores will
@@ -2645,7 +2500,7 @@ impl TableBuffer {
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
 
-        Ok((net_delta, bucket_id))
+        Ok((new_size as i64 + coalesce_delta, bucket_id))
     }
 }
 
@@ -2683,21 +2538,12 @@ impl TimeBucket {
         // time by `insert_batch`, so fetch_min can only keep the older value.
         self.first_wal_pin_micros.fetch_min(chrono::Utc::now().timestamp_micros(), Ordering::Relaxed);
         if let Some(pos) = pre_position {
-            let mut s = self.wal_shard_state.lock();
-            if s.first_positions.len() <= shard {
-                s.first_positions.resize(shard + 1, None);
-            }
-            s.first_positions[shard] = Some(s.first_positions[shard].map_or(pos, |prev| prev.min(pos)));
+            self.wal_shard_state.lock().merge(shard, pos);
         }
     }
 
     fn snapshot_wal_shard_state(&self, shards_per_topic: usize) -> Vec<Option<walrus_rust::WalPosition>> {
-        let s = self.wal_shard_state.lock();
-        let mut first_positions = vec![None; shards_per_topic];
-        for (i, p) in s.first_positions.iter().take(shards_per_topic).enumerate() {
-            first_positions[i] = *p;
-        }
-        first_positions
+        pad_positions(&self.wal_shard_state.lock().first_positions, shards_per_topic)
     }
 
     fn update_timestamps(&self, timestamp: i64) {
@@ -2707,10 +2553,9 @@ impl TimeBucket {
 
     /// Atomic snapshot of this bucket's batches + row count. Both come
     /// from the same lock acquisition so they're guaranteed consistent.
-    fn snapshot(&self) -> (Vec<arrow::record_batch::RecordBatch>, usize) {
-        let g = self.batches.lock();
-        let snap: Vec<arrow::record_batch::RecordBatch> = g.iter().cloned().collect();
-        let n: usize = snap.iter().map(|b| b.num_rows()).sum();
+    fn snapshot(&self) -> (Vec<RecordBatch>, usize) {
+        let snap = self.batches.lock().to_vec();
+        let n = snap.iter().map(|b| b.num_rows()).sum();
         (snap, n)
     }
 }
@@ -2729,7 +2574,7 @@ impl MemBuffer {
     /// SQL predicate on the snapshot.
     fn search_with_snapshot(
         &self, bucket: &TimeBucket, cache_key: &BucketCacheKey, table_schema: &crate::schema_loader::TableSchema, node: &crate::tantivy_index::udf::PredNode,
-    ) -> anyhow::Result<(Vec<arrow::record_batch::RecordBatch>, Option<std::collections::HashSet<String>>)> {
+    ) -> anyhow::Result<(Vec<RecordBatch>, Option<std::collections::HashSet<String>>)> {
         let (snapshot, snapshot_rows) = bucket.snapshot();
         if snapshot.is_empty() {
             return Ok((snapshot, None));
@@ -2742,21 +2587,22 @@ impl MemBuffer {
         // but-unflushed row (2026-07-05 review hardening). This also covers
         // hand-written `text_match(unindexed_col, ..)` reaching a bucket
         // index that has no such field.
-        let mut idx = self.cache_get(cache_key);
-        if idx.as_ref().is_none_or(|i| i.indexed_rows != snapshot_rows) {
-            let built = match crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, snapshot_rows) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("mem text index build failed (degrading to unfiltered snapshot): {e}");
+        let idx = match self.cache_get(cache_key).filter(|i| i.indexed_rows == snapshot_rows) {
+            Some(hit) => hit,
+            None => {
+                let built = match crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, snapshot_rows) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("mem text index build failed (degrading to unfiltered snapshot): {e}");
+                        return Ok((snapshot, None));
+                    }
+                };
+                let Some(built) = built else {
                     return Ok((snapshot, None));
-                }
-            };
-            let Some(built) = built else {
-                return Ok((snapshot, None));
-            };
-            idx = Some(self.cache_put(cache_key.clone(), Arc::new(built)));
-        }
-        let idx = idx.expect("idx is Some on this path");
+                };
+                self.cache_put(cache_key.clone(), Arc::new(built))
+            }
+        };
 
         // One combined boolean query. `collect_text_match_tree` only emits
         // OR nodes whose every branch is completely covered, so evaluating
@@ -3023,7 +2869,7 @@ mod tests {
             .unwrap();
             buffer.insert("p1", "t1", batch, ts).unwrap();
         }
-        let table = buffer.tables.get(&MemBuffer::make_key("p1", "t1")).unwrap();
+        let table = buffer.tables.get(&table_key("p1", "t1")).unwrap();
         let bucket = table.buckets.get(&MemBuffer::compute_bucket_id(ts)).unwrap();
         let g = bucket.batches.lock();
         let (n_batches, total_rows) = (g.len(), g.iter().map(|b| b.num_rows()).sum::<usize>());

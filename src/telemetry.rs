@@ -1,5 +1,6 @@
 use std::{sync::OnceLock, time::Duration};
 
+use anyhow::Context;
 use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
@@ -22,20 +23,17 @@ static LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 /// (messages up to 39MB → every export failed). 32 keeps a typical message
 /// ~2-3MB. See init_telemetry.
 const EXPORT_BATCH: usize = 32;
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
-    // Set global propagator for trace context
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     let otlp_endpoint = &config.otel_exporter_otlp_endpoint;
     info!("Initializing OpenTelemetry with OTLP endpoint: {}", otlp_endpoint);
 
-    // Configure service resource
     let service_name = &config.otel_service_name;
-    let service_version = &config.otel_service_version;
-
     let resource = Resource::builder()
-        .with_attributes([KeyValue::new("service.name", service_name.clone()), KeyValue::new("service.version", service_version.clone())])
+        .with_attributes([KeyValue::new("service.name", service_name.clone()), KeyValue::new("service.version", config.otel_service_version.clone())])
         .build();
 
     // Span export honors the standard OTEL_TRACES_EXPORTER=none switch. When on
@@ -51,8 +49,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         None
     } else {
         use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor};
-        let span_exporter =
-            opentelemetry_otlp::SpanExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(Duration::from_secs(10)).build()?;
+        let span_exporter = opentelemetry_otlp::SpanExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(EXPORT_TIMEOUT).build()?;
         let span_processor = BatchSpanProcessor::builder(span_exporter)
             .with_batch_config(BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
             .build();
@@ -71,36 +68,25 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // from client-side error strings because TF only logged to stdout).
     // The bridge must not observe the exporter's own tracing output —
     // tonic/hyper events inside an export would recurse into another export.
-    let log_exporter = opentelemetry_otlp::LogExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(Duration::from_secs(10)).build()?;
+    let log_exporter = opentelemetry_otlp::LogExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(EXPORT_TIMEOUT).build()?;
     // Slow-statement logs also carry full SQL text, so cap the log batch too
     // (same 4MB-limit reasoning as spans above).
     let log_processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(log_exporter)
         .with_batch_config(opentelemetry_sdk::logs::BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
         .build();
     let logger_provider = SdkLoggerProvider::builder().with_log_processor(log_processor).with_resource(resource).build();
-    let log_bridge =
-        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-            let t = meta.target();
-            !(t.starts_with("opentelemetry") || t.starts_with("tonic") || t.starts_with("h2") || t.starts_with("hyper"))
-        }));
+    let log_bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider)
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| !["opentelemetry", "tonic", "h2", "hyper"].iter().any(|p| meta.target().starts_with(p))));
     let _ = LOGGER_PROVIDER.set(logger_provider);
 
-    // Get log filter from environment
     // Tantivy emits an INFO event for every segment operation; recovery bursts
     // otherwise flood stdout and OTLP with merge/GC internals.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn"));
 
-    // Initialize tracing subscriber with telemetry and formatting layers
-    let is_json = config.is_json_logging();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_thread_names(true);
+    let fmt_layer = if config.is_json_logging() { fmt_layer.json().boxed() } else { fmt_layer.boxed() };
 
-    let subscriber = Registry::default().with(env_filter).with(telemetry_layer).with(log_bridge);
-
-    if is_json {
-        subscriber.with(tracing_subscriber::fmt::layer().json().with_target(true).with_thread_ids(true).with_thread_names(true)).try_init()
-    } else {
-        subscriber.with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_thread_names(true)).try_init()
-    }
-    .map_err(|e| anyhow::anyhow!("Failed to set tracing subscriber: {}", e))?;
+    Registry::default().with(env_filter).with(telemetry_layer).with(log_bridge).with(fmt_layer).try_init().context("failed to set tracing subscriber")?;
 
     info!("OpenTelemetry initialized successfully with service name: {}", service_name);
 
@@ -146,11 +132,14 @@ pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<Str
     }
 
     let opts = FormatOptions::default();
+    let schema = batch.schema();
     let formatters = batch.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &opts)).collect::<Result<Vec<_>, _>>()?;
+    // Imperative: every cell writes through `Capped`, which borrows `out` mutably.
     let mut out = String::new();
     for row in 0..batch.num_rows() {
-        for (formatter, field) in formatters.iter().zip(batch.schema().fields()) {
-            let _ = write!(out, "{}=", field.name());
+        for (formatter, field) in formatters.iter().zip(schema.fields()) {
+            out.push_str(field.name());
+            out.push('=');
             let mut w = Capped { buf: &mut out, left: PREVIEW_CELL_CAP };
             if write!(w, "{}", formatter.value(row)).is_err() {
                 out.push('…');
@@ -179,9 +168,8 @@ mod tests {
     #[test]
     fn capped_preview_bounds_giant_cells() {
         let mut list = ListBuilder::new(StringBuilder::new());
-        for _ in 0..10_000 {
-            list.values().append_value("x".repeat(100));
-        }
+        let cell = "x".repeat(100);
+        (0..10_000).for_each(|_| list.values().append_value(&cell));
         list.append(true);
         let names = StringArray::from(vec!["row1"]);
         let batch = RecordBatch::try_from_iter([

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::OnceLock, time::Duration};
 
 use serde::Deserialize;
 
@@ -19,14 +19,16 @@ const GIB: usize = 1024 * 1024 * 1024;
 // can be reproduced without a container.
 // ---------------------------------------------------------------------------
 
+/// Read a `/proc` or `/sys` file and parse it; `None` if either step fails —
+/// every detector below is a fallback chain over these.
+fn read_parsed<T>(path: &str, parse: impl FnOnce(&str) -> Option<T>) -> Option<T> {
+    std::fs::read_to_string(path).ok().and_then(|s| parse(&s))
+}
+
 /// Parse cgroup v2 `memory.max` content. Returns `None` for `"max"`
-/// (unlimited) or unparseable content — caller falls back.
+/// (unlimited, which simply fails to parse) or garbage — caller falls back.
 fn parse_cgroup_v2_memory_max(content: &str) -> Option<usize> {
-    let t = content.trim();
-    if t == "max" {
-        return None;
-    }
-    t.parse::<usize>().ok()
+    content.trim().parse().ok()
 }
 
 /// Parse cgroup v1 `memory.limit_in_bytes` content. v1 reports a huge
@@ -45,58 +47,49 @@ fn parse_meminfo_total_bytes(content: &str) -> Option<usize> {
 /// Parse cgroup v2 `cpu.max` content (`"<quota> <period>"` or `"max
 /// <period>"`) into a whole-core count, rounded up. `None` for unlimited.
 fn parse_cgroup_cpu_max(content: &str) -> Option<usize> {
+    // `mut` is the iterator's own cursor — two positional fields, no collection.
     let mut parts = content.split_whitespace();
-    let quota = parts.next()?;
-    let period = parts.next()?.parse::<f64>().ok()?;
-    if quota == "max" || period <= 0.0 {
-        return None;
-    }
-    let quota = quota.parse::<f64>().ok()?;
-    Some(((quota / period).ceil() as usize).max(1))
+    let (quota, period) = (parts.next()?.parse::<f64>().ok()?, parts.next()?.parse::<f64>().ok()?);
+    (quota > 0.0 && period > 0.0).then(|| ((quota / period).ceil() as usize).max(1))
 }
 
 /// Detect the effective memory limit in bytes: cgroup v2 → cgroup v1 →
 /// `/proc/meminfo` total → a conservative 8 GiB floor. Never panics.
 fn detect_memory_limit_bytes() -> usize {
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-        && let Some(v) = parse_cgroup_v2_memory_max(&s)
-    {
-        return v;
-    }
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        && let Some(v) = parse_cgroup_v1_memory_limit(&s)
-    {
-        return v;
-    }
-    // No cgroup limit → not a managed container. An explicit env override is
-    // safe to honor HERE and only here (off-box CLI / dev boxes): prod always
-    // runs under a cgroup, so the 2026-06-11 misconfigured-knob OOM-loop
-    // cannot recur through this path.
-    if let Some(v) = env_memory_override_bytes() {
-        tracing::warn!("budget tree: no cgroup limit; using TIMEFUSION_MEMORY_LIMIT_GB override ({} GiB)", v / GIB);
-        return v;
-    }
-    if let Ok(s) = std::fs::read_to_string("/proc/meminfo")
-        && let Some(v) = parse_meminfo_total_bytes(&s)
-    {
-        // No cgroup limit → shared host: budget HALF the machine, loudly.
-        // Sizing from full host RAM inside a container is the 2026-06-11
-        // memcg OOM-loop (16 kills/24h), so the fallback stays conservative.
-        tracing::warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / 2 / GIB);
-        return v / 2;
-    }
-    // macOS (dev / off-box CLI): same shared-host half-the-machine rule.
-    #[cfg(target_os = "macos")]
-    {
-        let mem =
-            sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory() as usize;
-        if mem > 0 {
-            tracing::warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", mem / 2 / GIB);
-            return mem / 2;
-        }
-    }
-    tracing::warn!("budget tree: could not detect memory limit from cgroup or /proc/meminfo; falling back to 8 GiB");
-    8 * GIB
+    read_parsed("/sys/fs/cgroup/memory.max", parse_cgroup_v2_memory_max)
+        .or_else(|| read_parsed("/sys/fs/cgroup/memory/memory.limit_in_bytes", parse_cgroup_v1_memory_limit))
+        // No cgroup limit → not a managed container. An explicit env override is
+        // safe to honor HERE and only here (off-box CLI / dev boxes): prod always
+        // runs under a cgroup, so the 2026-06-11 misconfigured-knob OOM-loop
+        // cannot recur through this path.
+        .or_else(|| {
+            env_memory_override_bytes().inspect(|v| tracing::warn!("budget tree: no cgroup limit; using TIMEFUSION_MEMORY_LIMIT_GB override ({} GiB)", v / GIB))
+        })
+        // Shared host: budget HALF the machine, loudly. Sizing from full host
+        // RAM inside a container is the 2026-06-11 memcg OOM-loop (16
+        // kills/24h), so the fallback stays conservative.
+        .or_else(|| {
+            read_parsed("/proc/meminfo", parse_meminfo_total_bytes)
+                .map(|v| v / 2)
+                .inspect(|v| tracing::warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / GIB))
+        })
+        // macOS (dev / off-box CLI): same shared-host half-the-machine rule.
+        .or_else(|| {
+            #[cfg(target_os = "macos")]
+            let macos = Some(
+                sysinfo::System::new_with_specifics(sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything())).total_memory() as usize
+                    / 2,
+            )
+            .filter(|half| *half > 0)
+            .inspect(|half| tracing::warn!("budget tree: no cgroup; deriving from HALF of host RAM ({} GiB)", half / GIB));
+            #[cfg(not(target_os = "macos"))]
+            let macos = None;
+            macos
+        })
+        .unwrap_or_else(|| {
+            tracing::warn!("budget tree: could not detect memory limit from cgroup or /proc/meminfo; falling back to 8 GiB");
+            8 * GIB
+        })
 }
 
 /// `TIMEFUSION_MEMORY_LIMIT_GB`, parsed. Consulted ONLY when no cgroup limit
@@ -129,29 +122,25 @@ fn env_memory_budget_bytes() -> Option<usize> {
 fn detect_memory_limit_clamped() -> usize {
     // A v1 "no limit" sentinel or an over-committed cgroup can report more than
     // physical RAM; clamp so the tree never budgets memory the host lacks.
-    let host = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| parse_meminfo_total_bytes(&s)).unwrap_or(usize::MAX);
-    detect_memory_limit_bytes().min(host)
+    let detected = detect_memory_limit_bytes();
+    read_parsed("/proc/meminfo", parse_meminfo_total_bytes).map_or(detected, |host| detected.min(host))
 }
 
 /// Detect available cores: cgroup v2 `cpu.max` quota/period → OS-reported
 /// parallelism → a 4-core floor. Never panics.
 pub(crate) fn detect_cores() -> usize {
-    let host = std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(4);
+    let host = std::thread::available_parallelism().map(NonZeroUsize::get).unwrap_or(4);
+    let read_i64 = |p: &str| read_parsed(p, |s| s.trim().parse::<i64>().ok());
     // cgroup v2 `cpu.max`, then v1 `cfs_quota_us`/`cfs_period_us`; a quota can
     // exceed host parallelism on misconfigured hosts, so clamp. THE process-wide
-    // core detector — autotune's `detected_query_partitions` reads it too, so
+    // core detector — `autotune::apply` reads it too, so
     // partitions and the budget tree can never size from different answers.
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")
-        && let Some(c) = parse_cgroup_cpu_max(&s)
-    {
-        return c.clamp(1, host);
-    }
-    let v1 = || {
-        let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?.trim().parse::<i64>().ok()?;
-        let period = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?.trim().parse::<i64>().ok()?;
-        (quota > 0 && period > 0).then(|| ((quota as f64 / period as f64).ceil() as usize).max(1))
-    };
-    v1().map_or(host, |c| c.clamp(1, host))
+    read_parsed("/sys/fs/cgroup/cpu.max", parse_cgroup_cpu_max)
+        .or_else(|| {
+            let (quota, period) = (read_i64("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")?, read_i64("/sys/fs/cgroup/cpu/cpu.cfs_period_us")?);
+            (quota > 0 && period > 0).then(|| ((quota as f64 / period as f64).ceil() as usize).max(1))
+        })
+        .map_or(host, |c| c.clamp(1, host))
 }
 
 /// Self-sizing memory/concurrency budget derived once at startup from the
@@ -171,9 +160,9 @@ pub struct DerivedBudget {
     maintenance_pool_bytes: usize,
 }
 
+const QUERY_POOL_FRACTION: f64 = 0.25;
 /// Ingest MemBuffer share of the limit. Reproduces today's working ratio
 /// (24 GiB of a 120 GiB box).
-const QUERY_POOL_FRACTION: f64 = 0.25;
 const INGEST_BUFFER_FRACTION: f64 = 0.20;
 /// Foyer read-cache share. Doc: today's 4 GiB of 120 is the most-starved
 /// consumer relative to impact (cache hit-rate is what seal-lag/thrash
@@ -191,7 +180,7 @@ const OPTIMIZE_MERGE_TASKS: usize = 2;
 /// exactly when compaction is most needed (SortPreservingMerge exhaustion
 /// 2026-07-23, OOM #3 2026-07-27). 32 × ~35MB batches ≈ ~1GB peak per
 /// merge; repeated cron passes converge fragmented partitions to target.
-const OPTIMIZE_MAX_FILES_PER_BIN: usize = 32;
+const OPTIMIZE_MAX_FILES_PER_BIN: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 /// Concurrent heavy maintenance rewrites (dedup/optimize/recompress).
 /// Formerly `TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY`; kept at the
 /// proven-safe 2 rather than re-derived (06-11 OOM was uncapped concurrency,
@@ -210,6 +199,19 @@ const PER_SORT_BUDGET_BYTES: usize = 4 * GIB;
 const HEAVY_MIN_SHARE: f64 = 0.25;
 /// Floor so a tiny box never zeroes the maintenance pool.
 const MAINTENANCE_FLOOR_BYTES: usize = GIB;
+
+/// The number the whole tree derives from: the detected limit, LOWERED by an
+/// operator request — budgeting above the cgroup is never valid, so an
+/// over-large request is clamped rather than honoured.
+fn effective_limit(detected: usize, requested: Option<usize>) -> usize {
+    requested.map_or(detected, |b| b.min(detected))
+}
+
+impl Default for DerivedBudget {
+    fn default() -> Self {
+        Self::from_limits(8 * GIB, 4)
+    }
+}
 
 impl DerivedBudget {
     /// Pure derivation over an already-detected limit/core count — the seam
@@ -236,8 +238,7 @@ impl DerivedBudget {
     /// is `TIMEFUSION_MEMORY_BUDGET_GB`, which can lower (never raise) the one
     /// number the whole tree derives from — see `env_memory_budget_bytes`.
     pub fn compute() -> Self {
-        let detected = detect_memory_limit_clamped();
-        Self::from_limits(env_memory_budget_bytes().map_or(detected, |b| b.min(detected)), detect_cores())
+        Self::from_limits(effective_limit(detect_memory_limit_clamped(), env_memory_budget_bytes()), detect_cores())
     }
 
     pub fn query_pool_bytes(&self) -> usize {
@@ -294,8 +295,8 @@ impl DerivedBudget {
 
     /// Files-per-bin cap for every optimize rewrite (see const doc).
     /// PINNED CONSTANT — bounds per-merge memory regardless of box size.
-    pub fn optimize_max_files_per_bin(&self) -> std::num::NonZeroUsize {
-        std::num::NonZeroUsize::new(OPTIMIZE_MAX_FILES_PER_BIN).expect("cap is non-zero")
+    pub fn optimize_max_files_per_bin(&self) -> NonZeroUsize {
+        OPTIMIZE_MAX_FILES_PER_BIN
     }
 
     /// PINNED CONSTANT (not box-derived): empirical sort peak, tighten after
@@ -362,8 +363,9 @@ impl DerivedBudget {
     /// hard-limit backpressure path could ever engage, which is exactly the
     /// preemption the e2e backpressure test exists to catch (it did).
     pub fn wal_flush_file_threshold(&self) -> usize {
-        let baseline_buffer = 24 * GIB;
-        (200.0 * (self.ingest_buffer_bytes as f64 / baseline_buffer as f64)).round().max(200.0) as usize
+        const BASELINE_BUFFER_BYTES: usize = 24 * GIB;
+        const BASELINE_FILES: f64 = 200.0;
+        (BASELINE_FILES * (self.ingest_buffer_bytes as f64 / BASELINE_BUFFER_BYTES as f64)).round().max(BASELINE_FILES) as usize
     }
 }
 
@@ -396,8 +398,6 @@ pub fn log_derived_budget(b: &DerivedBudget) {
 pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
     // See: https://github.com/softprops/envy/issues/26
-    let memory: MemoryConfig = envy::from_env()?;
-    let derived = DerivedBudget::compute();
     Ok(AppConfig {
         aws: envy::from_env()?,
         core: envy::from_env()?,
@@ -405,10 +405,10 @@ pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
         cache: envy::from_env()?,
         parquet: envy::from_env()?,
         maintenance: envy::from_env()?,
-        memory,
+        memory: envy::from_env()?,
         telemetry: envy::from_env()?,
         tantivy: envy::from_env()?,
-        derived,
+        derived: DerivedBudget::compute(),
     })
 }
 
@@ -417,10 +417,11 @@ pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(cfg);
     }
-    let mut config = load_config_from_env()?;
-    crate::autotune::apply(&mut config);
-    let _ = CONFIG.set(config);
-    Ok(CONFIG.get().unwrap())
+    // `&mut` is autotune's API (cross-module), so the mutation stays here.
+    let mut cfg = load_config_from_env()?;
+    crate::autotune::apply(&mut cfg);
+    let _ = CONFIG.set(cfg);
+    Ok(config())
 }
 
 /// Get global config. Panics if not initialized.
@@ -446,51 +447,12 @@ pub fn set_config_for_test(cfg: AppConfig) {
 /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
 /// paths gate their fail-secure defaults on this flag.
 pub fn is_insecure_auth_allowed() -> bool {
-    std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false)
+    std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-// Macro to generate const default functions for serde
+// serde `default = "..."` needs a fn per default value. The owned-type arms
+// convert (`&str` → String/PathBuf); everything else returns the literal.
 macro_rules! const_default {
-    ($name:ident: bool = $val:expr) => {
-        fn $name() -> bool {
-            $val
-        }
-    };
-    ($name:ident: u64 = $val:expr) => {
-        fn $name() -> u64 {
-            $val
-        }
-    };
-    ($name:ident: u16 = $val:expr) => {
-        fn $name() -> u16 {
-            $val
-        }
-    };
-    ($name:ident: u32 = $val:expr) => {
-        fn $name() -> u32 {
-            $val
-        }
-    };
-    ($name:ident: i32 = $val:expr) => {
-        fn $name() -> i32 {
-            $val
-        }
-    };
-    ($name:ident: i64 = $val:expr) => {
-        fn $name() -> i64 {
-            $val
-        }
-    };
-    ($name:ident: usize = $val:expr) => {
-        fn $name() -> usize {
-            $val
-        }
-    };
-    ($name:ident: f64 = $val:expr) => {
-        fn $name() -> f64 {
-            $val
-        }
-    };
     ($name:ident: String = $val:expr) => {
         fn $name() -> String {
             $val.into()
@@ -501,9 +463,13 @@ macro_rules! const_default {
             PathBuf::from($val)
         }
     };
+    ($name:ident: $t:ty = $val:expr) => {
+        fn $name() -> $t {
+            $val
+        }
+    };
 }
 
-// All default value functions using the macro
 const_default!(d_true: bool = true);
 const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
 const_default!(d_data_dir: PathBuf = "./data");
@@ -644,7 +610,7 @@ const_default!(d_provider_cache_capacity: usize = 4_096);
 const_default!(d_foyer_shards: usize = 8);
 const_default!(d_foyer_file_size_mb: usize = 32);
 const_default!(d_foyer_stats: String = "true");
-const_default!(d_metadata_size_hint: usize = 1_048_576);
+const_default!(d_metadata_size_hint: usize = MIB);
 // DataFusion's in-process decoded-parquet-metadata cache (footer + page index).
 // Distinct from the Foyer footer-BYTES cache: this holds the decoded
 // ParquetMetaData so repeat scans skip re-parsing. Entries larger than the
@@ -679,14 +645,14 @@ const_default!(d_zstd_level_warm: i32 = 9);
 const_default!(d_zstd_level_cold: i32 = 19);
 const_default!(d_cold_cutoff_days: u64 = 14);
 const_default!(d_recompress_schedule: String = "0 0 3 * * *");
-const_default!(d_row_group_size: usize = 134_217_728); // 128MB
+const_default!(d_row_group_size: usize = 128 * MIB);
 const_default!(d_checkpoint_interval: u64 = 10);
 // 256MB compacted-file target: fewer, larger files cut Delta metadata, S3
 // object count, and the per-commit get_file_uris() walk on the flush append
 // path; sorted + page-indexed files still prune time-range queries within a
 // file, so the query downside is minimal for this (project_id,date)-partitioned
 // workload. Light/today optimize keeps its own 16MB target.
-const_default!(d_optimize_target: i64 = 256 * 1024 * 1024);
+const_default!(d_optimize_target: i64 = 256 * MIB as i64);
 // Cold tier: sealed partitions (older than `cold_optimize_after_days`) bin-pack
 // to 1GB. File size grows with partition age — recent days stay at 256MB (less
 // rewrite while the day still fills), sealed days consolidate to 1GB so the
@@ -694,7 +660,7 @@ const_default!(d_optimize_target: i64 = 256 * 1024 * 1024);
 // commit latency. Compression is per-row-group, so 1GB files don't change bytes
 // stored — the win is fewer files (smaller checkpoint, fewer S3 objects, cheaper
 // query planning). Re-runs are cheap: Compact skips files already ≥ target.
-const_default!(d_cold_optimize_target: i64 = 1024 * 1024 * 1024);
+const_default!(d_cold_optimize_target: i64 = GIB as i64);
 // 1 day = everything past the current (day-partitioned) partition. Only today
 // still takes writes, so every sealed day consolidates to 1GB. The warm
 // optimize is clamped to dates newer than this boundary (see `optimize_table`)
@@ -731,8 +697,8 @@ const_default!(d_compact_min_files: usize = 5);
 // high-write project — recent 1h/3h queries were file-OPEN-latency bound (~62
 // opens ≈ 1.2s). A larger target collapses today's sealed slices into a few
 // large event-time-disjoint runs so recent queries open a handful of files.
-const_default!(d_light_optimize_target: i64 = 256 * 1024 * 1024);
-const_default!(d_sort_skip_bytes: usize = 256 * 1024 * 1024);
+const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
+const_default!(d_sort_skip_bytes: usize = 256 * MIB);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
@@ -769,10 +735,10 @@ const_default!(d_snapshot_reconcile: u64 = 500);
 // correct, and the skip metric (timefusion.dedup.chunk_skipped) surfaces the
 // debt. Guards against e.g. a z-ordered whole-day file (1GB+ on disk, several
 // GB decompressed × copies) dragging the whole day into one rewrite.
-const_default!(d_dedup_max_rewrite_bytes: u64 = 2 * 1024 * 1024 * 1024);
+const_default!(d_dedup_max_rewrite_bytes: u64 = 2 * GIB as u64);
 // 4 GiB estimated decoded footprint — a single chunk this large already
 // dwarfs the DataFusion pool; larger chunks skip rather than risk the cgroup.
-const_default!(d_dedup_max_decoded_bytes: u64 = 4 * 1024 * 1024 * 1024);
+const_default!(d_dedup_max_decoded_bytes: u64 = 4 * GIB as u64);
 // 12× compressed→decoded: zstd on wide Variant/JSON otel rows routinely
 // decodes 10-20×; 12 is a deliberately conservative floor.
 const_default!(d_dedup_decode_inflation: u64 = 12);
@@ -789,7 +755,6 @@ const_default!(d_dirty_bin_drain_batch: usize = 32);
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
 // Arbitrarily-late replays still need read-side dedup — see the parity plan.
 const_default!(d_dedup_lookback_days: u64 = 1);
-const_default!(d_false: bool = false);
 const_default!(d_query_partitions: usize = 0);
 // Wide-scan admission guard. 16 concurrent Parquet decoders bounds untracked
 // decode heap well under the 25 GB pool on the 188 GB/48-core box (48-way was
@@ -802,9 +767,7 @@ const_default!(d_wide_scan_lookback_hours: u64 = 2);
 const_default!(d_plan_cache_capacity: usize = 2048);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
-fn d_service_version() -> String {
-    env!("CARGO_PKG_VERSION").into()
-}
+const_default!(d_service_version: String = env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -832,12 +795,6 @@ pub struct AppConfig {
     /// knob has been dead since the tree landed.
     #[serde(skip)]
     pub derived: DerivedBudget,
-}
-
-impl Default for DerivedBudget {
-    fn default() -> Self {
-        Self::from_limits(8 * GIB, 4)
-    }
 }
 
 const_default!(d_tantivy_max_index_mb: u64 = 64);
@@ -913,22 +870,19 @@ impl TantivyConfig {
     /// Tables to index: schemas with `tantivy.indexed: true` on any field.
     /// Computed once from the static registry on first access (the registry
     /// is compiled-in YAML, so there's nothing to invalidate).
-    fn indexed_set() -> &'static std::collections::HashSet<String> {
-        static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    /// `BTreeSet` so `indexed_tables` is sorted by construction.
+    fn indexed_set() -> &'static std::collections::BTreeSet<String> {
+        static SET: OnceLock<std::collections::BTreeSet<String>> = OnceLock::new();
         SET.get_or_init(|| {
-            crate::schema_loader::registry()
-                .list_tables()
+            let reg = crate::schema_loader::registry();
+            reg.list_tables()
                 .into_iter()
-                .filter(|name| {
-                    crate::schema_loader::registry().get(name).is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)))
-                })
+                .filter(|name| reg.get(name).is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed))))
                 .collect()
         })
     }
     pub fn indexed_tables(&self) -> Vec<String> {
-        let mut v: Vec<String> = Self::indexed_set().iter().cloned().collect();
-        v.sort();
-        v
+        Self::indexed_set().iter().cloned().collect()
     }
     pub fn is_table_indexed(&self, table: &str) -> bool {
         Self::indexed_set().contains(table)
@@ -992,19 +946,21 @@ pub struct AwsConfig {
     pub timefusion_s3_log_request_timeout: Option<String>,
 }
 
-/// Coerce a bare-number timeout (e.g. `"150"`) to humantime seconds (`"150s"`).
-/// object_store's `ClientConfigKey::{ConnectTimeout,Timeout}` parse strictly via
-/// humantime and PANIC the process at boot on a unitless value — a prod
-/// `TIMEFUSION_S3_CONNECT_TIMEOUT=150` crash-looped TF on 2026-06-24. Treat an
-/// all-digit string as seconds; pass anything with a unit through untouched.
 /// Warm-connection pool size per host, shared by both object-store client
 /// construction paths. 128 gives headroom above the ~48-way query scan fanout
 /// so concurrent GETs reuse sockets instead of re-doing TLS (the connection
 /// starvation that failed the 2026-06-24 compaction under load).
 pub(crate) const S3_POOL_MAX_IDLE_PER_HOST: usize = 128;
 
-fn normalize_duration(s: String) -> String {
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) { format!("{s}s") } else { s }
+/// Effective timeout for a configured value, coercing a bare number (e.g.
+/// `"150"`) to humantime seconds (`"150s"`). object_store's
+/// `ClientConfigKey::{ConnectTimeout,Timeout}` parse strictly via humantime and
+/// PANIC the process at boot on a unitless value — a prod
+/// `TIMEFUSION_S3_CONNECT_TIMEOUT=150` crash-looped TF on 2026-06-24. Treat an
+/// all-digit string as seconds; pass anything with a unit through untouched.
+fn normalize_duration(configured: Option<&str>, default: &str) -> String {
+    let s = configured.unwrap_or(default);
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) { format!("{s}s") } else { s.to_owned() }
 }
 
 impl AwsConfig {
@@ -1012,11 +968,11 @@ impl AwsConfig {
     /// a generous bound only matters when something is wrong, where it trades
     /// slower failure for surviving transient R2 connection refusals.
     pub fn connect_timeout(&self) -> String {
-        normalize_duration(self.timefusion_s3_connect_timeout.clone().unwrap_or_else(|| "60s".into()))
+        normalize_duration(self.timefusion_s3_connect_timeout.as_deref(), "60s")
     }
 
     pub fn request_timeout(&self) -> String {
-        normalize_duration(self.timefusion_s3_request_timeout.clone().unwrap_or_else(|| "900s".into()))
+        normalize_duration(self.timefusion_s3_request_timeout.as_deref(), "900s")
     }
 
     /// Effective per-request bound for the commit-log request class — see
@@ -1024,35 +980,30 @@ impl AwsConfig {
     /// `request_timeout`: an operator raising it above the data bound is a
     /// deliberate act, and the two classes are independent by design.
     pub fn log_request_timeout(&self) -> String {
-        normalize_duration(self.timefusion_s3_log_request_timeout.clone().unwrap_or_else(|| "30s".into()))
+        normalize_duration(self.timefusion_s3_log_request_timeout.as_deref(), "30s")
     }
 
     pub fn build_storage_options(&self, endpoint_override: Option<&str>) -> HashMap<String, String> {
-        macro_rules! insert_opt {
-            ($opts:expr, $key:expr, $val:expr) => {
-                if let Some(ref v) = $val {
-                    $opts.insert($key.into(), v.clone());
-                }
-            };
-        }
-
-        let mut opts = HashMap::new();
-        insert_opt!(opts, "AWS_ACCESS_KEY_ID", self.aws_access_key_id);
-        insert_opt!(opts, "AWS_SECRET_ACCESS_KEY", self.aws_secret_access_key);
-        insert_opt!(opts, "AWS_REGION", self.aws_default_region);
-        insert_opt!(opts, "AWS_ALLOW_HTTP", self.aws_allow_http);
-        opts.insert("AWS_ENDPOINT_URL".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
-        // Bound connection establishment + total request time. Kept in sync
-        // with create_object_store (which builds its own client) so both the
-        // delta-rs register path and the direct AmazonS3Builder agree.
-        opts.insert("connect_timeout".into(), self.connect_timeout());
-        opts.insert("timeout".into(), self.request_timeout());
-        // Keep TLS connections warm for the query read path: a recent-window
-        // scan fans out ~target_partitions (48) concurrent GETs; the object_store
-        // default idle cap can force TLS re-establishment mid-fanout and starve
-        // R2. Matches create_object_store's direct AmazonS3Builder client.
-        opts.insert("pool_max_idle_per_host".into(), S3_POOL_MAX_IDLE_PER_HOST.to_string());
-        opts
+        [
+            ("AWS_ACCESS_KEY_ID", self.aws_access_key_id.clone()),
+            ("AWS_SECRET_ACCESS_KEY", self.aws_secret_access_key.clone()),
+            ("AWS_REGION", self.aws_default_region.clone()),
+            ("AWS_ALLOW_HTTP", self.aws_allow_http.clone()),
+            ("AWS_ENDPOINT_URL", Some(endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string())),
+            // Bound connection establishment + total request time. Kept in sync
+            // with create_object_store (which builds its own client) so both the
+            // delta-rs register path and the direct AmazonS3Builder agree.
+            ("connect_timeout", Some(self.connect_timeout())),
+            ("timeout", Some(self.request_timeout())),
+            // Keep TLS connections warm for the query read path: a recent-window
+            // scan fans out ~target_partitions (48) concurrent GETs; the object_store
+            // default idle cap can force TLS re-establishment mid-fanout and starve
+            // R2. Matches create_object_store's direct AmazonS3Builder client.
+            ("pool_max_idle_per_host", Some(S3_POOL_MAX_IDLE_PER_HOST.to_string())),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.to_string(), v?)))
+        .collect()
     }
 }
 
@@ -1184,7 +1135,7 @@ pub struct BufferConfig {
     /// Checked every ~15s by a dedicated WAL-gate task (`run_wal_gate_task` —
     /// deliberately NOT the flush loop, which stalls in exactly the overload
     /// this guards against). DML mem legs are exempt: failing an UPDATE
-    /// mid-statement would desync mem vs Delta. 0 disables. Default 96GB.
+    /// mid-statement would desync mem vs Delta. 0 disables (see `d_wal_hard_limit_gb`).
     #[serde(default = "d_wal_hard_limit_gb")]
     pub timefusion_wal_hard_limit_gb: u64,
     #[serde(default = "d_bucket_duration_secs")]
@@ -1244,11 +1195,10 @@ impl BufferConfig {
     }
     /// The tier's three ceilings — disk, per-scan heap, memoized decodes.
     pub fn hot_tier_limits(&self) -> crate::hot_tier::HotTierLimits {
-        const GB: u64 = 1024 * 1024 * 1024;
         crate::hot_tier::HotTierLimits {
-            max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GB),
-            leg_budget_bytes: self.timefusion_hot_tier_leg_budget_mb.saturating_mul(GB / 1024),
-            memo_bytes: self.timefusion_hot_tier_memo_mb.saturating_mul(GB / 1024),
+            max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GIB as u64),
+            leg_budget_bytes: self.timefusion_hot_tier_leg_budget_mb.saturating_mul(MIB as u64),
+            memo_bytes: self.timefusion_hot_tier_memo_mb.saturating_mul(MIB as u64),
         }
     }
 
@@ -1324,10 +1274,10 @@ impl BufferConfig {
     /// active bucket's restart replay even when memory pressure has not fired.
     /// Env-set bytes only; None = derive (see `AppConfig::effective_wal_max_unflushed_bytes`).
     pub fn wal_max_unflushed_bytes(&self) -> Option<u64> {
-        (self.timefusion_wal_max_unflushed_mb > 0).then(|| (self.timefusion_wal_max_unflushed_mb as u64).saturating_mul(1024 * 1024))
+        (self.timefusion_wal_max_unflushed_mb > 0).then(|| (self.timefusion_wal_max_unflushed_mb as u64).saturating_mul(MIB as u64))
     }
     pub fn wal_hard_limit_bytes(&self) -> Option<u64> {
-        (self.timefusion_wal_hard_limit_gb > 0).then(|| self.timefusion_wal_hard_limit_gb.saturating_mul(1024 * 1024 * 1024))
+        (self.timefusion_wal_hard_limit_gb > 0).then(|| self.timefusion_wal_hard_limit_gb.saturating_mul(GIB as u64))
     }
     pub fn bucket_duration_secs(&self) -> u64 {
         self.timefusion_bucket_duration_secs.max(1)
@@ -1706,7 +1656,7 @@ pub struct MaintenanceConfig {
     pub timefusion_dedup_lookback_days: u64,
     /// Run the legacy partition-wide dedup probe as an audit/fallback. Dirty
     /// sealed bins are the normal maintenance path.
-    #[serde(default = "d_false")]
+    #[serde(default)]
     pub timefusion_dedup_sweep_fallback: bool,
     /// Skip the read-side DedupExec (and restore per-scan LIMIT pushdown) for
     /// Delta-only queries whose every in-window (project, date) partition was
@@ -1839,6 +1789,10 @@ fn d_memory_pool() -> MemoryPoolKind {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     // Formerly `timefusion_memory_limit_gb` — now `derived.memory_limit_bytes()`.
+    // Formerly `timefusion_maintenance_pool_gb` — now
+    // `derived.maintenance_pool_bytes()` (see DerivedBudget, §4 of the
+    // compaction redesign doc). The 07-20/21 starvation this knob fixed
+    // (25 GB-box clamp vs a 188 GB box) is what the derivation replaces.
     #[serde(default)]
     pub timefusion_sort_spill_reservation_bytes: Option<usize>,
     #[serde(default = "d_memory_pool")]
@@ -1865,10 +1819,6 @@ pub struct MemoryConfig {
     /// 1h dashboard path) are never gated and keep full parallelism.
     #[serde(default = "d_max_concurrent_scan_readers")]
     pub timefusion_max_concurrent_scan_readers: usize,
-    // Formerly `timefusion_maintenance_pool_gb` — now
-    // `derived.maintenance_pool_bytes()` (see DerivedBudget, §4 of the
-    // compaction redesign doc). The 07-20/21 starvation this knob fixed
-    // (25 GB-box clamp vs a 188 GB box) is what the derivation replaces.
     #[serde(default = "d_wide_scan_lookback_hours")]
     pub timefusion_wide_scan_lookback_hours: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
@@ -1918,8 +1868,10 @@ impl AppConfig {
     /// (this is the wiring that fixes the 6 GB-vs-24 GB threshold drift — the
     /// derived numbers must actually reach the WAL layer, not just the startup log).
     pub fn effective_wal_max_files(&self) -> usize {
-        let env = self.buffer.wal_max_file_count();
-        if env > 0 { env } else { self.derived.wal_flush_file_threshold() }
+        match self.buffer.wal_max_file_count() {
+            0 => self.derived.wal_flush_file_threshold(),
+            env => env,
+        }
     }
 
     pub fn effective_wal_max_unflushed_bytes(&self) -> u64 {
@@ -1961,9 +1913,9 @@ mod tests {
         assert!(capped.maintenance_pool_bytes < full.maintenance_pool_bytes, "maintenance shrinks with the rest, not at its expense");
 
         // The clamp: an over-large request can never budget past the cgroup.
-        let detected = 80 * GIB;
-        assert_eq!(Some(200 * GIB).map_or(detected, |b: usize| b.min(detected)), detected);
-        assert_eq!(Some(40 * GIB).map_or(detected, |b: usize| b.min(detected)), 40 * GIB);
+        assert_eq!(effective_limit(80 * GIB, Some(200 * GIB)), 80 * GIB);
+        assert_eq!(effective_limit(80 * GIB, Some(40 * GIB)), 40 * GIB);
+        assert_eq!(effective_limit(80 * GIB, None), 80 * GIB);
     }
 
     // Regression for the 2026-06-24 crash loop: TIMEFUSION_S3_CONNECT_TIMEOUT=150
@@ -1971,10 +1923,11 @@ mod tests {
     // coerce to seconds; values with a unit pass through untouched.
     #[test]
     fn normalize_duration_coerces_bare_numbers_to_seconds() {
-        assert_eq!(normalize_duration("150".into()), "150s");
-        assert_eq!(normalize_duration("150s".into()), "150s");
-        assert_eq!(normalize_duration("3m".into()), "3m");
-        assert_eq!(normalize_duration("".into()), "");
+        assert_eq!(normalize_duration(Some("150"), "60s"), "150s");
+        assert_eq!(normalize_duration(Some("150s"), "60s"), "150s");
+        assert_eq!(normalize_duration(Some("3m"), "60s"), "3m");
+        assert_eq!(normalize_duration(Some(""), "60s"), "", "an explicitly-empty value is passed through, not defaulted");
+        assert_eq!(normalize_duration(None, "60s"), "60s");
         let aws = AwsConfig { timefusion_s3_connect_timeout: Some("150".into()), ..Default::default() };
         assert_eq!(aws.connect_timeout(), "150s");
     }
@@ -2002,10 +1955,10 @@ mod tests {
         assert_eq!(config.buffer.wal_max_unflushed_bytes(), None);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 1024);
         assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
-        assert_eq!(config.cache.disk_size_bytes(), 500 * 1024 * 1024 * 1024);
+        assert_eq!(config.cache.disk_size_bytes(), 500 * GIB);
         assert_eq!(config.cache.timefusion_warm_inline_max_mb, 0);
         assert_eq!(config.cache.timefusion_foyer_block_size_mb, 256);
-        assert_eq!(config.cache.block_size_bytes(), 256 * 1024 * 1024);
+        assert_eq!(config.cache.block_size_bytes(), 256 * MIB);
         assert_eq!(config.cache.timefusion_foyer_l1_max_entry_mb, 16);
         assert_eq!(config.cache.timefusion_cache_recent_days, 8);
         assert!(config.maintenance.timefusion_warm_after_compaction);
@@ -2031,14 +1984,13 @@ mod tests {
         assert!(p.timefusion_zstd_level_intermediate < p.timefusion_zstd_level_cold);
     }
 
-    // Prod-shaped box (120 GiB / 48 cores, 11 hot projects): pools sum within
-    // the limit, K lands in the 8..=11 range (4 GiB per-sort spill threshold,
-    // 2026-07-30 — was 4..=6 at 8 GiB), heavy keeps >= 1/4.
+    // Prod-shaped box (120 GiB / 48 cores, 11 hot projects): K lands in the
+    // 8..=11 range (4 GiB per-sort spill threshold, 2026-07-30 — was 4..=6 at
+    // 8 GiB), heavy keeps >= 1/4. The pool sum is pinned by
+    // `budget_tree_allocates_the_entire_limit` on the same box.
     #[test]
     fn derived_budget_prod_box_120gib_48cores() {
         let b = DerivedBudget::from_limits(120 * GIB, 48);
-        let sum = b.query_pool_bytes() + b.buffer_max_bytes() + b.foyer_memory_bytes() + b.writer_reserve_bytes() + b.maintenance_pool_bytes();
-        assert!(sum <= b.memory_limit_bytes(), "pools ({sum}) must not exceed the limit ({})", b.memory_limit_bytes());
         assert!(b.heavy_share_bytes() as f64 >= b.maintenance_pool_bytes() as f64 * 0.25 - 1.0);
         let k = b.light_optimize_k(11);
         assert!((8..=11).contains(&k), "K={k} outside the documented 8..=11 range");
@@ -2110,8 +2062,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.cache.timefusion_foyer_memory_mb = 256;
         config.cache.timefusion_foyer_disk_mb = Some(1024);
-        assert_eq!(config.cache.memory_size_bytes(), 256 * 1024 * 1024);
-        assert_eq!(config.cache.disk_size_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(config.cache.memory_size_bytes(), 256 * MIB);
+        assert_eq!(config.cache.disk_size_bytes(), GIB);
     }
 
     #[test]
@@ -2126,7 +2078,7 @@ mod tests {
         // Env override still wins.
         config.buffer.timefusion_wal_max_unflushed_mb = 12_000;
         config.buffer.timefusion_wal_max_file_count = 300;
-        assert_eq!(config.effective_wal_max_unflushed_bytes(), 12_000 * 1024 * 1024);
+        assert_eq!(config.effective_wal_max_unflushed_bytes(), 12_000 * MIB as u64);
         assert_eq!(config.effective_wal_max_files(), 300);
     }
 }

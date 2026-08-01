@@ -8,7 +8,7 @@
 //!     SELECT * FROM timefusion_stats;
 //!     SELECT key, value FROM timefusion_stats WHERE component='mem_buffer';
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering::Relaxed};
 
 use arrow::{
     array::{ArrayRef, StringArray},
@@ -34,6 +34,41 @@ use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, err
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 pub type FoyerStatsSnapshot = Arc<dyn Fn() -> FoyerRuntimeStats + Send + Sync>;
 
+type Row = (&'static str, String, String);
+
+/// `rows![component; "key" => value, …]` — one component's rows. Values only
+/// need `ToString`, so the mixed usize/u64/bool/`&str` metric types need no
+/// conversion at the call site. `rows![@atomic component; …]` takes the
+/// counters themselves and loads each one `Relaxed`.
+macro_rules! rows {
+    (@atomic $component:expr; $($key:literal => $counter:expr),* $(,)?) => {
+        rows![$component; $($key => $counter.load(Relaxed)),*]
+    };
+    ($component:expr; $($key:literal => $val:expr),* $(,)?) => {
+        vec![$(($component, $key.to_string(), $val.to_string())),*]
+    };
+}
+
+fn mb(bytes: f64) -> String {
+    format!("{:.1}", bytes / (1024.0 * 1024.0))
+}
+
+fn mib(bytes: usize) -> usize {
+    bytes / 1024 / 1024
+}
+
+fn gib(bytes: usize) -> usize {
+    mib(bytes) / 1024
+}
+
+fn pct(n: u64, d: u64) -> String {
+    format!("{:.1}", if d > 0 { n as f64 * 100.0 / d as f64 } else { 0.0 })
+}
+
+fn or_null<T: ToString>(v: Option<T>) -> String {
+    v.map_or_else(|| "null".to_string(), |v| v.to_string())
+}
+
 pub struct StatsTableProvider {
     layer: Option<Arc<BufferedWriteLayer>>,
     scan_metrics: Option<Arc<ScanMetrics>>,
@@ -58,228 +93,222 @@ impl StatsTableProvider {
         Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, schema }
     }
 
-    pub fn with_scan_metrics(mut self, m: Arc<ScanMetrics>) -> Self {
-        self.scan_metrics = Some(m);
-        self
+    pub fn with_scan_metrics(self, m: Arc<ScanMetrics>) -> Self {
+        Self { scan_metrics: Some(m), ..self }
     }
 
-    pub fn with_cache_sizes(mut self, f: CacheSizeSnapshot) -> Self {
-        self.cache_sizes = Some(f);
-        self
+    pub fn with_cache_sizes(self, f: CacheSizeSnapshot) -> Self {
+        Self { cache_sizes: Some(f), ..self }
     }
 
-    pub fn with_foyer_stats(mut self, f: FoyerStatsSnapshot) -> Self {
-        self.foyer_stats = Some(f);
-        self
+    pub fn with_foyer_stats(self, f: FoyerStatsSnapshot) -> Self {
+        Self { foyer_stats: Some(f), ..self }
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
-        let mut rows: Vec<(&'static str, String, String)> = Vec::with_capacity(16);
-
         // Boot memory budget. `slack_mb` is the figure that matters: it is what
         // absorbs allocation no budget tracks (parquet decode, walrus mmaps,
         // tantivy, allocator overhead), and a small slack is how the box gets
         // OOM-killed while every individual budget reads healthy.
-        if let Some(a) = crate::autotune::boot_budget_audit() {
-            for (k, v) in [
-                ("committed_mb", a.committed_mb),
-                ("warn_at_mb", a.warn_at_mb),
-                ("slack_mb", a.slack_mb()),
-                ("query_pool_mb", a.query_pool_mb),
-                ("mem_buffer_hard_mb", a.mem_buffer_hard_mb),
-                ("maintenance_pool_mb", a.maintenance_pool_mb),
-                ("foyer_mb", a.foyer_mb),
-                ("tantivy_peak_mb", a.tantivy_peak_mb),
-                ("df_metadata_cache_mb", a.df_metadata_cache_mb),
-            ] {
-                rows.push(("budget", k.into(), v.to_string()));
-            }
-            rows.push(("budget", "oversubscribed".into(), a.oversubscribed().to_string()));
-        }
+        let budget = crate::autotune::boot_budget_audit().map_or_else(Vec::new, |a| {
+            rows!["budget";
+                "committed_mb" => a.committed_mb,
+                "warn_at_mb" => a.warn_at_mb,
+                "slack_mb" => a.slack_mb(),
+                "query_pool_mb" => a.query_pool_mb,
+                "mem_buffer_hard_mb" => a.mem_buffer_hard_mb,
+                "maintenance_pool_mb" => a.maintenance_pool_mb,
+                "foyer_mb" => a.foyer_mb,
+                "tantivy_peak_mb" => a.tantivy_peak_mb,
+                "df_metadata_cache_mb" => a.df_metadata_cache_mb,
+                "oversubscribed" => a.oversubscribed(),
+            ]
+        });
 
-        if let Some(layer) = &self.layer {
-            let s = layer.snapshot_stats();
-            rows.push(("mem_buffer", "project_count".into(), s.mem_project_count.to_string()));
-            rows.push(("mem_buffer", "total_buckets".into(), s.mem_total_buckets.to_string()));
-            rows.push(("mem_buffer", "total_rows".into(), s.mem_total_rows.to_string()));
-            rows.push(("mem_buffer", "total_batches".into(), s.mem_total_batches.to_string()));
-            // Replay DML consumed without applying (table already flushed) —
-            // the quarantine dir no longer captures this loss class; monitor
-            // this like a quarantine count (growth ⇒ check logs + re-drive).
-            rows.push(("mem_buffer", "replay_dml_noops_total".into(), s.mem_replay_dml_noops.to_string()));
-            // Suffix `_approx` because the in-bucket coalesce path overwrites
-            // `memory_bytes` to the post-concat size, but the MemBuffer-level
-            // running total only adds the pre-concat new_size at insert time
-            // (no subtraction on coalesce). Drift is at most a few percent
-            // during coalesce-heavy bursts; the value is for capacity
-            // alerting, not for billing.
-            rows.push(("mem_buffer", "estimated_bytes_approx".into(), s.mem_estimated_bytes.to_string()));
-            rows.push(("mem_buffer", "estimated_mb_approx".into(), format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0))));
-            rows.push(("mem_buffer", "bucket_duration_micros".into(), s.bucket_duration_micros.to_string()));
-            rows.push(("mem_buffer", "oldest_bucket_age_secs".into(), s.oldest_bucket_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into())));
-            rows.push(("buffered_layer", "reserved_bytes".into(), s.reserved_bytes.to_string()));
-            rows.push(("buffered_layer", "max_memory_bytes".into(), s.max_memory_bytes.to_string()));
-            rows.push(("buffered_layer", "max_memory_mb".into(), format!("{:.1}", s.max_memory_bytes as f64 / (1024.0 * 1024.0))));
-            rows.push(("buffered_layer", "pressure_pct".into(), s.pressure_pct.to_string()));
-            rows.push(("buffered_layer", "backpressure_engaged_total".into(), s.backpressure_engaged_total.to_string()));
-            rows.push(("buffered_layer", "backpressure_rejected_total".into(), s.backpressure_rejected_total.to_string()));
-            rows.push(("buffered_layer", "backpressure_force_flush_total".into(), s.backpressure_force_flush_total.to_string()));
-            rows.push(("buffered_layer", "flush_completed_total".into(), s.flush_completed_total.to_string()));
-            rows.push(("buffered_layer", "flush_failed_total".into(), s.flush_failed_total.to_string()));
-            // Ingest-vs-drain: both climb in steady state. If ingested pulls
-            // ahead of flushed while pressure_pct=100 and flush_failed_total is
-            // flat, ingest is outpacing a working drain (throughput wedge) —
-            // not a stuck flush. `rows_in_buffer_lag` ≈ rows currently buffered
-            // (ingested includes WAL-recovered rows, so the pair stays
-            // comparable after a restart).
-            rows.push(("buffered_layer", "rows_ingested_total".into(), s.rows_ingested_total.to_string()));
-            rows.push(("buffered_layer", "rows_flushed_total".into(), s.rows_flushed_total.to_string()));
-            rows.push(("buffered_layer", "rows_in_buffer_lag".into(), s.rows_ingested_total.saturating_sub(s.rows_flushed_total).to_string()));
-            // Drain effectiveness: flat while pressure_pct=100 and flushes
-            // commit ⇒ drained buckets are empty (memory is in buckets the
-            // flush path isn't reaching, e.g. an open window needing force-flush).
-            rows.push(("buffered_layer", "flush_freed_bytes_total".into(), s.flush_freed_bytes_total.to_string()));
-            // Real RSS vs the estimate_batch_size charge. RSS far below
-            // estimated_bytes_approx ⇒ per-bucket estimate is over-counting and
-            // backpressure is tripping on phantom bytes, not real memory.
-            rows.push(("buffered_layer", "process_rss_bytes".into(), s.process_rss_bytes.map(|v| v.to_string()).unwrap_or_else(|| "null".into())));
-            rows.push((
-                "buffered_layer",
-                "process_rss_mb".into(),
-                s.process_rss_bytes.map(|v| format!("{:.1}", v as f64 / (1024.0 * 1024.0))).unwrap_or_else(|| "null".into()),
-            ));
-            // Orphaned topics = failed-commit rows living ONLY in the WAL,
-            // each pinning the WAL GC floor. PAGE on >0; remedy = restart.
-            rows.push(("buffered_layer", "orphaned_topics".into(), s.orphaned_topics.to_string()));
-            rows.push(("buffered_layer", "orphan_pin_age_secs".into(), s.orphan_pin_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into())));
-            rows.push(("buffered_layer", "drained".into(), s.drained.to_string()));
-            rows.push(("buffered_layer", "boot_micros".into(), s.boot_micros.to_string()));
-            rows.push(("wal", "recovery_complete".into(), s.wal_recovery_complete.to_string()));
-            rows.push(("wal", "recovery_duration_ms".into(), s.wal_recovery_duration_ms.to_string()));
-            rows.push(("tantivy", "recovery_pending_files".into(), s.tantivy_recovery_pending_files.to_string()));
-            rows.push(("wal", "files".into(), s.wal_files.to_string()));
-            rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
-            rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));
-            // Parked payloads: invisible to wal_disk_bytes (flat walk), which is
-            // how gc_wal_files deleted them unnoticed. ALERT if files > 0.
-            rows.push(("wal", "quarantine_files".into(), s.quarantine_files.to_string()));
-            rows.push(("wal", "quarantine_mb".into(), format!("{:.1}", s.quarantine_bytes as f64 / (1024.0 * 1024.0))));
-            // Local hot tier (demoted sealed buckets served by mmap'd Arrow
-            // IPC). `read_misses` growing = torn/absent files falling through
-            // to Delta; `write_failures` growing = demotion is broken (reads
-            // stay correct, just slower).
-            let h = &s.hot_tier;
-            for (k, v) in [
-                ("tables", h.tables as u64),
-                ("files", h.files as u64),
-                ("bytes", h.bytes),
-                ("writes_total", h.writes),
-                ("write_failures_total", h.write_failures),
-                ("read_hits_total", h.read_hits),
-                ("read_misses_total", h.read_misses),
-                ("mem_skipped_total", h.mem_skipped),
-                ("schema_drift_total", h.schema_drift),
-                ("gc_deleted_total", h.gc_deleted),
-                ("gc_bytes_freed_total", h.gc_bytes_freed),
-                ("invalidated_total", h.invalidated),
-                // DML statements scoped to their own time window vs. those
-                // that had to drop the whole table. `invalidations_full_total`
-                // dominating means the range derivation isn't matching the
-                // workload's predicate shapes — the tier is back to paying for
-                // files every enrichment statement throws away.
-                ("invalidations_ranged_total", h.invalidations_ranged),
-                ("invalidations_full_total", h.invalidations_full),
-                // Tables that stopped demoting because a DML kept dropping
-                // their files before any query read them (continuous
-                // whole-table enrichment). Non-zero is the tier working as
-                // intended; it used to be an invisible silent waste.
-                ("suppressed_tables", h.suppressed_tables as u64),
-                ("suppressions_total", h.suppressions),
-                // The two heap bounds. `memo_bytes` is the mapping the decode
-                // memo pins (LRU-capped); `leg_budget_stops_total` counts scans
-                // that hit the per-query hot-leg byte budget and served the
-                // remaining windows from Delta instead — sustained non-zero
-                // means the budget, not retention, is the tier's real size.
-                ("memo_files", h.memo_files as u64),
-                ("memo_bytes", h.memo_bytes),
-                ("memo_evicted_total", h.memo_evicted),
-                ("leg_budget_stops_total", h.leg_budget_stops),
-            ] {
-                rows.push(("hot_tier", k.into(), v.to_string()));
-            }
-            for ((project, table), secs) in &h.suppressed {
-                rows.push(("hot_tier", format!("suppressed.{project}.{table}"), format!("cooldown_secs_remaining={secs}")));
-            }
-            rows.push(("wal", "shards_per_topic".into(), s.wal_shards_per_topic.to_string()));
-            rows.push(("wal", "known_topics".into(), s.wal_known_topics.to_string()));
-        } else {
-            rows.push(("buffered_layer", "status".into(), "disabled".into()));
-        }
+        let layer = self.layer.as_ref().map_or_else(
+            || rows!["buffered_layer"; "status" => "disabled"],
+            |layer| {
+                let s = layer.snapshot_stats();
+                // Local hot tier (demoted sealed buckets served by mmap'd Arrow
+                // IPC). `read_misses` growing = torn/absent files falling through
+                // to Delta; `write_failures` growing = demotion is broken (reads
+                // stay correct, just slower).
+                let h = &s.hot_tier;
+                [
+                    rows!["mem_buffer";
+                        "project_count" => s.mem_project_count,
+                        "total_buckets" => s.mem_total_buckets,
+                        "total_rows" => s.mem_total_rows,
+                        "total_batches" => s.mem_total_batches,
+                        // Replay DML consumed without applying (table already flushed) —
+                        // the quarantine dir no longer captures this loss class; monitor
+                        // this like a quarantine count (growth ⇒ check logs + re-drive).
+                        "replay_dml_noops_total" => s.mem_replay_dml_noops,
+                        // Suffix `_approx` because the in-bucket coalesce path overwrites
+                        // `memory_bytes` to the post-concat size, but the MemBuffer-level
+                        // running total only adds the pre-concat new_size at insert time
+                        // (no subtraction on coalesce). Drift is at most a few percent
+                        // during coalesce-heavy bursts; the value is for capacity
+                        // alerting, not for billing.
+                        "estimated_bytes_approx" => s.mem_estimated_bytes,
+                        "estimated_mb_approx" => mb(s.mem_estimated_bytes as f64),
+                        "bucket_duration_micros" => s.bucket_duration_micros,
+                        "oldest_bucket_age_secs" => or_null(s.oldest_bucket_age_secs),
+                    ],
+                    rows!["buffered_layer";
+                        "reserved_bytes" => s.reserved_bytes,
+                        "max_memory_bytes" => s.max_memory_bytes,
+                        "max_memory_mb" => mb(s.max_memory_bytes as f64),
+                        "pressure_pct" => s.pressure_pct,
+                        "backpressure_engaged_total" => s.backpressure_engaged_total,
+                        "backpressure_rejected_total" => s.backpressure_rejected_total,
+                        "backpressure_force_flush_total" => s.backpressure_force_flush_total,
+                        "flush_completed_total" => s.flush_completed_total,
+                        "flush_failed_total" => s.flush_failed_total,
+                        // Ingest-vs-drain: both climb in steady state. If ingested pulls
+                        // ahead of flushed while pressure_pct=100 and flush_failed_total is
+                        // flat, ingest is outpacing a working drain (throughput wedge) —
+                        // not a stuck flush. `rows_in_buffer_lag` ≈ rows currently buffered
+                        // (ingested includes WAL-recovered rows, so the pair stays
+                        // comparable after a restart).
+                        "rows_ingested_total" => s.rows_ingested_total,
+                        "rows_flushed_total" => s.rows_flushed_total,
+                        "rows_in_buffer_lag" => s.rows_ingested_total.saturating_sub(s.rows_flushed_total),
+                        // Drain effectiveness: flat while pressure_pct=100 and flushes
+                        // commit ⇒ drained buckets are empty (memory is in buckets the
+                        // flush path isn't reaching, e.g. an open window needing force-flush).
+                        "flush_freed_bytes_total" => s.flush_freed_bytes_total,
+                        // Real RSS vs the estimate_batch_size charge. RSS far below
+                        // estimated_bytes_approx ⇒ per-bucket estimate is over-counting and
+                        // backpressure is tripping on phantom bytes, not real memory.
+                        "process_rss_bytes" => or_null(s.process_rss_bytes),
+                        "process_rss_mb" => or_null(s.process_rss_bytes.map(|v| mb(v as f64))),
+                        // Orphaned topics = failed-commit rows living ONLY in the WAL,
+                        // each pinning the WAL GC floor. PAGE on >0; remedy = restart.
+                        "orphaned_topics" => s.orphaned_topics,
+                        "orphan_pin_age_secs" => or_null(s.orphan_pin_age_secs),
+                        "drained" => s.drained,
+                        "boot_micros" => s.boot_micros,
+                    ],
+                    rows!["wal"; "recovery_complete" => s.wal_recovery_complete, "recovery_duration_ms" => s.wal_recovery_duration_ms],
+                    rows!["tantivy"; "recovery_pending_files" => s.tantivy_recovery_pending_files],
+                    rows!["wal";
+                        "files" => s.wal_files,
+                        "disk_bytes" => s.wal_disk_bytes,
+                        "disk_mb" => mb(s.wal_disk_bytes as f64),
+                        // Parked payloads: invisible to wal_disk_bytes (flat walk), which is
+                        // how gc_wal_files deleted them unnoticed. ALERT if files > 0.
+                        "quarantine_files" => s.quarantine_files,
+                        "quarantine_mb" => mb(s.quarantine_bytes as f64),
+                    ],
+                    rows!["hot_tier";
+                        "tables" => h.tables,
+                        "files" => h.files,
+                        "bytes" => h.bytes,
+                        "writes_total" => h.writes,
+                        "write_failures_total" => h.write_failures,
+                        "read_hits_total" => h.read_hits,
+                        "read_misses_total" => h.read_misses,
+                        "mem_skipped_total" => h.mem_skipped,
+                        "schema_drift_total" => h.schema_drift,
+                        "gc_deleted_total" => h.gc_deleted,
+                        "gc_bytes_freed_total" => h.gc_bytes_freed,
+                        "invalidated_total" => h.invalidated,
+                        // DML statements scoped to their own time window vs. those
+                        // that had to drop the whole table. `invalidations_full_total`
+                        // dominating means the range derivation isn't matching the
+                        // workload's predicate shapes — the tier is back to paying for
+                        // files every enrichment statement throws away.
+                        "invalidations_ranged_total" => h.invalidations_ranged,
+                        "invalidations_full_total" => h.invalidations_full,
+                        // Tables that stopped demoting because a DML kept dropping
+                        // their files before any query read them (continuous
+                        // whole-table enrichment). Non-zero is the tier working as
+                        // intended; it used to be an invisible silent waste.
+                        "suppressed_tables" => h.suppressed_tables,
+                        "suppressions_total" => h.suppressions,
+                        // The two heap bounds. `memo_bytes` is the mapping the decode
+                        // memo pins (LRU-capped); `leg_budget_stops_total` counts scans
+                        // that hit the per-query hot-leg byte budget and served the
+                        // remaining windows from Delta instead — sustained non-zero
+                        // means the budget, not retention, is the tier's real size.
+                        "memo_files" => h.memo_files,
+                        "memo_bytes" => h.memo_bytes,
+                        "memo_evicted_total" => h.memo_evicted,
+                        "leg_budget_stops_total" => h.leg_budget_stops,
+                    ],
+                    h.suppressed
+                        .iter()
+                        .map(|((project, table), secs)| ("hot_tier", format!("suppressed.{project}.{table}"), format!("cooldown_secs_remaining={secs}")))
+                        .collect(),
+                    rows!["wal"; "shards_per_topic" => s.wal_shards_per_topic, "known_topics" => s.wal_known_topics],
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            },
+        );
 
-        {
-            use std::sync::atomic::Ordering::Relaxed;
-            let d = crate::metrics::dml_stats();
-            rows.push(("dml", "occ_conflicts_total".into(), d.occ_conflicts.load(Relaxed).to_string()));
-            rows.push(("dml", "retry_successes_total".into(), d.retry_successes.load(Relaxed).to_string()));
-            rows.push(("dml", "retry_exhausted_total".into(), d.retry_exhausted.load(Relaxed).to_string()));
+        let d = crate::metrics::dml_stats();
+        let dml = rows![@atomic "dml";
+            "occ_conflicts_total" => d.occ_conflicts,
+            "retry_successes_total" => d.retry_successes,
+            "retry_exhausted_total" => d.retry_exhausted,
+        ];
 
-            let m = crate::metrics::maintenance_stats();
-            rows.push(("maintenance", "checkpoints_created".into(), m.checkpoints_created.load(Relaxed).to_string()));
-            rows.push(("maintenance", "checkpoint_failed".into(), m.checkpoint_failed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "checkpoint_corrupt".into(), m.checkpoint_corrupt.load(Relaxed).to_string()));
-            rows.push(("maintenance", "log_files_cleaned".into(), m.log_files_cleaned.load(Relaxed).to_string()));
-            rows.push(("maintenance", "log_cleanup_failed".into(), m.log_cleanup_failed.load(Relaxed).to_string()));
+        let m = crate::metrics::maintenance_stats();
+        let maintenance = rows![@atomic "maintenance";
+            "checkpoints_created" => m.checkpoints_created,
+            "checkpoint_failed" => m.checkpoint_failed,
+            "checkpoint_corrupt" => m.checkpoint_corrupt,
+            "log_files_cleaned" => m.log_files_cleaned,
+            "log_cleanup_failed" => m.log_cleanup_failed,
             // Max version lag (current - last checkpointed) seen at the last
             // checkpoint tick. Should stay near checkpoint_interval; a large,
             // growing value means the checkpoint task is failing or wedged.
-            rows.push(("maintenance", "checkpoint_lag_versions".into(), m.checkpoint_lag_versions.load(Relaxed).to_string()));
+            "checkpoint_lag_versions" => m.checkpoint_lag_versions,
             // NONZERO = committed parquet was destroyed elsewhere (2026-07-09
             // commit-path deletion bug). PAGE and investigate.
-            rows.push(("maintenance", "dangling_removed".into(), m.dangling_removed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "reconcile_failed".into(), m.reconcile_failed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dedup_timed_out_total".into(), m.dedup_timed_out.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dedup_failed_total".into(), m.dedup_failed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_timed_out_total".into(), m.light_optimize_timed_out.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_failed_total".into(), m.light_optimize_failed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_tick_truncated_total".into(), m.light_optimize_tick_truncated.load(Relaxed).to_string()));
+            "dangling_removed" => m.dangling_removed,
+            "reconcile_failed" => m.reconcile_failed,
+            "dedup_timed_out_total" => m.dedup_timed_out,
+            "dedup_failed_total" => m.dedup_failed,
+            "light_optimize_timed_out_total" => m.light_optimize_timed_out,
+            "light_optimize_failed_total" => m.light_optimize_failed,
+            "light_optimize_tick_truncated_total" => m.light_optimize_tick_truncated,
             // planned vs completed is the per-tick coverage check: a persistent
             // gap means hot projects are going uncompacted (prod 2026-07-29).
-            rows.push(("maintenance", "light_optimize_projects_planned_total".into(), m.light_optimize_projects_planned.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_projects_completed_total".into(), m.light_optimize_projects_completed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_bins_committed_total".into(), m.light_optimize_bins_committed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_waves_committed_total".into(), m.light_optimize_waves_committed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dedup_bins_committed_total".into(), m.dedup_bins_committed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dedup_waves_committed_total".into(), m.dedup_waves_committed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_wal_yields_total".into(), m.light_optimize_wal_yields.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_memory_brakes_total".into(), m.light_optimize_memory_brakes.load(Relaxed).to_string()));
-            rows.push(("maintenance", "mor_delta_leg_sorts_total".into(), m.mor_delta_leg_sorts.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_ticks_degraded_total".into(), m.light_optimize_ticks_degraded.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dirty_bin_queue_depth".into(), m.dirty_bin_queue_depth.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dirty_bin_enqueued_total".into(), m.dirty_bin_enqueued.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dirty_bin_eligible_total".into(), m.dirty_bin_eligible.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dirty_bin_processed_total".into(), m.dirty_bin_processed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dirty_bin_requeued_total".into(), m.dirty_bin_requeued.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dirty_bin_dropped_rows_total".into(), m.dirty_bin_dropped_rows.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dirty_bin_rewrite_duration_ms_total".into(), m.dirty_bin_rewrite_duration_ms.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dedup_bins_deferred_cold_total".into(), m.dedup_bins_deferred_cold.load(Relaxed).to_string()));
-            rows.push(("maintenance", "dedup_passes_flush_yields_total".into(), m.dedup_passes_flush_yields.load(Relaxed).to_string()));
-            rows.push(("maintenance", "wave_commits_yielded_to_flush_total".into(), m.wave_commits_yielded_to_flush.load(Relaxed).to_string()));
+            "light_optimize_projects_planned_total" => m.light_optimize_projects_planned,
+            "light_optimize_projects_completed_total" => m.light_optimize_projects_completed,
+            "light_optimize_bins_committed_total" => m.light_optimize_bins_committed,
+            "light_optimize_waves_committed_total" => m.light_optimize_waves_committed,
+            "dedup_bins_committed_total" => m.dedup_bins_committed,
+            "dedup_waves_committed_total" => m.dedup_waves_committed,
+            "light_optimize_wal_yields_total" => m.light_optimize_wal_yields,
+            "light_optimize_memory_brakes_total" => m.light_optimize_memory_brakes,
+            "mor_delta_leg_sorts_total" => m.mor_delta_leg_sorts,
+            "light_optimize_ticks_degraded_total" => m.light_optimize_ticks_degraded,
+            "dirty_bin_queue_depth" => m.dirty_bin_queue_depth,
+            "dirty_bin_enqueued_total" => m.dirty_bin_enqueued,
+            "dirty_bin_eligible_total" => m.dirty_bin_eligible,
+            "dirty_bin_processed_total" => m.dirty_bin_processed,
+            "dirty_bin_requeued_total" => m.dirty_bin_requeued,
+            "dirty_bin_dropped_rows_total" => m.dirty_bin_dropped_rows,
+            "dirty_bin_rewrite_duration_ms_total" => m.dirty_bin_rewrite_duration_ms,
+            "dedup_bins_deferred_cold_total" => m.dedup_bins_deferred_cold,
+            "dedup_passes_flush_yields_total" => m.dedup_passes_flush_yields,
+            "wave_commits_yielded_to_flush_total" => m.wave_commits_yielded_to_flush,
             // Runs exceeding the long-running warning threshold. Slow progress
             // is allowed; sustained nonzero with no completion = wedged.
-            rows.push(("maintenance", "cron_long_running_total".into(), m.cron_long_running.load(Relaxed).to_string()));
+            "cron_long_running_total" => m.cron_long_running,
             // Fired frozen while uptime grows = scheduler dead (2026-07-14
             // outage); skipped growing = a job body is wedged or overlong.
-            rows.push(("maintenance", "cron_ticks_fired".into(), m.cron_ticks_fired.load(Relaxed).to_string()));
-            rows.push(("maintenance", "cron_ticks_skipped".into(), m.cron_ticks_skipped.load(Relaxed).to_string()));
-        }
+            "cron_ticks_fired" => m.cron_ticks_fired,
+            "cron_ticks_skipped" => m.cron_ticks_skipped,
+        ];
 
-        if let Some(pc) = crate::plan_cache::global() {
+        let plan_cache = crate::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();
-            let total = hits + misses;
-            let hit_pct = if total > 0 { hits as f64 * 100.0 / total as f64 } else { 0.0 };
-            rows.push(("plan_cache", "hits".into(), hits.to_string()));
-            rows.push(("plan_cache", "misses".into(), misses.to_string()));
-            rows.push(("plan_cache", "hit_pct".into(), format!("{:.1}", hit_pct)));
             // Shape path = literal-bearing and now()-bearing SELECTs (the dashboard
             // hot path). Separate from the placeholder-`$N` counters above, and
             // previously unexposed — so the now()-shape caching (the bulk of the
@@ -287,108 +316,121 @@ impl StatsTableProvider {
             // was served via the shape path (built or reused); shape_skips = a shape
             // couldn't be parameterized and fell back to a fresh plan.
             let (shape_hits, shape_skips) = pc.shape_counters();
-            rows.push(("plan_cache", "shape_hits".into(), shape_hits.to_string()));
-            rows.push(("plan_cache", "shape_skips".into(), shape_skips.to_string()));
-        }
+            rows!["plan_cache";
+                "hits" => hits,
+                "misses" => misses,
+                "hit_pct" => pct(hits, hits + misses),
+                "shape_hits" => shape_hits,
+                "shape_skips" => shape_skips,
+            ]
+        });
 
-        if let Some(m) = &self.scan_metrics {
-            use std::sync::atomic::Ordering::Relaxed;
-            let total = m.scans_total.load(Relaxed);
-            let skipped = m.scans_skipped_delta.load(Relaxed);
-            let mem_only = m.scans_mem_only.load(Relaxed);
-            let delta_only = m.scans_delta_only.load(Relaxed);
-            let both = m.scans_mem_plus_delta.load(Relaxed);
-            let fr_hits = m.fast_resolve_hits.load(Relaxed);
-            let fr_misses = m.fast_resolve_misses.load(Relaxed);
-            let pct = |n: u64, d: u64| if d > 0 { n as f64 * 100.0 / d as f64 } else { 0.0 };
+        let scan = self.scan_metrics.as_ref().map_or_else(Vec::new, |m| {
+            let (total, skipped) = (m.scans_total.load(Relaxed), m.scans_skipped_delta.load(Relaxed));
+            let (fr_hits, fr_misses) = (m.fast_resolve_hits.load(Relaxed), m.fast_resolve_misses.load(Relaxed));
+            let (pc_hits, pc_misses) = (m.provider_cache_hits.load(Relaxed), m.provider_cache_misses.load(Relaxed));
             // Parquet decode heap — the largest consumer outside every budget.
             // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
             // concurrent decode heap, which is what a Transient budget must cover.
-            let dpeak = m.decode_peak_batch_bytes.load(Relaxed);
-            let dinflight_peak = m.decode_polls_inflight_peak.load(Relaxed);
-            rows.push(("scan_decode", "bytes_total".into(), m.decode_bytes_total.load(Relaxed).to_string()));
-            rows.push(("scan_decode", "peak_batch_bytes".into(), dpeak.to_string()));
-            rows.push(("scan_decode", "polls_inflight".into(), m.decode_polls_inflight.load(Relaxed).to_string()));
-            rows.push(("scan_decode", "polls_inflight_peak".into(), dinflight_peak.to_string()));
-            rows.push(("scan_decode", "worst_case_heap_mb".into(), format!("{:.1}", (dpeak * dinflight_peak) as f64 / (1024.0 * 1024.0))));
-            rows.push(("scan", "total".into(), total.to_string()));
-            rows.push(("scan", "skipped_delta".into(), skipped.to_string()));
-            rows.push(("scan", "skipped_delta_pct".into(), format!("{:.1}", pct(skipped, total))));
-            rows.push(("scan", "mem_only".into(), mem_only.to_string()));
-            rows.push(("scan", "delta_only".into(), delta_only.to_string()));
-            rows.push(("scan", "mem_plus_delta".into(), both.to_string()));
-            rows.push(("scan", "fast_resolve_hits".into(), fr_hits.to_string()));
-            rows.push(("scan", "fast_resolve_misses".into(), fr_misses.to_string()));
-            rows.push(("scan", "fast_resolve_hit_pct".into(), format!("{:.1}", pct(fr_hits, fr_hits + fr_misses))));
-            let pc_hits = m.provider_cache_hits.load(Relaxed);
-            let pc_misses = m.provider_cache_misses.load(Relaxed);
-            rows.push(("scan", "provider_cache_hits".into(), pc_hits.to_string()));
-            rows.push(("scan", "provider_cache_misses".into(), pc_misses.to_string()));
-            rows.push(("scan", "provider_cache_evictions".into(), m.provider_cache_evictions.load(Relaxed).to_string()));
-            rows.push(("scan", "provider_cache_hit_pct".into(), format!("{:.1}", pct(pc_hits, pc_hits + pc_misses))));
-            rows.push(("scan", "provider_build_abandoned".into(), m.provider_build_abandoned.load(Relaxed).to_string()));
-            rows.push(("scan", "lat_p50_us_approx".into(), m.latency_percentile_us(0.50).to_string()));
-            rows.push(("scan", "lat_p95_us_approx".into(), m.latency_percentile_us(0.95).to_string()));
-            rows.push(("scan", "lat_p99_us_approx".into(), m.latency_percentile_us(0.99).to_string()));
-            rows.push(("scan", "lat_p999_us_approx".into(), m.latency_percentile_us(0.999).to_string()));
-            let pgt = m.pgwire_total.load(Relaxed);
-            rows.push(("pgwire", "queries_total".into(), pgt.to_string()));
-            rows.push(("pgwire", "lat_p50_us_approx".into(), m.pgwire_percentile_us(0.50).to_string()));
-            rows.push(("pgwire", "lat_p95_us_approx".into(), m.pgwire_percentile_us(0.95).to_string()));
-            rows.push(("pgwire", "lat_p99_us_approx".into(), m.pgwire_percentile_us(0.99).to_string()));
-            rows.push(("pgwire", "lat_p999_us_approx".into(), m.pgwire_percentile_us(0.999).to_string()));
-        }
+            let (dpeak, dinflight_peak) = (m.decode_peak_batch_bytes.load(Relaxed), m.decode_polls_inflight_peak.load(Relaxed));
+            [
+                rows!["scan_decode";
+                    "bytes_total" => m.decode_bytes_total.load(Relaxed),
+                    "peak_batch_bytes" => dpeak,
+                    "polls_inflight" => m.decode_polls_inflight.load(Relaxed),
+                    "polls_inflight_peak" => dinflight_peak,
+                    "worst_case_heap_mb" => mb(dpeak.saturating_mul(dinflight_peak) as f64),
+                ],
+                rows!["scan";
+                    "total" => total,
+                    "skipped_delta" => skipped,
+                    "skipped_delta_pct" => pct(skipped, total),
+                    "mem_only" => m.scans_mem_only.load(Relaxed),
+                    "delta_only" => m.scans_delta_only.load(Relaxed),
+                    "mem_plus_delta" => m.scans_mem_plus_delta.load(Relaxed),
+                    "fast_resolve_hits" => fr_hits,
+                    "fast_resolve_misses" => fr_misses,
+                    "fast_resolve_hit_pct" => pct(fr_hits, fr_hits + fr_misses),
+                    "provider_cache_hits" => pc_hits,
+                    "provider_cache_misses" => pc_misses,
+                    "provider_cache_evictions" => m.provider_cache_evictions.load(Relaxed),
+                    "provider_cache_hit_pct" => pct(pc_hits, pc_hits + pc_misses),
+                    "provider_build_abandoned" => m.provider_build_abandoned.load(Relaxed),
+                    "lat_p50_us_approx" => m.latency_percentile_us(0.50),
+                    "lat_p95_us_approx" => m.latency_percentile_us(0.95),
+                    "lat_p99_us_approx" => m.latency_percentile_us(0.99),
+                    "lat_p999_us_approx" => m.latency_percentile_us(0.999),
+                ],
+                rows!["pgwire";
+                    "queries_total" => m.pgwire_total.load(Relaxed),
+                    "lat_p50_us_approx" => m.pgwire_percentile_us(0.50),
+                    "lat_p95_us_approx" => m.pgwire_percentile_us(0.95),
+                    "lat_p99_us_approx" => m.pgwire_percentile_us(0.99),
+                    "lat_p999_us_approx" => m.pgwire_percentile_us(0.999),
+                ],
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        });
 
-        if let Some(snap) = &self.foyer_stats {
+        let foyer = self.foyer_stats.as_ref().map_or_else(Vec::new, |snap| {
             let s = snap();
-            for (component, stats) in [("foyer", s.stats.main), ("foyer_metadata", s.stats.metadata)] {
-                rows.push((component, "hits".into(), stats.hits.to_string()));
-                rows.push((component, "misses".into(), stats.misses.to_string()));
-                rows.push((component, "bytes_served".into(), stats.bytes_served.to_string()));
-                rows.push((component, "inner_bytes_read".into(), stats.inner_bytes_read.to_string()));
-                rows.push((component, "ttl_expirations".into(), stats.ttl_expirations.to_string()));
-                rows.push((component, "inner_gets".into(), stats.inner_gets.to_string()));
-            }
-            rows.push(("foyer", "memory_mb".into(), (s.memory_size_bytes / 1024 / 1024).to_string()));
-            rows.push(("foyer", "disk_gb".into(), (s.disk_size_bytes / 1024 / 1024 / 1024).to_string()));
-            rows.push(("foyer", "ttl_seconds".into(), s.ttl_seconds.to_string()));
-            rows.push(("foyer", "l1_max_entry_mb".into(), (s.l1_max_entry_bytes / 1024 / 1024).to_string()));
-            rows.push(("foyer", "block_size_mb".into(), (s.block_size_bytes / 1024 / 1024).to_string()));
-            rows.push(("foyer", "cache_recent_days".into(), s.cache_recent_days.to_string()));
-            rows.push(("foyer", "cache_dir".into(), s.cache_dir.display().to_string()));
-            rows.push(("foyer", "metadata_memory_mb".into(), (s.metadata_memory_size_bytes / 1024 / 1024).to_string()));
-            rows.push(("foyer", "metadata_disk_gb".into(), (s.metadata_disk_size_bytes / 1024 / 1024 / 1024).to_string()));
-            rows.push(("foyer", "l1_used_bytes".into(), s.l1_used_bytes.to_string()));
-            rows.push(("foyer", "l2_used_bytes".into(), s.l2_used_bytes.to_string()));
-            rows.push(("foyer", "entry_count".into(), s.entry_count.to_string()));
-            rows.push(("foyer", "evictions".into(), s.evictions.to_string()));
-        }
+            [("foyer", s.stats.main), ("foyer_metadata", s.stats.metadata)]
+                .into_iter()
+                .flat_map(|(component, st)| {
+                    rows![component;
+                        "hits" => st.hits,
+                        "misses" => st.misses,
+                        "bytes_served" => st.bytes_served,
+                        "inner_bytes_read" => st.inner_bytes_read,
+                        "ttl_expirations" => st.ttl_expirations,
+                        "inner_gets" => st.inner_gets,
+                    ]
+                })
+                .chain(rows!["foyer";
+                    "memory_mb" => mib(s.memory_size_bytes),
+                    "disk_gb" => gib(s.disk_size_bytes),
+                    "ttl_seconds" => s.ttl_seconds,
+                    "l1_max_entry_mb" => mib(s.l1_max_entry_bytes),
+                    "block_size_mb" => mib(s.block_size_bytes),
+                    "cache_recent_days" => s.cache_recent_days,
+                    "cache_dir" => s.cache_dir.display(),
+                    "metadata_memory_mb" => mib(s.metadata_memory_size_bytes),
+                    "metadata_disk_gb" => gib(s.metadata_disk_size_bytes),
+                    "l1_used_bytes" => s.l1_used_bytes,
+                    "l2_used_bytes" => s.l2_used_bytes,
+                    "entry_count" => s.entry_count,
+                    "evictions" => s.evictions,
+                ])
+                .collect()
+        });
 
-        {
-            let s = deltalake::delta_datafusion::parquet_metrics::snapshot();
-            rows.push(("parquet", "metadata_cache_hits".into(), s.metadata_cache_hits.to_string()));
-            rows.push(("parquet", "metadata_cache_misses".into(), s.metadata_cache_misses.to_string()));
-            rows.push(("parquet", "bytes_read".into(), s.bytes_read.to_string()));
-            rows.push(("parquet", "read_time_us".into(), s.read_time_us.to_string()));
-            rows.push(("parquet", "scans".into(), s.scans.to_string()));
-            rows.push(("parquet", "files_planned".into(), s.files_planned.to_string()));
-            rows.push(("parquet", "bytes_planned".into(), s.bytes_planned.to_string()));
-            rows.push(("parquet", "selected_row_groups".into(), s.selected_row_groups.to_string()));
-        }
+        let p = deltalake::delta_datafusion::parquet_metrics::snapshot();
+        let parquet = rows!["parquet";
+            "metadata_cache_hits" => p.metadata_cache_hits,
+            "metadata_cache_misses" => p.metadata_cache_misses,
+            "bytes_read" => p.bytes_read,
+            "read_time_us" => p.read_time_us,
+            "scans" => p.scans,
+            "files_planned" => p.files_planned,
+            "bytes_planned" => p.bytes_planned,
+            "selected_row_groups" => p.selected_row_groups,
+        ];
 
-        if let Some(snap) = &self.cache_sizes {
+        let cache_sizes = self.cache_sizes.as_ref().map_or_else(Vec::new, |snap| {
             // Mirror the field-level doc: these caches don't evict; size
             // tracks unique (project, table) pairs since process start.
             let (fast_resolve, provider) = snap();
-            rows.push(("scan", "fast_resolve_cache_entries".into(), fast_resolve.to_string()));
-            rows.push(("scan", "provider_cache_entries".into(), provider.to_string()));
-        }
+            rows!["scan"; "fast_resolve_cache_entries" => fast_resolve, "provider_cache_entries" => provider]
+        });
 
-        let components: Vec<&str> = rows.iter().map(|r| r.0).collect();
-        let keys: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
-        let values: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
-
-        let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(components)), Arc::new(StringArray::from(keys)), Arc::new(StringArray::from(values))];
+        let rows: Vec<Row> = [budget, layer, dml, maintenance, plan_cache, scan, foyer, parquet, cache_sizes].into_iter().flatten().collect();
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(rows.iter().map(|r| Some(r.0)).collect::<StringArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.1.as_str())).collect::<StringArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.2.as_str())).collect::<StringArray>()),
+        ];
         RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)
     }
 }
@@ -413,7 +455,19 @@ impl TableProvider for StatsTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::StringArray;
+
+    type OwnedRow = (String, String, String);
+
+    fn snapshot_rows(p: &StatsTableProvider) -> Vec<OwnedRow> {
+        let batch = p.snapshot_batch().unwrap();
+        let col = |i: usize| batch.column(i).as_any().downcast_ref::<StringArray>().cloned().unwrap();
+        let (components, keys, values) = (col(0), col(1), col(2));
+        (0..batch.num_rows()).map(|i| (components.value(i).to_string(), keys.value(i).to_string(), values.value(i).to_string())).collect()
+    }
+
+    fn assert_has(rows: &[OwnedRow], component: &str, key: &str) {
+        assert!(rows.iter().any(|(c, k, _)| c == component && k == key), "missing {component}.{key}");
+    }
 
     #[test]
     fn exposes_foyer_runtime_configuration_and_occupancy() {
@@ -433,11 +487,7 @@ mod tests {
             evictions: 8,
             ..Default::default()
         };
-        let batch = StatsTableProvider::new(None).with_foyer_stats(Arc::new(move || snapshot.clone())).snapshot_batch().unwrap();
-        let components = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let keys = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let values = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        let rows: Vec<_> = (0..batch.num_rows()).map(|i| (components.value(i), keys.value(i), values.value(i))).collect();
+        let rows = snapshot_rows(&StatsTableProvider::new(None).with_foyer_stats(Arc::new(move || snapshot.clone())));
 
         for key in [
             "memory_mb",
@@ -454,25 +504,26 @@ mod tests {
             "entry_count",
             "evictions",
         ] {
-            assert!(rows.iter().any(|(component, actual, _)| *component == "foyer" && *actual == key), "missing foyer.{key}");
+            assert_has(&rows, "foyer", key);
         }
-        assert!(rows.contains(&("foyer", "cache_dir", "/cache")));
+        assert!(rows.contains(&("foyer".into(), "cache_dir".into(), "/cache".into())));
     }
 
     #[test]
     fn exposes_dml_retry_outcomes() {
-        let batch = StatsTableProvider::new(None).snapshot_batch().unwrap();
-        let components = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let keys = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let rows: Vec<_> = (0..batch.num_rows()).map(|i| (components.value(i), keys.value(i))).collect();
+        let rows = snapshot_rows(&StatsTableProvider::new(None));
 
-        assert!(rows.contains(&("dml", "occ_conflicts_total")));
-        assert!(rows.contains(&("dml", "retry_successes_total")));
-        assert!(rows.contains(&("dml", "retry_exhausted_total")));
-        assert!(rows.contains(&("maintenance", "dedup_timed_out_total")));
-        assert!(rows.contains(&("maintenance", "light_optimize_timed_out_total")));
-        assert!(rows.contains(&("maintenance", "cron_long_running_total")));
-        assert!(rows.contains(&("parquet", "metadata_cache_hits")));
-        assert!(rows.contains(&("parquet", "bytes_read")));
+        for (component, key) in [
+            ("dml", "occ_conflicts_total"),
+            ("dml", "retry_successes_total"),
+            ("dml", "retry_exhausted_total"),
+            ("maintenance", "dedup_timed_out_total"),
+            ("maintenance", "light_optimize_timed_out_total"),
+            ("maintenance", "cron_long_running_total"),
+            ("parquet", "metadata_cache_hits"),
+            ("parquet", "bytes_read"),
+        ] {
+            assert_has(&rows, component, key);
+        }
     }
 }

@@ -230,30 +230,17 @@ impl ScanMetrics {
     pub fn record_scan(&self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>) {
         use std::sync::atomic::Ordering::Relaxed;
         self.scans_total.fetch_add(1, Relaxed);
-        if skipped_delta {
-            self.scans_skipped_delta.fetch_add(1, Relaxed);
+        let by_source = match (has_mem, has_delta) {
+            (true, false) => Some(&self.scans_mem_only),
+            (false, true) => Some(&self.scans_delta_only),
+            (true, true) => Some(&self.scans_mem_plus_delta),
+            (false, false) => None,
+        };
+        let by_resolve = fast_resolve_hit.map(|hit| if hit { &self.fast_resolve_hits } else { &self.fast_resolve_misses });
+        for c in skipped_delta.then_some(&self.scans_skipped_delta).into_iter().chain(by_source).chain(by_resolve) {
+            c.fetch_add(1, Relaxed);
         }
-        match (has_mem, has_delta) {
-            (true, false) => {
-                self.scans_mem_only.fetch_add(1, Relaxed);
-            }
-            (false, true) => {
-                self.scans_delta_only.fetch_add(1, Relaxed);
-            }
-            (true, true) => {
-                self.scans_mem_plus_delta.fetch_add(1, Relaxed);
-            }
-            _ => {}
-        }
-        if let Some(hit) = fast_resolve_hit {
-            if hit {
-                self.fast_resolve_hits.fetch_add(1, Relaxed);
-            } else {
-                self.fast_resolve_misses.fetch_add(1, Relaxed);
-            }
-        }
-        let bucket = if duration_us <= 1 { 0 } else { (64 - duration_us.leading_zeros() - 1).min(31) as usize };
-        self.scan_latency_buckets[bucket].fetch_add(1, Relaxed);
+        self.scan_latency_buckets[latency_bucket(duration_us)].fetch_add(1, Relaxed);
     }
 
     /// Record a pgwire end-to-end query duration. Cheap on hot path —
@@ -261,8 +248,7 @@ impl ScanMetrics {
     pub fn record_pgwire_query(&self, duration_us: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         self.pgwire_total.fetch_add(1, Relaxed);
-        let bucket = if duration_us <= 1 { 0 } else { (64 - duration_us.leading_zeros() - 1).min(31) as usize };
-        self.pgwire_latency_buckets[bucket].fetch_add(1, Relaxed);
+        self.pgwire_latency_buckets[latency_bucket(duration_us)].fetch_add(1, Relaxed);
     }
 
     /// Estimate percentile from the power-of-two histogram. Returns the upper
@@ -276,20 +262,28 @@ impl ScanMetrics {
     }
     fn percentile_from_buckets(buckets: &[std::sync::atomic::AtomicU64; 32], p: f64) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
-        let total: u64 = buckets.iter().map(|b| b.load(Relaxed)).sum();
+        // Snapshot once: loading a second time for the cumulative walk could see
+        // a distribution that no longer sums to `total` under concurrent updates.
+        let counts = buckets.each_ref().map(|b| b.load(Relaxed));
+        let total: u64 = counts.iter().sum();
         if total == 0 {
             return 0;
         }
         let target = (total as f64 * p) as u64;
-        let mut cum = 0u64;
-        for (i, b) in buckets.iter().enumerate() {
-            cum += b.load(Relaxed);
-            if cum >= target {
-                return 1u64 << (i + 1);
-            }
-        }
-        1u64 << 32
+        counts
+            .iter()
+            .scan(0u64, |cum, c| {
+                *cum += c;
+                Some(*cum)
+            })
+            .position(|cum| cum >= target)
+            .map_or(1u64 << 32, |i| 1u64 << (i + 1))
     }
+}
+
+/// Power-of-two microsecond bucket index for the 32-bin latency histograms.
+fn latency_bucket(duration_us: u64) -> usize {
+    if duration_us <= 1 { 0 } else { (64 - duration_us.leading_zeros() - 1).min(31) as usize }
 }
 
 // Custom project tables: projects with their own S3 bucket get isolated tables
@@ -544,17 +538,15 @@ fn select_warm_paths(
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
 
-    batch.schema().fields().iter().position(|f| f.name() == "project_id").and_then(|idx| {
-        let column = batch.column(idx);
-        // Try Utf8View first (our preferred type), then fall back to Utf8
-        if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
-            (arr.len() > 0 && !arr.is_null(0)).then(|| arr.value(0).to_string())
-        } else if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
-            (arr.len() > 0 && !arr.is_null(0)).then(|| arr.value(0).to_string())
-        } else {
-            None
-        }
-    })
+    let idx = batch.schema().fields().iter().position(|f| f.name() == "project_id")?;
+    let column = batch.column(idx);
+    // Utf8View first (our preferred type), then fall back to Utf8.
+    column
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .and_then(|arr| arr.iter().next().flatten())
+        .or_else(|| column.as_any().downcast_ref::<StringArray>().and_then(|arr| arr.iter().next().flatten()))
+        .map(str::to_string)
 }
 
 /// Split a batch row-wise by its `project_id` column into per-project sub-batches.
@@ -583,23 +575,24 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
     };
     let column = batch.column(col_idx);
 
-    // Group row indices by project. `get_mut`-or-`insert` so the owned key String
-    // is allocated once per distinct project, not once per row.
+    // Group row indices by project. Imperative `get_mut`-or-`insert` (not a fold)
+    // so the owned key String is allocated once per distinct project, not per row.
+    // The block scopes the boxed iterator's borrow of `batch` so `batch` can move below.
     let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    let mut push = |pid: &str, i: usize| match groups.get_mut(pid) {
-        Some(v) => v.push(i as u32),
-        None => drop(groups.insert(pid.to_string(), vec![i as u32])),
-    };
-    if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
-        for i in 0..num_rows {
-            push(if arr.is_null(i) { default_project } else { arr.value(i) }, i);
+    {
+        let rows: Box<dyn Iterator<Item = Option<&str>> + '_> =
+            match (column.as_any().downcast_ref::<StringViewArray>(), column.as_any().downcast_ref::<StringArray>()) {
+                (Some(arr), _) => Box::new(arr.iter()),
+                (_, Some(arr)) => Box::new(arr.iter()),
+                _ => return Ok(vec![(default_project.to_string(), batch)]),
+            };
+        for (i, pid) in rows.enumerate() {
+            let pid = pid.unwrap_or(default_project);
+            match groups.get_mut(pid) {
+                Some(v) => v.push(i as u32),
+                None => drop(groups.insert(pid.to_string(), vec![i as u32])),
+            }
         }
-    } else if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
-        for i in 0..num_rows {
-            push(if arr.is_null(i) { default_project } else { arr.value(i) }, i);
-        }
-    } else {
-        return Ok(vec![(default_project.to_string(), batch)]);
     }
 
     // Homogeneous batch: route the whole thing, skip the take/copy.
@@ -611,18 +604,6 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
     groups.into_iter().map(|(pid, indices)| Ok((pid, take_record_batch(&batch, &UInt32Array::from(indices))?))).collect()
 }
 
-/// Convert Utf8/Utf8View/LargeUtf8 columns to Variant binary StructArrays where the target
-/// schema expects Variant. Called from `DataSink::write_all` so that INSERT statements (where
-/// the table provider presents Variant cols as Utf8View for the SQL planner's type check) can
-/// land their JSON-string values in the underlying Delta storage which expects Variant structs.
-/// Normalize incoming Timestamp columns whose timezone is a numeric UTC
-/// offset (`"+00:00"` — what psycopg / pgwire emit for timestamptz) to the
-/// IANA name `"UTC"`. Delta-rs's Arrow→Delta schema converter rejects
-/// `Timestamp(µs, "+00:00")` even though it's semantically identical to
-/// `"UTC"`; without normalization every flush errors out and MemBuffer
-/// fills until eviction warnings, with no data ever reaching Delta.
-///
-/// We only retag — the underlying micros-since-epoch buffer is unchanged.
 /// Build a minimal `SessionState` for delta-rs `OptimizeBuilder` to use.
 ///
 /// delta-rs's default `DeltaSessionConfig` turns `schema_force_view_types`
@@ -636,32 +617,43 @@ fn build_optimize_session_state(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
-    let mut cfg = SessionConfig::new().set_bool("datafusion.execution.parquet.schema_force_view_types", false);
-    // Bound per-operator peak memory (bare SessionConfig::new() otherwise keeps
-    // DataFusion's larger default) and reserve a small merge floor so the sort
-    // can spill instead of erroring under memory pressure.
-    // 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are wide —
-    // 8192-row decode batches measured up to 145MB (2026-07-27). Quartering
-    // the batch bounds a 32-file bin merge near ~1GB.
-    let _ = cfg.options_mut().set("datafusion.execution.batch_size", "2048");
-    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "33554432");
-    // Same nullability-widened file set as `create_session_context` (2026-07-31,
-    // 7d68f01): maintenance reads the very files that carry it, so any grouping
-    // step here would hit the identical physical-vs-logical check.
-    let _ = cfg.options_mut().set("datafusion.execution.skip_physical_aggregate_schema_check", "true");
-    // Cap maintenance parallelism hard. Each partition's ExternalSorter reserves
-    // sort_spill_reservation_bytes up-front from the bounded maintenance pool, so
-    // the query-derived count (≈ CPU cores) exhausts it before the sort can even
-    // start (prod 2026-07-12: ~46 sorters × 64 MB > the 4.8 GB pool). Legacy and
-    // high-file-count partitions still blew the reservation at 4 partitions, so
-    // drop to 2 and halve the per-partition reservation to fit the pool.
-    const MAINTENANCE_MAX_PARTITIONS: usize = 2;
-    let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
-    cfg = cfg.with_target_partitions(parts);
+    // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
+    // wide — 8192-row decode batches measured up to 145MB (2026-07-27). Quartering
+    // the batch bounds a 32-file bin merge near ~1GB. Bare `SessionConfig::new()`
+    // otherwise keeps DataFusion's larger default.
+    let cfg = maintenance_session_config(SessionConfig::new(), "2048", target_partitions);
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
     // OOM-killing the process, but are isolated from query pressure and can spill.
     SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build()
+}
+
+/// Parallelism cap for every maintenance session. Each partition's
+/// `ExternalSorter` reserves `sort_spill_reservation_bytes` up-front from the
+/// bounded maintenance pool, so the query-derived count (≈ CPU cores) exhausts it
+/// before the sort can even start (prod 2026-07-12: ~46 sorters × 64 MB > the
+/// 4.8 GB pool). Legacy and high-file-count partitions still blew the reservation
+/// at 4 partitions, hence 2.
+const MAINTENANCE_MAX_PARTITIONS: usize = 2;
+
+/// Config tuning shared by every delta-rs maintenance session.
+/// `schema_force_view_types=false` keeps Variant columns as `Binary` (not
+/// `BinaryView`) so delta_kernel's unshredded-variant schema check passes; the
+/// sort-spill floor lets a sort spill instead of erroring under the bounded
+/// maintenance pool; `skip_physical_aggregate_schema_check` mirrors
+/// `create_session_context` (2026-07-31, 7d68f01) because maintenance reads the
+/// very files carrying the widened nullability.
+fn maintenance_session_config(base: datafusion::prelude::SessionConfig, batch_size: &str, target_partitions: usize) -> datafusion::prelude::SessionConfig {
+    let mut cfg = base.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    for (k, v) in [
+        ("datafusion.execution.batch_size", batch_size),
+        ("datafusion.execution.sort_spill_reservation_bytes", "33554432"),
+        ("datafusion.execution.skip_physical_aggregate_schema_check", "true"),
+    ] {
+        let _ = cfg.options_mut().set(k, v);
+    }
+    let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
+    cfg.with_target_partitions(parts)
 }
 
 /// Session for delta-rs *write* execution (recompress's `replace_where`
@@ -675,20 +667,8 @@ fn build_delta_write_session_state(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
-    let cfg: SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
-    let mut cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
-    let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
-    // Reserve a small merge floor so a recompress `ORDER BY` (global sort of a
-    // cold partition) spills to disk instead of erroring under the bounded
-    // maintenance pool — same reason as `build_optimize_session_state`.
-    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "33554432");
-    // Same nullability-widened file set as `create_session_context` (2026-07-31,
-    // 7d68f01): maintenance reads the very files that carry it, so any grouping
-    // step here would hit the identical physical-vs-logical check.
-    let _ = cfg.options_mut().set("datafusion.execution.skip_physical_aggregate_schema_check", "true");
-    const MAINTENANCE_MAX_PARTITIONS: usize = 2;
-    let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
-    cfg = cfg.with_target_partitions(parts);
+    let base: SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
+    let cfg = maintenance_session_config(base, "8192", target_partitions);
     SessionStateBuilder::new()
         .with_config(cfg)
         .with_runtime_env(runtime_env)
@@ -787,8 +767,6 @@ where
     });
 }
 
-/// Cast Variant struct columns (Struct{BinaryView,BinaryView}) to the
-/// Binary-backed form delta-kernel's `unshredded_variant()` requires on
 /// On-disk key for the WAL watermark stored in `commitInfo.info`. Constant so
 /// the writer (this file) and reader (`derive_wal_cursor_for_table`) can't
 /// drift, and the roundtrip test below pins the format.
@@ -843,26 +821,21 @@ fn serialize_watermarks_to_json(
             (!map.is_empty()).then(|| (wal_topic(&project_id, &table_name), map))
         })
         .collect();
-    match per_topic.len() {
-        0 => serde_json::Map::new(),
-        1 => per_topic.pop().expect("len checked").1,
-        _ => {
-            // Dedup defensively: two units for the same topic in one commit
-            // would otherwise silently drop one. Take the per-shard MAX so the
-            // surviving entry can never be BEHIND either contributor (behind =
-            // over-replay, which is safe, but ahead would be loss).
-            let mut topics: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-            for (topic, map) in per_topic {
-                match topics.get_mut(&topic).and_then(serde_json::Value::as_object_mut) {
-                    Some(existing) => merge_max_watermark_maps(existing, map),
-                    None => {
-                        topics.insert(topic, serde_json::Value::Object(map));
-                    }
-                }
-            }
-            [(WATERMARK_TOPICS_KEY.to_string(), serde_json::Value::Object(topics))].into_iter().collect()
-        }
+    if per_topic.len() <= 1 {
+        return per_topic.pop().map(|(_, map)| map).unwrap_or_default();
     }
+    // Dedup defensively: two units for the same topic in one commit would
+    // otherwise silently drop one. Take the per-shard MAX so the surviving
+    // entry can never be BEHIND either contributor (behind = over-replay,
+    // which is safe, but ahead would be loss).
+    let topics = per_topic.into_iter().fold(serde_json::Map::new(), |mut topics, (topic, map)| {
+        match topics.get_mut(&topic).and_then(serde_json::Value::as_object_mut) {
+            Some(existing) => merge_max_watermark_maps(existing, map),
+            None => drop(topics.insert(topic, serde_json::Value::Object(map))),
+        }
+        topics
+    });
+    [(WATERMARK_TOPICS_KEY.to_string(), serde_json::Value::Object(topics))].into_iter().collect()
 }
 
 /// Per-shard MAX merge of two single-topic watermark maps, in place on `into`.
@@ -931,17 +904,16 @@ fn reap_orphaned_spill_dirs(spill_dir: &std::path::Path) {
 }
 
 fn reap_orphaned_spill_dirs_blocking(spill_dir: &std::path::Path, orphans: Vec<std::path::PathBuf>) {
-    let (mut dirs, mut bytes) = (0u64, 0u64);
-    for path in orphans {
+    let (dirs, bytes) = orphans.into_iter().fold((0u64, 0u64), |(dirs, bytes), path| {
         let size = dir_size_bytes(&path);
         match std::fs::remove_dir_all(&path) {
-            Ok(()) => {
-                dirs += 1;
-                bytes += size;
+            Ok(()) => (dirs + 1, bytes + size),
+            Err(err) => {
+                warn!("spill reap: cannot remove {path:?}: {err}");
+                (dirs, bytes)
             }
-            Err(err) => warn!("spill reap: cannot remove {path:?}: {err}"),
         }
-    }
+    });
     if dirs > 0 {
         info!("spill reap: removed {dirs} orphaned spill dir(s), {} MB freed from {spill_dir:?}", bytes / (1024 * 1024));
     }
@@ -1012,14 +984,15 @@ fn parse_watermark_from_json(
 fn max_watermark_across_commits<'a>(
     commit_infos: impl IntoIterator<Item = &'a std::collections::HashMap<String, serde_json::Value>>, shards: usize, project_id: &str, table_name: &str,
 ) -> Vec<Option<walrus_rust::WalPosition>> {
-    let mut acc = vec![None; shards];
-    for info in commit_infos {
-        for (shard, p) in parse_watermark_from_json(info, shards, project_id, table_name).into_iter().enumerate() {
-            let Some(candidate) = p else { continue };
-            acc[shard] = Some(acc[shard].map_or(candidate, |prev: walrus_rust::WalPosition| prev.max(candidate)));
-        }
-    }
-    acc
+    commit_infos.into_iter().fold(vec![None; shards], |acc, info| {
+        acc.into_iter()
+            .zip(parse_watermark_from_json(info, shards, project_id, table_name))
+            .map(|(prev, candidate)| match (prev, candidate) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            })
+            .collect()
+    })
 }
 
 /// Base [`CommitProperties`] for every ingest/maintenance commit. Disables the
@@ -1045,9 +1018,7 @@ fn build_watermark_commit_properties(watermarks: impl IntoIterator<Item = (Strin
     if entries.is_empty() {
         return base_commit_properties();
     }
-    let mut meta = std::collections::HashMap::new();
-    meta.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries));
-    base_commit_properties().with_metadata(meta)
+    base_commit_properties().with_metadata([(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries))])
 }
 
 /// `CommitProperties` for a compaction/dedup commit (Add + Remove): when
@@ -1380,14 +1351,15 @@ fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake:
 
 /// Drop `name` from `batch` (no-op when absent) — strips the synthetic
 /// [`DEDUP_FILE_COL`] before deduped rows are written back.
-fn drop_batch_column(batch: RecordBatch, name: &str) -> RecordBatch {
-    let Ok(idx) = batch.schema().index_of(name) else { return batch };
-    let mut cols = batch.columns().to_vec();
-    cols.remove(idx);
-    let fields: Vec<_> = batch.schema().fields().iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, f)| f.clone()).collect();
-    RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), cols).expect("row count unchanged")
+fn drop_batch_column(mut batch: RecordBatch, name: &str) -> RecordBatch {
+    if let Ok(idx) = batch.schema().index_of(name) {
+        batch.remove_column(idx);
+    }
+    batch
 }
 
+/// Cast Variant struct columns (Struct{BinaryView,BinaryView}) to the
+/// Binary-backed form delta-kernel's `unshredded_variant()` requires on
 /// write. No-op for any column that's not a Variant struct or already in
 /// Binary form. Called from `insert_records_batch` right before the
 /// Delta write so MemBuffer can keep its natural BinaryView layout
@@ -1395,47 +1367,63 @@ fn drop_batch_column(batch: RecordBatch, name: &str) -> RecordBatch {
 fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
     use arrow::{array::StructArray, compute::cast};
     use datafusion::arrow::datatypes::{DataType, Field};
-    let schema = batch.schema();
-    let mut new_cols = batch.columns().to_vec();
-    let mut new_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-    let mut changed = false;
-    for (i, field) in schema.fields().iter().enumerate() {
-        if !is_variant_type(field.data_type()) {
-            continue;
+    remap_batch_columns(batch, |field, col| {
+        let DataType::Struct(struct_fields) = field.data_type() else { return Ok(None) };
+        // Only act on Variant structs that still carry a BinaryView leg.
+        if !is_variant_type(field.data_type()) || !struct_fields.iter().any(|f| matches!(f.data_type(), DataType::BinaryView)) {
+            return Ok(None);
         }
-        let DataType::Struct(struct_fields) = field.data_type() else { continue };
-        // Only act if any inner field is BinaryView.
-        let needs = struct_fields.iter().any(|f| matches!(f.data_type(), DataType::BinaryView));
-        if !needs {
-            continue;
-        }
-        let Some(struct_arr) = batch.columns()[i].as_any().downcast_ref::<StructArray>() else {
-            continue;
-        };
+        let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() else { return Ok(None) };
         let casted_cols: Vec<arrow::array::ArrayRef> = struct_arr
             .columns()
             .iter()
-            .zip(struct_fields.iter())
-            .map(|(arr, f)| -> DFResult<arrow::array::ArrayRef> {
-                if matches!(f.data_type(), DataType::BinaryView) { cast(arr, &DataType::Binary).map_err(arrow_err) } else { Ok(arr.clone()) }
+            .zip(struct_fields)
+            .map(|(arr, f)| match f.data_type() {
+                DataType::BinaryView => cast(arr, &DataType::Binary).map_err(arrow_err),
+                _ => Ok(arr.clone()),
             })
             .collect::<DFResult<_>>()?;
         let casted_fields: arrow::datatypes::Fields = struct_fields
             .iter()
-            .map(|f| if matches!(f.data_type(), DataType::BinaryView) { Arc::new(Field::new(f.name(), DataType::Binary, f.is_nullable())) } else { f.clone() })
+            .map(|f| match f.data_type() {
+                DataType::BinaryView => Arc::new(Field::new(f.name(), DataType::Binary, f.is_nullable())),
+                _ => f.clone(),
+            })
             .collect::<Vec<_>>()
             .into();
-        new_cols[i] = Arc::new(StructArray::new(casted_fields.clone(), casted_cols, struct_arr.nulls().cloned()));
-        new_fields[i] = Arc::new(Field::new(field.name(), DataType::Struct(casted_fields), field.is_nullable()).with_metadata(field.metadata().clone()));
-        changed = true;
-    }
-    if !changed {
-        return Ok(batch);
-    }
-    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(arrow_err)
+        let new_field =
+            Arc::new(Field::new(field.name(), DataType::Struct(casted_fields.clone()), field.is_nullable()).with_metadata(field.metadata().clone()));
+        Ok(Some((new_field, Arc::new(StructArray::new(casted_fields, casted_cols, struct_arr.nulls().cloned())) as arrow::array::ArrayRef)))
+    })
 }
 
+/// Rebuild `batch` with the columns for which `remap` yields a replacement
+/// `(field, array)`; `None` leaves a column untouched, and an all-`None` pass
+/// returns `batch` itself (no copy). Schema-level metadata is preserved.
+/// Shared by the Variant→Binary cast and the timestamp-timezone normalizer so
+/// their no-op and metadata semantics can't drift.
+fn remap_batch_columns(
+    batch: RecordBatch, remap: impl Fn(&arrow_schema::FieldRef, &arrow::array::ArrayRef) -> DFResult<Option<(arrow_schema::FieldRef, arrow::array::ArrayRef)>>,
+) -> DFResult<RecordBatch> {
+    let schema = batch.schema();
+    let remapped = schema.fields().iter().zip(batch.columns()).map(|(f, c)| remap(f, c)).collect::<DFResult<Vec<_>>>()?;
+    if remapped.iter().all(Option::is_none) {
+        return Ok(batch);
+    }
+    let (fields, columns): (Vec<_>, Vec<_>) =
+        remapped.into_iter().zip(schema.fields().iter().zip(batch.columns())).map(|(new, (f, c))| new.unwrap_or_else(|| (f.clone(), c.clone()))).unzip();
+    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(new_schema, columns).map_err(arrow_err)
+}
+
+/// Normalize incoming Timestamp columns whose timezone is a numeric UTC
+/// offset (`"+00:00"` — what psycopg / pgwire emit for timestamptz) to the
+/// IANA name `"UTC"`. Delta-rs's Arrow→Delta schema converter rejects
+/// `Timestamp(µs, "+00:00")` even though it's semantically identical to
+/// `"UTC"`; without normalization every flush errors out and MemBuffer
+/// fills until eviction warnings, with no data ever reaching Delta.
+///
+/// We only retag — the underlying micros-since-epoch buffer is unchanged.
 fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
     use arrow::array::{TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
     use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
@@ -1449,43 +1437,32 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
             || tz.eq_ignore_ascii_case("GMT")
             || tz.eq_ignore_ascii_case("Z")
     };
-    let schema = batch.schema();
-    let mut new_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-    let mut new_cols = batch.columns().to_vec();
-    let mut changed = false;
-    for (i, field) in schema.fields().iter().enumerate() {
-        if let DataType::Timestamp(unit, Some(tz)) = field.data_type()
-            && is_utc_offset(tz.as_ref())
-        {
-            let col = &batch.columns()[i];
-            // Downcasts are guarded by the outer `DataType::Timestamp(unit, ..)` match,
-            // but Arrow's trait-object dispatch isn't an unsafe-level guarantee — return
-            // an error rather than panic on the INSERT path if a future Arrow version
-            // diverges.
-            let bad = |w| DataFusionError::Execution(format!("timestamp downcast failed for field '{}' with width {w}", field.name()));
-            let retagged: Arc<dyn arrow::array::Array> = match unit {
-                TimeUnit::Microsecond => {
-                    Arc::new(col.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| bad("Microsecond"))?.clone().with_timezone("UTC"))
-                }
-                TimeUnit::Millisecond => {
-                    Arc::new(col.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| bad("Millisecond"))?.clone().with_timezone("UTC"))
-                }
-                TimeUnit::Nanosecond => {
-                    Arc::new(col.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| bad("Nanosecond"))?.clone().with_timezone("UTC"))
-                }
-                TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| bad("Second"))?.clone().with_timezone("UTC")),
-            };
-            new_cols[i] = retagged;
-            new_fields[i] =
-                Arc::new(Field::new(field.name(), DataType::Timestamp(*unit, Some("UTC".into())), field.is_nullable()).with_metadata(field.metadata().clone()));
-            changed = true;
+    remap_batch_columns(batch, |field, col| {
+        let DataType::Timestamp(unit, Some(tz)) = field.data_type() else { return Ok(None) };
+        if !is_utc_offset(tz.as_ref()) {
+            return Ok(None);
         }
-    }
-    if !changed {
-        return Ok(batch);
-    }
-    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(arrow_err)
+        // Downcasts are guarded by the `DataType::Timestamp(unit, ..)` match above,
+        // but Arrow's trait-object dispatch isn't an unsafe-level guarantee — return
+        // an error rather than panic on the INSERT path if a future Arrow version
+        // diverges.
+        let bad = |w| DataFusionError::Execution(format!("timestamp downcast failed for field '{}' with width {w}", field.name()));
+        let retagged: arrow::array::ArrayRef = match unit {
+            TimeUnit::Microsecond => {
+                Arc::new(col.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| bad("Microsecond"))?.clone().with_timezone("UTC"))
+            }
+            TimeUnit::Millisecond => {
+                Arc::new(col.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| bad("Millisecond"))?.clone().with_timezone("UTC"))
+            }
+            TimeUnit::Nanosecond => {
+                Arc::new(col.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| bad("Nanosecond"))?.clone().with_timezone("UTC"))
+            }
+            TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| bad("Second"))?.clone().with_timezone("UTC")),
+        };
+        let new_field =
+            Arc::new(Field::new(field.name(), DataType::Timestamp(*unit, Some("UTC".into())), field.is_nullable()).with_metadata(field.metadata().clone()));
+        Ok(Some((new_field, retagged)))
+    })
 }
 
 /// `date` is a physical UTC partition key, never caller-owned data. Rebuild it
@@ -1548,6 +1525,10 @@ fn derive_date_partition(batch: RecordBatch) -> DFResult<RecordBatch> {
     RecordBatch::try_new(schema, columns).map_err(arrow_err)
 }
 
+/// Convert Utf8/Utf8View/LargeUtf8 columns to Variant binary StructArrays where the target
+/// schema expects Variant. Called from `DataSink::write_all` so that INSERT statements (where
+/// the table provider presents Variant cols as Utf8View for the SQL planner's type check) can
+/// land their JSON-string values in the underlying Delta storage which expects Variant structs.
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
     use datafusion::arrow::{
         array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray, StructArray},
@@ -1561,10 +1542,9 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
 
-    let utf8_to_variant = |iter: Box<dyn Iterator<Item = Option<&str>> + '_>| -> DFResult<StructArray> {
-        let items: Vec<_> = iter.collect();
-        let mut builder = VariantArrayBuilder::new(items.len());
-        for (idx, item) in items.into_iter().enumerate() {
+    fn utf8_to_variant<'a>(iter: impl ExactSizeIterator<Item = Option<&'a str>>) -> DFResult<StructArray> {
+        let mut builder = VariantArrayBuilder::new(iter.len());
+        for (idx, item) in iter.enumerate() {
             match item {
                 Some(s) => builder.append_json(s).map_err(|e| DataFusionError::Execution(format!("Invalid JSON at row {idx}: {e} (value: '{s}')")))?,
                 None => builder.append_null(),
@@ -1582,36 +1562,23 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
             Arc::new(Field::new(crate::schema_loader::VARIANT_VALUE_FIELD, DataType::Binary, false)),
         ];
         Ok(StructArray::new(fields.into(), vec![metadata, value], arr.nulls().cloned()))
-    };
+    }
 
-    for (idx, target_field) in target_schema.fields().iter().enumerate() {
-        if !is_variant_type(target_field.data_type()) || idx >= columns.len() {
-            continue;
-        }
+    for (idx, target_field) in target_schema.fields().iter().enumerate().take(columns.len()).filter(|(_, f)| is_variant_type(f.data_type())) {
         let col = &columns[idx];
         // Downcasts are guarded by the `DataType::*` match arm above. If Arrow ever
         // returns a different concrete array for the same logical type, surface as
         // a DataFusionError instead of panicking on the INSERT path.
         let name = target_field.name();
         let bad_downcast = |ty: &str| DataFusionError::Execution(format!("{ty} downcast failed for column {name}"));
-        let converted: Option<ArrayRef> = match col.data_type() {
-            DataType::Utf8View => {
-                Some(Arc::new(utf8_to_variant(Box::new(col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter()))?)
-                    as ArrayRef)
-            }
-            DataType::Utf8 => {
-                Some(Arc::new(utf8_to_variant(Box::new(col.as_any().downcast_ref::<StringArray>().ok_or_else(|| bad_downcast("Utf8"))?.iter()))?) as ArrayRef)
-            }
-            DataType::LargeUtf8 => {
-                Some(Arc::new(utf8_to_variant(Box::new(col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| bad_downcast("LargeUtf8"))?.iter()))?)
-                    as ArrayRef)
-            }
-            _ => None, // already Variant struct
+        let converted: ArrayRef = match col.data_type() {
+            DataType::Utf8View => Arc::new(utf8_to_variant(col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter())?),
+            DataType::Utf8 => Arc::new(utf8_to_variant(col.as_any().downcast_ref::<StringArray>().ok_or_else(|| bad_downcast("Utf8"))?.iter())?),
+            DataType::LargeUtf8 => Arc::new(utf8_to_variant(col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| bad_downcast("LargeUtf8"))?.iter())?),
+            _ => continue, // already Variant struct
         };
-        if let Some(arr) = converted {
-            columns[idx] = arr;
-            new_fields[idx] = target_field.clone();
-        }
+        columns[idx] = converted;
+        new_fields[idx] = target_field.clone();
     }
 
     let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
@@ -2180,7 +2147,7 @@ impl Database {
     pub async fn with_config(cfg: Arc<AppConfig>) -> Result<Self> {
         // Active tables rewrite their snapshot every flush; week-stale files
         // belong to dropped/idle tables and would otherwise accumulate forever.
-        crate::snapshot_cache::prune_stale(&Self::delta_snapshot_dir(&cfg), std::time::Duration::from_secs(7 * 24 * 3600));
+        crate::snapshot_cache::prune_stale(&Self::delta_snapshot_dir(&cfg), crate::snapshot_cache::SNAPSHOT_MAX_AGE);
         let dedup_dirty_bins = Arc::new(dashmap::DashMap::new());
         for bin in crate::dirty_bin_queue::load(&cfg.core.timefusion_data_dir) {
             dedup_dirty_bins.insert((bin.project_id, bin.table_name, bin.date, bin.bin), ());
@@ -2692,9 +2659,7 @@ impl Database {
                         let label = Self::table_label(&project_id, &table_name);
                         let table = table.read().await;
                         let current_version = table.version().unwrap_or(0);
-                        let schema_def = get_schema(&table_name).unwrap_or_else(get_default_schema);
-                        let schema = schema_def.schema_ref();
-                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, &project_id, &table_name, &schema).await {
+                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, &project_id, &table_name).await {
                             error!("Failed to refresh statistics for {}: {}", label, e);
                         } else {
                             debug!("Refreshed statistics for {} (version {})", label, current_version);
@@ -3134,8 +3099,7 @@ impl Database {
             // the moment a future refactor reads the Arc<AtomicBool> outside
             // the shard guard. Cost on ARM is one `dmb ish` per query;
             // negligible against the work it protects.
-            .map(|f| !f.load(std::sync::atomic::Ordering::Acquire))
-            .unwrap_or(false)
+            .is_some_and(|f| !f.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Mark a (project, table) as having Delta files. Called by the flush
@@ -3167,23 +3131,21 @@ impl Database {
         // Capacity is counted in providers (not keys) so the bound still
         // reflects retained memory now that a key holds a version ring.
         let capacity = self.config.cache.provider_cache_capacity().saturating_sub(1);
-        let mut total = self.delta_provider_cache_entries();
+        let total = self.delta_provider_cache_entries();
         if total > capacity {
             // Collect first, remove after: DashMap's iterator holds the shard
             // read lock, so removing mid-iteration can deadlock.
-            let mut doomed = Vec::new();
-            for entry in self.delta_provider_cache.iter() {
-                if total <= capacity {
-                    break;
-                }
-                total -= entry.value().len();
-                doomed.push(entry.key().clone());
-            }
-            for key in doomed {
-                if let Some((_, entry)) = self.delta_provider_cache.remove(&key) {
-                    evicted += entry.len();
-                }
-            }
+            let doomed: Vec<_> = self
+                .delta_provider_cache
+                .iter()
+                .scan(total, |remaining, entry| {
+                    (*remaining > capacity).then(|| {
+                        *remaining -= entry.value().len();
+                        entry.key().clone()
+                    })
+                })
+                .collect();
+            evicted += doomed.iter().filter_map(|key| self.delta_provider_cache.remove(key)).map(|(_, entry)| entry.len()).sum::<usize>();
         }
         self.scan_metrics.provider_cache_evictions.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3268,7 +3230,7 @@ impl Database {
                 );
             }
         }
-        let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
+        let has_files = t.read().await.version().is_some_and(|v| v > 0);
         let entry = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         if has_files {
             // Release pairs with the Acquire load in delta_scan_can_be_skipped
@@ -3287,23 +3249,25 @@ impl Database {
         let cached = self.unified_tables.read().await.get(table_name).cloned();
         if let Some(table) = cached {
             debug!("Found unified table '{}' in cache", table_name);
-            // For unified tables, we use table_name as the key for version tracking
-            let last_written_version = {
-                let versions = self.last_written_versions.read().await;
-                // Use empty string for project_id since unified tables aren't project-specific
-                versions.get(&("".to_string(), table_name.to_string())).cloned()
-            };
-
-            let current_version = table.read().await.version();
-            if should_refresh_table(current_version, last_written_version) {
-                self.update_table(&table, "", table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
-            }
-
-            return Ok(table);
+            // Version tracking keys unified tables under an empty project_id —
+            // they aren't project-specific.
+            return self.refresh_cached_table(table, "", table_name).await;
         }
 
         // Not in cache, create/load it
         self.get_or_create_unified_table(table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to get or create unified table: {}", e)))
+    }
+
+    /// Refresh a cache-hit handle when this process's view may be behind. Shared
+    /// by `resolve_unified_table` / `resolve_custom_table` so the staleness rule
+    /// can't drift between them.
+    async fn refresh_cached_table(&self, table: Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+        let last_written_version = self.last_written_versions.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned();
+        let current_version = table.read().await.version();
+        if should_refresh_table(current_version, last_written_version) {
+            self.update_table(&table, project_id, table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {e}")))?;
+        }
+        Ok(table)
     }
 
     /// Resolve a custom project table (isolated table for projects with their own S3 bucket)
@@ -3313,17 +3277,7 @@ impl Database {
         let cached = self.custom_project_tables.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned();
         if let Some(table) = cached {
             debug!("Found custom table for project '{}' table '{}' in cache", project_id, table_name);
-            let last_written_version = {
-                let versions = self.last_written_versions.read().await;
-                versions.get(&(project_id.to_string(), table_name.to_string())).cloned()
-            };
-
-            let current_version = table.read().await.version();
-            if should_refresh_table(current_version, last_written_version) {
-                self.update_table(&table, project_id, table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
-            }
-
-            return Ok(table);
+            return self.refresh_cached_table(table, project_id, table_name).await;
         }
 
         // Not in cache, create/load it
@@ -3761,24 +3715,23 @@ impl Database {
         // Same relativization as warm_cache_for_uris: the cache keys full files
         // by their object-store-relative path.
         let prefix = table_cache_prefix(table_uri);
-        let mut evicted = 0usize;
-        let mut dropped = 0usize;
-        for u in removed {
-            if let Some(path) = relativize_to_prefix(prefix, u) {
+        let (evicted, dropped) = removed.iter().fold((0usize, 0usize), |(evicted, dropped), u| match relativize_to_prefix(prefix, u) {
+            Some(path) => {
                 cache.evict_data_entry(path.as_ref());
-                evicted += 1;
-            } else {
-                // Prefix mismatch (trailing-slash or query-string drift between
-                // table_url() and get_file_uris()) — we'd evict the wrong key, so
-                // skip. Log like the warm path: a systematic mismatch here means
-                // tombstoned files linger in cache until TTL/LRU, which is worth
-                // diagnosing rather than silently swallowing.
+                (evicted + 1, dropped)
+            }
+            // Prefix mismatch (trailing-slash or query-string drift between
+            // table_url() and get_file_uris()) — we'd evict the wrong key, so
+            // skip. Log like the warm path: a systematic mismatch here means
+            // tombstoned files linger in cache until TTL/LRU, which is worth
+            // diagnosing rather than silently swallowing.
+            None => {
                 if dropped == 0 {
                     debug!("evict: URI {} does not start with table prefix {}; skipping (evict only)", u, prefix);
                 }
-                dropped += 1;
+                (evicted, dropped + 1)
             }
-        }
+        });
         if evicted > 0 {
             debug!("Evicted {} tombstoned file(s) from cache after compaction", evicted);
         }
@@ -4025,7 +3978,7 @@ impl Database {
 
     /// Directory holding locally persisted Delta snapshots (see `snapshot_cache`).
     fn delta_snapshot_dir(cfg: &AppConfig) -> PathBuf {
-        cfg.core.timefusion_data_dir.join(".timefusion_meta").join("delta_snapshots")
+        crate::wal::meta_path(&cfg.core.timefusion_data_dir, "delta_snapshots")
     }
 
     /// Whether snapshot refreshes may take the incremental catch-up fast path
@@ -5136,7 +5089,7 @@ impl Database {
     /// so this can't make recovery worse than today's at-least-once behaviour.
     pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::wal::WalManager) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
-        let totals: Vec<usize> = stream::iter(wal.list_topic_pairs()?)
+        let totals: Vec<usize> = stream::iter(wal.list_topic_pairs())
             .map(|(project_id, table_name)| async move { self.derive_wal_cursor_for_table(wal, &project_id, &table_name).await.unwrap_or(0) })
             .buffer_unordered(self.config.buffer.delta_scan_concurrency())
             .collect()
@@ -5453,11 +5406,8 @@ impl Database {
         let markers: Vec<(chrono::NaiveDate, String)> = dates.iter().map(|d| (*d, format!("date={d}"))).collect();
         let mut out: HashMap<chrono::NaiveDate, std::collections::HashSet<String>> = dates.iter().map(|d| (*d, std::collections::HashSet::new())).collect();
         for uri in uris {
-            for (d, marker) in &markers {
-                if uri.contains(marker) {
-                    out.get_mut(d).expect("date pre-seeded").insert(uri.clone());
-                    break;
-                }
+            if let Some((d, _)) = markers.iter().find(|(_, marker)| uri.contains(marker)) {
+                out.entry(*d).or_default().insert(uri.clone());
             }
         }
         out
@@ -5468,15 +5418,15 @@ impl Database {
     /// alone conflicts with every project's append to the active day.
     fn hot_project_ids(uris: &[String], date: chrono::NaiveDate) -> Vec<String> {
         let date_marker = format!("/date={date}/");
-        let mut counts = std::collections::HashMap::<&str, usize>::new();
-        for project_id in uris
+        let counts = uris
             .iter()
             .filter(|uri| uri.contains(&date_marker))
             .filter_map(|uri| uri.split('/').find_map(|segment| segment.strip_prefix("project_id=")))
             .filter(|project_id| !project_id.is_empty())
-        {
-            *counts.entry(project_id).or_default() += 1;
-        }
+            .fold(std::collections::HashMap::<&str, usize>::new(), |mut counts, project_id| {
+                *counts.entry(project_id).or_default() += 1;
+                counts
+            });
         // Most-fragmented partition first: it's the one whose recent-window
         // queries open the most files, so it benefits most from an early tick.
         let mut projects: Vec<_> = counts.into_iter().collect();
@@ -5537,37 +5487,39 @@ impl Database {
         let repairable = !schema.sorting_columns.is_empty();
         let cap = target_size.max(1);
         let converged = cap - cap / 8;
-        let mut per_project: HashMap<String, Vec<TailAdd>> = HashMap::new();
-        for file in table.snapshot()?.log_data().iter() {
-            let path = file.path();
-            if !path.contains(&date_marker) {
-                continue;
-            }
-            let Some(project_id) = path.split('/').find_map(|s| s.strip_prefix("project_id=")).filter(|p| !p.is_empty()).map(str::to_owned) else {
-                continue;
-            };
+        let per_project = table
+            .snapshot()?
+            .log_data()
+            .iter()
+            .filter(|file| file.path().contains(&date_marker))
             // Tag-first: both exclusions are pure metadata, so a converged file
             // or an over-cap sorted run never reaches the stats parse.
-            let size = file.size();
-            let sorted_run = is_sorted_run(&file.tags());
-            // A converged file is normally done — EXCEPT when it is converged
-            // and UNSORTED. Such a file declares no `sorting_columns`, and one
-            // of them disables the reader's all-or-nothing footer ordering for
-            // every scan that touches it (costing the streaming top-N pushdown
-            // and bounded dedup). Nothing else repairs it: the daily
-            // consolidate/recompress crons rarely survive this process's restart
-            // cadence, so hot-tail is the only pass that runs often enough to be
-            // relied on. `select_tail_bin` admits at most one per bin, so the
-            // backlog drains over ticks instead of rewriting several
-            // hundred-megabyte files at once.
-            if size >= converged && (sorted_run || !repairable) {
-                continue;
-            }
-            if size >= sorted_run_cap && sorted_run {
-                continue;
-            }
-            per_project.entry(project_id).or_default().push(TailAdd::from_stats(path.into_owned(), size, sorted_run, file.stats().as_deref()));
-        }
+            .filter_map(|file| {
+                let (size, sorted_run) = (file.size(), is_sorted_run(&file.tags()));
+                // A converged file is normally done — EXCEPT when it is converged
+                // and UNSORTED. Such a file declares no `sorting_columns`, and one
+                // of them disables the reader's all-or-nothing footer ordering for
+                // every scan that touches it (costing the streaming top-N pushdown
+                // and bounded dedup). Nothing else repairs it: the daily
+                // consolidate/recompress crons rarely survive this process's restart
+                // cadence, so hot-tail is the only pass that runs often enough to be
+                // relied on. `select_tail_bin` admits at most one per bin, so the
+                // backlog drains over ticks instead of rewriting several
+                // hundred-megabyte files at once.
+                let converged_done = size >= converged && (sorted_run || !repairable);
+                let over_cap_run = size >= sorted_run_cap && sorted_run;
+                if converged_done || over_cap_run {
+                    return None;
+                }
+                // `stats()` is reached only past both tag/size exclusions.
+                let path = file.path();
+                let project_id = path.split('/').find_map(|s| s.strip_prefix("project_id=")).filter(|p| !p.is_empty()).map(str::to_owned)?;
+                Some((project_id, TailAdd::from_stats(path.into_owned(), size, sorted_run, file.stats().as_deref())))
+            })
+            .fold(HashMap::<String, Vec<TailAdd>>::new(), |mut per_project, (project_id, add)| {
+                per_project.entry(project_id).or_default().push(add);
+                per_project
+            });
         let mut planned: Vec<(String, Vec<String>, usize)> = per_project
             .into_iter()
             .map(|(project_id, adds)| {
@@ -6485,11 +6437,8 @@ impl Database {
                         // Contiguous bucket range per shard (even ±1); string compare of
                         // zero-padded lowercase hex == numeric order.
                         let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
-                        let mut p = format!(" AND {bucket_expr} >= '{lo:02x}'");
-                        if hi < DEDUP_BUCKET_COUNT {
-                            p.push_str(&format!(" AND {bucket_expr} < '{hi:02x}'"));
-                        }
-                        p
+                        let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < '{hi:02x}'") } else { String::new() };
+                        format!(" AND {bucket_expr} >= '{lo:02x}'{upper}")
                     } else {
                         String::new()
                     };
@@ -6610,27 +6559,18 @@ impl Database {
     /// check-then-use window; 2026-07-05 review hardening).
     pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> bool {
         let Some(dates) = window_dates(lo, hi) else { return false };
-        for date in dates {
-            let marker = format!("date={date}");
-            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &marker) else {
-                return false;
-            };
+        dates.into_iter().all(|date| {
+            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &format!("date={date}")) else { return false };
             // The sweep keys custom-project tables (no project_id= path
             // segment) under "default"; match its grouping exactly.
-            let (key_pid, files) = if let Some(f) = by_pid.remove(project_id) {
-                (project_id.to_string(), f)
-            } else if let Some(f) = by_pid.remove("default") {
-                ("default".to_string(), f)
-            } else {
-                continue; // no Delta files for this date → nothing to dedup
+            let Some((key_pid, files)) =
+                by_pid.remove(project_id).map(|f| (project_id.to_string(), f)).or_else(|| by_pid.remove("default").map(|f| ("default".to_string(), f)))
+            else {
+                return true; // no Delta files for this date → nothing to dedup
             };
             let fp_key = (key_pid, table_name.to_string(), date.to_string());
-            match self.dedup_clean_fp.get(&fp_key) {
-                Some(fp) if *fp.value() == partition_file_fp(files) => {}
-                _ => return false,
-            }
-        }
-        true
+            self.dedup_clean_fp.get(&fp_key).is_some_and(|fp| *fp.value() == partition_file_fp(files))
+        })
     }
 
     /// Sweep every `(project_id, today)` partition in this table via
@@ -7543,7 +7483,7 @@ impl Database {
                     // every wave (the 2026-07-21 cache-thrash lesson).
                     self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
                     Self::record_wave_landed(&fresh, data_change);
-                    return WaveResult { landed: with(carried, fresh), failed };
+                    return WaveResult { landed: concat_landed(carried, fresh), failed };
                 }
                 Err(CommitFailure { message: e, timed_out }) => {
                     // Released BEFORE the probe: on a timeout the store is
@@ -7572,7 +7512,7 @@ impl Database {
                             self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
                             self.clear_bin_intents(&fresh);
                             Self::record_wave_landed(&fresh, data_change);
-                            return WaveResult { landed: with(carried, fresh), failed };
+                            return WaveResult { landed: concat_landed(carried, fresh), failed };
                         }
                         CommitProbe::NotLanded => {
                             crate::metrics::record_optimize_failed();
@@ -8247,10 +8187,7 @@ impl Database {
 
     /// Get table statistics using the statistics extractor
     pub async fn get_table_statistics(&self, table: &DeltaTable, project_id: &str, table_name: &str) -> Result<Statistics> {
-        // Get the schema for this table
-        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let schema = schema_def.schema_ref();
-        self.statistics_extractor.extract_statistics(table, project_id, table_name, &schema).await
+        self.statistics_extractor.extract_statistics(table, project_id, table_name).await
     }
 
     /// Clear the statistics cache
@@ -8554,6 +8491,8 @@ fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema_loader
 
 /// Default in-process sort budget for the FLUSH path, in in-memory Arrow bytes.
 /// Compaction must not reuse it — see the note in `sort_batches_by_schema`.
+/// Test-only: production callers pass `maintenance.timefusion_sort_skip_bytes`.
+#[cfg(test)]
 pub(crate) const DEFAULT_SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
 
 fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>, skip_over_bytes: usize) -> (FlushBatches, bool) {
@@ -8782,17 +8721,19 @@ fn schema_optimize_sort_columns(schema: &crate::schema_loader::TableSchema) -> V
 /// column schema instead cost 18.4% of process CPU in Add-stats `parse_json_impl`
 /// on every log replay (prod profile 2026-07-29).
 fn stats_columns_for(schema: &crate::schema_loader::TableSchema) -> String {
-    let mut cols: Vec<&str> = Vec::new();
-    for c in std::iter::once(schema.time_column_name())
+    std::iter::once(schema.time_column_name())
         .chain(schema.sorting_columns.iter().map(|c| c.name.as_str()))
         .chain(schema.dedup_keys.iter().map(String::as_str))
         .chain(schema.dedup_tiebreak.as_deref())
-    {
-        if !schema.partitions.iter().any(|p| p == c) && !cols.contains(&c) {
-            cols.push(c);
-        }
-    }
-    cols.join(",")
+        .filter(|c| !schema.partitions.iter().any(|p| p == c))
+        // Dedup preserving first-seen order; the list is a handful of columns.
+        .fold(Vec::<&str>::new(), |mut cols, c| {
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+            cols
+        })
+        .join(",")
 }
 
 /// SQL `ORDER BY` clause (leading space, quoted identifiers) matching the
@@ -9023,7 +8964,7 @@ fn process_memory_bytes() -> Option<usize> {
         // reclaiming it costs IO.
         return Some(v.saturating_sub(cgroup_inactive_file_bytes().unwrap_or(0)));
     }
-    crate::buffered_write_layer::process_rss_bytes()
+    crate::metrics::process_rss_bytes()
 }
 
 /// `inactive_file` from cgroup v2 `memory.stat` — the page cache the kernel
@@ -9203,7 +9144,7 @@ fn bin_adds_live(bin: &StagedBin, live: &std::collections::HashSet<String>) -> b
 
 /// `landed ++ more` — the wave's two landing sources (bins confirmed by an
 /// earlier attempt, and the ones this attempt just committed) as one list.
-fn with(mut landed: Vec<StagedBin>, more: Vec<StagedBin>) -> Vec<StagedBin> {
+fn concat_landed(mut landed: Vec<StagedBin>, more: Vec<StagedBin>) -> Vec<StagedBin> {
     landed.extend(more);
     landed
 }
@@ -9407,7 +9348,7 @@ fn build_writer_properties(
     // as implicit enable, which then uses the default NDV (~1M) and triggers
     // massive bloom buffer allocations on every column. We set fpp per-column
     // only, for the columns we actually want blooms on.
-    let mut builder = WriterProperties::builder()
+    let builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(zstd_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap())))
         .set_max_row_group_bytes(Some(max_row_group_size))
         .set_dictionary_enabled(true)
@@ -9423,43 +9364,46 @@ fn build_writer_properties(
         .set_sorting_columns(if declare_sorted && !sorting_columns_pq.is_empty() { Some(sorting_columns_pq) } else { None })
         .set_key_value_metadata(Some(vec![KeyValue::new(COMPRESSION_TIER_KEY.to_string(), zstd_level.to_string())]));
 
-    for field in &schema.fields {
-        let dt = field.data_type.as_str();
-        let col = ColumnPath::from(field.name.as_str());
-        let is_sort_key = sort_key_names.contains(field.name.as_str());
+    schema
+        .fields
+        .iter()
+        .fold(builder, |builder, field| {
+            let dt = field.data_type.as_str();
+            let col = ColumnPath::from(field.name.as_str());
+            let is_sort_key = sort_key_names.contains(field.name.as_str());
+            let time_like = dt.starts_with("Timestamp") || dt == "Date32";
 
-        // Page-level stats only where they prune AND are cheap: the declared
-        // sort keys, plus any timestamp/date column (8-byte min/max, common
-        // range predicates like observed_timestamp/start_time/end_time). Wide
-        // JSON/variant/string columns stay at the Chunk default so the
-        // ColumnIndex doesn't balloon.
-        if is_sort_key || dt.starts_with("Timestamp") || dt == "Date32" {
-            builder = builder.set_column_statistics_enabled(col.clone(), EnabledStatistics::Page);
-        }
+            // Page-level stats only where they prune AND are cheap: the declared
+            // sort keys, plus any timestamp/date column (8-byte min/max, common
+            // range predicates like observed_timestamp/start_time/end_time). Wide
+            // JSON/variant/string columns stay at the Chunk default so the
+            // ColumnIndex doesn't balloon.
+            let builder = if is_sort_key || time_like { builder.set_column_statistics_enabled(col.clone(), EnabledStatistics::Page) } else { builder };
 
-        if dt.starts_with("Timestamp") || dt == "Date32" {
-            builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED).set_column_dictionary_enabled(col.clone(), false);
-        } else if matches!(dt, "Int32" | "Int64" | "UInt32" | "UInt64") {
-            builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED);
-        } else if dt == "Utf8" && is_sort_key {
-            builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BYTE_ARRAY).set_column_dictionary_enabled(col.clone(), false);
-        }
+            let builder = if time_like {
+                builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED).set_column_dictionary_enabled(col.clone(), false)
+            } else if matches!(dt, "Int32" | "Int64" | "UInt32" | "UInt64") {
+                builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED)
+            } else if dt == "Utf8" && is_sort_key {
+                builder.set_column_encoding(col.clone(), Encoding::DELTA_BYTE_ARRAY).set_column_dictionary_enabled(col.clone(), false)
+            } else {
+                builder
+            };
 
-        // Explicit per-column dict opt-out (overrides defaults above only
-        // when set to Some(false); Some(true)/None leaves defaults intact).
-        if field.dictionary == Some(false) {
-            builder = builder.set_column_dictionary_enabled(col.clone(), false);
-        }
+            // Explicit per-column dict opt-out (overrides defaults above only
+            // when set to Some(false); Some(true)/None leaves defaults intact).
+            let builder = if field.dictionary == Some(false) { builder.set_column_dictionary_enabled(col.clone(), false) } else { builder };
 
-        if field.bloom_filter && !bloom_globally_disabled {
-            builder = builder
-                .set_column_bloom_filter_enabled(col.clone(), true)
-                .set_column_bloom_filter_ndv(col.clone(), BLOOM_NDV)
-                .set_column_bloom_filter_fpp(col, 0.01);
-        }
-    }
-
-    builder.build()
+            if field.bloom_filter && !bloom_globally_disabled {
+                builder
+                    .set_column_bloom_filter_enabled(col.clone(), true)
+                    .set_column_bloom_filter_ndv(col.clone(), BLOOM_NDV)
+                    .set_column_bloom_filter_fpp(col, 0.01)
+            } else {
+                builder
+            }
+        })
+        .build()
 }
 
 #[derive(Debug, Clone)]
@@ -9509,16 +9453,18 @@ impl ProjectRoutingTable {
         let target_schema = self.real_schema();
         // Partition row-wise: one INSERT may carry rows for many projects, each
         // landing in its own Delta table. Distinct projects write concurrently.
-        let mut writes = Vec::new();
-        for (project_id, sub) in partition_batch_by_project(batch, &self.default_project)? {
-            let converted = convert_variant_columns(sub, &target_schema)?;
-            writes.push(async move {
-                self.database
-                    .insert_records_batch(&project_id, &self.table_name, vec![converted], self.skip_queue, None)
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e)))
-            });
-        }
+        let writes = partition_batch_by_project(batch, &self.default_project)?
+            .into_iter()
+            .map(|(project_id, sub)| {
+                let converted = convert_variant_columns(sub, &target_schema)?;
+                Ok(async move {
+                    self.database
+                        .insert_records_batch(&project_id, &self.table_name, vec![converted], self.skip_queue, None)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e)))
+                })
+            })
+            .collect::<DFResult<Vec<_>>>()?;
         futures::future::try_join_all(writes).await?;
         Ok(total_rows)
     }
@@ -9656,15 +9602,14 @@ impl ProjectRoutingTable {
         // that silently missed an unmappable file would drop its rows.
         let file_selection: Option<Vec<String>> = exclude_files.filter(|e| !e.is_empty()).and_then(|exclude| {
             // Scoped so the (non-Send) file-view iterator drops before any await.
-            let uris = table.get_file_uris().ok()?;
-            let mut selected: Vec<String> = Vec::new();
-            for u in uris.filter(|u| u.ends_with(".parquet")) {
-                if exclude.contains(&u) {
-                    continue;
-                }
-                selected.push(crate::tantivy_index::service::parquet_rel_of_uri(&u)?.to_string());
-            }
-            Some(selected)
+            // `collect::<Option<_>>` reproduces the bail-the-whole-selection
+            // semantics: one unmappable URI aborts the restriction entirely.
+            table
+                .get_file_uris()
+                .ok()?
+                .filter(|u| u.ends_with(".parquet") && !exclude.contains(u))
+                .map(|u| crate::tantivy_index::service::parquet_rel_of_uri(&u).map(str::to_string))
+                .collect::<Option<Vec<String>>>()
         });
         // Row-selection pushdown: per-file matching ordinals keyed by rel path.
         // Purely narrowing — files without an entry scan normally — so unlike
@@ -9839,16 +9784,15 @@ impl ProjectRoutingTable {
         // delta table provider expects indices based on its own schema.
         let delta_schema = provider.schema();
         let translated_projection = projection.map(|proj| {
-            let mut translated = Vec::with_capacity(proj.len());
-            for &idx in proj {
-                let col_name = self.schema.field(idx).name();
-                if let Some(delta_idx) = delta_schema.fields().iter().position(|f| f.name() == col_name) {
-                    translated.push(delta_idx);
-                } else {
-                    warn!("Column '{}' requested in projection but not found in Delta schema for table '{}'", col_name, self.table_name);
-                }
-            }
-            translated
+            proj.iter()
+                .filter_map(|&idx| {
+                    let col_name = self.schema.field(idx).name();
+                    delta_schema.fields().iter().position(|f| f.name() == col_name).or_else(|| {
+                        warn!("Column '{}' requested in projection but not found in Delta schema for table '{}'", col_name, self.table_name);
+                        None
+                    })
+                })
+                .collect::<Vec<_>>()
         });
 
         let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await?;
@@ -10063,46 +10007,27 @@ impl ProjectRoutingTable {
             }
         }
 
-        let mut min_ts: Option<i64> = None;
-        let mut max_ts: Option<i64> = None;
-
-        for filter in filters {
-            if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter {
-                // Accept `timestamp <op> lit`, `lit <op> timestamp` (operands
-                // reversed → flip the comparison), and a Cast-wrapped column.
-                let (ts_value, op) = if is_col_through_cast(left, "timestamp") {
-                    (literal_micros(right), *op)
-                } else if is_col_through_cast(right, "timestamp") {
-                    (literal_micros(left), swap_comparison(op))
-                } else {
-                    continue;
-                };
-                let op = &op;
-
-                if let Some(ts) = ts_value {
-                    match op {
-                        Operator::Gt | Operator::GtEq => {
-                            min_ts = Some(min_ts.map_or(ts, |m| m.max(ts)));
-                        }
-                        Operator::Lt | Operator::LtEq => {
-                            max_ts = Some(max_ts.map_or(ts, |m| m.min(ts)));
-                        }
-                        Operator::Eq => {
-                            min_ts = Some(ts);
-                            max_ts = Some(ts);
-                        }
-                        _ => {}
-                    }
-                }
+        let (min_ts, max_ts) = filters.iter().fold((None::<i64>, None::<i64>), |acc @ (min_ts, max_ts), filter| {
+            let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter else { return acc };
+            // Accept `timestamp <op> lit`, `lit <op> timestamp` (operands
+            // reversed → flip the comparison), and a Cast-wrapped column.
+            let (ts_value, op) = if is_col_through_cast(left, "timestamp") {
+                (literal_micros(right), *op)
+            } else if is_col_through_cast(right, "timestamp") {
+                (literal_micros(left), swap_comparison(*op))
+            } else {
+                return acc;
+            };
+            let Some(ts) = ts_value else { return acc };
+            match op {
+                Operator::Gt | Operator::GtEq => (Some(min_ts.map_or(ts, |m| m.max(ts))), max_ts),
+                Operator::Lt | Operator::LtEq => (min_ts, Some(max_ts.map_or(ts, |m| m.min(ts)))),
+                Operator::Eq => (Some(ts), Some(ts)),
+                _ => acc,
             }
-        }
+        });
 
-        match (min_ts, max_ts) {
-            (Some(min), Some(max)) => Some((min, max)),
-            (Some(min), None) => Some((min, i64::MAX)),
-            (None, Some(max)) => Some((i64::MIN, max)),
-            (None, None) => None,
-        }
+        (min_ts.is_some() || max_ts.is_some()).then(|| (min_ts.unwrap_or(i64::MIN), max_ts.unwrap_or(i64::MAX)))
     }
 }
 

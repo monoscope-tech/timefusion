@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt::Debug,
     sync::{Arc, LazyLock},
 };
@@ -79,16 +80,9 @@ impl ConfigAuthSource {
 impl AuthSource for ConfigAuthSource {
     async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
         let username = login.user().unwrap_or("");
-        if username == self.config.username {
-            let pw = self.config.password.clone().unwrap_or_default();
-            Ok(Password::new(None, pw.into_bytes()))
-        } else {
-            Err(PgWireError::UserError(Box::new(datafusion_postgres::pgwire::error::ErrorInfo::new(
-                "FATAL".into(),
-                "28P01".into(),
-                format!("password authentication failed for user \"{username}\""),
-            ))))
-        }
+        (username == self.config.username).then(|| Password::new(None, self.config.password.clone().unwrap_or_default().into_bytes())).ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{username}\""))))
+        })
     }
 }
 
@@ -135,22 +129,14 @@ impl LoggingHandlerFactory {
 
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        let mut h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
-        if let Some(m) = &self.scan_metrics {
-            h = h.with_scan_metrics(m.clone());
-        }
-        if let Some(db) = &self.db {
-            h = h.with_database(db.clone());
-        }
-        Arc::new(h)
+        let h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
+        let h = self.scan_metrics.iter().fold(h, |h, m| h.with_scan_metrics(m.clone()));
+        Arc::new(self.db.iter().fold(h, |h, db| h.with_database(db.clone())))
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        let mut h = LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
-        if let Some(m) = &self.scan_metrics {
-            h = h.with_scan_metrics(m.clone());
-        }
-        Arc::new(h)
+        let h = LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
+        Arc::new(self.scan_metrics.iter().fold(h, |h, m| h.with_scan_metrics(m.clone())))
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
@@ -188,10 +174,6 @@ pub struct LoggingSimpleQueryHandler {
 }
 
 impl LoggingSimpleQueryHandler {
-    pub fn new(session_context: Arc<SessionContext>) -> Self {
-        Self { inner: DfSessionService::new(session_context), scan_metrics: None, db: None }
-    }
-
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
         Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None, db: None }
     }
@@ -208,23 +190,17 @@ impl LoggingSimpleQueryHandler {
 
     /// Execute an intercepted `OPTIMIZE <table> WHERE date = '...'`.
     async fn run_optimize(&self, cmd: OptimizeCmd) -> PgWireResult<Vec<Response>> {
-        let db = match self.db.as_ref() {
-            Some(d) => d,
-            None => return Err(admin_err("OPTIMIZE is not available on this server")),
-        };
-        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(&format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
-        let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date, cmd.project_id.as_deref()).await.map_err(|e| admin_err(&e.to_string()))?;
+        let db = require_available(self.db.as_ref(), "OPTIMIZE")?;
+        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
+        let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date, cmd.project_id.as_deref()).await.map_err(|e| admin_err(e.to_string()))?;
         info!("pgwire OPTIMIZE {} date={} project={:?}: {removed} removed, {added} added", cmd.table, cmd.date, cmd.project_id);
         Ok(vec![Response::Execution(Tag::new(&format!("OPTIMIZE {removed} {added}")))])
     }
 
     /// Execute an intercepted `VACUUM <table> [RETAIN <n> HOURS]`.
     async fn run_vacuum(&self, cmd: VacuumCmd) -> PgWireResult<Vec<Response>> {
-        let db = match self.db.as_ref() {
-            Some(d) => d,
-            None => return Err(admin_err("VACUUM is not available on this server")),
-        };
-        let deleted = db.vacuum_named(&cmd.table, cmd.retention_hours).await.map_err(|e| admin_err(&format!("VACUUM '{}': {e}", cmd.table)))?;
+        let db = require_available(self.db.as_ref(), "VACUUM")?;
+        let deleted = db.vacuum_named(&cmd.table, cmd.retention_hours).await.map_err(|e| admin_err(format!("VACUUM '{}': {e}", cmd.table)))?;
         info!("pgwire VACUUM {} retention={:?}: {deleted} files deleted", cmd.table, cmd.retention_hours);
         Ok(vec![Response::Execution(Tag::new(&format!("VACUUM {deleted}")))])
     }
@@ -235,31 +211,28 @@ impl LoggingSimpleQueryHandler {
     /// replay is near-empty. Errors when any bucket fails so callers can
     /// gate on it.
     async fn run_flush(&self) -> PgWireResult<Vec<Response>> {
-        let layer = match self.db.as_ref().and_then(|d| d.buffered_layer()) {
-            Some(l) => l,
-            None => return Err(admin_err("FLUSH is not available on this server")),
-        };
+        let layer = require_available(self.db.as_ref().and_then(|d| d.buffered_layer()), "FLUSH")?;
         // Misuse guard: FLUSH commits the open window per table (tiny parquet
         // files + tantivy builds), so a looping client mints file-count
         // explosion and contends flush_lock with routine flushes. Operator
         // cadence is "once before a deploy" — enforce a floor between runs.
         // Frozen-clock (test) harnesses are exempt: their cadence is
         // script-driven and the frozen epoch resets between environments.
+        use std::sync::atomic::{AtomicI64, Ordering};
         const FLUSH_MIN_INTERVAL_SECS: i64 = 10;
-        static LAST_FLUSH_MICROS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+        static LAST_FLUSH_MICROS: AtomicI64 = AtomicI64::new(i64::MIN);
         if !crate::clock::is_frozen() {
-            use std::sync::atomic::Ordering;
             let now = chrono::Utc::now().timestamp_micros();
             let since = now.saturating_sub(LAST_FLUSH_MICROS.load(Ordering::Acquire));
             if since < FLUSH_MIN_INTERVAL_SECS * 1_000_000 {
-                return Err(admin_err(&format!("FLUSH rate-limited: last ran {}s ago (min interval {FLUSH_MIN_INTERVAL_SECS}s)", since / 1_000_000)));
+                return Err(admin_err(format!("FLUSH rate-limited: last ran {}s ago (min interval {FLUSH_MIN_INTERVAL_SECS}s)", since / 1_000_000)));
             }
             LAST_FLUSH_MICROS.store(now, Ordering::Release);
         }
-        let stats = layer.flush_all_now().await.map_err(|e| admin_err(&format!("FLUSH: {e}")))?;
+        let stats = layer.flush_all_now().await.map_err(|e| admin_err(format!("FLUSH: {e}")))?;
         info!("pgwire FLUSH: {} bucket(s) flushed ({} rows), {} failed", stats.buckets_flushed, stats.total_rows, stats.buckets_failed);
         if stats.buckets_failed > 0 {
-            return Err(admin_err(&format!(
+            return Err(admin_err(format!(
                 "FLUSH: {} bucket(s) failed to flush ({} flushed) — data stays buffered/WAL-durable",
                 stats.buckets_failed, stats.buckets_flushed
             )));
@@ -280,8 +253,33 @@ pub(crate) struct OptimizeCmd {
     pub project_id: Option<String>,
 }
 
-fn admin_err(msg: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".to_string(), "42601".to_string(), msg.to_string())))
+fn admin_err(msg: impl Into<String>) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), "42601".into(), msg.into())))
+}
+
+/// `Ok(inner)` when the admin command's dependency (db handle, buffered layer)
+/// was wired in, else the standard "not available on this server" error.
+fn require_available<T>(opt: Option<T>, name: &str) -> PgWireResult<T> {
+    opt.ok_or_else(|| admin_err(format!("{name} is not available on this server")))
+}
+
+/// Remainder after a leading case-insensitive `keyword` that ends at end-of-input
+/// or at a `boundary` char — so identifiers merely starting with it
+/// (`optimizer_stats`, `aborted`) don't match. Remainder is returned untrimmed.
+fn strip_keyword<'a>(s: &'a str, keyword: &str, boundary: fn(char) -> bool) -> Option<&'a str> {
+    let (head, rest) = s.split_at_checked(keyword.len())?;
+    (head.eq_ignore_ascii_case(keyword) && (rest.is_empty() || rest.starts_with(boundary))).then_some(rest)
+}
+
+/// Strip a leading admin keyword plus any trailing `;`, returning the trimmed
+/// remainder. `None` when `query` isn't that command.
+fn strip_command<'a>(query: &'a str, keyword: &str) -> Option<&'a str> {
+    strip_keyword(query.trim().trim_end_matches(';').trim(), keyword, char::is_whitespace).map(str::trim)
+}
+
+/// `= '<value>'` → `<value>`, tolerating either quote style and loose spacing.
+fn filter_value(rest: &str) -> Result<&str, String> {
+    Ok(rest.trim().strip_prefix('=').ok_or("expected: <col> = '<value>'")?.trim().trim_matches(['\'', '"']).trim())
 }
 
 /// Parse `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'`.
@@ -293,61 +291,34 @@ fn admin_err(msg: &str) -> PgWireError {
 ///   unbounded in-process compaction can OOM the instance — and surfaced as a
 ///   clear error rather than a confusing DataFusion parser error.
 pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String> {
-    let q = query.trim().trim_end_matches(';').trim();
-    let lower = q.to_ascii_lowercase();
-    let is_optimize = lower == "optimize" || lower.strip_prefix("optimize").is_some_and(|r| r.starts_with(char::is_whitespace));
-    if !is_optimize {
-        return Ok(None);
-    }
-    let rest = q[8..].trim(); // "optimize" is 8 ASCII bytes
+    let Some(rest) = strip_command(query, "optimize") else { return Ok(None) };
     let (table, where_part) = rest.split_once(char::is_whitespace).map(|(t, w)| (t.trim(), w.trim())).unwrap_or((rest, ""));
     if table.is_empty() {
         return Err("OPTIMIZE requires a table and date: OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'".to_string());
     }
-    if !where_part.to_ascii_lowercase().starts_with("where") {
+    let Some(conds) = strip_keyword(where_part, "where", char::is_whitespace) else {
         return Err(format!(
             "OPTIMIZE {table} needs a date filter: OPTIMIZE {table} WHERE date = 'YYYY-MM-DD' (bare OPTIMIZE is disabled — it would compact all history in-process)"
         ));
-    }
+    };
     // `WHERE date = '...'` optionally AND-ed (either order) with
-    // `project_id = '...'`.
-    let mut date = None;
-    let mut project_id = None;
-    for cond in split_and(where_part[5..].trim()) {
+    // `project_id = '...'`. Values are simple quoted literals, so splitting on
+    // a top-level ` AND ` needs no nesting awareness.
+    static AND: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s+and\s+").unwrap());
+    let (date, project_id) = AND.split(conds.trim()).try_fold((None, None), |(date, project_id), cond| {
         let cond = cond.trim();
-        let lower_cond = cond.to_ascii_lowercase();
-        let (col, len) = if lower_cond.starts_with("project_id") {
-            ("project_id", 10)
-        } else if lower_cond.starts_with("date") {
-            ("date", 4)
-        } else {
-            return Err("OPTIMIZE supports only `date` and `project_id` filters".to_string());
-        };
-        let val = cond[len..].trim().strip_prefix('=').ok_or("expected: <col> = '<value>'")?.trim().trim_matches(|c| c == '\'' || c == '"').trim();
-        match col {
-            "date" => date = Some(val.parse::<chrono::NaiveDate>().map_err(|_| format!("invalid date '{val}', expected YYYY-MM-DD"))?),
-            _ => project_id = Some(val.to_string()),
+        let column = |name| strip_keyword(cond, name, |c: char| c.is_whitespace() || c == '=');
+        match (column("date"), column("project_id")) {
+            (Some(rest), _) => {
+                let val = filter_value(rest)?;
+                Ok((Some(val.parse::<chrono::NaiveDate>().map_err(|_| format!("invalid date '{val}', expected YYYY-MM-DD"))?), project_id))
+            }
+            (_, Some(rest)) => Ok((date, Some(filter_value(rest)?.to_string()))),
+            _ => Err("OPTIMIZE supports only `date` and `project_id` filters".to_string()),
         }
-    }
+    })?;
     let date = date.ok_or("OPTIMIZE requires a date filter: WHERE date = 'YYYY-MM-DD'")?;
     Ok(Some(OptimizeCmd { table: table.to_string(), date, project_id }))
-}
-
-/// Split a WHERE tail on top-level ` AND ` (case-insensitive). Values are
-/// simple quoted literals, so no nesting to worry about.
-fn split_and(s: &str) -> Vec<&str> {
-    let lower = s.to_ascii_lowercase();
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut search = 0;
-    while let Some(i) = lower[search..].find(" and ") {
-        let at = search + i;
-        parts.push(&s[start..at]);
-        start = at + 5;
-        search = start;
-    }
-    parts.push(&s[start..]);
-    parts
 }
 
 /// An intercepted `VACUUM <table> [RETAIN <n> HOURS]` admin command.
@@ -367,36 +338,28 @@ pub(crate) struct VacuumCmd {
 ///   table-wide (all partitions) and takes no date filter; the optional
 ///   `RETAIN <n> HOURS` overrides the configured retention.
 pub(crate) fn parse_vacuum(query: &str) -> Result<Option<VacuumCmd>, String> {
-    let q = query.trim().trim_end_matches(';').trim();
-    let lower = q.to_ascii_lowercase();
-    let is_vacuum = lower == "vacuum" || lower.strip_prefix("vacuum").is_some_and(|r| r.starts_with(char::is_whitespace));
-    if !is_vacuum {
-        return Ok(None);
-    }
-    let rest = q[6..].trim(); // "vacuum" is 6 ASCII bytes
+    let Some(rest) = strip_command(query, "vacuum") else { return Ok(None) };
     let (table, tail) = rest.split_once(char::is_whitespace).map(|(t, w)| (t.trim(), w.trim())).unwrap_or((rest, ""));
     if table.is_empty() {
         return Err("VACUUM requires a table: VACUUM <table> [RETAIN <n> HOURS] (bare VACUUM is disabled — name the table)".to_string());
     }
-    let retention_hours = if tail.is_empty() {
-        None
-    } else {
-        let after = tail
-            .to_ascii_lowercase()
-            .strip_prefix("retain")
-            .ok_or_else(|| format!("VACUUM {table}: expected optional `RETAIN <n> HOURS`, got '{tail}'"))?
-            .trim()
-            .to_string();
-        let num = after.strip_suffix("hours").or_else(|| after.strip_suffix("hour")).unwrap_or(&after).trim();
-        Some(num.parse::<u64>().map_err(|_| format!("VACUUM {table}: invalid retention '{after}', expected `RETAIN <n> HOURS`"))?)
-    };
+    let retention_hours = (!tail.is_empty())
+        .then(|| {
+            let lower = tail.to_ascii_lowercase();
+            let after = strip_keyword(&lower, "retain", char::is_whitespace)
+                .ok_or_else(|| format!("VACUUM {table}: expected optional `RETAIN <n> HOURS`, got '{tail}'"))?
+                .trim();
+            let num = after.strip_suffix("hours").or_else(|| after.strip_suffix("hour")).unwrap_or(after).trim();
+            num.parse::<u64>().map_err(|_| format!("VACUUM {table}: invalid retention '{after}', expected `RETAIN <n> HOURS`"))
+        })
+        .transpose()?;
     Ok(Some(VacuumCmd { table: table.to_string(), retention_hours }))
 }
 
 /// Parse a bare `FLUSH` admin command (not a Postgres statement, so safe to
 /// intercept). No arguments on purpose: it drains the whole MemBuffer.
 pub(crate) fn parse_flush(query: &str) -> bool {
-    query.trim().trim_end_matches(';').trim().eq_ignore_ascii_case("flush")
+    strip_command(query, "flush").is_some_and(str::is_empty)
 }
 
 /// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept.
@@ -407,40 +370,28 @@ pub(crate) fn parse_flush(query: &str) -> bool {
 /// (e.g. monoscope) sees its first statement on each connection fail with
 /// `sql parser error: Expected: an SQL statement, found: ABORT`, which then
 /// poisons the whole session.
-fn rewrite_pg_synonyms(query: &str) -> std::borrow::Cow<'_, str> {
-    let stripped = query.trim_start();
-    if stripped.len() < 5 {
-        return std::borrow::Cow::Borrowed(query);
-    }
-    let (head, rest) = stripped.split_at(5);
-    if !head.eq_ignore_ascii_case("ABORT") {
-        return std::borrow::Cow::Borrowed(query);
-    }
-    if !(rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';')) {
-        return std::borrow::Cow::Borrowed(query);
-    }
-    std::borrow::Cow::Owned(format!("ROLLBACK{}", rest))
+fn rewrite_pg_synonyms(query: &str) -> Cow<'_, str> {
+    strip_keyword(query.trim_start(), "ABORT", |c| c.is_whitespace() || c == ';').map_or(Cow::Borrowed(query), |rest| Cow::Owned(format!("ROLLBACK{rest}")))
 }
+
+/// (keyword, space-padded keyword, `query.type`, operation). First match wins,
+/// so order is significant.
+const QUERY_KINDS: [(&str, &str, &str, &str); 7] = [
+    ("select", " select ", "SELECT", "SELECT"),
+    ("update", " update ", "DML", "UPDATE"),
+    ("delete", " delete ", "DML", "DELETE"),
+    ("insert", " insert ", "DML", "INSERT"),
+    ("create", " create ", "DDL", "CREATE"),
+    ("drop", " drop ", "DDL", "DROP"),
+    ("alter", " alter ", "DDL", "ALTER"),
+];
 
 fn classify_query(query: &str) -> (&'static str, &'static str) {
     let q = query.trim().to_lowercase();
-    if q.starts_with("select") || q.contains(" select ") {
-        ("SELECT", "SELECT")
-    } else if q.starts_with("update") || q.contains(" update ") {
-        ("DML", "UPDATE")
-    } else if q.starts_with("delete") || q.contains(" delete ") {
-        ("DML", "DELETE")
-    } else if q.starts_with("insert") || q.contains(" insert ") {
-        ("DML", "INSERT")
-    } else if q.starts_with("create") || q.contains(" create ") {
-        ("DDL", "CREATE")
-    } else if q.starts_with("drop") || q.contains(" drop ") {
-        ("DDL", "DROP")
-    } else if q.starts_with("alter") || q.contains(" alter ") {
-        ("DDL", "ALTER")
-    } else {
-        ("OTHER", "UNKNOWN")
-    }
+    QUERY_KINDS
+        .iter()
+        .find(|(kw, padded, ..)| q.starts_with(kw) || q.contains(padded))
+        .map_or(("OTHER", "UNKNOWN"), |&(.., query_type, operation)| (query_type, operation))
 }
 
 /// Redact literal values and comments so the result can safely be indexed and
@@ -464,7 +415,7 @@ fn normalized_query(query: &str) -> String {
 fn query_template(query: &str) -> String {
     const MAX_CHARS: usize = 512;
     let query = normalized_query(query);
-    if query.chars().count() <= MAX_CHARS { query } else { format!("{}...", query.chars().take(MAX_CHARS).collect::<String>()) }
+    if query.chars().count() <= MAX_CHARS { query } else { query.chars().take(MAX_CHARS).chain(['.'; 3]).collect() }
 }
 
 fn query_fingerprint(query: &str) -> String {
@@ -493,13 +444,12 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
     }
 
     let (_, operation) = classify_query(query);
-    let template = query_template(query);
     let (tables, project_id) = query_dimensions(query);
     info!(
         event = "pgwire.slow_statement",
         query.class = operation,
         query.fingerprint = %query_fingerprint(query),
-        query.template = %template,
+        query.template = %query_template(query),
         query.tables = %tables,
         project.id = %project_id,
         protocol,
@@ -509,12 +459,11 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
     );
 }
 
-fn query_dimensions(query: &str) -> (String, String) {
+fn query_dimensions(query: &str) -> (String, &str) {
     static TABLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\b(?:from|join|into|update|table)\s+([\w.\"]+)"#).unwrap());
     static PROJECT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bproject_id\s*=\s*'([^']{1,128})'"#).unwrap());
-    let tables = TABLES.captures_iter(query).filter_map(|captures| captures.get(1).map(|m| m.as_str())).take(3).collect::<Vec<_>>().join(",");
-    let project_id = PROJECT.captures(query).and_then(|captures| captures.get(1)).map_or("", |m| m.as_str()).to_string();
-    (tables, project_id)
+    let tables = TABLES.captures_iter(query).filter_map(|captures| Some(captures.get(1)?.as_str())).take(3).collect::<Vec<_>>().join(",");
+    (tables, PROJECT.captures(query).and_then(|captures| captures.get(1)).map_or("", |m| m.as_str()))
 }
 
 #[async_trait]
@@ -534,23 +483,15 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let rewritten = rewrite_pg_synonyms(query);
         let query = rewritten.as_ref();
 
-        // OPTIMIZE <table> WHERE date = '...' — admin compaction, caught before
-        // DataFusion (whose parser rejects OPTIMIZE).
-        match parse_optimize(query) {
-            Ok(Some(cmd)) => return self.run_optimize(cmd).await,
-            Ok(None) => {}
-            Err(msg) => return Err(admin_err(&msg)),
+        // Admin commands, caught before DataFusion (whose parser rejects all
+        // three): OPTIMIZE compaction, VACUUM file reclamation, and FLUSH
+        // (drain MemBuffer to Delta — pre-deploy hook).
+        if let Some(cmd) = parse_optimize(query).map_err(admin_err)? {
+            return self.run_optimize(cmd).await;
         }
-
-        // VACUUM <table> [RETAIN <n> HOURS] — admin file reclamation, caught
-        // before DataFusion (whose parser rejects VACUUM).
-        match parse_vacuum(query) {
-            Ok(Some(cmd)) => return self.run_vacuum(cmd).await,
-            Ok(None) => {}
-            Err(msg) => return Err(admin_err(&msg)),
+        if let Some(cmd) = parse_vacuum(query).map_err(admin_err)? {
+            return self.run_vacuum(cmd).await;
         }
-
-        // FLUSH — drain MemBuffer to Delta (pre-deploy hook).
         if parse_flush(query) {
             return self.run_flush().await;
         }
@@ -576,12 +517,6 @@ impl LoggingExtendedQueryHandler {
     pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
         self.scan_metrics = Some(m);
         self
-    }
-}
-
-impl LoggingExtendedQueryHandler {
-    pub fn new(session_context: Arc<SessionContext>) -> Self {
-        Self { inner: DfSessionService::new(session_context), scan_metrics: None }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
@@ -642,20 +577,21 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
     }
 }
 
+fn handler_factory(
+    session_context: Arc<SessionContext>, auth_config: AuthConfig, scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>,
+) -> Arc<LoggingHandlerFactory> {
+    let factory = LoggingHandlerFactory::new(session_context, auth_config);
+    let factory = scan_metrics.into_iter().fold(factory, LoggingHandlerFactory::with_scan_metrics);
+    Arc::new(db.into_iter().fold(factory, LoggingHandlerFactory::with_database))
+}
+
 /// Start the server with custom handlers. `db` enables the admin commands
 /// (OPTIMIZE / VACUUM / FLUSH); without it they error as unavailable.
 pub async fn serve_with_logging(
     session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
-    if let Some(m) = scan_metrics {
-        factory = factory.with_scan_metrics(m);
-    }
-    if let Some(db) = db {
-        factory = factory.with_database(db);
-    }
-    let handlers = Arc::new(factory);
+    let handlers = handler_factory(session_context, auth_config, scan_metrics, db);
     datafusion_postgres::serve_with_handlers(handlers, options, shutdown).await?;
     Ok(())
 }
@@ -667,14 +603,7 @@ pub async fn serve_with_listener(
     listener: tokio::net::TcpListener, session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
-    if let Some(m) = scan_metrics {
-        factory = factory.with_scan_metrics(m);
-    }
-    if let Some(db) = db {
-        factory = factory.with_database(db);
-    }
-    let handlers = Arc::new(factory);
+    let handlers = handler_factory(session_context, auth_config, scan_metrics, db);
     datafusion_postgres::serve_with_listener(listener, handlers, options, shutdown).await?;
     Ok(())
 }

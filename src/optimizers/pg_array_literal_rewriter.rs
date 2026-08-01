@@ -23,13 +23,13 @@
 //! - multi-dimensional literals are rejected → arg left untouched, the
 //!   string-arg guard errors (PG supports them; schema is 1-D only).
 
-use std::sync::Arc;
+use std::{mem::take, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::DataType,
     common::{
         DFSchema, Result, plan_err,
-        tree_node::{Transformed, TreeNode},
+        tree_node::{Transformed, TreeNode, TreeNodeIterator},
     },
     config::ConfigOptions,
     logical_expr::{Expr, ExprSchemable, LogicalPlan, expr::ScalarFunction},
@@ -145,7 +145,6 @@ impl AnalyzerRule for PgArrayLiteralRewriter {
 }
 
 fn rewrite_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let mut input_schemas: Vec<_> = plan.inputs().iter().map(|i| i.schema().clone()).collect();
     // Leaf nodes (TableScan with pushed-down filters, Values) have no inputs;
     // their exprs are typed by their own schema instead. Without this, a
     // coalesce pushed into a TableScan's filter list would skip both the
@@ -153,9 +152,10 @@ fn rewrite_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     // wrap-into-single-element-list cast would then fire silently. A filter on
     // a column the scan doesn't project still won't resolve here (filters are
     // typed by the source schema); it falls through to the TypeCoercion error.
-    if input_schemas.is_empty() {
-        input_schemas.push(Arc::clone(plan.schema()));
-    }
+    let input_schemas = match plan.inputs().as_slice() {
+        [] => vec![Arc::clone(plan.schema())],
+        inputs => inputs.iter().map(|i| Arc::clone(i.schema())).collect(),
+    };
     plan.map_expressions(|expr| expr.transform_up(|e| rewrite_in_expr(e, &input_schemas)))
 }
 
@@ -169,30 +169,21 @@ fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transf
     }
 
     // Element type of the first arg that resolves to a list type.
-    let elem_type = args.iter().find_map(|a| {
+    let Some(elem_type) = args.iter().find_map(|a| {
         input_schemas.iter().find_map(|s| match a.get_type(s.as_ref()).ok()? {
             DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => Some(f.data_type().clone()),
             _ => None,
         })
-    });
-    let Some(elem_type) = elem_type else { return no(args) };
+    }) else {
+        return no(args);
+    };
 
-    let mut changed = false;
-    let new_args = args
-        .into_iter()
-        .map(|a| match &a {
-            Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) => {
-                match parse_pg_string_array(s).and_then(|elems| pg_elems_to_list(elems, &elem_type)) {
-                    Some(list) => {
-                        changed = true;
-                        Expr::Literal(list, None)
-                    }
-                    None => a,
-                }
-            }
-            _ => a,
+    let Transformed { data: new_args, transformed, .. } = args.into_iter().map_until_stop_and_collect(|a| {
+        Ok(match pg_list_literal(&a, &elem_type) {
+            Some(list) => Transformed::yes(Expr::Literal(list, None)),
+            None => Transformed::no(a),
         })
-        .collect::<Vec<_>>();
+    })?;
     // Any arg still string-typed here (a real string column, or a literal that
     // didn't parse as a PG array) survived only because PgCoalesceUdf's
     // coerce_types fallback over-promoted it to pass planning. Letting it
@@ -207,25 +198,25 @@ fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transf
     }) {
         return plan_err!("COALESCE types {bad} and List({elem_type}) cannot be matched");
     }
-    let rebuilt = Expr::ScalarFunction(ScalarFunction { func, args: new_args });
-    Ok(if changed { Transformed::yes(rebuilt) } else { Transformed::no(rebuilt) })
+    Ok(Transformed::new_transformed(Expr::ScalarFunction(ScalarFunction { func, args: new_args }), transformed))
 }
 
-/// Convert parsed PG array elements to a typed list literal. None on any
-/// element that doesn't parse as `elem_type` (caller leaves the arg alone).
+/// The typed list literal a string arg denotes as a PG array literal, or None
+/// if it isn't a string literal, isn't a PG array literal, or has an element
+/// that doesn't parse as `elem_type` (caller then leaves the arg alone).
 /// Always emits `ScalarValue::List` even when the sibling column is
 /// LargeList/FixedSizeList: coerce_types may claim those, but TypeCoercion
 /// then casts the literal (arrow supports List → Large/FixedSizeList), so no
 /// physical-planning mismatch — the variant only matters for element type.
-fn pg_elems_to_list(elems: Vec<Option<String>>, elem_type: &DataType) -> Option<ScalarValue> {
-    let vals: Option<Vec<ScalarValue>> = elems
+fn pg_list_literal(arg: &Expr, elem_type: &DataType) -> Option<ScalarValue> {
+    let Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) = arg else {
+        return None;
+    };
+    let vals: Vec<ScalarValue> = parse_pg_string_array(s)?
         .into_iter()
-        .map(|e| match e {
-            None => ScalarValue::try_from(elem_type).ok(),
-            Some(s) => ScalarValue::try_from_string(s, elem_type).ok(),
-        })
-        .collect();
-    Some(ScalarValue::List(ScalarValue::new_list_nullable(&vals?, elem_type)))
+        .map(|e| e.map_or_else(|| ScalarValue::try_from(elem_type).ok(), |s| ScalarValue::try_from_string(s, elem_type).ok()))
+        .collect::<Option<_>>()?;
+    Some(ScalarValue::List(ScalarValue::new_list_nullable(&vals, elem_type)))
 }
 
 /// Parse a PG array literal of strings: `{}`, `{a,b}`, `{"a,b",NULL}`.
@@ -244,7 +235,7 @@ fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
         return Some(vec![]);
     }
     let (mut elems, mut cur, mut in_quotes, mut was_quoted) = (Vec::new(), String::new(), false, false);
-    let mut chars = inner.chars().peekable();
+    let mut chars = inner.chars(); // `while let` + inner `next()` (escapes consume the next char) — not a `for` loop
     while let Some(c) = chars.next() {
         match c {
             '\\' if in_quotes => cur.push(chars.next()?),
@@ -256,22 +247,23 @@ fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
                 in_quotes = !in_quotes;
                 was_quoted = true;
             }
-            ',' if !in_quotes => {
-                elems.push(finish_elem(&mut cur, &mut was_quoted));
-            }
+            ',' if !in_quotes => elems.push(finish_elem(take(&mut cur), take(&mut was_quoted))),
             _ if in_quotes || !was_quoted => cur.push(c),
             _ => {} // ignore trailing chars after a closing quote
         }
     }
-    elems.push(finish_elem(&mut cur, &mut was_quoted));
+    elems.push(finish_elem(cur, was_quoted));
     Some(elems)
 }
 
-fn finish_elem(cur: &mut String, was_quoted: &mut bool) -> Option<String> {
-    let raw = std::mem::take(cur);
-    let quoted = std::mem::take(was_quoted);
+/// One scanned element: unquoted `NULL` is the null element, quoted text keeps
+/// its whitespace, unquoted text is trimmed.
+fn finish_elem(raw: String, quoted: bool) -> Option<String> {
+    if quoted {
+        return Some(raw);
+    }
     let trimmed = raw.trim();
-    if !quoted && trimmed.eq_ignore_ascii_case("null") { None } else { Some(if quoted { raw } else { trimmed.to_string() }) }
+    (!trimmed.eq_ignore_ascii_case("null")).then(|| trimmed.to_string())
 }
 
 #[cfg(test)]
