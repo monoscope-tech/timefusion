@@ -1,0 +1,136 @@
+# Merge-on-read DML (docs/plans/2026-08-01-merge-on-read-dml.md).
+#
+# On a `version_append` table an UPDATE/DELETE rewrites nothing: it appends a
+# new version of the row (a tombstone version, for DELETE) and the read path
+# resolves versions by `dedup_tiebreak`. `mor_versioned` is the only shipped
+# schema with the flag on; every other table must keep in-place semantics, which
+# the rest of the suite already covers.
+#
+# The layered interactions — flush, demotion, the hot leg's version gate, and
+# the exclusion bug where an appended version's window swallows its untouched
+# neighbours — need real commits and live in tests/e2e/merge_on_read.rs.
+
+statement ok
+INSERT INTO mor_versioned (project_id, timestamp, id, date, name) VALUES
+  ('mor_slt', TIMESTAMP '2023-05-01T10:00:00Z', 'a', DATE '2023-05-01', 'base a'),
+  ('mor_slt', TIMESTAMP '2023-05-01T10:00:01Z', 'b', DATE '2023-05-01', 'base b'),
+  ('mor_slt', TIMESTAMP '2023-05-01T10:00:02Z', 'c', DATE '2023-05-01', 'base c')
+
+query I
+SELECT COUNT(*) FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+3
+
+# An UPDATE appends a new version. The key still reads as ONE row, carrying the
+# new value — not two rows, and not the old value.
+statement ok
+UPDATE mor_versioned SET name = 'updated a' WHERE project_id = 'mor_slt' AND id = 'a'
+
+query T
+SELECT name FROM mor_versioned WHERE project_id = 'mor_slt' AND id = 'a'
+----
+updated a
+
+query I
+SELECT COUNT(*) FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+3
+
+# The untouched rows keep their values: an append must supersede exactly its own
+# dedup key.
+query T rowsort
+SELECT name FROM mor_versioned WHERE project_id = 'mor_slt' AND id IN ('b', 'c')
+----
+base b
+base c
+
+# The appended version carries a FRESH TF-owned stamp, strictly greater than the
+# one the insert issued — that ordering is the whole reason keep-greatest picks
+# it. (Compared against the untouched sibling rather than a literal: the stamps
+# are wall-clock-derived and the fixture must not pin a date.)
+query B
+SELECT MAX(CASE WHEN id = 'a' THEN updated_at END) > MAX(CASE WHEN id = 'b' THEN updated_at END) FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+true
+
+# Repeated updates of one key converge on the newest version.
+statement ok
+UPDATE mor_versioned SET name = 'updated a again' WHERE project_id = 'mor_slt' AND id = 'a'
+
+query T
+SELECT name FROM mor_versioned WHERE project_id = 'mor_slt' AND id = 'a'
+----
+updated a again
+
+query I
+SELECT COUNT(*) FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+3
+
+# An UPDATE matching nothing appends nothing.
+statement ok
+UPDATE mor_versioned SET name = 'ghost' WHERE project_id = 'mor_slt' AND id = 'no_such_id'
+
+query I
+SELECT COUNT(*) FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+3
+
+# DELETE appends a tombstone version: the key disappears from reads and from
+# COUNT(*), its siblings do not.
+statement ok
+DELETE FROM mor_versioned WHERE project_id = 'mor_slt' AND id = 'b'
+
+query I
+SELECT COUNT(*) FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+2
+
+query T rowsort
+SELECT id FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+a
+c
+
+# A tombstoned key that is re-inserted comes back: the new insert carries a
+# greater stamp than the tombstone, so keep-greatest resurrects it. (Nothing
+# depends on this today; it is asserted so a change in tombstone precedence is
+# a test failure rather than a surprise.)
+statement ok
+INSERT INTO mor_versioned (project_id, timestamp, id, date, name) VALUES
+  ('mor_slt', TIMESTAMP '2023-05-01T10:00:01Z', 'b', DATE '2023-05-01', 'reborn b')
+
+query T
+SELECT name FROM mor_versioned WHERE project_id = 'mor_slt' AND id = 'b'
+----
+reborn b
+
+# The enrichment shape that motivated the design: UPDATE ... FROM a values
+# source, joined on the dedup key, reading the row's own prior value.
+statement ok
+UPDATE mor_versioned SET name = mor_versioned.name || u.suffix
+FROM (SELECT 'c' AS jid, ' +tag' AS suffix) u
+WHERE mor_versioned.project_id = 'mor_slt' AND mor_versioned.id = u.jid
+
+query T
+SELECT name FROM mor_versioned WHERE project_id = 'mor_slt' AND id = 'c'
+----
+base c +tag
+
+query I
+SELECT COUNT(*) FROM mor_versioned WHERE project_id = 'mor_slt'
+----
+3
+
+# Isolation: another project's rows are untouched by any of the above.
+statement ok
+INSERT INTO mor_versioned (project_id, timestamp, id, date, name) VALUES
+  ('mor_slt_other', TIMESTAMP '2023-05-01T10:00:00Z', 'a', DATE '2023-05-01', 'other a')
+
+statement ok
+UPDATE mor_versioned SET name = 'tenant scoped' WHERE project_id = 'mor_slt' AND id = 'a'
+
+query T
+SELECT name FROM mor_versioned WHERE project_id = 'mor_slt_other' AND id = 'a'
+----
+other a

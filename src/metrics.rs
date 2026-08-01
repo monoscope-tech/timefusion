@@ -471,6 +471,18 @@ atomic_stats! {
     /// Chronic nonzero = compaction is being starved, not protected.
     light_optimize_wal_yields,
     light_optimize_memory_brakes,
+    /// Scans on a `version_append` table where the Delta leg did NOT already
+    /// satisfy keep-greatest's ordering, so a `SortExec` was injected over it.
+    ///
+    /// Zero is the healthy state and the PRECONDITION for turning
+    /// `version_append` on for a busy table: the sort is per-partition and
+    /// spillable, but prod's `otel_logs_and_spans` scans read 48 file groups
+    /// (2026-08-01), and 48 concurrent sorts over a measured 145MB peak batch is
+    /// the 2026-07-20 wide-scan OOM shape. Nonzero here means the partition
+    /// carries files without an honest sorted footer — today that is the DML
+    /// rewrite path (`dml_writer_properties` passes `declare_sorted=false`),
+    /// which merge-on-read removes by construction.
+    mor_delta_leg_sorts,
     /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
     /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
     /// outrunning flush often enough that compaction is running at the floor.

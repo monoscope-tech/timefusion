@@ -4241,7 +4241,7 @@ impl Database {
         // SortingColumn footer is honest and the page index localizes the lead
         // key. `sorted` is false when a schema-evolved bucket can't be combined
         // (we then write unsorted) — declare the footer only when it's true.
-        let (batches, sorted) = sort_batches_by_schema(schema, batches);
+        let (batches, sorted) = sort_batches_by_schema(schema, batches, self.config.maintenance.timefusion_sort_skip_bytes);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
         let staging_table = { table_ref.read().await.clone() };
@@ -6459,7 +6459,7 @@ impl Database {
                     // Variant struct columns may still be BinaryView if the partition
                     // mixes tiers — cast to Binary so the write accepts the schema.
                     let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-                    let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
+                    let (deduped, sorted) = sort_batches_by_schema(schema, deduped, self.config.maintenance.timefusion_sort_skip_bytes);
                     let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
                     let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                         .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
@@ -7008,7 +7008,13 @@ impl Database {
     /// `TIMEFUSION_LIGHT_OPTIMIZE_ENABLED=false` remains the incident kill switch.
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
-        let today = Utc::now().date_naive();
+        // `crate::clock`, not `Utc::now()`: the hot tail scopes itself to TODAY's
+        // partition and to an event-time seal window, so a wall-clock read here
+        // makes the whole pass unreachable from the virtual-time e2e harness —
+        // which is why this path had no end-to-end coverage and shipped writing
+        // every output unsorted. In production the clock IS the wall clock.
+        let today = crate::clock::now_micros();
+        let today = chrono::DateTime::from_timestamp_micros(today).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let today_str = today.to_string();
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
@@ -7183,18 +7189,31 @@ impl Database {
             // accumulate entries.
             let bin_table = format!("hot_bin_{}", uuid::Uuid::new_v4().simple());
             ctx.register_table(&bin_table, Arc::new(provider))?;
-            let read = ctx.sql(&format!("SELECT * FROM {bin_table}")).await;
-            let batches_res = match read {
-                Ok(df) => df.collect().await,
-                Err(e) => Err(e),
-            };
-            let _ = ctx.deregister_table(&bin_table);
-            let batches: Vec<RecordBatch> = batches_res?;
-            if batches.iter().all(|b| b.num_rows() == 0) {
-                return Ok(());
-            }
-            let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-            let (batches, sorted) = sort_batches_by_schema(schema, batches);
+            // ORDER BY in the PLAN, streamed — not `collect()` + an in-process
+            // Arrow lexsort.
+            //
+            // `sort_batches_by_schema` refuses to sort past `SORT_SKIP_BYTES`
+            // (256 MB of in-memory Arrow) and silently returns `sorted=false`.
+            // A hot bin is packed to `light_optimize_target_size` — 256 MB of
+            // FILE bytes — and prod's zstd ratio is ~17x, so EVERY bin arrived
+            // ~17x over that threshold and every hot-tail output was written
+            // unsorted: measured 2026-08-01, 0 of the 8 largest files in a live
+            // partition declared `sorting_columns`. One such file is enough,
+            // because the reader's `derive_common_ordering` is all-or-nothing —
+            // so the scan lost its declared ordering, which cost the streaming
+            // top-N pushdown AND forced `DedupExec` into its unbounded
+            // `full-set` seen-set, the per-query memory behind the OOM/restart
+            // cycle.
+            //
+            // Sorting in the plan fixes both halves: DataFusion merges the
+            // already-sorted inputs with a `SortPreservingMergeExec` (one batch
+            // per file, independent of bin size) and falls back to a SortExec
+            // that spills into the light pool where they are not — instead of
+            // materialising the whole bin 2-3x with no pool and no spill. The
+            // footer declaration is then honest by construction.
+            let order_by = schema_order_by_clause(schema);
+            let sorted = !order_by.is_empty();
+            let read = ctx.sql(&format!("SELECT * FROM {bin_table}{order_by}")).await;
             // Intermediate tier: this output is rewritten tonight by
             // consolidate/recompress, so it isn't worth max compression.
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
@@ -7202,9 +7221,24 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
                 .with_writer_properties(writer_properties);
             let target_schema = writer.arrow_schema();
-            for b in batches {
-                let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
+            let mut stream = match read {
+                Ok(df) => df.execute_stream().await,
+                Err(e) => Err(e),
+            }?;
+            let mut rows_staged = 0usize;
+            while let Some(batch) = stream.next().await {
+                let batch = cast_variant_columns_to_binary(batch?)?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                rows_staged += batch.num_rows();
+                let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                 writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
+            }
+            drop(stream);
+            let _ = ctx.deregister_table(&bin_table);
+            if rows_staged == 0 {
+                return Ok(());
             }
             adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(|mut add| {
                 // Tag the output so the next tick's selection treats it as a
@@ -8435,7 +8469,11 @@ fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema_loader
     take_record_batch(batch, &indices)
 }
 
-fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (FlushBatches, bool) {
+/// Default in-process sort budget for the FLUSH path, in in-memory Arrow bytes.
+/// Compaction must not reuse it — see the note in `sort_batches_by_schema`.
+pub(crate) const DEFAULT_SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
+
+fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>, skip_over_bytes: usize) -> (FlushBatches, bool) {
     use arrow::{
         compute::{SortOptions, concat_batches},
         row::{RowConverter, SortField},
@@ -8444,6 +8482,13 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     if batches.is_empty() || schema.sorting_columns.is_empty() {
         return unsorted(batches);
     }
+    // `skip_over_bytes` is the caller's budget for an IN-PROCESS sort, measured
+    // in in-memory Arrow bytes — NOT file bytes. The two differ by the zstd
+    // ratio, ~17x on prod otel data, which is exactly how a compaction path
+    // packing to a 256 MB FILE target silently blew a 256 MB in-memory budget on
+    // every single bin (see `stage_hot_bin`). A caller that sorts in a
+    // DataFusion plan instead should not be using this function at all.
+    //
     // Skip the in-flight sort for very large coalesced groups (bulk backfill):
     // concat + lexsort + take materializes the whole group 2-3x on the flush
     // path — a serial CPU + RSS spike that, multiplied by flush_parallelism,
@@ -8452,9 +8497,8 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     // scheduled compaction re-sort/Z-order. Steady-state per-(project,table)
     // groups stay well under the threshold, keeping their sorted footer +
     // compression; only giant backfill coalesces trip it.
-    const SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
     let total_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-    if total_bytes > SORT_SKIP_BYTES {
+    if total_bytes > skip_over_bytes {
         return unsorted(batches);
     }
     let first_schema = batches[0].schema();
@@ -8886,9 +8930,27 @@ fn process_memory_bytes() -> Option<usize> {
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
         && let Ok(v) = raw.trim().parse::<usize>()
     {
-        return Some(v);
+        // Discount the INACTIVE file cache. `memory.current` counts it, but the
+        // kernel reclaims it before OOM-killing anything, so charging it to the
+        // brake is charging pressure that does not exist — and it is not small:
+        // prod 2026-08-01 read 88.4 GB current = 75.6 GB anon + 11.7 GB
+        // inactive file. That 11.7 GB brought the brake forward by the same
+        // amount, and since the brake means "no maintenance AT ALL", it shortens
+        // the post-restart window in which compaction and dedup can make any
+        // progress (19.8k-deep dirty-bin backlog, 14 bins processed per process
+        // lifetime). Active file cache is left charged: it is being read now and
+        // reclaiming it costs IO.
+        return Some(v.saturating_sub(cgroup_inactive_file_bytes().unwrap_or(0)));
     }
     crate::metrics::process_rss_bytes()
+}
+
+/// `inactive_file` from cgroup v2 `memory.stat` — the page cache the kernel
+/// drops first under pressure. `None` when unreadable (the caller then charges
+/// the full `memory.current`, i.e. today's behaviour).
+fn cgroup_inactive_file_bytes() -> Option<usize> {
+    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?;
+    raw.lines().find_map(|l| l.strip_prefix("inactive_file ")?.trim().parse().ok())
 }
 
 /// Host free memory: `MemAvailable` from /proc/meminfo, which inside a
@@ -8920,7 +8982,7 @@ fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
 /// at 2-7s and never warmed while 3h (stable older files) did (prod 2026-07-21).
 fn seal_micros_now() -> i64 {
     const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
-    Utc::now().timestamp_micros() - SEAL_LAG_MICROS
+    crate::clock::now_micros() - SEAL_LAG_MICROS
 }
 
 /// The metadata one planner walk collects per candidate file. Decoupling
@@ -9131,8 +9193,31 @@ where
             }
             None => {}
         }
-        let outcomes: Vec<(String, Result<BinOutcome<T>>)> =
-            futures::stream::iter(std::mem::take(&mut pending)).map(|project_id| op(project_id, round)).buffer_unordered(concurrency).collect().await;
+        // Admission control INSIDE the round. The `should_pause` above guards
+        // only the round BOUNDARY, but the memory a round costs is allocated by
+        // the staging below — prod 2026-08-01 watched RSS go 50GB → 110GB
+        // (cgroup 128GB) inside one round while the brake, sampled only between
+        // rounds, never got the chance to fire; it recorded its first Stop after
+        // the round had already landed. `buffer_unordered` polls this closure as
+        // it admits each bin, so sampling here stops a round taking on NEW work
+        // the moment it crosses the line. Bins already in flight still finish —
+        // aborting them would waste the sort that is holding the memory.
+        // Deferred projects stay `pending`, so the next round's boundary check
+        // truncates the tick and rotates the cursor exactly as a brake there
+        // would have.
+        let outcomes: Vec<(String, Result<BinOutcome<T>>)> = futures::stream::iter(std::mem::take(&mut pending))
+            .map(|project_id| {
+                let (op, deferred) = (&op, matches!(should_pause(), Some(Brake::Stop(_))));
+                async move {
+                    match deferred {
+                        true => (project_id, Ok(BinOutcome::Retry)),
+                        false => op(project_id, round).await,
+                    }
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
         // Carry forward projects that still have work; converged or failed
         // projects drop out for the rest of the tick.
         let mut staged = Vec::with_capacity(outcomes.len());
@@ -10362,14 +10447,13 @@ impl TableProvider for ProjectRoutingTable {
         let limit = if post_scan_row_drop { None } else { limit };
 
         let scan_state = parking_lot::Mutex::new(ScanShape::default());
-        // Legs of the mem ∪ hot ∪ delta union, each flagged `sortable` — true for
-        // the in-memory legs (MemBuffer / hot tier), false for a Delta scan.
-        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, bool)>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Legs of the mem ∪ hot ∪ delta union, in recency order.
+        let wrap_result = |legs: Vec<Arc<dyn ExecutionPlan>>| -> DFResult<Arc<dyn ExecutionPlan>> {
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
             let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
-            let (mut plans, sortable): (Vec<Arc<dyn ExecutionPlan>>, Vec<bool>) = legs.into_iter().unzip();
+            let mut plans = legs;
             // Merge-on-read prerequisite: `DedupExec`'s keep-greatest only engages
             // while its input still declares an ordering on the leading dedup key
             // (that is what makes every version of a key arrive in one run), and
@@ -10397,8 +10481,24 @@ impl TableProvider for ProjectRoutingTable {
                 && table_schema.is_some_and(|t| t.version_append)
                 && let Some(req) = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &plans[0].schema()))
             {
+                // EVERY leg is sortable here, the Delta one included. Marking it
+                // unsortable — as the pre-merge-on-read code did — makes
+                // keep-greatest depend on the Delta scan happening to declare its
+                // footer ordering, and ONE file written without that declaration
+                // silently drops the whole scan's ordering, demotes the operator
+                // to keep-first and serves the PRE-UPDATE row. Correctness must
+                // not hinge on file metadata. The cost is bounded: sorting is
+                // skipped for any leg that already satisfies `req` (the normal
+                // case, since the table declares `sorting_columns`), and a
+                // `SortExec` here is per-partition and spillable.
+                let sortable = vec![true; plans.len()];
                 match crate::optimizers::ordered_children(&plans, &req, None, &sortable, false)? {
                     Some(ordered) => {
+                        // At least one leg needed sorting. Cheap for the
+                        // in-memory legs; the alarm is the DELTA leg — see the
+                        // metric's docs for why zero is the precondition for
+                        // enabling `version_append` on a busy table.
+                        crate::metrics::maintenance_stats().mor_delta_leg_sorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         plans = ordered;
                         merge_req = Some(req);
                     }
@@ -10417,12 +10517,17 @@ impl TableProvider for ProjectRoutingTable {
                 }
             }
             let plan = if plans.len() == 1 { plans.remove(0) } else { UnionExec::try_new(plans)? };
-            let plan = match merge_req {
+            let plan = match merge_req.clone() {
                 Some(req) => Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(req, plan)),
                 None => plan,
             };
             let plan = match dedup_on {
-                true => Arc::new(crate::read_dedup::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?),
+                true => Arc::new(
+                    crate::read_dedup::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?
+                        // Declaring it REQUIRED is what stops EnforceSorting from
+                        // deleting the merge above as unused — see the field docs.
+                        .requiring(merge_req.clone()),
+                ),
                 false => plan,
             };
             match &tombstone {
@@ -10460,7 +10565,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![(plan, false)]);
+            return wrap_result(vec![plan]);
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -10521,7 +10626,7 @@ impl TableProvider for ProjectRoutingTable {
         // (the hot leg serves pre-dedup rows and relies on `DedupExec`).
         let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters), layer.hot_tier_retention_micros());
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
-        let (hot_partitions, hot_ranges) = match skip_delta || too_deep {
+        let hot: crate::hot_tier::HotLeg = match skip_delta || too_deep {
             true => Default::default(),
             false => {
                 layer
@@ -10530,6 +10635,7 @@ impl TableProvider for ProjectRoutingTable {
                     .await
             }
         };
+        let (hot_partitions, hot_ranges, version_gate) = (hot.partitions, hot.ranges, hot.version_gate);
 
         // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
@@ -10553,7 +10659,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![(plan, false)]);
+            return wrap_result(vec![plan]);
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
@@ -10570,7 +10676,7 @@ impl TableProvider for ProjectRoutingTable {
         if let Some(mem_plan) = mem_plan.clone().filter(|_| skip_delta) {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(vec![(mem_plan, true)]);
+            return wrap_result(vec![mem_plan]);
         }
 
         // Build Delta filters with per-bucket exclusion.
@@ -10592,14 +10698,35 @@ impl TableProvider for ProjectRoutingTable {
         // Delta excludes the UNION of those ranges, and consecutive sealed
         // buckets are contiguous, so merging first collapses what would be one
         // conjunct per bucket (~36 for a 6h tier) into typically one.
+        //
+        // MERGE-ON-READ: on a `version_append` table an UPDATE appends a new
+        // version of the row carrying its ORIGINAL timestamp, so the newer
+        // version lands in Delta *inside* one of these ranges and the exclusion
+        // above would hide it — serving the pre-update row forever. Each
+        // conjunct is therefore weakened with `OR stamp > gate`: at or below the
+        // gate the in-memory/hot leg already holds the newest version of every
+        // row in the window, above it only Delta does. Applied to the merged
+        // (mem ∪ hot) ranges rather than the hot ones alone because weakening is
+        // safe in one direction only — an over-admitted row is a duplicate
+        // `DedupExec` collapses, an under-admitted one is a stale read — and the
+        // union path never grants `skip_dedup`.
         let mut delta_filters = optimized_filters.clone();
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
+        let version_col = table_schema.as_ref().filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone());
         for (start, end) in crate::mem_buffer::merge_ranges([mem_ranges, hot_ranges].concat()) {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(start) });
             let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(end) });
-            delta_filters.push(Expr::BinaryExpr(BinaryExpr { left: Box::new(below), op: Operator::Or, right: Box::new(at_or_above) }));
+            let outside = Expr::BinaryExpr(BinaryExpr { left: Box::new(below), op: Operator::Or, right: Box::new(at_or_above) });
+            delta_filters.push(match (&version_col, version_gate) {
+                (Some(c), Some(g)) => Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(outside),
+                    op: Operator::Or,
+                    right: Box::new(Expr::BinaryExpr(BinaryExpr { left: Box::new(col(c)), op: Operator::Gt, right: ts_lit(g) })),
+                }),
+                _ => outside,
+            });
         }
         if let Some(f) = tantivy_id_filter.clone() {
             delta_filters.push(f);
@@ -10638,8 +10765,7 @@ impl TableProvider for ProjectRoutingTable {
                 Some(Arc::new(DataSourceExec::new(Arc::new(source))) as Arc<dyn ExecutionPlan>)
             }
         };
-        let legs: Vec<(Arc<dyn ExecutionPlan>, bool)> =
-            [mem_plan.map(|p| (p, true)), hot_plan.map(|p| (p, true)), Some((delta_plan, false))].into_iter().flatten().collect();
+        let legs: Vec<Arc<dyn ExecutionPlan>> = [mem_plan, hot_plan, Some(delta_plan)].into_iter().flatten().collect();
         wrap_result(legs)
     }
 
@@ -10787,7 +10913,7 @@ mod writer_properties_tests {
             let _ = Int32Array::from(vec![0]); // keep the import honest for dictionary key typing
 
             let (want, want_sorted) = sort_batches_by_schema_reference(&sch, batches.clone());
-            let (got, got_sorted) = sort_batches_by_schema(&sch, batches);
+            let (got, got_sorted) = sort_batches_by_schema(&sch, batches, DEFAULT_SORT_SKIP_BYTES);
             if matches!(got, FlushBatches::Merge(_)) {
                 merged_paths += 1;
             }
@@ -10828,7 +10954,7 @@ mod writer_properties_tests {
             .collect();
         let sch = schema_with(vec![], vec!["timestamp"]);
         let (want, _) = sort_batches_by_schema_reference(&sch, batches.clone());
-        let (got, sorted) = sort_batches_by_schema(&sch, batches);
+        let (got, sorted) = sort_batches_by_schema(&sch, batches, DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         assert!(matches!(got, FlushBatches::Merge(_)), "this input must take the streaming path");
         assert_eq!(render(&want, None), render(&drain(got), None));
@@ -10845,7 +10971,7 @@ mod writer_properties_tests {
         // merge must hand the writer several chunks instead of one big batch.
         let mk =
             |off: i64| RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from((0..100_000).map(|i| i * 2 + off).rev().collect::<Vec<_>>()))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![mk(0), mk(1)]);
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![mk(0), mk(1)], DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         let chunks = drain(out);
         assert!(chunks.len() > 1, "output must be chunked, not one 200k-row batch");
@@ -10891,7 +11017,7 @@ mod writer_properties_tests {
         )
         .unwrap();
 
-        let (out, sorted) = sort_batches_by_schema(&sch, vec![batch_a, batch_b]);
+        let (out, sorted) = sort_batches_by_schema(&sch, vec![batch_a, batch_b], DEFAULT_SORT_SKIP_BYTES);
         let out = drain(out);
 
         assert!(sorted, "heterogeneous bucket must still be reported sorted so the footer is declared");
@@ -11108,14 +11234,14 @@ mod writer_properties_tests {
         let s = std::sync::Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
         let b1 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![3, 1]))]).unwrap();
         let b2 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![2, 0]))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2], DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         let out = drain(out);
         assert_eq!(out.len(), 1);
         let col = out[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(col.values(), &[0, 1, 2, 3]);
         // No declared sort columns → input returned untouched, sorted=false.
-        let (passthrough, sorted) = sort_batches_by_schema(&schema_with(vec![], vec![]), vec![out[0].clone(), out[0].clone()]);
+        let (passthrough, sorted) = sort_batches_by_schema(&schema_with(vec![], vec![]), vec![out[0].clone(), out[0].clone()], DEFAULT_SORT_SKIP_BYTES);
         assert!(!sorted);
         assert_eq!(drain(passthrough).len(), 2);
     }
@@ -11136,7 +11262,7 @@ mod writer_properties_tests {
         let b1 = RecordBatch::try_new(s1, vec![std::sync::Arc::new(Int64Array::from(vec![2, 1]))]).unwrap();
         let b2 =
             RecordBatch::try_new(s2, vec![std::sync::Arc::new(Int64Array::from(vec![3])), std::sync::Arc::new(StringArray::from(vec![Some("x")]))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2], DEFAULT_SORT_SKIP_BYTES);
         let out = drain(out);
         assert!(sorted, "mixed-schema bucket is unified and sorted, not left unsorted");
         assert_eq!(out.len(), 1, "batches unified into one sorted file");
@@ -12155,6 +12281,50 @@ mod tests {
         .await;
         assert_eq!(failed, 0);
         assert_eq!(*truncated.lock().unwrap(), vec![(0, 2)], "must truncate on round 0 with both projects still pending");
+    }
+
+    /// Prod 2026-08-01: RSS went 50GB → 110GB (cgroup 128GB) INSIDE one round,
+    /// and the brake — sampled only at the round boundary — recorded its first
+    /// `Stop` after that round had already landed. A brake that can only fire
+    /// between rounds cannot bound the memory a round allocates, so it must also
+    /// gate ADMISSION of each bin within the round.
+    ///
+    /// A brake that engages after the round starts must therefore stop new bins
+    /// from being admitted, leaving them pending for the boundary check to
+    /// truncate — not run the whole round anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_robin_bins_stops_admitting_bins_when_the_brake_engages_mid_round() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new()));
+        // Healthy at the round boundary; trips as soon as the first bin is
+        // admitted — the shape of a wave whose own staging exhausts memory.
+        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen, sink, gate) = (calls.clone(), truncated.clone(), admitted.clone());
+        super::round_robin_bins(
+            vec!["a".into(), "b".into(), "c".into()],
+            3,
+            1, // serial admission, so the trip point is deterministic
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.to_vec())),
+            move || (gate.load(std::sync::atomic::Ordering::SeqCst) > 0).then_some(super::Brake::Stop("mem")),
+            |project_id, _round| {
+                let (seen, admitted) = (seen.clone(), admitted.clone());
+                async move {
+                    admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    seen.lock().unwrap().push(project_id.clone());
+                    (project_id, Ok(super::BinOutcome::Staged(())))
+                }
+            },
+            |_bins, _round| async { 0 },
+        )
+        .await;
+
+        assert_eq!(*calls.lock().unwrap(), vec!["a".to_string()], "only the bin admitted before the brake tripped may run");
+        assert_eq!(
+            *truncated.lock().unwrap(),
+            vec![(1, vec!["a".to_string(), "b".to_string(), "c".to_string()])],
+            "the deferred bins stay pending and the NEXT round's boundary check truncates the tick"
+        );
     }
 
     /// Prod 2026-07-29: a permanently-engaged WAL brake truncated every tick at

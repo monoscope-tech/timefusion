@@ -698,6 +698,7 @@ const_default!(d_compact_min_files: usize = 5);
 // opens ≈ 1.2s). A larger target collapses today's sealed slices into a few
 // large event-time-disjoint runs so recent queries open a handful of files.
 const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
+const_default!(d_sort_skip_bytes: usize = 256 * MIB);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
@@ -1557,6 +1558,18 @@ pub struct MaintenanceConfig {
     /// that one-time transition sort.
     #[serde(default = "d_true")]
     pub timefusion_optimize_sort_by: bool,
+    /// Budget for an IN-PROCESS Arrow sort on the flush path, in in-memory
+    /// bytes. Past it `sort_batches_by_schema` writes unsorted (correctness-safe
+    /// — the footer just doesn't advertise an order) rather than materialising a
+    /// giant coalesced backfill 2-3x with no pool and no spill.
+    ///
+    /// It is in IN-MEMORY bytes, which is NOT what a compaction target is
+    /// measured in: prod's zstd ratio on otel data is ~17x, so a 256 MB
+    /// FILE-byte hot-tail bin is ~4.3 GB here. Paths that rewrite whole bins
+    /// sort inside a DataFusion plan (pooled, spillable, streaming) instead of
+    /// consulting this at all — see `stage_hot_bin`.
+    #[serde(default = "d_sort_skip_bytes")]
+    pub timefusion_sort_skip_bytes: usize,
     #[serde(default = "d_compact_min_files")]
     pub timefusion_compact_min_files: usize,
     /// Five-minute hot-partition compaction is required to prevent a

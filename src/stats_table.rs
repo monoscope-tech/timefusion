@@ -286,6 +286,7 @@ impl StatsTableProvider {
             "dedup_waves_committed_total" => m.dedup_waves_committed,
             "light_optimize_wal_yields_total" => m.light_optimize_wal_yields,
             "light_optimize_memory_brakes_total" => m.light_optimize_memory_brakes,
+            "mor_delta_leg_sorts_total" => m.mor_delta_leg_sorts,
             "light_optimize_ticks_degraded_total" => m.light_optimize_ticks_degraded,
             "dirty_bin_queue_depth" => m.dirty_bin_queue_depth,
             "dirty_bin_enqueued_total" => m.dirty_bin_enqueued,

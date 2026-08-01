@@ -896,6 +896,28 @@ impl BufferedWriteLayer {
         Ok(())
     }
 
+    /// Exempt the buckets a merge-on-read version append lands in from the
+    /// Delta-scan exclusion (`docs/plans/2026-08-01-merge-on-read-dml.md`).
+    ///
+    /// A version append carries the row's ORIGINAL timestamp, so it lands in a
+    /// bucket whose window Delta already holds the other — untouched — rows
+    /// for. An unmarked bucket makes MemBuffer authoritative for that whole
+    /// window and excludes it from the Delta scan, which would hide every row
+    /// the statement did not touch: a one-row UPDATE silently deleting the rest
+    /// of its window. This is the same exemption force-flush takes for the same
+    /// reason (both stores legitimately hold rows in the window); the row sets
+    /// overlap here rather than being disjoint, which `DedupExec` resolves.
+    ///
+    /// Must be called BEFORE the insert: between a bucket being created and
+    /// being marked, a concurrent scan would see it unmarked and exclude the
+    /// window.
+    pub fn mark_version_buckets(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) {
+        let time_col = crate::dml_coalescer::table_time_column(table_name);
+        for bucket in batches.iter().flat_map(|b| crate::mem_buffer::batch_bucket_ids(b, time_col)) {
+            self.mem_buffer.mark_force_flushed(project_id, table_name, bucket);
+        }
+    }
+
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
         // Fail fast while the WAL backlog is over its HARD cap (see
