@@ -59,6 +59,9 @@ pub mod test_helpers {
         cfg.core.timefusion_table_prefix = format!("test-{table_id}");
         cfg.core.timefusion_data_dir = PathBuf::from(data_dir);
         cfg.cache.timefusion_foyer_disabled = true;
+        // Dwell off: suite tests assert "sealed => next tick flushes"; the
+        // dwell gate has its own dedicated unit tests.
+        cfg.buffer.timefusion_flush_dwell_secs = 0;
         cfg
     }
 

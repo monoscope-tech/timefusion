@@ -1924,12 +1924,42 @@ impl BufferedWriteLayer {
         // silent data loss, caught by
         // `delete_during_airborne_commit_sticks_across_crash`. Dirty-kept
         // buckets are retried on the NEXT tick, exactly as before.
-        // BTreeSet = sorted + deduped in one pass.
-        let ids: std::collections::BTreeSet<i64> = self.mem_buffer.bucket_keys(|id| id < current_bucket).into_iter().map(|(_, _, id)| id).collect();
+        //
+        // DWELL GATE: a sealed-but-young bucket waits one bucket_duration from
+        // its CREATION before flushing, unless it is already big. MOR
+        // version-appends mint a bucket for an OLD window (instantly sealed:
+        // id < current) every minute, and flushing those on the 60s tick was
+        // the dominant parquet producer — one ~0.1MB file per (project, date)
+        // per minute, ~5x the steady ingest rate (2026-08-02 attribution).
+        // Dwelling lets the dribble accumulate into one file per window.
+        // Continuous-ingest buckets are already >= one duration old at seal,
+        // so their flush latency is unchanged. Pressure relief, pgwire FLUSH
+        // and shutdown use their own predicates and bypass this gate; rows
+        // stay WAL-durable and mem-readable while they dwell.
+        const FLUSH_DWELL_BYPASS_BYTES: usize = 32 << 20;
+        let dwell_micros = self.config.buffer.flush_dwell_micros();
+        let now = crate::clock::now_micros();
+        let mut fresh_small: std::collections::BTreeSet<i64> = Default::default();
+        let mut ids: std::collections::BTreeSet<i64> = Default::default();
+        for (id, created, bytes) in self.mem_buffer.bucket_flush_meta(|id| id < current_bucket) {
+            ids.insert(id);
+            if now.saturating_sub(created) < dwell_micros && bytes < FLUSH_DWELL_BYPASS_BYTES {
+                fresh_small.insert(id);
+            }
+        }
+        // An id is held back while ANY table's bucket at it is fresh and
+        // small (range-flushing below cannot split one id per table). This
+        // cannot starve: a held bucket is not flushed, so no NEW bucket can
+        // replace it at that id — the id becomes eligible at most one dwell
+        // after the youngest bucket's creation.
+        ids.retain(|id| !fresh_small.contains(id));
         let mut lo = i64::MIN;
         for chunk in ids.iter().copied().collect::<Vec<_>>().chunks(FLUSH_CHUNK_BUCKET_IDS) {
             let hi = chunk[chunk.len() - 1];
-            self.flush_buckets_where(move |id| id > lo && id <= hi).await?;
+            // Membership, not a range: the ids between chunk members may be
+            // dwell-held and a range predicate would flush them anyway.
+            let members: std::collections::BTreeSet<i64> = chunk.iter().copied().collect();
+            self.flush_buckets_where(move |id| id > lo && id <= hi && members.contains(&id)).await?;
             lo = hi;
         }
         Ok(())
@@ -3250,7 +3280,9 @@ mod tests {
     }
 
     fn create_test_config(data_dir: PathBuf) -> Arc<AppConfig> {
-        test_config_with(data_dir, |_| {})
+        // Dwell off: these tests assert the pre-dwell contract "sealed =>
+        // next tick flushes". The gate has its own dedicated tests.
+        test_config_with(data_dir, |c| c.buffer.timefusion_flush_dwell_secs = 0)
     }
 
     fn create_test_batch(project_id: &str) -> RecordBatch {
@@ -3305,6 +3337,45 @@ mod tests {
             commits >= SLICES as u64 / FLUSH_CHUNK_BUCKET_IDS as u64,
             "each commit must cover at most {FLUSH_CHUNK_BUCKET_IDS} bucket-id slice(s), got {commits} commit(s) for {SLICES}"
         );
+    }
+
+    /// The dwell gate itself: a freshly-created sealed bucket (the MOR
+    /// version-append dribble — an UPDATE minting a bucket for an OLD window
+    /// every minute) must NOT flush on the next tick; it flushes once it has
+    /// dwelled one bucket_duration, having coalesced that minute-by-minute
+    /// dribble into ONE parquet file instead of five.
+    #[serial]
+    #[tokio::test]
+    async fn fresh_small_sealed_buckets_dwell_then_flush() {
+        let dir = tempdir().unwrap();
+        // Default config keeps the dwell gate ON (-1 = one bucket_duration).
+        let cfg = test_config_with(dir.path().to_path_buf(), |_| {});
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("p{test_id}"), format!("t{test_id}"));
+
+        let commits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let c = commits.clone();
+        let mut layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, _b: Vec<RecordBatch>, _w| {
+            let c = c.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::Relaxed);
+                Ok(vec!["s3://test/part.parquet".to_string()])
+            })
+        }));
+
+        let bucket = crate::mem_buffer::bucket_duration_micros();
+        let now = crate::clock::now_micros();
+        // Sealed (old window) but just created — the dribble signature.
+        layer.mem_buffer.insert(&project, &table, create_test_batch(&project), now - 3 * bucket).unwrap();
+
+        layer.flush_completed_buckets().await.unwrap();
+        assert_eq!(commits.load(Ordering::Relaxed), 0, "a fresh small sealed bucket must dwell, not flush on the next tick");
+
+        crate::clock::set_micros(now + 2 * bucket);
+        layer.flush_completed_buckets().await.unwrap();
+        crate::clock::unfreeze();
+        assert_eq!(commits.load(Ordering::Relaxed), 1, "the dwelled bucket must flush exactly once");
     }
 
     #[serial]

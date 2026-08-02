@@ -40,7 +40,14 @@ async fn explain(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<S
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_but_well_pruned_scan_is_not_gated_while_a_many_file_scan_still_is() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
+    // Pin the file budget the test reasons about: the prod default moved to
+    // 256 files (2026-08-02), which 12 e2e files can never trip.
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_wide_scan_max_files(8)
+        .start()
+        .await?;
     let client = env.pg_client().await?;
 
     // One file per flush, each an hour apart, all far enough back that every

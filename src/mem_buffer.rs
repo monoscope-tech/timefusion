@@ -1267,6 +1267,23 @@ impl MemBuffer {
 
     /// (project_id, table_name, bucket_id) for every bucket whose id passes
     /// `filter`. Drives the take-based flush paths.
+    /// `(bucket_id, created_micros, memory_bytes)` for every bucket matching
+    /// `filter`, across all tables — the flush dwell gate's input. Same id can
+    /// appear once per (project, table).
+    pub fn bucket_flush_meta(&self, filter: impl Fn(i64) -> bool) -> Vec<(i64, i64, usize)> {
+        self.tables
+            .iter()
+            .flat_map(|t| {
+                t.value()
+                    .buckets
+                    .iter()
+                    .filter(|b| filter(*b.key()))
+                    .map(|b| (*b.key(), b.value().created_micros, b.value().memory_bytes.load(std::sync::atomic::Ordering::Relaxed)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn bucket_keys(&self, filter: impl Fn(i64) -> bool) -> Vec<(String, String, i64)> {
         self.tables
             .iter()

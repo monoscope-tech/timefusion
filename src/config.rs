@@ -556,6 +556,11 @@ const_default!(d_pgwire_user: String = "postgres");
 // with this interval. Trade-off: ~5x more Delta commits / small files (handled
 // by compaction/OPTIMIZE).
 const_default!(d_flush_interval: u64 = 60);
+// Flush dwell: a sealed-but-young bucket waits this long from CREATION before
+// the periodic flush commits it, unless it is already big. -1 = one
+// bucket_duration (the prod default), 0 = off (the test harnesses set this —
+// they assert "sealed => next tick flushes"). See flush_completed_buckets.
+const_default!(d_flush_dwell_secs: i64 = -1);
 const_default!(d_retention_mins: u64 = 70);
 // ON by default since 2026-08-02. It shipped at 0 (OFF) for its first
 // release — a new disk + page-cache consumer on a memory-tight box (host-level
@@ -1196,6 +1201,8 @@ impl CoreConfig {
 pub struct BufferConfig {
     #[serde(default = "d_flush_interval")]
     pub timefusion_flush_interval_secs: u64,
+    #[serde(default = "d_flush_dwell_secs")]
+    pub timefusion_flush_dwell_secs: i64,
     #[serde(default = "d_retention_mins")]
     pub timefusion_buffer_retention_mins: u64,
     #[serde(default = "d_eviction_interval")]
@@ -1428,6 +1435,14 @@ impl BufferConfig {
     }
     pub fn bucket_duration_secs(&self) -> u64 {
         self.timefusion_bucket_duration_secs.max(1)
+    }
+
+    /// The flush dwell in micros: -1 = one bucket_duration, 0 = gate off.
+    pub fn flush_dwell_micros(&self) -> i64 {
+        match self.timefusion_flush_dwell_secs {
+            s if s < 0 => (self.bucket_duration_secs() as i64) * 1_000_000,
+            s => s * 1_000_000,
+        }
     }
     pub fn pressure_flush_pct(&self) -> u32 {
         self.timefusion_pressure_flush_pct.min(100)

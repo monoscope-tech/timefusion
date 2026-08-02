@@ -73,6 +73,7 @@ pub struct E2eEnvBuilder {
     hot_tier_retention_hours: u64,
     sort_skip_bytes: Option<usize>,
     light_optimize_target_size: Option<i64>,
+    wide_scan_max_files: Option<usize>,
 }
 
 impl Default for E2eEnvBuilder {
@@ -95,6 +96,7 @@ impl Default for E2eEnvBuilder {
             hot_tier_retention_hours: 0,
             sort_skip_bytes: None,
             light_optimize_target_size: None,
+            wide_scan_max_files: None,
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
@@ -143,6 +145,12 @@ impl E2eEnvBuilder {
     /// "converged" (>= 7/8 of target) — the state a 265-778MB prod file is in.
     pub fn with_light_optimize_target(mut self, bytes: i64) -> Self {
         self.light_optimize_target_size = Some(bytes);
+        self
+    }
+    /// Shrink the wide-scan file budget so a test-sized file set trips the
+    /// admission gate (the prod default is 256 files).
+    pub fn with_wide_scan_max_files(mut self, files: usize) -> Self {
+        self.wide_scan_max_files = Some(files);
         self
     }
     pub fn with_foyer_enabled(mut self) -> Self {
@@ -274,6 +282,7 @@ impl E2eEnvBuilder {
             hot_tier_retention_hours: self.hot_tier_retention_hours,
             sort_skip_bytes: self.sort_skip_bytes,
             light_optimize_target_size: self.light_optimize_target_size,
+            wide_scan_max_files: self.wide_scan_max_files,
             page_row_count_limit: self.page_row_count_limit,
             test_id: &test_id,
         });
@@ -373,6 +382,7 @@ impl E2eEnv {
             hot_tier_retention_hours: self.builder.hot_tier_retention_hours,
             sort_skip_bytes: self.builder.sort_skip_bytes,
             light_optimize_target_size: self.builder.light_optimize_target_size,
+            wide_scan_max_files: self.builder.wide_scan_max_files,
             page_row_count_limit: self.builder.page_row_count_limit,
             test_id: &self.test_id,
         });
@@ -484,6 +494,7 @@ struct BuildCfgArgs<'a> {
     hot_tier_retention_hours: u64,
     sort_skip_bytes: Option<usize>,
     light_optimize_target_size: Option<i64>,
+    wide_scan_max_files: Option<usize>,
     test_id: &'a str,
 }
 
@@ -499,6 +510,9 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.core.timefusion_data_dir = args.data_dir;
     cfg.core.pgwire_port = args.pg_port;
     cfg.buffer.timefusion_flush_interval_secs = args.flush_interval_secs;
+    // Dwell off: e2e tests drive flushing with advance()+force_flush and
+    // assert prompt visibility in Delta; the gate has dedicated unit tests.
+    cfg.buffer.timefusion_flush_dwell_secs = 0;
     cfg.buffer.timefusion_eviction_interval_secs = args.eviction_interval_secs;
     cfg.buffer.timefusion_buffer_retention_mins = args.retention_mins;
     cfg.buffer.timefusion_bucket_duration_secs = args.bucket_duration_secs;
@@ -520,6 +534,9 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     }
     if let Some(rows) = args.page_row_count_limit {
         cfg.parquet.timefusion_page_row_count_limit = rows;
+    }
+    if let Some(files) = args.wide_scan_max_files {
+        cfg.memory.timefusion_wide_scan_max_files = files;
     }
     Arc::new(cfg)
 }
