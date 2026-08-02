@@ -843,6 +843,7 @@ const_default!(d_checkpoint_schedule: String = "0 */2 * * * *");
 // left by past commit-path parquet deletions (the 2026-07-09 incident left 14);
 // a nonzero removal count means committed data was destroyed elsewhere.
 const_default!(d_reconcile_schedule: String = "0 0 * * * *");
+const_default!(d_tantivy_reconcile_schedule: String = "0 30 3 * * *");
 const_default!(d_warm_recency_days: u64 = 1);
 // 16: at concurrency 4 prod's 3.1k-file boot warm ran >55 min and was cut
 // short by a restart every time; 16 finishes it in ~1-3 min. Footer GETs are
@@ -1776,6 +1777,12 @@ pub struct MaintenanceConfig {
     /// Dangling-Add reconcile schedule. See d_reconcile_schedule.
     #[serde(default = "d_reconcile_schedule")]
     pub timefusion_reconcile_schedule: String,
+    /// Nightly tantivy index reconcile: backfill uncovered live parquet +
+    /// GC manifest entries for rewritten-away files, per-uuid manifests
+    /// included. The single-process self-management of index consistency —
+    /// compaction/wave commits and CLI runs all converge here.
+    #[serde(default = "d_tantivy_reconcile_schedule")]
+    pub timefusion_tantivy_reconcile_schedule: String,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.

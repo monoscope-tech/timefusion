@@ -2738,6 +2738,31 @@ impl Database {
             }
         });
 
+        // Tantivy reconcile — nightly index consistency: backfill every live
+        // parquet no manifest covers (wave commits carry no index hook; failed
+        // builds; emergency-CLI compactions), then GC entries for dead files
+        // across every per-uuid manifest. Gated at tick time: the indexer is
+        // attached after construction, and may be absent entirely (no indexed
+        // tables / no bucket).
+        spawn_cron_job("Tantivy reconcile", &self.config.maintenance.timefusion_tantivy_reconcile_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
+                    let Some(svc) = db.tantivy_indexer().cloned() else { return };
+                    for table_name in svc.config.indexed_tables() {
+                        match db.tantivy_reconcile_table(&table_name).await {
+                            Ok((0, 0, 0)) => {}
+                            Ok((built, removed, blobs)) => {
+                                info!("tantivy nightly reconcile: table={} built={} entries_removed={} blobs_deleted={}", table_name, built, removed, blobs);
+                            }
+                            Err(e) => warn!("tantivy nightly reconcile failed for {}: {}", table_name, e),
+                        }
+                    }
+                }
+            }
+        });
+
         // Checkpoint + expired-log cleanup — runs the post-commit hooks out-of-band
         // (see the 2026-07-09 incident) so R2 500s on the checkpoint PUT / bulk log
         // delete never fail a landed commit; faster cadence keeps the log bounded.
@@ -5585,13 +5610,18 @@ impl Database {
                 // Drop sidecar index entries for files rewritten away.
                 if let Some(svc) = self.tantivy_indexer().cloned() {
                     let svc_table = table_name.to_string();
-                    // Per-project: collect all (project_id, ...) values from
-                    // manifests in this table prefix. Today only the unified
-                    // "default" path is exercised in practice; iterate over
-                    // known custom projects too.
-                    let mut project_ids: Vec<String> =
-                        self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()).collect();
-                    project_ids.push("default".to_string());
+                    // Manifests are keyed by the project uuid taken from the
+                    // parquet URI at build time — enumerate them rather than
+                    // guessing (a fixed "default"+customs list never visited
+                    // unified tenants' manifests, so their stale entries
+                    // outlived every compaction until the nightly reconcile).
+                    let project_ids = match crate::tantivy_index::manifest::list_projects(svc.object_store.as_ref(), table_name).await {
+                        Ok(pids) => pids,
+                        Err(e) => {
+                            warn!("tantivy gc: manifest enumeration failed for {}: {}", table_name, e);
+                            Vec::new()
+                        }
+                    };
                     for pid in project_ids {
                         match svc.gc_after_compaction(&svc_table, &pid, &live_uris).await {
                             Ok(report) if report.entries_removed > 0 => {
