@@ -702,9 +702,12 @@ async fn column_strings(db: &Arc<Database>, sql: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// A plain merge-on-read `SELECT` must dedup without introducing a sort or
-/// ordering-preserving merge. `DedupExec` keeps the greatest version in a
-/// full-set, so its single-partition coalesce is the intended input.
+/// A plain merge-on-read `SELECT` must never sort the DELTA leg — that
+/// blocking whole-window SortExec exhausted the query pool on prod
+/// 2026-08-02. In-memory legs MAY be sorted (bounded, already materialized):
+/// when the Delta leg declares its footer ordering, the cheap mem-leg sort
+/// plus a `SortPreservingMergeExec` is the intended shape, because it gives
+/// `DedupExec` a bounded keep-greatest instead of a full-set buffer.
 #[serial]
 #[tokio::test]
 async fn plain_select_dedups_without_sorting_under_mor() -> Result<()> {
@@ -716,10 +719,13 @@ async fn plain_select_dedups_without_sorting_under_mor() -> Result<()> {
 
     let plan = physical_plan(&db, &format!("SELECT name FROM mor_versioned WHERE project_id = '{project_id}'")).await?;
     let text = rendered(&plan);
-    let dedup = find_node(&plan, "DedupExec").unwrap_or_else(|| panic!("no DedupExec in plan:\n{text}"));
-    let input = dedup.children()[0].clone();
-    assert_eq!(input.name(), "CoalescePartitionsExec", "DedupExec must receive its single-partition input without a merge, got `{}`:\n{text}", input.name());
-    assert!(!text.contains("SortExec") && !text.contains("SortPreservingMergeExec"), "MOR dedup must not add sorting:\n{text}");
+    find_node(&plan, "DedupExec").unwrap_or_else(|| panic!("no DedupExec in plan:\n{text}"));
+    // The one invariant: no SortExec whose child is the Delta scan.
+    fn delta_leg_sorted(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> bool {
+        (plan.name() == "SortExec" && find_node(&plan.children()[0].clone(), "DeltaScanExec").is_some())
+            || plan.children().iter().any(|c| delta_leg_sorted(&(*c).clone()))
+    }
+    assert!(!delta_leg_sorted(&plan), "the Delta leg must never be sorted under MOR:\n{text}");
     Ok(())
 }
 

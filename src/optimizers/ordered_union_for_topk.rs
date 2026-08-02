@@ -133,9 +133,15 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
         return ordered_children(&children, &req_here, fetch, &[], true)?.map(UnionExec::try_new).transpose();
     }
     // Descend only through single-child, order-preserving operators so the
-    // ordering we create actually propagates up to the sort.
+    // ordering we create actually propagates up to the sort — but NEVER through
+    // a DedupExec: its survivors are decided across ALL input rows, and a
+    // `with_fetch` cut on a leg below it truncates that input. Under
+    // version_append the leg's top-n fills with row *versions*, so dedup can
+    // emit fewer than n distinct rows while more exist, and an equal-timestamp
+    // cut can keep a stale version whose newer sibling was truncated away.
     let children = plan.children();
     if children.len() == 1
+        && downcast::<crate::read_dedup::DedupExec>(plan.as_ref()).is_none()
         && plan.maintains_input_order().first() == Some(&true)
         && let Some(new_child) = order_union(children[0], req, fetch)?
     {
