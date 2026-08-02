@@ -7389,14 +7389,10 @@ impl Database {
         // Remove tombstones carry the exact fields of the files we rewrote.
         let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
         let targets = dedup_adds_by_path(
-            snapshot
-                .log_data()
-                .iter()
-                .filter(|f| wanted.contains(f.path().as_ref()))
-                .map(|f| {
-                    #[allow(deprecated)]
-                    f.add_action()
-                }),
+            snapshot.log_data().iter().filter(|f| wanted.contains(f.path().as_ref())).map(|f| {
+                #[allow(deprecated)]
+                f.add_action()
+            }),
             table_name,
         );
         if targets.len() != files.len() {
