@@ -256,7 +256,16 @@ impl DerivedBudget {
             let writer_reserve_bytes = (HEAVY_REWRITE_PERMITS * OPTIMIZE_MERGE_TASKS * WRITER_RESERVE_PER_TASK_BYTES).min(memory_limit_bytes / 10);
             let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes;
             let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
-            return Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes, profile };
+            return Self {
+                memory_limit_bytes,
+                cores,
+                query_pool_bytes,
+                ingest_buffer_bytes,
+                foyer_memory_bytes,
+                writer_reserve_bytes,
+                maintenance_pool_bytes,
+                profile,
+            };
         }
         // Fixed fraction, not the old TIMEFUSION_MEMORY_FRACTION knob: prod set
         // 0.75 calibrated against the hand-set 26 GB limit; applied to the real
@@ -2066,11 +2075,7 @@ mod tests {
         // The whole point of the profile: an 8 GiB pod must derive multi-GiB
         // sort memory instead of the 1 GiB floor the server shape leaves it.
         let cli = DerivedBudget::from_limits_with_profile(8 * GIB, 4, BudgetProfile::MaintenanceCli);
-        assert!(
-            cli.maintenance_pool_bytes >= 6 * GIB,
-            "8 GiB pod must yield >= 6 GiB maintenance pool, got {} GiB",
-            cli.maintenance_pool_bytes / GIB
-        );
+        assert!(cli.maintenance_pool_bytes >= 6 * GIB, "8 GiB pod must yield >= 6 GiB maintenance pool, got {} GiB", cli.maintenance_pool_bytes / GIB);
         // Engines run one at a time in a CLI: each share claims ~the whole pool.
         assert!(cli.heavy_share_bytes() >= (cli.maintenance_pool_bytes as f64 * 0.8) as usize);
         assert_eq!(cli.heavy_share_bytes(), cli.light_share_bytes());
