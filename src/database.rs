@@ -2506,7 +2506,7 @@ impl Database {
                     let (svc, store, pid, table) = (svc.clone(), delta_store.clone(), pid.clone(), table_owned.clone());
                     async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
                 }))
-                .buffer_unordered(2);
+                .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
                 while let Some(r) = jobs.next().await {
                     match r {
                         Ok(()) => built += 1,
@@ -5523,7 +5523,7 @@ impl Database {
                         let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
                         async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
                     }))
-                    .buffer_unordered(2);
+                    .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
                     while let Some(r) = jobs.next().await {
                         match r {
                             Ok(()) => built += 1,

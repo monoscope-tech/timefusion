@@ -471,6 +471,7 @@ macro_rules! const_default {
 }
 
 const_default!(d_true: bool = true);
+const_default!(d_tantivy_build_concurrency: usize = 2);
 const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
 const_default!(d_data_dir: PathBuf = "./data");
 const_default!(d_pgwire_port: u16 = 5432);
@@ -885,6 +886,12 @@ pub struct TantivyConfig {
     /// can engage. Off by default — reads every uncovered file back from S3.
     #[serde(default)]
     pub timefusion_tantivy_backfill: bool,
+    /// Concurrent index builds during backfill/reconcile/post-optimize
+    /// reindex. 2 is safe alongside prod query load; the off-box repair CLI
+    /// raises it (each 1 GB parquet takes ~2-3 min to index, so the first
+    /// full reconcile is throughput-bound on this knob).
+    #[serde(default = "d_tantivy_build_concurrency")]
+    pub timefusion_tantivy_build_concurrency: usize,
     /// File-level scan pruning: when the prefilter engages, files whose
     /// covering index returned zero hits are excluded from the Delta scan
     /// entirely (needle queries read only the files that can match). Off
