@@ -2470,9 +2470,14 @@ impl Database {
         if !svc.config.is_table_indexed(table_name) {
             return Ok((0, 0, 0));
         }
-        let built = self.backfill_table_indexes(&svc, table_name).await?;
-        // GC every manifest that exists (keyed by project uuid at build time)
-        // — a fixed "default"+customs list never visits unified tenants.
+        // GC FIRST, then backfill. Stale entries only ever cover dead files, so
+        // pruning them cannot regress live-file coverage — and it must not be
+        // hostage to the build phase (a memory-tight runner that OOMs on its
+        // first oversized parquet would otherwise never GC anything). This is
+        // the standalone-reconcile ordering only; the post-optimize hook keeps
+        // build-outputs-before-GC-inputs. GC every manifest that exists (keyed
+        // by project uuid at build time) — a fixed "default"+customs list never
+        // visits unified tenants.
         let (mut removed, mut blobs) = (0usize, 0usize);
         for pid in crate::tantivy_index::manifest::list_projects(svc.object_store.as_ref(), table_name).await? {
             let Ok(table_ref) = self.resolve_table(&pid, table_name).await else { continue };
@@ -2481,6 +2486,7 @@ impl Database {
             removed += report.entries_removed;
             blobs += report.blobs_deleted;
         }
+        let built = self.backfill_table_indexes(&svc, table_name).await?;
         Ok((built, removed, blobs))
     }
 
@@ -2498,9 +2504,13 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
             };
-            let (uris, delta_store) = {
+            let (uris, sizes, delta_store) = {
                 let t = table_ref.read().await;
-                (t.get_file_uris()?.collect::<Vec<String>>(), t.log_store().object_store(None))
+                let sizes: HashMap<String, u64> = match t.snapshot() {
+                    Ok(s) => s.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect(),
+                    Err(_) => HashMap::new(),
+                };
+                (t.get_file_uris()?.collect::<Vec<String>>(), sizes, t.log_store().object_store(None))
             };
             // Group live files by owning project (partition segment).
             let mut by_pid: HashMap<String, Vec<String>> = HashMap::new();
@@ -2509,11 +2519,22 @@ impl Database {
                     by_pid.entry(pid.to_string()).or_default().push(u);
                 }
             }
+            let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
             for (pid, mut uris) in by_pid {
                 let m = manifest::load(svc.object_store.as_ref(), table_name, &pid).await?;
                 let covered: std::collections::HashSet<&String> =
                     m.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
                 uris.retain(|u| !covered.contains(u));
+                if max_bytes > 0 {
+                    let before = uris.len();
+                    uris.retain(|u| parquet_rel_of_uri(u).and_then(|rel| sizes.get(rel)).is_none_or(|sz| *sz <= max_bytes));
+                    let skipped = before - uris.len();
+                    if skipped > 0 {
+                        // No silent caps: oversized files stay uncovered until a
+                        // bigger-memory runner reconciles without the limit.
+                        warn!(table_name, project_id = %pid, skipped, "tantivy backfill skipped files over TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB");
+                    }
+                }
                 uris.sort(); // lexical == chronological for date= partitions
                 let work: Vec<(String, String)> = uris.iter().filter_map(|uri| Some((parquet_rel_of_uri(uri)?.to_string(), uri.clone()))).collect();
                 let table_owned = table_name.to_string();
