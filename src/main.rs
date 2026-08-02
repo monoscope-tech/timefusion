@@ -23,7 +23,18 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // purges dirty pages on allocation events per-arena, so 4-8GB/min of write-path
 // churn retained ~2/3 of RSS as freed-but-unreturned pages (2026-07-29: 26GB
 // live heap vs 115GB RSS at the cgroup OOM kill).
-pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+// `prof_active:false` since 2026-08-02: the attribution this was deployed for is
+// DONE (giant-INSERT parse ASTs, snapshot refresh, RowConverter — 2026-07-31), and
+// leaving sampling on costs CPU and heap on a box whose memory headroom is the
+// binding constraint on compaction: the maintenance brake fires at 70% of the
+// cgroup (84GB) and RSS oscillates 51-99GB, so every GB back is brake headroom.
+// `lg_prof_interval:35` also dumps a .heap file every 32GB allocated, onto the
+// same volume that has twice filled with maintenance spill.
+//
+// `prof:true` is KEPT so profiling can be re-armed at runtime via the
+// `prof.active` mallctl without a rebuild — flip this to `prof_active:true` (or
+// set it via mallctl) whenever heap attribution is needed again.
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 use std::sync::Arc;
 
