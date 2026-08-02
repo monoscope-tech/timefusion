@@ -10207,7 +10207,13 @@ impl ProjectRoutingTable {
         // bypass gives up cache population and must NOT fire on a merely-widish
         // dashboard that will be re-read — hence its own, higher, knob.
         let bypass_cache = self.database.config.cache.cache_bypass_scan_micros().is_some_and(deeper_than);
-        Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone(), Some(self.database.scan_metrics.clone()), bypass_cache, mem.timefusion_max_concurrent_scan_readers as u32))
+        Arc::new(GatedScanExec::new(
+            plan,
+            self.database.heavy_scan_sem.clone(),
+            Some(self.database.scan_metrics.clone()),
+            bypass_cache,
+            mem.timefusion_max_concurrent_scan_readers as u32,
+        ))
     }
 
     /// The lead sort key that makes `DedupExec`'s keep-greatest engage: the
