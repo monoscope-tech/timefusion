@@ -3154,6 +3154,9 @@ mod tests {
     /// retry loop (2026-07-02), 600s let a hung commit hold the global
     /// `flush_lock` until the ingest buffer filled and every INSERT was
     /// rejected (2026-08-02). The budget has to come from the buffer's state.
+    // `#[serial]`: walrus_env_guard sets process-global WALRUS_DATA_DIR, so this
+    // must not overlap another test doing the same.
+    #[serial_test::serial]
     #[tokio::test]
     async fn flush_watchdog_contracts_as_the_ingest_buffer_fills() {
         let dir = tempdir().unwrap();
