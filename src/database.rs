@@ -2487,6 +2487,12 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(&pid, table_name).await else { continue };
             let live_uris: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             let report = svc.gc_after_compaction(table_name, &pid, &live_uris).await?;
+            if report.entries_removed > 0 || report.blob_delete_errors > 0 {
+                info!(
+                    "tantivy reconcile gc: table={table_name} project={pid} entries_removed={} blobs_deleted={} delete_errors={}",
+                    report.entries_removed, report.blobs_deleted, report.blob_delete_errors
+                );
+            }
             removed += report.entries_removed;
             blobs += report.blobs_deleted;
         }

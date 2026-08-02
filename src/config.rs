@@ -939,6 +939,7 @@ pub struct AppConfig {
     pub derived: DerivedBudget,
 }
 
+const_default!(d_tantivy_backfill_max_file_mb: u64 = 512);
 const_default!(d_tantivy_max_index_mb: u64 = 64);
 const_default!(d_tantivy_cache_disk_gb: u64 = 4);
 // Level 3: index packing is on the flush hot path; level 19 cost ~88% of a CPU
@@ -998,7 +999,9 @@ pub struct TantivyConfig {
     /// Backfill/reconcile skips parquet files larger than this (MB). 0 = no
     /// limit. Memory-tight runners (8 GB k8s nodes) OOM decoding+indexing
     /// 1 GB files; with a cap they repair everything else and log the skips.
-    #[serde(default)]
+    /// Defaults to 512 so the in-server nightly reconcile never index-builds
+    /// gigabyte whale parquets (~6 GB transient heap each) beside live queries.
+    #[serde(default = "d_tantivy_backfill_max_file_mb")]
     pub timefusion_tantivy_backfill_max_file_mb: u64,
     /// File-level scan pruning: when the prefilter engages, files whose
     /// covering index returned zero hits are excluded from the Delta scan

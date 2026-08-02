@@ -17,6 +17,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use futures::StreamExt;
 use object_store::ObjectStore;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -199,16 +200,25 @@ impl TantivyIndexService {
             .partition(|(_, e)| e.covered_files.is_empty() || e.covered_files.iter().any(|u| !live.contains(u.as_str())));
         let mut report = GcReport { kept: kept.len(), entries_removed: stale.len(), ..Default::default() };
         m.entries = kept;
-        // Effectful: one delete per stale blob, each awaited.
-        for blob in stale.into_values().filter_map(|e| e.index) {
-            match store::delete(self.object_store.as_ref(), &object_store::path::Path::from(blob.as_str())).await {
-                Ok(()) => report.blobs_deleted += 1,
-                Err(e) => {
-                    warn!("gc: failed to delete {blob}: {e}");
-                    report.blob_delete_errors += 1;
+        // Effectful: delete stale blobs concurrently (serial deletes made a
+        // 100k-blob GC take hours). A blob already gone counts as deleted —
+        // re-runs after an interrupted GC must not report errors.
+        let results: Vec<bool> = futures::stream::iter(stale.into_values().filter_map(|e| e.index))
+            .map(|blob| async move {
+                match store::delete(self.object_store.as_ref(), &object_store::path::Path::from(blob.as_str())).await {
+                    Ok(()) => true,
+                    Err(e) if matches!(e.downcast_ref::<object_store::Error>(), Some(object_store::Error::NotFound { .. })) => true,
+                    Err(e) => {
+                        warn!("gc: failed to delete {blob}: {e}");
+                        false
+                    }
                 }
-            }
-        }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+        report.blobs_deleted = results.iter().filter(|ok| **ok).count();
+        report.blob_delete_errors = results.len() - report.blobs_deleted;
         if report.entries_removed > 0 {
             manifest::save(self.object_store.as_ref(), table, project_id, &m).await?;
         }
