@@ -338,12 +338,8 @@ impl ExecutionPlan for DedupExec {
         // strictly cheaper than the sort it replaces, and it keeps the operator
         // CORRECT, where the old unbounded fallback (keep-first) would serve the
         // pre-update row.
-        let greatest = self
-            .tiebreak
-            .as_ref()
-            .and_then(|tb| in_schema.index_of(tb).ok())
-            .map(|idx| Greatest::new(idx, in_schema.field(idx).data_type()))
-            .transpose()?;
+        let greatest =
+            self.tiebreak.as_ref().and_then(|tb| in_schema.index_of(tb).ok()).map(|idx| Greatest::new(idx, in_schema.field(idx).data_type())).transpose()?;
         let dedup = Dedup {
             key_idxs: self.key_idxs.clone(),
             conv: RowConverter::new(self.key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
@@ -704,10 +700,7 @@ mod tests {
     async fn keep_greatest_without_a_bound_still_picks_the_newest_version() {
         // `a` is updated in a LATER batch; `b`'s newer version arrives FIRST.
         // Neither ordering assumption holds, and the ts column is not monotonic.
-        let plan = unbounded_greatest_plan(vec![
-            vbatch(&["a", "b"], &[10, 20], &[Some(1), Some(9)]),
-            vbatch(&["b", "a"], &[20, 10], &[Some(2), Some(7)]),
-        ]);
+        let plan = unbounded_greatest_plan(vec![vbatch(&["a", "b"], &[10, 20], &[Some(1), Some(9)]), vbatch(&["b", "a"], &[20, 10], &[Some(2), Some(7)])]);
         let mut got = collect_rows(&plan).await;
         got.sort();
         assert_eq!(got, vec![("a".into(), 10, Some(7)), ("b".into(), 20, Some(9))], "unbounded keep-greatest must win on the tiebreak, not on arrival order");
