@@ -1643,6 +1643,22 @@ pub struct Database {
     /// allocates outside every pool, and authorising GBs of that on a 26 GB box
     /// is what took prod down on 2026-08-01.
     flush_sort_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Admission to the escalated flush sort, so concurrent oversized groups take
+    /// the pool in turn instead of splitting it.
+    ///
+    /// `flush_sort_runtime_env` is ONE shared `FairSpillPool` and flush groups run
+    /// under `buffer_unordered`, so without this N concurrent escalations each get
+    /// ~pool/N. Spilling does not rescue that: it bounds the sort phase, but the
+    /// MERGE phase still needs a minimum reservation, and when it can't get one the
+    /// sort fails and the caller writes the group UNSORTED. On 2026-08-02, 21
+    /// concurrent groups against the 1 GB pool produced `Failed to allocate
+    /// additional 486.5 MB for ExternalSorterMerge[1] ... 312.1 MB remain`. Unsorted
+    /// output costs readers their footer ordering, which is the documented precursor
+    /// to lost TopK pushdown, unbounded read-side dedup, and OOM.
+    ///
+    /// One permit: escalation is the rare path (only oversized buckets reach it), and
+    /// sorted-but-serialized strictly beats parallel-but-unsorted.
+    flush_sort_sem: Arc<tokio::sync::Semaphore>,
     /// Memoized `build_optimize_session_state` results, one per runtime env.
     /// Building a `SessionState` re-registers every analyzer/optimizer rule and
     /// the whole UDF/UDAF set; the maintenance loop did that on EVERY optimize
@@ -2222,6 +2238,7 @@ impl Database {
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
             flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            flush_sort_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
             light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
@@ -4193,6 +4210,12 @@ impl Database {
         if order_by.is_empty() {
             return None;
         }
+
+        // Held for the whole sort so this group owns the pool outright (see field
+        // doc). Acquire before building the plan — the SessionContext reserves against
+        // the pool as it runs, not at construction. A closed semaphore only happens at
+        // shutdown, where falling back to unsorted beats blocking a draining flush.
+        let _permit = self.flush_sort_sem.acquire().await.ok()?;
 
         let state = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.flush_sort_runtime_env());
         let ctx = SessionContext::new_with_state(state);
