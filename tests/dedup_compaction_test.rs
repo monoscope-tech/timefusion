@@ -1333,3 +1333,57 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
 
     Ok(())
 }
+
+/// Regression (2026-08-02): the optimize CLI built its `Database` without a
+/// tantivy service, so `tantivy_indexer()` was `None` and every off-box
+/// compaction silently skipped both the output reindex and the input GC —
+/// orphaned manifest entries accumulated and compacted files stayed
+/// unindexed until a server-boot backfill. `tantivy_reconcile_table` is the
+/// CLI's post-run repair; it must also visit the per-uuid manifests that the
+/// in-server hook's fixed "default"+customs GC list never reaches.
+#[serial]
+#[tokio::test]
+async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
+    use timefusion::tantivy_index::{manifest, service::TantivyIndexService};
+    const TABLE: &str = "otel_logs_and_spans";
+    let cfg = TestConfigBuilder::new("tantivy_reconcile").with_buffer_mode(BufferMode::Enabled).build();
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let tantivy_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let svc = Arc::new(TantivyIndexService::new(tantivy_store.clone(), Arc::new(cfg.tantivy.clone())));
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+
+    // Two direct commits → two live parquet files, neither indexed (the
+    // direct insert path has no flush-time index callback).
+    let row = |id: &str| -> Result<_> { json_to_batch(vec![test_span_ts(id, "n", &project_id, ts)]) };
+    db.insert_records_batch(&project_id, TABLE, vec![row("id_a")?], true, None).await?;
+    db.insert_records_batch(&project_id, TABLE, vec![row("id_b")?], true, None).await?;
+
+    // Reconcile #1 = backfill: both uncovered live files get indexes under
+    // the project-uuid manifest; nothing is stale yet.
+    let (built, removed, _) = db.tantivy_reconcile_table(TABLE).await?;
+    assert!(built >= 2, "expected both uncovered live files indexed, built={built}");
+    assert_eq!(removed, 0, "nothing to GC before compaction");
+    let m = manifest::load(tantivy_store.as_ref(), TABLE, &project_id).await?;
+    assert_eq!(m.entries.len(), 2, "per-uuid manifest covers both files");
+
+    // Compact 2 files → 1: the inputs' entries are now stale.
+    let table_ref = db.unified_tables().read().await.get(TABLE).expect("table created").clone();
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+    db.compact_date_concurrent(&table_ref, TABLE, date, Some(&project_id), None).await?;
+
+    // Reconcile #2: stale entries GC'd (via manifest enumeration — the fixed
+    // "default" list would miss this manifest) and the output file covered.
+    let (_, removed2, _) = db.tantivy_reconcile_table(TABLE).await?;
+    assert!(removed2 >= 2, "pre-compaction entries must be GC'd, removed={removed2}");
+    let m = manifest::load(tantivy_store.as_ref(), TABLE, &project_id).await?;
+    let live: Vec<String> = table_ref.read().await.get_file_uris()?.filter(|u| u.contains(&project_id)).collect();
+    assert!(!live.is_empty());
+    let covered: Vec<&String> = m.entries.values().filter(|e| e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
+    for u in &live {
+        assert!(covered.contains(&u), "live file {u} must be index-covered after reconcile");
+    }
+    assert!(m.entries.values().all(|e| e.covered_files.iter().all(|u| live.contains(u))), "no entry may cover a dead file");
+    Ok(())
+}
