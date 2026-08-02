@@ -10774,19 +10774,21 @@ impl TableProvider for ProjectRoutingTable {
         // version-mutable column (see `version_mutable_columns` — it serves a
         // superseded version) may reach a scan leg, however it arrived here.
         //
-        // This also disables the tantivy prefilter on a merge-on-read table,
-        // and that is REQUIRED, not collateral: the prefilter excludes whole
-        // FILES proven to hold no match, so a search for a value only the OLD
-        // version carries excludes the file holding the NEW one. `DedupExec`
-        // then never sees the newer version, returns the stale row, and the
-        // filter above admits it. The id-set half would be safe on its own
-        // (`id` is a dedup key, so it admits every version of a row), but the
-        // file exclusion and row selections are not, and they are what makes
-        // the prefilter worth having. Cost: text/attribute predicates on these
-        // tables no longer prune files; time-range and tenant pruning, which
-        // dominate the dashboard workload, are unaffected because those columns
-        // are dedup keys and partitions.
+        // On a merge-on-read table this stripping constrains the tantivy
+        // prefilter too, but only PART of it is unsound. The invariant: leaf
+        // pruning below DedupExec commutes with keep-greatest only when the
+        // predicate evaluates identically on every version of a key. File
+        // exclusion and row selections violate that for mutable columns (a
+        // search for a value only the OLD version carries excludes the file
+        // holding the NEW one; DedupExec never sees the winner and serves the
+        // stale row) — those stay OFF below. The id-set half is sound even
+        // for mutable columns: `id` is a dedup key, so `id IN (hits)` admits
+        // or drops whole KEYS atomically — every version of a matching id
+        // passes, keep-greatest still picks the newest, and a stale-only
+        // match is rejected by the above-dedup filter. The coverage gate
+        // guarantees the winner's file was searched, so its id is in the set.
         let mutable = Self::version_mutable_columns(&self.table_name);
+        let unstripped_filters = filters;
         let leg_safe = |f: &Expr| {
             !Self::references_tombstone(&self.table_name, f) && !mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
         };
@@ -10809,7 +10811,15 @@ impl TableProvider for ProjectRoutingTable {
         //    caller (us) does NOT compute or pass MemBuffer ids — doing so
         //    would re-introduce the race where a concurrent insert lands a
         //    row in the snapshot that isn't in the pre-computed id set.
-        let text_match_tree = crate::tantivy_index::udf::collect_text_match_tree(&optimized_filters);
+        // On a MOR table the leg filters had mutable-column predicates
+        // stripped, so collect the tree from the UNSTRIPPED filters — the
+        // sidecar id-set (the only output allowed below on such tables, see
+        // the invariant note above) is sound for them. Non-MOR tables keep
+        // the stripped set (identical there anyway).
+        let text_match_tree = match mutable.is_some() {
+            false => crate::tantivy_index::udf::collect_text_match_tree(&optimized_filters),
+            true => crate::tantivy_index::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?),
+        };
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter (time-
         // prunes the sidecar search + scopes the coverage gate to a needle's
         // window, not every index the project built) and the skip-delta
@@ -10906,12 +10916,19 @@ impl TableProvider for ProjectRoutingTable {
                         // File pruning is only sound once every gate above
                         // passed (coverage complete, no field gap): a
                         // zero-hit covering index then proves its files hold
-                        // no matches for the routed predicates.
-                        if tcfg.timefusion_tantivy_file_pruning && !delta_zero_hit.is_empty() {
-                            tantivy_exclude = Some(delta_zero_hit);
-                        }
-                        if tcfg.timefusion_tantivy_row_selection && !delta_row_sel.is_empty() {
-                            tantivy_row_selections = Some(delta_row_sel);
+                        // no matches for the routed predicates. NEVER on a
+                        // version_append table — a "hitless" file may hold
+                        // the NEWEST version of a key whose match lives only
+                        // in an older version (mutable column), and dropping
+                        // it below DedupExec serves the stale row. The id-set
+                        // above stays sound there (whole-key granularity).
+                        if mutable.is_none() {
+                            if tcfg.timefusion_tantivy_file_pruning && !delta_zero_hit.is_empty() {
+                                tantivy_exclude = Some(delta_zero_hit);
+                            }
+                            if tcfg.timefusion_tantivy_row_selection && !delta_row_sel.is_empty() {
+                                tantivy_row_selections = Some(delta_row_sel);
+                            }
                         }
                     }
                 }
@@ -11148,8 +11165,14 @@ impl TableProvider for ProjectRoutingTable {
         // own atomic per-bucket prefilter inside the bucket lock — we must
         // NOT prepend `tantivy_id_filter` here (that filter is derived from
         // delta-side IDs only and would drop legitimate MemBuffer rows).
+        // On a MOR table the per-bucket ROW prefilter is below DedupExec and
+        // the tree may reference mutable columns (it was collected unstripped
+        // for the delta id-set) — dropping a stale version's row here while
+        // its match-bearing sibling sits in another leg breaks keep-greatest,
+        // so the mem leg gets no tree.
+        let mem_tree = text_match_tree.as_ref().filter(|_| mutable.is_none());
         let mem_leg =
-            layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, text_match_tree.as_ref()).unwrap_or_else(|e| {
+            layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree).unwrap_or_else(|e| {
                 warn!("Failed to query mem buffer: {}", e);
                 Default::default()
             });
