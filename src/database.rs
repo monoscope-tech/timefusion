@@ -208,6 +208,11 @@ pub struct ScanMetrics {
     pub decode_peak_batch_bytes: std::sync::atomic::AtomicU64,
     pub decode_polls_inflight: std::sync::atomic::AtomicU64,
     pub decode_polls_inflight_peak: std::sync::atomic::AtomicU64,
+    /// Decode polls that ran with pressure-reduced concurrency (see
+    /// `scan_pressure_permits`). Non-zero means the process was close enough
+    /// to its OOM line that wide-scan decodes were serialized instead of
+    /// letting an allocation burst outrun reclaim.
+    pub decode_pressure_throttled: std::sync::atomic::AtomicU64,
 }
 
 impl ScanMetrics {
@@ -10202,7 +10207,7 @@ impl ProjectRoutingTable {
         // bypass gives up cache population and must NOT fire on a merely-widish
         // dashboard that will be re-read — hence its own, higher, knob.
         let bypass_cache = self.database.config.cache.cache_bypass_scan_micros().is_some_and(deeper_than);
-        Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone(), Some(self.database.scan_metrics.clone()), bypass_cache))
+        Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone(), Some(self.database.scan_metrics.clone()), bypass_cache, mem.timefusion_max_concurrent_scan_readers as u32))
     }
 
     /// The lead sort key that makes `DedupExec`'s keep-greatest engage: the
@@ -10526,6 +10531,47 @@ fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
     plan.children().into_iter().filter_map(selected_file_work).reduce(|(n, b), (n2, b2)| (n + n2, b + b2))
 }
 
+/// Decode-admission pressure valve: how many of the wide-scan semaphore's
+/// `total` permits one decode poll must claim right now. 1 under normal
+/// pressure (full concurrency); a quarter of the pool from 88% of the cgroup
+/// limit; the whole pool (fully serialized decodes) from 95%. Decode heap is
+/// the one large consumer no DataFusion pool tracks, so near the OOM line the
+/// only lever is concurrency: 16 concurrent ~150MB-batch decodes were exactly
+/// the burst that outran jemalloc purge + memcg reclaim in the 2026-08-01/02
+/// hourly-OOM regime (70 kills / 3 days). Queries degrade to queued-but-alive
+/// instead of the whole process dying and paying a cold-cache restart spiral.
+/// The pressure number is memcg-charged usage minus reclaimable file cache —
+/// the same measure the maintenance wave brake acts on — sampled at most every
+/// 250ms (decode polls are ~ms-scale, so per-poll file reads would be pure
+/// overhead).
+fn scan_pressure_permits(total: u32) -> u32 {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static SAMPLED_AT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static USAGE_PCT: AtomicU64 = AtomicU64::new(0);
+    let now_ms = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let last = SAMPLED_AT_MS.load(Relaxed);
+    if last == u64::MAX || now_ms.saturating_sub(last) >= 250 {
+        SAMPLED_AT_MS.store(now_ms, Relaxed);
+        let limit = crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes);
+        let pct = match (process_memory_bytes(), limit) {
+            (Some(used), l) if l > 0 => (used * 100 / l) as u64,
+            _ => 0,
+        };
+        USAGE_PCT.store(pct, Relaxed);
+    }
+    pressure_permit_claim(USAGE_PCT.load(Relaxed), total)
+}
+
+/// Tier math for `scan_pressure_permits`, separated for testability.
+fn pressure_permit_claim(usage_pct: u64, total: u32) -> u32 {
+    match usage_pct {
+        p if p >= 95 => total,
+        p if p >= 88 => (total / 4).max(1),
+        _ => 1,
+    }
+}
+
 /// Concurrency-gates a wide read scan: each output partition acquires a permit
 /// from a shared semaphore around every batch decode, bounding the number of
 /// Parquet row groups decoded at once across ALL wide queries. This is the
@@ -10551,12 +10597,15 @@ struct GatedScanExec {
     /// the hot tail — must not evict the hot tail on its way through. Derived
     /// once, from the caller's filters (see `gate_if_wide`).
     bypass_cache: bool,
+    /// Size of `sem`'s pool — `scan_pressure_permits` scales its claim off it
+    /// (tokio semaphores don't expose their initial size).
+    pool_size: u32,
 }
 
 impl GatedScanExec {
-    fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>, bypass_cache: bool) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>, bypass_cache: bool, pool_size: u32) -> Self {
         let properties = input.properties().clone();
-        Self { input, sem, properties, metrics, bypass_cache }
+        Self { input, sem, properties, metrics, bypass_cache, pool_size }
     }
 }
 
@@ -10580,7 +10629,7 @@ impl ExecutionPlan for GatedScanExec {
         vec![&self.input]
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache)))
+        Ok(Arc::new(Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache, self.pool_size)))
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let inner = self.input.execute(partition, context)?;
@@ -10588,6 +10637,7 @@ impl ExecutionPlan for GatedScanExec {
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let bypass = self.bypass_cache;
+        let pool_size = self.pool_size;
         // Hold a permit only across each `poll_next` (one batch decode), then
         // release so other partitions/queries can proceed — see type docs.
         // The permit window is also exactly the decode window, which is what
@@ -10596,9 +10646,17 @@ impl ExecutionPlan for GatedScanExec {
             let sem = sem.clone();
             let metrics = metrics.clone();
             async move {
-                let _permit = sem.acquire_owned().await.ok()?;
+                // Near the OOM line each poll claims more of the pool,
+                // shrinking effective decode concurrency (see
+                // `scan_pressure_permits`). `acquire_many` never exceeds the
+                // pool size, so progress is guaranteed.
+                let want = scan_pressure_permits(pool_size);
+                let _permit = sem.acquire_many_owned(want).await.ok()?;
                 if let Some(m) = &metrics {
                     m.decode_begin();
+                    if want > 1 {
+                        m.decode_pressure_throttled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // The object-store fetches for this batch happen inside the
                 // poll, so the bypass scope covers exactly them. Only paid for
@@ -11943,7 +12001,7 @@ mod tests {
         let partitions: Vec<Vec<RecordBatch>> =
             (0..8).map(|i| vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![i]))]).unwrap()]).collect();
         let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema.clone(), None).unwrap())));
-        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2)), None, false));
+        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2)), None, false, 2));
         let ctx = Arc::new(TaskContext::default());
         let mut streams: Vec<_> = (0..8).map(|p| gated.execute(p, ctx.clone()).unwrap()).collect();
         let firsts = tokio::time::timeout(std::time::Duration::from_secs(10), futures::future::join_all(streams.iter_mut().map(futures::StreamExt::next)))
@@ -11971,7 +12029,7 @@ mod tests {
         let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema, None).unwrap())));
 
         let metrics = Arc::new(ScanMetrics::default());
-        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(4)), Some(metrics.clone()), false));
+        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(4)), Some(metrics.clone()), false, 4));
         let mut stream = gated.execute(0, Arc::new(TaskContext::default())).unwrap();
         let mut rows = 0;
         while let Some(b) = futures::StreamExt::next(&mut stream).await {
@@ -11983,6 +12041,21 @@ mod tests {
         assert_eq!(metrics.decode_peak_batch_bytes.load(Relaxed), want);
         assert_eq!(metrics.decode_polls_inflight.load(Relaxed), 0, "in-flight gauge must return to zero");
         assert_eq!(metrics.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
+    }
+
+    /// The decode pressure valve: full concurrency until 88% of the cgroup
+    /// limit, quarter pool to 95%, fully serialized past that. Claims never
+    /// exceed the pool (progress guaranteed) and never drop to zero.
+    #[test]
+    fn pressure_permit_claim_tiers() {
+        assert_eq!(pressure_permit_claim(0, 16), 1);
+        assert_eq!(pressure_permit_claim(87, 16), 1);
+        assert_eq!(pressure_permit_claim(88, 16), 4);
+        assert_eq!(pressure_permit_claim(94, 16), 4);
+        assert_eq!(pressure_permit_claim(95, 16), 16);
+        assert_eq!(pressure_permit_claim(200, 16), 16);
+        assert_eq!(pressure_permit_claim(88, 2), 1, "tiny pools floor at 1");
+        assert_eq!(pressure_permit_claim(95, 1), 1);
     }
 
     /// spawn_cron_job must fire on the wall-clock schedule (regression: the

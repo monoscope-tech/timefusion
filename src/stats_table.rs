@@ -339,6 +339,7 @@ impl StatsTableProvider {
                     "peak_batch_bytes" => dpeak,
                     "polls_inflight" => m.decode_polls_inflight.load(Relaxed),
                     "polls_inflight_peak" => dinflight_peak,
+                    "pressure_throttled_total" => m.decode_pressure_throttled.load(Relaxed),
                     "worst_case_heap_mb" => mb(dpeak.saturating_mul(dinflight_peak) as f64),
                 ],
                 rows!["scan";
