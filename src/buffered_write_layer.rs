@@ -714,13 +714,24 @@ impl BufferedWriteLayer {
     /// `MIN_FLUSH_TIMEOUT` so the lock is released while there is still room to
     /// retry — which is exactly when relief needs it.
     ///
+    /// The floor is half of `base`, NOT a small absolute number. Contracting is
+    /// only sound against a HUNG commit; against a slow-but-progressing drain an
+    /// early abort discards the work and the retry is no cheaper, so an
+    /// aggressive floor re-creates the 120s failure above at the exact moment
+    /// the buffer is fullest and the drains are largest. Prod on 2026-08-02
+    /// showed this concretely: commits were not completing within the 600s
+    /// ceiling while pressure sat at 100%, where a 45s floor would have aborted
+    /// every one of them and wedged flushing permanently. Capping the
+    /// contraction at 2x keeps a real pressure response without ever cutting
+    /// below a budget we already know is needed.
+    ///
     /// 0 (watchdog disabled) stays disabled.
     fn adaptive_flush_timeout(&self) -> Duration {
         let base = self.config.buffer.flush_bucket_timeout();
         if base.is_zero() {
             return base;
         }
-        const MIN_FLUSH_TIMEOUT: Duration = Duration::from_secs(45);
+        let min_flush_timeout = base / 2;
         // Headroom below this fraction of the cap starts contracting the budget;
         // at the cap it is the floor.
         const RELAXED_BELOW: f64 = 0.5;
@@ -730,9 +741,9 @@ impl BufferedWriteLayer {
             return base;
         }
         // Linear from `base` at RELAXED_BELOW down to the floor at the cap.
-        let span = (base.saturating_sub(MIN_FLUSH_TIMEOUT)).as_secs_f64();
+        let span = (base.saturating_sub(min_flush_timeout)).as_secs_f64();
         let scale = (1.0 - pressure) / (1.0 - RELAXED_BELOW);
-        MIN_FLUSH_TIMEOUT + Duration::from_secs_f64(span * scale)
+        min_flush_timeout + Duration::from_secs_f64(span * scale)
     }
 
     /// Above the hard reservation ceiling (budget + headroom) — the point at
@@ -3172,12 +3183,18 @@ mod tests {
         // because aborting it wastes the work and the retry is no faster.
         assert_eq!(layer.adaptive_flush_timeout(), ceiling, "with headroom the watchdog must not cut a progressing commit short");
 
-        // Nearly full: the budget must be far below the ceiling, so the lock is
-        // released while there is still room left to retry into.
+        // Nearly full: the budget contracts so the lock is released while there
+        // is still room left to retry into — but never past half the ceiling.
+        // Contracting is only sound against a HUNG commit; a slow-but-
+        // progressing drain that is aborted early loses the work for a retry
+        // that is no cheaper, and the buffer is fullest exactly when drains are
+        // largest. Prod (2026-08-02) was failing commits at the 600s ceiling
+        // while pressure sat at 100%, where an aggressive floor aborts every
+        // flush and wedges ingest permanently.
         layer.reserved_bytes.store(max * 99 / 100, Ordering::Release);
         let under_pressure = layer.adaptive_flush_timeout();
-        assert!(under_pressure < ceiling / 4, "at 99% of the ingest cap the watchdog must be aggressive, got {under_pressure:?} against a {ceiling:?} ceiling");
-        assert!(under_pressure >= Duration::from_secs(30), "...but never so short that no real commit can finish: {under_pressure:?}");
+        assert!(under_pressure < ceiling, "at 99% of the ingest cap the watchdog must contract, got {under_pressure:?} against a {ceiling:?} ceiling");
+        assert!(under_pressure >= ceiling / 2, "...but never below half the ceiling, or a legitimate large drain can never finish: {under_pressure:?}");
 
         // Monotonic: more pressure never buys more time.
         layer.reserved_bytes.store(max * 70 / 100, Ordering::Release);
