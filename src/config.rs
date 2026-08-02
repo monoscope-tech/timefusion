@@ -798,11 +798,21 @@ const_default!(d_query_partitions: usize = 0);
 const_default!(d_max_concurrent_scan_readers: usize = 16);
 const_default!(d_wide_scan_lookback_hours: u64 = 2);
 // Sized against the incident the gate exists for: the 7-day dashboard opened
-// hundreds of files at ~48-way parallelism. A recent-window scan on the busiest
-// prod tenant selects a handful of files after pruning, so 8 files / 256 MB
-// sits an order of magnitude below the danger and well above the normal path.
-const_default!(d_wide_scan_max_files: usize = 8);
-const_default!(d_wide_scan_max_mb: u64 = 256);
+// hundreds of files at ~48-way parallelism.
+//
+// The FILE-COUNT half assumed "a recent-window scan selects a handful of files
+// after pruning". That stopped being true once partitions fragmented to
+// thousands of small files: on 2026-08-02 a 1h window on one tenant selected 48
+// file groups, so the release could never fire and every dashboard past the 2h
+// lookback queued behind the 16-permit semaphore. Measured cliff, same tenant,
+// same query: 115min = 9.9s but 125min = TIMEOUT at 130s.
+//
+// BYTES are the honest proxy for decode heap; file COUNT is a proxy for a proxy,
+// and it is the one fragmentation invalidates. Median prod file is ~0.1 MB, so
+// 256 files is still only ~26 MB — the MB cap does the real bounding, and the
+// 7-day case that motivated the gate blows through the MB cap regardless.
+const_default!(d_wide_scan_max_files: usize = 256);
+const_default!(d_wide_scan_max_mb: u64 = 512);
 const_default!(d_plan_cache_capacity: usize = 2048);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
