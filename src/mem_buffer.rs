@@ -611,7 +611,19 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
 
     // Optional tiebreak column, encoded order-preservingly (same concat-just-this-
     // -column trick as the keys, so we never fuse the fat payload).
-    let tb_rows = match tiebreak {
+    // A MISSING tiebreak degrades to "no tiebreak" instead of failing the flush.
+    // Enabling `version_append` on an existing table adds the tiebreak column,
+    // but rows already buffered (or replayed from the WAL) were written under
+    // the OLD schema and don't carry it. Erroring here made those buckets
+    // permanently unflushable: they pinned MemBuffer at the hard limit forever
+    // while newer buckets drained fine (prod 2026-08-02, ~8k failures/2min of
+    // "dedup column `updated_at` missing from batch schema"). Unstamped rows
+    // carry no version information, so last-occurrence-wins is the correct
+    // reading of them, and cross-version resolution belongs to `DedupExec`,
+    // which already ranks a NULL stamp below any stamped version.
+    // Missing dedup KEYS stay fatal — that is a real schema fault, not legacy data.
+    let has_tiebreak = |col: &str| batches.iter().all(|b| b.column_by_name(col).is_some());
+    let tb_rows = match tiebreak.filter(|col| has_tiebreak(col)) {
         Some(col) => {
             let arr = concat_col(col)?;
             let conv = RowConverter::new(vec![SortField::new(arr.data_type().clone())])?;
@@ -3126,6 +3138,34 @@ mod tests {
     /// Defect 3: with a tiebreak column, the row with the greatest tiebreak value
     /// wins per key (an enriched re-emit carries a later `observed_timestamp`),
     /// regardless of input position — and a non-null tiebreak beats a null one.
+    #[test]
+    /// Rows buffered under the PRE-`version_append` schema carry no tiebreak
+    /// column. Failing them made those buckets permanently unflushable — they
+    /// pinned MemBuffer at the hard limit while newer buckets drained fine
+    /// (prod 2026-08-02). Degrade to last-occurrence-wins instead; unstamped
+    /// rows carry no version information, and `DedupExec` ranks a NULL stamp
+    /// below any stamped version on the read side.
+    #[test]
+    fn dedup_batches_tolerates_a_legacy_batch_with_no_tiebreak_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("payload", DataType::Utf8View, false)]));
+        let mk = |ids: Vec<i64>, pl: Vec<&str>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids)), Arc::new(StringViewArray::from(pl))]).unwrap()
+        };
+        let batches = vec![mk(vec![1], vec!["old"]), mk(vec![1], vec!["new"])];
+        let out = dedup_batches(batches, &["id".to_string()], Some("updated_at"), None).expect("a legacy batch must flush, not fail the whole commit");
+        let got: Vec<String> = out
+            .iter()
+            .flat_map(|b| {
+                let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
+                (0..b.num_rows()).map(|i| pl.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(got, vec!["new".to_string()], "with no tiebreak available the last occurrence must win");
+
+        // A missing dedup KEY stays fatal — that is a schema fault, not legacy data.
+        assert!(dedup_batches(vec![mk(vec![1], vec!["x"])], &["nope".to_string()], None, None).is_err(), "a missing dedup key must still fail loudly");
+    }
+
     #[test]
     fn dedup_batches_tiebreak_keeps_greatest() {
         let schema = Arc::new(Schema::new(vec![
