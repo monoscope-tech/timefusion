@@ -39,11 +39,18 @@
 //!   early and its tail degrades to keep-first — never unbounded, never worse
 //!   than the old behaviour.
 //!
-//! Keep-greatest is deliberately NOT attempted without a bound: it would have to
-//! hold one candidate per distinct key for the whole scan, which on a 7-day wide
-//! scan is the exact shape of the 2026-07-21 wide-scan OOM. Unordered input
-//! therefore keeps keep-first (today's semantics), and the dedup sweep stays the
-//! authority for which physical row survives on that path.
+//! Without a bound, keep-greatest still runs but must buffer to end-of-stream
+//! (one candidate per distinct key, plus the batches they reference). That was
+//! previously refused as the 2026-07-21 wide-scan OOM shape, and unordered input
+//! degraded to keep-first instead — but keep-first serves the PRE-UPDATE row,
+//! which merge-on-read cannot tolerate. The planner's other option, forcing an
+//! ordering the Delta leg cannot provide (merge-on-read writes a row's ORIGINAL
+//! timestamp into a NEW file, so files overlap in time), inserted a blocking
+//! SortExec that exhausted the 27.5GB query pool on prod 2026-08-02. Buffering a
+//! hash is strictly cheaper than sorting the same rows, so unbounded
+//! keep-greatest is the better of the two — and the only correct one. The wide
+//! scans that motivated the original refusal are bounded upstream by the
+//! wide-scan admission gate and the hot-leg byte budget.
 //!
 //! Single-partition only, deliberately. A hash-partitioned mode existed and was
 //! deleted: a mode shootout over the real 89-column `otel_logs_and_spans`
@@ -265,9 +272,15 @@ impl DisplayAs for DedupExec {
         // EXPLAIN without this, so the only symptom is unexplained heap growth.
         let in_schema = self.input.schema();
         write!(f, "DedupExec: keys=[{}], mode=", self.keys.join(", "))?;
+        // Which SURVIVOR rule runs matters as much as the seen-set size:
+        // unbounded input with a tiebreak now keeps the GREATEST version
+        // (buffering to end-of-stream); without a tiebreak it is keep-first.
+        // Reading `full-set` alone used to hide that difference, and under
+        // merge-on-read keep-first silently serves the pre-update row.
+        let survivor = if self.tiebreak.as_ref().is_some_and(|tb| in_schema.index_of(tb).is_ok()) { "greatest" } else { "first" };
         match detect_bound(&self.input, &self.keys, &in_schema) {
-            Some(b) => write!(f, "bounded[{}]", in_schema.field(b.idx).name()),
-            None => f.write_str("full-set"),
+            Some(b) => write!(f, "bounded[{}]/{survivor}", in_schema.field(b.idx).name()),
+            None => write!(f, "full-set/{survivor}"),
         }
     }
 }
@@ -315,15 +328,18 @@ impl ExecutionPlan for DedupExec {
         }
         let in_schema = self.input.schema();
         let bound = detect_bound(&self.input, &self.keys, &in_schema);
-        // Keep-greatest needs the bound to know when a key can no longer recur;
-        // without it we'd have to buffer a candidate per key for the whole scan.
-        let greatest = self
-            .tiebreak
-            .as_ref()
-            .filter(|_| bound.is_some())
-            .and_then(|tb| in_schema.index_of(tb).ok())
-            .map(|idx| Greatest::new(idx, in_schema.field(idx).data_type()))
-            .transpose()?;
+        // A bound lets keep-greatest emit per run without buffering the stream,
+        // so it is the preferred shape — but it is no longer REQUIRED. Refusing
+        // to run unbounded is what forced `version_append` scans to manufacture
+        // an ordering they could not get for free (merge-on-read writes a row's
+        // ORIGINAL timestamp into a NEW file, so Delta files overlap in time),
+        // and that blocking SortExec exhausted the query pool on prod
+        // 2026-08-02. Unbounded keep-greatest buffers to end-of-stream instead —
+        // strictly cheaper than the sort it replaces, and it keeps the operator
+        // CORRECT, where the old unbounded fallback (keep-first) would serve the
+        // pre-update row.
+        let greatest =
+            self.tiebreak.as_ref().and_then(|tb| in_schema.index_of(tb).ok()).map(|idx| Greatest::new(idx, in_schema.field(idx).data_type())).transpose()?;
         let dedup = Dedup {
             key_idxs: self.key_idxs.clone(),
             conv: RowConverter::new(self.key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
@@ -427,22 +443,35 @@ impl Dedup {
     fn push(&mut self, batch: &RecordBatch) -> DFResult<Vec<RecordBatch>> {
         let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
         let keys = self.conv.convert_columns(&key_arrays).map_err(arrow_err)?;
-        let (Some(g), Some(bound)) = (self.greatest.as_mut(), self.bound.as_mut()) else {
+        let Some(g) = self.greatest.as_mut() else {
             return Ok(dedup_first(batch, &keys, &mut self.seen, self.output_projection.as_deref(), self.bound.as_mut())?.into_iter().collect());
         };
         let proj = self.output_projection.as_deref();
         let mut out = Vec::new();
-        if g.bytes > RUN_BUFFER_MAX_BYTES {
+        // Only a BOUNDED run may flush early. Without a bound the whole scan is
+        // one open run: any key can still be beaten by a later batch, so emitting
+        // it now would serve the superseded row — exactly the merge-on-read bug
+        // this operator exists to prevent. Unbounded therefore buffers until
+        // end-of-stream, which is no worse than the blocking SortExec that
+        // forcing an ordering used to insert (and is a hash, not a spill).
+        if self.bound.is_some() && g.bytes > RUN_BUFFER_MAX_BYTES {
             out.extend(g.flush(proj, &mut self.seen, true)?);
         }
         let tbs = g.conv.convert_columns(&[batch.column(g.idx).clone()]).map_err(arrow_err)?;
-        let bvals =
-            bound_slice(batch.column(bound.idx)).ok_or_else(|| DataFusionError::Internal(format!("DedupExec bound column {} is not i64-backed", bound.idx)))?;
+        let bvals = match self.bound.as_ref() {
+            Some(bound) => Some(
+                bound_slice(batch.column(bound.idx))
+                    .ok_or_else(|| DataFusionError::Internal(format!("DedupExec bound column {} is not i64-backed", bound.idx)))?,
+            ),
+            None => None,
+        };
         // Index of `batch` within the open run's buffer; `None` until a row of
         // this batch wins something, and reset by every flush (the run changed).
         let mut cur: Option<u32> = None;
-        for (i, &t) in bvals.iter().enumerate().take(batch.num_rows()) {
-            if bound.advance(t) {
+        for i in 0..batch.num_rows() {
+            if let (Some(bound), Some(vals)) = (self.bound.as_mut(), bvals.as_ref())
+                && bound.advance(vals[i])
+            {
                 out.extend(g.flush(proj, &mut self.seen, false)?);
                 self.seen.clear();
                 cur = None;
@@ -653,6 +682,45 @@ mod tests {
         DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
     }
 
+    /// Same, but the source declares NO ordering — the merge-on-read shape, where
+    /// an UPDATE writes the row's original timestamp into a new file so the Delta
+    /// leg's files overlap in time and no ordering can be declared.
+    fn unbounded_greatest_plan(batches: Vec<RecordBatch>) -> DedupExec {
+        let src = source(&[batches], None);
+        DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
+    }
+
+    /// Unsorted input MUST still keep the greatest version. This is the whole
+    /// reason merge-on-read can be enabled without forcing an ordering: the old
+    /// code refused keep-greatest without a bound and degraded to keep-FIRST,
+    /// which serves the PRE-UPDATE row. Forcing the ordering instead inserted a
+    /// blocking SortExec that exhausted the query pool on prod (2026-08-02:
+    /// 1h ~13s, 3h timing out), so neither existing branch was usable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_greatest_without_a_bound_still_picks_the_newest_version() {
+        // `a` is updated in a LATER batch; `b`'s newer version arrives FIRST.
+        // Neither ordering assumption holds, and the ts column is not monotonic.
+        let plan = unbounded_greatest_plan(vec![vbatch(&["a", "b"], &[10, 20], &[Some(1), Some(9)]), vbatch(&["b", "a"], &[20, 10], &[Some(2), Some(7)])]);
+        let mut got = collect_rows(&plan).await;
+        got.sort();
+        assert_eq!(got, vec![("a".into(), 10, Some(7)), ("b".into(), 20, Some(9))], "unbounded keep-greatest must win on the tiebreak, not on arrival order");
+
+        // A NULL stamp (a legacy row written before the version column existed)
+        // must still lose to any stamped version, in either arrival order.
+        let plan = unbounded_greatest_plan(vec![vbatch(&["c"], &[30], &[None]), vbatch(&["c"], &[30], &[Some(4)])]);
+        assert_eq!(collect_rows(&plan).await, vec![("c".into(), 30, Some(4))]);
+    }
+
+    /// EXPLAIN must distinguish the SURVIVOR rule, not just the seen-set size:
+    /// `full-set/first` silently serves the pre-update row under merge-on-read,
+    /// while `full-set/greatest` is correct. They were indistinguishable before.
+    #[test]
+    fn explain_reports_the_survivor_rule() {
+        let plan = unbounded_greatest_plan(vec![vbatch(&["a"], &[1], &[Some(1)])]);
+        let shown = format!("{}", datafusion::physical_plan::displayable(&plan).one_line());
+        assert!(shown.contains("mode=full-set/greatest"), "unsorted + tiebreak must report keep-greatest, got: {shown}");
+    }
+
     async fn collect_rows(plan: &DedupExec) -> Vec<(String, i64, Option<i64>)> {
         let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let mut out = Vec::new();
@@ -719,14 +787,23 @@ mod tests {
         assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1))]);
     }
 
-    /// Unordered input has no run boundary, so keep-greatest is deliberately NOT
-    /// engaged (buffering a candidate per key over a wide scan is the
-    /// 2026-07-21 OOM shape): it degrades to keep-first, never to unbounded.
+    /// Unordered input has no run boundary, so keep-greatest buffers to
+    /// end-of-stream rather than degrading to keep-first. It used to degrade,
+    /// which under merge-on-read served the PRE-UPDATE row; the alternative the
+    /// planner then took — forcing an ordering — inserted a blocking SortExec
+    /// that exhausted the query pool on prod (2026-08-02). Buffering here is
+    /// strictly cheaper than that sort, and unlike keep-first it is correct.
+    ///
+    /// A table WITHOUT a tiebreak still keeps first: nothing ranks its versions.
     #[tokio::test(flavor = "multi_thread")]
-    async fn unordered_input_falls_back_to_keep_first() {
+    async fn unordered_input_keeps_greatest_and_without_a_tiebreak_keeps_first() {
         let src = source(&[vec![vbatch(&["a", "a"], &[1, 1], &[Some(1), Some(9)])]], None);
         let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap();
-        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1))]);
+        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(9))], "the newest version must win even with no ordering");
+
+        let src = source(&[vec![vbatch(&["a", "a"], &[1, 1], &[Some(1), Some(9)])]], None);
+        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], None, None).unwrap();
+        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1))], "no tiebreak ⇒ keep-first, unchanged");
     }
 
     /// `output_projection` still restores the requested columns.
