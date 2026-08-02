@@ -10986,17 +10986,22 @@ impl TableProvider for ProjectRoutingTable {
                 && table_schema.is_some_and(|t| t.version_append)
                 && let Some(req) = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &plans[0].schema()))
             {
-                // EVERY leg is sortable here, the Delta one included. Marking it
-                // unsortable — as the pre-merge-on-read code did — makes
-                // keep-greatest depend on the Delta scan happening to declare its
-                // footer ordering, and ONE file written without that declaration
-                // silently drops the whole scan's ordering, demotes the operator
-                // to keep-first and serves the PRE-UPDATE row. Correctness must
-                // not hinge on file metadata. The cost is bounded: sorting is
-                // skipped for any leg that already satisfies `req` (the normal
-                // case, since the table declares `sorting_columns`), and a
-                // `SortExec` here is per-partition and spillable.
-                let sortable = vec![true; plans.len()];
+                // NO leg may be sorted to satisfy `req`. Ordering is taken only
+                // when a leg already has it — free — because `DedupExec` now runs
+                // keep-greatest WITHOUT a bound, so losing the ordering costs
+                // buffering, not correctness.
+                //
+                // This was `vec![true; ...]`, which was right while the unbounded
+                // fallback was keep-FIRST (it would have served the PRE-UPDATE
+                // row, so correctness could not hinge on file metadata). But
+                // merge-on-read itself guarantees the Delta leg CANNOT satisfy
+                // `req`: an UPDATE appends the row's ORIGINAL timestamp into a
+                // NEW file, so files overlap in time and no ordering can be
+                // declared. "Sorting is skipped for any leg that already
+                // satisfies req" therefore never held for Delta — every scan
+                // sorted, and that blocking SortExec exhausted the 27.5GB query
+                // pool on prod 2026-08-02 (1h ~13s, 3h timing out).
+                let sortable = vec![false; plans.len()];
                 match crate::optimizers::ordered_children(&plans, &req, None, &sortable, false)? {
                     Some(ordered) => {
                         // At least one leg needed sorting. Cheap for the
