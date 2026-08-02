@@ -62,6 +62,7 @@ fn main() -> anyhow::Result<()> {
     match subcommand.as_deref() {
         Some("redrive-dml") => rt.block_on(run_redrive_dml_cli(cfg)),
         Some("optimize") => rt.block_on(run_optimize_cli(cfg)),
+        Some("migrate-columns") => rt.block_on(run_migrate_columns_cli(cfg)),
         _ => rt.block_on(async_main(cfg)),
     }
 }
@@ -485,6 +486,57 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 /// run off-box against prod storage so it doesn't load the live server's memory —
 /// it commits via the same S3/R2 conditional-put (If-None-Match) coordination as the
 /// live server, so concurrent commits conflict-detect safely (OCC retry).
+/// Evolve a live table's STORED Delta schema to include new nullable columns,
+/// WITHOUT changing any YAML.
+///
+/// This exists because a shipped table cannot gain a column by editing the YAML
+/// alone. The YAML is only one of two schemas; the other lives in each Delta
+/// table's transaction log and is whatever was there at creation. Editing the
+/// YAML makes the write path build wider batches while storage still declares
+/// the old shape, which is how 7d68f01 produced `number of columns(94) must
+/// match number of fields(92)`, 268 flush failures and rejected INSERTs within
+/// minutes of deploy. See the doc block at the top of `schema_loader.rs`.
+///
+/// Run this against prod FIRST; only once every live table carries the columns
+/// may the YAML declare them. It writes a ZERO-ROW batch at the widened schema
+/// with `SchemaMode::Merge`, so it adds metadata and no data, and re-running it
+/// is a no-op.
+///
+///   timefusion migrate-columns --table otel_logs_and_spans \
+///       --add updated_at:timestamp --add deleted:boolean [--dry-run]
+async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
+    let mut table = "otel_logs_and_spans".to_string();
+    let mut adds: Vec<(String, String)> = Vec::new();
+    let mut dry_run = false;
+    let mut it = std::env::args().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--table" => table = it.next().context("--table needs a value")?,
+            "--dry-run" => dry_run = true,
+            "--add" => {
+                let spec = it.next().context("--add needs NAME:TYPE")?;
+                let (n, t) = spec.split_once(':').context("--add expects NAME:TYPE (timestamp|boolean)")?;
+                adds.push((n.to_string(), t.to_string()));
+            }
+            other => anyhow::bail!("unknown argument: {other} (usage: timefusion migrate-columns --table T --add NAME:TYPE [--add ...] [--dry-run])"),
+        }
+    }
+    anyhow::ensure!(!adds.is_empty(), "nothing to do: pass at least one --add NAME:TYPE");
+
+    let db = Database::with_config(Arc::new(cfg.clone())).await?;
+    let report = db.migrate_add_columns(&table, &adds, dry_run).await?;
+    println!("table='{}' stored_columns={} requested={} missing={}", table, report.stored_before, adds.len(), report.added.len());
+    for n in &report.added {
+        println!("  + {n}");
+    }
+    match (report.added.is_empty(), dry_run) {
+        (true, _) => println!("nothing to migrate — every requested column is already in the stored schema"),
+        (_, true) => println!("--dry-run: no commit written"),
+        _ => println!("migrated: stored schema now has {} columns", report.stored_after),
+    }
+    Ok(())
+}
+
 async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
 

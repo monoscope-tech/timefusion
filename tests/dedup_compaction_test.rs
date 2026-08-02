@@ -1169,3 +1169,58 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
     assert_eq!(ctx.sql(&sql).await?.collect().await?.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     Ok(())
 }
+
+/// The migration that must run BEFORE a shipped table's YAML may declare new
+/// columns.
+///
+/// `otel_logs_and_spans` and `otel_metrics` cannot turn on `version_append`
+/// without two new columns: a TF-owned tiebreak (the stamp OVERWRITES whatever
+/// the client sent, so it must not reuse a client field like
+/// `observed_timestamp`) and a nullable Boolean tombstone. Widening the YAML
+/// alone is what broke prod in 7d68f01. `migrate_add_columns` widens STORAGE
+/// first, so the YAML change that follows is a no-op for the stored schema.
+///
+/// The fixture creates the table at the OLD column set — the state every live
+/// prod table is in — because a table built from the current YAML already has
+/// the columns and would prove nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Result<()> {
+    use deltalake::operations::create::CreateBuilder;
+
+    const TABLE: &str = "mor_versioned";
+    let cfg = TestConfigBuilder::new("migrate_cols").with_buffer_mode(BufferMode::Enabled).build();
+    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; `#[serial]`.
+    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+
+    let schema = timefusion::schema_loader::get_schema(TABLE).expect("fixture registered");
+    let added = ["updated_at", "deleted"];
+    let old_columns: Vec<_> = schema.columns()?.into_iter().filter(|c| !added.contains(&c.name().as_str())).collect();
+    let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
+    CreateBuilder::new()
+        .with_location(&storage_uri)
+        .with_columns(old_columns)
+        .with_partition_columns(schema.partitions.clone())
+        .with_storage_options(storage_options)
+        .await?;
+
+    let db = Database::with_config(Arc::clone(&cfg)).await?;
+    let adds = vec![("updated_at".to_string(), "timestamp".to_string()), ("deleted".to_string(), "boolean".to_string())];
+
+    // Dry run must report the work without committing any of it.
+    let dry = db.migrate_add_columns(TABLE, &adds, true).await?;
+    assert_eq!(dry.added.len(), 2, "dry run must report both missing columns");
+    assert_eq!(dry.stored_after, dry.stored_before, "dry run must not change the stored schema");
+
+    let first = db.migrate_add_columns(TABLE, &adds, false).await?;
+    assert_eq!(first.added.len(), 2, "both columns must be added to the STORED schema, got {:?}", first.added);
+    assert_eq!(first.stored_after, first.stored_before + 2, "stored column count must grow by exactly the two added");
+
+    // Idempotent: re-running after a crash or a partial rollout must be a no-op,
+    // not a second commit that re-adds the columns.
+    let second = db.migrate_add_columns(TABLE, &adds, false).await?;
+    assert!(second.added.is_empty(), "re-running the migration must add nothing, got {:?}", second.added);
+    assert_eq!(second.stored_before, first.stored_after, "the second run must observe the widened schema");
+
+    Ok(())
+}

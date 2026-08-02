@@ -10219,6 +10219,81 @@ impl ProjectRoutingTable {
     }
 }
 
+/// What [`Database::migrate_add_columns`] did.
+pub struct ColumnMigrationReport {
+    pub stored_before: usize,
+    pub stored_after: usize,
+    /// Columns actually added; empty when the stored schema already had them.
+    pub added: Vec<String>,
+}
+
+impl Database {
+    /// Evolve a live table's STORED Delta schema to include new nullable
+    /// columns, without touching any YAML.
+    ///
+    /// A shipped table cannot gain a column by editing its YAML: the YAML is one
+    /// schema, and each Delta table's transaction log holds another that was
+    /// fixed at creation time. Widening only the YAML makes the write path build
+    /// wider batches than storage declares — prod 7d68f01: `number of
+    /// columns(94) must match number of fields(92)`, 268 flush failures and
+    /// rejected INSERTs within minutes. So storage must be widened FIRST, by
+    /// this, and only then may the YAML declare the columns.
+    ///
+    /// Mechanism: commit a ZERO-ROW batch carrying only the new columns under
+    /// `SchemaMode::Merge`. That unions them into the stored schema while
+    /// writing no data and rewriting no existing row. Columns already present
+    /// are skipped, so a half-finished run is simply re-run.
+    pub async fn migrate_add_columns(&self, table_name: &str, adds: &[(String, String)], dry_run: bool) -> Result<ColumnMigrationReport> {
+        use arrow::array::{ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, TimeUnit};
+
+        let table_ref = self.get_or_create_unified_table(table_name).await?;
+        let stored: Vec<String> = {
+            let t = table_ref.read().await;
+            t.snapshot()?.schema().fields().map(|f| f.name().to_string()).collect()
+        };
+        let missing: Vec<&(String, String)> = adds.iter().filter(|(n, _)| !stored.contains(n)).collect();
+        let report = |after: usize, added: Vec<String>| ColumnMigrationReport { stored_before: stored.len(), stored_after: after, added };
+        if missing.is_empty() || dry_run {
+            return Ok(report(stored.len(), missing.iter().map(|(n, _)| n.clone()).collect()));
+        }
+
+        let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = missing
+            .iter()
+            .map(|(n, t)| match t.as_str() {
+                "timestamp" => Ok((
+                    Field::new(n, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+                    Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()).with_timezone("UTC")) as ArrayRef,
+                )),
+                "boolean" => Ok((Field::new(n, DataType::Boolean, true), Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef)),
+                other => anyhow::bail!("unsupported column type '{other}' (expected timestamp|boolean)"),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)?;
+
+        let t = { table_ref.read().await.clone() };
+        t.write(vec![batch])
+            .with_save_mode(deltalake::protocol::SaveMode::Append)
+            .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
+            .await
+            .map_err(|e| anyhow::anyhow!("schema-merge commit failed: {e}"))?;
+
+        // Re-read from the log rather than trusting the write: the whole point
+        // is that storage, not our intent, carries the columns.
+        let after: Vec<String> = {
+            let mut g = table_ref.write().await;
+            g.load().await?;
+            g.snapshot()?.schema().fields().map(|f| f.name().to_string()).collect()
+        };
+        let added: Vec<String> = missing.iter().map(|(n, _)| n.clone()).collect();
+        let still: Vec<&String> = added.iter().filter(|n| !after.contains(n)).collect();
+        anyhow::ensure!(still.is_empty(), "migration committed but columns are still absent from the stored schema: {still:?}");
+        Ok(report(after.len(), added))
+    }
+}
+
 /// Files and bytes a scan will actually open, read off the plan's file groups
 /// AFTER pruning. `None` when the plan carries no file scan (so the caller must
 /// not read "no files" as "no work").
