@@ -62,6 +62,14 @@ fn main() -> anyhow::Result<()> {
         return secret_crypto::run_cli();
     }
 
+    // Maintenance CLIs get the maintenance-heavy budget shape (the server
+    // shape strands a small cgroup's memory in query/ingest slices a one-shot
+    // CLI never uses). Must precede init_config, which snapshots the tree.
+    // SAFETY: no threads exist yet - we're before the Tokio runtime is built.
+    if matches!(subcommand.as_deref(), Some("optimize" | "redrive-dml" | "migrate-columns")) {
+        unsafe { std::env::set_var("TIMEFUSION_BUDGET_PROFILE", "maintenance-cli") };
+    }
+
     // Initialize global config from environment - validates all settings upfront
     let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
 

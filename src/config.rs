@@ -158,6 +158,29 @@ pub struct DerivedBudget {
     foyer_memory_bytes: usize,
     writer_reserve_bytes: usize,
     maintenance_pool_bytes: usize,
+    profile: BudgetProfile,
+}
+
+/// Which reservation shape the budget tree derives. A one-shot maintenance
+/// CLI (`optimize` / `redrive-dml` / `migrate-columns`) serves no pgwire
+/// queries and starts no ingest, yet under the server shape it still pays
+/// those reservations — inside a 7 GiB k8s pod the maintenance pool lands on
+/// its 1 GiB floor and whale-bin sorts die admitting their first batch
+/// (2026-08-02). The CLI shape hands maintenance nearly the whole cgroup.
+/// Selected via `TIMEFUSION_BUDGET_PROFILE=maintenance-cli`, set by `main`
+/// for CLI subcommands before config init — never by operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetProfile {
+    #[default]
+    Server,
+    MaintenanceCli,
+}
+
+fn profile_from_env() -> BudgetProfile {
+    match std::env::var("TIMEFUSION_BUDGET_PROFILE").as_deref() {
+        Ok("maintenance-cli") => BudgetProfile::MaintenanceCli,
+        _ => BudgetProfile::Server,
+    }
 }
 
 const QUERY_POOL_FRACTION: f64 = 0.25;
@@ -218,6 +241,23 @@ impl DerivedBudget {
     /// unit tests drive directly (simulated boxes) without touching the
     /// filesystem.
     fn from_limits(memory_limit_bytes: usize, cores: usize) -> Self {
+        Self::from_limits_with_profile(memory_limit_bytes, cores, BudgetProfile::Server)
+    }
+
+    fn from_limits_with_profile(memory_limit_bytes: usize, cores: usize, profile: BudgetProfile) -> Self {
+        if profile == BudgetProfile::MaintenanceCli {
+            // No queries, no ingest: token slices for the scan-side query pool
+            // and foyer, the same writer-reserve cap (delta-rs output buffers
+            // are real in a CLI), everything else to maintenance. An 8 GiB pod
+            // derives ~6 GiB of sort/spill memory instead of the 1 GiB floor.
+            let query_pool_bytes = (memory_limit_bytes as f64 * 0.08) as usize;
+            let ingest_buffer_bytes = (memory_limit_bytes as f64 * 0.02) as usize;
+            let foyer_memory_bytes = (memory_limit_bytes as f64 * 0.02) as usize;
+            let writer_reserve_bytes = (HEAVY_REWRITE_PERMITS * OPTIMIZE_MERGE_TASKS * WRITER_RESERVE_PER_TASK_BYTES).min(memory_limit_bytes / 10);
+            let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes;
+            let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
+            return Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes, profile };
+        }
         // Fixed fraction, not the old TIMEFUSION_MEMORY_FRACTION knob: prod set
         // 0.75 calibrated against the hand-set 26 GB limit; applied to the real
         // 120 GiB cgroup it would take 90 GiB and crush maintenance to the
@@ -231,14 +271,14 @@ impl DerivedBudget {
         let writer_reserve_bytes = (HEAVY_REWRITE_PERMITS * OPTIMIZE_MERGE_TASKS * WRITER_RESERVE_PER_TASK_BYTES).min(memory_limit_bytes / 10);
         let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes;
         let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
-        Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes }
+        Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes, profile }
     }
 
     /// Detect the real container limits and derive the tree. The only env input
     /// is `TIMEFUSION_MEMORY_BUDGET_GB`, which can lower (never raise) the one
     /// number the whole tree derives from — see `env_memory_budget_bytes`.
     pub fn compute() -> Self {
-        Self::from_limits(effective_limit(detect_memory_limit_clamped(), env_memory_budget_bytes()), detect_cores())
+        Self::from_limits_with_profile(effective_limit(detect_memory_limit_clamped(), env_memory_budget_bytes()), detect_cores(), profile_from_env())
     }
 
     pub fn query_pool_bytes(&self) -> usize {
@@ -270,12 +310,21 @@ impl DerivedBudget {
     /// Heavy maintenance (dedup/optimize/recompress) share — at least
     /// `HEAVY_MIN_SHARE` of the maintenance pool.
     pub fn heavy_share_bytes(&self) -> usize {
-        ((self.maintenance_pool_bytes as f64) * HEAVY_MIN_SHARE) as usize
+        // MaintenanceCli: engines run one command at a time and each engine's
+        // pool is a separate FairSpillPool, so both shares may claim ~the whole
+        // pool — only the active engine ever allocates.
+        match self.profile {
+            BudgetProfile::MaintenanceCli => ((self.maintenance_pool_bytes as f64) * 0.85) as usize,
+            BudgetProfile::Server => ((self.maintenance_pool_bytes as f64) * HEAVY_MIN_SHARE) as usize,
+        }
     }
 
     /// Light hot-tail compaction share — the remainder.
     pub fn light_share_bytes(&self) -> usize {
-        self.maintenance_pool_bytes - self.heavy_share_bytes()
+        match self.profile {
+            BudgetProfile::MaintenanceCli => self.heavy_share_bytes(),
+            BudgetProfile::Server => self.maintenance_pool_bytes - self.heavy_share_bytes(),
+        }
     }
 
     /// Concurrent heavy maintenance rewrites. Formerly
@@ -291,6 +340,18 @@ impl DerivedBudget {
     /// PINNED CONSTANT (not box-derived) — see `rewrite_permits`.
     pub fn optimize_merge_tasks(&self) -> usize {
         OPTIMIZE_MERGE_TASKS
+    }
+
+    /// Scan batch size for maintenance sessions. Merge/sort memory has batch
+    /// granularity (a batch is indivisible — it must be admitted to the pool
+    /// before it can ever spill), and 2048-row otel batches reach ~35-150 MB.
+    /// Under the CLI profile's small cgroups the unit drops to 256 rows
+    /// (~4-20 MB) so tiny pools can admit, buffer, and spill.
+    pub fn maintenance_batch_size(&self) -> &'static str {
+        match self.profile {
+            BudgetProfile::MaintenanceCli => "256",
+            BudgetProfile::Server => "2048",
+        }
     }
 
     /// Files-per-bin cap for every optimize rewrite (see const doc).
@@ -374,6 +435,7 @@ impl DerivedBudget {
 /// prod's current 11 as the illustrative K.
 pub fn log_derived_budget(b: &DerivedBudget) {
     tracing::info!(
+        profile = ?b.profile,
         detected_limit_gb = detect_memory_limit_clamped() / GIB,
         effective_limit_gb = b.memory_limit_bytes / GIB,
         cores = b.cores,
@@ -1999,6 +2061,32 @@ mod tests {
     /// container on a 188 GB host shared with ~62 GB of other services means TF's
     /// entitlement alone oversubscribes the HOST. Pinning the arithmetic so the
     /// "sums to the whole limit" property can't be changed unnoticed.
+    #[test]
+    fn cli_profile_hands_maintenance_the_cgroup() {
+        // The whole point of the profile: an 8 GiB pod must derive multi-GiB
+        // sort memory instead of the 1 GiB floor the server shape leaves it.
+        let cli = DerivedBudget::from_limits_with_profile(8 * GIB, 4, BudgetProfile::MaintenanceCli);
+        assert!(
+            cli.maintenance_pool_bytes >= 6 * GIB,
+            "8 GiB pod must yield >= 6 GiB maintenance pool, got {} GiB",
+            cli.maintenance_pool_bytes / GIB
+        );
+        // Engines run one at a time in a CLI: each share claims ~the whole pool.
+        assert!(cli.heavy_share_bytes() >= (cli.maintenance_pool_bytes as f64 * 0.8) as usize);
+        assert_eq!(cli.heavy_share_bytes(), cli.light_share_bytes());
+        assert_eq!(cli.maintenance_batch_size(), "256");
+        // The server shape is untouched by the profile's existence.
+        let server = DerivedBudget::from_limits(8 * GIB, 4);
+        assert!(
+            cli.heavy_share_bytes() >= 4 * server.heavy_share_bytes(),
+            "the profile's whole purpose: heavy sort memory multiplies ({} GiB -> {} GiB)",
+            server.heavy_share_bytes() / GIB,
+            cli.heavy_share_bytes() / GIB
+        );
+        assert_eq!(server.maintenance_batch_size(), "2048");
+        assert_eq!(server.light_share_bytes(), server.maintenance_pool_bytes - server.heavy_share_bytes());
+    }
+
     #[test]
     fn budget_tree_allocates_the_entire_limit() {
         let b = DerivedBudget::from_limits(120 * GIB, 48);

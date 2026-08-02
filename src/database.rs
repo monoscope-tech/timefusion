@@ -620,8 +620,12 @@ fn build_optimize_session_state(
     // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
     // wide — 8192-row decode batches measured up to 145MB (2026-07-27). Quartering
     // the batch bounds a 32-file bin merge near ~1GB. Bare `SessionConfig::new()`
-    // otherwise keeps DataFusion's larger default.
-    let cfg = maintenance_session_config(SessionConfig::new(), "2048", target_partitions);
+    // otherwise keeps DataFusion's larger default. Under the maintenance-CLI
+    // budget profile the batch drops to 256 rows — a batch is the sort's
+    // indivisible admission unit, and small-cgroup pools must be able to admit
+    // one before spilling can engage.
+    let batch_size = crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size());
+    let cfg = maintenance_session_config(SessionConfig::new(), batch_size, target_partitions);
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
     // OOM-killing the process, but are isolated from query pressure and can spill.
