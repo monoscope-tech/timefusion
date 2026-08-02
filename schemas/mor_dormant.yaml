@@ -56,3 +56,17 @@ fields:
   - name: duration
     data_type: Int64
     nullable: true
+  # The hash-enrichment shape. `coalesce_merges` folding is DML-coalescer
+  # machinery that only non-merge-on-read tables reach, so its test needs a
+  # subject here too. `bloom_filter` mirrors otel so the prune path is real.
+  - name: hashes
+    data_type: "List(Utf8)"
+    nullable: true
+  - name: context___span_id
+    data_type: Utf8
+    nullable: true
+    bloom_filter: true
+  - name: context___trace_id
+    data_type: Utf8
+    nullable: true
+    bloom_filter: true
