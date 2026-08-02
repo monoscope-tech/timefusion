@@ -47,6 +47,11 @@ fn fill_pct(used: usize, max_bytes: usize) -> u32 {
 /// Hard limit = `max_bytes + max_bytes / N` = 120% of budget (`5` → +20%),
 /// leaving headroom for in-flight writes without unbounded growth.
 const HARD_LIMIT_HEADROOM_DIVISOR: usize = 5;
+/// How many bucket-id time slices one steady-state flush cycle commits before
+/// releasing `flush_lock` and freeing their memory. Bounds the unit of work so a
+/// deep backlog is drained by many small commits that each finish, rather than
+/// one huge commit that never does — see `flush_completed_buckets`.
+const FLUSH_CHUNK_BUCKET_IDS: usize = 2;
 /// The reservation ceiling live writers are rejected at.
 fn hard_limit(max_bytes: usize) -> usize {
     max_bytes.saturating_add(max_bytes / HARD_LIMIT_HEADROOM_DIVISOR)
@@ -1888,9 +1893,40 @@ impl BufferedWriteLayer {
     }
 
     #[instrument(skip(self))]
+    /// Oldest-first, in BOUNDED chunks.
+    ///
+    /// This used to commit every sealed bucket in a single cycle, which made the
+    /// unit of work scale with buffer occupancy while the watchdog stayed fixed:
+    /// the fuller the buffer, the larger the commit, the less likely it ever
+    /// finished — and when it was aborted nothing was freed, so the next cycle
+    /// retried the same too-big commit. That positive feedback IS the recurring
+    /// wedge, and it is why no fixed timeout ever worked (120s and 600s were
+    /// both attempts to bound an unbounded workload with a deadline). Prod on
+    /// 2026-08-02: 23GB pinned across 286 buckets, flush_completed=0 vs
+    /// flush_failed=927, every insert rejected.
+    ///
+    /// Chunking commits and frees incrementally, so each unit stays small enough
+    /// to finish and pressure falls monotonically instead of never at all. Same
+    /// oldest-first shape `drain_replay_backlog` already uses on the boot path.
     async fn flush_completed_buckets(&self) -> anyhow::Result<()> {
         let current_bucket = MemBuffer::current_bucket_id();
-        self.flush_buckets_where(move |id| id < current_bucket).await.map(|_| ())
+        // Snapshot the slice list ONCE and walk it in ranges, so every sealed
+        // bucket is attempted exactly once per cycle. Re-deriving the remaining
+        // set each pass instead would immediately re-flush a bucket that was
+        // dirty-kept because a DML mutated it mid-commit, and that second pass
+        // drains the post-delete state the dirty finish exists to preserve —
+        // silent data loss, caught by
+        // `delete_during_airborne_commit_sticks_across_crash`. Dirty-kept
+        // buckets are retried on the NEXT tick, exactly as before.
+        // BTreeSet = sorted + deduped in one pass.
+        let ids: std::collections::BTreeSet<i64> = self.mem_buffer.bucket_keys(|id| id < current_bucket).into_iter().map(|(_, _, id)| id).collect();
+        let mut lo = i64::MIN;
+        for chunk in ids.iter().copied().collect::<Vec<_>>().chunks(FLUSH_CHUNK_BUCKET_IDS) {
+            let hi = chunk[chunk.len() - 1];
+            self.flush_buckets_where(move |id| id > lo && id <= hi).await?;
+            lo = hi;
+        }
+        Ok(())
     }
 
     /// Snapshot-flush every bucket whose id matches `pred`, coalesced into one
@@ -3208,6 +3244,57 @@ mod tests {
     fn create_test_batch(project_id: &str) -> RecordBatch {
         // Use test_span helper which creates data matching the default schema
         json_to_batch(vec![test_span("test1", "span1", project_id), test_span("test2", "span2", project_id), test_span("test3", "span3", project_id)]).unwrap()
+    }
+
+    /// A deep backlog must drain as MANY bounded commits, not one unbounded one.
+    /// Committing every sealed bucket in a single cycle ties the unit of work to
+    /// buffer occupancy while the watchdog stays fixed, so the fuller the buffer
+    /// the less likely the flush ever finishes — and an aborted flush frees
+    /// nothing, so the next cycle retries the same too-big commit. That loop
+    /// wedged prod on 2026-08-02 (flush_completed=0, flush_failed=927, 23GB
+    /// pinned, inserts rejected).
+    #[serial]
+    #[tokio::test]
+    async fn a_deep_backlog_flushes_in_bounded_chunks() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("p{test_id}"), format!("t{test_id}"));
+
+        let commits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (c, r) = (commits.clone(), rows.clone());
+        let mut layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _w| {
+            let (c, r) = (c.clone(), r.clone());
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::Relaxed);
+                r.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
+                Ok(vec!["s3://test/part.parquet".to_string()])
+            })
+        }));
+
+        // Six sealed bucket-id slices for ONE (project, table): pre-chunking this
+        // coalesced into a single commit regardless of backlog depth.
+        const SLICES: i64 = 6;
+        let bucket = crate::mem_buffer::bucket_duration_micros();
+        let now = crate::clock::now_micros();
+        for slice in 1..=SLICES {
+            layer.mem_buffer.insert(&project, &table, create_test_batch(&project), now - slice * bucket).unwrap();
+        }
+
+        layer.flush_completed_buckets().await.unwrap();
+
+        let commits = commits.load(Ordering::Relaxed);
+        assert_eq!(rows.load(Ordering::Relaxed), (SLICES * 3) as u64, "every buffered row must still reach Delta");
+        assert!(commits > 1, "a {SLICES}-slice backlog must not be committed as one unbounded unit, got {commits} commit(s)");
+        assert!(
+            commits >= SLICES as u64 / FLUSH_CHUNK_BUCKET_IDS as u64,
+            "each commit must cover at most {FLUSH_CHUNK_BUCKET_IDS} bucket-id slice(s), got {commits} commit(s) for {SLICES}"
+        );
     }
 
     #[serial]
