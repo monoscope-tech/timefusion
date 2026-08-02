@@ -4213,8 +4213,9 @@ impl Database {
 
         // Held for the whole sort so this group owns the pool outright (see field
         // doc). Acquire before building the plan — the SessionContext reserves against
-        // the pool as it runs, not at construction. A closed semaphore only happens at
-        // shutdown, where falling back to unsorted beats blocking a draining flush.
+        // the pool as it runs, not at construction. Nothing closes this semaphore
+        // today; if some future shutdown path does, `.ok()?` degrades to writing
+        // unsorted, which beats blocking a draining flush.
         let _permit = self.flush_sort_sem.acquire().await.ok()?;
 
         let state = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.flush_sort_runtime_env());
