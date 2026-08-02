@@ -521,19 +521,40 @@ impl SharedFoyerCache {
     /// a redeploy. The disk cache is a rebuildable READ cache, so abandoning an
     /// in-progress flush loses only warmth, never durable data — prioritize
     /// releasing the WAL lock over cache completeness.
+    /// How long Foyer's close may take before it is abandoned. Small on purpose:
+    /// see the note in `shutdown_by`.
+    const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
     pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
 
+        // Foyer close gets a SMALL slice of the grace, not all of it.
+        //
+        // An unclean kill leaves the disk cache in a state where `close()` never
+        // completes. Bounded only by `deadline`, the next shutdown then spends
+        // the ENTIRE stop grace here (measured 2026-08-02: 70.003s against a 70s
+        // grace) and leaves nothing for the WAL cursor snapshot — so the process
+        // is SIGKILLed, `clean_shutdown=false`, and the next boot pays a full
+        // blocking WAL replay, which can overrun and kill uncleanly again. One
+        // dirty kill otherwise makes every later restart slow and dirty.
+        //
+        // Everything at stake here is rebuildable cache warmth, so it is the
+        // cheapest thing in shutdown to abandon. See issue #82, where the same
+        // close overran "for minutes" in prod and stalled the wal.lock release.
+        let close_deadline = deadline.min(tokio::time::Instant::now() + Self::CLOSE_BUDGET);
         info!("Closing Foyer caches...");
-        match tokio::time::timeout_at(deadline, async {
+        match tokio::time::timeout_at(close_deadline, async {
             self.cache.close().await?;
             self.metadata_cache.close().await
         })
         .await
         {
             Ok(res) => res?,
-            Err(_) => warn!("Foyer close exceeded shutdown deadline — abandoning disk-cache flush to release the WAL lock (cache warmth lost, no data loss)"),
+            Err(_) => warn!(
+                "Foyer close exceeded its {:?} budget — abandoning disk-cache flush so the rest of shutdown keeps its share of the grace (cache warmth lost, no data loss)",
+                Self::CLOSE_BUDGET
+            ),
         }
         Ok(())
     }
