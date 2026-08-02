@@ -1349,6 +1349,36 @@ fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake:
     }
 }
 
+/// Collect matched Adds keeping at most ONE per path, so a rewrite's target set
+/// is always countable against the distinct files it was derived from.
+///
+/// A path can appear twice in an in-memory snapshot even though the Delta log is
+/// clean: the incremental advance concatenated a carried-forward file list with
+/// a kernel "delta" that was silently a FULL file set whenever the refresh
+/// crossed a newly written checkpoint (fixed in the fork, but a snapshot is
+/// shared mutable state and this is the only place the damage is observable).
+/// Both rewrite planners compare `targets.len()` against the number of distinct
+/// files they mean to rewrite, so a duplicate turned every plan into a
+/// permanent, silent mismatch — "mapped 2/1 files", 3 wasted re-plans, and dedup
+/// plus hot-tail compaction stalled indefinitely (prod 2026-08-02).
+fn dedup_adds_by_path(adds: impl Iterator<Item = deltalake::kernel::Add>, table_name: &str) -> Vec<deltalake::kernel::Add> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<deltalake::kernel::Add> = Vec::new();
+    let mut dropped = 0usize;
+    for add in adds {
+        if seen.insert(add.path.clone()) {
+            out.push(add);
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        warn!(table_name, dropped, event = "snapshot_duplicate_adds", "snapshot listed the same file more than once — reads over it double-count rows");
+        crate::metrics::maintenance_stats().snapshot_duplicate_adds.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 /// Drop `name` from `batch` (no-op when absent) — strips the synthetic
 /// [`DEDUP_FILE_COL`] before deduped rows are written back.
 fn drop_batch_column(mut batch: RecordBatch, name: &str) -> RecordBatch {
@@ -1643,6 +1673,16 @@ pub struct Database {
     /// allocates outside every pool, and authorising GBs of that on a 26 GB box
     /// is what took prod down on 2026-08-01.
     flush_sort_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Caps how many spilling flush sorts share `flush_sort_runtime_env` at
+    /// once. The pool is a `FairSpillPool`, so N concurrent sorts each get
+    /// ~pool/N; below a viable slice `ExternalSorterMerge` cannot merge its
+    /// spill files and the sort fails with "Not enough memory to continue
+    /// external sort" (prod, 2026-08-02). The caller then writes the group
+    /// UNSORTED, and a single file with no `sorting_columns` footer disables
+    /// the reader's all-or-nothing ordering for every scan touching that
+    /// partition — so pool starvation shows up as slow queries, not as an
+    /// error. Serialising a few oversized sorts is much cheaper than that.
+    flush_sort_gate: Arc<tokio::sync::Semaphore>,
     /// Memoized `build_optimize_session_state` results, one per runtime env.
     /// Building a `SessionState` re-registers every analyzer/optimizer rule and
     /// the whole UDF/UDAF set; the maintenance loop did that on EVERY optimize
@@ -2214,6 +2254,10 @@ impl Database {
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1);
+        // Each concurrent spilling sort needs a workable slice of the shared
+        // FairSpillPool or its merge phase starves — see `flush_sort_gate`.
+        const MIN_SPILL_SORT_BYTES: usize = 512 << 20;
+        let flush_sort_permits = (cfg.maintenance.flush_sort_pool_bytes() / MIN_SPILL_SORT_BYTES).max(1);
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         let db = Self {
@@ -2221,6 +2265,7 @@ impl Database {
             runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            flush_sort_gate: Arc::new(tokio::sync::Semaphore::new(flush_sort_permits)),
             flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
             light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
@@ -2476,7 +2521,7 @@ impl Database {
                     let (svc, store, pid, table) = (svc.clone(), delta_store.clone(), pid.clone(), table_owned.clone());
                     async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
                 }))
-                .buffer_unordered(2);
+                .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
                 while let Some(r) = jobs.next().await {
                     match r {
                         Ok(()) => built += 1,
@@ -2609,7 +2654,7 @@ impl Database {
         });
 
         // Consolidate — daily cold sweep bin-packing sealed partitions (older than
-        // cold_optimize_after_days) to the 1GB cold target, beyond the 48h warm window.
+        // cold_optimize_after_days) to the 512MB cold target, beyond the 48h warm window.
         spawn_cron_job("Consolidate", &self.config.maintenance.timefusion_consolidate_schedule, cancel.clone(), {
             let db = db.clone();
             move || {
@@ -4167,6 +4212,10 @@ impl Database {
     /// a sort failure.
     async fn sort_flush_group_spilling(&self, schema: &crate::schema_loader::TableSchema, batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
         use datafusion::{datasource::MemTable, prelude::SessionContext};
+        // Hold a slice of the shared spill pool for the whole sort. Queueing
+        // here costs latency on an already-oversized group; losing the slice
+        // costs the partition's footer ordering on every later scan.
+        let _slice = self.flush_sort_gate.acquire().await.ok()?;
         let first = batches.first()?.schema();
         // Schema-diverse buckets (an evolved nullable column) must be unified
         // before MemTable will accept them; give up rather than guess.
@@ -5283,9 +5332,9 @@ impl Database {
         let today = now.date_naive();
         let num_days = (window_hours / 24).max(1);
         // Cold consolidation (daily) owns sealed partitions older than
-        // `cold_optimize_after_days` and bin-packs them to the 1GB target.
+        // `cold_optimize_after_days` and bin-packs them to the 512MB target.
         // Exclude them from the 30-min warm Z-order so it can't fragment those
-        // 1GB files back to the warm target every cycle (oscillation = wasted
+        // cold files back to the warm target every cycle (oscillation = wasted
         // S3 I/O). With after_days=1 this leaves warm processing only today —
         // the partition still taking writes.
         let after_days = self.config.parquet.cold_optimize_after_days();
@@ -5493,7 +5542,7 @@ impl Database {
                         let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
                         async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
                     }))
-                    .buffer_unordered(2);
+                    .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
                     while let Some(r) = jobs.next().await {
                         match r {
                             Ok(()) => built += 1,
@@ -5691,10 +5740,10 @@ impl Database {
     }
 
     /// Partition-ownership boundary between the warm (30-min Z-order) and cold
-    /// (daily 1GB consolidate) tiers: a `date` is cold-owned once it's at least
+    /// (daily 512MB consolidate) tiers: a `date` is cold-owned once it's at least
     /// `after_days` older than `today`. The warm optimize processes the
     /// complement, so the two tiers never rewrite the same partition (no
-    /// 256MB↔1GB oscillation). Single source of truth for both schedulers.
+    /// 256MB↔512MB oscillation). Single source of truth for both schedulers.
     fn date_is_cold(today: chrono::NaiveDate, date: chrono::NaiveDate, after_days: u64) -> bool {
         (today - date).num_days() >= after_days as i64
     }
@@ -5702,7 +5751,7 @@ impl Database {
     /// Compacted-file target by partition age (calendar-based): sealed days
     /// consolidate to the larger cold target (fewer files → smaller checkpoint
     /// → faster commits); the current day stays at the warm target so a
-    /// still-filling partition isn't rewritten to 1GB repeatedly.
+    /// still-filling partition isn't rewritten to the cold target repeatedly.
     fn optimize_target_for_date(&self, date: chrono::NaiveDate) -> i64 {
         if Self::date_is_cold(Utc::now().date_naive(), date, self.config.parquet.cold_optimize_after_days()) {
             self.config.parquet.timefusion_cold_optimize_target_size
@@ -5734,8 +5783,8 @@ impl Database {
     }
 
     /// `compact_date` with an explicit merge concurrency. The cold consolidation
-    /// sweep passes 1: a 1GB-target merge holds ~target-sized output buffers per
-    /// task, so concurrency × 1GB can OOM the memory-tight in-process instance
+    /// sweep passes 1: a 512MB-target merge holds ~target-sized output buffers per
+    /// task, so concurrency × 512MB can OOM the memory-tight in-process instance
     /// (the off-box recipe uses concurrency 1 for the same reason). The on-demand
     /// pgwire/CLI callers keep the configured concurrency.
     async fn compact_date_with(
@@ -6076,7 +6125,7 @@ impl Database {
     }
 
     /// Daily cold consolidation: bin-pack every sealed partition (date older
-    /// than `cold_optimize_after_days`) toward the 1GB cold target. Calendar-age
+    /// than `cold_optimize_after_days`) toward the 512MB cold target. Calendar-age
     /// driven and idempotent — converged runs are excluded from re-selection,
     /// so already-consolidated partitions cost a snapshot scan, not a rewrite
     /// (bounds S3 I/O across the whole cold backlog). Covers "previous days and
@@ -6157,7 +6206,7 @@ impl Database {
     /// prod 2026-07-21). Converges: outputs ≥ 7/8·target (and lone tail runs)
     /// are excluded from re-selection by `light_optimize_tail`.
     /// `target_size`/`only_project` are caller-supplied so the off-box CLI can
-    /// consolidate a still-hot date to the cold (1GB) target for one tenant
+    /// consolidate a still-hot date to the cold (512MB) target for one tenant
     /// without waiting for the partition to seal.
     pub async fn consolidate_date_binned(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>, max_passes: usize,
@@ -6518,20 +6567,22 @@ impl Database {
             // 2. Map scan values to Add actions in the SAME snapshot
             // (suffix-match either direction: the scan column carries the
             // store path, the log a table-relative one).
-            let targets: Vec<deltalake::kernel::Add> = chunk_snapshot
-                .log_data()
-                .iter()
-                .filter(|f| {
-                    let p = f.path();
-                    file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
-                })
-                // Deprecated in favour of arrow-direct access, but the
-                // Remove tombstones below need the Add's exact fields.
-                .map(|f| {
-                    #[allow(deprecated)]
-                    f.add_action()
-                })
-                .collect();
+            let targets = dedup_adds_by_path(
+                chunk_snapshot
+                    .log_data()
+                    .iter()
+                    .filter(|f| {
+                        let p = f.path();
+                        file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
+                    })
+                    // Deprecated in favour of arrow-direct access, but the
+                    // Remove tombstones below need the Add's exact fields.
+                    .map(|f| {
+                        #[allow(deprecated)]
+                        f.add_action()
+                    }),
+                table_name,
+            );
             if targets.len() != file_ids.len() {
                 warn!(
                     "dedup rewrite: mapped {}/{} files for table={} chunk=[{}] (sample scan value: {:?}), re-planning",
@@ -6955,8 +7006,17 @@ impl Database {
         let (hot, mut cold): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|(_, date, _)| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|d| !Self::date_is_cold(today, d, after_days)));
-        let mut ready: Vec<_> = hot.into_iter().take(batch).collect();
-        let deferred = cold.split_off(cold.len().min(batch - ready.len()));
+        // Cold bins get a RESERVED share of the batch. Hot-first is right — a
+        // boot that drained a 10-day backlog oldest-first never reached the hot
+        // window (2026-07-30) — but giving hot the WHOLE batch starves cold
+        // forever whenever hot work is continuous: prod 2026-08-02 sat at
+        // queue=22135 with 20556 deferred cold and dirty_bin_processed=0, so the
+        // backlog that keeps files duplicated never shrank at all. Reserving half
+        // keeps hot's priority while making the cold backlog drain monotonically.
+        let cold_reserve = cold.len().min(batch / 2);
+        let mut ready: Vec<_> = hot.into_iter().take(batch.saturating_sub(cold_reserve)).collect();
+        // Hot under-using its share hands the remainder back to cold.
+        let deferred = cold.split_off(cold.len().min(batch.saturating_sub(ready.len())));
         ready.extend(cold);
         (ready, deferred)
     }
@@ -7356,15 +7416,13 @@ impl Database {
         // Map paths to Add actions in the SAME snapshot the scan reads, so the
         // Remove tombstones carry the exact fields of the files we rewrote.
         let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
-        let targets: Vec<deltalake::kernel::Add> = snapshot
-            .log_data()
-            .iter()
-            .filter(|f| wanted.contains(f.path().as_ref()))
-            .map(|f| {
+        let targets = dedup_adds_by_path(
+            snapshot.log_data().iter().filter(|f| wanted.contains(f.path().as_ref())).map(|f| {
                 #[allow(deprecated)]
                 f.add_action()
-            })
-            .collect();
+            }),
+            table_name,
+        );
         if targets.len() != files.len() {
             debug!(table_name, project_id, mapped = targets.len(), selected = files.len(), event = "light_optimize_bin_vanished");
             return Ok(BinOutcome::Retry);
@@ -9766,12 +9824,52 @@ impl ProjectRoutingTable {
         ProjectIdPushdown::has_project_id_filter(filters)
     }
 
-    /// Create a MemorySourceConfig-based execution plan with multiple partitions
-    fn create_memory_exec(&self, partitions: &[Vec<RecordBatch>], projection: Option<&Vec<usize>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+    /// Create a MemorySourceConfig-based execution plan with multiple partitions.
+    ///
+    /// `sorted` asserts every partition is already ordered by the table's
+    /// declared `sorting_columns`; it is the caller's correctness claim (see
+    /// `MemLeg::sorted` / `HotLeg::sorted`), and declaring it is what stops
+    /// `ordered_children` injecting a blocking `SortExec` over this leg on
+    /// every merge-on-read scan.
+    fn create_memory_exec(&self, partitions: &[Vec<RecordBatch>], projection: Option<&Vec<usize>>, sorted: bool) -> DFResult<Arc<dyn ExecutionPlan>> {
         let mem_source =
             MemorySourceConfig::try_new(partitions, self.schema.clone(), projection.cloned()).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        Ok(Arc::new(DataSourceExec::new(Arc::new(mem_source))))
+        let out = match projection {
+            Some(p) => Arc::new(self.schema.project(p)?),
+            None => self.schema.clone(),
+        };
+        Ok(Arc::new(DataSourceExec::new(Arc::new(Self::declare_ordering(mem_source, sorted, &self.table_name, &out)))))
+    }
+
+    /// Attach the table's declared ordering to an in-memory source.
+    ///
+    /// Declared against the source's OUTPUT schema (post-projection), and only
+    /// for the leading run of sorting columns that survived it — a query that
+    /// projects `timestamp` away gets no claim rather than a false one. Failure
+    /// to attach is never fatal: an undeclared source is merely slower.
+    fn declare_ordering(source: MemorySourceConfig, sorted: bool, table_name: &str, out: &SchemaRef) -> MemorySourceConfig {
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        let Some(table) = crate::schema_loader::get_schema(table_name).filter(|_| sorted) else { return source };
+        let exprs: Vec<PhysicalSortExpr> = table
+            .sorting_columns
+            .iter()
+            .map_while(|sc| {
+                let idx = out.index_of(&sc.name).ok()?;
+                Some(PhysicalSortExpr::new(
+                    Arc::new(PhysicalColumn::new(&sc.name, idx)),
+                    arrow::compute::SortOptions { descending: sc.descending, nulls_first: sc.nulls_first },
+                ))
+            })
+            .collect();
+        let Some(ordering) = LexOrdering::new(exprs) else { return source };
+        // `try_with_sort_information` consumes the source, so keep a copy to
+        // fall back to — the undeclared source must still serve its rows.
+        let undeclared = source.clone();
+        source.try_with_sort_information(vec![ordering]).unwrap_or_else(|e| {
+            debug!("in-memory leg for {table_name} could not declare its ordering ({e}); the plan will sort it instead");
+            undeclared
+        })
     }
 
     /// Scan a Delta table and coerce output schema to match our expected types.
@@ -10080,6 +10178,31 @@ impl ProjectRoutingTable {
         LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(PhysicalColumn::new(&sc.name, idx)), opts)])
     }
 
+    /// On a `version_append` table, the columns an UPDATE can change — i.e.
+    /// everything except the dedup keys and the partition columns, which
+    /// identify the row and so are the same in every version of it. `None` for
+    /// a table that appends no versions (nothing is version-mutable there).
+    ///
+    /// A predicate on one of these must NEVER reach a scan leg. Applied at the
+    /// source it selects rows by a value that may belong to a SUPERSEDED
+    /// version, AND it removes the newer version from `DedupExec`'s input — so
+    /// keep-greatest returns the stale row and it then passes the same filter
+    /// above. `WHERE status_code = 'OK'` matched a row already updated to
+    /// 'ERROR' (2026-08-02, `integration::test_update_operations`), which for an
+    /// UPDATE means writing a new version of a row the statement never matched.
+    ///
+    /// `Inexact` is NOT sufficient: re-applying the filter above the scan
+    /// cannot recover a version the source already dropped. It has to be
+    /// `Unsupported` so the leg reads every version and the filter runs above
+    /// `DedupExec`. This generalizes [`Self::references_tombstone`], which is
+    /// this exact bug for one specific column.
+    fn version_mutable_columns(table_name: &str) -> Option<std::collections::HashSet<String>> {
+        let schema = crate::schema_loader::get_schema(table_name).filter(|s| s.version_append)?;
+        let immutable: std::collections::HashSet<&str> =
+            schema.dedup_keys.iter().map(String::as_str).chain(schema.partitions.iter().map(String::as_str)).collect();
+        Some(schema.schema_ref().fields().iter().map(|f| f.name().clone()).filter(|n| !immutable.contains(n.as_str())).collect())
+    }
+
     /// Does `f` mention the table's tombstone marker? Such a predicate must
     /// NEVER reach a scan leg. Applied at the source — `MemBuffer::query`'s
     /// `compile_filter_conjunction`, or the Delta kernel — it would drop the
@@ -10195,8 +10318,21 @@ impl ProjectRoutingTable {
     /// fingerprint that STILL matches the live file set — i.e. a sweep pass
     /// proved it duplicate-free and nothing has committed to it since. Only
     /// consulted on Delta-only paths (mem∪delta overlap needs DedupExec).
+    ///
+    /// NEVER granted on a `version_append` table. There, `DedupExec` is not an
+    /// optimization that a clean sweep can prove unnecessary — it IS the
+    /// mechanism that resolves versions, and the sweep's own "duplicate-free"
+    /// verdict is about duplicate KEYS, which is exactly what merge-on-read
+    /// creates on purpose. Skipping it serves every superseded version and
+    /// every tombstoned row alongside the current one: an UPDATE reads back
+    /// pre-update and a DELETE does not delete (caught by
+    /// `buffer_consistency_test::test_{update,delete}::immediate` at the
+    /// 2026-08-02 flip).
     fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> bool {
         if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept {
+            return false;
+        }
+        if crate::schema_loader::get_schema(&self.table_name).is_some_and(|s| s.version_append) {
             return false;
         }
         let Some(window) = window else { return false };
@@ -10540,11 +10676,13 @@ impl TableProvider for ProjectRoutingTable {
             .get(&self.table_name)
             .map(|s| s.schema_ref().fields().iter().filter(|f| crate::schema_loader::is_variant_type(f.data_type())).map(|f| f.name().clone()).collect())
             .unwrap_or_default();
+        let mutable = Self::version_mutable_columns(&self.table_name);
         Ok(filter
             .iter()
             .map(|f| {
                 if Self::references_tombstone(&self.table_name, f)
                     || (!variant_cols.is_empty() && f.column_refs().iter().any(|c| variant_cols.contains(&c.name)))
+                    || mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
                 {
                     TableProviderFilterPushDown::Unsupported
                 } else if Self::is_exact_pushdown_filter(f) {
@@ -10580,10 +10718,29 @@ impl TableProvider for ProjectRoutingTable {
         let scan_metrics = self.database.scan_metrics.clone();
 
         // Apply our custom optimizations to the filters
-        // Second line of defence behind `supports_filters_pushdown`: a predicate
-        // on the tombstone marker must never reach a scan leg (see
-        // `references_tombstone` — it resurrects deleted rows silently).
-        let filters: Vec<Expr> = filters.iter().filter(|f| !Self::references_tombstone(&self.table_name, f)).cloned().collect();
+        // Second line of defence behind `supports_filters_pushdown`: neither a
+        // predicate on the tombstone marker (see `references_tombstone` — it
+        // resurrects deleted rows silently) nor one on any other
+        // version-mutable column (see `version_mutable_columns` — it serves a
+        // superseded version) may reach a scan leg, however it arrived here.
+        //
+        // This also disables the tantivy prefilter on a merge-on-read table,
+        // and that is REQUIRED, not collateral: the prefilter excludes whole
+        // FILES proven to hold no match, so a search for a value only the OLD
+        // version carries excludes the file holding the NEW one. `DedupExec`
+        // then never sees the newer version, returns the stale row, and the
+        // filter above admits it. The id-set half would be safe on its own
+        // (`id` is a dedup key, so it admits every version of a row), but the
+        // file exclusion and row selections are not, and they are what makes
+        // the prefilter worth having. Cost: text/attribute predicates on these
+        // tables no longer prune files; time-range and tenant pruning, which
+        // dominate the dashboard workload, are unaffected because those columns
+        // are dedup keys and partitions.
+        let mutable = Self::version_mutable_columns(&self.table_name);
+        let leg_safe = |f: &Expr| {
+            !Self::references_tombstone(&self.table_name, f) && !mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
+        };
+        let filters: Vec<Expr> = filters.iter().filter(|f| leg_safe(f)).cloned().collect();
         let optimized_filters = self.apply_time_series_optimizations(&filters)?;
 
         // Get project_id from filters if possible, otherwise use default
@@ -10943,13 +11100,12 @@ impl TableProvider for ProjectRoutingTable {
         // own atomic per-bucket prefilter inside the bucket lock — we must
         // NOT prepend `tantivy_id_filter` here (that filter is derived from
         // delta-side IDs only and would drop legitimate MemBuffer rows).
-        let mem_partitions = match layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, text_match_tree.as_ref()) {
-            Ok(partitions) => partitions,
-            Err(e) => {
+        let mem_leg =
+            layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, text_match_tree.as_ref()).unwrap_or_else(|e| {
                 warn!("Failed to query mem buffer: {}", e);
-                vec![]
-            }
-        };
+                Default::default()
+            });
+        let mem_partitions = mem_leg.partitions;
 
         // Hot-tier third leg (P1) — see `HotTier::query_partitioned` for the
         // coverage contract. Consulted only when Delta is actually being
@@ -10983,7 +11139,7 @@ impl TableProvider for ProjectRoutingTable {
                     .await
             }
         };
-        let (hot_partitions, hot_ranges, version_gate) = (hot.partitions, hot.ranges, hot.version_gate);
+        let (hot_partitions, hot_ranges, version_gate, hot_sorted) = (hot.partitions, hot.ranges, hot.version_gate, hot.sorted);
 
         // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
@@ -11015,7 +11171,7 @@ impl TableProvider for ProjectRoutingTable {
             true => None,
             false => {
                 tag_shape(&|s| s.has_mem = true);
-                Some(self.create_memory_exec(&mem_partitions, projection)?)
+                Some(self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?)
             }
         };
 
@@ -11109,7 +11265,9 @@ impl TableProvider for ProjectRoutingTable {
                     Some(p) => Arc::new(self.schema.project(p)?),
                     None => self.schema.clone(),
                 };
+                let hot_out = hot_schema.clone();
                 let source = MemorySourceConfig::try_new(&hot_partitions, hot_schema, None).map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let source = Self::declare_ordering(source, hot_sorted, &self.table_name, &hot_out);
                 Some(Arc::new(DataSourceExec::new(Arc::new(source))) as Arc<dyn ExecutionPlan>)
             }
         };
@@ -11660,9 +11818,13 @@ mod tests {
         let deleted = col("deleted").eq(lit(true));
         assert!(ProjectRoutingTable::references_tombstone("mor_versioned", &deleted));
         assert!(!ProjectRoutingTable::references_tombstone("mor_versioned", &col("id").eq(lit("x"))));
+        // The shipped merge-on-read tables must be protected too.
+        for t in ["otel_logs_and_spans", "otel_metrics"] {
+            assert!(ProjectRoutingTable::references_tombstone(t, &deleted), "{t} ships merge-on-read — its tombstone predicate must not reach a leg");
+        }
         // Tables declaring no tombstone column have no such predicate to protect
-        // — including the shipped ones, where `deleted` is just an unknown name.
-        for t in ["variant_bench", "otel_logs_and_spans"] {
+        // — there `deleted` is just an unknown column name.
+        for t in ["variant_bench", "mor_dormant"] {
             assert!(!ProjectRoutingTable::references_tombstone(t, &deleted));
         }
     }
@@ -11826,8 +11988,8 @@ mod tests {
     /// predicate re-evaluation failure ("Transaction failed") — while permanent
     /// errors (protocol version, auth/IO) fail fast. Guards the dedup/optimize
     /// loops, which previously omitted some of these substrings.
-    // Warm (30-min Z-order) and cold (daily 1GB consolidate) tiers must own
-    // disjoint partitions, or they oscillate the same day 256MB↔1GB every cycle.
+    // Warm (30-min Z-order) and cold (daily 512MB consolidate) tiers must own
+    // disjoint partitions, or they oscillate the same day 256MB↔512MB every cycle.
     // `date_is_cold` is the single boundary both use; assert today is warm and
     // every earlier day is cold at the default after_days=1 ("past the current
     // day"), and that a larger boundary keeps the warm window in sync.
@@ -12298,6 +12460,26 @@ mod tests {
 
     fn test_add(path: &str) -> deltalake::kernel::Add {
         deltalake::kernel::Add { path: path.to_string(), size: 1024, modification_time: 0, data_change: true, ..Default::default() }
+    }
+
+    /// A snapshot that lists one file twice must still map to ONE target, so
+    /// the planners' `targets.len() != files.len()` check stays meaningful.
+    /// Prod 2026-08-02: the incremental snapshot advance duplicated the file
+    /// list across a checkpoint, every plan logged "mapped 2/1 files", and both
+    /// dedup and hot-tail compaction stalled indefinitely.
+    #[test]
+    fn dedup_adds_by_path_collapses_a_duplicated_snapshot_entry() {
+        let dup = vec![test_add("a.parquet"), test_add("b.parquet"), test_add("a.parquet")];
+        let targets = super::dedup_adds_by_path(dup.into_iter(), "otel_metrics");
+        assert_eq!(targets.len(), 2, "one Add per distinct path");
+        let mut paths: Vec<&str> = targets.iter().map(|a| a.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["a.parquet", "b.parquet"]);
+        // Order-preserving for the already-clean case: no needless churn in the
+        // Remove tombstones a wave commits.
+        let clean = vec![test_add("b.parquet"), test_add("a.parquet")];
+        let targets = super::dedup_adds_by_path(clean.into_iter(), "otel_metrics");
+        assert_eq!(targets.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(), ["b.parquet", "a.parquet"]);
     }
 
     fn staged_unit(project: &str, paths: &[&str], dedup: Option<super::DedupUnit>) -> super::StagedBin {
@@ -12801,7 +12983,10 @@ mod tests {
         assert_eq!(cols[0].column, "timestamp");
         assert_eq!(dedup.columns, vec!["timestamp", "id"]);
         let tb = dedup.tiebreak.expect("tiebreak from schema");
-        assert!(tb.column == "observed_timestamp" && tb.descending);
+        // `updated_at` since the 2026-08-02 merge-on-read flip: the tiebreak had
+        // to move off the client-supplied `observed_timestamp`, which
+        // `stamp_version` would otherwise overwrite on every write.
+        assert!(tb.column == "updated_at" && tb.descending);
         assert!(declare_sorted);
         // sort disabled → plain Compact, no dedup claim
         assert!(matches!(consolidate_optimize_type(schema, false), (OptimizeType::Compact, false)));
@@ -14419,11 +14604,22 @@ mod tests {
         );
         assert!(deferred.is_empty(), "a batch with room serves the cold tail too");
 
-        // A batch smaller than the hot tier never spends a slot on cold work.
-        let (ready, deferred) = Database::select_drain_bins(candidates, today, 3, 2);
-        assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-29", 1)]);
-        assert_eq!(deferred, vec![bin("2026-07-21", 3), bin("2026-07-20", 5)], "cold bins are deferred, not dropped");
+        // A batch smaller than the hot tier still RESERVES half for cold, so the
+        // cold backlog drains monotonically instead of being deferred forever
+        // behind continuous hot work (prod 2026-08-02: 20556 deferred, 0
+        // processed, queue 22135). Hot keeps the priority — it takes the larger
+        // share and the newest bins — but it no longer takes everything.
+        let (ready, deferred) = Database::select_drain_bins(candidates.clone(), today, 3, 2);
+        assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-21", 3)], "hot keeps priority, cold gets its reserved slot");
+        assert_eq!(deferred, vec![bin("2026-07-20", 5)], "cold bins are deferred, not dropped");
         assert_eq!(deferred.last().unwrap().1, "2026-07-20", "summary line reports the oldest deferred date");
+
+        // With no cold work at all, hot still gets the WHOLE batch — the reserve
+        // must never idle a slot.
+        let hot_only: Vec<_> = candidates.iter().filter(|(_, d, _)| d.as_str() >= "2026-07-28").cloned().collect();
+        let (ready, deferred) = Database::select_drain_bins(hot_only, today, 3, 2);
+        assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-29", 1)], "no cold work ⇒ hot uses the full batch");
+        assert!(deferred.is_empty());
     }
 
     /// The cold cutoff must never DROP bins: the nightly consolidate bin-packs

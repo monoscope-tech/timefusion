@@ -471,6 +471,7 @@ macro_rules! const_default {
 }
 
 const_default!(d_true: bool = true);
+const_default!(d_tantivy_build_concurrency: usize = 2);
 const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
 const_default!(d_data_dir: PathBuf = "./data");
 const_default!(d_pgwire_port: u16 = 5432);
@@ -485,11 +486,17 @@ const_default!(d_pgwire_user: String = "postgres");
 // by compaction/OPTIMIZE).
 const_default!(d_flush_interval: u64 = 60);
 const_default!(d_retention_mins: u64 = 70);
-// 0 = OFF for the tier's first release: it is a new disk + page-cache consumer
-// and prod is memory-tight (host-level OOM kills, 2026-07-31). Enable per
-// deployment with TIMEFUSION_HOT_TIER_RETENTION_HOURS=6 and watch
-// hot_tier.bytes / workingset_refault; flip this default once soaked.
-const_default!(d_hot_tier_retention_hours: u64 = 0);
+// 6h, ON by default since 2026-08-02. It shipped at 0 (OFF) for its first
+// release — a new disk + page-cache consumer on a memory-tight box (host-level
+// OOM kills, 2026-07-31) — with the note "flip this default once soaked". Prod
+// has run TIMEFUSION_HOT_TIER_RETENTION_HOURS=6 since, so this is that flip:
+// the default now matches the soaked deployment instead of leaving the tier
+// dependent on an env var that a fresh deployment would silently omit.
+//
+// Disk is bounded by `d_hot_tier_max_disk_gb` and heap by
+// `d_hot_tier_leg_budget_mb`, both independent of this value; raising it costs
+// disk and page cache, not process memory.
+const_default!(d_hot_tier_retention_hours: u64 = 6);
 const_default!(d_hot_tier_max_disk_gb: u64 = 64);
 const_default!(d_hot_tier_leg_budget_mb: u64 = 512);
 const_default!(d_hot_tier_memo_mb: u64 = 1024);
@@ -578,13 +585,15 @@ const_default!(d_dml_coalesce_secs: u64 = 3);
 // retries; rows stay in MemBuffer + WAL, so it's safe. Must exceed a normal
 // backfill commit but stay well under retention.
 //
-// 600s, NOT 120s: the timeout covers the whole callback — parquet encode +
-// S3 upload + commit — and a post-restart WAL-replay backlog produces
-// multi-GB coalesced commits that legitimately take minutes. At 120s the
-// watchdog aborted every big drain, wasting the work and retrying forever
-// while MemBuffer grew to the memcg limit (2026-07-02 OOM loop: stalled=42
-// vs flush-ok=22, RSS 89GB). The watchdog exists for the *infinitely* hung
-// commit, so a generous ceiling loses nothing.
+// The CEILING, not the budget: `BufferedWriteLayer::adaptive_flush_timeout`
+// contracts it as the ingest buffer fills. Read that function before changing
+// this — prod has been wedged from both ends of the fixed-value trade (120s
+// aborted legitimate multi-GB drains into a retry loop, 2026-07-02; 600s let a
+// hung commit hold the global flush_lock until the ingest buffer filled and
+// every tenant's INSERT was rejected, 2026-08-02). 600 stays right for the
+// ceiling: with headroom, a slow-but-progressing commit should be allowed to
+// finish, because aborting it wastes the work and the next attempt is no
+// faster.
 const_default!(d_flush_bucket_timeout_secs: u64 = 600);
 // Durability mode for the WAL. One of:
 //   "sync_each" — fsync after every entry (default; zero data-loss window, ~1ms per write)
@@ -654,17 +663,20 @@ const_default!(d_checkpoint_interval: u64 = 10);
 // workload. Light/today optimize keeps its own 16MB target.
 const_default!(d_optimize_target: i64 = 256 * MIB as i64);
 // Cold tier: sealed partitions (older than `cold_optimize_after_days`) bin-pack
-// to 1GB. File size grows with partition age — recent days stay at 256MB (less
-// rewrite while the day still fills), sealed days consolidate to 1GB so the
+// to 512MB. File size grows with partition age — recent days stay at 256MB (less
+// rewrite while the day still fills), sealed days consolidate to 512MB so the
 // Delta checkpoint (≈ live file count) shrinks, which is the dominant driver of
-// commit latency. Compression is per-row-group, so 1GB files don't change bytes
+// commit latency. Compression is per-row-group, so bigger files don't change bytes
 // stored — the win is fewer files (smaller checkpoint, fewer S3 objects, cheaper
 // query planning). Re-runs are cheap: Compact skips files already ≥ target.
-const_default!(d_cold_optimize_target: i64 = GIB as i64);
+// 512MB, not 1GB: a merge holds ~target-sized output buffers per concurrent task
+// and the decompressed working set is ~17x the compressed target, so 1GB made the
+// sort/merge step of the final consolidation memory-hostile on this box.
+const_default!(d_cold_optimize_target: i64 = 512 * MIB as i64);
 // 1 day = everything past the current (day-partitioned) partition. Only today
-// still takes writes, so every sealed day consolidates to 1GB. The warm
+// still takes writes, so every sealed day consolidates to 512MB. The warm
 // optimize is clamped to dates newer than this boundary (see `optimize_table`)
-// so the 30-min Z-order never fragments these 1GB files back to 256MB.
+// so the 30-min Z-order never fragments these files back to 256MB.
 const_default!(d_cold_optimize_after_days: u64 = 1);
 const_default!(d_stats_cache_size: usize = 50);
 // Observability data is high-churn and rarely time-traveled; the only hard
@@ -690,7 +702,7 @@ const_default!(d_compact_min_files: usize = 5);
 // Hot/today target stays small (32MB): the light job runs every 5 min on the
 // current partition, which takes constant writes — a large target would rewrite
 // the same growing files repeatedly (write amplification) and add in-process
-// merge memory on the hot path. Consolidation to 256MB/1GB happens later, once
+// merge memory on the hot path. Consolidation to 256MB/512MB happens later, once
 // the partition is sealed (warm optimize → daily cold consolidate).
 // 256MB (was 32MB): on the 188GB/48-core box the small-merge-memory rationale is
 // moot, and 32MB left the hot (today) partition as dozens of tiny files for a
@@ -724,7 +736,7 @@ const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
-// Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
+// Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
 // cold target. Calendar-age driven; idempotent (skips ≥-target files).
 const_default!(d_consolidate_schedule: String = "0 30 2 * * *");
 const_default!(d_consolidate_catchup_passes: usize = 4);
@@ -789,11 +801,21 @@ const_default!(d_query_partitions: usize = 0);
 const_default!(d_max_concurrent_scan_readers: usize = 16);
 const_default!(d_wide_scan_lookback_hours: u64 = 2);
 // Sized against the incident the gate exists for: the 7-day dashboard opened
-// hundreds of files at ~48-way parallelism. A recent-window scan on the busiest
-// prod tenant selects a handful of files after pruning, so 8 files / 256 MB
-// sits an order of magnitude below the danger and well above the normal path.
-const_default!(d_wide_scan_max_files: usize = 8);
-const_default!(d_wide_scan_max_mb: u64 = 256);
+// hundreds of files at ~48-way parallelism.
+//
+// The FILE-COUNT half assumed "a recent-window scan selects a handful of files
+// after pruning". That stopped being true once partitions fragmented to
+// thousands of small files: on 2026-08-02 a 1h window on one tenant selected 48
+// file groups, so the release could never fire and every dashboard past the 2h
+// lookback queued behind the 16-permit semaphore. Measured cliff, same tenant,
+// same query: 115min = 9.9s but 125min = TIMEOUT at 130s.
+//
+// BYTES are the honest proxy for decode heap; file COUNT is a proxy for a proxy,
+// and it is the one fragmentation invalidates. Median prod file is ~0.1 MB, so
+// 256 files is still only ~26 MB — the MB cap does the real bounding, and the
+// 7-day case that motivated the gate blows through the MB cap regardless.
+const_default!(d_wide_scan_max_files: usize = 256);
+const_default!(d_wide_scan_max_mb: u64 = 512);
 const_default!(d_plan_cache_capacity: usize = 2048);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
@@ -877,6 +899,12 @@ pub struct TantivyConfig {
     /// can engage. Off by default — reads every uncovered file back from S3.
     #[serde(default)]
     pub timefusion_tantivy_backfill: bool,
+    /// Concurrent index builds during backfill/reconcile/post-optimize
+    /// reindex. 2 is safe alongside prod query load; the off-box repair CLI
+    /// raises it (each 1 GB parquet takes ~2-3 min to index, so the first
+    /// full reconcile is throughput-bound on this knob).
+    #[serde(default = "d_tantivy_build_concurrency")]
+    pub timefusion_tantivy_build_concurrency: usize,
     /// File-level scan pruning: when the prefilter engages, files whose
     /// covering index returned zero hits are excluded from the Delta scan
     /// entirely (needle queries read only the files that can match). Off
@@ -1538,7 +1566,7 @@ pub struct ParquetConfig {
 impl ParquetConfig {
     /// Warm/cold boundary in days, floored at 1: the current (day-partitioned)
     /// partition must always stay warm — it's still taking writes — so 0 is
-    /// never valid (it would consolidate today to 1GB mid-write).
+    /// never valid (it would consolidate today to the cold target mid-write).
     pub fn cold_optimize_after_days(&self) -> u64 {
         self.timefusion_cold_optimize_after_days.max(1)
     }

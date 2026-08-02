@@ -18,11 +18,15 @@ fn get_str(arr: &dyn Array, idx: usize) -> String {
 
 async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<BufferedWriteLayer>, String)> {
     let cfg = TestConfigBuilder::new("buf_test").with_buffer_mode(mode).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment. We use #[serial] on all tests
-    // to prevent concurrent access to this process-global state. This is inherently racy but
-    // acceptable for tests since they run sequentially.
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
-    let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
+    // Wire the SAME Delta writer prod does. A layer without it does not fail —
+    // `flush_bucket` used to log "no delta write callback" and drain the bucket
+    // anyway, so every flushed row was silently destroyed while `is_empty()`
+    // reported success. It now errors instead, which would strand these tests'
+    // rows in MemBuffer; either way the harness must mirror production.
+    let db0 = Database::with_config(Arc::clone(&cfg)).await?;
+    let layer =
+        Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::bootstrap::delta_write_callback(&db0)));
+    let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     Ok((db, layer, project_id))
 }
@@ -279,5 +283,13 @@ async fn test_immediate_flush_drains_buffer() -> Result<()> {
 
     // Buffer should be empty after immediate flush (flush drains buffer even without callback)
     assert!(layer.is_empty(), "Buffer should be empty after immediate flush");
+    // DRAINED IS NOT PERSISTED. This assertion is the one that matters: an
+    // empty buffer proves the rows LEFT MemBuffer, not that they arrived in
+    // Delta, so on its own it is equally consistent with the flush dropping
+    // them on the floor.
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let got = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?.collect().await?;
+    assert_eq!(got[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 10, "every drained row must be readable from Delta");
     Ok(())
 }

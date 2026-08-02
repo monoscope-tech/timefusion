@@ -1,0 +1,72 @@
+# The DORMANT half of the merge-on-read plan-shape gate: a table that declares
+# dedup keys and a tiebreak but does NOT set `version_append`. It exists so the
+# "no version can exist, so none of the ordering machinery may appear" assertion
+# has a subject after `otel_logs_and_spans` and `otel_metrics` flipped
+# `version_append: true` — before that, otel itself played this role.
+#
+# Nothing writes to it in production; like `mor_versioned` and `variant_bench`
+# it is a fixture so tests exercise the real registry path instead of a mock.
+table_name: mor_dormant
+partitions:
+  - project_id
+  - date
+dedup_keys:
+  - timestamp
+  - id
+# Client-owned here, exactly as otel's `observed_timestamp` was pre-flip: with
+# `version_append` off, `stamp_column` returns None and TF never overwrites it.
+dedup_tiebreak: updated_at
+sorting_columns:
+  - name: timestamp
+    descending: true
+    nulls_first: true
+z_order_columns:
+  - timestamp
+  - id
+fields:
+  - name: date
+    data_type: Date32
+    nullable: false
+  - name: timestamp
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
+    nullable: false
+  - name: id
+    data_type: Utf8
+    nullable: false
+  - name: name
+    data_type: Utf8
+    nullable: true
+  # Nullable because delta-rs nulls out partition columns in per-file stats.
+  - name: project_id
+    data_type: Utf8
+    nullable: true
+  - name: updated_at
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
+    nullable: true
+  # Enough of the otel shape to host the in-place DML tests. Those exercise the
+  # delta-rs MERGE, the DML coalescer's deferral and the merge write lock —
+  # machinery every non-merge-on-read table still uses, but which
+  # `otel_logs_and_spans` stopped exercising when it flipped `version_append`.
+  - name: level
+    data_type: Utf8
+    nullable: true
+  - name: status_code
+    data_type: Utf8
+    nullable: true
+  - name: duration
+    data_type: Int64
+    nullable: true
+  # The hash-enrichment shape. `coalesce_merges` folding is DML-coalescer
+  # machinery that only non-merge-on-read tables reach, so its test needs a
+  # subject here too. `bloom_filter` mirrors otel so the prune path is real.
+  - name: hashes
+    data_type: "List(Utf8)"
+    nullable: true
+  - name: context___span_id
+    data_type: Utf8
+    nullable: true
+    bloom_filter: true
+  - name: context___trace_id
+    data_type: Utf8
+    nullable: true
+    bloom_filter: true

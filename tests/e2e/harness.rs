@@ -601,3 +601,19 @@ pub async fn insert_for(client: &tokio_postgres::Client, project_id: &str, id: &
 pub async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> Result<()> {
     insert_for(client, "e2e_project", id, ts_micros).await
 }
+
+/// Insert one row into `mor_dormant`, which declares fewer columns than otel.
+/// The deletion-vector tests moved here when `otel_logs_and_spans` flipped
+/// `version_append`: under merge-on-read an UPDATE appends a row version rather
+/// than masking-and-rewriting, so DV behaviour needs a non-versioned subject.
+pub async fn insert_dormant_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> Result<()> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
+    let sql = format!(
+        "INSERT INTO mor_dormant (project_id, date, timestamp, id, name, status_code, level) \
+         VALUES ($1, '{}', '{}', $2, 'span', 'OK', 'INFO')",
+        dt.date_naive(),
+        dt.format("%Y-%m-%d %H:%M:%S%.f"),
+    );
+    client.execute(&sql, &[&"e2e_project", &id]).await?;
+    Ok(())
+}

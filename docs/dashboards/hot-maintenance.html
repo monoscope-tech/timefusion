@@ -46,51 +46,53 @@ h2{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3
 .note b{color:var(--ink)}
 .foot{color:var(--ink3);font-size:11.5px;margin-top:18px}
 </style>
+<style>
+.cmp{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow-x:auto;margin-top:8px}
+.cmp table{border-collapse:collapse;width:100%;min-width:720px}
+.cmp th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);text-align:left;font-weight:600;padding:9px 12px;border-bottom:1px solid var(--line)}
+.cmp td{padding:7px 12px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:top}
+.cmp tr:last-child td{border-bottom:none}
+.cmp td.m{font-variant-numeric:tabular-nums;white-space:nowrap}
+.better{color:var(--good);font-weight:600}.worse{color:var(--crit);font-weight:600}.same{color:var(--ink2)}
+</style>
 <div class="wrap">
-<h1>Intra-day maintenance — what the server is doing to today's data</h1>
-<p class="sub">prod `bc4e884` on captain · updated 2026-07-31 01:00 CEST · prod on 012245d (idle-timeout live) · counters reset at each boot</p>
+<h1>Intra-day maintenance — 08-01 vs the 07-31 firefight day</h1>
+<p class="sub">prod `5926f66` on captain · updated 2026-08-01 02:15 CEST · booted 11 min ago (exit-137 kill before it) · counters reset each boot</p>
 
-<div class="banner">⚠️ <span><b>THREE OOM kills: 18:47, 20:32, 00:21 CEST</b> — the cadence survived two deploys, so the RSS driver is not in the fixed paths; jemalloc heap profiles from all three kills sit on the volume awaiting jeprof analysis (top follow-up). Each cycle self-heals via WAL replay. The window-bucketed DML merges (9460e15, deploying) remove one more suspect; the role-split remains the structural fix.</span></div>
+<div class="banner">⚠️ <span><b>The OOM loop continues (~1-2h cadence; 4 kills in the last 5 hours, ~12 across 07-31)</b> — but it is no longer a mystery: the libunwind profiler fix (c0a2cb5, verified 27-frame stacks) attributed it on 07-31. No single leak — it's ~4GB per concurrent query + jemalloc retention (RSS ≈ 2-3× live heap) + a 120GiB cgroup TF budgets to 100% on a shared 188GB host. Fix list is with the team (cgroup right-size, query-memory admission, INSERT size-limit/params, jemalloc retention tuning). RSS is already 53GB eleven minutes after boot.</span></div>
 
-<h2>Ingest &amp; flush (the write path)</h2>
+<h2>Yesterday vs today — what changed</h2>
+<div class="cmp"><table>
+<thead><tr><th>signal</th><th>07-31 (firefight)</th><th>08-01 now</th><th>read</th></tr></thead>
+<tbody>
+<tr><td>whale sealed-day files</td><td class="m">7,190 across 07-19..28</td><td class="m">~950, all ≈1GB floors</td><td class="better">−87% — the overnight drain</td></tr>
+<tr><td>today's hot partition</td><td class="m">peaked 1,061 (07-30 orphaned)</td><td class="m">held 400–800 non-whale + ~50 whale</td><td class="better">guardian + k8s 10-min loop own it</td></tr>
+<tr><td>pgwire p95 / p99</td><td class="m">2.1s / 8.4s (and full timeouts during wedge)</td><td class="m">1.05s / 8.4s</td><td class="better">p95 halved; tail still restart-bound</td></tr>
+<tr><td>scan p95</td><td class="m">— (scans wedged at 0 for 70 min)</td><td class="m">131ms · 68% scans pruned · provider 94%</td><td class="better">wedge documented + recipe saved</td></tr>
+<tr><td>OOM kills</td><td class="m">~12 (unattributable)</td><td class="m">~4 in 5h (ATTRIBUTED)</td><td class="same">same illness, now diagnosable</td></tr>
+<tr><td>in-server light waves</td><td class="m">0 all day</td><td class="m">0 (boots too short) — off-box loops compensate</td><td class="same">fixes when OOM loop ends</td></tr>
+<tr><td>dedup bins committed</td><td class="m">0</td><td class="m">8 this boot · queue 19.7k (13.7k cold-deferred)</td><td class="better">first in-server dedup progress</td></tr>
+<tr><td>WAL quarantine</td><td class="m">12 files / 476MB</td><td class="m worse">124 files / 446MB</td><td class="worse">file count ×10 — needs the redrive routine</td></tr>
+</tbody>
+</table></div>
+
+<h2>Ingest &amp; flush (this boot, 11 min)</h2>
 <div class="tiles">
-  <div class="tile"><div class="k">rows ingested <span class="pill ok">healthy</span></div><div class="v">1.04M</div><div class="d">~26k rows/min since 21:56 boot · 147 flushes, 0 failed</div></div>
-  <div class="tile"><div class="k">flushes <span class="pill ok">0 failed</span></div><div class="v">850</div><div class="d">buffer lag 166k rows · oldest bucket 16 s</div></div>
-  <div class="tile"><div class="k">memory pressure <span class="pill warn">RSS 27.3 GB</span></div><div class="v">23%</div><div class="d">MemBuffer fine; RSS climb slower on 9bbeeaa — watching</div></div>
-  <div class="tile"><div class="k">WAL <span class="pill warn">quarantine</span></div><div class="v">7 pairs</div><div class="d"><b>5 of 12 recovered + swept from prod</b>; 3 giants await the window-sliced redrive (image building)</div></div>
+  <div class="tile"><div class="k">rows ingested <span class="pill ok">healthy</span></div><div class="v">1.45M</div><div class="d">478 flushes, 0 failed · oldest bucket 2s</div></div>
+  <div class="tile"><div class="k">memory <span class="pill crit">RSS 55.9GB @ 11min</span></div><div class="v">1%</div><div class="d">MemBuffer pressure trivial — the RSS is query/ingest working sets + allocator retention</div></div>
+  <div class="tile"><div class="k">WAL <span class="pill warn">quarantine ×10</span></div><div class="v">124 files</div><div class="d">446MB parked (was 12/476MB) — many small parks through the OOM churn; run redrive-dml</div></div>
+  <div class="tile"><div class="k">checkpoints <span class="pill ok">lag 13</span></div><div class="v">4</div><div class="d">off-box checkpoint recipe proven during the wedge</div></div>
 </div>
 
-<h2>Light (hot-tail) compaction — every 5 min on today's partitions</h2>
+<h2>Who compacts what now</h2>
 <div class="tiles">
-  <div class="tile"><div class="k">waves committed <span class="pill warn">0 since boot</span></div><div class="v">0</div><div class="d">40 min without a wave commit post-deploy — today still ~20-60 files/project; check next hour</div></div>
-  <div class="tile"><div class="k">today's file counts <span class="pill ok">flat</span></div><div class="v">10–70<span class="dim">/project</span></div><div class="d">was 150–225 before the bin-cap deploy — visibly fixed</div></div>
-  <div class="tile"><div class="k">tick health <span class="pill warn">5 timeouts</span></div><div class="v">27 <span class="dim">ticks</span></div><div class="d">6 skipped, 2 truncated, 3 long-running, 0 failures</div></div>
-  <div class="tile"><div class="k">brakes/yields <span class="pill ok">0</span></div><div class="v">0</div><div class="d">no memory brakes, no WAL yields, no degraded ticks</div></div>
+  <div class="tile"><div class="k">whale today</div><div class="v">guardian</div><div class="d">captain, 10-min Compact folds · self-expires 13:10 UTC — renew if OOMs persist</div></div>
+  <div class="tile"><div class="k">non-whale today</div><div class="v">k8s loop</div><div class="d">tf-compact CronJob, 10-min, 8MB targets · ⚠ prod R2 creds live on the demo cluster</div></div>
+  <div class="tile"><div class="k">sealed days</div><div class="v">done</div><div class="d">all ≈1GB floors; unsorted (Compact) — quiet-season SortByDedup pass restores footer+dedup</div></div>
+  <div class="tile"><div class="k">in-server</div><div class="v">starved</div><div class="d">0 waves per boot; recovers when the box stops dying hourly</div></div>
 </div>
 
-<h2>Dedup — physical duplicate removal on flushed bins</h2>
-<div class="tiles">
-  <div class="tile"><div class="k">dirty-bin queue <span class="pill warn">deep</span></div><div class="v">16,716</div><div class="d">mostly cold-deferred (14,359) — drained lowest-priority by design</div></div>
-  <div class="tile"><div class="k">processed since boot <span class="pill warn">0</span></div><div class="v">0 <span class="dim">bins</span></div><div class="d">21 dedup timeouts, 0 failures — starved by the busy hour, will catch up</div></div>
-  <div class="tile"><div class="k">read-side dedup <span class="pill ok">always on</span></div><div class="v">DedupExec</div><div class="d">queries stay duplicate-free regardless of the physical queue</div></div>
-</div>
+<p class="note"><b>The one-line status:</b> the platform's file-count problem is solved and externally held; the remaining illness is the attributed OOM loop, and its fix list is ordinary engineering — cgroup right-sizing, query-memory admission, INSERT size limits, allocator tuning. Watch items: quarantine ×10 (redrive), guardian expiry at 13:10 UTC, prod creds on the demo cluster.</p>
 
-<h2>Housekeeping crons</h2>
-<div class="tiles">
-  <div class="tile"><div class="k">checkpoints <span class="pill ok">0 failed</span></div><div class="v">3</div><div class="d">lag 43 versions · 516 old log files cleaned</div></div>
-  <div class="tile"><div class="k">vacuum</div><div class="v">every 6 h</div><div class="d">next :15 tick; 24 h retention (protects live query snapshots)</div></div>
-  <div class="tile"><div class="k">FSCK / reconcile <span class="pill ok">clean</span></div><div class="v">0</div><div class="d">dangling adds removed: 0 · reconcile failures: 0</div></div>
-</div>
-
-<h2>Read path (context for the same window)</h2>
-<div class="tiles">
-  <div class="tile"><div class="k">queries <span class="pill ok"></span></div><div class="v">4.4k</div><div class="d">p50 131 ms · p95 2.1 s · p99 8.4 s</div></div>
-  <div class="tile"><div class="k">scan pruning</div><div class="v">78.6%</div><div class="d">of Delta scans skipped entirely; provider cache 82% hits</div></div>
-  <div class="tile"><div class="k">plan cache</div><div class="v">56.8%</div><div class="d">3.5k hits / 2.7k misses since boot</div></div>
-  <div class="tile"><div class="k">foyer cache</div><div class="v">77.6%</div><div class="d">28.6 GB served from cache · 4 GB mem + 120 GB disk</div></div>
-</div>
-
-<p class="note"><b>How to read this day:</b> the write path and hot-tail compaction are healthy — today's partitions hold at 10–70 files/project because light optimize now commits bounded 32-file bins every few minutes (the morning's fix, working in prod). The two ambers are real but understood: the dedup queue is deep because heavy maintenance spent the day competing with the off-box backfill and lost its slots (its cold backlog drains at lowest priority; read-side dedup keeps queries correct meanwhile), and the WAL quarantine holds 12 files/475 MB that should be inspected per the quarantine routine. The red item is the OOM cadence — three kills, an active incident by our own definition; mitigations shipped all day, heap-profile attribution is the next morning task. Silver lining: the wedge mechanism is now CONFIRMED (reaper stack dump: all threads futex-parked = unclosed-channel wait) and its fix is deployed.</p>
-
-<p class="foot">Sources: timefusion_stats over pgwire · docker service state · Delta snapshot v441327+ · counters reset at each boot, so rates are per-35-min-uptime</p>
+<p class="foot">Sources: timefusion_stats over pgwire (boot 11 min) · docker service state · 07-31 baselines from that day's artifact + incident log</p>
 </div>

@@ -47,6 +47,11 @@ fn fill_pct(used: usize, max_bytes: usize) -> u32 {
 /// Hard limit = `max_bytes + max_bytes / N` = 120% of budget (`5` → +20%),
 /// leaving headroom for in-flight writes without unbounded growth.
 const HARD_LIMIT_HEADROOM_DIVISOR: usize = 5;
+/// How many bucket-id time slices one steady-state flush cycle commits before
+/// releasing `flush_lock` and freeing their memory. Bounds the unit of work so a
+/// deep backlog is drained by many small commits that each finish, rather than
+/// one huge commit that never does — see `flush_completed_buckets`.
+const FLUSH_CHUNK_BUCKET_IDS: usize = 2;
 /// The reservation ceiling live writers are rejected at.
 fn hard_limit(max_bytes: usize) -> usize {
     max_bytes.saturating_add(max_bytes / HARD_LIMIT_HEADROOM_DIVISOR)
@@ -689,6 +694,61 @@ impl BufferedWriteLayer {
 
     fn is_memory_pressure(&self) -> bool {
         self.effective_memory_bytes() >= self.max_memory_bytes()
+    }
+
+    /// The stall watchdog's budget for ONE commit, scaled by how much ingest
+    /// headroom is left.
+    ///
+    /// A fixed budget cannot work here, and prod has now been wedged from BOTH
+    /// ends of the trade:
+    ///
+    /// - 120s aborted legitimate multi-GB post-replay drains, wasting the work
+    ///   and retrying forever while MemBuffer grew to the memcg limit
+    ///   (2026-07-02: stalled=42 vs flush-ok=22, RSS 89GB).
+    /// - 600s let ONE hung commit hold the global `flush_lock` for ten minutes.
+    ///   Nothing else can flush meanwhile, so MemBuffer reaches the 24 GB ingest
+    ///   cap, every tenant's INSERT is rejected with "Memory limit exceeded",
+    ///   and the box OOMs (exit 137) — the recurring wedge, where reads hang
+    ///   while `SELECT 1` stays instant.
+    ///
+    /// The fault is treating this as a question about the COMMIT when it is a
+    /// question about the BUFFER: the watchdog exists to stop a stuck commit
+    /// from starving ingest, so its urgency should come from how close ingest is
+    /// to starving. With headroom, a slow-but-progressing drain is harmless and
+    /// gets the full budget. As the buffer fills, the budget contracts toward
+    /// `MIN_FLUSH_TIMEOUT` so the lock is released while there is still room to
+    /// retry — which is exactly when relief needs it.
+    ///
+    /// The floor is half of `base`, NOT a small absolute number. Contracting is
+    /// only sound against a HUNG commit; against a slow-but-progressing drain an
+    /// early abort discards the work and the retry is no cheaper, so an
+    /// aggressive floor re-creates the 120s failure above at the exact moment
+    /// the buffer is fullest and the drains are largest. Prod on 2026-08-02
+    /// showed this concretely: commits were not completing within the 600s
+    /// ceiling while pressure sat at 100%, where a 45s floor would have aborted
+    /// every one of them and wedged flushing permanently. Capping the
+    /// contraction at 2x keeps a real pressure response without ever cutting
+    /// below a budget we already know is needed.
+    ///
+    /// 0 (watchdog disabled) stays disabled.
+    fn adaptive_flush_timeout(&self) -> Duration {
+        let base = self.config.buffer.flush_bucket_timeout();
+        if base.is_zero() {
+            return base;
+        }
+        let min_flush_timeout = base / 2;
+        // Headroom below this fraction of the cap starts contracting the budget;
+        // at the cap it is the floor.
+        const RELAXED_BELOW: f64 = 0.5;
+        let (used, max) = (self.effective_memory_bytes() as f64, self.max_memory_bytes().max(1) as f64);
+        let pressure = (used / max).clamp(0.0, 1.0);
+        if pressure <= RELAXED_BELOW {
+            return base;
+        }
+        // Linear from `base` at RELAXED_BELOW down to the floor at the cap.
+        let span = (base.saturating_sub(min_flush_timeout)).as_secs_f64();
+        let scale = (1.0 - pressure) / (1.0 - RELAXED_BELOW);
+        min_flush_timeout + Duration::from_secs_f64(span * scale)
     }
 
     /// Above the hard reservation ceiling (budget + headroom) — the point at
@@ -1833,9 +1893,40 @@ impl BufferedWriteLayer {
     }
 
     #[instrument(skip(self))]
+    /// Oldest-first, in BOUNDED chunks.
+    ///
+    /// This used to commit every sealed bucket in a single cycle, which made the
+    /// unit of work scale with buffer occupancy while the watchdog stayed fixed:
+    /// the fuller the buffer, the larger the commit, the less likely it ever
+    /// finished — and when it was aborted nothing was freed, so the next cycle
+    /// retried the same too-big commit. That positive feedback IS the recurring
+    /// wedge, and it is why no fixed timeout ever worked (120s and 600s were
+    /// both attempts to bound an unbounded workload with a deadline). Prod on
+    /// 2026-08-02: 23GB pinned across 286 buckets, flush_completed=0 vs
+    /// flush_failed=927, every insert rejected.
+    ///
+    /// Chunking commits and frees incrementally, so each unit stays small enough
+    /// to finish and pressure falls monotonically instead of never at all. Same
+    /// oldest-first shape `drain_replay_backlog` already uses on the boot path.
     async fn flush_completed_buckets(&self) -> anyhow::Result<()> {
         let current_bucket = MemBuffer::current_bucket_id();
-        self.flush_buckets_where(move |id| id < current_bucket).await.map(|_| ())
+        // Snapshot the slice list ONCE and walk it in ranges, so every sealed
+        // bucket is attempted exactly once per cycle. Re-deriving the remaining
+        // set each pass instead would immediately re-flush a bucket that was
+        // dirty-kept because a DML mutated it mid-commit, and that second pass
+        // drains the post-delete state the dirty finish exists to preserve —
+        // silent data loss, caught by
+        // `delete_during_airborne_commit_sticks_across_crash`. Dirty-kept
+        // buckets are retried on the NEXT tick, exactly as before.
+        // BTreeSet = sorted + deduped in one pass.
+        let ids: std::collections::BTreeSet<i64> = self.mem_buffer.bucket_keys(|id| id < current_bucket).into_iter().map(|(_, _, id)| id).collect();
+        let mut lo = i64::MIN;
+        for chunk in ids.iter().copied().collect::<Vec<_>>().chunks(FLUSH_CHUNK_BUCKET_IDS) {
+            let hi = chunk[chunk.len() - 1];
+            self.flush_buckets_where(move |id| id > lo && id <= hi).await?;
+            lo = hi;
+        }
+        Ok(())
     }
 
     /// Snapshot-flush every bucket whose id matches `pred`, coalesced into one
@@ -2022,7 +2113,7 @@ impl BufferedWriteLayer {
         // an un-timed-out hang would pin `flush_lock` forever. On elapse every
         // group fails and retries next cycle; rows stay durable in MemBuffer + WAL.
         let expected = units.len();
-        let timeout = self.config.buffer.flush_bucket_timeout();
+        let timeout = self.adaptive_flush_timeout();
         let commit = callback(units);
         let results = if timeout.is_zero() {
             commit.await
@@ -2270,7 +2361,7 @@ impl BufferedWriteLayer {
             // dedup_keys (write-side) and DedupExec (read-side) collapse the
             // duplicates, and a slow-but-successful commit is rare next to a
             // truly hung one; size the timeout well above normal commit p99.
-            let timeout = self.config.buffer.flush_bucket_timeout();
+            let timeout = self.adaptive_flush_timeout();
             if timeout.is_zero() {
                 commit.await?
             } else {
@@ -2286,8 +2377,21 @@ impl BufferedWriteLayer {
                     })??
             }
         } else {
-            warn!("No delta write callback configured, skipping flush");
-            Vec::new()
+            // A missing callback must FAIL the flush, never "succeed" having
+            // written nothing. The caller treats Ok as "the rows are durable in
+            // Delta" and drains them out of MemBuffer + advances the WAL
+            // watermark, so returning Ok here destroyed every row in the bucket
+            // and left only a warn line — while `layer.is_empty()` and the flush
+            // metrics both reported success. Failing puts it on the same footing
+            // as a Delta/S3 commit failure: rows stay durable in MemBuffer + WAL
+            // and the next cycle retries. (`drain_to_budget` already declines to
+            // run without a callback, so this cannot spin.)
+            return Err(anyhow::anyhow!(
+                "no delta write callback configured for {}.{} — refusing to drain bucket {} (rows stay in MemBuffer + WAL)",
+                bucket.project_id,
+                bucket.table_name,
+                bucket.bucket_id
+            ));
         };
         self.index_flushed_files(bucket, batches, added_files);
         Ok(())
@@ -2854,7 +2958,9 @@ impl BufferedWriteLayer {
 
     /// Query and return partitioned data - one partition per time bucket.
     /// This enables parallel execution across time buckets in DataFusion.
-    pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr]) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    pub fn query_partitioned(
+        &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr],
+    ) -> anyhow::Result<crate::mem_buffer::MemLeg> {
         self.mem_buffer.query_partitioned(project_id, table_name, filters)
     }
 
@@ -2865,7 +2971,7 @@ impl BufferedWriteLayer {
     /// behavior when `node` is None or the table has no indexed fields.
     pub fn query_partitioned_with_text_match(
         &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr], node: Option<&crate::tantivy_index::udf::PredNode>,
-    ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    ) -> anyhow::Result<crate::mem_buffer::MemLeg> {
         self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, node)
     }
 
@@ -3090,6 +3196,42 @@ mod tests {
         Arc::new(cfg)
     }
 
+    /// The stall watchdog must contract as ingest headroom disappears. Both
+    /// fixed values wedged prod: 120s aborted legitimate multi-GB drains into a
+    /// retry loop (2026-07-02), 600s let a hung commit hold the global
+    /// `flush_lock` until the ingest buffer filled and every INSERT was
+    /// rejected (2026-08-02). The budget has to come from the buffer's state.
+    #[tokio::test]
+    async fn flush_watchdog_contracts_as_the_ingest_buffer_fills() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+
+        let ceiling = layer.config.buffer.flush_bucket_timeout();
+        let max = layer.max_memory_bytes();
+
+        // Empty buffer: a slow-but-progressing commit gets the full ceiling,
+        // because aborting it wastes the work and the retry is no faster.
+        assert_eq!(layer.adaptive_flush_timeout(), ceiling, "with headroom the watchdog must not cut a progressing commit short");
+
+        // Nearly full: the budget contracts so the lock is released while there
+        // is still room left to retry into — but never past half the ceiling.
+        // Contracting is only sound against a HUNG commit; a slow-but-
+        // progressing drain that is aborted early loses the work for a retry
+        // that is no cheaper, and the buffer is fullest exactly when drains are
+        // largest. Prod (2026-08-02) was failing commits at the 600s ceiling
+        // while pressure sat at 100%, where an aggressive floor aborts every
+        // flush and wedges ingest permanently.
+        layer.reserved_bytes.store(max * 99 / 100, Ordering::Release);
+        let under_pressure = layer.adaptive_flush_timeout();
+        assert!(under_pressure < ceiling, "at 99% of the ingest cap the watchdog must contract, got {under_pressure:?} against a {ceiling:?} ceiling");
+        assert!(under_pressure >= ceiling / 2, "...but never below half the ceiling, or a legitimate large drain can never finish: {under_pressure:?}");
+
+        // Monotonic: more pressure never buys more time.
+        layer.reserved_bytes.store(max * 70 / 100, Ordering::Release);
+        assert!(layer.adaptive_flush_timeout() >= under_pressure, "the budget must shrink monotonically with pressure");
+    }
+
     fn create_test_config(data_dir: PathBuf) -> Arc<AppConfig> {
         test_config_with(data_dir, |_| {})
     }
@@ -3097,6 +3239,55 @@ mod tests {
     fn create_test_batch(project_id: &str) -> RecordBatch {
         // Use test_span helper which creates data matching the default schema
         json_to_batch(vec![test_span("test1", "span1", project_id), test_span("test2", "span2", project_id), test_span("test3", "span3", project_id)]).unwrap()
+    }
+
+    /// A deep backlog must drain as MANY bounded commits, not one unbounded one.
+    /// Committing every sealed bucket in a single cycle ties the unit of work to
+    /// buffer occupancy while the watchdog stays fixed, so the fuller the buffer
+    /// the less likely the flush ever finishes — and an aborted flush frees
+    /// nothing, so the next cycle retries the same too-big commit. That loop
+    /// wedged prod on 2026-08-02 (flush_completed=0, flush_failed=927, 23GB
+    /// pinned, inserts rejected).
+    #[serial]
+    #[tokio::test]
+    async fn a_deep_backlog_flushes_in_bounded_chunks() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("p{test_id}"), format!("t{test_id}"));
+
+        let commits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (c, r) = (commits.clone(), rows.clone());
+        let mut layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _w| {
+            let (c, r) = (c.clone(), r.clone());
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::Relaxed);
+                r.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
+                Ok(vec!["s3://test/part.parquet".to_string()])
+            })
+        }));
+
+        // Six sealed bucket-id slices for ONE (project, table): pre-chunking this
+        // coalesced into a single commit regardless of backlog depth.
+        const SLICES: i64 = 6;
+        let bucket = crate::mem_buffer::bucket_duration_micros();
+        let now = crate::clock::now_micros();
+        for slice in 1..=SLICES {
+            layer.mem_buffer.insert(&project, &table, create_test_batch(&project), now - slice * bucket).unwrap();
+        }
+
+        layer.flush_completed_buckets().await.unwrap();
+
+        let commits = commits.load(Ordering::Relaxed);
+        assert_eq!(rows.load(Ordering::Relaxed), (SLICES * 3) as u64, "every buffered row must still reach Delta");
+        assert!(commits > 1, "a {SLICES}-slice backlog must not be committed as one unbounded unit, got {commits} commit(s)");
+        assert!(
+            commits >= SLICES as u64 / FLUSH_CHUNK_BUCKET_IDS as u64,
+            "each commit must cover at most {FLUSH_CHUNK_BUCKET_IDS} bucket-id slice(s), got {commits} commit(s) for {SLICES}"
+        );
     }
 
     #[serial]

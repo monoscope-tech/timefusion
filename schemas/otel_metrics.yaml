@@ -5,7 +5,27 @@ partitions:
 dedup_keys:
   - timestamp
   - id
-dedup_tiebreak: ingested_at
+# TF-owned, for the same reason as otel_logs_and_spans: `stamp_version`
+# overwrites this column, and `ingested_at` is client-visible data.
+dedup_tiebreak: updated_at
+tombstone_column: deleted
+# DISABLED 2026-08-02. `version_append: true` made DedupExec mandatory, and an
+# UPDATE appended a row carrying its ORIGINAL timestamp into a NEW file — which
+# destroys the time-range disjointness recent-window queries depend on. With
+# files overlapping, no ordering can be declared, so every scan paid a full
+# SortExec that exhausted the 27.5GB query pool: 1h ~13s, 3h TIMED OUT.
+#
+# `dedup_tiebreak` and `tombstone_column` are deliberately KEPT. They are what
+# make this flip safe: existing tombstones still beat their older version on the
+# tiebreak, and existing multi-version rows still collapse, because DedupExec
+# keeps running on any window `dedup_window_clean` has not proven swept. The
+# read-side skip is only granted on swept windows, where the sweep has already
+# dropped tombstoned rows and collapsed versions physically.
+#
+# Re-enabling is additive (no migration either way), but do NOT re-enable until
+# compaction demonstrably keeps pace with the enrichment rate — under MOR,
+# compaction is load-bearing, not an optimisation.
+version_append: false
 sorting_columns:
   - name: timestamp
     descending: true
@@ -85,3 +105,7 @@ fields:
   - { name: summary_quantiles, data_type: 'List(Float64)', nullable: true }
   - { name: summary_values, data_type: 'List(Float64)', nullable: true }
   - { name: message_size_bytes, data_type: Int64, nullable: false }
+  # Merge-on-read pair, appended LAST to match the stored Delta schema (67 -> 69
+  # via `migrate-columns`). See otel_logs_and_spans.yaml for why order matters.
+  - { name: updated_at, data_type: 'Timestamp(Microsecond, Some("UTC"))', nullable: true }
+  - { name: deleted, data_type: Boolean, nullable: true }

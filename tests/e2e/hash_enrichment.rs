@@ -379,6 +379,11 @@ async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<
 /// projects, drained once, must apply every project's tag via ONE folded merge
 /// — one kernel metadata scan + one OCC commit instead of one per project.
 /// COALESCE_MERGES pins the fold; per-project counts pin correctness.
+///
+/// Subject is `mor_dormant`: once `otel_logs_and_spans` set `version_append` an
+/// enrichment UPDATE there appends a row version instead of going through the
+/// DML coalescer's MERGE, so otel folds ZERO merges and can no longer witness
+/// this. The row-level assertions still passed on otel — only the fold did not.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::Result<()> {
@@ -396,13 +401,13 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
     for p in projects {
         let sql = format!(
-            "INSERT INTO otel_logs_and_spans \
-             (project_id, date, timestamp, id, name, status_code, level, hashes, summary, context___span_id, context___trace_id) \
-             VALUES ('{p}', '{}', '{}', 'id-{p}', 'span', 'OK', 'INFO', ARRAY[]::text[], $1, 'span-{p}', 'trace-{p}')",
+            "INSERT INTO mor_dormant \
+             (project_id, date, timestamp, id, name, status_code, level, hashes, context___span_id, context___trace_id) \
+             VALUES ('{p}', '{}', '{}', 'id-{p}', 'span', 'OK', 'INFO', ARRAY[]::text[], 'span-{p}', 'trace-{p}')",
             dt.date_naive(),
             dt.format("%Y-%m-%d %H:%M:%S%.f"),
         );
-        client.execute(&sql, &[&vec!["s"]]).await?;
+        client.execute(&sql, &[]).await?;
     }
     // Rows must be Delta-only so the enrichment rides the deferred Delta leg.
     env.force_flush().await?;
@@ -412,7 +417,7 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
     let (lo, hi) = (FROZEN_START_MICROS - 1_000_000, FROZEN_START_MICROS + 60_000_000);
     for p in projects {
         let sql = format!(
-            "UPDATE otel_logs_and_spans o \
+            "UPDATE mor_dormant o \
                SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag] \
                FROM ( SELECT unnest(ARRAY['span-{p}']::text[]) AS span_id, \
                              unnest(ARRAY['trace-{p}']::text[]) AS trace_id, \
@@ -428,10 +433,8 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
     env.drain_dml_coalescer().await;
 
     for p in projects {
-        let count: i64 = client
-            .query_one(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{p}' AND hashes && ARRAY['TAG-{p}']::text[]"), &[])
-            .await?
-            .get(0);
+        let count: i64 =
+            client.query_one(&format!("SELECT COUNT(*) FROM mor_dormant WHERE project_id = '{p}' AND hashes && ARRAY['TAG-{p}']::text[]"), &[]).await?.get(0);
         assert_eq!(count, 1, "folded enrichment lost project {p}'s tag");
     }
     let merges = timefusion::metrics::dml_stats().coalesce_merges.load(std::sync::atomic::Ordering::Relaxed) - merges_before;

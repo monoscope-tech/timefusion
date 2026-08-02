@@ -55,12 +55,22 @@ pub struct TableSchema {
     /// `tombstone_column`.
     ///
     /// Read-side fast paths that are only *wrong* once a key has more than one
-    /// version on disk gate on THIS flag, not on `tombstone_column`: see
-    /// [`Self::tombstones_possible`] (COUNT(*)-from-stats pushdown) and the
-    /// order-preserving union in `ProjectRoutingTable::scan` (which exists only
-    /// to make `DedupExec`'s keep-greatest engage). Declaring the column is
-    /// inert, so gating those on the column alone costs a full scan / a blocking
-    /// sort + k-way merge for a feature that cannot yet have written anything.
+    /// version on disk gate on THIS flag — e.g. the order-preserving union in
+    /// `ProjectRoutingTable::scan`, which exists only to make `DedupExec`'s
+    /// keep-greatest engage. Declaring the column is inert, so gating those on
+    /// the column alone costs a blocking sort + k-way merge for a feature that
+    /// cannot yet have written anything.
+    ///
+    /// [`Self::tombstones_possible`] deliberately does NOT gate on this flag:
+    /// versions already written outlive the flag being turned off. Anything
+    /// whose correctness depends on what is IN STORAGE must key off the column.
+    ///
+    /// DISABLED on `otel_logs_and_spans` / `otel_metrics` 2026-08-02: making
+    /// dedup mandatory forced a query-time `SortExec` (the appended version
+    /// carries the row's ORIGINAL timestamp into a new file, destroying the
+    /// time-range disjointness the ordering relies on), which exhausted the
+    /// query pool — 1h ~13s, 3h timing out. Re-enable only once compaction
+    /// demonstrably keeps pace with the enrichment rate.
     #[serde(default)]
     pub version_append: bool,
 }
@@ -108,19 +118,33 @@ impl TableSchema {
         Some((parse_arrow_data_type(&f.data_type).ok()?, f.nullable))
     }
 
-    /// Can a tombstone row EXIST in this table's storage? Only if the column is
-    /// declared AND the write path that emits tombstones is enabled — a declared
-    /// column with `version_append: false` is a no-op (see `tombstone_column`).
+    /// Can a tombstone row EXIST in this table's storage? True as soon as the
+    /// column is declared, regardless of the write path.
     ///
-    /// ORDERING INVARIANT: `version_append` is the flag that *enables* writing a
-    /// tombstone, so it is necessarily true strictly before the first tombstone
-    /// exists; a reader that trusts it therefore never counts one it hasn't
-    /// accounted for. Never add a write path that appends a tombstone (or any
-    /// second row version) without gating it on `version_append`, and never flip
-    /// the flag off after tombstones were written — either breaks this and turns
-    /// the COUNT(*) stats pushdown into a silent over-count.
+    /// The old rule was `column && version_append`, guarded by a warning to
+    /// "never flip the flag off after tombstones were written". That warning was
+    /// correct and the hazard was real: disabling merge-on-read on
+    /// `otel_logs_and_spans` (2026-08-02) would have instantly re-enabled
+    /// COUNT(*)-from-stats over files still holding tombstoned rows, counting
+    /// deleted rows as live. Rather than leave a flag whose safety depends on
+    /// never being turned off, this now tracks STORAGE: a declared column means
+    /// a tombstone may be down there, whatever the writer is doing today.
+    ///
+    /// The cost is that a table which declares the column but has never
+    /// tombstoned anything gives up the stats fast path. That is the right side
+    /// to err on — the alternative silently over-counts. A table that genuinely
+    /// wants the fast path simply must not declare a `tombstone_column`.
     pub fn tombstones_possible(&self) -> bool {
-        self.tombstone_column.is_some() && self.version_append
+        // Deliberately does NOT consult `version_append`. Whether a tombstone can
+        // be sitting in STORAGE is a property of the data, not of whether the
+        // write path happens to be enabled right now — and `version_append` is a
+        // flag that gets toggled. It was `tombstone_column.is_some() &&
+        // version_append`, which meant turning merge-on-read OFF instantly
+        // re-enabled COUNT(*)-from-stats pushdown over files that still contain
+        // tombstoned rows, silently counting deleted rows as live (2026-08-02).
+        // Being conservative here costs a dormant table the stats fast path;
+        // being wrong resurrects deleted rows in every COUNT.
+        self.tombstone_column.is_some()
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -463,8 +487,9 @@ mod tests {
 
     /// The tombstone column must be nullable Boolean (NULL = live, so no
     /// backfill) and named by the schema — nothing hard-codes it. Exercised on
-    /// `mor_versioned`, the from-scratch fixture: it is the ONLY table allowed to
-    /// declare these columns (see the migration note above `TableSchema`).
+    /// `mor_versioned`, the from-scratch fixture. (It was once the ONLY table
+    /// allowed to declare these columns; the shipped tables joined it after the
+    /// 2026-08-02 migration — see `shipped_mor_tables_declare_the_migrated_columns_last`.)
     #[test]
     fn mor_versioned_tombstone_column_is_nullable_boolean() {
         let schema = get_schema("mor_versioned").expect("fixture registered");
@@ -473,24 +498,45 @@ mod tests {
         assert_eq!(schema.dedup_tiebreak.as_deref(), Some("updated_at"));
     }
 
-    /// The SHIPPED tables must not have gained merge-on-read columns. Adding one
-    /// to a table that already has live Delta data broke prod (7d68f01): every
-    /// existing Delta table still stores the old column set, and the write path
-    /// builds batches to the YAML's. Guards the specific columns that did it.
+    /// The SHIPPED merge-on-read tables, post-migration (2026-08-02). This guard
+    /// used to assert these tables had NO merge-on-read columns, because adding
+    /// one to a table that already holds live Delta data broke prod (7d68f01):
+    /// the stored transaction log kept the old column set while the write path
+    /// built batches to the YAML's, giving `number of columns(94) must match
+    /// number of fields(92)`.
+    ///
+    /// The migration has since been run and verified against prod
+    /// (`migrate-columns`, commit edb2fd2), so the invariant is no longer
+    /// "absent" but "declared in the SAME SHAPE AND ORDER the stored schema was
+    /// widened in" — the two columns last, nullable, and never before any
+    /// pre-existing field. Reordering them here re-creates 7d68f01 exactly.
     #[test]
-    fn shipped_tables_declare_no_merge_on_read_columns() {
+    fn shipped_mor_tables_declare_the_migrated_columns_last() {
         for name in ["otel_logs_and_spans", "otel_metrics"] {
             let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
-            assert_eq!(schema.tombstone_column, None, "{name} is a shipped table — a tombstone column needs a Delta-side migration first");
-            assert!(!schema.version_append, "{name} is a shipped table — version_append needs the columns, which need a migration");
-            for col in ["updated_at", "deleted"] {
-                assert!(schema.field_def(col).is_none(), "{name} must not declare `{col}`: prod's Delta tables have no such field (7d68f01)");
-            }
+            // `version_append` is OFF since 2026-08-02 (it forced a query-time
+            // SortExec that exhausted the query pool), but the migrated columns
+            // and the tombstone/tiebreak declarations MUST stay: tombstones and
+            // multi-version rows written while it was on are still in storage,
+            // and DedupExec + the tombstone filter are what keep them correct.
+            assert!(!schema.version_append, "{name} has merge-on-read disabled; re-enabling needs compaction to keep pace first");
+            assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"), "{name} tombstone column");
+            // Nullable, so the migration needed no backfill: NULL reads as live.
+            assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)), "{name}.deleted must be nullable Boolean");
+            assert!(matches!(schema.field_def("updated_at"), Some((ArrowDataType::Timestamp(..), true))), "{name}.updated_at must be a nullable timestamp");
+
+            // ORDER is the load-bearing part: `migrate-columns` APPENDED these,
+            // so they must be the final two fields, updated_at then deleted.
+            let tail: Vec<&str> = schema.fields.iter().rev().take(2).map(|f| f.name.as_str()).collect();
+            assert_eq!(tail, vec!["deleted", "updated_at"], "{name}: the migrated columns must be the LAST two fields, in migration order (7d68f01)");
         }
-        // The tiebreaks these tables actually ship with — client-supplied, and
-        // therefore never stamped (see `insert_coerce::stamp_column`).
-        assert_eq!(get_schema("otel_logs_and_spans").unwrap().dedup_tiebreak.as_deref(), Some("observed_timestamp"));
-        assert_eq!(get_schema("otel_metrics").unwrap().dedup_tiebreak.as_deref(), Some("ingested_at"));
+        // The tiebreak MUST be the TF-owned column, not the client's:
+        // `insert_coerce::stamp_version` OVERWRITES whatever this names, so
+        // pointing it back at `observed_timestamp` / `ingested_at` would destroy
+        // client data on every write.
+        for name in ["otel_logs_and_spans", "otel_metrics"] {
+            assert_eq!(get_schema(name).unwrap().dedup_tiebreak.as_deref(), Some("updated_at"), "{name} must break ties on the TF-owned stamp");
+        }
     }
 
     #[test]
@@ -510,15 +556,24 @@ mod tests {
     /// reading it off the column alone cost every `COUNT(*)` on the main table
     /// its fast path (pre-deploy review, 2026-07-31).
     #[test]
-    fn tombstones_possible_needs_the_write_path_too() {
+    fn tombstones_possible_tracks_storage_not_the_write_path() {
         let parse = |extra: &str| parse_schema(extra, FIELDS_YAML);
 
         assert!(!parse("").tombstones_possible(), "no tombstone column at all");
-        assert!(!parse("tombstone_column: deleted\n").tombstones_possible(), "declared but dormant → no tombstone can exist");
+        // A declared column means a tombstone MAY sit in storage, whatever the
+        // write path is doing now — `version_append` is a flag that gets toggled,
+        // and turning it off does not delete the tombstones already written.
+        // Consulting it here let COUNT(*)-from-stats count deleted rows as live
+        // the moment merge-on-read was disabled (2026-08-02).
+        assert!(parse("tombstone_column: deleted\n").tombstones_possible(), "declared column ⇒ tombstones may exist even with the write path off");
         assert!(parse("tombstone_column: deleted\nversion_append: true\n").tombstones_possible(), "write path on → tombstones can exist");
-        // The live schemas, as shipped.
-        assert!(!get_schema("otel_logs_and_spans").unwrap().tombstones_possible());
+        // The live schemas. otel has `version_append: false` since 2026-08-02 but
+        // KEEPS its tombstone column, so it must stay conservative.
+        assert!(get_schema("otel_logs_and_spans").unwrap().tombstones_possible(), "otel still holds tombstones written while MOR was on");
         assert!(get_schema("mor_versioned").unwrap().tombstones_possible());
+        // `mor_dormant` declares a tiebreak but NO tombstone column, so nothing
+        // could ever have tombstoned it — the stats fast path stays available.
+        assert!(!get_schema("mor_dormant").unwrap().tombstones_possible());
     }
 
     #[test]

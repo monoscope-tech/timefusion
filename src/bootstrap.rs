@@ -14,7 +14,7 @@ use datafusion::execution::context::SessionContext;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    buffered_write_layer::{BufferedWriteLayer, DeltaWatermark, DeltaWriteCallback},
+    buffered_write_layer::{BufferedWriteLayer, DeltaWatermark},
     config::AppConfig,
     database::Database,
 };
@@ -44,14 +44,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     let mut db = Database::with_config(Arc::clone(&cfg)).await?;
     tracing::info!("bootstrap.phase=database_init elapsed_ms={}", t_db.elapsed().as_millis());
 
-    let db_for_callback = db.clone();
-    let delta_write_callback: DeltaWriteCallback =
-        Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
-            let db = db_for_callback.clone();
-            // insert_records_batch warms the just-flushed files itself
-            // (watermark-gated) — warming here too would double the GETs.
-            Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await })
-        });
+    let delta_write_callback = delta_write_callback(&db);
 
     let mut session_context = Arc::new(db.clone()).create_session_context();
     db.setup_session_udfs(&mut session_context)?;
@@ -119,6 +112,23 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
 }
 
 /// The C3 coalescing flush writer: hands the whole tick's groups to
+/// The per-bucket Delta write a flush hands its rows to. Shared by `bootstrap`,
+/// `main` AND the test harnesses, because a layer built WITHOUT it does not
+/// fail — `flush_bucket` logs "No delta write callback configured, skipping
+/// flush" and drains the bucket anyway. A test layer missing this therefore
+/// silently discards every flushed row while `is_empty()` reports success
+/// (2026-08-02: `buffer_consistency_test` asserted exactly that and passed for
+/// as long as its DML never routed through a flush).
+pub fn delta_write_callback(db: &crate::database::Database) -> crate::buffered_write_layer::DeltaWriteCallback {
+    let db = db.clone();
+    Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
+        let db = db.clone();
+        // insert_records_batch warms the just-flushed files itself
+        // (watermark-gated) — warming here too would double the GETs.
+        Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await })
+    })
+}
+
 /// `insert_records_batches_coalesced`, which emits one Delta commit per
 /// PHYSICAL table. Shared by `bootstrap` and `main` so the e2e path and prod
 /// wire the identical callback. Only used when
