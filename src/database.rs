@@ -1673,6 +1673,16 @@ pub struct Database {
     /// allocates outside every pool, and authorising GBs of that on a 26 GB box
     /// is what took prod down on 2026-08-01.
     flush_sort_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Caps how many spilling flush sorts share `flush_sort_runtime_env` at
+    /// once. The pool is a `FairSpillPool`, so N concurrent sorts each get
+    /// ~pool/N; below a viable slice `ExternalSorterMerge` cannot merge its
+    /// spill files and the sort fails with "Not enough memory to continue
+    /// external sort" (prod, 2026-08-02). The caller then writes the group
+    /// UNSORTED, and a single file with no `sorting_columns` footer disables
+    /// the reader's all-or-nothing ordering for every scan touching that
+    /// partition — so pool starvation shows up as slow queries, not as an
+    /// error. Serialising a few oversized sorts is much cheaper than that.
+    flush_sort_gate: Arc<tokio::sync::Semaphore>,
     /// Memoized `build_optimize_session_state` results, one per runtime env.
     /// Building a `SessionState` re-registers every analyzer/optimizer rule and
     /// the whole UDF/UDAF set; the maintenance loop did that on EVERY optimize
@@ -2244,6 +2254,10 @@ impl Database {
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1);
+        // Each concurrent spilling sort needs a workable slice of the shared
+        // FairSpillPool or its merge phase starves — see `flush_sort_gate`.
+        const MIN_SPILL_SORT_BYTES: usize = 512 << 20;
+        let flush_sort_permits = (cfg.maintenance.flush_sort_pool_bytes() / MIN_SPILL_SORT_BYTES).max(1);
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         let db = Self {
@@ -2251,6 +2265,7 @@ impl Database {
             runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            flush_sort_gate: Arc::new(tokio::sync::Semaphore::new(flush_sort_permits)),
             flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
             light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
@@ -4197,6 +4212,10 @@ impl Database {
     /// a sort failure.
     async fn sort_flush_group_spilling(&self, schema: &crate::schema_loader::TableSchema, batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
         use datafusion::{datasource::MemTable, prelude::SessionContext};
+        // Hold a slice of the shared spill pool for the whole sort. Queueing
+        // here costs latency on an already-oversized group; losing the slice
+        // costs the partition's footer ordering on every later scan.
+        let _slice = self.flush_sort_gate.acquire().await.ok()?;
         let first = batches.first()?.schema();
         // Schema-diverse buckets (an evolved nullable column) must be unified
         // before MemTable will accept them; give up rather than guess.
