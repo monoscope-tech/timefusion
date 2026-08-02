@@ -79,7 +79,10 @@ use datafusion::{
         row::{RowConverter, SortField},
     },
     error::{DataFusionError, Result as DFResult},
-    execution::TaskContext,
+    execution::{
+        TaskContext,
+        memory_pool::{MemoryConsumer, MemoryReservation},
+    },
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, stream::RecordBatchStreamAdapter,
     },
@@ -338,8 +341,19 @@ impl ExecutionPlan for DedupExec {
         // strictly cheaper than the sort it replaces, and it keeps the operator
         // CORRECT, where the old unbounded fallback (keep-first) would serve the
         // pre-update row.
-        let greatest =
-            self.tiebreak.as_ref().and_then(|tb| in_schema.index_of(tb).ok()).map(|idx| Greatest::new(idx, in_schema.field(idx).data_type())).transpose()?;
+        // The run buffer is REAL heap the pool must see: unbounded keep-greatest
+        // holds the whole scan's batches until end-of-stream, and untracked
+        // that is exactly the anon-RSS growth that OOM-killed prod on
+        // 2026-08-03 (kernel: anon-rss 125GB against a 120GiB cgroup). Under
+        // the pool an oversized window fails ITS query with
+        // ResourcesExhausted; the server survives.
+        let reservation = MemoryConsumer::new("DedupExec[keep-greatest]").register(context.memory_pool());
+        let greatest = self
+            .tiebreak
+            .as_ref()
+            .and_then(|tb| in_schema.index_of(tb).ok())
+            .map(|idx| Greatest::new(idx, in_schema.field(idx).data_type(), reservation))
+            .transpose()?;
         let dedup = Dedup {
             key_idxs: self.key_idxs.clone(),
             conv: RowConverter::new(self.key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
@@ -393,12 +407,15 @@ struct Greatest {
     best: HashMap<Box<[u8]>, Cand, ahash::RandomState>,
     batches: Vec<RecordBatch>,
     bytes: usize,
+    /// Pool accounting for `batches` (`bytes` mirrors its size). The winner
+    /// map is second-order (one small entry per key) and stays untracked.
+    reservation: MemoryReservation,
 }
 
 impl Greatest {
-    fn new(idx: usize, dt: &DataType) -> DFResult<Self> {
+    fn new(idx: usize, dt: &DataType, reservation: MemoryReservation) -> DFResult<Self> {
         let sf = SortField::new_with_options(dt.clone(), SortOptions { descending: false, nulls_first: true });
-        Ok(Self { idx, conv: RowConverter::new(vec![sf]).map_err(arrow_err)?, best: HashMap::default(), batches: Vec::new(), bytes: 0 })
+        Ok(Self { idx, conv: RowConverter::new(vec![sf]).map_err(arrow_err)?, best: HashMap::default(), batches: Vec::new(), bytes: 0, reservation })
     }
 
     /// Emit the run's winners in input position order and reset. `partial` (a
@@ -407,6 +424,7 @@ impl Greatest {
     /// degrades to keep-first.
     fn flush(&mut self, output_projection: Option<&[usize]>, seen: &mut SeenSet, partial: bool) -> DFResult<Vec<RecordBatch>> {
         self.bytes = 0;
+        self.reservation.free();
         let batches = std::mem::take(&mut self.batches);
         if self.best.is_empty() {
             return Ok(Vec::new());
@@ -484,11 +502,20 @@ impl Dedup {
             if g.best.get(key).is_some_and(|c| tb <= &c.tb[..]) {
                 continue;
             }
-            let bi = *cur.get_or_insert_with(|| {
-                g.batches.push(batch.clone());
-                g.bytes += batch.get_array_memory_size();
-                g.batches.len() as u32 - 1
-            });
+            let bi = match cur {
+                Some(bi) => bi,
+                None => {
+                    // Pool BEFORE buffering: on ResourcesExhausted the query
+                    // fails here instead of the cgroup killing the server.
+                    let size = batch.get_array_memory_size();
+                    g.reservation.try_grow(size)?;
+                    g.batches.push(batch.clone());
+                    g.bytes += size;
+                    let bi = g.batches.len() as u32 - 1;
+                    cur = Some(bi);
+                    bi
+                }
+            };
             g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into() });
         }
         Ok(out)
@@ -711,6 +738,30 @@ mod tests {
         assert_eq!(collect_rows(&plan).await, vec![("c".into(), 30, Some(4))]);
     }
 
+    /// The unbounded run buffer must be POOL-TRACKED: untracked it grows with
+    /// the whole scan as anon heap the cgroup cannot see coming, which
+    /// OOM-killed prod on 2026-08-03 (kernel: anon-rss 125GB / 120GiB limit).
+    /// Under a pool the oversized query fails with ResourcesExhausted and the
+    /// server survives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unbounded_run_buffer_is_pool_tracked_so_an_oversized_scan_fails_its_query() {
+        use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
+        let batches: Vec<RecordBatch> = (0..64).map(|i| vbatch(&[format!("k{i}").as_str()], &[i], &[Some(i)])).collect();
+        let plan = unbounded_greatest_plan(batches);
+        let runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(512))).build_arc().unwrap();
+        let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+        let mut stream = plan.execute(0, ctx).unwrap();
+        let mut err = None;
+        while let Some(r) = futures::StreamExt::next(&mut stream).await {
+            if let Err(e) = r {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("a 512-byte pool must refuse the run buffer");
+        assert!(format!("{err}").contains("Resources exhausted"), "must fail with the pool's error, got: {err}");
+    }
+
     /// EXPLAIN must distinguish the SURVIVOR rule, not just the seen-set size:
     /// `full-set/first` silently serves the pre-update row under merge-on-read,
     /// while `full-set/greatest` is correct. They were indistinguishable before.
@@ -910,7 +961,10 @@ mod tests {
             output_projection: None,
             seen: SeenSet::default(),
             bound: Some(Bound { idx: 1, desc: false, last: None }),
-            greatest: Some(Greatest::new(2, in_schema.field(2).data_type()).unwrap()),
+            greatest: Some(
+                Greatest::new(2, in_schema.field(2).data_type(), MemoryConsumer::new("test").register(&Arc::new(TaskContext::default()).memory_pool().clone()))
+                    .unwrap(),
+            ),
         };
         for t in 0..200i64 {
             d.push(&vbatch(&["a", "b", "a"], &[t, t, t], &[Some(1), Some(1), Some(2)])).unwrap();
