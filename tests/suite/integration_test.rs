@@ -4,7 +4,6 @@ mod integration {
 
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
-    use rand::RngExt;
     use serial_test::serial;
     use timefusion::{database::Database, test_utils::test_helpers::minio_test_config};
     use tokio::sync::Notify;
@@ -22,7 +21,9 @@ mod integration {
             timefusion::test_utils::init_test_logging();
 
             let test_id = Uuid::new_v4().to_string();
-            let port = 5433 + rand::rng().random_range(1..100) as u16;
+            // Kernel-assigned free port: tests now run as concurrent processes,
+            // and a random pick from a 100-wide window collides.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
 
             let cfg = minio_test_config(&test_id, &format!("/tmp/timefusion-{test_id}"));
 

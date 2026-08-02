@@ -15,7 +15,6 @@ mod connection_pressure {
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
     use dotenv::dotenv;
-    use rand::RngExt;
     use serial_test::serial;
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::timeout};
@@ -34,7 +33,10 @@ mod connection_pressure {
             dotenv().ok();
 
             let test_id = Uuid::new_v4().to_string();
-            let port = 6433 + rand::rng().random_range(1..100) as u16;
+            // Kernel-assigned free port, not a random pick from a 100-wide
+            // window: these servers now start concurrently with every other
+            // test process, and a collision wedges the whole run.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
 
             unsafe {
                 std::env::set_var("PGWIRE_PORT", port.to_string());

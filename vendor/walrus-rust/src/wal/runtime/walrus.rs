@@ -51,6 +51,13 @@ impl Walrus {
         Self::with_paths(paths, mode, fsync_schedule)
     }
 
+    /// Open a WAL rooted at an explicit directory, bypassing `WALRUS_DATA_DIR`.
+    /// Required whenever more than one instance lives in a process — the env
+    /// var is global, so instances that fall back to it collide.
+    pub fn with_root(root: impl Into<std::path::PathBuf>, mode: ReadConsistency, fsync_schedule: FsyncSchedule) -> std::io::Result<Self> {
+        Self::with_paths(Arc::new(WalPathManager::under(root.into())), mode, fsync_schedule)
+    }
+
     pub fn new_for_key(key: &str) -> std::io::Result<Self> {
         Self::with_consistency_for_key(key, ReadConsistency::StrictlyAtOnce)
     }

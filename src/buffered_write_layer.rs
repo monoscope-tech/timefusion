@@ -3104,8 +3104,6 @@ mod tests {
     async fn test_insert_and_query() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
@@ -3133,8 +3131,6 @@ mod tests {
         // Explicit: the shipped default is 0 (tier off for its first release),
         // so this test must opt the tier in rather than inherit it.
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_hot_tier_retention_hours = 6);
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let (project, table) = (format!("hp{test_id}"), format!("ht{test_id}"));
 
@@ -3176,8 +3172,6 @@ mod tests {
     async fn coalesced_flush_hands_every_project_to_one_writer_call() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_flush_coalesce_commits = true);
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let table = format!("cc{test_id}");
@@ -3248,8 +3242,6 @@ mod tests {
     async fn coalesced_commit_failure_requeues_every_project() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_flush_coalesce_commits = true);
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let table = format!("cf{test_id}");
@@ -3313,8 +3305,6 @@ mod tests {
     async fn coalesced_writer_short_result_vector_fails_every_group() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_flush_coalesce_commits = true);
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let table = format!("cs{test_id}");
@@ -3343,8 +3333,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
         assert!(!cfg.buffer.flush_coalesce_commits(), "coalescing must default to OFF");
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let table = format!("cd{test_id}");
@@ -3382,9 +3370,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment. We use #[serial]
-        // to prevent concurrent access to this process-global state.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
@@ -3426,8 +3411,6 @@ mod tests {
     async fn wal_replay_restores_entries_older_than_retention() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("ar{}", test_id);
@@ -3467,8 +3450,6 @@ mod tests {
         let dir = tempdir().unwrap();
         // First life: default (roomy) budget so the backlog can be acked into the WAL.
         let cfg_big = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg_big.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("bb{}", test_id);
@@ -3567,8 +3548,6 @@ mod tests {
     async fn resumable_replay_after_crash_skips_drained_prefix() {
         let dir = tempdir().unwrap();
         let cfg_big = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg_big.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("rr{}", test_id);
@@ -3654,8 +3633,6 @@ mod tests {
     async fn resumable_replay_multi_topic_no_loss_across_crash() {
         let dir = tempdir().unwrap();
         let cfg_big = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg_big.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         // Two distinct tenants → two WAL topics replayed sequentially.
@@ -3751,8 +3728,6 @@ mod tests {
     async fn flush_advance_must_not_consume_open_bucket_entries() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("wm{}", test_id);
@@ -3801,8 +3776,6 @@ mod tests {
     async fn delete_during_airborne_commit_sticks_across_crash() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("dd{}", test_id);
@@ -3871,8 +3844,6 @@ mod tests {
     async fn sealed_rows_stay_queryable_during_flush_commit() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("vz{}", test_id);
@@ -3923,8 +3894,6 @@ mod tests {
     async fn corruption_threshold_boots_instead_of_crash_looping() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_wal_corruption_threshold = 1);
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("cr{}", test_id);
@@ -3970,8 +3939,6 @@ mod tests {
     async fn dml_entry_survives_unrelated_flush_and_crash() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("dm{}", test_id);
@@ -4022,8 +3989,6 @@ mod tests {
     async fn update_with_timestamp_predicate_replays_after_restart() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("tp{}", test_id);
@@ -4068,8 +4033,6 @@ mod tests {
         let dir = tempdir().unwrap();
         // budget=1s, flush_deadline=0.8s
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 1);
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("s{}", test_id);
         let table = format!("s{}", test_id);
@@ -4113,8 +4076,6 @@ mod tests {
     async fn shutdown_claims_drained_when_flush_completes() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("d{}", test_id);
         let table = format!("d{}", test_id);
@@ -4142,8 +4103,6 @@ mod tests {
     async fn orphaned_holds_park_recovery_cursor_and_pin_gc_floor() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
         let shards = layer.wal.shards_per_topic();
 
@@ -4179,8 +4138,6 @@ mod tests {
         use datafusion::logical_expr::col;
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("u{}", test_id);
         let table = format!("u{}", test_id);
@@ -4220,8 +4177,6 @@ mod tests {
     async fn shutdown_deadline_preserves_landed_commits_bookkeeping() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 1);
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let fast = format!("f{}", test_id);
         let slow = format!("w{}", test_id);
@@ -4266,8 +4221,6 @@ mod tests {
     async fn flush_all_now_exempts_surviving_open_bucket_from_exclusion() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("o{}", test_id);
         let table = format!("o{}", test_id);
@@ -4332,8 +4285,6 @@ mod tests {
         };
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("q{}", test_id);
         let table = format!("q{}", test_id);
@@ -4401,8 +4352,6 @@ mod tests {
     async fn version_stamp_is_durable_and_seeds_the_clock_at_boot() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         // `mor_versioned` — the only table whose tiebreak TF owns. The WAL and
         // MemBuffer legs under test are schema-free, so an otel-shaped batch is
         // fine; what matters is that `stamp_version` fires for this table name.
@@ -4451,8 +4400,6 @@ mod tests {
     async fn boot_redrives_quarantined_insert_payloads() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("r{}", test_id);
         let table = format!("r{}", test_id);
@@ -4469,6 +4416,7 @@ mod tests {
         // Build the layer FIRST: walrus's boot dir scan reads any pre-existing
         // top-level file as a WAL segment, and quarantine payloads aren't that.
         let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+        let wal_dir = cfg.core.wal_dir();
         let qdir = wal_dir.join("quarantine");
         std::fs::create_dir_all(&qdir).unwrap();
         let meta = |kind: &str| format!("ts_micros=1\nproject_id={project}\ntable_name={table}\noperation=Insert\nkind={kind}\nreason=x\nbytes=0\n");
@@ -4529,8 +4477,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        // Walrus reads WALRUS_DATA_DIR from env — serialize for safety.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("b{}", test_id);
@@ -4583,7 +4529,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("u{}", test_id);
@@ -4634,8 +4579,6 @@ mod tests {
     async fn test_pressure_pct() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("p{}", test_id);
         let table = format!("t{}", test_id);
@@ -4659,8 +4602,6 @@ mod tests {
     async fn wal_holds_recorded_on_insert() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("c{}", test_id);
         let table = format!("c{}", test_id);
@@ -4692,7 +4633,6 @@ mod tests {
 
         // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial]
         // protects the global.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("o{}", test_id);
@@ -4746,8 +4686,6 @@ mod tests {
     async fn flush_callback_receives_per_shard_watermark() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("w{}", test_id);
@@ -4812,8 +4750,6 @@ mod tests {
         let dir = tempdir().unwrap();
         // 64MB floor → hard limit ~76.8MB
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_buffer_max_memory_mb = 64);
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("bp{}", test_id);
@@ -4872,8 +4808,6 @@ mod tests {
         let dir = tempdir().unwrap();
         // 64MB floor → hard limit ~76.8MB
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_buffer_max_memory_mb = 64);
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let (project, table) = (format!("cb{test_id}"), format!("cb{test_id}"));
@@ -4923,8 +4857,6 @@ mod tests {
             c.buffer.timefusion_write_backpressure_secs = 0; // exhaust immediately
             c.buffer.timefusion_wal_admit_decouple = decouple;
         });
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let mut layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
         layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
         let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
@@ -4993,8 +4925,6 @@ mod tests {
     async fn force_flush_current_bucket_drains_open_window() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("fc{}", test_id);
@@ -5029,8 +4959,6 @@ mod tests {
     async fn force_flush_with_stuck_completed_bucket_keeps_it_durable() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("g{}", test_id);
@@ -5078,8 +5006,6 @@ mod tests {
     async fn force_flush_isolates_stuck_tenant() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let t1 = format!("a{}", test_id); // stuck tenant: completed bucket, never flushed
@@ -5126,8 +5052,6 @@ mod tests {
         let dir = tempdir().unwrap();
         // 1s flush-bucket timeout trips the watchdog fast
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_flush_bucket_timeout_secs = 1);
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("w{}", test_id);
@@ -5155,8 +5079,6 @@ mod tests {
     async fn test_memory_reservation() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
@@ -5182,8 +5104,6 @@ mod tests {
     async fn insert_rejected_while_wal_hard_backpressure_set() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let wal_dir = cfg.core.wal_dir();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(std::path::Path::new(&wal_dir));
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let (project, table) = (format!("w{test_id}"), format!("w{test_id}"));
         let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();

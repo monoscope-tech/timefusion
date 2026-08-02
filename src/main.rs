@@ -54,10 +54,9 @@ fn main() -> anyhow::Result<()> {
     // Initialize global config from environment - validates all settings upfront
     let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
 
-    // Set WALRUS_DATA_DIR before Tokio runtime starts (required by walrus-rust)
-    // SAFETY: No threads exist yet - we're before tokio::runtime::Builder
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
-
+    // (No WALRUS_DATA_DIR here any more: `WalManager` passes `cfg.core.wal_dir()`
+    // to `Walrus::with_root`, so the WAL location is a parameter rather than a
+    // process-global. Same on-disk path, minus the global.)
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     match subcommand.as_deref() {
         Some("redrive-dml") => rt.block_on(run_redrive_dml_cli(cfg)),

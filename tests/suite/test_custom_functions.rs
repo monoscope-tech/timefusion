@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod test_custom_functions {
+mod tests {
     use anyhow::Result;
     use datafusion::prelude::*;
     use timefusion::{functions::register_custom_functions, test_utils::test_helpers::array_get_str as get_str};

@@ -28,6 +28,14 @@ impl WalPathManager {
         Self { root }
     }
 
+    /// Root supplied by the caller instead of read from `WALRUS_DATA_DIR`.
+    /// The env var is process-global, so two `Walrus` instances in one process
+    /// (every concurrent test) otherwise share one WAL directory and corrupt
+    /// each other's blocks.
+    pub(crate) fn under(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub(crate) fn ensure_root(&self) -> std::io::Result<()> {
         fs::create_dir_all(&self.root)
     }

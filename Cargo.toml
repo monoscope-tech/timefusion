@@ -3,6 +3,10 @@ name = "timefusion"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+# Integration tests are ONE target (`tests/suite/main.rs`), not one per file.
+# Auto-discovery would resurrect the per-file targets, and each is a separate
+# full link of a ~100 MB binary against 1200+ deps — 26 links per source edit.
+autotests = false
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
@@ -181,6 +185,10 @@ tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_mall
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 
 [[test]]
+name = "suite"
+path = "tests/suite/main.rs"
+
+[[test]]
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e"]
@@ -196,6 +204,13 @@ required-features = ["e2e"]
 # bulk of debuginfo, cutting codegen + link time on this large crate.
 [profile.dev]
 debug = "line-tables-only"
+# Deliberately NOT `[profile.dev.package."*"] opt-level = 2`. Measured
+# 2026-08-02: it takes the suite from 72s to 63s (11%) — the tail is
+# `kill_recovery` spawning server processes, which is startup- and S3-bound, not
+# CPU-bound — and costs a 13-minute dependency rebuild (4800s of CPU, so ~20min
+# on a 4-vCPU CI runner) every time Cargo.lock moves. It also broke
+# `test_update_from_does_not_block_readers_or_writers`, whose merge got too fast
+# to observe. Not worth it; don't re-run the experiment.
 
 [profile.release]
 lto = "thin"

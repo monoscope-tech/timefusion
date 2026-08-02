@@ -41,21 +41,17 @@ jobs:
   build-test:
     name: Clippy & Test (shard ${{ matrix.shard }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # The test run is the dominant cost: `cargo test` runs the ~24 integration
-    # binaries strictly serially, each re-bootstrapping MinIO/Delta, and the
-    # tantivy/sqllogictest suites dominate — serial runs blew past the 45m cap
-    # (2026-07-20, cancelled). We shard across 4 isolated runners with nextest's
-    # `--partition`, which distributes every test across shards (no target left
-    # unrun, unlike hand-listing `--test` targets) so wall-clock ≈ slowest shard.
-    # `--test-threads=1` per shard is REQUIRED for correctness: many tests are
-    # `#[serial]` because they share the process-global `WALRUS_DATA_DIR`, and
-    # nextest's process-per-test model ignores `serial_test`'s in-process lock
-    # (verified: 9/9 tantivy_e2e fail concurrent). Single-threaded per runner
-    # reproduces today's sequential-per-binary semantics safely.
+    # Tests run concurrently now. The old `--test-threads=1` was there because
+    # every `WalManager` shared the process-global `WALRUS_DATA_DIR`, so two
+    # concurrent tests corrupted each other's WAL (9/9 tantivy_e2e failed).
+    # `Walrus::with_root` takes the directory as a parameter, so each test's
+    # config already isolates it and the serialization is no longer needed.
+    # Two shards rather than four: a full parallel run is ~1.5 min of test time
+    # locally, so the job is dominated by the build, which sharding doesn't help.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2]
     # Warm-cache runs finish in ~13m, but a Cargo.lock change busts the
     # rust-cache key and forces a full cold recompile, which alone can approach
     # the old 25m cap and starve the (S3-integration-heavy) test run — the
@@ -81,7 +77,6 @@ jobs:
       ENABLE_BATCH_QUEUE: "true"
       MAX_PG_CONNECTIONS: "100"
       AWS_S3_LOCKING_PROVIDER: ""
-      WALRUS_DATA_DIR: /tmp/walrus-wal
       # Use small cache sizes for CI tests (similar to test_config in object_store_cache.rs)
       TIMEFUSION_FOYER_MEMORY_MB: "10"
       TIMEFUSION_FOYER_DISK_MB: "50"
@@ -141,7 +136,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
 
-      # Clippy is shard-independent — run it once (on shard 1) instead of 4×.
+      # Clippy is shard-independent — run it once (on shard 1) instead of per-shard.
       # `cargo lint` is the alias in `.cargo/config.toml`; `make lint` and the
       # `prepush` gate call the same one, so local and CI cannot drift.
       - name: Clippy
@@ -155,11 +150,8 @@ jobs:
       # 2026-07-20). The e2e suite is owned by the `e2e` job below (single-
       # threaded); the only other features are `test` (unused) and `profiling`
       # (prod-only, already lint-covered by the Clippy step's --all-features).
-      #
-      # See the job-level comment for why `--test-threads=1` is required.
-      # `--no-fail-fast` so one failure still reports the rest of the shard.
       - name: Test
-        run: cargo nextest run --locked --no-fail-fast --test-threads=1 --partition hash:${{ matrix.shard }}/4
+        run: cargo nextest run --profile ci --locked --partition hash:${{ matrix.shard }}/2
 
   # E2E suite: full pgwire → BufferedWriteLayer → WAL → Delta path against a
   # per-test MinIO via testcontainers. Runs in its own job so failures are
@@ -183,8 +175,13 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: e2e
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+      # Capped at 2 concurrent: each e2e test starts its own MinIO container, and
+      # more than a couple at a time swamps a 4-vCPU runner (the 2026-07-20
+      # cold_start timeout). The WAL is per-test-config now, so the old
+      # `--test-threads=1` is no longer a correctness requirement.
       - name: E2E
-        # --test-threads=1: walrus-rust reads WALRUS_DATA_DIR from process
-        # env, so per-test WAL isolation requires serialization.
-        run: cargo test --test e2e --features e2e --locked -- --test-threads=1 --nocapture
+        run: cargo nextest run --profile ci --features e2e --locked -E 'binary(e2e)' --test-threads 2
 
