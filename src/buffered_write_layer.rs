@@ -691,6 +691,50 @@ impl BufferedWriteLayer {
         self.effective_memory_bytes() >= self.max_memory_bytes()
     }
 
+    /// The stall watchdog's budget for ONE commit, scaled by how much ingest
+    /// headroom is left.
+    ///
+    /// A fixed budget cannot work here, and prod has now been wedged from BOTH
+    /// ends of the trade:
+    ///
+    /// - 120s aborted legitimate multi-GB post-replay drains, wasting the work
+    ///   and retrying forever while MemBuffer grew to the memcg limit
+    ///   (2026-07-02: stalled=42 vs flush-ok=22, RSS 89GB).
+    /// - 600s let ONE hung commit hold the global `flush_lock` for ten minutes.
+    ///   Nothing else can flush meanwhile, so MemBuffer reaches the 24 GB ingest
+    ///   cap, every tenant's INSERT is rejected with "Memory limit exceeded",
+    ///   and the box OOMs (exit 137) — the recurring wedge, where reads hang
+    ///   while `SELECT 1` stays instant.
+    ///
+    /// The fault is treating this as a question about the COMMIT when it is a
+    /// question about the BUFFER: the watchdog exists to stop a stuck commit
+    /// from starving ingest, so its urgency should come from how close ingest is
+    /// to starving. With headroom, a slow-but-progressing drain is harmless and
+    /// gets the full budget. As the buffer fills, the budget contracts toward
+    /// `MIN_FLUSH_TIMEOUT` so the lock is released while there is still room to
+    /// retry — which is exactly when relief needs it.
+    ///
+    /// 0 (watchdog disabled) stays disabled.
+    fn adaptive_flush_timeout(&self) -> Duration {
+        let base = self.config.buffer.flush_bucket_timeout();
+        if base.is_zero() {
+            return base;
+        }
+        const MIN_FLUSH_TIMEOUT: Duration = Duration::from_secs(45);
+        // Headroom below this fraction of the cap starts contracting the budget;
+        // at the cap it is the floor.
+        const RELAXED_BELOW: f64 = 0.5;
+        let (used, max) = (self.effective_memory_bytes() as f64, self.max_memory_bytes().max(1) as f64);
+        let pressure = (used / max).clamp(0.0, 1.0);
+        if pressure <= RELAXED_BELOW {
+            return base;
+        }
+        // Linear from `base` at RELAXED_BELOW down to the floor at the cap.
+        let span = (base.saturating_sub(MIN_FLUSH_TIMEOUT)).as_secs_f64();
+        let scale = (1.0 - pressure) / (1.0 - RELAXED_BELOW);
+        MIN_FLUSH_TIMEOUT + Duration::from_secs_f64(span * scale)
+    }
+
     /// Above the hard reservation ceiling (budget + headroom) — the point at
     /// which live writers are rejected. WAL replay parks on this rather than
     /// on `is_memory_pressure` so it can keep overlapping with an in-flight
@@ -2022,7 +2066,7 @@ impl BufferedWriteLayer {
         // an un-timed-out hang would pin `flush_lock` forever. On elapse every
         // group fails and retries next cycle; rows stay durable in MemBuffer + WAL.
         let expected = units.len();
-        let timeout = self.config.buffer.flush_bucket_timeout();
+        let timeout = self.adaptive_flush_timeout();
         let commit = callback(units);
         let results = if timeout.is_zero() {
             commit.await
@@ -2270,7 +2314,7 @@ impl BufferedWriteLayer {
             // dedup_keys (write-side) and DedupExec (read-side) collapse the
             // duplicates, and a slow-but-successful commit is rare next to a
             // truly hung one; size the timeout well above normal commit p99.
-            let timeout = self.config.buffer.flush_bucket_timeout();
+            let timeout = self.adaptive_flush_timeout();
             if timeout.is_zero() {
                 commit.await?
             } else {
@@ -2286,8 +2330,21 @@ impl BufferedWriteLayer {
                     })??
             }
         } else {
-            warn!("No delta write callback configured, skipping flush");
-            Vec::new()
+            // A missing callback must FAIL the flush, never "succeed" having
+            // written nothing. The caller treats Ok as "the rows are durable in
+            // Delta" and drains them out of MemBuffer + advances the WAL
+            // watermark, so returning Ok here destroyed every row in the bucket
+            // and left only a warn line — while `layer.is_empty()` and the flush
+            // metrics both reported success. Failing puts it on the same footing
+            // as a Delta/S3 commit failure: rows stay durable in MemBuffer + WAL
+            // and the next cycle retries. (`drain_to_budget` already declines to
+            // run without a callback, so this cannot spin.)
+            return Err(anyhow::anyhow!(
+                "no delta write callback configured for {}.{} — refusing to drain bucket {} (rows stay in MemBuffer + WAL)",
+                bucket.project_id,
+                bucket.table_name,
+                bucket.bucket_id
+            ));
         };
         self.index_flushed_files(bucket, batches, added_files);
         Ok(())
@@ -2854,7 +2911,9 @@ impl BufferedWriteLayer {
 
     /// Query and return partitioned data - one partition per time bucket.
     /// This enables parallel execution across time buckets in DataFusion.
-    pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr]) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    pub fn query_partitioned(
+        &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr],
+    ) -> anyhow::Result<crate::mem_buffer::MemLeg> {
         self.mem_buffer.query_partitioned(project_id, table_name, filters)
     }
 
@@ -2865,7 +2924,7 @@ impl BufferedWriteLayer {
     /// behavior when `node` is None or the table has no indexed fields.
     pub fn query_partitioned_with_text_match(
         &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr], node: Option<&crate::tantivy_index::udf::PredNode>,
-    ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    ) -> anyhow::Result<crate::mem_buffer::MemLeg> {
         self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, node)
     }
 
@@ -3088,6 +3147,38 @@ mod tests {
         cfg.core.timefusion_data_dir = data_dir;
         tweak(&mut cfg);
         Arc::new(cfg)
+    }
+
+    /// The stall watchdog must contract as ingest headroom disappears. Both
+    /// fixed values wedged prod: 120s aborted legitimate multi-GB drains into a
+    /// retry loop (2026-07-02), 600s let a hung commit hold the global
+    /// `flush_lock` until the ingest buffer filled and every INSERT was
+    /// rejected (2026-08-02). The budget has to come from the buffer's state.
+    #[tokio::test]
+    async fn flush_watchdog_contracts_as_the_ingest_buffer_fills() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+
+        let ceiling = layer.config.buffer.flush_bucket_timeout();
+        let max = layer.max_memory_bytes();
+
+        // Empty buffer: a slow-but-progressing commit gets the full ceiling,
+        // because aborting it wastes the work and the retry is no faster.
+        assert_eq!(layer.adaptive_flush_timeout(), ceiling, "with headroom the watchdog must not cut a progressing commit short");
+
+        // Nearly full: the budget must be far below the ceiling, so the lock is
+        // released while there is still room left to retry into.
+        layer.reserved_bytes.store(max * 99 / 100, Ordering::Release);
+        let under_pressure = layer.adaptive_flush_timeout();
+        assert!(under_pressure < ceiling / 4, "at 99% of the ingest cap the watchdog must be aggressive, got {under_pressure:?} against a {ceiling:?} ceiling");
+        assert!(under_pressure >= Duration::from_secs(30), "...but never so short that no real commit can finish: {under_pressure:?}");
+
+        // Monotonic: more pressure never buys more time.
+        layer.reserved_bytes.store(max * 70 / 100, Ordering::Release);
+        assert!(layer.adaptive_flush_timeout() >= under_pressure, "the budget must shrink monotonically with pressure");
     }
 
     fn create_test_config(data_dir: PathBuf) -> Arc<AppConfig> {

@@ -420,10 +420,17 @@ async fn dedup_skips_single_hot_key_over_budget() -> Result<()> {
 }
 
 /// Characterization (refutes the target-dup hypothesis): a duplicated *target*
-/// row does NOT break `UPDATE ... FROM`. One source row matching multiple target
-/// rows is allowed by delta-rs — it updates all of them (count=2 here). So the
-/// prod MERGE failure is NOT caused by the over-budget dedup skip leaving target
-/// duplicates; the cardinality violation is source-side (see the next test).
+/// row does NOT break `UPDATE ... FROM`. The cardinality violation that aborted
+/// prod's MERGE is source-side (see the next test), not a consequence of the
+/// over-budget dedup skip leaving target duplicates.
+///
+/// The reported count differs by table kind, and BOTH are correct:
+/// - in-place (delta-rs MERGE): two physical rows are two rows to rewrite ⇒ 2.
+/// - merge-on-read: the two physical rows share `(id, timestamp)`, so they are
+///   ONE logical row. The scan feeding the append is post-`DedupExec`, and the
+///   single appended version supersedes both copies ⇒ 1.
+/// `otel_logs_and_spans` is merge-on-read, so 1 is the answer here; asserting 2
+/// would be asserting that the append duplicated the row.
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
@@ -449,7 +456,15 @@ async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
          WHERE project_id = '{project_id}' AND otel_logs_and_spans.id = u.id"
     );
     let updated = ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<datafusion::arrow::datatypes::UInt64Type>().value(0);
-    assert_eq!(updated, 2, "one source row must update BOTH duplicate target rows — target dups do not fail the MERGE");
+    assert_eq!(updated, 1, "the duplicate copies are ONE logical row to merge-on-read: one version appended, superseding both");
+    // The point of the test: the MERGE did not abort, and the duplicate is gone
+    // from the logical table rather than half-updated.
+    let mut ctx2 = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx2)?;
+    let rows = ctx2.sql(&format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'")).await?.collect().await?;
+    let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "both copies resolve to one current version");
+    assert_eq!(rows[0].column(0).as_string_view().value(0), "enriched", "and it is the updated one");
     Ok(())
 }
 
@@ -734,12 +749,15 @@ async fn plain_select_merges_ordered_under_dedup() -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn dormant_version_append_table_keeps_coalesce_and_no_injected_sort() -> Result<()> {
+    // `mor_dormant`, not otel: otel itself played this role until it flipped
+    // `version_append: true`, at which point asserting the dormant shape on it
+    // asserted the opposite of what ships.
     let (db, project_id) = buffered_db("mor_plan_shape_dormant").await?;
     let ts = chrono::Utc::now().timestamp_micros();
-    write(&db, &project_id, (0..8).map(|i| test_span_ts(&format!("k{i}"), "v", &project_id, ts - i * 1000)).collect(), true).await?;
-    write(&db, &project_id, vec![test_span_ts("k0", "v2", &project_id, ts)], false).await?;
+    write_to(&db, "mor_dormant", &project_id, (0..8).map(|i| mor_row(&format!("k{i}"), "v", &project_id, ts - i * 1000, None)).collect(), true).await?;
+    write_to(&db, "mor_dormant", &project_id, vec![mor_row("k0", "v2", &project_id, ts, None)], false).await?;
 
-    let plan = physical_plan(&db, &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
+    let plan = physical_plan(&db, &format!("SELECT name FROM mor_dormant WHERE project_id = '{project_id}'")).await?;
     let text = rendered(&plan);
     let dedup = find_node(&plan, "DedupExec").unwrap_or_else(|| panic!("no DedupExec in plan:\n{text}"));
     assert_eq!(dedup.children()[0].name(), "CoalescePartitionsExec", "a dormant version_append table must keep the pre-merge-on-read plan shape:\n{text}");
@@ -1167,6 +1185,97 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
     // alone would NOT have proved anything.
     let sql = format!("SELECT status_code, COUNT(*) FROM {TABLE} WHERE project_id = '{project_id}' GROUP BY status_code");
     assert_eq!(ctx.sql(&sql).await?.collect().await?.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    Ok(())
+}
+
+/// A predicate on a column an UPDATE can change must never reach a scan leg.
+///
+/// Applied at the source it selects rows by a value belonging to a SUPERSEDED
+/// version AND removes the newer version from `DedupExec`'s input, so
+/// keep-greatest returns the stale row and it passes the same filter above. The
+/// row then reads back — and for an UPDATE, gets a new version written — under a
+/// value it no longer has. Found 2026-08-02 when `integration::test_update_
+/// operations` reported 3 rows matching `status_code = 'OK'` where 2 were
+/// correct, one of them already updated to 'ERROR'.
+///
+/// `Inexact` pushdown cannot fix this: re-applying the filter above the scan
+/// cannot recover a version the source already dropped.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_on_an_updated_column_never_matches_the_superseded_version() -> Result<()> {
+    let (db, project_id) = buffered_db("mor_mutable_filter").await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    write(&db, &project_id, vec![test_span_ts("row", "before", &project_id, ts)], true).await?;
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    ctx.sql(&format!("UPDATE otel_logs_and_spans SET name = 'after' WHERE project_id = '{project_id}' AND id = 'row'")).await?.collect().await?;
+
+    let count = |ctx: datafusion::prelude::SessionContext, pid: String, name: &'static str| async move {
+        let rows = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}' AND name = '{name}'")).await?.collect().await?;
+        anyhow::Ok(rows[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0))
+    };
+    assert_eq!(count(ctx.clone(), project_id.clone(), "after").await?, 1, "the current version must match its own value");
+    assert_eq!(
+        count(ctx, project_id, "before").await?,
+        0,
+        "the superseded value must match NOTHING — a non-zero count means the filter reached a scan leg and resurrected the old version"
+    );
+    Ok(())
+}
+
+/// THE state prod is in on the first deploy after the merge-on-read flip: every
+/// row already in Delta was written before `updated_at` existed, so its stamp is
+/// NULL, while every new version carries a real one.
+///
+/// If keep-greatest let NULL win, every UPDATE after the deploy would silently
+/// do nothing — the row would keep reading back at its pre-update value with no
+/// error anywhere. The `mor_versioned` fixture cannot catch this: TF stamps
+/// everything it writes, so a legacy NULL-stamped row has to be manufactured
+/// out-of-band, exactly as the nullability-widening regression above does.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
+    const TABLE: &str = "otel_logs_and_spans";
+    let cfg = TestConfigBuilder::new("mor_null_stamp").with_buffer_mode(BufferMode::Enabled).build();
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+
+    // A normal write, to create the table.
+    db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("other", "v", &project_id, ts)])?], true, None).await?;
+
+    // Now the legacy row: written straight to Delta so nothing stamps it, which
+    // leaves `updated_at` NULL just like every pre-migration row in prod.
+    let batch = json_to_batch(vec![test_span_ts("legacy", "before", &project_id, ts)])?;
+    assert!(
+        batch.column_by_name("updated_at").is_none_or(|c| c.null_count() == c.len()),
+        "precondition: the out-of-band row must carry no stamp, or this test proves nothing"
+    );
+    let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
+    let table = deltalake::DeltaTableBuilder::from_url(url::Url::parse(&storage_uri)?)?.with_storage_options(storage_options).load().await?;
+    table.write(vec![batch]).with_schema_mode(deltalake::operations::write::SchemaMode::Merge).await?;
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let read = |ctx: datafusion::prelude::SessionContext, pid: String| async move {
+        let rows = ctx.sql(&format!("SELECT name FROM {TABLE} WHERE project_id = '{pid}' AND id = 'legacy'")).await?.collect().await?;
+        anyhow::Ok(
+            rows.iter().flat_map(|b| (0..b.num_rows()).map(|i| b.column(0).as_string_view().value(i).to_string()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(read(ctx.clone(), project_id.clone()).await?, vec!["before"], "precondition: the legacy row reads back");
+
+    ctx.sql(&format!("UPDATE {TABLE} SET name = 'after' WHERE project_id = '{project_id}' AND id = 'legacy'")).await?.collect().await?;
+
+    // The appended version carries a real stamp; the legacy row's is NULL. The
+    // stamped version MUST win, and there must be exactly one logical row left.
+    assert_eq!(
+        read(ctx, project_id).await?,
+        vec!["after"],
+        "a stamped version must beat a legacy NULL stamp — otherwise UPDATE is a silent no-op after the flip"
+    );
     Ok(())
 }
 

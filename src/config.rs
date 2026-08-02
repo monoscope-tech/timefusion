@@ -485,11 +485,17 @@ const_default!(d_pgwire_user: String = "postgres");
 // by compaction/OPTIMIZE).
 const_default!(d_flush_interval: u64 = 60);
 const_default!(d_retention_mins: u64 = 70);
-// 0 = OFF for the tier's first release: it is a new disk + page-cache consumer
-// and prod is memory-tight (host-level OOM kills, 2026-07-31). Enable per
-// deployment with TIMEFUSION_HOT_TIER_RETENTION_HOURS=6 and watch
-// hot_tier.bytes / workingset_refault; flip this default once soaked.
-const_default!(d_hot_tier_retention_hours: u64 = 0);
+// 6h, ON by default since 2026-08-02. It shipped at 0 (OFF) for its first
+// release — a new disk + page-cache consumer on a memory-tight box (host-level
+// OOM kills, 2026-07-31) — with the note "flip this default once soaked". Prod
+// has run TIMEFUSION_HOT_TIER_RETENTION_HOURS=6 since, so this is that flip:
+// the default now matches the soaked deployment instead of leaving the tier
+// dependent on an env var that a fresh deployment would silently omit.
+//
+// Disk is bounded by `d_hot_tier_max_disk_gb` and heap by
+// `d_hot_tier_leg_budget_mb`, both independent of this value; raising it costs
+// disk and page cache, not process memory.
+const_default!(d_hot_tier_retention_hours: u64 = 6);
 const_default!(d_hot_tier_max_disk_gb: u64 = 64);
 const_default!(d_hot_tier_leg_budget_mb: u64 = 512);
 const_default!(d_hot_tier_memo_mb: u64 = 1024);
@@ -578,13 +584,15 @@ const_default!(d_dml_coalesce_secs: u64 = 3);
 // retries; rows stay in MemBuffer + WAL, so it's safe. Must exceed a normal
 // backfill commit but stay well under retention.
 //
-// 600s, NOT 120s: the timeout covers the whole callback — parquet encode +
-// S3 upload + commit — and a post-restart WAL-replay backlog produces
-// multi-GB coalesced commits that legitimately take minutes. At 120s the
-// watchdog aborted every big drain, wasting the work and retrying forever
-// while MemBuffer grew to the memcg limit (2026-07-02 OOM loop: stalled=42
-// vs flush-ok=22, RSS 89GB). The watchdog exists for the *infinitely* hung
-// commit, so a generous ceiling loses nothing.
+// The CEILING, not the budget: `BufferedWriteLayer::adaptive_flush_timeout`
+// contracts it as the ingest buffer fills. Read that function before changing
+// this — prod has been wedged from both ends of the fixed-value trade (120s
+// aborted legitimate multi-GB drains into a retry loop, 2026-07-02; 600s let a
+// hung commit hold the global flush_lock until the ingest buffer filled and
+// every tenant's INSERT was rejected, 2026-08-02). 600 stays right for the
+// ceiling: with headroom, a slow-but-progressing commit should be allowed to
+// finish, because aborting it wastes the work and the next attempt is no
+// faster.
 const_default!(d_flush_bucket_timeout_secs: u64 = 600);
 // Durability mode for the WAL. One of:
 //   "sync_each" — fsync after every entry (default; zero data-loss window, ~1ms per write)

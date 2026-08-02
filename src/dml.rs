@@ -890,11 +890,28 @@ async fn perform_update_with_buffer(
 ) -> Result<u64> {
     // Merge-on-read tables take neither leg: one append supersedes the row
     // wherever it lives, so there is no mem/Delta split to coordinate.
+    //
+    // Same-key source rows still need SUCCESSIVE rounds, for a reason specific
+    // to versioning: `stamp_version` issues ONE stamp per batch, so two source
+    // rows for the same key applied in a single append become two versions
+    // sharing a tiebreak — and keep-greatest resolves a tie ARBITRARILY, so the
+    // last write silently loses (the enrichment worker's same-key multi-tag
+    // pattern, prod 2026-07-19). One round per key occurrence gives each
+    // version its own strictly greater stamp, which is what makes
+    // last-write-wins hold.
     if is_version_append(table_name) {
         let append_span = tracing::trace_span!(parent: span, "mor.update");
-        return perform_version_append(database, buffered_layer, table_name, project_id, predicate, &assignments, source.as_ref(), false, &session)
-            .instrument(append_span)
-            .await;
+        let rounds = match source {
+            Some(src) => crate::dml_coalescer::split_source_rounds(src)?.into_iter().map(Some).collect(),
+            None => vec![None],
+        };
+        let mut total = 0u64;
+        for round in rounds {
+            total += perform_version_append(database, buffered_layer, table_name, project_id, predicate.clone(), &assignments, round.as_ref(), false, &session)
+                .instrument(append_span.clone())
+                .await?;
+        }
+        return Ok(total);
     }
 
     // `UPDATE ... FROM` path: MemBuffer takes the join via update_with_source,

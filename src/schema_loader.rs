@@ -463,8 +463,9 @@ mod tests {
 
     /// The tombstone column must be nullable Boolean (NULL = live, so no
     /// backfill) and named by the schema — nothing hard-codes it. Exercised on
-    /// `mor_versioned`, the from-scratch fixture: it is the ONLY table allowed to
-    /// declare these columns (see the migration note above `TableSchema`).
+    /// `mor_versioned`, the from-scratch fixture. (It was once the ONLY table
+    /// allowed to declare these columns; the shipped tables joined it after the
+    /// 2026-08-02 migration — see `shipped_mor_tables_declare_the_migrated_columns_last`.)
     #[test]
     fn mor_versioned_tombstone_column_is_nullable_boolean() {
         let schema = get_schema("mor_versioned").expect("fixture registered");
@@ -473,24 +474,40 @@ mod tests {
         assert_eq!(schema.dedup_tiebreak.as_deref(), Some("updated_at"));
     }
 
-    /// The SHIPPED tables must not have gained merge-on-read columns. Adding one
-    /// to a table that already has live Delta data broke prod (7d68f01): every
-    /// existing Delta table still stores the old column set, and the write path
-    /// builds batches to the YAML's. Guards the specific columns that did it.
+    /// The SHIPPED merge-on-read tables, post-migration (2026-08-02). This guard
+    /// used to assert these tables had NO merge-on-read columns, because adding
+    /// one to a table that already holds live Delta data broke prod (7d68f01):
+    /// the stored transaction log kept the old column set while the write path
+    /// built batches to the YAML's, giving `number of columns(94) must match
+    /// number of fields(92)`.
+    ///
+    /// The migration has since been run and verified against prod
+    /// (`migrate-columns`, commit edb2fd2), so the invariant is no longer
+    /// "absent" but "declared in the SAME SHAPE AND ORDER the stored schema was
+    /// widened in" — the two columns last, nullable, and never before any
+    /// pre-existing field. Reordering them here re-creates 7d68f01 exactly.
     #[test]
-    fn shipped_tables_declare_no_merge_on_read_columns() {
+    fn shipped_mor_tables_declare_the_migrated_columns_last() {
         for name in ["otel_logs_and_spans", "otel_metrics"] {
             let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
-            assert_eq!(schema.tombstone_column, None, "{name} is a shipped table — a tombstone column needs a Delta-side migration first");
-            assert!(!schema.version_append, "{name} is a shipped table — version_append needs the columns, which need a migration");
-            for col in ["updated_at", "deleted"] {
-                assert!(schema.field_def(col).is_none(), "{name} must not declare `{col}`: prod's Delta tables have no such field (7d68f01)");
-            }
+            assert!(schema.version_append, "{name} ships merge-on-read");
+            assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"), "{name} tombstone column");
+            // Nullable, so the migration needed no backfill: NULL reads as live.
+            assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)), "{name}.deleted must be nullable Boolean");
+            assert!(matches!(schema.field_def("updated_at"), Some((ArrowDataType::Timestamp(..), true))), "{name}.updated_at must be a nullable timestamp");
+
+            // ORDER is the load-bearing part: `migrate-columns` APPENDED these,
+            // so they must be the final two fields, updated_at then deleted.
+            let tail: Vec<&str> = schema.fields.iter().rev().take(2).map(|f| f.name.as_str()).collect();
+            assert_eq!(tail, vec!["deleted", "updated_at"], "{name}: the migrated columns must be the LAST two fields, in migration order (7d68f01)");
         }
-        // The tiebreaks these tables actually ship with — client-supplied, and
-        // therefore never stamped (see `insert_coerce::stamp_column`).
-        assert_eq!(get_schema("otel_logs_and_spans").unwrap().dedup_tiebreak.as_deref(), Some("observed_timestamp"));
-        assert_eq!(get_schema("otel_metrics").unwrap().dedup_tiebreak.as_deref(), Some("ingested_at"));
+        // The tiebreak MUST be the TF-owned column, not the client's:
+        // `insert_coerce::stamp_version` OVERWRITES whatever this names, so
+        // pointing it back at `observed_timestamp` / `ingested_at` would destroy
+        // client data on every write.
+        for name in ["otel_logs_and_spans", "otel_metrics"] {
+            assert_eq!(get_schema(name).unwrap().dedup_tiebreak.as_deref(), Some("updated_at"), "{name} must break ties on the TF-owned stamp");
+        }
     }
 
     #[test]
@@ -516,8 +533,10 @@ mod tests {
         assert!(!parse("").tombstones_possible(), "no tombstone column at all");
         assert!(!parse("tombstone_column: deleted\n").tombstones_possible(), "declared but dormant → no tombstone can exist");
         assert!(parse("tombstone_column: deleted\nversion_append: true\n").tombstones_possible(), "write path on → tombstones can exist");
-        // The live schemas, as shipped.
-        assert!(!get_schema("otel_logs_and_spans").unwrap().tombstones_possible());
+        // The live schemas, as shipped. `mor_dormant` is now the dormant case:
+        // it declares a tiebreak but no write path, so no tombstone can exist.
+        assert!(!get_schema("mor_dormant").unwrap().tombstones_possible());
+        assert!(get_schema("otel_logs_and_spans").unwrap().tombstones_possible(), "otel ships merge-on-read since 2026-08-02");
         assert!(get_schema("mor_versioned").unwrap().tombstones_possible());
     }
 

@@ -9741,12 +9741,52 @@ impl ProjectRoutingTable {
         ProjectIdPushdown::has_project_id_filter(filters)
     }
 
-    /// Create a MemorySourceConfig-based execution plan with multiple partitions
-    fn create_memory_exec(&self, partitions: &[Vec<RecordBatch>], projection: Option<&Vec<usize>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+    /// Create a MemorySourceConfig-based execution plan with multiple partitions.
+    ///
+    /// `sorted` asserts every partition is already ordered by the table's
+    /// declared `sorting_columns`; it is the caller's correctness claim (see
+    /// `MemLeg::sorted` / `HotLeg::sorted`), and declaring it is what stops
+    /// `ordered_children` injecting a blocking `SortExec` over this leg on
+    /// every merge-on-read scan.
+    fn create_memory_exec(&self, partitions: &[Vec<RecordBatch>], projection: Option<&Vec<usize>>, sorted: bool) -> DFResult<Arc<dyn ExecutionPlan>> {
         let mem_source =
             MemorySourceConfig::try_new(partitions, self.schema.clone(), projection.cloned()).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        Ok(Arc::new(DataSourceExec::new(Arc::new(mem_source))))
+        let out = match projection {
+            Some(p) => Arc::new(self.schema.project(p)?),
+            None => self.schema.clone(),
+        };
+        Ok(Arc::new(DataSourceExec::new(Arc::new(Self::declare_ordering(mem_source, sorted, &self.table_name, &out)))))
+    }
+
+    /// Attach the table's declared ordering to an in-memory source.
+    ///
+    /// Declared against the source's OUTPUT schema (post-projection), and only
+    /// for the leading run of sorting columns that survived it — a query that
+    /// projects `timestamp` away gets no claim rather than a false one. Failure
+    /// to attach is never fatal: an undeclared source is merely slower.
+    fn declare_ordering(source: MemorySourceConfig, sorted: bool, table_name: &str, out: &SchemaRef) -> MemorySourceConfig {
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        let Some(table) = crate::schema_loader::get_schema(table_name).filter(|_| sorted) else { return source };
+        let exprs: Vec<PhysicalSortExpr> = table
+            .sorting_columns
+            .iter()
+            .map_while(|sc| {
+                let idx = out.index_of(&sc.name).ok()?;
+                Some(PhysicalSortExpr::new(
+                    Arc::new(PhysicalColumn::new(&sc.name, idx)),
+                    arrow::compute::SortOptions { descending: sc.descending, nulls_first: sc.nulls_first },
+                ))
+            })
+            .collect();
+        let Some(ordering) = LexOrdering::new(exprs) else { return source };
+        // `try_with_sort_information` consumes the source, so keep a copy to
+        // fall back to — the undeclared source must still serve its rows.
+        let undeclared = source.clone();
+        source.try_with_sort_information(vec![ordering]).unwrap_or_else(|e| {
+            debug!("in-memory leg for {table_name} could not declare its ordering ({e}); the plan will sort it instead");
+            undeclared
+        })
     }
 
     /// Scan a Delta table and coerce output schema to match our expected types.
@@ -10055,6 +10095,31 @@ impl ProjectRoutingTable {
         LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(PhysicalColumn::new(&sc.name, idx)), opts)])
     }
 
+    /// On a `version_append` table, the columns an UPDATE can change — i.e.
+    /// everything except the dedup keys and the partition columns, which
+    /// identify the row and so are the same in every version of it. `None` for
+    /// a table that appends no versions (nothing is version-mutable there).
+    ///
+    /// A predicate on one of these must NEVER reach a scan leg. Applied at the
+    /// source it selects rows by a value that may belong to a SUPERSEDED
+    /// version, AND it removes the newer version from `DedupExec`'s input — so
+    /// keep-greatest returns the stale row and it then passes the same filter
+    /// above. `WHERE status_code = 'OK'` matched a row already updated to
+    /// 'ERROR' (2026-08-02, `integration::test_update_operations`), which for an
+    /// UPDATE means writing a new version of a row the statement never matched.
+    ///
+    /// `Inexact` is NOT sufficient: re-applying the filter above the scan
+    /// cannot recover a version the source already dropped. It has to be
+    /// `Unsupported` so the leg reads every version and the filter runs above
+    /// `DedupExec`. This generalizes [`Self::references_tombstone`], which is
+    /// this exact bug for one specific column.
+    fn version_mutable_columns(table_name: &str) -> Option<std::collections::HashSet<String>> {
+        let schema = crate::schema_loader::get_schema(table_name).filter(|s| s.version_append)?;
+        let immutable: std::collections::HashSet<&str> =
+            schema.dedup_keys.iter().map(String::as_str).chain(schema.partitions.iter().map(String::as_str)).collect();
+        Some(schema.schema_ref().fields().iter().map(|f| f.name().clone()).filter(|n| !immutable.contains(n.as_str())).collect())
+    }
+
     /// Does `f` mention the table's tombstone marker? Such a predicate must
     /// NEVER reach a scan leg. Applied at the source — `MemBuffer::query`'s
     /// `compile_filter_conjunction`, or the Delta kernel — it would drop the
@@ -10170,8 +10235,21 @@ impl ProjectRoutingTable {
     /// fingerprint that STILL matches the live file set — i.e. a sweep pass
     /// proved it duplicate-free and nothing has committed to it since. Only
     /// consulted on Delta-only paths (mem∪delta overlap needs DedupExec).
+    ///
+    /// NEVER granted on a `version_append` table. There, `DedupExec` is not an
+    /// optimization that a clean sweep can prove unnecessary — it IS the
+    /// mechanism that resolves versions, and the sweep's own "duplicate-free"
+    /// verdict is about duplicate KEYS, which is exactly what merge-on-read
+    /// creates on purpose. Skipping it serves every superseded version and
+    /// every tombstoned row alongside the current one: an UPDATE reads back
+    /// pre-update and a DELETE does not delete (caught by
+    /// `buffer_consistency_test::test_{update,delete}::immediate` at the
+    /// 2026-08-02 flip).
     fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> bool {
         if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept {
+            return false;
+        }
+        if crate::schema_loader::get_schema(&self.table_name).is_some_and(|s| s.version_append) {
             return false;
         }
         let Some(window) = window else { return false };
@@ -10515,11 +10593,13 @@ impl TableProvider for ProjectRoutingTable {
             .get(&self.table_name)
             .map(|s| s.schema_ref().fields().iter().filter(|f| crate::schema_loader::is_variant_type(f.data_type())).map(|f| f.name().clone()).collect())
             .unwrap_or_default();
+        let mutable = Self::version_mutable_columns(&self.table_name);
         Ok(filter
             .iter()
             .map(|f| {
                 if Self::references_tombstone(&self.table_name, f)
                     || (!variant_cols.is_empty() && f.column_refs().iter().any(|c| variant_cols.contains(&c.name)))
+                    || mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
                 {
                     TableProviderFilterPushDown::Unsupported
                 } else if Self::is_exact_pushdown_filter(f) {
@@ -10555,10 +10635,29 @@ impl TableProvider for ProjectRoutingTable {
         let scan_metrics = self.database.scan_metrics.clone();
 
         // Apply our custom optimizations to the filters
-        // Second line of defence behind `supports_filters_pushdown`: a predicate
-        // on the tombstone marker must never reach a scan leg (see
-        // `references_tombstone` — it resurrects deleted rows silently).
-        let filters: Vec<Expr> = filters.iter().filter(|f| !Self::references_tombstone(&self.table_name, f)).cloned().collect();
+        // Second line of defence behind `supports_filters_pushdown`: neither a
+        // predicate on the tombstone marker (see `references_tombstone` — it
+        // resurrects deleted rows silently) nor one on any other
+        // version-mutable column (see `version_mutable_columns` — it serves a
+        // superseded version) may reach a scan leg, however it arrived here.
+        //
+        // This also disables the tantivy prefilter on a merge-on-read table,
+        // and that is REQUIRED, not collateral: the prefilter excludes whole
+        // FILES proven to hold no match, so a search for a value only the OLD
+        // version carries excludes the file holding the NEW one. `DedupExec`
+        // then never sees the newer version, returns the stale row, and the
+        // filter above admits it. The id-set half would be safe on its own
+        // (`id` is a dedup key, so it admits every version of a row), but the
+        // file exclusion and row selections are not, and they are what makes
+        // the prefilter worth having. Cost: text/attribute predicates on these
+        // tables no longer prune files; time-range and tenant pruning, which
+        // dominate the dashboard workload, are unaffected because those columns
+        // are dedup keys and partitions.
+        let mutable = Self::version_mutable_columns(&self.table_name);
+        let leg_safe = |f: &Expr| {
+            !Self::references_tombstone(&self.table_name, f) && !mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
+        };
+        let filters: Vec<Expr> = filters.iter().filter(|f| leg_safe(f)).cloned().collect();
         let optimized_filters = self.apply_time_series_optimizations(&filters)?;
 
         // Get project_id from filters if possible, otherwise use default
@@ -10918,13 +11017,12 @@ impl TableProvider for ProjectRoutingTable {
         // own atomic per-bucket prefilter inside the bucket lock — we must
         // NOT prepend `tantivy_id_filter` here (that filter is derived from
         // delta-side IDs only and would drop legitimate MemBuffer rows).
-        let mem_partitions = match layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, text_match_tree.as_ref()) {
-            Ok(partitions) => partitions,
-            Err(e) => {
+        let mem_leg =
+            layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, text_match_tree.as_ref()).unwrap_or_else(|e| {
                 warn!("Failed to query mem buffer: {}", e);
-                vec![]
-            }
-        };
+                Default::default()
+            });
+        let mem_partitions = mem_leg.partitions;
 
         // Hot-tier third leg (P1) — see `HotTier::query_partitioned` for the
         // coverage contract. Consulted only when Delta is actually being
@@ -10958,7 +11056,7 @@ impl TableProvider for ProjectRoutingTable {
                     .await
             }
         };
-        let (hot_partitions, hot_ranges, version_gate) = (hot.partitions, hot.ranges, hot.version_gate);
+        let (hot_partitions, hot_ranges, version_gate, hot_sorted) = (hot.partitions, hot.ranges, hot.version_gate, hot.sorted);
 
         // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
@@ -10990,7 +11088,7 @@ impl TableProvider for ProjectRoutingTable {
             true => None,
             false => {
                 tag_shape(&|s| s.has_mem = true);
-                Some(self.create_memory_exec(&mem_partitions, projection)?)
+                Some(self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?)
             }
         };
 
@@ -11084,7 +11182,9 @@ impl TableProvider for ProjectRoutingTable {
                     Some(p) => Arc::new(self.schema.project(p)?),
                     None => self.schema.clone(),
                 };
+                let hot_out = hot_schema.clone();
                 let source = MemorySourceConfig::try_new(&hot_partitions, hot_schema, None).map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let source = Self::declare_ordering(source, hot_sorted, &self.table_name, &hot_out);
                 Some(Arc::new(DataSourceExec::new(Arc::new(source))) as Arc<dyn ExecutionPlan>)
             }
         };
@@ -11635,9 +11735,13 @@ mod tests {
         let deleted = col("deleted").eq(lit(true));
         assert!(ProjectRoutingTable::references_tombstone("mor_versioned", &deleted));
         assert!(!ProjectRoutingTable::references_tombstone("mor_versioned", &col("id").eq(lit("x"))));
+        // The shipped merge-on-read tables must be protected too.
+        for t in ["otel_logs_and_spans", "otel_metrics"] {
+            assert!(ProjectRoutingTable::references_tombstone(t, &deleted), "{t} ships merge-on-read — its tombstone predicate must not reach a leg");
+        }
         // Tables declaring no tombstone column have no such predicate to protect
-        // — including the shipped ones, where `deleted` is just an unknown name.
-        for t in ["variant_bench", "otel_logs_and_spans"] {
+        // — there `deleted` is just an unknown column name.
+        for t in ["variant_bench", "mor_dormant"] {
             assert!(!ProjectRoutingTable::references_tombstone(t, &deleted));
         }
     }
@@ -12776,7 +12880,10 @@ mod tests {
         assert_eq!(cols[0].column, "timestamp");
         assert_eq!(dedup.columns, vec!["timestamp", "id"]);
         let tb = dedup.tiebreak.expect("tiebreak from schema");
-        assert!(tb.column == "observed_timestamp" && tb.descending);
+        // `updated_at` since the 2026-08-02 merge-on-read flip: the tiebreak had
+        // to move off the client-supplied `observed_timestamp`, which
+        // `stamp_version` would otherwise overwrite on every write.
+        assert!(tb.column == "updated_at" && tb.descending);
         assert!(declare_sorted);
         // sort disabled → plain Compact, no dedup claim
         assert!(matches!(consolidate_optimize_type(schema, false), (OptimizeType::Compact, false)));

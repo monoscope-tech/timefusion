@@ -133,10 +133,14 @@ pub fn observe_stamp(table: &str, value: i64) {
 /// `version_append` is what makes the tiebreak **TF-owned** — it is the flag that
 /// says UPDATE/DELETE append a new version carrying a fresh tiebreak, which is
 /// only sound if TF, not the client, issues that value. A microsecond-timestamp
-/// tiebreak on its own is NOT enough to claim ownership: `otel_logs_and_spans`
-/// breaks ties on `observed_timestamp` and `otel_metrics` on `ingested_at`, both
-/// client-supplied and both `Timestamp(Microsecond, _)` — stamping those would
-/// silently overwrite ingested data on tables that never had a version stamp.
+/// tiebreak on its own is NOT enough to claim ownership — which is exactly why
+/// flipping `version_append` on `otel_logs_and_spans` / `otel_metrics`
+/// (2026-08-02) had to MOVE their tiebreak first: they broke ties on the
+/// client-supplied `observed_timestamp` / `ingested_at`, both
+/// `Timestamp(Microsecond, _)`, and stamping those would have silently
+/// destroyed ingested, user-queried data on every write. Both now point at the
+/// TF-owned `updated_at`. A table that declares a client-owned tiebreak must
+/// leave `version_append` off (`mor_dormant` is the fixture for that shape).
 fn stamp_column(table: &str) -> Option<(FieldRef, Option<Arc<str>>)> {
     let schema = crate::schema_loader::get_schema(table).filter(|s| s.version_append)?;
     let name = schema.dedup_tiebreak.as_deref()?;
@@ -289,12 +293,14 @@ mod stamp_tests {
 
     /// Only a `version_append` table has a TF-owned tiebreak; every other table
     /// is left byte-for-byte alone. Covers both reasons for that: no tiebreak at
-    /// all (`variant_bench`), and a CLIENT-supplied microsecond-timestamp
-    /// tiebreak that TF must not overwrite (`otel_logs_and_spans` breaks ties on
-    /// the OTel-assigned `observed_timestamp`; `otel_metrics` on `ingested_at`).
+    /// all (`variant_bench`), and a declared tiebreak with the write path OFF
+    /// (`mor_dormant`) — the shape `otel_logs_and_spans` and `otel_metrics` had
+    /// until they flipped merge-on-read on 2026-08-02, when their tiebreak also
+    /// moved off the client-supplied `observed_timestamp` / `ingested_at` and
+    /// onto the TF-owned `updated_at` precisely BECAUSE stamping overwrites it.
     #[test]
     fn only_version_append_tables_are_stamped() {
-        for t in ["variant_bench", "otel_logs_and_spans", "otel_metrics"] {
+        for t in ["variant_bench", "mor_dormant"] {
             assert!(stamp_column(t).is_none(), "{t} is not a version_append table — TF must not own its tiebreak");
             let before = batch_with(None);
             let out = stamp_version(t, vec![before.clone()]);

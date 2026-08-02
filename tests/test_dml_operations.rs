@@ -427,12 +427,21 @@ mod test_dml_operations {
     // ==========================================================================
 
     /// Helper: select `duration` for `name` in `test_project`, ordered by name.
-    async fn duration_by_name(ctx: &datafusion::prelude::SessionContext, name: &str) -> Result<i64> {
-        let q = format!("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = '{}'", name);
+    /// `mor_dormant` is the in-place-DML fixture: `otel_logs_and_spans` flipped
+    /// `version_append` on 2026-08-02, so it no longer takes the delta-rs MERGE
+    /// path these tests are about. See `schemas/mor_dormant.yaml`.
+    const INPLACE_TABLE: &str = "mor_dormant";
+
+    async fn duration_by_name_in(ctx: &datafusion::prelude::SessionContext, table: &str, name: &str) -> Result<i64> {
+        let q = format!("SELECT duration FROM {table} WHERE project_id = 'test_project' AND name = '{}'", name);
         let df = ctx.sql(&q).await?;
         let results = df.collect().await?;
         assert!(!results.is_empty() && results[0].num_rows() == 1, "duration_by_name: expected 1 row for {}", name);
         Ok(results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
+    }
+
+    async fn duration_by_name(ctx: &datafusion::prelude::SessionContext, name: &str) -> Result<i64> {
+        duration_by_name_in(ctx, "otel_logs_and_spans", name).await
     }
 
     /// VALUES-list source: smallest possible `UPDATE ... FROM` shape.
@@ -694,6 +703,13 @@ mod test_dml_operations {
         let now = chrono::Utc::now();
         const FILES: usize = 24;
         const ROWS_PER_FILE: usize = 400;
+        // How many rows per file the merge below rewrites. `mor_dormant` is a
+        // much narrower schema than the otel table this used to run against (a
+        // handful of columns vs ~91), so a merge touching one row per file
+        // finishes before the concurrent reader does and the overlap can't be
+        // observed. Growing the TABLE does not fix that — it slows the reader
+        // just as much — so the merge is given more work at a fixed table size.
+        const MATCHED_PER_FILE: usize = 200;
         for f in 0..FILES {
             let records: Vec<serde_json::Value> = (0..ROWS_PER_FILE)
                 .map(|r| {
@@ -707,15 +723,19 @@ mod test_dml_operations {
                     })
                 })
                 .collect();
-            let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
-            db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+            let batch = timefusion::test_utils::test_helpers::json_to_batch_for(INPLACE_TABLE, records)?;
+            db.insert_records_batch("test_project", INPLACE_TABLE, vec![batch], true, None).await?;
         }
 
-        let values = (0..FILES).map(|f| format!("('T{f}', {f})")).collect::<Vec<_>>().join(", ");
+        let values = (0..FILES)
+            // From r=1: row 0 of each file is named `T{f}`, not `f{f}_r0`.
+            .flat_map(|f| (1..=MATCHED_PER_FILE).map(move |r| format!("('f{f}_r{r}', {f})")))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
-            "UPDATE otel_logs_and_spans SET duration = u.d \
+            "UPDATE mor_dormant SET duration = u.d \
              FROM (VALUES {values}) AS u(name, d) \
-             WHERE project_id = 'test_project' AND otel_logs_and_spans.name = u.name"
+             WHERE project_id = 'test_project' AND mor_dormant.name = u.name"
         );
         let update_ctx = ctx.clone();
         let update_handle = tokio::spawn(async move { update_ctx.sql(&sql).await?.collect().await.map_err(anyhow::Error::from) });
@@ -725,28 +745,31 @@ mod test_dml_operations {
         assert!(!update_handle.is_finished(), "UPDATE finished too fast to observe concurrency — grow FILES/ROWS_PER_FILE");
 
         // Reader mid-UPDATE.
-        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
+        let df = ctx.sql("SELECT COUNT(*) FROM mor_dormant WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(count as usize, FILES * ROWS_PER_FILE);
         assert!(!update_handle.is_finished(), "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock");
 
         // Writer mid-UPDATE (direct Delta insert commits + swaps the handle).
-        let extra = timefusion::test_utils::test_helpers::json_to_batch(vec![serde_json::json!({
-            "id": "extra", "name": "Extra", "project_id": "test_project",
-            "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
-            "duration": 1, "date": now.date_naive().to_string(), "hashes": [], "summary": []
-        })])?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![extra], true, None).await?;
+        let extra = timefusion::test_utils::test_helpers::json_to_batch_for(
+            INPLACE_TABLE,
+            vec![serde_json::json!({
+                "id": "extra", "name": "Extra", "project_id": "test_project",
+                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
+                "duration": 1, "date": now.date_naive().to_string(), "hashes": [], "summary": []
+            })],
+        )?;
+        db.insert_records_batch("test_project", INPLACE_TABLE, vec![extra], true, None).await?;
         assert!(!update_handle.is_finished(), "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock");
 
         let result = update_handle.await??;
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated as usize, FILES);
+        assert_eq!(rows_updated as usize, FILES * MATCHED_PER_FILE);
 
         // The mid-UPDATE insert must not just be un-blocked — its row must
         // survive the UPDATE's snapshot swap.
-        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
+        let df = ctx.sql("SELECT COUNT(*) FROM mor_dormant WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(final_count as usize, FILES * ROWS_PER_FILE + 1, "concurrent insert's row lost across the DML swap");
@@ -812,16 +835,16 @@ mod test_dml_operations {
         db.setup_session_context(&mut ctx)?;
 
         let now = chrono::Utc::now();
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(create_test_records(now))?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        let batch = timefusion::test_utils::test_helpers::json_to_batch_for(INPLACE_TABLE, create_test_records(now))?;
+        db.insert_records_batch("test_project", INPLACE_TABLE, vec![batch], true, None).await?;
 
         let update = |val: i64, name: &str| {
             format!(
-                "UPDATE otel_logs_and_spans
+                "UPDATE mor_dormant
                    SET duration = u.d
                    FROM (VALUES ('{name}', {val})) AS u(name, d)
                    WHERE project_id = 'test_project'
-                     AND otel_logs_and_spans.name = u.name"
+                     AND mor_dormant.name = u.name"
             )
         };
         for sql in [update(500, "Bob"), update(999, "Alice")] {
@@ -830,20 +853,20 @@ mod test_dml_operations {
             assert_eq!(rows, 0, "deferred statement reports 0 rows (no mem leg here)");
         }
         // Nothing merged yet: Delta untouched until a drain.
-        assert_eq!(duration_by_name(&ctx, "Bob").await?, 200);
-        assert_eq!(duration_by_name(&ctx, "Alice").await?, 100);
+        assert_eq!(duration_by_name_in(&ctx, INPLACE_TABLE, "Bob").await?, 200);
+        assert_eq!(duration_by_name_in(&ctx, INPLACE_TABLE, "Alice").await?, 100);
 
         db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
-        assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
-        assert_eq!(duration_by_name(&ctx, "Alice").await?, 999);
-        assert_eq!(duration_by_name(&ctx, "Charlie").await?, 300, "unmatched row untouched");
+        assert_eq!(duration_by_name_in(&ctx, INPLACE_TABLE, "Bob").await?, 500);
+        assert_eq!(duration_by_name_in(&ctx, INPLACE_TABLE, "Alice").await?, 999);
+        assert_eq!(duration_by_name_in(&ctx, INPLACE_TABLE, "Charlie").await?, 300, "unmatched row untouched");
 
         // Same key updated twice before one drain: rounds apply in arrival
         // order, so the later statement wins.
         ctx.sql(&update(777, "Bob")).await?.collect().await?;
         ctx.sql(&update(888, "Bob")).await?.collect().await?;
         db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
-        assert_eq!(duration_by_name(&ctx, "Bob").await?, 888);
+        assert_eq!(duration_by_name_in(&ctx, INPLACE_TABLE, "Bob").await?, 888);
         Ok(())
     }
 
@@ -945,8 +968,14 @@ mod test_dml_operations {
         // SAFETY: same #[serial]-guarded process-global env dance as
         // buffer_consistency_test.rs.
         unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
-        let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
-        let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
+        // The layer needs the SAME Delta writer prod uses: without it
+        // `flush_bucket` cannot persist anything (it now fails rather than
+        // draining into the void), and this test is precisely about the flush
+        // persisting the post-DML value.
+        let db0 = Database::with_config(Arc::clone(&cfg)).await?;
+        let layer =
+            Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::bootstrap::delta_write_callback(&db0)));
+        let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -971,10 +1000,18 @@ mod test_dml_operations {
         assert_eq!(rows, 1, "mem leg updated the buffered row");
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 4242, "overlay read sees the update immediately");
 
-        // Flush → Delta must hold the POST-update value.
+        // Flush → the post-update value must be DURABLE, i.e. still served once
+        // MemBuffer no longer holds it.
+        //
+        // Read through the table, not `query_delta_only`. On a merge-on-read
+        // table Delta legitimately holds BOTH versions — the update appended one
+        // rather than rewriting the row — so a dedup-bypassing read returns
+        // whichever it happens to see first and asserts nothing about currency.
+        // An empty buffer plus a table read is the real statement: the value can
+        // only be coming from Delta, and it went through keep-greatest.
         layer.flush_all_now().await?;
-        let delta = db.query_delta_only("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
-        assert_eq!(delta[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 4242, "flush persisted the post-DML value");
+        assert!(layer.is_empty(), "flush must have drained the buffer, or the read below could still be served from memory");
+        assert_eq!(duration_by_name(&ctx, "Bob").await?, 4242, "flush persisted the post-DML value");
         Ok(())
     }
 }

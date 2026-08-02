@@ -834,6 +834,76 @@ pub fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafus
     }
 }
 
+/// MemBuffer's contribution to a scan: one partition per surviving time
+/// bucket, plus whether EVERY partition is ordered by the table's declared
+/// `sorting_columns`. Only then may the caller declare that ordering on the
+/// `MemorySourceConfig` — the flag is a correctness claim, not a hint.
+#[derive(Debug, Default)]
+pub struct MemLeg {
+    pub partitions: Vec<Vec<RecordBatch>>,
+    pub sorted: bool,
+}
+
+/// Sort one partition's batches into a single batch ordered by `schema`'s
+/// declared `sorting_columns`, or `None` when that cannot be done truthfully.
+///
+/// This is what lets the in-memory legs DECLARE an ordering
+/// (`MemorySourceConfig::try_with_sort_information`). Without it, a
+/// merge-on-read scan's `keep_greatest` requirement is unsatisfied by the mem
+/// and hot legs, so `ordered_children` injects a fetch-less blocking `SortExec`
+/// over each of them and `DedupExec` falls back to its unbounded `full-set`
+/// seen-set.
+///
+/// Only the leading RUN of sorting columns that are actually present is used,
+/// and the first one is mandatory: the caller declares the first column, so
+/// silently sorting by a later column instead would make that declaration a
+/// lie — and a false ordering claim is a wrong-results bug, not a slow plan.
+pub fn sort_partition(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> Option<Vec<RecordBatch>> {
+    use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch};
+    if batches.is_empty() {
+        return None;
+    }
+    let arrow_schema = batches[0].schema();
+    // A schema-diverse partition is left alone rather than merged: the merge
+    // is the expensive, failure-prone half of `sort_batches_by_schema` and this
+    // path runs per query. Undeclared ordering is always safe.
+    if batches.iter().any(|b| b.schema() != arrow_schema) {
+        return None;
+    }
+    let spec: Vec<(usize, SortOptions)> = schema
+        .sorting_columns
+        .iter()
+        .map_while(|sc| {
+            let idx = arrow_schema.index_of(&sc.name).ok()?;
+            Some((idx, SortOptions { descending: sc.descending, nulls_first: sc.nulls_first }))
+        })
+        .collect();
+    if spec.is_empty() {
+        return None;
+    }
+    let combined = match batches.len() {
+        1 => batches.into_iter().next().unwrap(),
+        _ => concat_batches(&arrow_schema, &batches).ok()?,
+    };
+    let sort_cols: Vec<SortColumn> = spec.into_iter().map(|(i, options)| SortColumn { values: combined.column(i).clone(), options: Some(options) }).collect();
+    let indices = lexsort_to_indices(&sort_cols, None).ok()?;
+    let sorted = match indices.values().iter().enumerate().all(|(i, &v)| v as usize == i) {
+        true => combined,
+        false => take_record_batch(&combined, &indices).ok()?,
+    };
+    // Hand back BATCHES, not the one concatenated monolith: a global lexsort has
+    // to materialize the partition once, but nothing downstream should have to
+    // hold it as a single value. Slicing is zero-copy and order-preserving, so
+    // this restores the batch shape both callers had before — a demoted IPC file
+    // stays multi-batch, and a scan partition stays pollable in steps rather
+    // than as one giant batch.
+    Some((0..sorted.num_rows()).step_by(SORT_CHUNK_ROWS).map(|off| sorted.slice(off, SORT_CHUNK_ROWS.min(sorted.num_rows() - off))).collect())
+}
+
+/// Rows per batch handed back by [`sort_partition`]. Matches the order of
+/// magnitude of a normal flush batch; the exact value is not load-bearing.
+const SORT_CHUNK_ROWS: usize = 8192;
+
 /// The DISTINCT bucket ids `batch`'s rows land in, keyed off `time_col`.
 /// Empty when the column is absent or is not an i64-backed time type — the
 /// caller then simply marks nothing, which is the conservative direction only
@@ -1295,7 +1365,7 @@ impl MemBuffer {
     #[instrument(skip(self, filters, node), fields(project_id, table_name))]
     pub fn query_partitioned_with_text_match(
         &self, project_id: &str, table_name: &str, filters: &[Expr], node: Option<&crate::tantivy_index::udf::PredNode>,
-    ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    ) -> anyhow::Result<MemLeg> {
         // No preds or no indexed field ⇒ no prefilter ⇒ plain bucket scan.
         self.scan_buckets(project_id, table_name, filters, crate::schema_loader::get_schema(table_name).filter(|s| has_indexed_fields(s)).zip(node))
     }
@@ -1303,14 +1373,14 @@ impl MemBuffer {
     /// Flattened [`Self::query_partitioned`] — same rows, bucket partitioning dropped.
     #[instrument(skip(self, filters), fields(project_id, table_name))]
     pub fn query(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<Vec<RecordBatch>> {
-        Ok(self.query_partitioned(project_id, table_name, filters)?.into_iter().flatten().collect())
+        Ok(self.query_partitioned(project_id, table_name, filters)?.partitions.into_iter().flatten().collect())
     }
 
     /// Query and return partitioned data - one partition per time bucket.
     /// This enables parallel execution across time buckets.
     /// Optional filters enable timestamp-based bucket pruning.
     #[instrument(skip(self, filters), fields(project_id, table_name))]
-    pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<MemLeg> {
         self.scan_buckets(project_id, table_name, filters, None)
     }
 
@@ -1320,9 +1390,9 @@ impl MemBuffer {
     /// Empty partitions are dropped.
     fn scan_buckets(
         &self, project_id: &str, table_name: &str, filters: &[Expr], text: Option<(&crate::schema_loader::TableSchema, &crate::tantivy_index::udf::PredNode)>,
-    ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    ) -> anyhow::Result<MemLeg> {
         let ts_range = extract_timestamp_range(filters);
-        let Some(table) = self.get_table(project_id, table_name) else { return Ok(Vec::new()) };
+        let Some(table) = self.get_table(project_id, table_name) else { return Ok(MemLeg::default()) };
         // Pre-compile filters into a single physical predicate so each batch is
         // filtered to matching rows before returning. Best-effort: anything that
         // fails to compile is left for FilterExec on top to evaluate.
@@ -1356,8 +1426,34 @@ impl MemBuffer {
             .filter(|p| !p.is_empty())
             .collect::<Vec<_>>();
 
-        debug!("MemBuffer scan_buckets: project={}, table={}, text_match={}, partitions={}", project_id, table_name, text.is_some(), partitions.len());
-        Ok(partitions)
+        // Sort each partition so the leg can DECLARE its ordering (see
+        // `sort_partition`). Done here, on the POST-FILTER rows, rather than on
+        // the insert path: ingest throughput is untouched, and the rows sorted
+        // are only those the query actually returns. This is not extra work
+        // overall — an undeclared leg makes `ordered_children` inject a
+        // `SortExec` over the very same rows — but it is work the plan can now
+        // see, which is what keeps `DedupExec` on its bounded seen-set.
+        //
+        // All-or-nothing: `try_with_sort_information` declares one ordering for
+        // the whole source, so one unsortable partition (schema-diverse bucket,
+        // sorting column projected away) must retract the claim for all of them.
+        let schema = crate::schema_loader::get_schema(table_name).filter(|s| !s.sorting_columns.is_empty());
+        let (partitions, sorted) = match schema {
+            Some(s) => match partitions.iter().map(|p| sort_partition(s, p.clone())).collect::<Option<Vec<_>>>() {
+                Some(sorted) => (sorted, true),
+                None => (partitions, false),
+            },
+            None => (partitions, false),
+        };
+
+        debug!(
+            "MemBuffer scan_buckets: project={}, table={}, text_match={}, partitions={}, sorted={sorted}",
+            project_id,
+            table_name,
+            text.is_some(),
+            partitions.len()
+        );
+        Ok(MemLeg { partitions, sorted })
     }
 
     /// Time ranges (start, end_exclusive) the Delta scan must exclude
@@ -2719,6 +2815,41 @@ mod tests {
         assert!(align_nullability(&mistyped, &declared, None).is_none());
     }
 
+    /// `sort_partition` is what earns the in-memory legs their ordering claim,
+    /// so it must actually order the rows — and hand them back as BATCHES.
+    /// A global lexsort has to concatenate the partition once; returning that
+    /// monolith would make every demoted IPC file and every scan partition a
+    /// single giant value, so the sorted result is sliced back (zero-copy)
+    /// into bounded chunks. Order must survive the slicing.
+    #[test]
+    fn sort_partition_orders_descending_and_chunks_the_result() {
+        let schema = crate::schema_loader::get_schema("mor_versioned").expect("fixture registered");
+        assert_eq!(schema.sorting_columns[0].name, "timestamp", "this test asserts a `timestamp DESC` ordering");
+        assert!(schema.sorting_columns[0].descending);
+
+        // More than one chunk's worth, in scrambled event-time order: an
+        // arrival-ordered fixture would come out sorted even if nothing sorted.
+        const N: i64 = SORT_CHUNK_ROWS as i64 * 2 + 17;
+        let batches: Vec<RecordBatch> = (0..N).map(|i| create_test_batch((i * 7919) % N)).collect();
+        let sorted = sort_partition(schema, batches).expect("a partition with the sorting column must sort");
+
+        assert!(sorted.len() > 1, "the result must be chunked, got {} batch(es)", sorted.len());
+        assert!(sorted.iter().all(|b| b.num_rows() <= SORT_CHUNK_ROWS), "no chunk may exceed the bound");
+        assert_eq!(sorted.iter().map(|b| b.num_rows()).sum::<usize>(), N as usize, "sorting must not lose or duplicate rows");
+
+        // Descending across the WHOLE partition, chunk boundaries included.
+        let ts: Vec<i64> = sorted
+            .iter()
+            .flat_map(|b| {
+                let c = b.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().expect("timestamp column");
+                c.values().to_vec()
+            })
+            .collect();
+        assert!(ts.windows(2).all(|w| w[0] >= w[1]), "rows must be ordered timestamp DESC across chunk boundaries");
+        assert_eq!(ts.first().copied(), Some(N - 1), "greatest timestamp first");
+        assert_eq!(ts.last().copied(), Some(0), "least timestamp last");
+    }
+
     fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
@@ -3225,12 +3356,12 @@ mod tests {
         let preds = vec![crate::tantivy_index::udf::TextMatchPred { column: "name".into(), query: "alpha".into() }];
         let node = crate::tantivy_index::udf::PredNode::from_preds(&preds);
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], node.as_ref()).unwrap();
-        let total_rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        let total_rows: usize = parts.partitions.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1, "expected only the matching row, got {} rows in {:?}", total_rows, parts);
 
         // Verify the returned row is the matching one by checking the id col.
         use arrow::array::AsArray;
-        let returned = &parts[0][0];
+        let returned = &parts.partitions[0][0];
         let id_arr = returned.column_by_name("id").unwrap().as_string_view();
         assert_eq!(id_arr.value(0), "hit-1");
     }
@@ -3245,7 +3376,7 @@ mod tests {
         buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
 
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], None).unwrap();
-        let total: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        let total: usize = parts.partitions.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2, "no text_match preds → all rows returned");
     }
 
@@ -3942,7 +4073,7 @@ mod tests {
         // query_partitioned must also apply the filter inline.
         let id_pred2 = col("id").eq(lit(7i64));
         let parts = buffer.query_partitioned("project1", "table1", &[id_pred2]).unwrap();
-        let total_rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        let total_rows: usize = parts.partitions.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
 
@@ -4056,7 +4187,7 @@ mod tests {
         let or = col("name").eq(view("client")).or(col("name").eq(view("internal")));
 
         let parts = buf.query_partitioned("p", "t", std::slice::from_ref(&or)).unwrap();
-        let rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        let rows: usize = parts.partitions.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1258 + 13346, "OR of two Utf8View equalities must keep all matches");
     }
 

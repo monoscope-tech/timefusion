@@ -164,12 +164,30 @@ impl DemotionHealth {
 /// outside every DataFusion memory pool and outside `GatedScanExec`, which
 /// wraps only the Delta plan. A 7d/14d scan's range covers the whole hot
 /// window, so consulting the tier would pull all of it into heap to shave a
-/// handful of files off a scan already dominated by thousands. Past the tier's
-/// own window it is by definition a fraction of the answer, so that window is
-/// the threshold; `retention_micros = 0` (tier off) rejects everything.
+/// handful of files off a scan already dominated by thousands.
+///
+/// The threshold is a MULTIPLE of the retention window, not the window itself.
+/// At exactly one window a query for the tier's own span sits right on the
+/// line: a dashboard asking for 6h against 6h of retention computes its
+/// lookback from a `now()` sampled before the scan runs, so it lands a few
+/// micros OVER and skips the tier — the tier is at its most useful for exactly
+/// the query that cannot use it. The heap it could waste is already bounded
+/// precisely and independently by `limits.leg_budget_bytes`, charged on the
+/// post-filter bytes actually retained, so this test only has to reject scans
+/// so deep the tier is a rounding error in the answer. (Same mistake, same
+/// fix, as the wide-scan gate: do not let a depth proxy stand in for a work
+/// bound that already exists.)
+///
+/// `retention_micros = 0` (tier off) still rejects everything.
 pub fn skip_for_lookback(lookback: Option<i64>, retention_micros: i64) -> bool {
-    lookback.is_none_or(|d| d > retention_micros)
+    lookback.is_none_or(|d| d > retention_micros.saturating_mul(LOOKBACK_WINDOWS))
 }
+
+/// How many retention windows deep a scan may reach and still consult the tier.
+/// 2 keeps the tier's own span (and a little slack for clock skew and a
+/// half-open bound) comfortably inside, while still rejecting the multi-day
+/// scans the eager materialization was never meant to serve.
+const LOOKBACK_WINDOWS: i64 = 2;
 
 /// One demoted bucket file. `[min_ts, end_ts)` is the file's ACTUAL row range,
 /// not its bucket window, and is HALF-OPEN — the same convention as
@@ -181,6 +199,13 @@ pub struct HotBucketMeta {
     pub min_ts: i64,
     pub end_ts: i64,
     pub bytes: u64,
+    /// This file's rows are ordered by the table's declared `sorting_columns`.
+    /// Recorded per FILE, in the name (an `s` on the seq component), because
+    /// the read side turns it into a `try_with_sort_information` claim: a file
+    /// left by an older binary, or one whose batches would not sort, must be
+    /// able to say so rather than be assumed ordered. Any unsorted file in a
+    /// leg retracts the claim for the whole leg.
+    pub sorted: bool,
     /// Greatest `dedup_tiebreak` (version stamp) among the file's rows, on a
     /// `version_append` table. It is what lets the file keep excluding its
     /// window from Delta while merge-on-read keeps appending newer versions
@@ -216,6 +241,12 @@ pub struct HotLeg {
     /// in an excluded window can be newer than the file that owns it and the
     /// exclusion stands unweakened.
     pub version_gate: Option<i64>,
+    /// Every served partition is ordered by the table's declared
+    /// `sorting_columns`, so the caller may declare that ordering on the
+    /// `MemorySourceConfig`. True exactly when the table declares sorting
+    /// columns: `write_bucket` sorts every file it writes and refuses to write
+    /// one it could not sort, and projection/filtering preserve row order.
+    pub sorted: bool,
 }
 
 impl HotLeg {
@@ -370,12 +401,17 @@ fn parse_meta(path: PathBuf, bytes: u64) -> Option<HotBucketMeta> {
         [bucket_id, min_ts, end_ts, seq, stamp] => (bucket_id, min_ts, end_ts, seq, Some(stamp)),
         _ => return None,
     };
+    // A trailing `s` on the seq component marks a SORTED file. Its absence is
+    // what a pre-sort binary's files (and unsortable batches) look like, so the
+    // default is the safe one: no ordering claim.
+    let sorted = seq.ends_with('s');
     Some(HotBucketMeta {
         bucket_id: bucket_id.parse().ok()?,
         min_ts: min_ts.parse().ok()?,
         end_ts: end_ts.parse().ok()?,
-        seq: seq.parse().ok()?,
+        seq: seq.trim_end_matches('s').parse().ok()?,
         max_stamp: stamp.map(str::parse).transpose().ok()?,
+        sorted,
         bytes,
         path,
     })
@@ -478,6 +514,19 @@ impl HotTier {
             debug!("hot tier skipping {project_id}.{table_name}: name is not a safe path component");
             return Ok(None);
         }
+        // Sort ONCE, here. These are the MemBuffer bucket's own batches
+        // (`demote_drained` hands over `FlushableBucket.batches`), so this is
+        // the single point where the rows are frozen and can be ordered for
+        // every later reader of the tier — off the insert path, off the query
+        // path, and off the flush's critical path (demotion already runs in a
+        // spawn_blocking behind its own permit).
+        //
+        // Best-effort: an unsortable batch set is still worth demoting, it just
+        // does not carry the `s` marker and so contributes no ordering claim.
+        let owned = crate::schema_loader::get_schema(table_name)
+            .filter(|s| !s.sorting_columns.is_empty())
+            .and_then(|s| crate::mem_buffer::sort_partition(s, batches.to_vec()));
+        let (batches, sorted) = owned.as_deref().map_or((batches, false), |b| (b, true));
         let Some(schema) = batches.first().map(|b| b.schema()) else { return Ok(None) };
         let dir = self.root.join(project_id).join(table_name);
         fs::create_dir_all(&dir)?;
@@ -489,7 +538,8 @@ impl HotTier {
             .and_then(|s| s.dedup_tiebreak.clone())
             .and_then(|c| max_stamp_of(batches, &c));
         let stamp_suffix = max_stamp.map(|s| format!("_{s}")).unwrap_or_default();
-        let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{stamp_suffix}.{EXT}"));
+        let sort_marker = if sorted { "s" } else { "" };
+        let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{sort_marker}{stamp_suffix}.{EXT}"));
         crate::wal::write_atomic_with(&path, true, |f| {
             // Default options: 64-byte alignment, V5, NO compression — the
             // alignment is what keeps the mmap read zero-copy, the absence of
@@ -498,7 +548,7 @@ impl HotTier {
             batches.iter().try_for_each(|b| w.write(b)).map_err(std::io::Error::other)?;
             w.finish().map_err(std::io::Error::other)
         })?;
-        Ok(Some(HotBucketMeta { bucket_id, seq, min_ts, end_ts, max_stamp, bytes: fs::metadata(&path)?.len(), path }))
+        Ok(Some(HotBucketMeta { bucket_id, seq, min_ts, end_ts, max_stamp, sorted, bytes: fs::metadata(&path)?.len(), path }))
     }
 
     /// Files whose row range overlaps `query_range` — a CLOSED `[lo, hi]`
@@ -547,22 +597,33 @@ impl HotTier {
         if metas.is_empty() {
             return Default::default();
         }
-        let versioned = crate::schema_loader::get_schema(table_name).is_some_and(|s| s.version_append);
+        let declared = crate::schema_loader::get_schema(table_name);
+        let versioned = declared.as_ref().is_some_and(|s| s.version_append);
+        let orders = declared.is_some_and(|s| !s.sorting_columns.is_empty());
         let (tier, mem_ranges, filters, schema, projection) = (self.clone(), mem_ranges.to_vec(), filters.to_vec(), schema.clone(), projection.cloned());
         // open + mmap + decode + page faults are blocking syscalls; a planner
         // future must not run them on its async worker.
-        tokio::task::spawn_blocking(move || tier.read_leg(&metas, &mem_ranges, &filters, &schema, projection.as_deref(), versioned)).await.unwrap_or_default()
+        tokio::task::spawn_blocking(move || tier.read_leg(&metas, &mem_ranges, &filters, &schema, projection.as_deref(), versioned, orders))
+            .await
+            .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_leg(
         &self, metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], filters: &[Expr], schema: &SchemaRef, projection: Option<&[usize]>, versioned: bool,
+        orders: bool,
     ) -> HotLeg {
         let cols = plan_columns(projection, filters, schema);
         let filter_schema = cols.as_ref().map_or_else(|| schema.clone(), |c| c.schema.clone());
         let pred = compile_filter_conjunction(filters, &filter_schema).ok().flatten();
         // Imperative: `used` is a running total whose overflow must stop the
         // walk, and each step is a counted/logged side effect.
-        let (mut partitions, mut ranges, mut used, mut gate) = (Vec::new(), Vec::new(), 0u64, None::<i64>);
+        // `sorted` is an AND across the files actually SERVED: projection and
+        // filtering preserve row order, so a leg of sorted files is sorted, but
+        // one unmarked file (older binary, unsortable batches) retracts the
+        // claim for all of them — `try_with_sort_information` declares one
+        // ordering for the whole source.
+        let (mut partitions, mut ranges, mut used, mut gate, mut sorted) = (Vec::new(), Vec::new(), 0u64, None::<i64>, orders);
         for meta in metas {
             let Some(filtered) = self.materialize(meta, mem_ranges, cols.as_ref(), &pred, schema) else { continue };
             // The hot leg is materialized at PLAN time into a
@@ -582,6 +643,7 @@ impl HotTier {
                 break;
             }
             used += bytes;
+            sorted &= meta.sorted;
             ranges.push(meta.range());
             // The gate travels with the range it guards: a file that cannot
             // vouch for a stamp (`None`) drops it to `i64::MIN`, which admits
@@ -595,7 +657,7 @@ impl HotTier {
                 partitions.push(filtered);
             }
         }
-        HotLeg { partitions, ranges, version_gate: gate }
+        HotLeg { partitions, ranges, version_gate: gate, sorted }
     }
 
     /// One file's contribution to the leg, projected and filtered. `None` =
@@ -1372,7 +1434,13 @@ mod tests {
         assert!(!skip_for_lookback(Some(hour), six_h), "a 1h dashboard is exactly what the tier is for");
         assert!(!skip_for_lookback(Some(3 * hour), six_h), "3h too");
         assert!(!skip_for_lookback(Some(six_h), six_h), "the window's own edge is still served");
-        assert!(skip_for_lookback(Some(six_h + 1), six_h), "one micro past the window and the tier is a fraction of the answer");
+        // THE case this threshold exists for: a dashboard asking for the tier's
+        // own span computes its lookback from a `now()` sampled before the scan,
+        // so it lands just OVER one window. At a 1x threshold that query — the
+        // one the tier is most useful for — skipped the tier entirely.
+        assert!(!skip_for_lookback(Some(six_h + 1), six_h), "a hair past the window is still the tier's own span, not a deep scan");
+        assert!(!skip_for_lookback(Some(2 * six_h), six_h), "slack up to the multiple; leg_budget_bytes bounds the heap, not this");
+        assert!(skip_for_lookback(Some(2 * six_h + 1), six_h), "past the multiple the tier is a fraction of the answer");
         assert!(skip_for_lookback(Some(14 * 24 * hour), six_h), "14d");
         assert!(skip_for_lookback(None, six_h), "no lower bound = infinitely deep");
         // Tier off (retention 0): nothing is ever consulted, however shallow.
