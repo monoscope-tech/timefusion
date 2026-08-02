@@ -702,13 +702,12 @@ async fn column_strings(db: &Arc<Database>, sql: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The load-bearing prerequisite, as a plan-shape assertion: a PLAIN `SELECT`
-/// (no ORDER BY, no LIMIT) over a `version_append` table must reach `DedupExec`
-/// through a `SortPreservingMergeExec`, never a `CoalescePartitionsExec`, and
-/// its input must still declare an ordering.
+/// A plain merge-on-read `SELECT` must dedup without introducing a sort or
+/// ordering-preserving merge. `DedupExec` keeps the greatest version in a
+/// full-set, so its single-partition coalesce is the intended input.
 #[serial]
 #[tokio::test]
-async fn plain_select_merges_ordered_under_dedup() -> Result<()> {
+async fn plain_select_dedups_without_sorting_under_mor() -> Result<()> {
     let (db, project_id) = buffered_db("mor_plan_shape").await?;
     let ts = chrono::Utc::now().timestamp_micros();
     let rows = (0..8).map(|i| mor_row(&format!("k{i}"), "v", &project_id, ts - i * 1000, None)).collect();
@@ -719,9 +718,8 @@ async fn plain_select_merges_ordered_under_dedup() -> Result<()> {
     let text = rendered(&plan);
     let dedup = find_node(&plan, "DedupExec").unwrap_or_else(|| panic!("no DedupExec in plan:\n{text}"));
     let input = dedup.children()[0].clone();
-    assert_eq!(input.name(), "SortPreservingMergeExec", "DedupExec must be fed by an order-preserving merge, got `{}`:\n{text}", input.name());
-    assert!(input.properties().output_ordering().is_some(), "the merge must still declare the ordering keep-greatest reads:\n{text}");
-    assert!(!text.contains("CoalescePartitionsExec"), "an ordering-erasing coalesce under DedupExec is exactly the blocker:\n{text}");
+    assert_eq!(input.name(), "CoalescePartitionsExec", "DedupExec must receive its single-partition input without a merge, got `{}`:\n{text}", input.name());
+    assert!(!text.contains("SortExec") && !text.contains("SortPreservingMergeExec"), "MOR dedup must not add sorting:\n{text}");
     Ok(())
 }
 

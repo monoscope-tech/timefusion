@@ -905,6 +905,11 @@ pub struct TantivyConfig {
     /// full reconcile is throughput-bound on this knob).
     #[serde(default = "d_tantivy_build_concurrency")]
     pub timefusion_tantivy_build_concurrency: usize,
+    /// Backfill/reconcile skips parquet files larger than this (MB). 0 = no
+    /// limit. Memory-tight runners (8 GB k8s nodes) OOM decoding+indexing
+    /// 1 GB files; with a cap they repair everything else and log the skips.
+    #[serde(default)]
+    pub timefusion_tantivy_backfill_max_file_mb: u64,
     /// File-level scan pruning: when the prefilter engages, files whose
     /// covering index returned zero hits are excluded from the Delta scan
     /// entirely (needle queries read only the files that can match). Off

@@ -2470,9 +2470,14 @@ impl Database {
         if !svc.config.is_table_indexed(table_name) {
             return Ok((0, 0, 0));
         }
-        let built = self.backfill_table_indexes(&svc, table_name).await?;
-        // GC every manifest that exists (keyed by project uuid at build time)
-        // — a fixed "default"+customs list never visits unified tenants.
+        // GC FIRST, then backfill. Stale entries only ever cover dead files, so
+        // pruning them cannot regress live-file coverage — and it must not be
+        // hostage to the build phase (a memory-tight runner that OOMs on its
+        // first oversized parquet would otherwise never GC anything). This is
+        // the standalone-reconcile ordering only; the post-optimize hook keeps
+        // build-outputs-before-GC-inputs. GC every manifest that exists (keyed
+        // by project uuid at build time) — a fixed "default"+customs list never
+        // visits unified tenants.
         let (mut removed, mut blobs) = (0usize, 0usize);
         for pid in crate::tantivy_index::manifest::list_projects(svc.object_store.as_ref(), table_name).await? {
             let Ok(table_ref) = self.resolve_table(&pid, table_name).await else { continue };
@@ -2481,6 +2486,7 @@ impl Database {
             removed += report.entries_removed;
             blobs += report.blobs_deleted;
         }
+        let built = self.backfill_table_indexes(&svc, table_name).await?;
         Ok((built, removed, blobs))
     }
 
@@ -2498,9 +2504,13 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
             };
-            let (uris, delta_store) = {
+            let (uris, sizes, delta_store) = {
                 let t = table_ref.read().await;
-                (t.get_file_uris()?.collect::<Vec<String>>(), t.log_store().object_store(None))
+                let sizes: HashMap<String, u64> = match t.snapshot() {
+                    Ok(s) => s.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect(),
+                    Err(_) => HashMap::new(),
+                };
+                (t.get_file_uris()?.collect::<Vec<String>>(), sizes, t.log_store().object_store(None))
             };
             // Group live files by owning project (partition segment).
             let mut by_pid: HashMap<String, Vec<String>> = HashMap::new();
@@ -2509,11 +2519,22 @@ impl Database {
                     by_pid.entry(pid.to_string()).or_default().push(u);
                 }
             }
+            let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
             for (pid, mut uris) in by_pid {
                 let m = manifest::load(svc.object_store.as_ref(), table_name, &pid).await?;
                 let covered: std::collections::HashSet<&String> =
                     m.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
                 uris.retain(|u| !covered.contains(u));
+                if max_bytes > 0 {
+                    let before = uris.len();
+                    uris.retain(|u| parquet_rel_of_uri(u).and_then(|rel| sizes.get(rel)).is_none_or(|sz| *sz <= max_bytes));
+                    let skipped = before - uris.len();
+                    if skipped > 0 {
+                        // No silent caps: oversized files stay uncovered until a
+                        // bigger-memory runner reconciles without the limit.
+                        warn!(table_name, project_id = %pid, skipped, "tantivy backfill skipped files over TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB");
+                    }
+                }
                 uris.sort(); // lexical == chronological for date= partitions
                 let work: Vec<(String, String)> = uris.iter().filter_map(|uri| Some((parquet_rel_of_uri(uri)?.to_string(), uri.clone()))).collect();
                 let table_owned = table_name.to_string();
@@ -6626,11 +6647,7 @@ impl Database {
                 })
                 .sum::<u64>()
                 .saturating_mul(2); // RowConverter keyed copy in dedup_batches
-            // budget == 0 disables that ceiling (→ 1 shard). K = the max either budget
-            // demands, clamped to the bucket count (shards partition the bucket space).
-            let shards_for = |est: u64, budget: u64| if budget > 0 { est.div_ceil(budget) } else { 1 };
-            let shards =
-                shards_for(est_decoded_bytes, decoded_budget).max(shards_for(rewrite_bytes.max(0) as u64, compressed_budget)).clamp(1, DEDUP_BUCKET_COUNT);
+            let shards = dedup_shard_count(est_decoded_bytes, rewrite_bytes.max(0) as u64, decoded_budget, compressed_budget);
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
             // Bucket = first byte of md5 over the dedup keys (2 hex chars =
             // DEDUP_BUCKET_COUNT buckets, evenly spread); chr(31) separates keys so
@@ -7035,13 +7052,9 @@ impl Database {
             return Ok(());
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
-        // Cap a single bin's rewrite so one pathological partition can't hold the
-        // shared maintenance lock (maintenance_job_sem=1) and starve every other
-        // table's dedup + light_optimize. Prod 2026-07-20: a today-partition bin
-        // took 648s (replace_where can't prune files while DV disables pushdown),
-        // stalling all maintenance for ~half the boot window. On timeout the bin
-        // is requeued for a later tick.
-        const DIRTY_BIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+        // Per-shard byte budgets in `stage_dedup_chunk` bound Arrow materialization.
+        // Do not time out the whole bin: cancelling it discards all staged work and
+        // retries the same oversized bin forever.
         let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
         // Skip TODAY's partition: it's the hot, still-growing partition, so a
         // dedup replace_where rewrites an ever-larger file set for a handful of
@@ -7107,14 +7120,8 @@ impl Database {
             info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
             let started = std::time::Instant::now();
             let staged = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
-                Ok(parsed) => {
-                    tokio::time::timeout(
-                        DIRTY_BIN_BUDGET,
-                        self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())),
-                    )
-                    .await
-                }
-                Err(e) => Ok(Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}"))),
+                Ok(parsed) => self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())).await,
+                Err(e) => Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}")),
             };
             (key, started.elapsed(), staged)
         }))
@@ -7145,18 +7152,12 @@ impl Database {
                 continue;
             }
             match staged {
-                // Over budget — requeue and move on so other maintenance runs.
-                Err(_) => {
-                    requeue(key, &stats.dedup_timed_out);
-                    warn!(project_id, table_name, date, bin, budget_secs = DIRTY_BIN_BUDGET.as_secs(), event = "dirty_bin_timeout");
-                    continue;
-                }
-                Ok(Err(error)) => {
+                Err(error) => {
                     requeue(key, &stats.dirty_bin_requeued);
                     warn!(project_id, table_name, date, bin, %error, event = "dirty_bin_failure");
                     continue;
                 }
-                Ok(Ok((units, complete))) => {
+                Ok((units, complete)) => {
                     stats.dirty_bin_rewrite_duration_ms.fetch_add(elapsed.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                     // Duplicate-bearing work was skipped inside the bin (unsealed
                     // chunk, unshardable key group): the bin is NOT done, so it
@@ -8576,6 +8577,13 @@ fn build_query_runtime_env(
 /// `[0, DEDUP_BUCKET_COUNT)` into contiguous ranges, so more shards than buckets
 /// would leave rows uncovered. Doubles as a runaway-shard-count backstop.
 const DEDUP_BUCKET_COUNT: u64 = 256;
+
+/// Returns the hash-shard count needed to keep one dedup rewrite within either
+/// configured byte budget. A zero budget disables that ceiling.
+fn dedup_shard_count(decoded_bytes: u64, rewrite_bytes: u64, decoded_budget: u64, rewrite_budget: u64) -> u64 {
+    let shards_for = |bytes: u64, budget: u64| if budget > 0 { bytes.div_ceil(budget) } else { 1 };
+    shards_for(decoded_bytes, decoded_budget).max(shards_for(rewrite_bytes, rewrite_budget)).clamp(1, DEDUP_BUCKET_COUNT)
+}
 
 /// Rows a bucket must exceed before the streaming merge is worth its setup
 /// (row encoding + heap) over just sorting the single concatenated batch.
@@ -14625,6 +14633,13 @@ mod tests {
         let (ready, deferred) = Database::select_drain_bins(hot_only, today, 3, 2);
         assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-29", 1)], "no cold work ⇒ hot uses the full batch");
         assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn dedup_shards_bound_oversized_rewrites() {
+        assert_eq!(dedup_shard_count(100, 100, 100, 100), 1);
+        assert_eq!(dedup_shard_count(101, 100, 100, 100), 2);
+        assert_eq!(dedup_shard_count(u64::MAX, 1, 1, 0), DEDUP_BUCKET_COUNT);
     }
 
     /// The cold cutoff must never DROP bins: the nightly consolidate bin-packs
