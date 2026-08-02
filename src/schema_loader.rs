@@ -65,12 +65,17 @@ pub struct TableSchema {
     /// versions already written outlive the flag being turned off. Anything
     /// whose correctness depends on what is IN STORAGE must key off the column.
     ///
-    /// DISABLED on `otel_logs_and_spans` / `otel_metrics` 2026-08-02: making
-    /// dedup mandatory forced a query-time `SortExec` (the appended version
-    /// carries the row's ORIGINAL timestamp into a new file, destroying the
-    /// time-range disjointness the ordering relies on), which exhausted the
-    /// query pool — 1h ~13s, 3h timing out. Re-enable only once compaction
-    /// demonstrably keeps pace with the enrichment rate.
+    /// 2026-08-02: enabling this on `otel_logs_and_spans` / `otel_metrics` first
+    /// made recent-window reads unusable (1h ~13s, 3h timing out). Dedup becomes
+    /// mandatory, bounded dedup needed ordered input, and the appended version
+    /// carries the row's ORIGINAL timestamp into a NEW file — so Delta files
+    /// overlap in time, no ordering can be declared, and the planner inserted a
+    /// query-time `SortExec` that exhausted the 27.5GB query pool.
+    ///
+    /// Fixed in `read_dedup`, not by giving up the feature: keep-greatest now
+    /// runs WITHOUT a bound (buffering to end-of-stream), so nothing has to
+    /// manufacture an ordering. `mor_delta_leg_sorts` staying 0 is the signal
+    /// that this is holding.
     #[serde(default)]
     pub version_append: bool,
 }
@@ -519,7 +524,7 @@ mod tests {
             // and the tombstone/tiebreak declarations MUST stay: tombstones and
             // multi-version rows written while it was on are still in storage,
             // and DedupExec + the tombstone filter are what keep them correct.
-            assert!(!schema.version_append, "{name} has merge-on-read disabled; re-enabling needs compaction to keep pace first");
+            assert!(schema.version_append, "{name} ships merge-on-read");
             assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"), "{name} tombstone column");
             // Nullable, so the migration needed no backfill: NULL reads as live.
             assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)), "{name}.deleted must be nullable Boolean");
@@ -569,7 +574,7 @@ mod tests {
         assert!(parse("tombstone_column: deleted\nversion_append: true\n").tombstones_possible(), "write path on → tombstones can exist");
         // The live schemas. otel has `version_append: false` since 2026-08-02 but
         // KEEPS its tombstone column, so it must stay conservative.
-        assert!(get_schema("otel_logs_and_spans").unwrap().tombstones_possible(), "otel still holds tombstones written while MOR was on");
+        assert!(get_schema("otel_logs_and_spans").unwrap().tombstones_possible(), "otel ships merge-on-read");
         assert!(get_schema("mor_versioned").unwrap().tombstones_possible());
         // `mor_dormant` declares a tiebreak but NO tombstone column, so nothing
         // could ever have tombstoned it — the stats fast path stays available.

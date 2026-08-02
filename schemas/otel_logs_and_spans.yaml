@@ -20,23 +20,17 @@ dedup_tiebreak: updated_at
 # rewriting files; `DedupExec` keep-greatest resolves versions at read time and
 # `deleted` marks the tombstone.
 tombstone_column: deleted
-# DISABLED 2026-08-02. `version_append: true` made DedupExec mandatory, and an
-# UPDATE appended a row carrying its ORIGINAL timestamp into a NEW file — which
-# destroys the time-range disjointness recent-window queries depend on. With
-# files overlapping, no ordering can be declared, so every scan paid a full
-# SortExec that exhausted the 27.5GB query pool: 1h ~13s, 3h TIMED OUT.
+# RE-ENABLED 2026-08-02 (see read_dedup.rs). The earlier disable was because
+# `version_append` forced a query-time SortExec: dedup is mandatory here, bounded
+# dedup needs ordered input, and an UPDATE appends the row's ORIGINAL timestamp
+# into a NEW file, so Delta files overlap in time and no ordering can be
+# declared. That sort exhausted the 27.5GB query pool (1h ~13s, 3h timing out).
 #
-# `dedup_tiebreak` and `tombstone_column` are deliberately KEPT. They are what
-# make this flip safe: existing tombstones still beat their older version on the
-# tiebreak, and existing multi-version rows still collapse, because DedupExec
-# keeps running on any window `dedup_window_clean` has not proven swept. The
-# read-side skip is only granted on swept windows, where the sweep has already
-# dropped tombstoned rows and collapsed versions physically.
-#
-# Re-enabling is additive (no migration either way), but do NOT re-enable until
-# compaction demonstrably keeps pace with the enrichment rate — under MOR,
-# compaction is load-bearing, not an optimisation.
-version_append: false
+# Fixed at the source: DedupExec now runs keep-greatest WITHOUT a bound,
+# buffering to end-of-stream instead of demanding an ordering. No SortExec, and
+# unlike the old unbounded fallback (keep-first) it still serves the newest
+# version. Watch `mor_delta_leg_sorts` — it must stay 0.
+version_append: true
 # Hot paths: point lookup by (timestamp, id), and service_name queries within
 # a time range. Leading with `timestamp` keeps row-group min/max stats tight
 # for any timestamp-bound query; sorting by service_name next clusters rows
