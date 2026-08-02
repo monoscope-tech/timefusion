@@ -406,6 +406,11 @@ pub struct BufferedWriteLayer {
     /// heap the memory governor cannot see; over the bound we simply skip (the
     /// tier is a cache). Also the point GC and tests quiesce against.
     demote_permit: Arc<tokio::sync::Semaphore>,
+    /// Demotions waiting on `demote_permit`. A busy permit used to DROP the
+    /// whole drained set (a coverage hole the 24h window then serves from R2);
+    /// now up to `MAX_PENDING_DEMOTIONS` wait their turn, and the counter keeps
+    /// the waiting heap bounded exactly as the permit comment above demands.
+    demote_pending: Arc<std::sync::atomic::AtomicUsize>,
     shutdown: CancellationToken,
     delta_write_callback: Option<DeltaWriteCallback>,
     /// Set alongside `delta_write_callback`; used instead of it when
@@ -577,6 +582,7 @@ impl BufferedWriteLayer {
             // `open` rescans the dir, so a restart comes back warm.
             hot_tier: crate::hot_tier::HotTier::open(cfg.core.hot_tier_dir(), cfg.buffer.hot_tier_retention(), cfg.buffer.hot_tier_limits()),
             demote_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            demote_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown: CancellationToken::new(),
             delta_write_callback: None,
             coalesced_write_callback: None,
@@ -2253,18 +2259,29 @@ impl BufferedWriteLayer {
         if drained.is_empty() {
             return;
         }
-        let Ok(permit) = self.demote_permit.clone().try_acquire_owned() else {
+        // Bounded wait instead of drop-on-busy: a busy permit used to discard
+        // the drained set outright, and each skip is a permanent coverage hole
+        // that every later 24h query pays for at R2. Two waiters cap the heap
+        // pinned by queued batches (they were about to be freed regardless).
+        const MAX_PENDING_DEMOTIONS: usize = 2;
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.demote_pending.fetch_update(Relaxed, Relaxed, |n| (n < MAX_PENDING_DEMOTIONS).then_some(n + 1)).is_err() {
             crate::metrics::record_hot_tier_demote_skipped();
             return;
-        };
+        }
         let work: Vec<_> =
             drained.iter().map(|b| (b.project_id.clone(), b.table_name.clone(), b.bucket_id, b.batches.clone(), b.min_timestamp, b.max_timestamp)).collect();
-        let tier = self.hot_tier.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            for (p, t, id, batches, min, max) in work {
-                tier.demote(&p, &t, id, &batches, min, max);
-            }
+        let (tier, sem, pending) = (self.hot_tier.clone(), self.demote_permit.clone(), self.demote_pending.clone());
+        tokio::spawn(async move {
+            let permit = sem.acquire_owned().await;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                for (p, t, id, batches, min, max) in work {
+                    tier.demote(&p, &t, id, &batches, min, max);
+                }
+            })
+            .await;
+            pending.fetch_sub(1, Relaxed);
         });
     }
 
