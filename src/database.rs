@@ -11171,11 +11171,10 @@ impl TableProvider for ProjectRoutingTable {
         // its match-bearing sibling sits in another leg breaks keep-greatest,
         // so the mem leg gets no tree.
         let mem_tree = text_match_tree.as_ref().filter(|_| mutable.is_none());
-        let mem_leg =
-            layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree).unwrap_or_else(|e| {
-                warn!("Failed to query mem buffer: {}", e);
-                Default::default()
-            });
+        let mem_leg = layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree).unwrap_or_else(|e| {
+            warn!("Failed to query mem buffer: {}", e);
+            Default::default()
+        });
         let mem_partitions = mem_leg.partitions;
 
         // Hot-tier third leg (P1) — see `HotTier::query_partitioned` for the
