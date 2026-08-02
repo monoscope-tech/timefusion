@@ -1,14 +1,26 @@
 .PHONY: lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
-# Default test (fast, excludes slow integration tests)
+# THE inner-loop command: the whole suite, every time you change something.
+#
+# `cargo nextest` (not `cargo test`) because nextest runs one process per test
+# from a single global pool. `cargo test` runs the test *binaries* one after
+# another and `#[serial]` re-serializes most tests inside each one, so it uses
+# roughly one core no matter how many the box has. Process-per-test also gives
+# each test its own copy of the process-global state (`PGWIRE_PORT`, the
+# `OnceLock` config) that `#[serial]` exists to protect.
+#
+# Needs cargo-nextest:
+#   curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ~/.cargo/bin
+#
+# Filter with ARGS (substring match on the test name):
+#   make test ARGS=dedup_compaction
 test:
-	cargo test $${ARGS}
+	cargo nextest run $${ARGS}
 
-# Fast lib-only iteration: single leaf compile (no redundant `cargo build`),
-# skips integration/e2e. Filter one test with ARGS, e.g.
-#   make test-unit ARGS=test_recompress_partition_skip_idempotency
+# Lib-only: skips the integration binary entirely. Use when iterating on a
+# pure-logic change; `make test` is cheap enough to be the default otherwise.
 test-unit:
-	cargo test --lib $${ARGS}
+	cargo nextest run --lib $${ARGS}
 
 # Exactly what CI's Clippy step runs — the flags live once, in the `cargo lint`
 # alias in `.cargo/config.toml`. A bare `cargo clippy` is NOT equivalent: it
@@ -22,38 +34,37 @@ lint-fix:
 	cargo lint-fix
 
 # Pre-push gate: CI's lint first (fails fast and cheap — a lint error should not
-# cost you a 2-minute test run), then the full local suite (lib + sqllogictest +
-# dedup + integration) in one invocation so all four test binaries share a single
-# compile pass. Set TIMEFUSION_TEST_S3_ENDPOINT to reuse a persistent MinIO and
-# skip container startup on the S3-heavy sqllogictest.
+# cost a full test run), then the whole suite. No hand-picked subset any more:
+# with nextest the full run is short enough that skipping targets only buys a
+# surprise in CI. Set TIMEFUSION_TEST_S3_ENDPOINT to reuse a persistent MinIO.
 prepush: lint
-	RUST_LOG=off cargo test --lib --test sqllogictest --test dedup_compaction_test --test integration_test $${ARGS}
+	RUST_LOG=off cargo nextest run $${ARGS}
 
-# Run all tests including slow integration tests
+# Everything, including the #[ignore]d tests.
 test-all:
-	@export $$(cat .env | grep -v '^#' | xargs) && cargo test -- --include-ignored $${ARGS}
+	@export $$(cat .env | grep -v '^#' | xargs) && cargo nextest run --run-ignored all $${ARGS}
 
 # Explicit test with OVH/S3
 test-ovh:
 	@echo "Testing with OVH/S3..."
-	@export $$(cat .env | grep -v '^#' | xargs) && cargo test $${ARGS}
+	@export $$(cat .env | grep -v '^#' | xargs) && cargo nextest run $${ARGS}
 
 # Test with MinIO (fast, excludes slow integration tests)
 test-minio:
 	@echo "Testing with MinIO..."
-	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test $${ARGS}
+	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo nextest run $${ARGS}
 
 # Test with MinIO including all tests (same as CI)
 test-minio-all:
 	@echo "Testing all with MinIO (including integration tests)..."
-	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test -- --include-ignored $${ARGS}
+	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo nextest run --run-ignored all $${ARGS}
 
 # Test with production config (be careful!)
 test-prod:
 	@echo "WARNING: Testing with PRODUCTION credentials!"
 	@echo "Press Ctrl+C to cancel, or wait 3 seconds to continue..."
 	@sleep 3
-	@export $$(cat .env.prod | grep -v '^#' | xargs) && cargo test $${ARGS}
+	@export $$(cat .env.prod | grep -v '^#' | xargs) && cargo nextest run $${ARGS}
 
 # Run with production configuration
 run-prod:
@@ -95,12 +106,12 @@ minio-clean:
 # These are slower tests that start a full PGWire server
 test-integration:
 	@echo "Running integration tests..."
-	@export $$(cat .env | grep -v '^#' | xargs) && cargo test --test integration_test --test sqllogictest -- --ignored $${ARGS}
+	@export $$(cat .env | grep -v '^#' | xargs) && cargo nextest run --run-ignored all -E 'test(integration) or test(sqllogictest)' $${ARGS}
 
 # Run integration tests with MinIO
 test-integration-minio:
 	@echo "Running integration tests with MinIO..."
-	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test --test integration_test --test sqllogictest -- --ignored $${ARGS}
+	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo nextest run --run-ignored all -E 'test(integration) or test(sqllogictest)' $${ARGS}
 
 # Background-run TimeFusion against local MinIO. PID + log under /tmp.
 # Intended for use by downstream test suites (e.g. monoscope integration tests).
@@ -124,7 +135,7 @@ tf-start: minio-start
 # gets a fresh container + bucket so they parallelize safely.
 test-e2e:
 	@echo "Running E2E suite (Docker required for MinIO)..."
-	cargo test --test e2e --features e2e -- --test-threads=1 --nocapture $${ARGS}
+	cargo nextest run --features e2e -E 'binary(e2e)' $${ARGS}
 
 tf-stop:
 	@[ -f /tmp/timefusion.pid ] && kill $$(cat /tmp/timefusion.pid) 2>/dev/null || true

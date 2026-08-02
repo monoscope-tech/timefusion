@@ -13838,7 +13838,6 @@ mod tests {
         let mut cfg = (*create_test_config(&prefix)).clone();
         cfg.buffer.timefusion_flush_coalesce_commits = true;
         let cfg = Arc::new(cfg);
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         tokio::time::timeout(std::time::Duration::from_secs(50), async {
             let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
             let t = "otel_logs_and_spans";
@@ -13891,7 +13890,6 @@ mod tests {
         // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
         let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&prefix);
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         tokio::time::timeout(std::time::Duration::from_secs(50), async {
             // Need the real buffered layer (force_flush path), so bootstrap the
             // full stack rather than the layer-less setup_test_database().
@@ -13941,7 +13939,6 @@ mod tests {
         // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
         let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&prefix);
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let res = tokio::time::timeout(std::time::Duration::from_secs(50), async {
             let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
             let project_id = format!("ffs_{}", prefix);
@@ -13989,7 +13986,6 @@ mod tests {
         // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
         let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&prefix);
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let res = tokio::time::timeout(std::time::Duration::from_secs(50), async {
             let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
             let project_id = format!("ffw_{}", prefix);

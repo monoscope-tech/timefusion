@@ -244,21 +244,10 @@ impl E2eEnvBuilder {
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).ok();
 
-        // walrus-rust reads WALRUS_DATA_DIR from process env. Point it at
-        // the same path the WAL itself is opened at (`cfg.core.wal_dir()` =
-        // `<data_dir>/wal`) so both views agree. Without this, parallel
-        // tests would replay each other's WAL on bootstrap; with it, each
-        // test sees only its own WAL after restart.
-        let test_wal_dir = data_dir.join("wal");
-        std::fs::create_dir_all(&test_wal_dir).ok();
-        // SAFETY: every e2e test is #[serial_test::serial] (the dedicated E2E
-        // job also passes --test-threads=1), so no other thread reads/writes
-        // WALRUS_DATA_DIR concurrently. The serial attribute is what keeps
-        // this sound when the suite runs under plain `cargo test
-        // --all-features` (the Clippy & Test job), where parallel harness
-        // startups used to race the env var and bootstrap with another
-        // test's WAL dir ("Unsupported WAL version: 0").
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", &test_wal_dir) };
+        // `<data_dir>/wal` is this test's WAL. `WalManager` opens exactly that
+        // path (`cfg.core.wal_dir()`), so nothing process-global is involved and
+        // concurrent tests cannot replay each other's WAL.
+        std::fs::create_dir_all(data_dir.join("wal")).ok();
 
         // Bucket creation: MinIO default credentials are minioadmin/minioadmin.
         create_bucket(&endpoint, &bucket).await.context("create MinIO bucket")?;
@@ -301,6 +290,7 @@ impl E2eEnvBuilder {
 
         Ok(E2eEnv {
             _minio: minio,
+            wal_dir: data_dir.join("wal"),
             data_dir,
             pg_port,
             pg_shutdown,
@@ -308,7 +298,6 @@ impl E2eEnvBuilder {
             bucket,
             endpoint,
             test_id,
-            wal_dir: test_wal_dir,
             builder: self,
         })
     }
@@ -361,10 +350,6 @@ impl E2eEnv {
         drop(prev);
         // Give the pgwire accept loop a moment to release the port.
         tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Re-point walrus to our preserved WAL dir before re-bootstrapping.
-        // SAFETY: --test-threads=1 — no concurrent reader/writer of this var.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", &self.wal_dir) };
 
         let pg_port = 5500 + rand::rng().random_range(1..400) as u16;
         let cfg = build_config(BuildCfgArgs {

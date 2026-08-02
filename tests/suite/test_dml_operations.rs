@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod test_dml_operations {
+mod tests {
     use std::sync::Arc;
 
     use anyhow::Result;
@@ -651,7 +651,6 @@ mod test_dml_operations {
         let cfg = create_test_config(&test_id);
         // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment; #[serial]
         // prevents concurrent access to this process-global.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
         let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
 
         let db0 = Database::with_config(cfg).await?;
@@ -965,9 +964,6 @@ mod test_dml_operations {
     async fn test_update_from_buffered_rows_persisted_by_flush() -> Result<()> {
         timefusion::test_utils::init_test_logging();
         let cfg = timefusion::test_utils::test_helpers::TestConfigBuilder::new("dml_wm").build();
-        // SAFETY: same #[serial]-guarded process-global env dance as
-        // buffer_consistency_test.rs.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
         // The layer needs the SAME Delta writer prod uses: without it
         // `flush_bucket` cannot persist anything (it now fails rather than
         // draining into the void), and this test is precisely about the flush

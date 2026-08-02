@@ -29,12 +29,12 @@ The `Makefile` has shortcuts (`make minio-start`, `make run-minio`,
 ## Tests
 
 ```bash
-cargo test                          # unit tests (fast)
-cargo test --test sqllogictest      # SQL logic tests
-cargo test --test integration_test  # write-path integration
-cargo test --test e2e               # end-to-end (Docker required; testcontainers MinIO)
-RUST_LOG=debug cargo test           # with debug logging
-make test-all                       # everything, including slow integration tests
+make test                           # the whole suite in one parallel run (~74s)
+cargo nextest run <substring>       # one test or one .slt file, e.g. `dedup_compaction`
+cargo nextest run --lib             # unit tests only
+make test-e2e                       # end-to-end (Docker required; testcontainers MinIO)
+RUST_LOG=debug cargo nextest run --no-capture   # with debug logging
+make test-all                       # also the #[ignore]d tests
 ```
 
 - **Dev builds compile far faster than release** — use them while iterating.
@@ -77,7 +77,7 @@ See [CLAUDE.md](CLAUDE.md) for the full code philosophy.
 ## Commits & pull requests
 
 - Keep commits focused; write clear messages describing the *why*.
-- Make sure `cargo test`, `cargo fmt --check`, and `cargo clippy` pass.
+- Make sure `make prepush` (`cargo lint` + the full suite) and `cargo fmt --check` pass.
 - Open the PR against `master` with a description of the change and how you
   verified it.
 

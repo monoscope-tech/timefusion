@@ -317,13 +317,14 @@ cargo run
 **Tests:**
 
 ```bash
-cargo test                          # unit tests (fast)
-cargo test --test sqllogictest      # SQL logic tests
-cargo test --test integration_test  # write-path integration
-cargo test --test e2e               # end-to-end (Docker required)
-RUST_LOG=debug cargo test           # with debug logging
+make test                           # the whole suite in one parallel run (~74s)
+cargo nextest run <substring>       # one test or one .slt file, e.g. `dedup_compaction`
+cargo nextest run --lib             # unit tests only
+make test-e2e                       # end-to-end (Docker required; testcontainers MinIO)
+RUST_LOG=debug cargo nextest run --no-capture   # with debug logging
 
-make test-unit ARGS=<test_name>     # fast lib-only iteration (single leaf compile)
+Tests run under [cargo-nextest](https://nexte.st) (one process per test).
+Install: `curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ~/.cargo/bin`.
 ```
 
 **Faster local builds (macOS arm64):** `.cargo/config.toml` links with `ld64.lld`

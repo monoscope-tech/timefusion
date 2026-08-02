@@ -1,0 +1,41 @@
+# cargo-nextest: the inner-loop test runner.
+#
+# Why nextest and not `cargo test`: `cargo test` runs the integration test
+# BINARIES strictly one after another (24+ of them), and within a binary the
+# `#[serial]` annotations serialize most tests again — so the suite is
+# effectively single-threaded end to end. nextest runs every test as its own
+# process from a single global pool, so all binaries' tests interleave and the
+# box's cores are actually used.
+#
+# Process-per-test also isolates the process-global state (`PGWIRE_PORT`, the
+# `OnceLock` config) that `#[serial]` exists to protect. The one global that
+# process isolation could NOT save us from was walrus's `WALRUS_DATA_DIR` —
+# tests share a filesystem — so `WalManager` now passes the directory to
+# `Walrus::with_root` instead. Don't add a new process-global to this list.
+
+[profile.default]
+# Each test process is a full DataFusion + Delta + object-store client; ~10
+# concurrent ones fit comfortably in 32 GiB. Left at "num-cpus" so smaller
+# boxes scale down on their own.
+test-threads = "num-cpus"
+# Tests talk to a local MinIO; a wedged Delta commit should fail the run
+# rather than hang the dev loop behind the default (no) timeout.
+slow-timeout = { period = "30s", terminate-after = 20 }
+fail-fast = false
+status-level = "fail"
+final-status-level = "slow"
+
+# `cargo nextest run --profile ci`
+[profile.ci]
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 10 }
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "retry"
+retries = 1
+
+# Ad-hoc profiling of the tail: flags every test over 4s.
+[profile.timings]
+slow-timeout = { period = "4s", terminate-after = 100 }
+status-level = "slow"
+final-status-level = "slow"

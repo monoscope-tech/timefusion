@@ -3135,10 +3135,6 @@ mod tests {
         assert!(err.to_string().contains("nonexistent"), "msg: {err}");
     }
 
-    /// Defect 3: with a tiebreak column, the row with the greatest tiebreak value
-    /// wins per key (an enriched re-emit carries a later `observed_timestamp`),
-    /// regardless of input position — and a non-null tiebreak beats a null one.
-    #[test]
     /// Rows buffered under the PRE-`version_append` schema carry no tiebreak
     /// column. Failing them made those buckets permanently unflushable — they
     /// pinned MemBuffer at the hard limit while newer buckets drained fine
@@ -3166,6 +3162,9 @@ mod tests {
         assert!(dedup_batches(vec![mk(vec![1], vec!["x"])], &["nope".to_string()], None, None).is_err(), "a missing dedup key must still fail loudly");
     }
 
+    /// Defect 3: with a tiebreak column, the row with the greatest tiebreak value
+    /// wins per key (an enriched re-emit carries a later `observed_timestamp`),
+    /// regardless of input position — and a non-null tiebreak beats a null one.
     #[test]
     fn dedup_batches_tiebreak_keeps_greatest() {
         let schema = Arc::new(Schema::new(vec![

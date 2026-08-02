@@ -248,7 +248,11 @@ impl WalManager {
             crate::config::WalFsyncMode::SyncEach => FsyncSchedule::SyncEach,
             crate::config::WalFsyncMode::None => FsyncSchedule::NoFsync,
         };
-        let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, schedule)?;
+        // Root the WAL at the dir we were handed, NOT at walrus's process-global
+        // `WALRUS_DATA_DIR`. That env var made every `WalManager` in a process
+        // share one directory, so concurrent tests corrupted each other's blocks
+        // and the whole suite had to run serially to stay correct.
+        let wal = Walrus::with_root(&data_dir, ReadConsistency::StrictlyAtOnce, schedule)?;
 
         let meta_dir = data_dir.join(META_DIR);
         let _ = std::fs::create_dir_all(&meta_dir);
@@ -1597,7 +1601,6 @@ mod tests {
     #[test]
     fn oversized_insert_append_survives_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(dir.path());
         let table = format!("big_{}", uuid::Uuid::new_v4().simple());
         let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 2).unwrap();
 
@@ -1696,7 +1699,6 @@ mod tests {
     #[test]
     fn append_update_with_source_rejects_oversized_source() {
         let dir = tempfile::tempdir().unwrap();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(dir.path());
         let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 2).unwrap();
         let source = SerializedSource { join_keys: vec![("id".to_string(), "id".to_string())], batch_ipc: vec![0u8; MAX_BATCH_SIZE + 1] };
         let res = wal.append_update_with_source("proj", "tbl", None, &[], &source, |_, _| {});
@@ -1742,7 +1744,6 @@ mod tests {
     #[test]
     fn ack_fsync_appends_are_synced_and_readable() {
         let dir = tempfile::tempdir().unwrap();
-        let _env = crate::test_utils::test_helpers::walrus_env_guard(dir.path());
         let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
         let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::Milliseconds(60_000), 2)
             .unwrap()
@@ -1777,10 +1778,6 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: walrus reads its data dir from the process-global
-        // WALRUS_DATA_DIR; #[serial] protects the mutation. Without this the
-        // test inherits a prior test's now-dropped tempdir and walrus I/O fails.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", dir.path()) };
         let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
         let wal = Arc::new(WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 4).unwrap());
 

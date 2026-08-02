@@ -57,8 +57,6 @@ async fn make_client(svc: IngestService) -> IngestClient<tonic::transport::Chann
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_write_round_trip() -> Result<()> {
     let cfg = TestConfigBuilder::new("grpc_test").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: walrus-rust uses a process-global env var; #[serial] guards it.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
 
@@ -94,7 +92,6 @@ async fn grpc_write_round_trip() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_rejects_bad_payload() -> Result<()> {
     let cfg = TestConfigBuilder::new("grpc_test").with_buffer_mode(BufferMode::Enabled).build();
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
 
@@ -115,7 +112,6 @@ async fn grpc_rejects_bad_payload() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_auth_rejects_missing_token() -> Result<()> {
     let cfg = TestConfigBuilder::new("grpc_test").with_buffer_mode(BufferMode::Enabled).build();
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
 

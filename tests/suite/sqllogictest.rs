@@ -10,8 +10,6 @@ mod sqllogictest_tests {
     use anyhow::{Context, Result};
     use async_trait::async_trait;
     use datafusion_postgres::ServerOptions;
-    use dotenv::dotenv;
-    use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
     use timefusion::database::Database;
@@ -277,7 +275,7 @@ mod sqllogictest_tests {
     /// last resort rather than the default. Hitting non-local S3 is deliberately
     /// hard: it requires exporting the real AWS_* creds *and*
     /// `TIMEFUSION_TEST_S3_ENDPOINT` yourself.
-    async fn ensure_local_minio() -> Result<MinioGuard> {
+    async fn ensure_local_minio() -> Result<(MinioGuard, String)> {
         const LOCAL: &str = "127.0.0.1:9000";
         let (guard, endpoint) = if let Ok(ep) = std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
             (MinioGuard::External, ep)
@@ -312,23 +310,11 @@ mod sqllogictest_tests {
             let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
             (MinioGuard::Container(minio), format!("http://{host}:{port}"))
         };
-        let bucket = "timefusion-test";
-        unsafe {
-            std::env::set_var("AWS_S3_ENDPOINT", &endpoint);
-            std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
-            std::env::set_var("AWS_S3_BUCKET", bucket);
-            std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
-            std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
-            std::env::set_var("AWS_REGION", "us-east-1");
-            std::env::set_var("AWS_ALLOW_HTTP", "true");
-            std::env::set_var("AWS_S3_LOCKING_PROVIDER", "");
-            // Neutralize any prod DynamoDB locking leaking in from a stale .env.
-            std::env::remove_var("AWS_ENDPOINT_URL_DYNAMODB");
-        }
-        create_bucket(&endpoint, bucket).await?;
-        Ok(guard)
+        create_bucket(&endpoint, BUCKET).await?;
+        Ok((guard, endpoint))
     }
+
+    const BUCKET: &str = "timefusion-test";
 
     /// Spawn the local `minio` binary as a throwaway server on 127.0.0.1:9000.
     fn spawn_local_minio() -> Result<std::process::Child> {
@@ -373,24 +359,34 @@ mod sqllogictest_tests {
 
     async fn start_test_server() -> Result<(Arc<Notify>, u16, MinioGuard)> {
         let test_id = Uuid::new_v4().to_string();
-        dotenv().ok();
 
-        // Default all sqllogictests to local MinIO before Database::new() reads config.
-        let minio = ensure_local_minio().await?;
+        let (minio, endpoint) = ensure_local_minio().await?;
 
-        // Use a unique port for each test run
-        let port = 5433 + (std::process::id() % 100) as u16;
-        unsafe {
-            std::env::set_var("PGWIRE_PORT", port.to_string());
-            std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-slt-{}", test_id));
-        }
+        // Free ephemeral port, asked of the kernel rather than derived from the
+        // pid: with one process per .slt file these servers start concurrently,
+        // and `5433 + pid % 100` collides often enough to wedge a whole run.
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port();
+
+        // Explicit config rather than `Database::new()` + `set_var`: the storage
+        // prefix and port are per-test, and writing them into the process env
+        // makes concurrently-starting servers steal each other's values.
+        let mut cfg = timefusion::config::AppConfig::default();
+        cfg.aws.aws_s3_bucket = Some(BUCKET.to_string());
+        cfg.aws.aws_s3_endpoint = endpoint;
+        cfg.aws.aws_access_key_id = Some("minioadmin".into());
+        cfg.aws.aws_secret_access_key = Some("minioadmin".into());
+        cfg.aws.aws_default_region = Some("us-east-1".into());
+        cfg.aws.aws_allow_http = Some("true".into());
+        cfg.core.timefusion_table_prefix = format!("test-slt-{test_id}");
+        cfg.core.timefusion_data_dir = std::env::temp_dir().join(format!("timefusion-slt-{test_id}"));
+        cfg.cache.timefusion_foyer_disabled = true;
 
         // Use a shareable notification
         let shutdown_signal = Arc::new(Notify::new());
         let shutdown_signal_clone = shutdown_signal.clone();
 
         tokio::spawn(async move {
-            let db = Database::new().await.expect("Failed to create database");
+            let db = Database::with_config(Arc::new(cfg)).await.expect("Failed to create database");
             let db = Arc::new(db);
             let mut session_context = db.clone().create_session_context();
             db.setup_session_context(&mut session_context).expect("Failed to setup session context");
@@ -409,131 +405,80 @@ mod sqllogictest_tests {
             }
         });
 
-        // Wait for server to be ready
-        let _ = connect_with_retry(port, Duration::from_secs(5)).await?;
+        // Generous: these servers boot concurrently with the rest of the suite,
+        // and a debug-build `Database::new()` on a loaded box can take far longer
+        // than it does in isolation. A too-tight budget here shows up as a
+        // spurious .slt failure that only reproduces under full-suite load.
+        let _ = connect_with_retry(port, Duration::from_secs(60)).await?;
 
         Ok((shutdown_signal, port, minio))
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial]
-    async fn run_sqllogictest() -> Result<()> {
-        // `_minio` keeps the MinIO container alive for the whole test.
+    /// Run a single `tests/slt/<stem>.slt` against a private server.
+    ///
+    /// One server per file rather than one shared across all of them: under
+    /// nextest each test is its own process, so the files run concurrently.
+    /// They also share unqualified table names (`test_table`, `events`, `t`, …)
+    /// and only stay isolated because each server gets its own storage prefix.
+    async fn run_slt(stem: &str) -> Result<()> {
+        // `_minio` keeps the MinIO instance alive for the whole test.
         let (shutdown_signal, port, _minio) = start_test_server().await?;
+        let path = Path::new("tests/slt").join(format!("{stem}.slt"));
 
-        let _factory = || async move {
-            let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
+        let factory = || async move {
+            let (client, _) = connect_with_retry(port, Duration::from_secs(30)).await?;
             Ok::<TestDB, TestError>(TestDB { client })
         };
-
-        // Auto-discover all .slt test files
-        let test_dir = Path::new("tests/slt");
-        let mut test_files = Vec::new();
-
-        // Check if a specific test file is requested via environment variable.
-        // `SLT_FILTER` is a shorter alias for `SQLLOGICTEST_FILE`.
-        let test_filter = std::env::var("SQLLOGICTEST_FILE").or_else(|_| std::env::var("SLT_FILTER")).ok();
-
-        // Pretty output mode
-        let pretty_mode = std::env::var("SQLLOGICTEST_PRETTY").is_ok();
-
-        if test_dir.is_dir() {
-            for entry in std::fs::read_dir(test_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("slt") {
-                    if let Some(ref filter) = test_filter {
-                        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if filename.contains(filter) {
-                            test_files.push(path);
-                        }
-                    } else {
-                        test_files.push(path);
-                    }
-                }
-            }
-        }
-
-        test_files.sort();
-
-        if pretty_mode {
-            println!("\n🧪 SQLLogicTest Runner");
-            println!("{}", "=".repeat(50));
-        }
-
-        if let Some(ref filter) = test_filter {
-            println!("\n📁 Filtering for test files containing: '{}'", filter);
-        }
-
-        println!("\n📋 Found {} test files:", test_files.len());
-        for file in &test_files {
-            println!("   • {}", file.file_name().unwrap().to_string_lossy());
-        }
-
-        if test_files.is_empty() {
-            shutdown_signal.notify_one();
-            if let Some(ref filter) = test_filter {
-                return Err(anyhow::anyhow!("No test files found matching filter '{}'", filter));
-            } else {
-                return Err(anyhow::anyhow!("No .slt test files found in tests/slt directory"));
-            }
-        }
-
-        let mut all_passed = true;
-        for test_file in test_files {
-            let test_path = test_file.as_path();
-            if pretty_mode {
-                println!("\n\n🔄 Running: {}", test_path.file_name().unwrap().to_string_lossy());
-                println!("{}", "-".repeat(50));
-            } else {
-                println!("\nRunning SQLLogicTest: {}", test_path.display());
-            }
-
-            let (cleanup_client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
-            let tables_to_drop = ["test_table", "events", "t", "numeric_test", "percentile_test", "test_spans"];
-            for table in &tables_to_drop {
-                let drop_sql = format!("DROP TABLE IF EXISTS {}", table);
-                let _ = cleanup_client.execute(&drop_sql, &[]).await;
-            }
-
-            let factory_clone = || async move {
-                let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
-                Ok::<TestDB, TestError>(TestDB { client })
-            };
-
-            let test_result = sqllogictest::Runner::new(factory_clone).run_file_async(test_path).await;
-
-            match test_result {
-                Ok(_) => {
-                    if pretty_mode {
-                        println!("✅ PASSED: {}", test_path.file_name().unwrap().to_string_lossy());
-                    } else {
-                        println!("✓ {} passed", test_path.display());
-                    }
-                }
-                Err(e) => {
-                    if pretty_mode {
-                        eprintln!("❌ FAILED: {}", test_path.file_name().unwrap().to_string_lossy());
-                        eprintln!("   Error: {:?}", e);
-                    } else {
-                        eprintln!("✗ {} failed: {:?}", test_path.display(), e);
-                    }
-                    all_passed = false;
-                }
-            }
-        }
-
+        let result = sqllogictest::Runner::new(factory).run_file_async(&path).await;
         shutdown_signal.notify_one();
-
-        if pretty_mode {
-            println!("\n{}", "=".repeat(50));
-            if all_passed {
-                println!("✅ All tests passed!");
-            } else {
-                println!("❌ Some tests failed");
-            }
-        }
-
-        if all_passed { Ok(()) } else { Err(anyhow::anyhow!("Some SQLLogicTests failed")) }
+        result.map_err(|e| anyhow::anyhow!("{} failed: {e:?}", path.display()))
     }
+
+    /// One `#[test]` per .slt file, so `cargo nextest run` fans them out across
+    /// cores instead of walking ~2800 lines of SQL serially through one server.
+    /// The test is named after the file, so `cargo nextest run variant_functions`
+    /// runs just that one.
+    macro_rules! slt_files {
+        ($($stem:ident),* $(,)?) => {
+            $(
+                #[tokio::test(flavor = "multi_thread")]
+                async fn $stem() -> Result<()> {
+                    run_slt(stringify!($stem)).await
+                }
+            )*
+
+            /// A new .slt file that nobody added to `slt_files!` would otherwise
+            /// be silently never run.
+            #[test]
+            fn every_slt_file_has_a_test() {
+                let declared = [$(stringify!($stem)),*];
+                let missing: Vec<String> = std::fs::read_dir("tests/slt")
+                    .expect("tests/slt")
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "slt"))
+                    .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+                    .filter(|stem| !declared.contains(&stem.as_str()))
+                    .collect();
+                assert!(missing.is_empty(), "add these to slt_files!: {missing:?}");
+            }
+        };
+    }
+
+    slt_files!(
+        aggregations,
+        basic_operations,
+        custom_functions,
+        distinct_on_variant,
+        edge_cases,
+        filtering,
+        function_availability_test,
+        integration,
+        json_functions,
+        merge_on_read,
+        partition_pruning_test,
+        percentile_functions,
+        variant_column,
+        variant_functions,
+    );
 }

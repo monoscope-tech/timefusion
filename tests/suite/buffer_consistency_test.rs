@@ -18,10 +18,6 @@ fn get_str(arr: &dyn Array, idx: usize) -> String {
 
 async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<BufferedWriteLayer>, String)> {
     let cfg = TestConfigBuilder::new("buf_test").with_buffer_mode(mode).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment. We use #[serial] on all tests
-    // to prevent concurrent access to this process-global state. This is inherently racy but
-    // acceptable for tests since they run sequentially.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     // Wire the SAME Delta writer prod does. A layer without it does not fail —
     // `flush_bucket` used to log "no delta write callback" and drain the bucket
     // anyway, so every flushed row was silently destroyed while `is_empty()`

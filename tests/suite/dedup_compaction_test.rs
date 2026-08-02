@@ -13,14 +13,13 @@ use datafusion::arrow::{
 use serial_test::serial;
 use timefusion::{
     database::Database,
-    test_utils::test_helpers::{BufferMode, TestConfigBuilder, delta_physical_row_count, json_to_batch, test_span_ts, walrus_env_guard},
+    test_utils::test_helpers::{BufferMode, TestConfigBuilder, delta_physical_row_count, json_to_batch, test_span_ts},
 };
 
 #[serial]
 #[tokio::test]
 async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let cfg = TestConfigBuilder::new("dedup_compaction").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -72,7 +71,6 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
 #[tokio::test]
 async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
     let cfg = TestConfigBuilder::new("read_side_dedup").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -112,7 +110,6 @@ async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
 #[tokio::test]
 async fn limit_query_not_truncated_below_read_dedup() -> Result<()> {
     let cfg = TestConfigBuilder::new("read_dedup_limit").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -144,7 +141,6 @@ async fn limit_query_not_truncated_below_read_dedup() -> Result<()> {
 #[tokio::test]
 async fn dedup_sweep_collapses_prior_day_partition() -> Result<()> {
     let cfg = TestConfigBuilder::new("dedup_sweep_lookback").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -181,7 +177,6 @@ async fn dedup_sweep_collapses_prior_day_partition() -> Result<()> {
 async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
     use std::sync::atomic::Ordering::{Acquire, Release};
     let cfg = TestConfigBuilder::new("dedup_occ_race").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -242,7 +237,6 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
 #[tokio::test]
 async fn optimize_preserves_all_partition_values() -> Result<()> {
     let cfg = TestConfigBuilder::new("optimize_partition_preserve").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -282,7 +276,6 @@ async fn optimize_preserves_all_partition_values() -> Result<()> {
 #[tokio::test]
 async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
     let cfg = TestConfigBuilder::new("dedup_targeted").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -349,7 +342,6 @@ async fn dedup_shards_over_budget_and_preserves_rows() -> Result<()> {
     cfg.maintenance.timefusion_dedup_max_decoded_bytes = 5_000_000;
     let cfg = Arc::new(cfg);
 
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -400,7 +392,6 @@ async fn dedup_skips_single_hot_key_over_budget() -> Result<()> {
     cfg.maintenance.timefusion_dedup_max_decoded_bytes = 4_000_000;
     let cfg = Arc::new(cfg);
 
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -435,7 +426,6 @@ async fn dedup_skips_single_hot_key_over_budget() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
     let cfg = TestConfigBuilder::new("update_dup_target").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -480,7 +470,6 @@ async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn update_from_duplicate_source_keys_applies_last_write_wins() -> Result<()> {
     let cfg = TestConfigBuilder::new("update_dup_source").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -523,7 +512,6 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     use timefusion::test_utils::test_helpers::minio_test_config;
     let id = format!("cold-consol-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let dir = format!("/tmp/timefusion-{id}");
-    let _env = walrus_env_guard(std::path::Path::new(&dir));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     // A sealed, cold date (3 days back). Arrival order interleaves event
@@ -645,9 +633,6 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
 /// A `Database` with a real buffered layer, so writes can land in MemBuffer.
 async fn buffered_db(name: &str) -> Result<(Arc<Database>, String)> {
     let cfg = TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; every
-    // caller is `#[serial]`, same as `buffer_consistency_test::setup_db_with_buffer`.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
     Ok((db, format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8])))
@@ -991,8 +976,6 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
 
     const TABLE: &str = "mor_versioned";
     let cfg = TestConfigBuilder::new("schema_skew").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; `#[serial]`.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
 
     // Pre-create the unified Delta table at the OLD column set, at exactly the
     // URI `get_or_create_unified_table` will later resolve, so TF LOADS this
@@ -1131,8 +1114,6 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
 
     const TABLE: &str = "otel_logs_and_spans";
     let cfg = TestConfigBuilder::new("nullability_widened").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; `#[serial]`.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
@@ -1238,7 +1219,6 @@ async fn a_filter_on_an_updated_column_never_matches_the_superseded_version() ->
 async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
     const TABLE: &str = "otel_logs_and_spans";
     let cfg = TestConfigBuilder::new("mor_null_stamp").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
@@ -1299,8 +1279,6 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
 
     const TABLE: &str = "mor_versioned";
     let cfg = TestConfigBuilder::new("migrate_cols").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from the environment; `#[serial]`.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
 
     let schema = timefusion::schema_loader::get_schema(TABLE).expect("fixture registered");
     let added = ["updated_at", "deleted"];
@@ -1347,7 +1325,6 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     use timefusion::tantivy_index::{manifest, service::TantivyIndexService};
     const TABLE: &str = "otel_logs_and_spans";
     let cfg = TestConfigBuilder::new("tantivy_reconcile").with_buffer_mode(BufferMode::Enabled).build();
-    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let tantivy_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let svc = Arc::new(TantivyIndexService::new(tantivy_store.clone(), Arc::new(cfg.tantivy.clone())));
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));

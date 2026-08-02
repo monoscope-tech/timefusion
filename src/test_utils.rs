@@ -68,36 +68,6 @@ pub mod test_helpers {
         Arc::new(minio_base_config(table_id, data_dir))
     }
 
-    /// Point walrus-rust at the test's data dir, restoring the prior value on
-    /// drop — including on panic, so a failed `#[serial]` test can't leak the
-    /// var into the next one. SAFETY: `set_var` is racy if another thread
-    /// reads the env concurrently; callers must hold `#[serial]` — enforced
-    /// at runtime by the held-flag assert below, so a forgotten `#[serial]`
-    /// fails loudly instead of racing silently.
-    pub fn walrus_env_guard(dir: &std::path::Path) -> impl Drop {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static HELD: AtomicBool = AtomicBool::new(false);
-        // prev read BEFORE taking the flag, and the guard constructed BEFORE
-        // set_var: nothing fallible runs while HELD is set but unguarded, so
-        // no panic path can leave HELD stuck and poison later callers with a
-        // misleading "already held" assert.
-        let prev = std::env::var_os("WALRUS_DATA_DIR");
-        assert!(!HELD.swap(true, Ordering::Acquire), "walrus_env_guard already held by another test — add #[serial] to the caller");
-        let guard = scopeguard::guard(prev, |prev| {
-            // SAFETY: HELD is swapped false only here, after restoring the var, so no other
-            // thread holding the guard's #[serial] contract can observe a torn env value.
-            match prev {
-                Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
-                None => unsafe { std::env::remove_var("WALRUS_DATA_DIR") },
-            }
-            HELD.store(false, Ordering::Release);
-        });
-        // SAFETY: HELD was just claimed above and #[serial] on the caller guarantees no
-        // other thread reads/writes this env var concurrently.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", dir) };
-        guard
-    }
-
     /// Physical row count from the Delta log's `num_records` stats, summed over
     /// all active files. Bypasses the routed scan path entirely — unlike a
     /// `query_delta_only` COUNT, it is NOT collapsed by the read-side `DedupExec`,
