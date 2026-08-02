@@ -450,6 +450,11 @@ atomic_stats! {
     reconcile_failed,
     dedup_timed_out,
     dedup_failed,
+    /// Adds a rewrite planner had to drop because the in-memory snapshot listed
+    /// the same file twice. Nonzero means reads over that table double-count
+    /// rows — the file list diverged from the log, which no amount of dedup or
+    /// compaction repairs on its own. PAGE if > 0.
+    snapshot_duplicate_adds,
     light_optimize_timed_out,
     light_optimize_failed,
     /// Ticks that hit the wall-clock budget with hot projects still pending.
