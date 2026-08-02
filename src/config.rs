@@ -663,17 +663,20 @@ const_default!(d_checkpoint_interval: u64 = 10);
 // workload. Light/today optimize keeps its own 16MB target.
 const_default!(d_optimize_target: i64 = 256 * MIB as i64);
 // Cold tier: sealed partitions (older than `cold_optimize_after_days`) bin-pack
-// to 1GB. File size grows with partition age — recent days stay at 256MB (less
-// rewrite while the day still fills), sealed days consolidate to 1GB so the
+// to 512MB. File size grows with partition age — recent days stay at 256MB (less
+// rewrite while the day still fills), sealed days consolidate to 512MB so the
 // Delta checkpoint (≈ live file count) shrinks, which is the dominant driver of
-// commit latency. Compression is per-row-group, so 1GB files don't change bytes
+// commit latency. Compression is per-row-group, so bigger files don't change bytes
 // stored — the win is fewer files (smaller checkpoint, fewer S3 objects, cheaper
 // query planning). Re-runs are cheap: Compact skips files already ≥ target.
-const_default!(d_cold_optimize_target: i64 = GIB as i64);
+// 512MB, not 1GB: a merge holds ~target-sized output buffers per concurrent task
+// and the decompressed working set is ~17x the compressed target, so 1GB made the
+// sort/merge step of the final consolidation memory-hostile on this box.
+const_default!(d_cold_optimize_target: i64 = 512 * MIB as i64);
 // 1 day = everything past the current (day-partitioned) partition. Only today
-// still takes writes, so every sealed day consolidates to 1GB. The warm
+// still takes writes, so every sealed day consolidates to 512MB. The warm
 // optimize is clamped to dates newer than this boundary (see `optimize_table`)
-// so the 30-min Z-order never fragments these 1GB files back to 256MB.
+// so the 30-min Z-order never fragments these files back to 256MB.
 const_default!(d_cold_optimize_after_days: u64 = 1);
 const_default!(d_stats_cache_size: usize = 50);
 // Observability data is high-churn and rarely time-traveled; the only hard
@@ -699,7 +702,7 @@ const_default!(d_compact_min_files: usize = 5);
 // Hot/today target stays small (32MB): the light job runs every 5 min on the
 // current partition, which takes constant writes — a large target would rewrite
 // the same growing files repeatedly (write amplification) and add in-process
-// merge memory on the hot path. Consolidation to 256MB/1GB happens later, once
+// merge memory on the hot path. Consolidation to 256MB/512MB happens later, once
 // the partition is sealed (warm optimize → daily cold consolidate).
 // 256MB (was 32MB): on the 188GB/48-core box the small-merge-memory rationale is
 // moot, and 32MB left the hot (today) partition as dozens of tiny files for a
@@ -733,7 +736,7 @@ const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
-// Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
+// Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
 // cold target. Calendar-age driven; idempotent (skips ≥-target files).
 const_default!(d_consolidate_schedule: String = "0 30 2 * * *");
 const_default!(d_consolidate_catchup_passes: usize = 4);
@@ -1563,7 +1566,7 @@ pub struct ParquetConfig {
 impl ParquetConfig {
     /// Warm/cold boundary in days, floored at 1: the current (day-partitioned)
     /// partition must always stay warm — it's still taking writes — so 0 is
-    /// never valid (it would consolidate today to 1GB mid-write).
+    /// never valid (it would consolidate today to the cold target mid-write).
     pub fn cold_optimize_after_days(&self) -> u64 {
         self.timefusion_cold_optimize_after_days.max(1)
     }

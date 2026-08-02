@@ -94,7 +94,7 @@ cron (`sec min hour dom mon dow`).
 | Variable                                | Default         | Description |
 | --------------------------------------- | --------------- | ----------- |
 | `TIMEFUSION_OPTIMIZE_TARGET_SIZE`       | `268435456`     | Warm compaction target file size (256 MB). |
-| `TIMEFUSION_COLD_OPTIMIZE_TARGET_SIZE`  | `1073741824`    | Cold (sealed-partition) target file size (1 GB). |
+| `TIMEFUSION_COLD_OPTIMIZE_TARGET_SIZE`  | `536870912`     | Cold (sealed-partition) target file size (512 MB). |
 | `TIMEFUSION_COLD_OPTIMIZE_AFTER_DAYS`   | `1`             | Partitions older than this consolidate to the cold target (min 1). |
 | `TIMEFUSION_LIGHT_OPTIMIZE_TARGET_SIZE` | `33554432`      | Hot/today compaction target (32 MB). |
 | `TIMEFUSION_COMPACT_MIN_FILES`          | `5`             | Min small files before a compaction runs. |
