@@ -1349,6 +1349,36 @@ fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake:
     }
 }
 
+/// Collect matched Adds keeping at most ONE per path, so a rewrite's target set
+/// is always countable against the distinct files it was derived from.
+///
+/// A path can appear twice in an in-memory snapshot even though the Delta log is
+/// clean: the incremental advance concatenated a carried-forward file list with
+/// a kernel "delta" that was silently a FULL file set whenever the refresh
+/// crossed a newly written checkpoint (fixed in the fork, but a snapshot is
+/// shared mutable state and this is the only place the damage is observable).
+/// Both rewrite planners compare `targets.len()` against the number of distinct
+/// files they mean to rewrite, so a duplicate turned every plan into a
+/// permanent, silent mismatch — "mapped 2/1 files", 3 wasted re-plans, and dedup
+/// plus hot-tail compaction stalled indefinitely (prod 2026-08-02).
+fn dedup_adds_by_path(adds: impl Iterator<Item = deltalake::kernel::Add>, table_name: &str) -> Vec<deltalake::kernel::Add> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<deltalake::kernel::Add> = Vec::new();
+    let mut dropped = 0usize;
+    for add in adds {
+        if seen.insert(add.path.clone()) {
+            out.push(add);
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        warn!(table_name, dropped, event = "snapshot_duplicate_adds", "snapshot listed the same file more than once — reads over it double-count rows");
+        crate::metrics::maintenance_stats().snapshot_duplicate_adds.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 /// Drop `name` from `batch` (no-op when absent) — strips the synthetic
 /// [`DEDUP_FILE_COL`] before deduped rows are written back.
 fn drop_batch_column(mut batch: RecordBatch, name: &str) -> RecordBatch {
@@ -6518,20 +6548,22 @@ impl Database {
             // 2. Map scan values to Add actions in the SAME snapshot
             // (suffix-match either direction: the scan column carries the
             // store path, the log a table-relative one).
-            let targets: Vec<deltalake::kernel::Add> = chunk_snapshot
-                .log_data()
-                .iter()
-                .filter(|f| {
-                    let p = f.path();
-                    file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
-                })
-                // Deprecated in favour of arrow-direct access, but the
-                // Remove tombstones below need the Add's exact fields.
-                .map(|f| {
-                    #[allow(deprecated)]
-                    f.add_action()
-                })
-                .collect();
+            let targets = dedup_adds_by_path(
+                chunk_snapshot
+                    .log_data()
+                    .iter()
+                    .filter(|f| {
+                        let p = f.path();
+                        file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
+                    })
+                    // Deprecated in favour of arrow-direct access, but the
+                    // Remove tombstones below need the Add's exact fields.
+                    .map(|f| {
+                        #[allow(deprecated)]
+                        f.add_action()
+                    }),
+                table_name,
+            );
             if targets.len() != file_ids.len() {
                 warn!(
                     "dedup rewrite: mapped {}/{} files for table={} chunk=[{}] (sample scan value: {:?}), re-planning",
@@ -7356,15 +7388,13 @@ impl Database {
         // Map paths to Add actions in the SAME snapshot the scan reads, so the
         // Remove tombstones carry the exact fields of the files we rewrote.
         let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
-        let targets: Vec<deltalake::kernel::Add> = snapshot
-            .log_data()
-            .iter()
-            .filter(|f| wanted.contains(f.path().as_ref()))
-            .map(|f| {
+        let targets = dedup_adds_by_path(
+            snapshot.log_data().iter().filter(|f| wanted.contains(f.path().as_ref())).map(|f| {
                 #[allow(deprecated)]
                 f.add_action()
-            })
-            .collect();
+            }),
+            table_name,
+        );
         if targets.len() != files.len() {
             debug!(table_name, project_id, mapped = targets.len(), selected = files.len(), event = "light_optimize_bin_vanished");
             return Ok(BinOutcome::Retry);
@@ -12402,6 +12432,26 @@ mod tests {
 
     fn test_add(path: &str) -> deltalake::kernel::Add {
         deltalake::kernel::Add { path: path.to_string(), size: 1024, modification_time: 0, data_change: true, ..Default::default() }
+    }
+
+    /// A snapshot that lists one file twice must still map to ONE target, so
+    /// the planners' `targets.len() != files.len()` check stays meaningful.
+    /// Prod 2026-08-02: the incremental snapshot advance duplicated the file
+    /// list across a checkpoint, every plan logged "mapped 2/1 files", and both
+    /// dedup and hot-tail compaction stalled indefinitely.
+    #[test]
+    fn dedup_adds_by_path_collapses_a_duplicated_snapshot_entry() {
+        let dup = vec![test_add("a.parquet"), test_add("b.parquet"), test_add("a.parquet")];
+        let targets = super::dedup_adds_by_path(dup.into_iter(), "otel_metrics");
+        assert_eq!(targets.len(), 2, "one Add per distinct path");
+        let mut paths: Vec<&str> = targets.iter().map(|a| a.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["a.parquet", "b.parquet"]);
+        // Order-preserving for the already-clean case: no needless churn in the
+        // Remove tombstones a wave commits.
+        let clean = vec![test_add("b.parquet"), test_add("a.parquet")];
+        let targets = super::dedup_adds_by_path(clean.into_iter(), "otel_metrics");
+        assert_eq!(targets.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(), ["b.parquet", "a.parquet"]);
     }
 
     fn staged_unit(project: &str, paths: &[&str], dedup: Option<super::DedupUnit>) -> super::StagedBin {
