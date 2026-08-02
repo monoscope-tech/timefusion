@@ -578,6 +578,18 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
 
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
+    // Attach the tantivy sidecar service exactly like the server bootstrap.
+    // Without it `tantivy_indexer()` is None, so the post-optimize reindex/GC
+    // hooks silently no-op: every CLI compaction orphans the rewritten files'
+    // index entries and leaves its outputs unindexed until a server backfill.
+    let db = match (cfg.tantivy.indexed_tables().is_empty(), cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default()) {
+        (false, bucket) if !bucket.is_empty() => {
+            let storage_uri = format!("s3://{bucket}/{}/tantivy", cfg.core.timefusion_table_prefix);
+            let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+            db.with_tantivy_indexer(Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store, Arc::new(cfg.tantivy.clone()))))
+        }
+        _ => db,
+    };
     let table_ref = db.get_or_create_unified_table(&table).await?;
     println!("table prefix='{}' → {}", cfg.core.timefusion_table_prefix, table);
 
@@ -652,6 +664,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 }
             }
         }
+        reconcile_tantivy(&db, &table).await;
         return db.shutdown().await;
     }
     // Effectful loop: each partition awaits a compaction and prints as it lands.
@@ -667,5 +680,17 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     }
     println!("done: {tot_r} files removed, {tot_a} files added across {} partition(s)", dates.len());
+    reconcile_tantivy(&db, &table).await;
     db.shutdown().await
+}
+
+/// Post-run index reconcile: index uncovered live files (incl. leftovers from
+/// earlier runs that compacted without the service attached), GC dead entries.
+/// Best-effort — the coverage gate keeps queries correct either way.
+async fn reconcile_tantivy(db: &Database, table: &str) {
+    match db.tantivy_reconcile_table(table).await {
+        Ok((0, 0, 0)) => {}
+        Ok((built, removed, blobs)) => println!("tantivy reconcile: built={built} manifest_entries_removed={removed} blobs_deleted={blobs}"),
+        Err(e) => eprintln!("tantivy reconcile FAILED (indexes stale until the next reconcile or server backfill): {e}"),
+    }
 }

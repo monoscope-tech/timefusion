@@ -2414,6 +2414,31 @@ impl Database {
         });
     }
 
+    /// Synchronous backfill + GC for one table — the optimize CLI's
+    /// post-compaction reconcile. Builds indexes for every live parquet not
+    /// covered by a manifest (repairing earlier CLI runs that compacted with
+    /// no indexer attached, and wave commits which carry no tantivy hook),
+    /// then prunes manifest entries and blobs whose covered files are gone.
+    /// Returns (indexes_built, manifest_entries_removed, blobs_deleted).
+    pub async fn tantivy_reconcile_table(&self, table_name: &str) -> anyhow::Result<(usize, usize, usize)> {
+        let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0, 0)) };
+        if !svc.config.is_table_indexed(table_name) {
+            return Ok((0, 0, 0));
+        }
+        let built = self.backfill_table_indexes(&svc, table_name).await?;
+        // GC every manifest that exists (keyed by project uuid at build time)
+        // — a fixed "default"+customs list never visits unified tenants.
+        let (mut removed, mut blobs) = (0usize, 0usize);
+        for pid in crate::tantivy_index::manifest::list_projects(svc.object_store.as_ref(), table_name).await? {
+            let Ok(table_ref) = self.resolve_table(&pid, table_name).await else { continue };
+            let live_uris: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
+            let report = svc.gc_after_compaction(table_name, &pid, &live_uris).await?;
+            removed += report.entries_removed;
+            blobs += report.blobs_deleted;
+        }
+        Ok((built, removed, blobs))
+    }
+
     async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy_index::service::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
         use crate::tantivy_index::{
             manifest,

@@ -65,6 +65,17 @@ pub fn manifest_path(table: &str, project_id: &str) -> ObjPath {
     ObjPath::from(format!("{MANIFEST_PREFIX}/{table}/{project_id}/manifest.json"))
 }
 
+/// Project ids that have a manifest under this table's prefix — the GC's
+/// authoritative iteration set. Manifests are keyed by the project uuid taken
+/// from the parquet URI at build time, so a fixed "default"+custom-projects
+/// list never visits unified tenants' manifests and their entries outlive
+/// every compaction.
+pub async fn list_projects(store: &dyn ObjectStore, table: &str) -> Result<Vec<String>> {
+    let prefix = ObjPath::from(format!("{MANIFEST_PREFIX}/{table}"));
+    let listing = store.list_with_delimiter(Some(&prefix)).await.context("list manifest prefixes")?;
+    Ok(listing.common_prefixes.iter().filter_map(|p| p.parts().next_back().map(|s| s.as_ref().to_string())).collect())
+}
+
 pub async fn load(store: &dyn ObjectStore, table: &str, project_id: &str) -> Result<Manifest> {
     match store.get(&manifest_path(table, project_id)).await {
         Ok(result) => serde_json::from_slice(&result.bytes().await.context("read manifest bytes")?).context("parse manifest json"),
