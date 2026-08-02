@@ -7006,8 +7006,17 @@ impl Database {
         let (hot, mut cold): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|(_, date, _)| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|d| !Self::date_is_cold(today, d, after_days)));
-        let mut ready: Vec<_> = hot.into_iter().take(batch).collect();
-        let deferred = cold.split_off(cold.len().min(batch - ready.len()));
+        // Cold bins get a RESERVED share of the batch. Hot-first is right — a
+        // boot that drained a 10-day backlog oldest-first never reached the hot
+        // window (2026-07-30) — but giving hot the WHOLE batch starves cold
+        // forever whenever hot work is continuous: prod 2026-08-02 sat at
+        // queue=22135 with 20556 deferred cold and dirty_bin_processed=0, so the
+        // backlog that keeps files duplicated never shrank at all. Reserving half
+        // keeps hot's priority while making the cold backlog drain monotonically.
+        let cold_reserve = cold.len().min(batch / 2);
+        let mut ready: Vec<_> = hot.into_iter().take(batch.saturating_sub(cold_reserve)).collect();
+        // Hot under-using its share hands the remainder back to cold.
+        let deferred = cold.split_off(cold.len().min(batch.saturating_sub(ready.len())));
         ready.extend(cold);
         (ready, deferred)
     }
@@ -14599,11 +14608,22 @@ mod tests {
         );
         assert!(deferred.is_empty(), "a batch with room serves the cold tail too");
 
-        // A batch smaller than the hot tier never spends a slot on cold work.
-        let (ready, deferred) = Database::select_drain_bins(candidates, today, 3, 2);
-        assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-29", 1)]);
-        assert_eq!(deferred, vec![bin("2026-07-21", 3), bin("2026-07-20", 5)], "cold bins are deferred, not dropped");
+        // A batch smaller than the hot tier still RESERVES half for cold, so the
+        // cold backlog drains monotonically instead of being deferred forever
+        // behind continuous hot work (prod 2026-08-02: 20556 deferred, 0
+        // processed, queue 22135). Hot keeps the priority — it takes the larger
+        // share and the newest bins — but it no longer takes everything.
+        let (ready, deferred) = Database::select_drain_bins(candidates.clone(), today, 3, 2);
+        assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-21", 3)], "hot keeps priority, cold gets its reserved slot");
+        assert_eq!(deferred, vec![bin("2026-07-20", 5)], "cold bins are deferred, not dropped");
         assert_eq!(deferred.last().unwrap().1, "2026-07-20", "summary line reports the oldest deferred date");
+
+        // With no cold work at all, hot still gets the WHOLE batch — the reserve
+        // must never idle a slot.
+        let hot_only: Vec<_> = candidates.iter().filter(|(_, d, _)| d.as_str() >= "2026-07-28").cloned().collect();
+        let (ready, deferred) = Database::select_drain_bins(hot_only, today, 3, 2);
+        assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-29", 1)], "no cold work ⇒ hot uses the full batch");
+        assert!(deferred.is_empty());
     }
 
     /// The cold cutoff must never DROP bins: the nightly consolidate bin-packs
