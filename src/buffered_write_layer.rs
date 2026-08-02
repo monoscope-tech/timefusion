@@ -3561,7 +3561,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("r{}", test_id);
@@ -4668,7 +4667,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("b{}", test_id);
         let table = format!("b{}", test_id);
@@ -4719,7 +4717,6 @@ mod tests {
     async fn update_with_source_wal_replay_after_restart() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-
 
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("u{}", test_id);
