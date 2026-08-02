@@ -7114,8 +7114,11 @@ impl Database {
         const DEDUP_WAVE_UNITS: usize = 8;
         let mut staging = futures::stream::iter(ready.into_iter().map(|(project_id, date, bin)| async move {
             let key: DirtyBinKey = (project_id.clone(), table_name.to_string(), date.clone(), bin);
+            // No persist here: rewriting the whole multi-MB queue file per
+            // dequeue made the drain O(queue x batch) in fsync I/O. Crash
+            // direction is safe — an unpersisted dequeue reappears after
+            // restart and re-dedups (idempotent). End-of-pass persists.
             self.dedup_dirty_bins.remove(&key);
-            self.persist_dirty_bins();
             crate::metrics::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
             let started = std::time::Instant::now();
@@ -7130,7 +7133,6 @@ impl Database {
         let mut wave: Vec<StagedBin> = Vec::new();
         let requeue = |key: DirtyBinKey, counter: &std::sync::atomic::AtomicU64| {
             self.dedup_dirty_bins.insert(key, ());
-            self.persist_dirty_bins();
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
         // Between-chunk gate: a pass can outlive its start-of-pass health check
@@ -7165,6 +7167,12 @@ impl Database {
                     if !complete {
                         requeue(key, &stats.dirty_bin_requeued);
                         warn!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
+                    } else if units.is_empty() {
+                        // A bin with nothing to rewrite (already compacted /
+                        // no duplicates) never enters a wave, so count its
+                        // drain here or the processed metric reads 0 while
+                        // the queue empties.
+                        stats.dirty_bin_processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     wave.extend(units);
                 }
@@ -10961,7 +10969,7 @@ impl TableProvider for ProjectRoutingTable {
 
         let scan_state = parking_lot::Mutex::new(ScanShape::default());
         // Legs of the mem ∪ hot ∪ delta union, in recency order.
-        let wrap_result = |legs: Vec<Arc<dyn ExecutionPlan>>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        let wrap_result = |legs: Vec<Arc<dyn ExecutionPlan>>, leg_sortable: Vec<bool>| -> DFResult<Arc<dyn ExecutionPlan>> {
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
@@ -10994,29 +11002,22 @@ impl TableProvider for ProjectRoutingTable {
                 && table_schema.is_some_and(|t| t.version_append)
                 && let Some(req) = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &plans[0].schema()))
             {
-                // NO leg may be sorted to satisfy `req`. Ordering is taken only
-                // when a leg already has it — free — because `DedupExec` now runs
-                // keep-greatest WITHOUT a bound, so losing the ordering costs
-                // buffering, not correctness.
+                // Per-leg sortability: the DELTA leg is NEVER sortable — under
+                // merge-on-read an UPDATE appends the row's ORIGINAL timestamp
+                // into a NEW file, files overlap, and the blocking SortExec
+                // that "fixes" that exhausted the 27.5GB query pool on prod
+                // 2026-08-02 (1h ~13s, 3h timing out). `ordered_children`
+                // bails (None) whenever an unsortable leg misses `req`, so a
+                // Delta sort is structurally impossible here.
                 //
-                // This was `vec![true; ...]`, which was right while the unbounded
-                // fallback was keep-FIRST (it would have served the PRE-UPDATE
-                // row, so correctness could not hinge on file metadata). But
-                // merge-on-read itself guarantees the Delta leg CANNOT satisfy
-                // `req`: an UPDATE appends the row's ORIGINAL timestamp into a
-                // NEW file, so files overlap in time and no ordering can be
-                // declared. "Sorting is skipped for any leg that already
-                // satisfies req" therefore never held for Delta — every scan
-                // sorted, and that blocking SortExec exhausted the 27.5GB query
-                // pool on prod 2026-08-02 (1h ~13s, 3h timing out).
-                let sortable = vec![false; plans.len()];
-                match crate::optimizers::ordered_children(&plans, &req, None, &sortable, false)? {
+                // The in-memory legs (mem, hot) ARE sortable: their data is
+                // already materialized, the sort is bounded and cheap, and a
+                // mem-only scan is exactly where a fresh version append lives
+                // — all-false left it permanently on unbounded keep-greatest.
+                match crate::optimizers::ordered_children(&plans, &req, None, &leg_sortable, false)? {
                     Some(ordered) => {
-                        // At least one leg needed sorting. Cheap for the
-                        // in-memory legs; the alarm is the DELTA leg — see the
-                        // metric's docs for why zero is the precondition for
-                        // enabling `version_append` on a busy table.
-                        crate::metrics::maintenance_stats().mor_delta_leg_sorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Only in-memory legs can reach here (Delta is marked
+                        // unsortable), so this is cheap — no metric alarm.
                         plans = ordered;
                         merge_req = Some(req);
                     }
@@ -11083,7 +11084,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![plan]);
+            return wrap_result(vec![plan], vec![false]);
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -11176,7 +11177,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![plan]);
+            return wrap_result(vec![plan], vec![false]);
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
@@ -11193,7 +11194,7 @@ impl TableProvider for ProjectRoutingTable {
         if let Some(mem_plan) = mem_plan.clone().filter(|_| skip_delta) {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(vec![mem_plan]);
+            return wrap_result(vec![mem_plan], vec![true]);
         }
 
         // Build Delta filters with per-bucket exclusion.
@@ -11284,8 +11285,10 @@ impl TableProvider for ProjectRoutingTable {
                 Some(Arc::new(DataSourceExec::new(Arc::new(source))) as Arc<dyn ExecutionPlan>)
             }
         };
+        // Sortable mask tracks the flatten: in-memory legs true, Delta false.
+        let leg_sortable: Vec<bool> = [mem_plan.as_ref().map(|_| true), hot_plan.as_ref().map(|_| true), Some(false)].into_iter().flatten().collect();
         let legs: Vec<Arc<dyn ExecutionPlan>> = [mem_plan, hot_plan, Some(delta_plan)].into_iter().flatten().collect();
-        wrap_result(legs)
+        wrap_result(legs, leg_sortable)
     }
 
     fn statistics(&self) -> Option<Statistics> {

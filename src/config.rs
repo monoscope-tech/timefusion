@@ -486,7 +486,7 @@ const_default!(d_pgwire_user: String = "postgres");
 // by compaction/OPTIMIZE).
 const_default!(d_flush_interval: u64 = 60);
 const_default!(d_retention_mins: u64 = 70);
-// 6h, ON by default since 2026-08-02. It shipped at 0 (OFF) for its first
+// ON by default since 2026-08-02. It shipped at 0 (OFF) for its first
 // release — a new disk + page-cache consumer on a memory-tight box (host-level
 // OOM kills, 2026-07-31) — with the note "flip this default once soaked". Prod
 // has run TIMEFUSION_HOT_TIER_RETENTION_HOURS=6 since, so this is that flip:
@@ -496,9 +496,17 @@ const_default!(d_retention_mins: u64 = 70);
 // Disk is bounded by `d_hot_tier_max_disk_gb` and heap by
 // `d_hot_tier_leg_budget_mb`, both independent of this value; raising it costs
 // disk and page cache, not process memory.
-const_default!(d_hot_tier_retention_hours: u64 = 6);
-const_default!(d_hot_tier_max_disk_gb: u64 = 64);
-const_default!(d_hot_tier_leg_budget_mb: u64 = 512);
+// 24h since 2026-08-02: dashboards' widest recent window is 24h, and
+// `skip_for_lookback`'s 2x-retention ceiling made anything past 12h skip the
+// tier entirely. Disk must scale with it (6h held ~24GB => 24h ~ 96GB) or
+// oldest-first GC silently shrinks the effective window back down.
+const_default!(d_hot_tier_retention_hours: u64 = 24);
+const_default!(d_hot_tier_max_disk_gb: u64 = 128);
+// 1GB: at 512MB the leg-budget walk stopped mid-window on wide 24h scans and
+// pushed the older half to R2 — the exact latency the tier exists to remove.
+// Not higher: the hot leg materializes eagerly OUTSIDE every memory pool, so
+// this is un-pooled heap per concurrent scan (x16 gated scans worst case).
+const_default!(d_hot_tier_leg_budget_mb: u64 = 1024);
 const_default!(d_hot_tier_memo_mb: u64 = 1024);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
@@ -785,7 +793,12 @@ const_default!(d_dedup_bytes_per_row: u64 = 4096);
 // (~3 UPDATEs/s) drove the 2026-07-29 OOM crash-loop. Results are identical
 // either way — permits only bound peak memory, excess statements queue.
 const_default!(d_dml_merge_concurrency: usize = 1);
-const_default!(d_dirty_bin_drain_batch: usize = 32);
+// 512 since 2026-08-02: at 32/5min the 22.5k-bin backlog had a 58h floor even
+// with every bin landing. Memory is NOT batch-scaled — staging concurrency is
+// pinned by `maintenance_rewrite_sem` (2) and per-shard byte budgets; a bigger
+// batch only lengthens the pass (overlapping ticks are skipped => continuous
+// drain), and `flush_healthy` is re-checked between every staged bin.
+const_default!(d_dirty_bin_drain_batch: usize = 512);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
