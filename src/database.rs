@@ -6647,11 +6647,7 @@ impl Database {
                 })
                 .sum::<u64>()
                 .saturating_mul(2); // RowConverter keyed copy in dedup_batches
-            // budget == 0 disables that ceiling (→ 1 shard). K = the max either budget
-            // demands, clamped to the bucket count (shards partition the bucket space).
-            let shards_for = |est: u64, budget: u64| if budget > 0 { est.div_ceil(budget) } else { 1 };
-            let shards =
-                shards_for(est_decoded_bytes, decoded_budget).max(shards_for(rewrite_bytes.max(0) as u64, compressed_budget)).clamp(1, DEDUP_BUCKET_COUNT);
+            let shards = dedup_shard_count(est_decoded_bytes, rewrite_bytes.max(0) as u64, decoded_budget, compressed_budget);
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
             // Bucket = first byte of md5 over the dedup keys (2 hex chars =
             // DEDUP_BUCKET_COUNT buckets, evenly spread); chr(31) separates keys so
@@ -7056,13 +7052,9 @@ impl Database {
             return Ok(());
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
-        // Cap a single bin's rewrite so one pathological partition can't hold the
-        // shared maintenance lock (maintenance_job_sem=1) and starve every other
-        // table's dedup + light_optimize. Prod 2026-07-20: a today-partition bin
-        // took 648s (replace_where can't prune files while DV disables pushdown),
-        // stalling all maintenance for ~half the boot window. On timeout the bin
-        // is requeued for a later tick.
-        const DIRTY_BIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+        // Per-shard byte budgets in `stage_dedup_chunk` bound Arrow materialization.
+        // Do not time out the whole bin: cancelling it discards all staged work and
+        // retries the same oversized bin forever.
         let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
         // Skip TODAY's partition: it's the hot, still-growing partition, so a
         // dedup replace_where rewrites an ever-larger file set for a handful of
@@ -7128,14 +7120,8 @@ impl Database {
             info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
             let started = std::time::Instant::now();
             let staged = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
-                Ok(parsed) => {
-                    tokio::time::timeout(
-                        DIRTY_BIN_BUDGET,
-                        self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())),
-                    )
-                    .await
-                }
-                Err(e) => Ok(Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}"))),
+                Ok(parsed) => self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())).await,
+                Err(e) => Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}")),
             };
             (key, started.elapsed(), staged)
         }))
@@ -7166,18 +7152,12 @@ impl Database {
                 continue;
             }
             match staged {
-                // Over budget — requeue and move on so other maintenance runs.
-                Err(_) => {
-                    requeue(key, &stats.dedup_timed_out);
-                    warn!(project_id, table_name, date, bin, budget_secs = DIRTY_BIN_BUDGET.as_secs(), event = "dirty_bin_timeout");
-                    continue;
-                }
-                Ok(Err(error)) => {
+                Err(error) => {
                     requeue(key, &stats.dirty_bin_requeued);
                     warn!(project_id, table_name, date, bin, %error, event = "dirty_bin_failure");
                     continue;
                 }
-                Ok(Ok((units, complete))) => {
+                Ok((units, complete)) => {
                     stats.dirty_bin_rewrite_duration_ms.fetch_add(elapsed.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                     // Duplicate-bearing work was skipped inside the bin (unsealed
                     // chunk, unshardable key group): the bin is NOT done, so it
@@ -8597,6 +8577,13 @@ fn build_query_runtime_env(
 /// `[0, DEDUP_BUCKET_COUNT)` into contiguous ranges, so more shards than buckets
 /// would leave rows uncovered. Doubles as a runaway-shard-count backstop.
 const DEDUP_BUCKET_COUNT: u64 = 256;
+
+/// Returns the hash-shard count needed to keep one dedup rewrite within either
+/// configured byte budget. A zero budget disables that ceiling.
+fn dedup_shard_count(decoded_bytes: u64, rewrite_bytes: u64, decoded_budget: u64, rewrite_budget: u64) -> u64 {
+    let shards_for = |bytes: u64, budget: u64| if budget > 0 { bytes.div_ceil(budget) } else { 1 };
+    shards_for(decoded_bytes, decoded_budget).max(shards_for(rewrite_bytes, rewrite_budget)).clamp(1, DEDUP_BUCKET_COUNT)
+}
 
 /// Rows a bucket must exceed before the streaming merge is worth its setup
 /// (row encoding + heap) over just sorting the single concatenated batch.
@@ -14646,6 +14633,13 @@ mod tests {
         let (ready, deferred) = Database::select_drain_bins(hot_only, today, 3, 2);
         assert_eq!(ready, vec![bin("2026-07-29", 7), bin("2026-07-29", 1)], "no cold work ⇒ hot uses the full batch");
         assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn dedup_shards_bound_oversized_rewrites() {
+        assert_eq!(dedup_shard_count(100, 100, 100, 100), 1);
+        assert_eq!(dedup_shard_count(101, 100, 100, 100), 2);
+        assert_eq!(dedup_shard_count(u64::MAX, 1, 1, 0), DEDUP_BUCKET_COUNT);
     }
 
     /// The cold cutoff must never DROP bins: the nightly consolidate bin-packs
