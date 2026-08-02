@@ -433,10 +433,8 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
     env.drain_dml_coalescer().await;
 
     for p in projects {
-        let count: i64 = client
-            .query_one(&format!("SELECT COUNT(*) FROM mor_dormant WHERE project_id = '{p}' AND hashes && ARRAY['TAG-{p}']::text[]"), &[])
-            .await?
-            .get(0);
+        let count: i64 =
+            client.query_one(&format!("SELECT COUNT(*) FROM mor_dormant WHERE project_id = '{p}' AND hashes && ARRAY['TAG-{p}']::text[]"), &[]).await?.get(0);
         assert_eq!(count, 1, "folded enrichment lost project {p}'s tag");
     }
     let merges = timefusion::metrics::dml_stats().coalesce_merges.load(std::sync::atomic::Ordering::Relaxed) - merges_before;
