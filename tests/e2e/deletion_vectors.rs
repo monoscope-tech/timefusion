@@ -51,8 +51,7 @@ async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Res
     let updated: String = client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = 'u-1'", &[&"e2e_project"]).await?.get(0);
     assert_eq!(updated, "ERR", "the DV-updated row must read back the new value");
 
-    let untouched: String =
-        client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = 'u-3'", &[&"e2e_project"]).await?.get(0);
+    let untouched: String = client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = 'u-3'", &[&"e2e_project"]).await?.get(0);
     assert_eq!(untouched, "OK", "unmatched rows stay untouched");
 
     // DV DELETE: mask row u-2.
@@ -121,9 +120,8 @@ async fn dv_compaction_consolidates_deletion_vectors() -> anyhow::Result<()> {
 
     // Full compaction: reads DV-masked data, drops deleted rows, writes DV-free files.
     let db = env.db();
-    let table_ref = timefusion::database::get_unified_delta_table(db.unified_tables(), "mor_dormant")
-        .await
-        .ok_or_else(|| anyhow::anyhow!("unified table not found"))?;
+    let table_ref =
+        timefusion::database::get_unified_delta_table(db.unified_tables(), "mor_dormant").await.ok_or_else(|| anyhow::anyhow!("unified table not found"))?;
     db.optimize_table(&table_ref, "mor_dormant", None).await?;
 
     // Post-compaction: deleted rows stay gone, updated rows keep their new value.
@@ -178,8 +176,7 @@ async fn dv_merge_update_from_source_masks_and_appends() -> anyhow::Result<()> {
     assert_eq!(count, 5, "merge-update must not change the row count");
 
     for (id, expected) in [("m-1", "X1"), ("m-3", "X3"), ("m-2", "OK"), ("m-0", "OK")] {
-        let got: String =
-            client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = $2", &[&"e2e_project", &id]).await?.get(0);
+        let got: String = client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = $2", &[&"e2e_project", &id]).await?.get(0);
         assert_eq!(got, expected, "row {id} should read status_code={expected}");
     }
 
