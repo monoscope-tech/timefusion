@@ -636,7 +636,7 @@ impl Greatest {
         batches
             .into_iter()
             .zip(masks)
-            .map(|(b, m)| project_out(filter_record_batch(&b, &BooleanArray::from(m)).map_err(arrow_err)?, output_projection))
+            .map(|(b, m)| filter_project_out(&b, &BooleanArray::from(m), output_projection))
             .filter(|r| !r.as_ref().is_ok_and(|o| o.num_rows() == 0))
             .collect()
     }
@@ -772,12 +772,16 @@ impl Dedup {
     }
 }
 
-/// Restore the requested projection on a surviving batch.
-fn project_out(b: RecordBatch, output_projection: Option<&[usize]>) -> DFResult<RecordBatch> {
-    match output_projection {
-        Some(idxs) => b.project(idxs).map_err(arrow_err),
-        None => Ok(b),
-    }
+/// Filter only columns the caller will consume. COUNT and narrow projections
+/// augment the scan with ID/tiebreak columns solely for winner selection;
+/// filtering those variable-width arrays and then throwing them away was a
+/// large avoidable copy on amplified merge-on-read scans.
+fn filter_project_out(batch: &RecordBatch, mask: &BooleanArray, output_projection: Option<&[usize]>) -> DFResult<RecordBatch> {
+    let projected = match output_projection {
+        Some(idxs) => batch.project(idxs).map_err(arrow_err)?,
+        None => batch.clone(),
+    };
+    filter_record_batch(&projected, mask).map_err(arrow_err)
 }
 
 /// Keep-first: drop rows whose key tuple was already emitted, then restore the
@@ -810,7 +814,7 @@ fn dedup_first(
             }
         })
         .collect();
-    let out = project_out(filter_record_batch(batch, &mask).map_err(arrow_err)?, output_projection)?;
+    let out = filter_project_out(batch, &mask, output_projection)?;
     Ok((out.num_rows() > 0).then_some(out))
 }
 
