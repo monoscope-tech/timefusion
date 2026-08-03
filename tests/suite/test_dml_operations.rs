@@ -634,6 +634,87 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for the prod 2026-08-03 write-amplification bug: the
+    /// cross-side guard lives in `join.filter`, and the optimizer pushes the
+    /// target-side conjuncts (project_id + TIMESTAMP BOUNDS) into a `Filter`
+    /// BELOW the join — `extract_dml_info` used to let that deeper Filter
+    /// OVERWRITE the accumulated predicate, silently dropping the guard, so
+    /// every enrichment pass re-appended versions for every matched row. The
+    /// timestamp bound is what distinguishes this from the idempotency test
+    /// above: it is the conjunct that did the clobbering in prod. Also
+    /// exercises the join-key IN-list pushdown on its engaged (< cap) path.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_guard_survives_pushed_down_time_bounds() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let records = create_test_records(now);
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        let sql = format!(
+            "UPDATE otel_logs_and_spans o
+               SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag]
+              FROM (SELECT unnest(ARRAY['Bob','Alice']::text[]) AS span_name,
+                           unnest(ARRAY['pat:bob','pat:alice']::text[]) AS tag) u
+             WHERE o.project_id = 'test_project'
+               AND o.timestamp >= '{}' AND o.timestamp < '{}'
+               AND o.name = u.span_name
+               AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])",
+            (now - chrono::Duration::hours(1)).to_rfc3339(),
+            (now + chrono::Duration::hours(1)).to_rfc3339()
+        );
+        let r1 = ctx.sql(&sql).await?.collect().await?;
+        let n1 = r1[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        assert_eq!(n1, 2, "first pass tags Bob and Alice");
+        let r2 = ctx.sql(&sql).await?.collect().await?;
+        let n2 = r2[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        assert_eq!(n2, 0, "the @> guard must survive the pushed-down time bounds — re-run touches nothing");
+        Ok(())
+    }
+
+    /// A source larger than the join-key IN-list pushdown cap (4096 rows) must
+    /// skip the pushdown and still update exactly the matching rows — the cap
+    /// branch degrades to the plain join, never to wrong results.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_from_source_beyond_key_pushdown_cap() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let records = create_test_records(now);
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        // 4100 keys: 4098 misses + Bob + Alice.
+        let names: Vec<String> = (0..4098).map(|i| format!("'nobody-{i}'")).chain(["'Bob'".into(), "'Alice'".into()]).collect();
+        let tags: Vec<String> = (0..4100).map(|i| format!("'pat:{i}'")).collect();
+        let sql = format!(
+            "UPDATE otel_logs_and_spans o
+               SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag]
+              FROM (SELECT unnest(ARRAY[{}]::text[]) AS span_name,
+                           unnest(ARRAY[{}]::text[]) AS tag) u
+             WHERE o.project_id = 'test_project' AND o.name = u.span_name",
+            names.join(","),
+            tags.join(",")
+        );
+        let r = ctx.sql(&sql).await?.collect().await?;
+        let n = r[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        assert_eq!(n, 2, "over-cap source must still match exactly Bob and Alice via the plain join");
+        Ok(())
+    }
+
     /// Regression: main.rs creates the pgwire SessionContext (and its
     /// DmlQueryPlanner) BEFORE attaching the BufferedWriteLayer (the WAL-replay
     /// registry needs the context first). The planner used to capture a
