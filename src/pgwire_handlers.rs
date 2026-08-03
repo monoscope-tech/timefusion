@@ -15,7 +15,7 @@ use datafusion_postgres::{
             auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler, cleartext::CleartextPasswordAuthStartupHandler},
             portal::Portal,
             query::{ExtendedQueryHandler, SimpleQueryHandler},
-            results::{DescribePortalResponse, DescribeStatementResponse, Response, Tag},
+            results::{DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag},
             stmt::StoredStatement,
             store::PortalStore,
         },
@@ -23,7 +23,7 @@ use datafusion_postgres::{
         messages::PgWireBackendMessage,
     },
 };
-use futures::Sink;
+use futures::{Sink, stream};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use tracing::{Instrument, error, field::Empty, info, instrument};
@@ -263,6 +263,71 @@ impl LoggingSimpleQueryHandler {
         }
         Ok(vec![Response::Execution(Tag::new(&format!("FLUSH {}", stats.total_rows)))])
     }
+
+    /// Read recent Delta commit metadata without requiring direct object-store
+    /// credentials on the operator's machine.
+    async fn run_delta_history(&self, cmd: DeltaHistoryCmd) -> PgWireResult<Vec<Response>> {
+        use datafusion_postgres::pgwire::api::Type;
+
+        let db = require_available(self.db.as_ref(), "DELTA HISTORY")?;
+        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA HISTORY: open table '{}': {e}", cmd.table)))?;
+        let table = table_ref.read().await;
+        let commits: Vec<_> = table.history(Some(cmd.limit)).await.map_err(|e| admin_err(format!("DELTA HISTORY '{}': {e}", cmd.table)))?.collect();
+        drop(table);
+
+        let fields = Arc::new(
+            ["version", "timestamp_utc", "operation", "read_version", "is_blind_append", "operation_parameters", "commit_info"]
+                .into_iter()
+                .map(|name| FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text))
+                .collect::<Vec<_>>(),
+        );
+        let rows = commits.into_iter().map({
+            let fields = fields.clone();
+            move |commit| {
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                let timestamp = commit.timestamp.and_then(chrono::DateTime::from_timestamp_millis).map(|v| v.to_rfc3339()).unwrap_or_default();
+                let read_version = commit.read_version.map(|v| v.to_string()).unwrap_or_default();
+                let version = commit.read_version.map(|v| (v + 1).to_string()).unwrap_or_default();
+                let operation = commit.operation.clone().unwrap_or_default();
+                let blind_append = commit.is_blind_append.map(|v| v.to_string()).unwrap_or_default();
+                let parameters = serde_json::to_string(&commit.operation_parameters).unwrap_or_default();
+                let info = serde_json::to_string(&commit).unwrap_or_default();
+                for value in [&version, &timestamp, &operation, &read_version, &blind_append, &parameters, &info] {
+                    encoder.encode_field(value)?;
+                }
+                Ok(encoder.take_row())
+            }
+        });
+        Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
+    }
+}
+
+/// `DELTA HISTORY <table> [LIMIT <n>]` is deliberately read-only.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeltaHistoryCmd {
+    pub table: String,
+    pub limit: usize,
+}
+
+pub(crate) fn parse_delta_history(query: &str) -> Result<Option<DeltaHistoryCmd>, String> {
+    let Some(rest) = strip_command(query, "delta") else { return Ok(None) };
+    let Some(rest) = strip_keyword(rest, "history", char::is_whitespace) else {
+        return Err("DELTA supports only: DELTA HISTORY <table> [LIMIT <n>]".to_string());
+    };
+    let mut parts = rest.split_whitespace();
+    let table = parts.next().ok_or("DELTA HISTORY requires a table: DELTA HISTORY <table> [LIMIT <n>]")?;
+    let limit = match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => 100,
+        (Some(keyword), Some(value), None) if keyword.eq_ignore_ascii_case("limit") => {
+            let limit = value.parse::<usize>().map_err(|_| format!("invalid DELTA HISTORY limit '{value}'"))?;
+            if !(1..=10_000).contains(&limit) {
+                return Err("DELTA HISTORY limit must be between 1 and 10000".to_string());
+            }
+            limit
+        }
+        _ => return Err("expected: DELTA HISTORY <table> [LIMIT <n>]".to_string()),
+    };
+    Ok(Some(DeltaHistoryCmd { table: table.to_string(), limit }))
 }
 
 /// An intercepted `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'` admin command.
@@ -516,6 +581,9 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         if let Some(cmd) = parse_vacuum(query).map_err(admin_err)? {
             return self.run_vacuum(cmd).await;
         }
+        if let Some(cmd) = parse_delta_history(query).map_err(admin_err)? {
+            return self.run_delta_history(cmd).await;
+        }
         if parse_flush(query) {
             return self.run_flush().await;
         }
@@ -636,7 +704,7 @@ pub async fn serve_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint, query_template, rewrite_pg_synonyms};
+    use super::{parse_delta_history, parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint, query_template, rewrite_pg_synonyms};
 
     #[test]
     fn optimize_parses_table_and_date() {
@@ -715,6 +783,18 @@ mod tests {
         assert!(!parse_flush("FLUSH t"));
         assert!(!parse_flush("SELECT flushed FROM t"));
         assert!(!parse_flush("flush_log"));
+    }
+
+    #[test]
+    fn delta_history_parses_bounded_read_only_command() {
+        let cmd = parse_delta_history("DELTA HISTORY otel_logs_and_spans LIMIT 250;").unwrap().unwrap();
+        assert_eq!(cmd.table, "otel_logs_and_spans");
+        assert_eq!(cmd.limit, 250);
+        assert_eq!(parse_delta_history("delta history t").unwrap().unwrap().limit, 100);
+        assert!(parse_delta_history("DELTA HISTORY t LIMIT 0").is_err());
+        assert!(parse_delta_history("DELTA HISTORY t LIMIT 10001").is_err());
+        assert!(parse_delta_history("DELTA RESTORE t").is_err());
+        assert_eq!(parse_delta_history("SELECT delta FROM t"), Ok(None));
     }
 
     #[test]
