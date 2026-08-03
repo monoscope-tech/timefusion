@@ -64,13 +64,13 @@ tr:last-child td{border-bottom:none}
 </style>
 <div class="wrap">
 <h1>Active parquet files per project × day — otel_logs_and_spans</h1>
-<p class="sub">unified table on R2 · snapshot v461900 · 2026-08-03 01:30 CEST · goal: sealed day ≈ 1 file/GB</p>
+<p class="sub">unified table on R2 · snapshot v462176 · 2026-08-03 06:15 CEST · goal: sealed day ≈ 1 file/GB</p>
 
 <div class="tiles">
-  <div class="tile"><div class="k">Sealed days, non-whale</div><div class="v">1 file <span class="dim">each</span></div><div class="d">07-19 → 08-01 fully converged and HOLDING across all 13 projects</div></div>
-  <div class="tile"><div class="k">Whale 08-02 (today)</div><div class="v"><span class="dim">1,277 →</span> 706</div><div class="d">k3s job tf-whale-0802 compacting live (512MB bins)</div></div>
-  <div class="tile"><div class="k">Whale 08-01</div><div class="v">323</div><div class="d">chained next after 08-02 finishes</div></div>
-  <div class="tile"><div class="k">Whale sealed 07-19..31</div><div class="v">~984</div><div class="d">30–120/day; ~1GB files + DV residue — near floor, dedup cron ratchets the rest</div></div>
+  <div class="tile"><div class="k">Sealed days, non-whale</div><div class="v">1 file <span class="dim">each</span></div><div class="d">07-19 → 08-02 converged — 08-02 sealed and collapsed by the server alone overnight</div></div>
+  <div class="tile"><div class="k">Whale 08-02 / 08-01</div><div class="v">142 <span class="dim">/</span> 220</div><div class="d">08-02 done (1,277 → 142); 08-01 k3s backlog job still grinding (323 → 220)</div></div>
+  <div class="tile"><div class="k">Whale 08-03 (today)</div><div class="v">20</div><div class="d">prod's own hot-tail holding today converged — the single-process test, passing</div></div>
+  <div class="tile"><div class="k">OOM kills</div><div class="v">0 <span class="dim">since 01:12Z</span></div><div class="d">was ~hourly (70 in 3 days); slack fix + decode valve + heap-dump root-cause</div></div>
 </div>
 
 <div class="legend">
@@ -87,15 +87,15 @@ tr:last-child td{border-bottom:none}
 </table>
 </div>
 
-<p class="note"><b>Reading it:</b> each cell is the live count of active Add actions for that (project, day). Sealed non-whale days all sit at <b>1 file</b> — the server's own hot-tail compaction + sealed-day dedup are keeping converged days converged with no external help. The 08-02 column is today's still-hot partition (~22–29 dribble files per project; the dwell-gate deploy cut the dribble ~5×, and these collapse when the day seals). <b>87576849 (whale)</b> writes 10–100× everyone else: 08-02 is being drained live by the k3s emergency job (1,277 → 706 so far), 08-01 chains next; its sealed days hold ~1GB files near floor. Tonight also shipped in-server: nightly tantivy index reconcile (03:30), concurrent index GC, and a memory-pressure decode valve targeting the hourly-OOM restarts. <b>Standing leftovers</b> from the 07-31 drain: whale sealed days were floored with <i>unsorted</i> streaming Compact (no TopK footer until a quiet-season SortBy pass); DML quarantine 3 giants pending; 6297304f has 16 files in a garbage <code>date=2238-12-31</code> partition.</p>
+<p class="note"><b>Reading it:</b> each cell is the live count of active Add actions for that (project, day); sealed day ≈ 1 file/GB is the target. Every non-whale sealed day is at <b>1 file</b> — 08-02 was sealed, deduped and collapsed by the server alone overnight, and today's ~20-file dribble per project folds when the day seals. <b>87576849 (whale)</b>: 08-02 finished at 142 (from 1,277), 08-01 still draining on the k3s backlog job (323 → 220), today self-holding at 20. <b>Overnight in-server ships:</b> OOM root-caused (budget tree sanctioned 114G of pools on the 120G cgroup with zero slack — 15% untracked-slack carve-out shipped, kills stopped: 0 since 01:12Z vs ~hourly before), memory-pressure decode valve, nightly tantivy reconcile ran at 03:30 (52k stale index entries GC'd in minutes, concurrent deletes), stale <code>DIRTY_BIN_DRAIN_BATCH=1</code> env removed (dedup backlog unfrozen, ~15× drain rate). Leftovers: whale sealed days are unsorted 1GB compacts (quiet-season SortBy pending); 3 giant DML quarantine payloads; 16 files in the garbage <code>date=2238-12-31</code> partition (excluded from grid).</p>
 
 <p class="foot">Counts = active Adds in the Delta snapshot (tombstones excluded) · whale row shaded thresholds ×10 (its 1GB floor is ~40–100 files/day)</p>
 </div>
 
 <script>
-const DATES=["07-19","07-20","07-21","07-22","07-23","07-24","07-25","07-26","07-27","07-28","07-29","07-30","07-31","08-01","08-02"];
-const GRID=[["87576849",5,30,70,116,113,121,33,76,70,99,53,71,107,323,706],["6297304f",1,1,1,1,1,1,1,1,1,1,3,44,2,1,22],["28f62f01",0,1,1,1,1,1,1,9,1,1,1,3,1,3,29],["edb04135",1,1,1,1,1,1,1,1,1,1,1,1,16,1,24],["2a39bd83",1,1,1,1,1,1,1,1,1,1,1,5,1,1,23],["98fdd4f3",1,1,1,1,1,1,1,1,1,1,1,1,1,1,26],["d062e010",1,1,1,1,1,1,1,2,1,1,1,1,1,1,25],["00000000",1,1,1,1,1,1,1,1,1,1,1,1,1,1,25],["be87ebc1",1,1,1,1,1,1,1,4,1,1,1,1,1,1,22],["dcad860a",1,1,1,1,1,1,1,1,1,1,1,2,1,1,24],["94c5dc1f",1,1,1,1,1,1,1,1,1,1,1,1,1,1,23],["5ce1c976",1,1,1,1,1,1,1,1,1,1,1,2,1,0,4],["8100121c",1,1,1,1,1,1,1,1,1,1,1,1,1,1,2],["4f020cf8",0,0,1,1,1,1,1,0,1,0,0,1,0,1,0]];
-const WHALE="87576849", TODAY="08-02";
+const DATES=["07-19","07-20","07-21","07-22","07-23","07-24","07-25","07-26","07-27","07-28","07-29","07-30","07-31","08-01","08-02","08-03"];
+const GRID=[["87576849",5,30,70,116,113,121,33,76,70,99,53,75,107,220,142,20],["6297304f",1,1,1,1,1,1,1,1,1,1,3,44,2,1,6,20],["edb04135",1,1,1,1,1,1,1,1,1,1,1,1,16,1,1,20],["28f62f01",0,1,1,1,1,1,1,9,1,1,1,3,1,3,2,21],["2a39bd83",1,1,1,1,1,1,1,1,1,1,1,5,1,1,1,20],["be87ebc1",1,1,1,1,1,1,1,4,1,1,1,1,1,1,1,20],["d062e010",1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,20],["00000000",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,20],["94c5dc1f",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,20],["98fdd4f3",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,20],["dcad860a",1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,16],["8100121c",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,6],["5ce1c976",1,1,1,1,1,1,1,1,1,1,1,2,1,0,1,0],["4f020cf8",0,0,1,1,1,1,1,0,1,0,0,1,0,1,0,0]];
+const WHALE="87576849", TODAY="08-03";
 document.getElementById("hdr").innerHTML="<th>project</th>"+DATES.map(d=>`<th>${d}</th>`).join("")+"<th>status</th>";
 const cls=(p,d,v)=>{if(v===0)return"";const m=p===WHALE?10:1; // whale floor is ~10x
   if(d===TODAY)return v<=2*m?"c2":v<=15*m?"c3":"c4";
