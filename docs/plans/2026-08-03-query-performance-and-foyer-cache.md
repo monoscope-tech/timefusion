@@ -191,6 +191,18 @@ For the representative query and two known tenants, collect cold and warm sample
 
 Do not run 3-day execution benchmarks until Phase 2 is deployed.
 
+### Production finding: restart warm storm
+
+After exact range admission was deployed, three repeated 1h queries produced
+roughly 1,748 range hits and 77 range misses, but total inner-store reads still
+grew by about 14.1GB while range bytes grew by only 0.95GB. The bootstrap full-
+file warmer accounted for the remaining approximately 13GB and competed with
+queries for object-store bandwidth.
+
+Bootstrap therefore rebuilds table state and warms Parquet metadata only. New
+flush and optimize outputs retain detached full-body warming. Existing files
+populate exact range entries on demand, avoiding a deployment-wide body fetch.
+
 ## Rollout
 
 1. Add observability and benchmark harness.

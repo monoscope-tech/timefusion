@@ -3765,14 +3765,14 @@ impl Database {
     /// don't spend S3 GETs (and evict useful entries) warming cold partitions
     /// nobody reads.
     ///
-    /// `confirm` switches to the Influx-oracle flush-path mode: the pass is
-    /// awaited under that deadline, files the cache already holds (captured
-    /// during their own upload) cost a free probe instead of a GET, and the
-    /// warm is full-bytes/recent-only — a footer-only entry would still leave
-    /// the next dashboard query paying an R2 first-byte for the data. Policy
-    /// otherwise (kill switch, recency) is shared with the detached path.
+    /// `confirm` switches to the Influx-oracle flush-path mode: the metadata
+    /// pass is awaited under that deadline, while full bodies are left to the
+    /// detached post-commit pass. `allow_full_files` is false during bootstrap
+    /// so restart recovery cannot saturate object-store bandwidth by fetching
+    /// every recent body before queries can populate compact range entries.
     async fn warm_cache_for_uris(
         &self, object_store: Arc<dyn object_store::ObjectStore>, table_uri: String, uris: Vec<String>, confirm: Option<std::time::Duration>,
+        allow_full_files: bool,
     ) {
         let maint = &self.config.maintenance;
         if !maint.timefusion_warm_after_compaction || uris.is_empty() {
@@ -3783,7 +3783,7 @@ impl Database {
             // MemBuffer handoff. Full bodies warm detached below: a slow R2
             // GET must not make the flush path abandon metadata or wedge.
             Some(_) => (false, false),
-            None => (maint.timefusion_warm_full_files, maint.timefusion_warm_all_footers),
+            None => (allow_full_files && maint.timefusion_warm_full_files, maint.timefusion_warm_all_footers),
         };
         let recency_days = maint.timefusion_warm_recency_days;
         // Confirm fetches whole parquet bodies into untracked transient heap ON
@@ -3974,7 +3974,7 @@ impl Database {
                 };
                 // Already inside a detached task — await the warm directly
                 // instead of spawning a second nested task.
-                db.warm_cache_for_uris(store, table_uri, uris, None).await;
+                db.warm_cache_for_uris(store, table_uri, uris, None, true).await;
             }
         });
     }
@@ -4016,7 +4016,13 @@ impl Database {
                                 (uris, table.log_store().object_store(None), table.table_url().to_string())
                             };
                             info!("bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}", uris.len(), t.elapsed().as_millis());
-                            db.warm_cache_for_uris(store, table_uri, uris, None).await;
+                            // Restart reconstructs table and parquet metadata
+                            // only. Re-downloading every uncached recent body at
+                            // boot saturated object-store bandwidth (13GB during
+                            // three 1h queries) and made a recovered deployment
+                            // slower than a cold range read. New files still get
+                            // full-body warming on their post-commit paths.
+                            db.warm_cache_for_uris(store, table_uri, uris, None, false).await;
                         }
                         Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }
@@ -4083,7 +4089,7 @@ impl Database {
         let db = self.clone();
         tokio::spawn(async move {
             let uri = warm_table_uri;
-            db.warm_cache_for_uris(warm_store, uri.clone(), added, None).await;
+            db.warm_cache_for_uris(warm_store, uri.clone(), added, None, true).await;
             db.evict_cache_for_uris(&uri, &removed);
         });
         live_uris
@@ -5324,13 +5330,14 @@ impl Database {
                 // Establish header/footer coverage before the MemBuffer drains.
                 // Full bodies are warmed by the normal detached path below;
                 // the confirm must never make flush durability depend on R2.
-                self.warm_cache_for_uris(warm_store.clone(), warm_table_uri.clone(), warm_added.clone(), Some(crate::config::CACHE_CONFIRM_TIMEOUT)).await;
+                self.warm_cache_for_uris(warm_store.clone(), warm_table_uri.clone(), warm_added.clone(), Some(crate::config::CACHE_CONFIRM_TIMEOUT), false)
+                    .await;
                 let db = self.clone();
                 let shutdown = self.maintenance_shutdown.clone();
                 tokio::spawn(async move {
                     tokio::select! {
                         _ = shutdown.cancelled() => {}
-                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None) => {}
+                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None, true) => {}
                     }
                 });
             } else {
@@ -5339,7 +5346,7 @@ impl Database {
                 tokio::spawn(async move {
                     tokio::select! {
                         _ = shutdown.cancelled() => {}
-                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None) => {}
+                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None, true) => {}
                     }
                 });
             }
