@@ -34,6 +34,7 @@ mod imp {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             warn!("profiling: cannot create {dir:?}: {e} — CPU flamegraphs disabled, heap dumps still land at malloc_conf prof_prefix");
         }
+        archive_prekill_dumps(&dir);
         info!("profiling: enabled (jemalloc heap auto-dump + rolling CPU flamegraph) → {dir:?}");
         spawn_cpu_sampler(dir);
     }
@@ -79,6 +80,54 @@ mod imp {
                 }
             })
             .expect("spawn cpu-profiler thread");
+    }
+
+    /// Preserve the PREVIOUS process's final heap dumps before this process's
+    /// pruner evicts them. At prod churn (~4 dumps/min) the rolling KEEP_HEAP
+    /// window is ~12 minutes, so an OOM-killed process's last dumps — the only
+    /// attribution evidence for the kill — were gone before anyone could look
+    /// (2026-08-03, twice). Boot moves the newest few into `prekill-<pid-seq>/`;
+    /// only the 3 newest archives are kept.
+    fn archive_prekill_dumps(dir: &std::path::Path) {
+        let mut dumps: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("jeprof") && n.ends_with(".heap")))
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+            .collect();
+        if dumps.is_empty() {
+            return;
+        }
+        dumps.sort_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        let stamp = dumps[0].0.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let arch = dir.join(format!("prekill-{stamp}"));
+        if std::fs::create_dir_all(&arch).is_err() {
+            return;
+        }
+        for (_, p) in dumps.iter().take(5) {
+            if let Some(name) = p.file_name() {
+                let _ = std::fs::rename(p, arch.join(name));
+            }
+        }
+        // The rest of the dead process's dumps are noise — drop them now so the
+        // rolling pruner starts clean for this process.
+        dumps.into_iter().skip(5).for_each(|(_, old)| {
+            let _ = std::fs::remove_file(old);
+        });
+        let mut archives: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("prekill-")))
+            .map(|e| e.path())
+            .collect();
+        archives.sort();
+        let n = archives.len();
+        archives.into_iter().take(n.saturating_sub(3)).for_each(|old| {
+            let _ = std::fs::remove_dir_all(&old);
+        });
+        info!("profiling: archived previous process's final heap dumps → {arch:?}");
     }
 
     fn write_flamegraph(path: &std::path::Path, report: &pprof::Report) -> anyhow::Result<()> {

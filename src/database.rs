@@ -2592,6 +2592,24 @@ impl Database {
         let db = Arc::new(self.background_clone());
         let cancel = self.maintenance_shutdown.clone();
 
+        // Always-on pressure sampling. `scan_pressure_permits` samples lazily
+        // (on gated decode polls), so a climb driven by anything OTHER than a
+        // wide scan — flush sorts, replay, maintenance — reached the OOM kill
+        // with zero tier transitions logged and a stale tier for the first
+        // gated poll that DID arrive (2026-08-03 04:36 kill: no valve line in
+        // the whole 24-min life). A 250ms heartbeat keeps the tier fresh and
+        // the transition log complete no matter who is allocating.
+        {
+            let total = self.config.memory.timefusion_max_concurrent_scan_readers as u32;
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                while !cancel.is_cancelled() {
+                    let _ = scan_pressure_permits(total);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            });
+        }
+
         // Before any maintenance job can stage new work: delete the staged
         // parquet of bins that never reached their wave commit because the
         // process died between staging and committing. Best-effort by
