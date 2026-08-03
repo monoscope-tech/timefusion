@@ -203,6 +203,20 @@ Bootstrap therefore rebuilds table state and warms Parquet metadata only. New
 flush and optimize outputs retain detached full-body warming. Existing files
 populate exact range entries on demand, avoiding a deployment-wide body fetch.
 
+### Production finding: sliding ranges defeat exact keys
+
+After removing the restart body storm, serialized counts measured 7.15s (1h),
+9.29s (3h), 14.74s (24h), and 25.29s (3d). A warm 1h `EXPLAIN ANALYZE` improved
+to 3.16s, but still opened 83 files for 48 row groups. Although only 2.94MB of
+projected Parquet data was scanned, the requested benchmark matrix accumulated
+about 14GB of inner-store range reads.
+
+Exact `(path,start,end)` keys are unstable for a sliding `now()-window`
+predicate because page-index selection and coalescing move the byte boundaries.
+Large Parquet data ranges therefore align to 1MiB edges before fetch/admission.
+This permits nearby refreshes to reuse an entry while bounding extra remote
+bytes to less than 2MiB per request; tiny files retain whole-file caching.
+
 ## Rollout
 
 1. Add observability and benchmark harness.

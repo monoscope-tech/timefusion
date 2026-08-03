@@ -27,6 +27,11 @@ use tokio::{
 };
 use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 
+/// Align large Parquet data reads so sliding time predicates reuse the same
+/// cache entry even when page/coalescing boundaries move slightly. At most two
+/// edge blocks are extra, bounding amplification to <2 MiB per request.
+const PARQUET_RANGE_ALIGNMENT_BYTES: u64 = 1024 * 1024;
+
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheValue {
@@ -1129,7 +1134,9 @@ impl FoyerObjectStoreCache {
     async fn get_range_cached(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let span = tracing::Span::current();
         let is_parquet = is_parquet_file(location);
-        let range_cache_key = Self::make_range_cache_key(location, &range);
+        let mut range_cache_key = Self::make_range_cache_key(location, &range);
+        let mut fetch_range = range.clone();
+        let mut response_slice = None;
         let mut range_meta = None;
 
         // First check if we have the full file cached
@@ -1307,6 +1314,32 @@ impl FoyerObjectStoreCache {
                         return Ok(Bytes::from(full).slice(range.start as usize..range.end as usize));
                     }
                 }
+            } else if file_size > PARQUET_RANGE_ALIGNMENT_BYTES {
+                // Exact DataFusion ranges depend on the sliding predicate and
+                // page-index result. Normalize their edges so the next refresh
+                // addresses the same cache entry instead of downloading a
+                // nearly-identical multi-MB range again.
+                let aligned_start = (range.start / PARQUET_RANGE_ALIGNMENT_BYTES) * PARQUET_RANGE_ALIGNMENT_BYTES;
+                let aligned_end = range.end.div_ceil(PARQUET_RANGE_ALIGNMENT_BYTES).saturating_mul(PARQUET_RANGE_ALIGNMENT_BYTES).min(file_size);
+                let aligned = aligned_start..aligned_end;
+                let aligned_key = Self::make_range_cache_key(location, &aligned);
+                if aligned != range
+                    && let Ok(Some(entry)) = self.cache.get(&aligned_key).await
+                {
+                    let value = entry.value();
+                    let start = (range.start - aligned.start) as usize;
+                    let end = start + (range.end - range.start) as usize;
+                    if !value.is_expired(self.config.ttl) && end <= value.data.len() {
+                        record_range_hit(&self.stats, range.end - range.start).await;
+                        span.record("cache_hit", true);
+                        let data = value.data.slice(start..end);
+                        self.maybe_touch(&self.cache, &aligned_key, entry.clone(), self.config.l1_max_entry_bytes);
+                        return Ok(data);
+                    }
+                }
+                response_slice = Some(((range.start - aligned.start) as usize, (range.end - aligned.start) as usize));
+                range_cache_key = aligned_key;
+                fetch_range = aligned;
             }
         }
 
@@ -1318,18 +1351,18 @@ impl FoyerObjectStoreCache {
         let start_time = std::time::Instant::now();
         let inner_span = tracing::trace_span!(parent: &span, "s3.get_range",
             location = %location,
-            range.start = range.start,
-            range.end = range.end
+            range.start = fetch_range.start,
+            range.end = fetch_range.end
         );
-        let result = self.inner.get_range(location, range.clone()).instrument(inner_span).await?;
+        let result = self.inner.get_range(location, fetch_range.clone()).instrument(inner_span).await?;
         let duration = start_time.elapsed();
 
         debug!(
             "S3 GET_RANGE request: {} (range: {}..{}, size: {} bytes, duration: {}ms, parquet: {})",
             location,
-            range.start,
-            range.end,
-            range.end - range.start,
+            fetch_range.start,
+            fetch_range.end,
+            fetch_range.end - fetch_range.start,
             duration.as_millis(),
             is_parquet
         );
@@ -1339,7 +1372,10 @@ impl FoyerObjectStoreCache {
         if let Some(meta) = range_meta.as_ref() {
             self.admit_data_range(location, range_cache_key, &result, meta);
         }
-        Ok(result)
+        Ok(match response_slice {
+            Some((start, end)) => result.slice(start..end),
+            None => result,
+        })
     }
 
     /// Resolve a path's `ObjectMeta` from cache only (no S3). Checks the
@@ -3099,6 +3135,31 @@ mod tests {
         let warm = cache.get_stats().await.main;
         assert_eq!(warm.range_hits, 1, "a repeated coalesced range must hit the main range cache");
         assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read, "a range hit must not touch the inner store");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sliding_large_file_ranges_reuse_aligned_cache_entry() -> anyhow::Result<()> {
+        let config = FoyerCacheConfig::test_config_with("aligned_ranges", |c| c.l1_max_entry_bytes = 64);
+        let shared = SharedFoyerCache::new(config).await?;
+        let mem = Arc::new(InMemory::new());
+        let cache = FoyerObjectStoreCache::new_with_shared_cache(mem.clone(), &shared);
+
+        let path = Path::from("tbl/date=2026-01-02/large.parquet");
+        let body: Vec<u8> = (0..3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
+
+        let first = 100..1_500_000;
+        let shifted = 200..1_400_000;
+        assert_eq!(&cache.get_range_cached(&path, first.clone()).await?[..], &body[first.start as usize..first.end as usize]);
+        let cold = cache.get_stats().await.main;
+        assert_eq!(cold.range_misses, 1);
+        assert_eq!(cold.inner_bytes_read, 2 * PARQUET_RANGE_ALIGNMENT_BYTES);
+
+        assert_eq!(&cache.get_range_cached(&path, shifted.clone()).await?[..], &body[shifted.start as usize..shifted.end as usize]);
+        let warm = cache.get_stats().await.main;
+        assert_eq!(warm.range_hits, 1, "a shifted predicate range in the same aligned window must hit");
+        assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read);
         Ok(())
     }
 
