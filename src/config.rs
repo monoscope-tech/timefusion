@@ -870,12 +870,15 @@ const_default!(d_dedup_bytes_per_row: u64 = 4096);
 // (~3 UPDATEs/s) drove the 2026-07-29 OOM crash-loop. Results are identical
 // either way — permits only bound peak memory, excess statements queue.
 const_default!(d_dml_merge_concurrency: usize = 1);
-// 512 since 2026-08-02: at 32/5min the 22.5k-bin backlog had a 58h floor even
-// with every bin landing. Memory is NOT batch-scaled — staging concurrency is
-// pinned by `maintenance_rewrite_sem` (2) and per-shard byte budgets; a bigger
-// batch only lengthens the pass (overlapping ticks are skipped => continuous
-// drain), and `flush_healthy` is re-checked between every staged bin.
-const_default!(d_dirty_bin_drain_batch: usize = 512);
+// 128 since 2026-08-03 (was 512 for a few hours, 32 before): 32/5min put a
+// 58h floor under the 22.5k backlog, but 512 turned out to OOM the box —
+// prod RSS climbed a constant ~7GB/min while staging ran (independent of
+// query load) and the ~55min kill cycle matched the 512-bin pass length
+// exactly: something pass-scoped accumulates (per-bin Delta provider /
+// session / snapshot state) and frees only at pass end, which a 512-bin
+// pass never reached. 128 completes a pass in ~10-15min — the pass-scoped
+// growth caps near ~25-30GB — while still draining ~4x the original rate.
+const_default!(d_dirty_bin_drain_batch: usize = 128);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
