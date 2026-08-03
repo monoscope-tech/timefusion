@@ -205,7 +205,12 @@ impl FoyerCacheConfig {
         // silently losing the ability to cache the bigger outputs. The
         // configured block size acts as a lower bound / explicit override.
         let optimize_target = cfg.parquet.timefusion_optimize_target_size.max(0) as usize;
-        let block_size_bytes = cfg.cache.block_size_bytes().max(optimize_target.saturating_mul(2));
+        // Hard floor of 2GiB: the fleet holds compacted files up to ~1.5GB
+        // (historical consolidation outputs), and foyer's max entry is
+        // `block_size - blob_index_size` — with the old 512MB floor every file
+        // above it silently never persisted to the disk tier, re-fetched from
+        // R2 on each scan.
+        let block_size_bytes = cfg.cache.block_size_bytes().max(optimize_target.saturating_mul(2)).max(2 << 30);
         let disk_size_bytes = cfg.cache.disk_size_bytes();
         if block_size_bytes > disk_size_bytes {
             tracing::warn!(
@@ -2621,19 +2626,20 @@ mod tests {
         use crate::config::AppConfig;
         let mut cfg = AppConfig::default();
 
-        // Defaults: the 256MB optimize target doubles to 512MB, above the 256MB
-        // configured floor, so the block tracks 2x the target.
-        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 512 * 1024 * 1024);
+        // The 2GiB hard floor wins over both the configured block size and 2x
+        // the optimize target: the fleet holds ~1.5GB files, and foyer's max
+        // entry is the block size — anything above it silently never persists.
+        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 2 << 30);
 
-        // Raise the optimize target past the floor → block auto-tracks to 2x,
-        // so big outputs stay cacheable without touching the cache config.
-        cfg.parquet.timefusion_optimize_target_size = 512 * 1024 * 1024;
-        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 1024 * 1024 * 1024, "block size should track 2x the optimize target");
+        // A target big enough that 2x exceeds the hard floor → block tracks it,
+        // so bigger outputs stay cacheable without touching the cache config.
+        cfg.parquet.timefusion_optimize_target_size = 2 * 1024 * 1024 * 1024;
+        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 4 << 30, "block size should track 2x the optimize target");
 
-        // With a small target, the configured block size is the floor.
+        // A small target still floors at 2GiB.
         cfg.parquet.timefusion_optimize_target_size = 16 * 1024 * 1024;
         cfg.cache.timefusion_foyer_block_size_mb = 256;
-        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 256 * 1024 * 1024, "configured block size acts as a floor");
+        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 2 << 30, "the 1.5GB-file floor holds");
     }
 
     #[tokio::test]
