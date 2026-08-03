@@ -8,7 +8,6 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
 use datafusion_postgres::ServerOptions;
-use rand::RngExt;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 use timefusion::{
     bootstrap::{self, Bootstrapped},
@@ -219,26 +218,7 @@ impl E2eEnvBuilder {
         // Freeze clock BEFORE bootstrap so background tasks see test time.
         clock::set_micros(self.frozen_at_micros);
 
-        // MinIO is a single native binary — Docker/testcontainers is only the
-        // zero-setup default. Point TIMEFUSION_TEST_S3_ENDPOINT at a running
-        // MinIO (e.g. `minio server /tmp/minio-e2e`) to skip Docker entirely;
-        // per-test isolation comes from the unique bucket, not the container.
-        let (minio, endpoint) = match std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
-            Ok(ep) => (None, ep),
-            Err(_) => {
-                let minio = pinned_minio_image()
-                    .with_cmd(["server", "/data"])
-                    .with_env_var("MINIO_ROOT_USER", "minioadmin")
-                    .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-                    .start()
-                    .await
-                    .context("start MinIO container")?;
-                let host = minio.get_host().await.context("get MinIO host")?.to_string();
-                let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
-                let endpoint = format!("http://{host}:{port}");
-                (Some(minio), endpoint)
-            }
-        };
+        let (minio, endpoint) = ensure_local_minio().await?;
 
         let test_id = Uuid::new_v4().to_string()[..8].to_string();
         let bucket = format!("e2e-{test_id}");
@@ -260,7 +240,10 @@ impl E2eEnvBuilder {
         // Bucket creation: MinIO default credentials are minioadmin/minioadmin.
         create_bucket(&endpoint, &bucket).await.context("create MinIO bucket")?;
 
-        let pg_port = 5500 + rand::rng().random_range(1..400) as u16;
+        // OS-assigned port: a fixed random window across ~55 parallel test
+        // processes collides — the loser's bind fails silently inside the
+        // spawned task and the client connects to the *other* test's server.
+        let (pg_listener, pg_port) = bind_pg_listener().await?;
         let cfg = build_config(BuildCfgArgs {
             endpoint: &endpoint,
             bucket: &bucket,
@@ -294,7 +277,7 @@ impl E2eEnvBuilder {
 
         // Spawn pgwire server. Shutdown via Notify (same as integration_test).
         let pg_shutdown = Arc::new(Notify::new());
-        spawn_pgwire(Arc::clone(&bootstrapped.session_ctx), Arc::clone(&bootstrapped.db), pg_port, Arc::clone(&pg_shutdown));
+        spawn_pgwire(Arc::clone(&bootstrapped.session_ctx), Arc::clone(&bootstrapped.db), pg_listener, Arc::clone(&pg_shutdown));
         wait_for_pg(pg_port).await.context("pgwire never came up")?;
 
         Ok(E2eEnv {
@@ -313,7 +296,8 @@ impl E2eEnvBuilder {
 }
 
 pub struct E2eEnv {
-    /// None when running against an external MinIO (TIMEFUSION_TEST_S3_ENDPOINT).
+    /// None unless this test fell back to a Docker MinIO (no endpoint env, no
+    /// running :9000, no local `minio` binary).
     _minio: Option<ContainerAsync<GenericImage>>,
     pub data_dir: PathBuf,
     pub pg_port: u16,
@@ -356,11 +340,16 @@ impl E2eEnv {
         let prev = self.bootstrapped.take().expect("already shut down");
         prev.buffered_layer.crash_for_test().await;
         self.pg_shutdown.notify_one();
+        // Retire the old instance's background work (preload/warm tasks hold
+        // their own Arc<Database>, so dropping `prev` alone leaves them — and
+        // their in-flight Foyer fetches — running for the rest of the test;
+        // see Drop for why a live fetch at Runtime teardown deadlocks).
+        // Crash semantics are preserved: this cancels maintenance and closes
+        // the cache but never drains MemBuffer or advances the WAL cursor.
+        let _ = prev.db.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(10)).await;
         drop(prev);
-        // Give the pgwire accept loop a moment to release the port.
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let pg_port = 5500 + rand::rng().random_range(1..400) as u16;
+        let (pg_listener, pg_port) = bind_pg_listener().await?;
         let cfg = build_config(BuildCfgArgs {
             endpoint: &self.endpoint,
             bucket: &self.bucket,
@@ -391,7 +380,7 @@ impl E2eEnv {
         bootstrapped.db.get_or_create_table("e2e_project", "otel_logs_and_spans").await.context("pre-warm table")?;
 
         self.pg_shutdown = Arc::new(Notify::new());
-        spawn_pgwire(Arc::clone(&bootstrapped.session_ctx), Arc::clone(&bootstrapped.db), pg_port, Arc::clone(&self.pg_shutdown));
+        spawn_pgwire(Arc::clone(&bootstrapped.session_ctx), Arc::clone(&bootstrapped.db), pg_listener, Arc::clone(&self.pg_shutdown));
         wait_for_pg(pg_port).await.context("pgwire never came up after restart")?;
 
         self.pg_port = pg_port;
@@ -457,14 +446,22 @@ impl E2eEnv {
 impl Drop for E2eEnv {
     fn drop(&mut self) {
         self.pg_shutdown.notify_one();
+        // Deterministic teardown while the runtime is still alive. Leaving it
+        // to Runtime::drop deadlocks: foyer's get_or_fetch spawns its fetch
+        // task while holding the inflight mutex, and on a shutting-down
+        // runtime tokio::spawn drops that future INLINE — RawFetch::drop then
+        // re-locks the same mutex on the same thread, and BlockingPool::
+        // shutdown waits on it forever (the 3×600s e2e timeouts, 2026-08-03).
+        // Database::shutdown cancels the warm tasks and closes Foyer first,
+        // so no fetch survives to Runtime teardown. block_in_place is fine:
+        // every e2e test is `flavor = "multi_thread"`.
+        if let Some(b) = self.bootstrapped.take() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(b.db.shutdown_by(deadline)));
+        }
         // Unfreeze so we don't leak state into the next test in this binary.
         clock::unfreeze();
         let _ = std::fs::remove_dir_all(&self.data_dir);
-        // Background tasks tied to the buffered layer hold strong refs into
-        // it; we can't `await shutdown()` from Drop, so we rely on tokio
-        // task cancellation when the test's runtime tears down. This
-        // mirrors a hard kill, which is exactly what we want for a test
-        // that explicitly calls restart().
     }
 }
 
@@ -541,6 +538,59 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     Arc::new(cfg)
 }
 
+/// Local-first MinIO resolution, mirroring the sqllogictest harness:
+///   1. `TIMEFUSION_TEST_S3_ENDPOINT` if set (CI's MinIO, or any hand-run one).
+///   2. An already-running MinIO on 127.0.0.1:9000 (e.g. `make minio-start`).
+///   3. The local `minio` binary — spawned DETACHED on :9000 and left running,
+///      because e2e tests run as ~55 parallel processes and a per-test kill
+///      would tear the server out from under every sibling. `make minio-stop`
+///      reclaims it; subsequent runs reuse it (hit case 2).
+///   4. Docker (testcontainers) — only when no `minio` binary is on PATH.
+///
+/// Per-test isolation comes from the unique bucket, never from the server.
+async fn ensure_local_minio() -> Result<(Option<ContainerAsync<GenericImage>>, String)> {
+    const LOCAL: &str = "127.0.0.1:9000";
+    let port_open = || async { tokio::net::TcpStream::connect(LOCAL).await.is_ok() };
+    if let Ok(ep) = std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
+        return Ok((None, ep));
+    }
+    if port_open().await {
+        return Ok((None, format!("http://{LOCAL}")));
+    }
+    if std::process::Command::new("minio").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        let data_dir = std::env::temp_dir().join("timefusion-e2e-minio");
+        std::fs::create_dir_all(&data_dir).ok();
+        // Concurrent first-run races are fine: the losers' binds fail while the
+        // health loop below waits for whichever sibling won.
+        std::process::Command::new("minio")
+            .args(["server", data_dir.to_str().unwrap(), "--address", LOCAL])
+            .env("MINIO_ROOT_USER", "minioadmin")
+            .env("MINIO_ROOT_PASSWORD", "minioadmin")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawn local minio server")?;
+        for _ in 0..100 {
+            if port_open().await {
+                return Ok((None, format!("http://{LOCAL}")));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::bail!("local `minio` binary never came up on {LOCAL}");
+    }
+    let minio = pinned_minio_image()
+        .with_cmd(["server", "/data"])
+        .with_env_var("MINIO_ROOT_USER", "minioadmin")
+        .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+        .start()
+        .await
+        .context("start MinIO container")?;
+    let host = minio.get_host().await.context("get MinIO host")?.to_string();
+    let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
+    let endpoint = format!("http://{host}:{port}");
+    Ok((Some(minio), endpoint))
+}
+
 async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
     let creds = Credentials::new("minioadmin", "minioadmin", None, None, "e2e");
     let cfg = aws_sdk_s3::config::Builder::new()
@@ -565,13 +615,21 @@ async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
     }
 }
 
-fn spawn_pgwire(session_ctx: Arc<datafusion::execution::context::SessionContext>, db: Arc<timefusion::database::Database>, port: u16, shutdown: Arc<Notify>) {
+/// Bind an OS-assigned loopback port for pgwire. The listener is handed to the
+/// server as-is, so there is no bind/connect race and no port window to collide in.
+async fn bind_pg_listener() -> Result<(tokio::net::TcpListener, u16)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind pgwire listener")?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
+}
+
+fn spawn_pgwire(session_ctx: Arc<datafusion::execution::context::SessionContext>, db: Arc<timefusion::database::Database>, listener: tokio::net::TcpListener, shutdown: Arc<Notify>) {
     tokio::spawn(async move {
-        let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
+        let opts = ServerOptions::new();
         let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
         tokio::select! {
             _ = shutdown.notified() => {},
-            res = timefusion::pgwire_handlers::serve_with_logging(session_ctx, &opts, auth, None, Some(db), std::future::pending::<()>()) => {
+            res = timefusion::pgwire_handlers::serve_with_listener(listener, session_ctx, &opts, auth, None, Some(db), std::future::pending::<()>()) => {
                 if let Err(e) = res {
                     eprintln!("pgwire error: {e:?}");
                 }

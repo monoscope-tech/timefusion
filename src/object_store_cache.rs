@@ -369,6 +369,32 @@ fn capped_block_size(desired: usize, disk_size: usize) -> usize {
     desired.min(disk_size / 4).max(MIN_DISK_BLOCK_BYTES).min(disk_size)
 }
 
+/// Dedicated runtime for foyer's internal fetch/IO tasks, shared by every
+/// cache instance in the process (2 threads, lives for the process).
+///
+/// Why not the caller's runtime: `RawCache::get_or_fetch_inner` holds its
+/// inflight-manager mutex across `Spawner::spawn`. On a live runtime that's
+/// fine, but on a runtime that is shutting down tokio cancels the spawned
+/// task INLINE — `RawFetch::drop` then re-locks the same non-reentrant mutex
+/// on the same thread and deadlocks. Any in-flight cache get racing runtime
+/// teardown (test end, prod stop-grace) could hang forever; the e2e restart
+/// tests hit it deterministically (3×600s timeouts, 2026-08-03). A dedicated
+/// runtime never dies under foyer, so the inline-cancel path can't trigger.
+fn foyer_spawner() -> foyer::Spawner {
+    static SPAWNER: std::sync::OnceLock<foyer::Spawner> = std::sync::OnceLock::new();
+    SPAWNER
+        .get_or_init(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("foyer")
+                .enable_all()
+                .build()
+                .expect("build foyer runtime");
+            foyer::Spawner::from(rt)
+        })
+        .clone()
+}
+
 /// Build one hybrid (memory + disk) cache tier. The data and metadata caches
 /// differ only in their sizes and in the eviction listener, so they share this.
 async fn build_hybrid_cache(
@@ -383,6 +409,7 @@ async fn build_hybrid_cache(
             .with_shards(shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
             .storage()
+            .with_spawner(foyer_spawner())
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(BlockEngineConfig::new(FsDeviceBuilder::new(dir).with_capacity(disk_bytes).build()?).with_block_size(block_size))
             .build()

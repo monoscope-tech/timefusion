@@ -131,10 +131,11 @@ tf-start: minio-start
 			sleep 1; \
 		done; echo "timeout waiting for PGWire on $$port"; tail -50 /tmp/timefusion.log; exit 1
 
-# E2E tests: dynamic MinIO via testcontainers (requires Docker). Each test
-# gets a fresh container + bucket so they parallelize safely.
+# E2E tests: local-first MinIO like sqllogictest (endpoint env → running :9000
+# → local `minio` binary spawned detached → Docker last). Per-test isolation is
+# the unique bucket, so one shared server parallelizes safely.
 test-e2e:
-	@echo "Running E2E suite (Docker required for MinIO)..."
+	@echo "Running E2E suite (local-first MinIO; Docker only as fallback)..."
 	cargo nextest run --features e2e -E 'binary(e2e)' $${ARGS}
 
 tf-stop:

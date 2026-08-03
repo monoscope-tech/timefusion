@@ -25,6 +25,13 @@ fail-fast = false
 status-level = "fail"
 final-status-level = "slow"
 
+# E2E tests bootstrap a full server against MinIO — legitimately slower than
+# unit tests (slowest passing test ~112s), but a hung teardown should cost
+# 4 minutes, not the default 10.
+[[profile.default.overrides]]
+filter = 'binary(e2e)'
+slow-timeout = { period = "30s", terminate-after = 8 }
+
 # `cargo nextest run --profile ci`
 [profile.ci]
 test-threads = "num-cpus"
