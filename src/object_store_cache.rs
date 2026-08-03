@@ -275,8 +275,11 @@ impl FoyerCacheConfig {
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
+    pub range_hits: u64,
+    pub range_misses: u64,
     pub bytes_served: u64,
     pub inner_bytes_read: u64,
+    pub range_bytes_read: u64,
     pub ttl_expirations: u64,
     pub inner_gets: u64,
     pub inner_puts: u64,
@@ -315,8 +318,18 @@ impl CacheStats {
     fn log(&self) {
         let hit_rate = if self.hits + self.misses > 0 { (self.hits as f64 / (self.hits + self.misses) as f64) * 100.0 } else { 0.0 };
         info!(
-            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, Bytes served: {}, Inner bytes read: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
-            hit_rate, self.hits, self.misses, self.bytes_served, self.inner_bytes_read, self.ttl_expirations, self.inner_gets, self.inner_puts
+            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, Range hits: {}, Range misses: {}, Bytes served: {}, Inner bytes read: {}, Range bytes read: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
+            hit_rate,
+            self.hits,
+            self.misses,
+            self.range_hits,
+            self.range_misses,
+            self.bytes_served,
+            self.inner_bytes_read,
+            self.range_bytes_read,
+            self.ttl_expirations,
+            self.inner_gets,
+            self.inner_puts
         );
     }
 }
@@ -343,6 +356,23 @@ async fn record_miss_with_fetch(stats: &StatsRef) {
     bump(stats, |s| {
         s.misses += 1;
         s.inner_gets += 1;
+    })
+    .await;
+}
+
+async fn record_range_hit(stats: &StatsRef, bytes_served: u64) {
+    bump(stats, |s| {
+        s.hits += 1;
+        s.range_hits += 1;
+        s.bytes_served += bytes_served;
+    })
+    .await;
+}
+
+async fn record_range_miss(stats: &StatsRef, bytes_read: u64) {
+    bump(stats, |s| {
+        s.range_misses += 1;
+        s.range_bytes_read += bytes_read;
     })
     .await;
 }
@@ -651,6 +681,14 @@ fn is_parquet_file(location: &Path) -> bool {
     location.as_ref().ends_with(".parquet")
 }
 
+/// Best-effort: warm the Parquet header and footer of `location` into the cache.
+/// The header probe is deliberately metadata too: a cold `0..8` Parquet magic
+/// read must not be classified as data and trigger a full-object fallback.
+pub async fn warm_parquet_metadata(store: &dyn ObjectStore, location: &Path, metadata_size_hint: u64) -> bool {
+    let header = store.get_opts(location, GetOptions { range: Some(GetRange::Bounded(0..8)), ..Default::default() }).await.is_ok();
+    warm_footer(store, location, metadata_size_hint).await && header
+}
+
 /// Best-effort: warm the Parquet footer of `location` into the cache by issuing
 /// a ranged GET of the last `metadata_size_hint` bytes through `store`. When
 /// `store` is a [`FoyerObjectStoreCache`], that ranged GET lands in the
@@ -788,7 +826,7 @@ fn put_result_meta(location: Path, size: u64, result: &PutResult) -> ObjectMeta 
 }
 
 /// Foyer-based hybrid cache implementation for object store
-#[derive(derive_more::Display, derive_more::Debug)]
+#[derive(Clone, derive_more::Display, derive_more::Debug)]
 #[display("FoyerHybridCachedObjectStore({})", inner)]
 #[debug("FoyerHybridCachedObjectStore {{ inner: {} }}", inner)]
 pub struct FoyerObjectStoreCache {
@@ -1149,7 +1187,7 @@ impl FoyerObjectStoreCache {
         if let Ok(Some(entry)) = self.cache.get(&full_cache_key).await {
             let value = entry.value();
             if !value.is_expired(self.config.ttl) && range.end <= value.data.len() as u64 {
-                record_hit(&self.stats, range.end - range.start).await;
+                record_range_hit(&self.stats, range.end - range.start).await;
                 span.record("cache_hit", true);
                 debug!(
                     "Foyer cache HIT (full file) for range: {} (range: {}..{}, size: {} bytes, parquet={}, age={}ms)",
@@ -1250,7 +1288,7 @@ impl FoyerObjectStoreCache {
             // (prod 2026-08-03: hits=0/misses=0 with 1703 warmed entries while
             // a sea of sub-1MB flush files paid per-range GETs). Falling
             // through caches the whole body in the main tier with ONE GET.
-            let is_metadata_request = file_size > metadata_size_hint && range.start >= file_size.saturating_sub(metadata_size_hint);
+            let is_metadata_request = range.end <= 8 || (file_size > metadata_size_hint && range.start >= file_size.saturating_sub(metadata_size_hint));
             span.record("is_metadata", is_metadata_request);
 
             if is_metadata_request {
@@ -1331,6 +1369,7 @@ impl FoyerObjectStoreCache {
             is_parquet
         );
 
+        record_range_miss(&self.stats, result.len() as u64).await;
         bump(&self.stats, |s| s.inner_bytes_read += result.len() as u64).await;
         Ok(result)
     }
@@ -2785,6 +2824,27 @@ mod tests {
         assert_eq!(stats.main.hits, 1, "data read should hit main cache after full warm");
         assert_eq!(stats.main.misses, 0);
 
+        cache.shutdown().await?;
+        Ok(())
+    }
+
+    /// Header and footer warming must both use the metadata cache, so a Parquet
+    /// reader's leading magic probe cannot fall through to a full data read.
+    #[tokio::test]
+    async fn warm_parquet_metadata_primes_header_and_footer() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("table/date=2026-06-05/meta.parquet");
+        let size = 4096usize;
+        inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; size]))).await?;
+        let cache = FoyerObjectStoreCache::new(inner, FoyerCacheConfig::test_config_with("header_footer", |c| c.parquet_metadata_size_hint = 1024)).await?;
+
+        assert!(warm_parquet_metadata(&cache, &path, 1024).await);
+        cache.reset_stats().await;
+        assert_eq!(cache.get_range(&path, 0..8).await?.len(), 8);
+        assert_eq!(cache.get_range(&path, 3500..3600).await?.len(), 100);
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.metadata.hits, 2);
+        assert_eq!(stats.metadata.inner_gets, 0);
         cache.shutdown().await?;
         Ok(())
     }

@@ -405,8 +405,11 @@ impl StatsTableProvider {
                     rows![component;
                         "hits" => st.hits,
                         "misses" => st.misses,
+                        "range_hits" => st.range_hits,
+                        "range_misses" => st.range_misses,
                         "bytes_served" => st.bytes_served,
                         "inner_bytes_read" => st.inner_bytes_read,
+                        "range_bytes_read" => st.range_bytes_read,
                         "ttl_expirations" => st.ttl_expirations,
                         "inner_gets" => st.inner_gets,
                     ]

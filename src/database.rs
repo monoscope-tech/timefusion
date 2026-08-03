@@ -3779,7 +3779,10 @@ impl Database {
             return;
         }
         let (warm_full_files, warm_all_footers) = match confirm {
-            Some(_) => (true, false),
+            // Confirm only proves the small metadata reads before the
+            // MemBuffer handoff. Full bodies warm detached below: a slow R2
+            // GET must not make the flush path abandon metadata or wedge.
+            Some(_) => (false, false),
             None => (maint.timefusion_warm_full_files, maint.timefusion_warm_all_footers),
         };
         let recency_days = maint.timefusion_warm_recency_days;
@@ -3862,11 +3865,10 @@ impl Database {
         let pass = futures::stream::iter(paths).for_each_concurrent(concurrency, |(path, recent)| {
             let store = object_store.clone();
             async move {
-                // A full-file entry also serves the ranged footer reads, so the
-                // confirm's full warm subsumes the footer pass.
-                if confirm.is_none() {
-                    let _ = crate::object_store_cache::warm_footer(store.as_ref(), &path, metadata_size_hint).await;
-                }
+                // Metadata is cheap and required independently of a full-body
+                // warm: a cold Parquet header/footer probe must never trigger a
+                // whole-object GET.
+                let _ = crate::object_store_cache::warm_parquet_metadata(store.as_ref(), &path, metadata_size_hint).await;
                 if warm_full_files && recent {
                     let hit = match shared {
                         Some(shared) => {
@@ -5319,7 +5321,18 @@ impl Database {
             // differs.
             let warm_added = added.clone();
             if self.object_store_cache.is_some() {
-                self.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, Some(crate::config::CACHE_CONFIRM_TIMEOUT)).await;
+                // Establish header/footer coverage before the MemBuffer drains.
+                // Full bodies are warmed by the normal detached path below;
+                // the confirm must never make flush durability depend on R2.
+                self.warm_cache_for_uris(warm_store.clone(), warm_table_uri.clone(), warm_added.clone(), Some(crate::config::CACHE_CONFIRM_TIMEOUT)).await;
+                let db = self.clone();
+                let shutdown = self.maintenance_shutdown.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {}
+                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None) => {}
+                    }
+                });
             } else {
                 let db = self.clone();
                 let shutdown = self.maintenance_shutdown.clone();
