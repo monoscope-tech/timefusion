@@ -349,6 +349,17 @@ impl ExecutionPlan for DedupExec {
         }
         let in_schema = self.input.schema();
         let bound = detect_bound(&self.input, &self.keys, &in_schema);
+        // Within a bounded run the bound column is constant, and both `seen`
+        // and `greatest.best` are cleared when that value advances. Encoding it
+        // into every hash key is therefore redundant. Production's key is
+        // `(timestamp, id)` bounded by timestamp, so this removes one timestamp
+        // encoding from every physical row while preserving full composite-key
+        // identity across runs. Retain it for a one-column key so RowConverter
+        // never receives an empty schema.
+        let key_idxs = match &bound {
+            Some(bound) if self.key_idxs.len() > 1 => self.key_idxs.iter().copied().filter(|idx| *idx != bound.idx).collect(),
+            _ => self.key_idxs.clone(),
+        };
         // A bound lets keep-greatest emit per run without buffering the stream,
         // so it is the preferred shape — but it is no longer REQUIRED. Refusing
         // to run unbounded is what forced `version_append` scans to manufacture
@@ -373,8 +384,8 @@ impl ExecutionPlan for DedupExec {
             .map(|idx| Greatest::new(idx, in_schema.field(idx).data_type(), reservation))
             .transpose()?;
         let dedup = Dedup {
-            key_idxs: self.key_idxs.clone(),
-            conv: RowConverter::new(self.key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
+            conv: RowConverter::new(key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
+            key_idxs,
             output_projection: self.output_projection.clone(),
             seen: SeenSet::default(),
             bound,
