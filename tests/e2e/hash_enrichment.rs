@@ -21,6 +21,26 @@ async fn insert_span(client: &tokio_postgres::Client, id: &str, span: &str, trac
     Ok(())
 }
 
+/// Insert one round's baseline rows in a single pgwire statement. The race
+/// regression below needs a non-trivial Delta file, not hundreds of network
+/// round trips to construct it.
+async fn insert_span_batch(client: &tokio_postgres::Client, round: usize, rows: usize, ts: i64) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap();
+    let ids = (0..rows).map(|i| format!("base-{round}-{i}")).collect::<Vec<_>>();
+    let spans = (0..rows).map(|i| format!("span-{round}-{i}")).collect::<Vec<_>>();
+    let traces = (0..rows).map(|i| format!("trace-{round}-{i}")).collect::<Vec<_>>();
+    let sql = format!(
+        "INSERT INTO otel_logs_and_spans \
+         (project_id, date, timestamp, id, name, status_code, level, hashes, summary, context___span_id, context___trace_id) \
+         SELECT 'e2e_project', '{}', '{}', id, 'span', 'OK', 'INFO', ARRAY[]::text[], ARRAY['s']::text[], span_id, trace_id \
+         FROM unnest($1::text[], $2::text[], $3::text[]) AS u(id, span_id, trace_id)",
+        dt.date_naive(),
+        dt.format("%Y-%m-%d %H:%M:%S%.f"),
+    );
+    client.execute(&sql, &[&ids, &spans, &traces]).await?;
+    Ok((spans, traces))
+}
+
 /// The exact enrichment UPDATE-2 shape from monoscope BackgroundJobs.hs.
 async fn enrich(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &str) -> anyhow::Result<u64> {
     let sql = format!(
@@ -483,19 +503,20 @@ async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
     for round in 0..ROUNDS {
         // (1) Baseline rows, flushed to Delta so the enrichment rides the
         //     deferred Delta leg (merge-on-read DV rewrite) rather than MemBuffer.
-        for i in 0..BASE_ROWS {
-            let id = format!("base-{round}-{i}");
-            insert_span(&client, &id, &format!("span-{round}-{i}"), &format!("trace-{round}-{i}"), FROZEN_START_MICROS).await?;
-        }
+        let (spans, traces) = insert_span_batch(&client, round, BASE_ROWS, FROZEN_START_MICROS).await?;
         expected += BASE_ROWS;
         env.force_flush().await?;
         env.force_evict().await?;
 
         // (2) Queue an enrichment for the baseline rows; the coalescer holds the
         //     Delta leg until we drain it.
-        for i in 0..BASE_ROWS {
-            enrich(&client, &format!("span-{round}-{i}"), &format!("trace-{round}-{i}"), &format!("TAG-{round}")).await?;
-        }
+        let span_refs = spans.iter().map(String::as_str).collect::<Vec<_>>();
+        let trace_refs = traces.iter().map(String::as_str).collect::<Vec<_>>();
+        let tag = format!("TAG-{round}");
+        let tags = vec![tag.as_str(); BASE_ROWS];
+        let lo = FROZEN_START_MICROS - 1_000_000;
+        let hi = FROZEN_START_MICROS + 60_000_000;
+        enrich_prod_shape(&client, &span_refs, &trace_refs, &tags, lo, hi).await?;
 
         // (3) Run the merge and, concurrently, append + flush NEW rows so their
         //     AddFile commit races the merge's commit — the tolerated-append path.
