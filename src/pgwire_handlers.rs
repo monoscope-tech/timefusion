@@ -166,6 +166,30 @@ impl ErrorHandler for LoggingErrorHandler {
     }
 }
 
+/// Concurrent-giant-statement gate. A mega-statement (monoscope's multi-MB
+/// INSERTs / unnest-array enrichment UPDATEs) materializes its literals and
+/// bound parameters as ScalarValue arrays during plan + bind — tens to
+/// hundreds of MB of transient heap per statement, bounded only by connection
+/// concurrency. The 08:13Z 2026-08-03 OOM's pre-kill heap dumps were dominated
+/// by exactly this (`ScalarValue::iter_to_array`/`make_run_array` under
+/// pgwire). Two permits: one giant can always run while another queues, and
+/// worst-case transient parse heap is 2x one statement instead of Nx.
+const GIANT_STMT_BYTES: usize = 2 * 1024 * 1024;
+static GIANT_STMT_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+async fn giant_stmt_permit(len: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    if len < GIANT_STMT_BYTES {
+        return None;
+    }
+    let t0 = std::time::Instant::now();
+    let permit = GIANT_STMT_SEM.acquire().await.expect("giant-stmt semaphore never closed");
+    let waited = t0.elapsed();
+    if waited.as_millis() > 50 {
+        tracing::info!("giant statement ({len} B) queued {waited:?} behind the 2-permit parse gate");
+    }
+    Some(permit)
+}
+
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
     inner: DfSessionService,
@@ -499,6 +523,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let span = tracing::Span::current();
         record_query_span(&span, query);
 
+        let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
         let result = <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await;
@@ -569,6 +594,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         let query = &portal.statement.statement.0;
         record_query_span(&span, query);
 
+        let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
         let result = <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span).await;
