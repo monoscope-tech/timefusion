@@ -6791,6 +6791,23 @@ impl Database {
             // K = ceil(estimated decoded bytes / budget); the estimate is the
             // row-count-vs-inflation MAX ×2 documented on the config fields.
             let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
+            // Fail closed unless the provider's full-file re-read can be
+            // checked against Delta's independent row-count metadata. This is
+            // the invariant that would have stopped the 2026-08-03 loss: the
+            // buggy bin-scoped re-read produced 63k rows while removing files
+            // whose Add actions described 5.8M live rows. Deletion-vector
+            // cardinality is subtracted because the provider correctly hides
+            // those already-deleted physical rows.
+            let expected_live_rows = targets.iter().try_fold(0u64, |sum, add| -> Result<u64> {
+                let stats = add.get_stats()?.ok_or_else(|| anyhow::anyhow!("dedup rewrite refuses target without num_records stats: {}", add.path))?;
+                let rows = u64::try_from(stats.num_records).map_err(|_| anyhow::anyhow!("dedup rewrite target has negative num_records: {}", add.path))?;
+                let deleted = u64::try_from(add.deletion_vector.as_ref().map_or(0, |dv| dv.cardinality))
+                    .map_err(|_| anyhow::anyhow!("dedup rewrite target has negative deletion-vector cardinality: {}", add.path))?;
+                let live = rows
+                    .checked_sub(deleted)
+                    .ok_or_else(|| anyhow::anyhow!("dedup rewrite target deletion-vector cardinality exceeds num_records: {}", add.path))?;
+                sum.checked_add(live).ok_or_else(|| anyhow::anyhow!("dedup rewrite target row count overflow"))
+            })?;
             let compressed_budget = self.config.maintenance.timefusion_dedup_max_rewrite_bytes;
             let inflation = self.config.maintenance.timefusion_dedup_decode_inflation.max(1);
             let decoded_budget = self.config.maintenance.timefusion_dedup_max_decoded_bytes;
@@ -6811,6 +6828,26 @@ impl Database {
             // distinct tuples can't collide. Also the GROUP BY for the skew probe below.
             let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
             let bucket_expr = format!("substr(md5(concat_ws(chr(31), {keys_varchar})), 1, 2)");
+            // Independent narrow oracle for the staged output count. The
+            // Arrow rewrite below chooses the greatest tiebreak per key, but it
+            // must still emit exactly one row per distinct key (tombstones are
+            // retained). A disagreement rejects the unit before Remove actions
+            // can reach `commit_wave`.
+            let logical_rows_sql = format!(
+                "SELECT count(*) FROM (SELECT 1 FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
+            );
+            let expected_logical_rows = ctx
+                .sql(&logical_rows_sql)
+                .await?
+                .collect()
+                .await?
+                .first()
+                .filter(|batch| batch.num_rows() == 1)
+                .and_then(|batch| batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>())
+                .map(|array| array.value(0))
+                .ok_or_else(|| anyhow::anyhow!("dedup rewrite distinct-key validation returned no scalar"))?;
+            let expected_logical_rows =
+                u64::try_from(expected_logical_rows).map_err(|_| anyhow::anyhow!("dedup rewrite distinct-key validation returned a negative count"))?;
 
             // Sharding can't split a single key group — all copies share one bucket.
             // If the largest group alone would blow the budget, no shard count helps,
@@ -6921,6 +6958,18 @@ impl Database {
             if let Err(e) = stage_result {
                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                 return Err(e);
+            }
+            if !dedup_rewrite_counts_match(before as u64, expected_live_rows, after as u64, expected_logical_rows) {
+                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                anyhow::bail!(
+                    "dedup rewrite validation failed for table={} chunk=[{}]: reread={}/{} expected live rows, output={}/{} expected logical rows",
+                    table_name,
+                    label,
+                    before,
+                    expected_live_rows,
+                    after,
+                    expected_logical_rows
+                );
             }
             if before == 0 {
                 return Ok(BinOutcome::Retry);
@@ -8783,6 +8832,14 @@ const DEDUP_BUCKET_COUNT: u64 = 256;
 fn dedup_shard_count(decoded_bytes: u64, rewrite_bytes: u64, decoded_budget: u64, rewrite_budget: u64) -> u64 {
     let shards_for = |bytes: u64, budget: u64| if budget > 0 { bytes.div_ceil(budget) } else { 1 };
     shards_for(decoded_bytes, decoded_budget).max(shards_for(rewrite_bytes, rewrite_budget)).clamp(1, DEDUP_BUCKET_COUNT)
+}
+
+/// Two independent conservation checks required before a physical dedup unit
+/// may create Remove actions. The first proves the full live contents of every
+/// target file were re-read; the second proves winner selection emitted exactly
+/// one row per logical key.
+fn dedup_rewrite_counts_match(reread: u64, expected_live: u64, output: u64, expected_logical: u64) -> bool {
+    reread == expected_live && output == expected_logical
 }
 
 /// Rows a bucket must exceed before the streaming merge is worth its setup
@@ -15039,6 +15096,16 @@ mod tests {
         assert_eq!(dedup_shard_count(100, 100, 100, 100), 1);
         assert_eq!(dedup_shard_count(101, 100, 100, 100), 2);
         assert_eq!(dedup_shard_count(u64::MAX, 1, 1, 0), DEDUP_BUCKET_COUNT);
+    }
+
+    #[test]
+    fn dedup_rewrite_rejects_the_production_partial_file_loss_shape() {
+        assert!(dedup_rewrite_counts_match(5_795_641, 5_795_641, 2_100_000, 2_100_000));
+        assert!(
+            !dedup_rewrite_counts_match(63_786, 5_795_641, 63_786, 2_100_000),
+            "a bin-scoped re-read must never remove files whose adjacent rows were omitted"
+        );
+        assert!(!dedup_rewrite_counts_match(5_795_641, 5_795_641, 2_100_001, 2_100_000), "winner-count drift must also fail closed");
     }
 
     /// The cold cutoff must never DROP bins: the nightly consolidate bin-packs
