@@ -603,7 +603,6 @@ mod tests {
     /// investigation of MergeBuilder's accounting of WHEN MATCHED with
     /// non-trivial predicate filtering. Monoscope's re-extraction safety on
     /// TF will rely on this — track as a follow-up.
-    #[ignore = "MergeBuilder idempotency under NOT @> predicate — see comment"]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_unnest_text_array_idempotent() -> Result<()> {

@@ -195,7 +195,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
     // the walk is not a fixed-length iteration, so a fold would just thread the same
     // four fields by hand. Iterative (not recursive) — plan trees can be deep.
     let mut current_plan = input;
-    let mut predicate = None;
+    let mut predicate: Option<Expr> = None;
     let mut assignments = None;
     let mut project_id = String::new();
     let mut source_plan: Option<UpdateSourcePlan> = None;
@@ -215,8 +215,20 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 current_plan = proj.input.as_ref();
             }
             LogicalPlan::Filter(filter) => {
-                predicate = Some(filter.predicate.clone());
+                // AND-merge, never overwrite: the walk may already hold the
+                // cross-side conjunct pulled from `join.filter` above (e.g. the
+                // enrichment guard `NOT (o.hashes @> ARRAY[u.tag])`), and the
+                // optimizer pushes the target-side filter BELOW the join —
+                // overwriting here silently dropped the guard, so every
+                // enrichment pass re-appended full-row versions for every
+                // matched span, tagged or not (unbounded write amplification;
+                // prod 2026-08-03).
                 project_id = extract_project_id_from_expr(&filter.predicate).unwrap_or(project_id);
+                let p = filter.predicate.clone();
+                predicate = Some(match predicate.take() {
+                    Some(existing) => existing.and(p),
+                    None => p,
+                });
                 current_plan = filter.input.as_ref();
             }
             LogicalPlan::Join(join) if extract_assignments => {
@@ -806,14 +818,39 @@ async fn perform_version_append(
     // that table. It also prunes, which is why the in-place Delta leg
     // re-augments its own predicate the same way.
     let tenant = Expr::Column(Column::from_name("project_id")).eq(lit(project_id));
-    let filter = match predicate.clone() {
-        Some(p) => tenant.and(p),
-        None => tenant,
-    };
+    let source_cols: std::collections::HashSet<String> = source.map(|s| s.schema.fields().iter().map(|f| f.name().clone()).collect()).unwrap_or_default();
+    // The predicate splits at the join: a conjunct referencing any source
+    // column (the enrichment guard `NOT (hashes @> ARRAY[u.tag])`) can only be
+    // evaluated on the joined row, while target-only conjuncts (tenant, time
+    // bounds) belong on the scan where they prune. Dropping the source-side
+    // conjuncts instead of deferring them un-guards the UPDATE — every pass
+    // then re-appends versions for every matched row (prod 2026-08-03).
+    let (pre_join, post_join): (Vec<Expr>, Vec<Expr>) = predicate
+        .as_ref()
+        .map(|p| split_conjunction(p).into_iter().cloned().partition(|c| !c.column_refs().iter().any(|col| source_cols.contains(&col.name))))
+        .unwrap_or_default();
+    let filter = pre_join.into_iter().fold(tenant, Expr::and);
     let mut builder = LogicalPlanBuilder::scan(table_name, provider_as_source(provider), None)?.filter(filter)?;
 
-    let source_cols: std::collections::HashSet<String> = source.map(|s| s.schema.fields().iter().map(|f| f.name().clone()).collect()).unwrap_or_default();
     if let Some(src) = source {
+        // The join keys never prune the scan on their own — the equi-join
+        // matches AFTER every row in the window is decoded. Pushing the
+        // source's key values down as IN-lists engages the parquet bloom
+        // filters on exactly these columns and shrinks the scan from "whole
+        // window, all columns" to the matched pages. Sound: join-key target
+        // columns are identity columns, never version-mutable. Skipped above
+        // a cap so a giant source can't build a pathological expression.
+        const KEY_PUSHDOWN_CAP: usize = 4096;
+        if src.batch.num_rows() <= KEY_PUSHDOWN_CAP {
+            for (t, s) in &src.join_keys {
+                let idx = src.schema.index_of(s)?;
+                let arr = src.batch.column(idx);
+                let mut vals = (0..arr.len()).map(|i| datafusion::common::ScalarValue::try_from_array(arr, i)).collect::<Result<Vec<_>>>()?;
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                vals.dedup();
+                builder = builder.filter(Expr::Column(Column::from_name(t)).in_list(vals.into_iter().map(lit).collect(), false))?;
+            }
+        }
         let mem = MemTable::try_new(src.schema.clone(), vec![vec![src.batch.clone()]])?;
         let src_plan = LogicalPlanBuilder::scan(MOR_SOURCE, provider_as_source(Arc::new(mem)), None)?.build()?;
         let on: Vec<Expr> = src
@@ -822,6 +859,9 @@ async fn perform_version_append(
             .map(|(t, s)| Expr::Column(Column::new(Some(table_name.to_string()), t)).eq(Expr::Column(Column::new(Some(MOR_SOURCE.to_string()), s))))
             .collect();
         builder = builder.join_on(src_plan, JoinType::Inner, on)?;
+        if let Some(guard) = post_join.into_iter().reduce(Expr::and) {
+            builder = builder.filter(requalify_for_merge(guard, &source_cols, MOR_SOURCE, table_name)?)?;
+        }
     }
 
     // Full-row versions: every column is carried forward, with the assignments
