@@ -8068,8 +8068,9 @@ impl Database {
     /// sink. Never sizes concurrency upward; strictly "start no more work".
     ///
     /// Two levels, because the failure modes differ. WAL backlog can be a
-    /// sustained property of a busy hour, so it DEGRADES to a service floor
-    /// (one project per tick) — a full stop there starves compaction
+    /// sustained property of a busy hour (and of every post-boot replay), so
+    /// it DEGRADES to a service floor — serial, one bin in flight, still
+    /// bounded by the tick deadline — a full stop there starves compaction
     /// indefinitely, which degrades reads and merges. Memory near the cgroup
     /// limit is an imminent OOM: hard STOP.
     fn light_optimize_brake(&self) -> Option<Brake> {
@@ -9577,21 +9578,19 @@ where
                 on_truncate(round, &pending);
                 break;
             }
-            // Service floor: keep the debt-ordered HEAD and cut the rest, so a
-            // sustained overload still compacts one project per tick instead of
-            // zero. The cut projects go through `on_truncate` exactly like a
-            // deadline truncation, so the rotation cursor resumes at the first
-            // project this tick never served — fairness across ticks holds.
+            // Service floor: drop to SERIAL, not to one project. One bin in
+            // flight bounds the instantaneous heap exactly as a one-project cut
+            // did, while the tick deadline still bounds total work — but every
+            // project the deadline admits gets served. The old cut-to-head
+            // floor starved compaction for the whole post-boot WAL replay
+            // (backlog stays over threshold for ~an hour, so 11 hot projects
+            // compacted once per ~55min each and today's flush dribble piled up
+            // to 50-65 files/partition, prod 2026-08-03). Projects the
+            // deadline does cut still rotate via `on_truncate`.
             Some(Brake::Degrade(reason)) => {
                 concurrency = 1;
                 crate::metrics::maintenance_stats().light_optimize_ticks_degraded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if pending.len() > 1 {
-                    let cut = pending.split_off(1);
-                    info!(round, served = 1, cut = cut.len(), reason, event = "light_optimize_wave_degraded");
-                    on_truncate(round, &cut);
-                } else {
-                    info!(round, served = pending.len(), cut = 0, reason, event = "light_optimize_wave_degraded");
-                }
+                info!(round, served = pending.len(), reason, event = "light_optimize_wave_degraded");
             }
             None => {}
         }
@@ -11300,8 +11299,9 @@ impl TableProvider for ProjectRoutingTable {
         // (post-commit) data.
         // ...and only when the scan is shallow enough for the tier to be worth
         // its heap. The hot leg is materialized EAGERLY at plan time into a
-        // `MemorySourceConfig` — outside every memory pool and outside
-        // `GatedScanExec`, which wraps only the Delta plan. A 7d/14d scan's
+        // `MemorySourceConfig` — charged to the query pool only at execute
+        // time (`HotLegPooledExec`) and outside `GatedScanExec`, which wraps
+        // only the Delta plan. A 7d/14d scan's
         // `query_time_range` covers the whole hot window, so it would pull the
         // entire tier into heap to shave a few files off a scan already
         // dominated by thousands; past the retention window the tier is by
@@ -11325,7 +11325,7 @@ impl TableProvider for ProjectRoutingTable {
                     .await
             }
         };
-        let (hot_partitions, hot_ranges, version_gate, hot_sorted) = (hot.partitions, hot.ranges, hot.version_gate, hot.sorted);
+        let (hot_partitions, hot_ranges, version_gate, hot_sorted, hot_bytes) = (hot.partitions, hot.ranges, hot.version_gate, hot.sorted, hot.bytes);
 
         // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
@@ -11454,7 +11454,8 @@ impl TableProvider for ProjectRoutingTable {
                 let hot_out = hot_schema.clone();
                 let source = MemorySourceConfig::try_new(&hot_partitions, hot_schema, None).map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let source = Self::declare_ordering(source, hot_sorted, &self.table_name, &hot_out);
-                Some(Arc::new(DataSourceExec::new(Arc::new(source))) as Arc<dyn ExecutionPlan>)
+                let exec = Arc::new(DataSourceExec::new(Arc::new(source)));
+                Some(Arc::new(crate::hot_tier::HotLegPooledExec::new(exec, hot_bytes)) as Arc<dyn ExecutionPlan>)
             }
         };
         // Sortable mask tracks the flatten: in-memory legs true, Delta false.
@@ -13089,7 +13090,7 @@ mod tests {
     /// floor — the debt-ordered head project keeps getting served every round —
     /// while `Stop` keeps the old full-truncation behaviour.
     #[tokio::test(flavor = "multi_thread")]
-    async fn round_robin_bins_degrade_keeps_serving_the_head_project() {
+    async fn round_robin_bins_degrade_serves_all_projects_serially() {
         let run = |brake: Option<super::Brake>| async move {
             let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
             let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new()));
@@ -13115,12 +13116,13 @@ mod tests {
         };
 
         let (calls, truncated) = run(Some(super::Brake::Degrade("wal"))).await;
+        let serial_round = |r: usize| [("head".to_string(), r), ("b".to_string(), r), ("c".to_string(), r)];
         assert_eq!(
             calls,
-            vec![("head".to_string(), 0), ("head".to_string(), 1), ("head".to_string(), 2)],
-            "degrade must serve exactly the head project, once per round"
+            [serial_round(0), serial_round(1), serial_round(2)].concat(),
+            "degrade serves every project serially — the deadline, not a cut, bounds the tick"
         );
-        assert_eq!(truncated, vec![(0, vec!["b".to_string(), "c".to_string()])], "the cut projects rotate exactly once, so the cursor resumes at 'b'");
+        assert!(truncated.is_empty(), "degrade alone cuts nothing; only the deadline truncates");
 
         let (calls, truncated) = run(Some(super::Brake::Stop("mem"))).await;
         assert!(calls.is_empty(), "stop must start no work at all");

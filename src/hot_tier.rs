@@ -43,7 +43,16 @@ use arrow::{
 };
 use arrow_ipc::{Block, convert::fb_to_schema, reader::FileDecoder, reader::read_footer_length, root_as_footer, writer::FileWriter, writer::IpcWriteOptions};
 use dashmap::DashMap;
-use datafusion::{logical_expr::Expr, physical_expr::PhysicalExpr};
+use datafusion::{
+    error::Result as DFResult,
+    execution::{
+        TaskContext,
+        memory_pool::{MemoryConsumer, MemoryReservation},
+    },
+    logical_expr::Expr,
+    physical_expr::PhysicalExpr,
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream},
+};
 use tracing::{debug, info, warn};
 
 use crate::mem_buffer::{TableKey, compile_filter_conjunction, filter_snapshot, overlaps, table_key};
@@ -247,11 +256,80 @@ pub struct HotLeg {
     /// columns: `write_bucket` sorts every file it writes and refuses to write
     /// one it could not sort, and projection/filtering preserve row order.
     pub sorted: bool,
+    /// Post-filter bytes the served partitions hold — the heap this leg keeps
+    /// alive for the life of the plan. `HotLegPooledExec` charges exactly this
+    /// to the query's memory pool.
+    pub bytes: u64,
 }
 
 impl HotLeg {
     pub fn is_empty(&self) -> bool {
         self.partitions.is_empty() && self.ranges.is_empty()
+    }
+}
+
+/// Charges the hot leg's materialized bytes to the query's memory pool.
+///
+/// The leg is built eagerly at plan time (`read_leg`) into plain
+/// `RecordBatch`es that live until the plan drops, invisible to every
+/// DataFusion pool — N concurrent scans could otherwise stack N ×
+/// `leg_budget_bytes` of unaccounted heap. The first `execute` call reserves
+/// the leg's post-filter size from the query pool; the reservation is held by
+/// the plan node itself, so it frees exactly when the batches do. The charge
+/// happens at execute rather than plan time only because planning has no pool
+/// in scope — the allocation it accounts for already exists either way, so a
+/// failed `try_grow` fails the query (the sound direction: the leg's ranges
+/// were already excluded from the Delta leg, serving without it would drop
+/// windows).
+#[derive(Debug)]
+pub struct HotLegPooledExec {
+    inner: Arc<dyn ExecutionPlan>,
+    bytes: u64,
+    reservation: std::sync::Mutex<Option<MemoryReservation>>,
+}
+
+impl HotLegPooledExec {
+    pub fn new(inner: Arc<dyn ExecutionPlan>, bytes: u64) -> Self {
+        Self { inner, bytes, reservation: std::sync::Mutex::new(None) }
+    }
+}
+
+impl DisplayAs for HotLegPooledExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "HotLegPooledExec: bytes={}", self.bytes)
+    }
+}
+
+impl ExecutionPlan for HotLegPooledExec {
+    fn name(&self) -> &'static str {
+        "HotLegPooledExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(self: Arc<Self>, mut children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(children.swap_remove(0), self.bytes)))
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        let mut guard = self.reservation.lock().unwrap();
+        if guard.is_none() {
+            let r = MemoryConsumer::new("HotTierLeg").register(context.memory_pool());
+            r.try_grow(self.bytes as usize)?;
+            *guard = Some(r);
+        }
+        drop(guard);
+        self.inner.execute(partition, context)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<datafusion::common::Statistics>> {
+        self.inner.partition_statistics(partition)
     }
 }
 
@@ -627,11 +705,13 @@ impl HotTier {
         for meta in metas {
             let Some(filtered) = self.materialize(meta, mem_ranges, cols.as_ref(), &pred, schema) else { continue };
             // The hot leg is materialized at PLAN time into a
-            // `MemorySourceConfig` — no memory pool, no `GatedScanExec`, no
-            // spill. `limits.leg_budget_bytes` is therefore the only thing
-            // bounding it, and it is charged on the post-filter bytes actually
-            // retained (`filter_record_batch` heap-copies, so these are real
-            // allocations, unlike the zero-copy decode they came from).
+            // `MemorySourceConfig` — no `GatedScanExec`, no spill, and the
+            // query pool only learns of it at execute time via
+            // `HotLegPooledExec`. `limits.leg_budget_bytes` is therefore what
+            // bounds ONE scan's materialization, charged on the post-filter
+            // bytes actually retained (`filter_record_batch` heap-copies, so
+            // these are real allocations, unlike the zero-copy decode they
+            // came from).
             //
             // Range and partition are pushed TOGETHER, after the check: a file
             // whose rows we refuse to hold must also not be excluded from the
@@ -657,7 +737,7 @@ impl HotTier {
                 partitions.push(filtered);
             }
         }
-        HotLeg { partitions, ranges, version_gate: gate, sorted }
+        HotLeg { partitions, ranges, version_gate: gate, sorted, bytes: used }
     }
 
     /// One file's contribution to the leg, projected and filtered. `None` =
@@ -1548,5 +1628,35 @@ mod tests {
         tier.demote("p1", "sub/dir", 1, &[batch(8)], 10, 20);
         assert_eq!(tier.stats().files, 0);
         assert_eq!(tier.stats().write_failures, 0, "an unsafe name is a skip, not a failure");
+    }
+
+    /// The leg's plan-time heap must be visible to the query pool: a leg
+    /// larger than the pool fails its query with ResourcesExhausted instead of
+    /// stacking unaccounted bytes toward the cgroup kill, and the charge is
+    /// made ONCE across partitions.
+    #[tokio::test]
+    async fn pooled_leg_charges_the_query_pool_once_and_oversize_fails() {
+        use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
+        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+
+        let source = MemorySourceConfig::try_new(&[vec![batch(4)], vec![batch(4)]], schema(), None).unwrap();
+        let inner = Arc::new(DataSourceExec::new(Arc::new(source)));
+        let ctx = |pool_bytes| {
+            let env = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes))).build_arc().unwrap();
+            Arc::new(TaskContext::default().with_runtime(env))
+        };
+
+        let fits = HotLegPooledExec::new(inner.clone(), 512);
+        let ctx_fits = ctx(1024);
+        fits.execute(0, ctx_fits.clone()).unwrap();
+        fits.execute(1, ctx_fits.clone()).unwrap();
+        assert_eq!(ctx_fits.memory_pool().reserved(), 512, "one charge for the whole leg, not per partition");
+
+        let oversize = HotLegPooledExec::new(inner, 2048);
+        let err = match oversize.execute(0, ctx(1024)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("oversized leg must fail its query"),
+        };
+        assert!(err.contains("Resources exhausted"), "got: {err}");
     }
 }
