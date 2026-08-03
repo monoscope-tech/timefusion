@@ -456,6 +456,102 @@ struct Cand {
     tb: TiebreakValue,
 }
 
+/// Most telemetry timestamps identify one logical event, so a bounded run
+/// normally has one winner (plus its physical MOR copies). Avoid hashing those
+/// tiny runs; promote only an unusually wide equal-timestamp run to a map.
+const SMALL_WINNER_LIMIT: usize = 8;
+
+enum WinnerUpdate {
+    Loses,
+    ReplaceSmall(usize),
+    ReplaceLarge,
+    Insert,
+}
+
+enum Winners {
+    Small(Vec<(Box<[u8]>, Cand)>),
+    Large(HashMap<Box<[u8]>, Cand, ahash::RandomState>),
+}
+
+impl Winners {
+    fn new() -> Self {
+        Self::Small(Vec::with_capacity(SMALL_WINNER_LIMIT))
+    }
+
+    fn probe(&self, key: &[u8], tb: &TiebreakRef<'_>) -> WinnerUpdate {
+        match self {
+            Self::Small(entries) => match entries.iter().position(|(stored, _)| stored.as_ref() == key) {
+                Some(i) if tb.beats(&entries[i].1.tb) => WinnerUpdate::ReplaceSmall(i),
+                Some(_) => WinnerUpdate::Loses,
+                None => WinnerUpdate::Insert,
+            },
+            Self::Large(entries) => match entries.get(key) {
+                Some(cand) if tb.beats(&cand.tb) => WinnerUpdate::ReplaceLarge,
+                Some(_) => WinnerUpdate::Loses,
+                None => WinnerUpdate::Insert,
+            },
+        }
+    }
+
+    fn apply(&mut self, key: &[u8], cand: Cand, update: WinnerUpdate) {
+        match update {
+            WinnerUpdate::Loses => unreachable!("losing winner update must not be applied"),
+            WinnerUpdate::ReplaceSmall(i) => {
+                let Self::Small(entries) = self else { unreachable!("small winner probe changed representation") };
+                entries[i].1 = cand;
+            }
+            WinnerUpdate::ReplaceLarge => {
+                let Self::Large(entries) = self else { unreachable!("large winner probe changed representation") };
+                entries.insert(key.into(), cand);
+            }
+            WinnerUpdate::Insert => match self {
+                Self::Small(entries) if entries.len() < SMALL_WINNER_LIMIT => entries.push((key.into(), cand)),
+                Self::Small(entries) => {
+                    let mut promoted = HashMap::with_capacity_and_hasher(entries.len() + 1, ahash::RandomState::new());
+                    promoted.extend(entries.drain(..));
+                    promoted.insert(key.into(), cand);
+                    *self = Self::Large(promoted);
+                }
+                Self::Large(entries) => {
+                    entries.insert(key.into(), cand);
+                }
+            },
+        }
+    }
+
+    fn drain(&mut self, mut f: impl FnMut(Box<[u8]>, Cand)) {
+        match self {
+            Self::Small(entries) => entries.drain(..).for_each(|(key, cand)| f(key, cand)),
+            Self::Large(entries) => {
+                entries.drain().for_each(|(key, cand)| f(key, cand));
+                *self = Self::new();
+            }
+        }
+    }
+
+    fn shift_batches(&mut self, count: u32) {
+        match self {
+            Self::Small(entries) => entries.iter_mut().for_each(|(_, cand)| cand.batch -= count),
+            Self::Large(entries) => entries.values_mut().for_each(|cand| cand.batch -= count),
+        }
+    }
+
+    fn min_batch(&self, default: usize) -> usize {
+        match self {
+            Self::Small(entries) => entries.iter().map(|(_, cand)| cand.batch as usize).min().unwrap_or(default),
+            Self::Large(entries) => entries.values().map(|cand| cand.batch as usize).min().unwrap_or(default),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Small(entries) => entries.len(),
+            Self::Large(entries) => entries.len(),
+        }
+    }
+}
+
 /// Owned winner tiebreak. Timestamp/int64 values stay primitive; other schema
 /// types retain Arrow's generic order-preserving encoding.
 enum TiebreakValue {
@@ -509,7 +605,7 @@ struct Greatest {
     /// row format compares byte-lexicographically in value order, so `>` on the
     /// encoded bytes *is* `>` on the value, for any type.
     conv: Option<RowConverter>,
-    best: HashMap<Box<[u8]>, Cand, ahash::RandomState>,
+    best: Winners,
     batches: Vec<RecordBatch>,
     /// Winner masks accumulated for CLOSED runs. A bounded stream may contain
     /// thousands of timestamp runs in one Arrow batch; filtering the whole
@@ -532,7 +628,7 @@ impl Greatest {
                 RowConverter::new(vec![sf]).map_err(arrow_err)
             })
             .transpose()?;
-        Ok(Self { idx, conv, best: HashMap::default(), batches: Vec::new(), masks: Vec::new(), bytes: 0, reservation })
+        Ok(Self { idx, conv, best: Winners::new(), batches: Vec::new(), masks: Vec::new(), bytes: 0, reservation })
     }
 
     fn tiebreak_rows<'a>(&self, column: &'a ArrayRef) -> DFResult<TiebreakRows<'a>> {
@@ -550,12 +646,12 @@ impl Greatest {
     /// is the memory-ceiling fallback: park those keys in `seen` so the tail of
     /// the same run cannot emit them again (the existing keep-first fallback).
     fn close_run(&mut self, seen: &mut SeenSet, partial: bool) {
-        for (k, c) in self.best.drain() {
+        self.best.drain(|k, c| {
             self.masks[c.batch as usize][c.row as usize] = true;
             if partial {
                 seen.insert(k);
             }
-        }
+        });
     }
 
     /// Emit a closed prefix of retained batches exactly once. Any candidates
@@ -571,9 +667,7 @@ impl Greatest {
         let freed: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
         self.bytes = self.bytes.saturating_sub(freed);
         self.reservation.shrink(freed);
-        for cand in self.best.values_mut() {
-            cand.batch -= count as u32;
-        }
+        self.best.shift_batches(count as u32);
         batches
             .into_iter()
             .zip(masks)
@@ -670,7 +764,8 @@ impl Dedup {
                 continue;
             }
             let tb = tbs.value(i);
-            if g.best.get(key).is_some_and(|c| !tb.beats(&c.tb)) {
+            let update = g.best.probe(key, &tb);
+            if matches!(update, WinnerUpdate::Loses) {
                 continue;
             }
             let bi = match cur {
@@ -691,12 +786,12 @@ impl Dedup {
                     bi
                 }
             };
-            g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into_owned() });
+            g.best.apply(key, Cand { batch: bi, row: i as u32, tb: tb.into_owned() }, update);
         }
         // Sorted input guarantees the open run is a suffix. Emit every batch
         // before the earliest candidate it still owns; a batch containing both
         // closed winners and the open run waits until the next boundary.
-        let keep_from = g.best.values().map(|c| c.batch as usize).min().unwrap_or(g.batches.len());
+        let keep_from = g.best.min_batch(g.batches.len());
         out.extend(g.emit_prefix(keep_from, proj)?);
         Ok(out)
     }
@@ -770,6 +865,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn winner_store_avoids_hashing_small_runs_and_promotes_wide_runs() {
+        let mut winners = Winners::new();
+        for row in 0..SMALL_WINNER_LIMIT {
+            let key = format!("id-{row}");
+            let tb = TiebreakRef::I64(Some(1));
+            let update = winners.probe(key.as_bytes(), &tb);
+            winners.apply(key.as_bytes(), Cand { batch: 0, row: row as u32, tb: tb.into_owned() }, update);
+        }
+        assert!(matches!(winners, Winners::Small(_)));
+
+        let key = b"promotes";
+        let tb = TiebreakRef::I64(Some(1));
+        let update = winners.probe(key, &tb);
+        winners.apply(key, Cand { batch: 0, row: 8, tb: tb.into_owned() }, update);
+        assert!(matches!(winners, Winners::Large(_)));
+
+        let newer = TiebreakRef::I64(Some(2));
+        let update = winners.probe(key, &newer);
+        assert!(matches!(update, WinnerUpdate::ReplaceLarge));
+        winners.apply(key, Cand { batch: 1, row: 9, tb: newer.into_owned() }, update);
+        assert_eq!(winners.min_batch(99), 0);
+
+        let mut drained = 0;
+        winners.drain(|_, _| drained += 1);
+        assert_eq!(drained, SMALL_WINNER_LIMIT + 1);
+        assert!(matches!(winners, Winners::Small(_)), "a closed wide run must return to the hash-free representation");
+    }
 
     fn batch(ids: &[&str], vals: &[i64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false), Field::new("v", DataType::Int64, false)]));
