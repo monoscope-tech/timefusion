@@ -1,5 +1,6 @@
 mod defer_expensive_projection;
 mod ordered_union_for_topk;
+mod parallel_count_dedup;
 pub mod pg_array_literal_rewriter;
 mod tantivy_rewriter;
 mod variant_insert_rewriter;
@@ -16,6 +17,7 @@ use datafusion::{
 };
 pub use defer_expensive_projection::DeferExpensiveProjection;
 pub use ordered_union_for_topk::{OrderedUnionForTopK, ordered_children};
+pub use parallel_count_dedup::ParallelCountDedup;
 pub use pg_array_literal_rewriter::PgArrayLiteralRewriter;
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
