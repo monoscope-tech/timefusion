@@ -105,6 +105,24 @@ type SeenSet = HashSet<Box<[u8]>, ahash::RandomState>;
 /// than growing without bound.
 const RUN_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// One unordered merge-on-read query may not monopolize the global query
+/// pool. Bounded inputs release at each timestamp run; only the unbounded
+/// correctness fallback needs this ceiling. Production previously had four
+/// such consumers retain 4.8-9.6GB each and exhaust the 30GB pool.
+const UNBOUNDED_GREATEST_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+fn check_unbounded_growth(current: usize, additional: usize) -> DFResult<()> {
+    let requested =
+        current.checked_add(additional).ok_or_else(|| DataFusionError::ResourcesExhausted("unordered merge-on-read dedup buffer size overflow".to_string()))?;
+    if requested > UNBOUNDED_GREATEST_MAX_BYTES {
+        return Err(DataFusionError::ResourcesExhausted(format!(
+            "unordered merge-on-read dedup exceeded its {} MiB per-query limit; narrow the time window or compact unsorted files",
+            UNBOUNDED_GREATEST_MAX_BYTES / 1024 / 1024
+        )));
+    }
+    Ok(())
+}
+
 /// Bounded-window dedup state (parity plan Point 3, Tier 2). When the input is
 /// already sorted by a dedup-key column (`timestamp` leads the table sort
 /// order), duplicates of a key are confined to a single bound-value run: two
@@ -508,6 +526,9 @@ impl Dedup {
                     // Pool BEFORE buffering: on ResourcesExhausted the query
                     // fails here instead of the cgroup killing the server.
                     let size = batch.get_array_memory_size();
+                    if self.bound.is_none() {
+                        check_unbounded_growth(g.bytes, size)?;
+                    }
                     g.reservation.try_grow(size)?;
                     g.batches.push(batch.clone());
                     g.bytes += size;
@@ -760,6 +781,14 @@ mod tests {
         }
         let err = err.expect("a 512-byte pool must refuse the run buffer");
         assert!(format!("{err}").contains("Resources exhausted"), "must fail with the pool's error, got: {err}");
+    }
+
+    #[test]
+    fn unbounded_run_buffer_has_a_per_query_ceiling() {
+        assert!(check_unbounded_growth(UNBOUNDED_GREATEST_MAX_BYTES - 1, 1).is_ok());
+        let err = check_unbounded_growth(UNBOUNDED_GREATEST_MAX_BYTES, 1).unwrap_err();
+        assert!(format!("{err}").contains("per-query limit"));
+        assert!(check_unbounded_growth(usize::MAX, 1).is_err(), "overflow must fail closed");
     }
 
     /// EXPLAIN must distinguish the SURVIVOR rule, not just the seen-set size:

@@ -41,8 +41,10 @@ use arrow::{
     buffer::Buffer,
     datatypes::{DataType, SchemaRef, TimeUnit},
 };
-use arrow_ipc::{Block, convert::fb_to_schema, reader::FileDecoder, reader::read_footer_length, root_as_footer, writer::FileWriter, writer::IpcWriteOptions};
-use dashmap::DashMap;
+use arrow_ipc::{
+    Block, CompressionType, convert::fb_to_schema, reader::FileDecoder, reader::read_footer_length, root_as_footer, writer::FileWriter, writer::IpcWriteOptions,
+};
+use dashmap::{DashMap, DashSet};
 use datafusion::{
     error::Result as DFResult,
     execution::{
@@ -405,6 +407,10 @@ pub struct HotTier {
     /// plus the mapping — not row data. Dropped when the file is, when
     /// `limits.memo_bytes` is exceeded (LRU), or on `rescan`.
     decoded: DashMap<PathBuf, MemoEntry>,
+    /// Files successfully served since boot. Projection-specific decodes are
+    /// intentionally not in `decoded`, so memo presence is no longer a sound
+    /// proxy for whether demotion paid off before DML invalidated a file.
+    read_files: DashSet<PathBuf>,
     /// Bytes of mapping currently pinned by `decoded`, and the LRU stamp
     /// source. `memo_bytes` is only ever mutated through `memo_insert` /
     /// `memo_forget`, which is what keeps it in step with the map.
@@ -619,10 +625,13 @@ impl HotTier {
         let sort_marker = if sorted { "s" } else { "" };
         let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{sort_marker}{stamp_suffix}.{EXT}"));
         crate::wal::write_atomic_with(&path, true, |f| {
-            // Default options: 64-byte alignment, V5, NO compression — the
-            // alignment is what keeps the mmap read zero-copy, the absence of
-            // compression is what makes it possible at all.
-            let mut w = FileWriter::try_new_with_options(f, schema.as_ref(), IpcWriteOptions::default()).map_err(std::io::Error::other)?;
+            // Compress each IPC buffer independently. FileDecoder projection
+            // skips unrequested buffers before decompression, so a narrow query
+            // pays only for its columns while LZ4 lets the 24h tier fit under
+            // the fixed disk ceiling. The previous uncompressed representation
+            // saturated 128GB after only part of the desired window.
+            let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME)).map_err(std::io::Error::other)?;
+            let mut w = FileWriter::try_new_with_options(f, schema.as_ref(), options).map_err(std::io::Error::other)?;
             batches.iter().try_for_each(|b| w.write(b)).map_err(std::io::Error::other)?;
             w.finish().map_err(std::io::Error::other)
         })?;
@@ -804,11 +813,13 @@ impl HotTier {
         if let Some(hit) = self.decoded.get(path) {
             hit.used.store(self.memo_clock.fetch_add(1, Relaxed), Relaxed);
             self.read_hits.fetch_add(1, Relaxed);
+            self.read_files.insert(path.to_path_buf());
             return Some(hit.batches.clone());
         }
         match decode_file(path, false, None) {
             Ok(batches) => {
                 self.read_hits.fetch_add(1, Relaxed);
+                self.read_files.insert(path.to_path_buf());
                 let batches = Arc::new(batches);
                 self.memo_insert(path, batches.clone());
                 Some(batches)
@@ -829,6 +840,7 @@ impl HotTier {
         match decode_file(path, false, Some(projection)) {
             Ok(batches) => {
                 self.read_hits.fetch_add(1, Relaxed);
+                self.read_files.insert(path.to_path_buf());
                 Some(Arc::new(batches))
             }
             Err(e) => {
@@ -839,13 +851,15 @@ impl HotTier {
         }
     }
 
-    /// Memoize one decode and enforce the memo's byte ceiling. The charge is
-    /// the file's length: an entry's cost is dominated by the mmap it pins for
-    /// its whole lifetime (clean, reclaimable pages — pressure, not RSS), and
-    /// that mapping is exactly the file. An entry that can't be sized isn't
-    /// memoized at all, so `memo_bytes` can never understate the map.
+    /// Memoize one full-schema decode and enforce the memo's byte ceiling.
+    /// Charge the larger of file bytes and decoded Arrow bytes: legacy files
+    /// are zero-copy mmap views (file size dominates), while compressed files
+    /// own decompressed buffers (Arrow size dominates). Under-counting the
+    /// latter would turn LZ4's disk win into invisible heap growth.
     fn memo_insert(&self, path: &Path, batches: Arc<Vec<RecordBatch>>) {
-        let Ok(bytes) = fs::metadata(path).map(|m| m.len()) else { return };
+        let Ok(file_bytes) = fs::metadata(path).map(|m| m.len()) else { return };
+        let decoded_bytes = batches.iter().map(|b| b.get_array_memory_size() as u64).sum();
+        let bytes = file_bytes.max(decoded_bytes);
         let used = AtomicU64::new(self.memo_clock.fetch_add(1, Relaxed));
         if let Some(old) = self.decoded.insert(path.to_path_buf(), MemoEntry { batches, bytes, used }) {
             self.memo_bytes.fetch_sub(old.bytes, Relaxed);
@@ -920,10 +934,9 @@ impl HotTier {
             return;
         }
         self.invalidated.fetch_add(paths.len() as u64, Relaxed);
-        // A file with no memoized decode was never read by any query: it was
-        // written and thrown away, pure cost. Must be counted before `unlink`,
-        // which drops those entries.
-        let wasted = paths.iter().filter(|p| !self.decoded.contains_key(*p)).count() as u64;
+        // A file never served by any query was written and thrown away, pure
+        // cost. Must be counted before `unlink`, which drops the read marker.
+        let wasted = paths.iter().filter(|p| !self.read_files.contains(*p)).count() as u64;
         debug!("hot tier invalidated {} file(s) ({wasted} never read) for {}.{} after DML", paths.len(), key.0, key.1);
         self.unlink(&paths);
         // Make the unlinks durable. A SIGKILL/OOM-kill is safe without this
@@ -944,6 +957,7 @@ impl HotTier {
     fn unlink(&self, paths: &[PathBuf]) {
         for p in paths {
             self.memo_forget(p);
+            self.read_files.remove(p);
             let _ = fs::remove_file(p);
         }
     }
@@ -954,6 +968,7 @@ impl HotTier {
     pub fn rescan(&self) {
         self.index.clear();
         self.decoded.clear();
+        self.read_files.clear();
         self.memo_bytes.store(0, Relaxed);
         let files = dir_entries(&self.root)
             .filter_map(named)
@@ -1179,21 +1194,24 @@ mod tests {
         assert!(align_nullability(&[batch(2)], &other).is_none(), "column-count drift still rejected");
     }
 
-    /// The whole design rests on mmap'd IPC decoding WITHOUT a realigning
-    /// copy — `with_require_alignment(true)` makes a copy an error, so this
-    /// asserts the 64-byte writer alignment survives the mmap round trip.
+    /// New hot files are buffer-compressed and remain lossless. Repetitive
+    /// payload makes the capacity property deterministic: the file must be
+    /// materially smaller than its decoded Arrow representation.
     #[test]
-    fn roundtrip_is_zero_copy_and_lossless() {
+    fn roundtrip_is_compressed_aligned_and_lossless() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        let b = batch(64);
+        let b =
+            RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vec![100i64; 4096])), Arc::new(StringArray::from(vec!["repeated payload"; 4096]))])
+                .unwrap();
         tier.demote("p1", "otel_logs_and_spans", 7, std::slice::from_ref(&b), 100, 200);
 
         let metas = tier.buckets_in_range("p1", "otel_logs_and_spans", Some((150, 300)));
         assert_eq!(metas.len(), 1);
         // Stored half-open: the inclusive max 200 becomes end 201.
         assert_eq!((metas[0].bucket_id, metas[0].min_ts, metas[0].end_ts), (7, 100, 201));
-        assert_eq!(decode_file(&metas[0].path, true, None).unwrap(), vec![b], "mmap'd IPC must decode zero-copy and byte-identical");
+        assert!(metas[0].bytes < b.get_array_memory_size() as u64 / 2, "LZ4 hot file should fit far more history under the disk cap");
+        assert_eq!(decode_file(&metas[0].path, true, None).unwrap(), vec![b], "compressed IPC must decode aligned and byte-identical");
         // Out-of-range windows must not select it.
         assert!(tier.buckets_in_range("p1", "otel_logs_and_spans", Some((201, 300))).is_empty());
         assert!(tier.buckets_in_range("other", "otel_logs_and_spans", None).is_empty());
@@ -1445,6 +1463,7 @@ mod tests {
     /// Continuous whole-table enrichment (monoscope writes `hashes` over all of
     /// `otel_logs_and_spans`) invalidates every demoted file before a query can
     /// read it. The tier must notice and stop paying for those writes.
+    #[serial]
     #[test]
     fn wasted_demotions_suppress_the_table() {
         let dir = tempfile::tempdir().unwrap();
@@ -1508,6 +1527,7 @@ mod tests {
     }
 
     /// Suppression only gates WRITES: files already on disk keep serving.
+    #[serial]
     #[tokio::test]
     async fn suppression_does_not_affect_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -1582,9 +1602,9 @@ mod tests {
         assert!(parts.is_empty() && ranges.is_empty(), "no rows AND no exclusion — the whole window must fall through to Delta");
     }
 
-    /// The decode memo pins one mmap per entry for the entry's lifetime, so an
-    /// unbounded memo means one wide scan pins the whole tier. It must be
-    /// capped in bytes and evict least-recently-used.
+    /// The decode memo owns either mmap views or decompressed Arrow buffers, so
+    /// an unbounded memo can retain the whole tier. It must charge the larger
+    /// representation, cap bytes, and evict least-recently-used.
     #[test]
     fn memo_is_byte_capped_and_evicts_lru() {
         let dir = tempfile::tempdir().unwrap();
@@ -1594,16 +1614,19 @@ mod tests {
         }
         let metas = big.buckets_in_range("p1", "t", None);
         let file_bytes = metas[0].bytes;
+        let decoded = decode_file(&metas[0].path, false, None).unwrap();
+        let decoded_bytes = decoded.iter().map(|b| b.get_array_memory_size() as u64).sum::<u64>();
+        let entry_bytes = file_bytes.max(decoded_bytes);
 
         // Cap at two files. Read 0, 1, 2 — the first read must be the victim.
-        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { memo_bytes: file_bytes * 2, ..limits(u64::MAX) });
+        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { memo_bytes: entry_bytes * 2, ..limits(u64::MAX) });
         let metas = tier.buckets_in_range("p1", "t", None);
         for m in &metas {
             assert!(tier.read_file(&m.path).is_some());
         }
         let s = tier.stats();
         assert_eq!((s.memo_files, s.memo_evicted), (2, 1), "the memo holds exactly its cap, evicting one");
-        assert!(s.memo_bytes <= file_bytes * 2 && s.memo_bytes > 0, "memo_bytes tracks the map: {s:?}");
+        assert_eq!(s.memo_bytes, entry_bytes * 2, "memo_bytes tracks decoded ownership: {s:?}");
         assert!(!tier.decoded.contains_key(&metas[0].path), "the least-recently-used entry is the one dropped");
         assert!(tier.decoded.contains_key(&metas[2].path));
         // Touching 1 makes 2 the LRU; the next insert must then evict 2.

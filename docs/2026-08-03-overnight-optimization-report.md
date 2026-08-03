@@ -134,3 +134,35 @@ only their own files — see 04:45 addendum) and re-enable the dirty-bin drain
 evening) and restore TIMEFUSION_HOT_TIER_LEG_BUDGET_MB to 1024 once the hot
 leg is pool-registered; (3) keep light_optimize consolidating today's files
 (now unstarved).
+
+## 2026-08-03 follow-up — projected hot reads exposed capacity and dedup pressure
+
+After `ca8e67b` made Arrow IPC decoding projection-aware, representative 1h
+latency fell from 12–14 s to 7.8–8.1 s, then to 2.6–5.7 s after one hot-tail
+compaction wave reduced the Delta row groups from 45 to 17. A historical 1h
+window measured 1.52 s and a recent 10m window 530 ms. Serialized wide-window
+samples were still 19.9 s (3h), 15.0 s (24h), and 27.6 s (3d).
+
+The post-compaction 1h plan produced about 72k physical rows for 35k survivors:
+merge-on-read is processing more than 2x duplication. It opened 55 objects,
+scanned 17 row groups and only 1.72 MB, yet accumulated 26.8 s of scan time
+across partitions. Foyer is active (32,996 range hits / 1,780 misses), so this
+is not a disabled-cache problem. Recent file rewrites continually introduce
+new object ranges, while concurrent unordered dedup operators were observed
+holding 4.8–9.6 GB each and driving the 30 GB query pool to exhaustion.
+
+Two safeguards are next:
+
+- Write new hot-tier Arrow files with per-buffer LZ4 compression. Projection
+  skips unrequested buffers before decompression, while compression lets the
+  requested 24h history fit within the fixed 128 GB ceiling. Legacy
+  uncompressed files remain readable and age out normally. Memo accounting
+  charges the larger of file bytes and decompressed Arrow ownership.
+- Cap the correctness fallback for one unbounded unordered greatest-version
+  dedup at 2 GiB. Bounded timestamp-run dedup remains unchanged. An oversized
+  fallback now fails that query with `ResourcesExhausted` instead of allowing
+  a few queries to monopolize the whole global pool.
+
+The target is still unproven: do not call the work complete until production
+24h p95 is below 500 ms. Compression improves coverage as new files replace
+legacy files; it does not instantly rewrite the existing 128 GB tier.
