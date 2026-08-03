@@ -7385,6 +7385,10 @@ impl Database {
     /// fallback sweep). The 90s deadline is a warning threshold, not a
     /// cancellation: a slow-but-healthy table is allowed to finish.
     async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
+        if !self.config.maintenance.timefusion_dirty_bin_dedup_enabled {
+            debug!(table_name, event = "dirty_bin_dedup_paused", "physical dirty-bin dedup is disabled; read-side dedup remains active");
+            return;
+        }
         const DEDUP_WARN: std::time::Duration = std::time::Duration::from_secs(90);
         let t0 = std::time::Instant::now();
         match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy()).await {

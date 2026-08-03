@@ -248,6 +248,12 @@ full-file replacements would duplicate all carried rows and emit duplicate
 Remove actions. Only one target-disjoint unit lands per wave; overlapping
 units are discarded and requeued to re-plan from the replacement snapshot.
 
+Scheduled physical dirty-bin dedup is now behind
+`TIMEFUSION_DIRTY_BIN_DEDUP_ENABLED` and defaults off as an incident kill
+switch. Read-side dedup remains active, so query correctness does not depend on
+the physical drain. The schedule must stay disabled in production until the
+lost rows are recovered and prod-shaped multi-bin/overlap validation passes.
+
 Production data already removed by the faulty commits is not restored by the
 code fix. Recovery must be handled separately from the latency work. The
 <500 ms 24h target remains unproven.

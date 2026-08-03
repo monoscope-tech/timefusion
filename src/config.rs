@@ -1786,6 +1786,12 @@ pub struct MaintenanceConfig {
     /// dedup skips today, compaction only touches today). Default 5 min.
     #[serde(default = "d_light_schedule")]
     pub timefusion_dedup_schedule: String,
+    /// Incident kill switch for physical dirty-bin dedup. Disabled by default
+    /// after the 2026-08-03 row-loss incident; read-side dedup remains the
+    /// correctness path. Re-enable only after prod-shaped carry-through and
+    /// overlapping-target validation.
+    #[serde(default)]
+    pub timefusion_dirty_bin_dedup_enabled: bool,
     #[serde(default = "d_optimize_schedule")]
     pub timefusion_optimize_schedule: String,
     #[serde(default = "d_consolidate_schedule")]
