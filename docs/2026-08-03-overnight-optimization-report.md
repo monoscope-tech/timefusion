@@ -112,3 +112,25 @@ today's partition — the latency-relevant one) still runs.
 - Percentile-style queries scan the whole window — they need the file-count
   cut (dwell gate live; dirty-bin drain resumes after the churn fix) and hot
   coverage; TopK/list-style dashboards are already fast.
+
+## 08:50 closing numbers (image 033487f, minutes after deploy restart, cold)
+
+| window | 98fdd4f3 | 28f62f01 (whale) |
+|---|---|---|
+| 5 min | **323 ms** | **345 ms** |
+| 1 h | **613 ms** | 2.9 s |
+| 6 h | 9.0 s | 16.9 s |
+| 24 h | 18.2 s | 63.6 s |
+
+Warm TopK earlier measured **377 ms** (6h ORDER BY ts DESC LIMIT 50). Zero
+failed flushes / rejections all night. Stability: decay-0 is baked (c7050a4);
+no OOM since the drain pause + decay-0 config (~07:06).
+
+The 6h/24h percentile windows remain file-count-bound. The path to <500 ms
+there, in order: (1) fix the maintenance planning churn (bin scans must plan
+only their own files — see 04:45 addendum) and re-enable the dirty-bin drain
+(app-definition env TIMEFUSION_DIRTY_BIN_DRAIN_BATCH, currently 1) to eat the
+~22k-bin backlog; (2) let 24h hot-tier coverage finish building (by this
+evening) and restore TIMEFUSION_HOT_TIER_LEG_BUDGET_MB to 1024 once the hot
+leg is pool-registered; (3) keep light_optimize consolidating today's files
+(now unstarved).

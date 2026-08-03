@@ -210,10 +210,14 @@ const OPTIMIZE_MERGE_TASKS: usize = 2;
 /// merge; repeated cron passes converge fragmented partitions to target.
 const OPTIMIZE_MAX_FILES_PER_BIN: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 /// Concurrent heavy maintenance rewrites (dedup/optimize/recompress).
-/// Formerly `TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY`; kept at the
-/// proven-safe 2 rather than re-derived (06-11 OOM was uncapped concurrency,
-/// not a memory-sizing bug).
-const HEAVY_REWRITE_PERMITS: usize = 2;
+/// Formerly `TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY`; held at 2 until
+/// 2026-08-03 (06-11 OOM was uncapped concurrency, not memory sizing).
+/// 3 since 2026-08-03 — paired with HALVING `d_dedup_max_decoded_bytes`
+/// 4→2 GiB so worst-case in-flight decoded bytes stays ≤ the old 8 GiB —
+/// to drain the ~22k dirty-bin backlog the 2026-08-02 stall left behind.
+/// Do NOT bump further without shrinking the per-shard budget again: that
+/// is the 2026-07-04-class fan-in OOM.
+const HEAVY_REWRITE_PERMITS: usize = 3;
 /// Per-sort budget. 8 GiB (from the legacy 5.8 GiB blocking-sort peak) capped
 /// wave concurrency k at 1-2 on prod's 24 GiB pool — hot compact ran serial
 /// on a 48-core box while ticks overran 2-3x (2026-07-30). Sorts run on a
@@ -875,9 +879,11 @@ const_default!(d_snapshot_reconcile: u64 = 500);
 // debt. Guards against e.g. a z-ordered whole-day file (1GB+ on disk, several
 // GB decompressed × copies) dragging the whole day into one rewrite.
 const_default!(d_dedup_max_rewrite_bytes: u64 = 2 * GIB as u64);
-// 4 GiB estimated decoded footprint — a single chunk this large already
-// dwarfs the DataFusion pool; larger chunks skip rather than risk the cgroup.
-const_default!(d_dedup_max_decoded_bytes: u64 = 4 * GIB as u64);
+// 2 GiB estimated decoded footprint (was 4 GiB while rewrite permits were 2;
+// halved when permits went to 3 so permits x budget stays ≤ 8 GiB in flight —
+// see HEAVY_REWRITE_PERMITS). A chunk this large already dwarfs the
+// DataFusion pool; larger chunks skip rather than risk the cgroup.
+const_default!(d_dedup_max_decoded_bytes: u64 = 2 * GIB as u64);
 // 12× compressed→decoded: zstd on wide Variant/JSON otel rows routinely
 // decodes 10-20×; 12 is a deliberately conservative floor.
 const_default!(d_dedup_decode_inflation: u64 = 12);
@@ -2141,7 +2147,10 @@ mod tests {
         assert_eq!(b.query_pool_bytes, 30 * GIB);
         assert_eq!(b.ingest_buffer_bytes, 24 * GIB);
         assert_eq!(b.foyer_memory_bytes, 12 * GIB);
-        assert_eq!(b.maintenance_pool_bytes, 30 * GIB, "maintenance takes the remainder AFTER slack (was 48G with slack=0)");
+        // 27 GiB since 2026-08-03: rewrite permits 2->3 grew the writer
+        // reserve, which comes out of the maintenance remainder (was 30G at
+        // permits=2, 48G with slack=0).
+        assert_eq!(b.maintenance_pool_bytes, 27 * GIB, "maintenance takes the remainder AFTER slack");
     }
 
     /// `TIMEFUSION_MEMORY_BUDGET_GB` exists so a shared host can size TF below
@@ -2242,7 +2251,9 @@ mod tests {
         // 5 with the 30G post-slack pool (was 8..=11 at 48G): fewer concurrent
         // per-project sorts is the intended trade for not OOMing the box.
         assert!((4..=11).contains(&k), "K={k} outside the expected 4..=11 range");
-        assert_eq!(b.rewrite_permits(), 2);
+        // 3 since 2026-08-03 (paired with the halved per-shard decode budget
+        // so permits x budget stays <= the old 8 GiB envelope).
+        assert_eq!(b.rewrite_permits(), 3);
         assert_eq!(b.optimize_merge_tasks(), 2);
     }
 
