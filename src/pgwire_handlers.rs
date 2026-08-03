@@ -23,7 +23,7 @@ use datafusion_postgres::{
         messages::PgWireBackendMessage,
     },
 };
-use futures::{Sink, stream};
+use futures::{Sink, TryStreamExt, stream};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use tracing::{Instrument, error, field::Empty, info, instrument};
@@ -346,6 +346,85 @@ impl LoggingSimpleQueryHandler {
         });
         Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
     }
+
+    /// Reconstruct the full pre-commit Add actions for files removed by
+    /// `version`. This is read-only and fails unless every removal has a source.
+    async fn run_delta_recovery_audit(&self, cmd: DeltaRecoveryAuditCmd) -> PgWireResult<Vec<Response>> {
+        use datafusion_postgres::pgwire::api::Type;
+
+        let db = require_available(self.db.as_ref(), "DELTA RECOVERY AUDIT")?;
+        let table_ref =
+            db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT: open table '{}': {e}", cmd.table)))?;
+        let mut before = table_ref.read().await.clone();
+        let bytes = before
+            .log_store()
+            .read_commit_entry(cmd.version)
+            .await
+            .map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT '{}' VERSION {}: {e}", cmd.table, cmd.version)))?
+            .ok_or_else(|| admin_err(format!("DELTA RECOVERY AUDIT '{}' VERSION {}: commit not found", cmd.table, cmd.version)))?;
+        let removed = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<deltalake::kernel::Action>(line).map_err(|e| admin_err(format!("decode Delta action: {e}"))))
+            .collect::<PgWireResult<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|action| match action {
+                deltalake::kernel::Action::Remove(remove) => Some(remove.path),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        if removed.is_empty() {
+            return Err(admin_err(format!("DELTA RECOVERY AUDIT '{}' VERSION {}: commit removed no files", cmd.table, cmd.version)));
+        }
+        let previous = cmd.version.checked_sub(1).ok_or_else(|| admin_err("DELTA RECOVERY AUDIT cannot inspect before version 0"))?;
+        before.load_version(previous).await.map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT '{}': load version {previous}: {e}", cmd.table)))?;
+        let mut sources = before
+            .get_active_add_actions_by_partitions(&[])
+            .try_filter_map(|view| {
+                let include = removed.contains(view.path().as_ref());
+                // The replacement Arrow-table API is intended for analytics
+                // and does not round-trip a complete Add action. Recovery must
+                // preserve raw stats/tags byte-for-byte, which this delta-rs
+                // compatibility method explicitly guarantees.
+                #[allow(deprecated)]
+                let source = include.then(|| view.add_action());
+                futures::future::ready(Ok(source))
+            })
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT '{}': read source actions: {e}", cmd.table)))?;
+        if sources.len() != removed.len() {
+            return Err(admin_err(format!(
+                "DELTA RECOVERY AUDIT '{}' VERSION {}: reconstructed {} of {} removed files",
+                cmd.table,
+                cmd.version,
+                sources.len(),
+                removed.len()
+            )));
+        }
+        sources.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+
+        let fields = Arc::new(
+            ["removed_by_version", "path", "size_bytes", "source_add_json"]
+                .into_iter()
+                .map(|name| FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text))
+                .collect::<Vec<_>>(),
+        );
+        let rows = sources.into_iter().map({
+            let fields = fields.clone();
+            move |add| {
+                let version = cmd.version.to_string();
+                let size = add.size.to_string();
+                let json = serde_json::to_string(&deltalake::kernel::Action::Add(add.clone())).map_err(|e| admin_err(format!("encode source Add: {e}")))?;
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                for value in [&version, &add.path, &size, &json] {
+                    encoder.encode_field(value)?;
+                }
+                Ok(encoder.take_row())
+            }
+        });
+        Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
+    }
 }
 
 /// `DELTA HISTORY <table> [LIMIT <n>]` is deliberately read-only.
@@ -394,6 +473,29 @@ pub(crate) fn parse_delta_actions(query: &str) -> Result<Option<DeltaActionsCmd>
     }
     let version = value.parse::<u64>().map_err(|_| format!("invalid Delta version '{value}'"))?;
     Ok(Some(DeltaActionsCmd { table: table.to_string(), version }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeltaRecoveryAuditCmd {
+    pub table: String,
+    pub version: u64,
+}
+
+pub(crate) fn parse_delta_recovery_audit(query: &str) -> Result<Option<DeltaRecoveryAuditCmd>, String> {
+    let Some(rest) = strip_command(query, "delta") else { return Ok(None) };
+    let Some(rest) = strip_keyword(rest, "recovery", char::is_whitespace) else { return Ok(None) };
+    let Some(rest) = strip_keyword(rest.trim(), "audit", char::is_whitespace) else {
+        return Err("DELTA RECOVERY supports only: DELTA RECOVERY AUDIT <table> VERSION <n>".to_string());
+    };
+    let mut parts = rest.split_whitespace();
+    let table = parts.next().ok_or("DELTA RECOVERY AUDIT requires a table")?;
+    let keyword = parts.next().ok_or("DELTA RECOVERY AUDIT requires a VERSION")?;
+    let value = parts.next().ok_or("DELTA RECOVERY AUDIT requires a numeric VERSION")?;
+    if !keyword.eq_ignore_ascii_case("version") || parts.next().is_some() {
+        return Err("expected: DELTA RECOVERY AUDIT <table> VERSION <n>".to_string());
+    }
+    let version = value.parse::<u64>().map_err(|_| format!("invalid Delta version '{value}'"))?;
+    Ok(Some(DeltaRecoveryAuditCmd { table: table.to_string(), version }))
 }
 
 /// An intercepted `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'` admin command.
@@ -647,6 +749,9 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         if let Some(cmd) = parse_vacuum(query).map_err(admin_err)? {
             return self.run_vacuum(cmd).await;
         }
+        if let Some(cmd) = parse_delta_recovery_audit(query).map_err(admin_err)? {
+            return self.run_delta_recovery_audit(cmd).await;
+        }
         if let Some(cmd) = parse_delta_actions(query).map_err(admin_err)? {
             return self.run_delta_actions(cmd).await;
         }
@@ -774,8 +879,8 @@ pub async fn serve_with_listener(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_delta_actions, parse_delta_history, parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint, query_template,
-        rewrite_pg_synonyms,
+        parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint,
+        query_template, rewrite_pg_synonyms,
     };
 
     #[test]
@@ -877,6 +982,16 @@ mod tests {
         assert!(parse_delta_actions("DELTA ACTIONS t").is_err());
         assert!(parse_delta_actions("DELTA ACTIONS t VERSION nope").is_err());
         assert_eq!(parse_delta_actions("SELECT 1"), Ok(None));
+    }
+
+    #[test]
+    fn delta_recovery_audit_is_explicit_and_version_bounded() {
+        let cmd = parse_delta_recovery_audit("DELTA RECOVERY AUDIT otel_logs_and_spans VERSION 462921;").unwrap().unwrap();
+        assert_eq!(cmd.table, "otel_logs_and_spans");
+        assert_eq!(cmd.version, 462921);
+        assert!(parse_delta_recovery_audit("DELTA RECOVERY otel_logs_and_spans VERSION 462921").is_err());
+        assert!(parse_delta_recovery_audit("DELTA RECOVERY AUDIT t VERSION nope").is_err());
+        assert_eq!(parse_delta_recovery_audit("SELECT 1"), Ok(None));
     }
 
     #[test]
