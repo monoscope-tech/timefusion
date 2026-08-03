@@ -71,6 +71,7 @@ counter_registry! {
     flush_completed            => "timefusion.flush.completed": "Flush cycles that committed to Delta",
     flush_failed               => "timefusion.flush.failed": "Flush cycles that errored",
     flush_stalled              => "timefusion.flush.stalled": "Flush bucket commits that exceeded the flush-bucket watchdog timeout (Delta/S3 commit hung, holding flush_lock). A stalled flush frees no MemBuffer memory → inserts wedge at the hard limit. PAGE if > 0",
+    flush_sort_unsorted_fallbacks => "timefusion.flush.sort_unsorted_fallbacks": "Escalated flush sorts that failed and wrote the group UNSORTED. One such file disables the reader's footer ordering for its whole partition (query-time SortExec, unordered MOR dedup) — a read-path incident in the making. PAGE if > 0",
     query_executions           => "timefusion.query.executions": "SQL query plans executed",
     tantivy_prefilter_attempts => "timefusion.tantivy.prefilter_attempts": "Queries where at least one text_match predicate triggered a tantivy lookup",
     tantivy_prefilter_used     => "timefusion.tantivy.prefilter_used": "Queries where the tantivy id-set prefilter was applied to the Delta scan",
@@ -339,6 +340,7 @@ recorders! {
     record_backpressure_rejected => backpressure_rejected,
     record_backpressure_force_flush => backpressure_force_flush,
     record_flush_stalled => flush_stalled,
+    record_flush_sort_unsorted_fallback => flush_sort_unsorted_fallbacks mirror MAINTENANCE_STATS.flush_sort_unsorted_fallbacks,
     record_write_capture_skipped => write_capture_skipped,
     record_cache_confirm_timeout => cache_confirm_timeouts,
     record_cache_insert_bypassed => cache_insert_bypassed,
@@ -488,6 +490,11 @@ atomic_stats! {
     /// rewrite path (`dml_writer_properties` passes `declare_sorted=false`),
     /// which merge-on-read removes by construction.
     mor_delta_leg_sorts,
+    /// Escalated flush sorts that FAILED and wrote their group unsorted. One
+    /// unsorted file disables the reader's footer ordering for every scan
+    /// touching its partition (query-time SortExec, unordered MOR dedup), so
+    /// any nonzero here is a read-path incident in the making (2026-08-03).
+    flush_sort_unsorted_fallbacks,
     /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
     /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
     /// outrunning flush often enough that compaction is running at the floor.

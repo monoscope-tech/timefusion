@@ -4312,7 +4312,12 @@ impl Database {
                 (FlushBatches::Ready(sorted.into_iter()), true)
             }
             // Never lose rows to a sort failure: write the originals unsorted.
-            None => (FlushBatches::Ready(batches.into_iter()), false),
+            // Counted because one such file disables the reader's ordering for
+            // its whole partition — this must never be silent (2026-08-03).
+            None => {
+                crate::metrics::record_flush_sort_unsorted_fallback();
+                (FlushBatches::Ready(batches.into_iter()), false)
+            }
         }
     }
 
@@ -4367,7 +4372,14 @@ impl Database {
             return None;
         }
 
-        let state = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.flush_sort_runtime_env());
+        // ONE pool consumer per gate permit — the invariant `flush_sort_gate`'s
+        // 512 MB-per-permit sizing assumes. With N>1 partitions this plan fans
+        // out to N ExternalSorters (32 MB merge reservation each) plus an
+        // UNSPILLABLE SortPreservingMergeExec, and concurrent escalations
+        // starved the FairSpillPool into the unsorted fallback (prod
+        // 2026-08-03). A single-partition sort is slower but has no merge exec
+        // and spills within its fair share, so the footer stays honest.
+        let state = build_delta_write_session_state(1, self.flush_sort_runtime_env());
         let ctx = SessionContext::new_with_state(state);
         let name = format!("flush_sort_{}", uuid::Uuid::new_v4().simple());
         ctx.register_table(&name, Arc::new(MemTable::try_new(arrow_schema, vec![unified]).ok()?)).ok()?;
@@ -13362,6 +13374,54 @@ mod tests {
         // Disable Foyer cache for tests
         cfg.cache.timefusion_foyer_disabled = true;
         Arc::new(cfg)
+    }
+
+    /// prod 2026-08-03 ~21:00Z: escalated flush sorts starved their own shared
+    /// FairSpillPool and silently wrote UNSORTED files. Each plan fanned out to
+    /// `MAINTENANCE_MAX_PARTITIONS` ExternalSorters (32 MB merge reservation
+    /// each) plus an UNSPILLABLE SortPreservingMergeExec, so N gate permits
+    /// meant ~3N pool consumers — not the 1-per-permit the gate's 512 MB math
+    /// assumes. One unsorted file then cost the partition's footer ordering:
+    /// reads needed a query-time SortExec (48 × ~1.5 GB blew the 30 GB query
+    /// pool → Log Explorer XX000) and enrichment UPDATEs died on the 2 GiB
+    /// unordered-dedup limit. The escalated sort must be ONE pool consumer:
+    /// single-partition plan, no merge exec — so it survives even the 64 MB
+    /// pool floor with data far larger than the pool.
+    #[tokio::test]
+    async fn escalated_flush_sort_is_one_pool_consumer_and_survives_a_minimum_pool() -> Result<()> {
+        use arrow::array::{StringArray, TimestampMicrosecondArray};
+        let mut cfg = (*create_test_config("flush-sort-floor")).clone();
+        cfg.maintenance.timefusion_sort_skip_bytes = 0; // every group escalates
+        cfg.maintenance.timefusion_flush_sort_pool_mb = 64; // the config floor
+        let db = Database::with_config(Arc::new(cfg)).await?;
+
+        let table = get_schema("otel_logs_and_spans").expect("registered");
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("timestamp", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+        ]));
+        // ~128 MB across 16 batches — 2× the pool — with scrambled event time,
+        // so an append-ordered pass-through cannot masquerade as a sort.
+        let per_batch = 10_000i64;
+        let batches: Vec<RecordBatch> = (0..16)
+            .map(|b| {
+                let ts: TimestampMicrosecondArray = (0..per_batch).map(|i| Some((b * per_batch + i).wrapping_mul(2_654_435_761) % 1_000_000_000)).collect();
+                let ids = StringArray::from_iter_values((0..per_batch).map(|i| format!("{b:04}-{i:06}-{}", "x".repeat(800))));
+                RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(ts), Arc::new(ids)]).unwrap()
+            })
+            .collect();
+
+        let (out, escalated) = db.sort_flush_group(table, batches).await;
+        assert!(escalated, "the spilling sort starved its own pool and fell back to writing unsorted");
+        let FlushBatches::Ready(it) = out else { panic!("escalated path yields Ready batches") };
+        let sorted: Vec<RecordBatch> = it.collect();
+        let stamps: Vec<i64> = sorted
+            .iter()
+            .flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec())
+            .collect();
+        assert_eq!(stamps.len(), 160_000, "the sort must not lose or duplicate rows");
+        assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
+        Ok(())
     }
 
     async fn setup_test_database() -> Result<(Database, SessionContext, String)> {
