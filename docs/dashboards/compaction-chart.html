@@ -64,13 +64,13 @@ tr:last-child td{border-bottom:none}
 </style>
 <div class="wrap">
 <h1>Active parquet files per project × day — otel_logs_and_spans</h1>
-<p class="sub">unified table on R2 · snapshot v462512 · 2026-08-03 11:05 CEST · goal: sealed day ≈ 1 file/GB</p>
+<p class="sub">unified table on R2 · snapshot v463266 · 2026-08-04 01:33 CEST (08-03 23:33 UTC — the 08-03 partition is still live) · goal: sealed day ≈ 1 file/GB</p>
 
 <div class="tiles">
-  <div class="tile"><div class="k">Sealed days, non-whale</div><div class="v">1 file <span class="dim">each</span></div><div class="d">07-19 → 08-02 converged — 08-02 sealed and collapsed by the server alone overnight</div></div>
-  <div class="tile"><div class="k">Whale 08-01 / 08-02</div><div class="v">86 <span class="dim">/</span> 123</div><div class="d">both DONE (323→86, 1,277→123) — k3s backlog lane finished and deleted</div></div>
-  <div class="tile"><div class="k">Whale 08-03 (today)</div><div class="v">53</div><div class="d">prod hot-tail holding today by itself — single-process test passing</div></div>
-  <div class="tile"><div class="k">OOM kills today</div><div class="v">1 <span class="dim">since 01:12Z</span></div><div class="d">was ~hourly; the one kill was attributed from pre-kill heap dumps and its fix (giant-stmt gate) is live</div></div>
+  <div class="tile"><div class="k">Dedup wave</div><div class="v">healed</div><div class="d">the 08-01/08-02 shreds all re-collapsed to 1 file — every non-whale sealed day through 08-02 is back at the floor (only 6297304f's 07-30/31 at 49/9 remain)</div></div>
+  <div class="tile"><div class="k">Whale 08-02</div><div class="v">164 <span class="dim">files</span></div><div class="d">healing steadily: 275 (20:09 peak) → 223 → 164; bytes settled at 15.6GB (was 25.1 pre-dedup)</div></div>
+  <div class="tile"><div class="k">Whale 08-03</div><div class="v">0.46 <span class="dim">GB</span></div><div class="d">day nearly sealed (UTC) at 41 files and only 0.46GB — vs 22–85GB every other day; whale ingest collapsed, check upstream</div></div>
+  <div class="tile"><div class="k">Restarts</div><div class="v">~30 min <span class="dim">cadence</span></div><div class="d">last kill ~00:33; ~00:57 and ~01:22 CEST were clean shutdowns (deploys?) — drain-leak climb still unattributed</div></div>
 </div>
 
 <div class="legend">
@@ -87,20 +87,20 @@ tr:last-child td{border-bottom:none}
 </table>
 </div>
 
-<p class="note"><b>Reading it:</b> each cell is the live count of active Add actions for that (project, day); sealed day ≈ 1 file/GB is the target. Every non-whale sealed day sits at <b>1 file</b>, and the 08-03 column is today's live dribble (~45–58/project, folds when the day seals — 08-02's dribble collapsed to 1 overnight with no external help). <b>87576849 (whale)</b>: the backlog campaign is complete — 08-01 at 86, 08-02 at 123, today self-holding at 53; all sealed days near their ~1GB floor. <b>In-server ships (overnight + this morning):</b> OOM root-caused via heap dumps — budget over-commit fixed (15% untracked slack), memory-pressure decode valve, 2-permit gate on multi-MB pgwire statements (attributed from the first archived pre-kill dump, fix live within the hour), nightly tantivy reconcile (52k stale index entries GC'd at 03:30), stale <code>DIRTY_BIN_DRAIN_BATCH=1</code> knob deleted from code (dedup backlog now drains ~128 bins/15min). Leftovers: whale sealed days are unsorted 1GB compacts (quiet-season SortBy); 3 giant DML quarantine payloads; 16 files in the garbage <code>date=2238-12-31</code> partition (excluded).</p>
+<p class="note"><b>Reading it:</b> each cell is the live count of active Add actions for that (project, day); sealed day ≈ 1 file/GB is the target. <b>The 08-03 dedup sweep is essentially over and it healed everything it touched:</b> every non-whale shred from yesterday (08-02 at 17:22; 08-01's 88/58/35/29-file spikes at 20:09) re-collapsed to <b>1 file</b>. Only 6297304f's 07-30/31 (49/9 files) predate the sweep and still await a pass. <b>The whale's 08-02 keeps healing</b>: 275 (20:09 peak) → 223 → <b>164</b>, bytes settled at 15.6GB — dedup removed ~38% of the MOR-dribble day's bytes (plausible given its 1,277-file dribble; a row-count check against a pre-dedup version is still the cheap way to be sure). <b>Whale ingest genuinely collapsed on 08-03</b>: the UTC day is nearly sealed at just 0.46GB vs 22–85GB every other day this window — check the tenant's upstream pipeline. <b>Restarts continue ~every 30 min</b> — last OOM kill ~00:33 CEST; the ~00:57/~01:22 cycles were clean shutdowns (deploys?); the ~7GB/min drain-leak climb is still unattributed. Leftovers: whale sealed days are unsorted 1GB compacts (quiet-season SortBy); 3 giant DML quarantine payloads; 16 files in the garbage <code>date=2238-12-31</code> partition (excluded).</p>
 
 <p class="foot">Counts = active Adds in the Delta snapshot (tombstones excluded) · whale row shaded thresholds ×10 (its 1GB floor is ~40–100 files/day)</p>
 </div>
 
 <script>
 const DATES=["07-19","07-20","07-21","07-22","07-23","07-24","07-25","07-26","07-27","07-28","07-29","07-30","07-31","08-01","08-02","08-03"];
-const GRID=[["87576849",5,30,70,116,113,121,33,76,70,99,53,75,107,86,123,53],["6297304f",1,1,1,1,1,1,1,1,1,1,3,44,5,10,9,58],["28f62f01",0,1,1,1,1,1,1,9,1,1,1,3,1,3,2,58],["edb04135",1,1,1,1,1,1,1,1,1,1,1,1,16,1,1,54],["be87ebc1",1,1,1,1,1,1,1,4,1,1,1,1,1,1,1,55],["d062e010",1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,56],["00000000",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,56],["98fdd4f3",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,52],["2a39bd83",1,1,1,1,1,1,1,1,1,1,1,5,1,1,1,47],["94c5dc1f",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,51],["dcad860a",1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,44],["8100121c",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],["5ce1c976",1,1,1,1,1,1,1,1,1,1,1,2,1,0,1,0],["4f020cf8",0,0,1,1,1,1,1,0,1,0,0,1,0,1,0,0]];
+const GRID=[["87576849",5,30,70,116,113,121,33,76,70,99,53,75,107,83,164,41],["6297304f",1,1,1,1,1,1,1,1,1,1,3,49,9,1,1,42],["28f62f01",0,1,1,1,1,1,1,9,1,1,1,3,1,1,1,50],["edb04135",1,1,1,1,1,1,1,1,1,1,1,1,16,1,1,2],["be87ebc1",1,1,1,1,1,1,1,4,1,1,1,1,1,1,1,41],["d062e010",1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,40],["00000000",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,41],["98fdd4f3",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,40],["2a39bd83",1,1,1,1,1,1,1,1,1,1,1,5,1,1,1,6],["94c5dc1f",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,39],["dcad860a",1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,43],["8100121c",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2],["5ce1c976",1,1,1,1,1,1,1,1,1,1,1,2,1,0,1,1],["4f020cf8",0,0,1,1,1,1,1,0,1,0,0,1,0,1,0,0]];
 const WHALE="87576849", TODAY="08-03";
 document.getElementById("hdr").innerHTML="<th>project</th>"+DATES.map(d=>`<th>${d}</th>`).join("")+"<th>status</th>";
 const cls=(p,d,v)=>{if(v===0)return"";const m=p===WHALE?10:1; // whale floor is ~10x
   if(d===TODAY)return v<=2*m?"c2":v<=15*m?"c3":"c4";
   return v<=m?"c1":v<=9*m?"c2":v<=99*m?"c3":"c4"};
-const chip=p=>p===WHALE?`<span class="chip run">k3s draining 08-02</span>`:`<span class="chip done">converged</span>`;
+const chip=p=>p==="87576849"?`<span class="chip run">08-02 healing</span>`:p==="6297304f"?`<span class="chip run">07-30/31 pending</span>`:`<span class="chip done">converged</span>`;
 document.getElementById("rows").innerHTML=GRID.map(r=>{
   const p=r[0];
   return `<tr><td class="proj">${p}${p==="00000000"?' <span class="tag">(default)</span>':p===WHALE?' <span class="tag">(whale)</span>':""}</td>`+
