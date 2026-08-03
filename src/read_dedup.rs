@@ -73,7 +73,7 @@ use std::{
 
 use datafusion::{
     arrow::{
-        array::{Array, ArrayRef, BooleanArray, RecordBatch},
+        array::{Array, ArrayRef, BooleanArray, LargeStringArray, RecordBatch, StringArray, StringViewArray},
         compute::{SortOptions, filter_record_batch},
         datatypes::{DataType, SchemaRef},
         row::{RowConverter, SortField},
@@ -383,6 +383,10 @@ impl ExecutionPlan for DedupExec {
             .and_then(|tb| in_schema.index_of(tb).ok())
             .map(|idx| Greatest::new(idx, in_schema.field(idx).data_type(), reservation))
             .transpose()?;
+        let direct_string_key = (greatest.is_some() && key_idxs.len() == 1).then(|| key_idxs[0]).filter(|idx| {
+            let field = in_schema.field(*idx);
+            !field.is_nullable() && matches!(field.data_type(), DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)
+        });
         let dedup = Dedup {
             conv: RowConverter::new(key_idxs.iter().map(|&i| SortField::new(in_schema.field(i).data_type().clone())).collect()).map_err(arrow_err)?,
             key_idxs,
@@ -390,6 +394,7 @@ impl ExecutionPlan for DedupExec {
             seen: SeenSet::default(),
             bound,
             greatest,
+            direct_string_key,
         };
 
         let input = self.input.execute(partition, context)?;
@@ -560,14 +565,47 @@ struct Dedup {
     seen: SeenSet,
     bound: Option<Bound>,
     greatest: Option<Greatest>,
+    /// Greatest-mode fast path for one non-null string key. The production
+    /// bounded key becomes just `id: Utf8View` after removing timestamp.
+    direct_string_key: Option<usize>,
+}
+
+enum KeyRows {
+    Encoded(datafusion::arrow::row::Rows),
+    Utf8(ArrayRef),
+    Utf8View(ArrayRef),
+    LargeUtf8(ArrayRef),
+}
+
+impl KeyRows {
+    fn value(&self, row: usize) -> &[u8] {
+        match self {
+            Self::Encoded(rows) => rows.row(row).data(),
+            Self::Utf8(array) => array.as_any().downcast_ref::<StringArray>().expect("validated Utf8 key").value(row).as_bytes(),
+            Self::Utf8View(array) => array.as_any().downcast_ref::<StringViewArray>().expect("validated Utf8View key").value(row).as_bytes(),
+            Self::LargeUtf8(array) => array.as_any().downcast_ref::<LargeStringArray>().expect("validated LargeUtf8 key").value(row).as_bytes(),
+        }
+    }
 }
 
 impl Dedup {
     fn push(&mut self, batch: &RecordBatch) -> DFResult<Vec<RecordBatch>> {
-        let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
-        let keys = self.conv.convert_columns(&key_arrays).map_err(arrow_err)?;
         let Some(g) = self.greatest.as_mut() else {
+            let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
+            let keys = self.conv.convert_columns(&key_arrays).map_err(arrow_err)?;
             return Ok(dedup_first(batch, &keys, &mut self.seen, self.output_projection.as_deref(), self.bound.as_mut())?.into_iter().collect());
+        };
+        let keys = match self.direct_string_key {
+            Some(idx) => match batch.column(idx).data_type() {
+                DataType::Utf8 => KeyRows::Utf8(batch.column(idx).clone()),
+                DataType::Utf8View => KeyRows::Utf8View(batch.column(idx).clone()),
+                DataType::LargeUtf8 => KeyRows::LargeUtf8(batch.column(idx).clone()),
+                _ => unreachable!("direct string key type was validated at construction"),
+            },
+            None => {
+                let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
+                KeyRows::Encoded(self.conv.convert_columns(&key_arrays).map_err(arrow_err)?)
+            }
         };
         let proj = self.output_projection.as_deref();
         let mut out = Vec::new();
@@ -599,7 +637,7 @@ impl Dedup {
                 g.close_run(&mut self.seen, false);
                 self.seen.clear();
             }
-            let key = keys.row(i).data();
+            let key = keys.value(i);
             if self.seen.contains(key) {
                 continue;
             }
@@ -1133,6 +1171,7 @@ mod tests {
             output_projection: None,
             seen: SeenSet::default(),
             bound: Some(Bound { idx: 1, desc: false, last: None }),
+            direct_string_key: None,
             greatest: Some(
                 Greatest::new(2, in_schema.field(2).data_type(), MemoryConsumer::new("test").register(&Arc::new(TaskContext::default()).memory_pool().clone()))
                     .unwrap(),
