@@ -68,3 +68,47 @@ fork ordering fix for streaming TopK + O(run) dedup memory.
   path; hot tier under `component='hot_tier'`.
 - Do NOT raise the memory brake or run manual `OPTIMIZE ... WHERE date=...`
   (crashed the server twice on 2026-08-02, 455 s/1636 s, no win).
+
+---
+
+## 04:45 addendum — the OOM saga and where things ended
+
+**Five cgroup OOM kills** (~01:03, 02:00, 02:57, 03:25, 04:00), all: anon-RSS
+hits 120 GiB, kernel kills, clean recovery in ~3 min. Attribution by 2-min RSS
+sampling: RSS climbs a CONSTANT ~7 GB/min **while dirty-bin drain staging runs**,
+independent of query load. Not DedupExec (pool-tracked, zero ResourcesExhausted),
+not pass-scoped (batch 512→128 changed nothing). Deep audit verdict: no true
+retention site — it is **per-bin planning churn**: each staged bin builds 3–5
+fresh sessions/providers and each query replays ~34k files' statistics
+(~170–340 MB pool-invisible per query), ratcheting RSS via fragmentation.
+
+**Mitigation in force:** `TIMEFUSION_DIRTY_BIN_DRAIN_BATCH=1` (drain paused to a
+trickle) — set in the CapRover app definition (survives deploys) AND on the live
+service. RSS verified stable after. light_optimize (hot-tail compaction of
+today's partition — the latency-relevant one) still runs.
+
+**Proper fix (daylight, in order):**
+1. Make bin scans plan ONLY their files: pass partition/bin bounds via
+   `with_file_skipping_predicates` / `with_file_selection` on the fork's
+   TableProviderBuilder; find why project_id/date partition pruning planned
+   34,225 files (`files_planned` metric).
+2. Reuse the memoized `maintenance_session_state()` (database.rs:4323) instead
+   of `build_optimize_session_state` per bin/replan (database.rs:6391, 6618).
+3. Confirm with jeprof (prof:true still baked; re-arm `prof.active` at runtime).
+4. Then restore `TIMEFUSION_DIRTY_BIN_DRAIN_BATCH` (remove the env; code
+   default is 128) and let the 21.5k backlog drain.
+
+## Final measured state (b5613d0, ~04:35, drain paused)
+
+- **TopK works**: `ORDER BY timestamp DESC LIMIT 50` over 6h = **377 ms**.
+- Plans: **9/21 tenants bounded dedup** (was 0), 10 with declared ordering —
+  the fork ordering fix (`timefusion-mor-ordered-groups/a59a4336`) is live and
+  converts more tenants as compaction homogenizes footers.
+- 98fdd4f3: 5min **207 ms**, 1h **533 ms**, 6h 8.9 s, 24h 12.2 s.
+- 28f62f01 (whale): 5min 690 ms, 1h 11 s, 6h 39 s, 24h times out at 95 s.
+- Ingest: zero failed flushes, zero rejections all night after the fixes.
+- Hot tier: ~114 GB / ~2k files, 24h retention live, coverage still building
+  forward (full 24h by ~this evening).
+- Percentile-style queries scan the whole window — they need the file-count
+  cut (dwell gate live; dirty-bin drain resumes after the churn fix) and hot
+  coverage; TopK/list-style dashboards are already fast.

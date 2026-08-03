@@ -39,7 +39,16 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // (70 cgroup kills over 08-01/02, ~hourly under dashboard load) and the 00:45Z
 // kill was 125GB of pure anon — a regime the 07-31 dumps never covered. Flip
 // back to false once the current eater is named.
-pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+// `dirty_decay_ms:0` since 2026-08-03: return freed dirty pages to the OS
+// IMMEDIATELY. Six cgroup OOM kills tonight at anon-rss ~125GB were, per the
+// 2026-07-31 attribution ratio (live 31GB vs RSS 82GB) and tonight's clean
+// A/B, dominated by freed-but-unreturned churn that decay=1000 never caught
+// up with (maintenance planning replays ~34k files' stats per query; Foyer
+// still copies every parquet range). With decay 0 + the dirty-bin drain
+// paused, RSS held ~30GB at 45min where every prior boot hit 60-100GB. The
+// madvise cost is real but this box is IO-bound, not CPU-bound; do NOT raise
+// this back without re-running that A/B under maintenance load.
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 use std::sync::Arc;
 
