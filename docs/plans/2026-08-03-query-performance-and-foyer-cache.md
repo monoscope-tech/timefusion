@@ -16,6 +16,13 @@ The plan also materialized a 428.9 MB hot-tier leg for a count query.
 
 During the investigation, Foyer `inner_bytes_read` rose from zero to about 1.48 TB. A 3-day structural `EXPLAIN` alone planned 1,618 files and added about 126 GB of Foyer inner reads. The 3-day plan intentionally skips the hot tier.
 
+A later warm 1-hour count (83k rows) still caused 185 main-cache misses and
+increased `inner_bytes_read` by 1.33 GB while `EXPLAIN ANALYZE` reported only
+4.99 MB of selected Parquet bytes. Query-triggered detached full-file warming
+therefore amplified storage traffic by roughly 266x and landed only one new
+full-file entry during the sample. This path competes with foreground range
+reads and is not a viable convergence mechanism at production fan-out.
+
 Current prod settings include 120 GB Foyer disk, 4 GB L1, and `TIMEFUSION_WARM_FULL_FILES=true`. Foyer metadata cache was partially effective (2,302 hits / 2,619 misses at the first snapshot), while main-cache coverage was incomplete.
 
 ## Root causes
@@ -102,9 +109,12 @@ The current 10-second confirm may stop waiting for full warming, but it must not
 For a query range miss:
 
 1. Serve a main-cache full-file hit when present.
-2. Otherwise use `inner.get_range` for exactly the requested range.
-3. Enqueue or retain one detached full warm for eligible files.
-4. Never synchronously fetch a whole object merely to satisfy a small range probe.
+2. Serve a main-cache exact-range hit when present.
+3. Otherwise use `inner.get_range` for exactly the requested range and admit
+   that range for repeat dashboard queries.
+4. Never start a full-file warm from a query. Full-file convergence belongs to
+   upload capture and bounded post-commit/restart workers.
+5. Never synchronously fetch a whole object merely to satisfy a small range probe.
 
 Full warming applies only to files inside the full-cache working-set window and below Foyer’s cacheable object limit. Metadata warming can cover all live files.
 
@@ -161,7 +171,8 @@ Success: representative 1h/3h scans open materially fewer files and the dirty-bi
 - Footer and header warm serve later reads without remote HEAD/GET.
 - Full-file cache range hit is zero-copy and makes no object-store call.
 - Cold Parquet range uses `get_range`, never `get`.
-- A cold range enqueues one deduplicated full warm.
+- A repeated cold-file data range hits Foyer without another inner request.
+- A query range never enqueues a full-file warm.
 - Confirm timeout leaves metadata cached and warm work queued.
 - Multipart capture, queued warm, and range lookup use identical cache keys.
 

@@ -5,7 +5,7 @@
      — monoscope's lookupOtelRecord, sent with uuid + timestamptz params.
 
 Usage:
-  python3 bench/query_latency.py seed        # insert rows, spread over 12h, flush to Delta
+  python3 bench/query_latency.py seed        # insert rows, spread over 24h, flush to Delta
   python3 bench/query_latency.py seed_scale  # prod-shaped: N projects x N days (QLAT_* env)
   python3 bench/query_latency.py run         # run latency suite against seeded data
   python3 bench/query_latency.py run_ages    # random access per partition age (needs seed_scale)
@@ -27,7 +27,8 @@ STATE = ROOT / "data" / "query_latency_state.json"
 
 PID = "qlat-bench-project"
 N_ROWS = 20000
-WINDOW_H = 12  # spread rows over the last 12 hours
+WINDOW_H = int(os.environ.get("QLAT_WINDOW_H", "24"))
+LATENCY_BUDGET_MS = float(os.environ.get("QLAT_BUDGET_MS", "500"))
 INSERT_BATCH = 700  # 88 cols x 700 = 61.6k params < 65535 pgwire limit
 
 
@@ -156,7 +157,7 @@ def queries():
     return [
         ("simple_select_1", "SELECT 1", ()),
         ("list_recent_50", Q_LIST, (pid, since)),
-        ("count_12h", Q_COUNT, (pid, since)),
+        (f"count_{WINDOW_H}h", Q_COUNT, (pid, since)),
         ("union_percentiles_x4", Q_UNION_PCT, (pid, since) * 4),
         ("random_access_ts_id", Q_RANDOM, (lo, hi, pid, tgt["id"])),
     ]
@@ -164,6 +165,7 @@ def queries():
 
 def run(n_iter=15):
     qs = queries()
+    failed = False
     print(f"{'query':<24} {'p50':>8} {'p95':>8} {'min':>8} {'max':>8}  (ms, {n_iter} iters, fresh conn each)")
     for name, sql, params in qs:
         times = []
@@ -176,6 +178,8 @@ def run(n_iter=15):
         times_w = sorted(times[2:])  # drop 2 cold
         p50 = statistics.median(times_w)
         p95 = times_w[min(len(times_w) - 1, int(len(times_w) * 0.95))]
+        if name != "simple_select_1" and p95 >= LATENCY_BUDGET_MS:
+            failed = True
         print(f"{name:<24} {p50:8.1f} {p95:8.1f} {times_w[0]:8.1f} {times_w[-1]:8.1f}")
 
     # Same but on a single reused connection (separates conn setup from query cost).
@@ -200,6 +204,9 @@ def run(n_iter=15):
             p50 = statistics.median(times_w)
             plan_p50 = statistics.median(sorted(plan_times[2:])) if len(plan_times) > 4 else 0.0
             print(f"{name:<24} {p50:8.1f} {times_w[-1]:8.1f} {plan_p50:14.1f}")
+
+    if failed:
+        raise SystemExit(f"24h latency gate failed: one or more p95 values exceeded {LATENCY_BUDGET_MS:.0f}ms")
 
 
 def explain():

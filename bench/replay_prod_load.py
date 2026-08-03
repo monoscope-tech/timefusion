@@ -277,11 +277,11 @@ QUERIES = {
     "list_24h":    ("SELECT id, timestamp FROM otel_logs_and_spans "
                     "WHERE project_id=%(pid)s AND timestamp >= now() - INTERVAL '24 hours' "
                     "ORDER BY timestamp DESC LIMIT 251",
-                    5.0),
+                    0.5),
     "hist_24h":    ("SELECT time_bucket('5 minutes', timestamp) tb, count(*) FROM otel_logs_and_spans "
                     "WHERE project_id=%(pid)s AND timestamp >= now() - INTERVAL '24 hours' "
                     "GROUP BY tb ORDER BY tb DESC LIMIT 500",
-                    5.0),
+                    0.5),
 }
 
 

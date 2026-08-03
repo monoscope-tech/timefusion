@@ -455,21 +455,7 @@ pub struct SharedFoyerCache {
     metadata_stats: StatsRef,
     config: FoyerCacheConfig,
     evictions: Arc<AtomicU64>,
-    /// Transient-heap budget (MiB units) for detached large-file warms, plus
-    /// per-key dedup of in-flight warms. Global across every table's cache
-    /// wrapper — the OOM this bounds was the SUM over tables/scans.
-    warm_budget: Arc<tokio::sync::Semaphore>,
-    warm_inflight: Arc<DashMap<String, ()>>,
 }
-
-/// Total whole-file bytes detached warms may hold in flight at once, MiB.
-/// Foyer is EXPECTED to hold entire compacted files (up to ~1.5GB) on its
-/// disk tier; what must be bounded is only the transient heap while fetching
-/// them, so the budget clears the largest single file with headroom.
-/// Unbounded, a wide scan's misses fetched ~90MB-avg files synchronously
-/// (284GB inner reads in 13 min) and drove anon RSS to 95.7GB — a global OOM
-/// kill (prod 2026-08-03 12:34Z).
-const WARM_INFLIGHT_BUDGET_MIB: u32 = 2048;
 
 struct EvictionCounter(Arc<AtomicU64>);
 
@@ -547,8 +533,6 @@ impl SharedFoyerCache {
             metadata_stats: Arc::new(RwLock::new(CacheStats::default())),
             config,
             evictions,
-            warm_budget: Arc::new(tokio::sync::Semaphore::new(WARM_INFLIGHT_BUDGET_MIB as usize)),
-            warm_inflight: Arc::new(DashMap::new()),
         })
     }
 
@@ -839,8 +823,6 @@ pub struct FoyerObjectStoreCache {
     refreshing: Arc<DashSet<String>>,
     main_fetch_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
-    warm_budget: Arc<tokio::sync::Semaphore>,
-    warm_inflight: Arc<DashMap<String, ()>>,
 }
 
 impl FoyerObjectStoreCache {
@@ -855,51 +837,12 @@ impl FoyerObjectStoreCache {
             refreshing: Arc::new(DashSet::new()),
             main_fetch_locks: Arc::new(DashMap::new()),
             background_tasks: Arc::new(Mutex::new(JoinSet::new())),
-            warm_budget: shared_cache.warm_budget.clone(),
-            warm_inflight: shared_cache.warm_inflight.clone(),
         }
     }
 
     /// Check if a path is the mutable _last_checkpoint file
     fn is_last_checkpoint(location: &Path) -> bool {
         location.as_ref().contains("_delta_log/_last_checkpoint")
-    }
-
-    /// Detached whole-file warm for a large parquet file, deduplicated per key
-    /// and bounded by the global transient-heap budget. Never blocks the
-    /// caller; on a saturated budget the file simply stays uncached until a
-    /// later miss retries. A file bigger than the entire budget never warms —
-    /// its ranges are always served by ranged fetches.
-    fn spawn_budgeted_warm(&self, location: &Path, size: u64) {
-        let key = Self::make_cache_key(location);
-        let size_mib = size.div_ceil(1 << 20).max(1) as u32;
-        if size_mib > WARM_INFLIGHT_BUDGET_MIB || self.warm_inflight.insert(key.clone(), ()).is_some() {
-            return;
-        }
-        let Ok(permit) = Arc::clone(&self.warm_budget).try_acquire_many_owned(size_mib) else {
-            self.warm_inflight.remove(&key);
-            return;
-        };
-        let (inner, cache, stats, inflight) = (self.inner.clone(), self.cache.clone(), self.stats.clone(), self.warm_inflight.clone());
-        let (l1_max, location) = (self.config.l1_max_entry_bytes, location.clone());
-        tokio::spawn(async move {
-            let _permit = permit;
-            let fetched = async {
-                let result = inner.get(&location).await?;
-                let meta = result.meta.clone();
-                Ok::<_, object_store::Error>((result.bytes().await?, meta))
-            }
-            .await;
-            match fetched {
-                Ok((data, meta)) => {
-                    bump(&stats, |s| s.inner_bytes_read += data.len() as u64).await;
-                    debug!("Warmed large file into cache: {} ({} bytes)", location, data.len());
-                    insert_main(&cache, key.clone(), CacheValue::new(data, meta), l1_max);
-                }
-                Err(e) => debug!("large-file warm failed for {}: {e}", location),
-            }
-            inflight.remove(&key);
-        });
     }
 
     /// Explicitly invalidate checkpoint cache for a given table
@@ -1181,6 +1124,8 @@ impl FoyerObjectStoreCache {
     async fn get_range_cached(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let span = tracing::Span::current();
         let is_parquet = is_parquet_file(location);
+        let range_cache_key = Self::make_range_cache_key(location, &range);
+        let mut range_meta = None;
 
         // First check if we have the full file cached
         let full_cache_key = Self::make_cache_key(location);
@@ -1210,13 +1155,31 @@ impl FoyerObjectStoreCache {
             }
         }
 
+        // Full-file coverage is preferred, but cache the exact coalesced data
+        // ranges DataFusion repeatedly requests as a resilient second line.
+        // This avoids making every dashboard refresh wait on R2 when upload or
+        // post-commit full warming has not converged yet. Range entries live in
+        // the main tier (not the small metadata tier) and remain subject to the
+        // recent-window and wide-scan admission policies.
+        if is_parquet && let Ok(Some(entry)) = self.cache.get(&range_cache_key).await {
+            let value = entry.value();
+            if !value.is_expired(self.config.ttl) {
+                record_range_hit(&self.stats, value.data.len() as u64).await;
+                span.record("cache_hit", true);
+                let data = value.data.clone();
+                self.maybe_touch(&self.cache, &range_cache_key, entry.clone(), self.config.l1_max_entry_bytes);
+                return Ok(data);
+            }
+            bump(&self.stats, |s| s.ttl_expirations += 1).await;
+            self.cache.remove(&range_cache_key);
+        }
+
         // For Parquet files, implement smart caching based on the range
         if is_parquet {
             // Probe the metadata range cache *before* any HEAD: its key is just
             // (location, range), so a steady-state footer read served from cache
             // pays zero S3 round-trips. Data ranges aren't stored here and fall
             // through to the size-based classification below.
-            let range_cache_key = Self::make_range_cache_key(location, &range);
             if let Ok(Some(entry)) = self.metadata_cache.get(&range_cache_key).await {
                 let value = entry.value();
                 if !value.is_expired(self.config.ttl) {
@@ -1240,6 +1203,7 @@ impl FoyerObjectStoreCache {
             // to stamp the cached range's meta. Use the cached ObjectMeta
             // (immutable Delta files) so this HEAD is paid at most once per file.
             let file_meta = self.head_cached(location).await.inspect_err(|e| debug!("Failed to get metadata for {}: {}", location, e))?;
+            range_meta = Some(file_meta.clone());
 
             let file_size = file_meta.size;
             let metadata_size_hint = self.config.parquet_metadata_size_hint as u64;
@@ -1322,16 +1286,14 @@ impl FoyerObjectStoreCache {
                 return Ok(data);
             }
 
-            // Data-range miss: the cache's job is to end up holding the WHOLE
-            // file (compaction targets up to 512MB and the disk tier is sized
-            // for days of them) — but the QUERY must never wait on, nor the
-            // heap pay for, an unbounded fan-out of whole-file fetches
-            // (synchronous unbounded warming fetched ~90MB-avg files at 284GB
-            // per 13 min and OOM-killed the box, 2026-08-03 12:34Z). So:
-            // a small file (≤ the L1 entry cap) warms INLINE — the body is
-            // barely bigger than the range, serve the slice from it; a large
-            // file warms DETACHED under the global byte budget while this
-            // request is served by the plain ranged fetch below.
+            // A small file (≤ the L1 entry cap) is cheap enough to cache whole
+            // inline. Large files are warmed only by upload capture and the
+            // post-commit/restart warmer. Never start a full-object download
+            // from a query miss: in production one 1h count needed ~5MB of
+            // selected parquet bytes but query-triggered detached warms read
+            // 1.33GB from object storage (266x amplification) and competed
+            // with the foreground range requests. A large miss therefore
+            // falls through to the exact range fetch below.
             if file_meta.size <= self.config.l1_max_entry_bytes as u64 {
                 debug!("Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)", location, range.start, range.end);
                 if let Ok(result) = self.get_cached(location).await {
@@ -1340,8 +1302,6 @@ impl FoyerObjectStoreCache {
                         return Ok(Bytes::from(full).slice(range.start as usize..range.end as usize));
                     }
                 }
-            } else {
-                self.spawn_budgeted_warm(location, file_meta.size);
             }
         }
 
@@ -1371,6 +1331,9 @@ impl FoyerObjectStoreCache {
 
         record_range_miss(&self.stats, result.len() as u64).await;
         bump(&self.stats, |s| s.inner_bytes_read += result.len() as u64).await;
+        if let Some(meta) = range_meta.as_ref() {
+            self.admit_data_range(location, range_cache_key, &result, meta);
+        }
         Ok(result)
     }
 
@@ -1498,6 +1461,22 @@ impl FoyerObjectStoreCache {
             version: file.version.clone(),
         };
         self.admit(&self.metadata_cache, key, CacheValue::new(data.to_vec(), meta), 0);
+    }
+
+    /// Admit an exact parquet data range to the main cache. This is the
+    /// fallback for files whose full-file post-commit warm has not landed.
+    fn admit_data_range(&self, location: &Path, key: String, data: &[u8], file: &ObjectMeta) {
+        if !is_within_recent_window(location, self.config.cache_recent_days) {
+            return;
+        }
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: file.last_modified,
+            size: data.len() as u64,
+            e_tag: file.e_tag.clone(),
+            version: file.version.clone(),
+        };
+        self.admit(&self.cache, key, CacheValue::new(data.to_vec(), meta), self.config.l1_max_entry_bytes);
     }
 
     /// Cache a path's `ObjectMeta` (body-less entry) so later reads skip the HEAD.
@@ -3087,13 +3066,12 @@ mod tests {
         Ok(())
     }
 
-    /// A data-range miss on a LARGE parquet file (above the L1 entry cap) is
-    /// served immediately by a ranged fetch while the whole file warms into
-    /// the cache in a detached, budget-bounded task — the cache converges to
-    /// holding entire compacted files without the query ever waiting on (or
-    /// the heap fanning out) whole-file fetches.
+    /// A data-range miss on a large parquet file is range-only. Full-file cache
+    /// convergence belongs to upload capture and the post-commit/restart
+    /// warmer; doing it from the query path causes severe bandwidth
+    /// amplification and competes with the request it is meant to accelerate.
     #[tokio::test]
-    async fn large_file_range_serves_ranged_and_warms_detached() -> anyhow::Result<()> {
+    async fn large_file_query_miss_reads_ranges_without_warming_full_file() -> anyhow::Result<()> {
         let config = FoyerCacheConfig::test_config_with("large_warm", |c| c.l1_max_entry_bytes = 64);
         let shared = SharedFoyerCache::new(config).await?;
         let mem = Arc::new(InMemory::new());
@@ -3103,15 +3081,18 @@ mod tests {
         let body: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
 
-        assert_eq!(&cache.get_range_cached(&path, 100..200).await?[..], &body[100..200], "range served without waiting on the warm");
-        for _ in 0..200 {
-            if shared.contains_data(path.as_ref()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(shared.contains_data(path.as_ref()), "detached warm must land the whole file in cache");
-        assert_eq!(&cache.get_range_cached(&path, 200..300).await?[..], &body[200..300], "later ranges hit the warmed entry");
+        assert_eq!(&cache.get_range_cached(&path, 100..200).await?[..], &body[100..200]);
+        assert_eq!(&cache.get_range_cached(&path, 200..300).await?[..], &body[200..300]);
+        assert!(!shared.contains_data(path.as_ref()), "query ranges must not trigger a full-file cache population");
+        let cold = cache.get_stats().await.main;
+        assert_eq!(cold.range_misses, 2);
+        assert_eq!(cold.range_bytes_read, 200, "inner bytes must track requested ranges, not the 4096-byte object");
+        assert_eq!(cold.inner_bytes_read, 200);
+
+        assert_eq!(&cache.get_range_cached(&path, 100..200).await?[..], &body[100..200]);
+        let warm = cache.get_stats().await.main;
+        assert_eq!(warm.range_hits, 1, "a repeated coalesced range must hit the main range cache");
+        assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read, "a range hit must not touch the inner store");
         Ok(())
     }
 
