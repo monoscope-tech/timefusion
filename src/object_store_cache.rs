@@ -1227,15 +1227,25 @@ impl FoyerObjectStoreCache {
                 return Ok(data);
             }
 
-            // For data requests, try to cache the full file, then slice the
-            // request out of it. Guarding on the materialized length (not
-            // `meta.size`) keeps a short body falling through to the ranged
-            // fetch below instead of panicking on the slice.
-            debug!("Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)", location, range.start, range.end);
-            if let Ok(result) = self.get_cached(location).await {
-                let full = Self::read_payload(result.payload).await?;
-                if range.end <= full.len() as u64 {
-                    return Ok(Bytes::from(full).slice(range.start as usize..range.end as usize));
+            // For data requests on files SMALL enough to hold whole (the L1
+            // steering bound), cache the full file and slice the request out
+            // of it. Guarding on the materialized length (not `meta.size`)
+            // keeps a short body falling through to the ranged fetch below
+            // instead of panicking on the slice.
+            //
+            // The size bound is load-bearing: unbounded, a wide scan's misses
+            // fetched WHOLE compacted files (~90MB avg, 284GB inner reads in
+            // 13 min) — transient bodies plus the disk-tier write queue drove
+            // anon RSS to 95.7GB and a global OOM kill (prod 2026-08-03
+            // 12:34Z). A large file's data ranges take the plain ranged fetch
+            // below, exactly the pre-cache behavior.
+            if file_meta.size <= self.config.l1_max_entry_bytes as u64 {
+                debug!("Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)", location, range.start, range.end);
+                if let Ok(result) = self.get_cached(location).await {
+                    let full = Self::read_payload(result.payload).await?;
+                    if range.end <= full.len() as u64 {
+                        return Ok(Bytes::from(full).slice(range.start as usize..range.end as usize));
+                    }
                 }
             }
         }
