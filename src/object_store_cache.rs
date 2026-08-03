@@ -30,16 +30,20 @@ use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheValue {
-    #[serde(with = "serde_bytes")]
-    data: Vec<u8>,
+    /// `Bytes`, not `Vec<u8>`: served slices refcount the BUFFER, never the
+    /// `HybridCacheEntry` (2bb5e85 pinned entries via `Bytes::from_owner` and
+    /// stalled foyer admission under scan load — 191 failed flushes; see
+    /// 5926f66). Eviction always proceeds; a live slice only delays freeing
+    /// the bytes until its reader drops.
+    data: Bytes,
     #[serde(with = "object_meta_serde")]
     meta: ObjectMeta,
     timestamp_millis: u64,
 }
 
 impl CacheValue {
-    fn new(data: Vec<u8>, meta: ObjectMeta) -> Self {
-        Self { data, meta, timestamp_millis: current_millis() }
+    fn new(data: impl Into<Bytes>, meta: ObjectMeta) -> Self {
+        Self { data: data.into(), meta, timestamp_millis: current_millis() }
     }
 
     fn age_millis(&self) -> u64 {
@@ -946,7 +950,7 @@ impl FoyerObjectStoreCache {
     async fn serve_hit(&self, span: &tracing::Span, value: &CacheValue) -> GetResult {
         record_hit(&self.stats, value.data.len() as u64).await;
         span.record("cache_hit", true);
-        Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone())
+        Self::make_get_result(value.data.clone(), value.meta.clone())
     }
 
     #[instrument(
@@ -1051,8 +1055,9 @@ impl FoyerObjectStoreCache {
             bump(&self.stats, |s| s.inner_bytes_read += data.len() as u64).await;
             span.record("cache_entry_bytes", data.len() as i64);
             span.record("cache_admission", if data.len() > self.config.l1_max_entry_bytes { "disk" } else { "memory" });
+            let data = Bytes::from(data);
             self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
-            Ok(Self::make_get_result(Bytes::from(data), result.meta))
+            Ok(Self::make_get_result(data, result.meta))
         }
         .await;
 
@@ -1094,18 +1099,13 @@ impl FoyerObjectStoreCache {
                     is_parquet,
                     value.age_millis()
                 );
-                // NOTE: this copy is ~11% of prod live heap (2026-07-31 profile)
-                // and is the obvious thing to make zero-copy. It was tried
-                // (2bb5e85) by handing `Bytes` an owner holding the
-                // `HybridCacheEntry`, and it took prod down: every returned
-                // slice pins its entry, so under scan load entries stop being
-                // reclaimable and the cache stalls — surfacing as GET timeouts
-                // on whatever needs the cache next (the tantivy manifest fetch
-                // on the FLUSH path: 191 failed flushes, MemBuffer to 96%,
-                // reverted here). Any retry must bound how long a slice may pin
-                // an entry, and must be load-tested — a correctness test passes
-                // either way.
-                let sliced = Bytes::copy_from_slice(&value.data[range.start as usize..range.end as usize]);
+                // Zero-copy, second attempt. 2bb5e85 pinned the cache ENTRY
+                // (`Bytes::from_owner(entry)`) and stalled foyer admission
+                // under scan load; this slice shares only the `Bytes` buffer,
+                // so eviction and accounting proceed regardless — a live slice
+                // at worst delays freeing one evicted file body until its
+                // reader drops.
+                let sliced = value.data.slice(range.start as usize..range.end as usize);
                 self.maybe_touch(&self.cache, &full_cache_key, entry.clone(), self.config.l1_max_entry_bytes);
                 return Ok(sliced);
             }
@@ -1130,7 +1130,7 @@ impl FoyerObjectStoreCache {
                         value.data.len(),
                         value.age_millis()
                     );
-                    let sliced = Bytes::from(value.data.clone());
+                    let sliced = value.data.clone();
                     // l1_max=0: metadata entries are tiny, always keep in L1.
                     self.maybe_touch(&self.metadata_cache, &range_cache_key, entry.clone(), 0);
                     return Ok(sliced);
@@ -1172,7 +1172,7 @@ impl FoyerObjectStoreCache {
                             // Distinct from the exact-key HIT log above so cache-key
                             // alignment is diagnosable on a new deployment.
                             debug!("Metadata cache HIT (containment {}..{}) for: {} (range: {}..{})", candidate, file_size, location, range.start, range.end);
-                            let sliced = Bytes::copy_from_slice(&value.data[s..e]);
+                            let sliced = value.data.slice(s..e);
                             self.maybe_touch(&self.metadata_cache, &key, entry.clone(), 0);
                             return Ok(sliced);
                         }
@@ -1954,15 +1954,8 @@ mod tests {
         Ok(())
     }
 
-    /// A cache-hit range read serves the requested slice of the cached object.
-    ///
-    /// It COPIES, deliberately. Serving it zero-copy (2bb5e85) pinned the
-    /// `HybridCacheEntry` behind every returned slice, entries stopped being
-    /// reclaimable under scan load, and the stalled cache timed out the tantivy
-    /// manifest GET on the flush path — 191 failed flushes and MemBuffer at 96%
-    /// in prod before the revert. This test deliberately asserts only the
-    /// CONTENT, because the aliasing assertion it used to make passed while the
-    /// change was actively unsafe.
+    /// A cache-hit range read serves the requested slice of the cached object,
+    /// zero-copy (a `Bytes::slice` of the entry's buffer).
     #[tokio::test]
     async fn cache_hit_serves_the_requested_range() -> anyhow::Result<()> {
         let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("hit_range")).await?;
@@ -1975,6 +1968,45 @@ mod tests {
         assert_eq!(&store.get_range_cached(&path, 10..40).await?[..], &body[10..40], "served range must be the cached bytes");
         assert_eq!(&store.get_range_cached(&path, 0..1).await?[..], &body[0..1], "leading edge");
         assert_eq!(&store.get_range_cached(&path, 255..256).await?[..], &body[255..256], "trailing edge");
+        Ok(())
+    }
+
+    /// THE test the first zero-copy attempt (2bb5e85) needed: a slice held by a
+    /// reader must never pin the cache ENTRY. That attempt handed `Bytes` an
+    /// owner holding the `HybridCacheEntry`; entries stopped being reclaimable
+    /// under scan load, foyer admission stalled, and the tantivy manifest GET
+    /// on the flush path timed out — 191 failed flushes in prod (see 5926f66).
+    /// Now `CacheValue.data` is itself `Bytes`, so a served slice refcounts the
+    /// BUFFER only: removal and further cache traffic must complete while
+    /// slices are held, and the held slices must stay readable afterwards.
+    #[tokio::test]
+    async fn held_slice_does_not_pin_the_cache_entry() -> anyhow::Result<()> {
+        let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("no_pin")).await?;
+        let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(object_store::memory::InMemory::new()), &cache);
+        let path = Path::from("test/pin.parquet");
+        let body: Vec<u8> = (0u8..=255).collect();
+        let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: body.len() as u64, e_tag: None, version: None };
+        let key = FoyerObjectStoreCache::make_cache_key(&path);
+        cache.cache.insert(key.clone(), CacheValue::new(body.clone(), meta.clone()));
+
+        let held: Vec<Bytes> = futures::future::try_join_all((0..8).map(|i| store.get_range_cached(&path, i * 8..i * 8 + 8))).await?;
+
+        // Removal and a full traffic cycle must not block on the held slices.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            cache.cache.remove(&key);
+            for i in 0..64u8 {
+                let p = Path::from(format!("test/churn_{i}.parquet"));
+                let m = ObjectMeta { location: p.clone(), last_modified: Utc::now(), size: 256, e_tag: None, version: None };
+                cache.cache.insert(FoyerObjectStoreCache::make_cache_key(&p), CacheValue::new(body.clone(), m));
+                cache.cache.get(&FoyerObjectStoreCache::make_cache_key(&p)).await.ok();
+            }
+        })
+        .await
+        .expect("cache traffic must proceed while slices are held — a hang here is the 2bb5e85 outage");
+
+        for (i, s) in held.iter().enumerate() {
+            assert_eq!(&s[..], &body[i * 8..i * 8 + 8], "held slice stays readable after eviction");
+        }
         Ok(())
     }
 

@@ -50,7 +50,7 @@ sqlx = { version = "0.8", features = [
   "uuid",
 ] }
 futures = { version = "0.3.31", features = ["alloc"] }
-bytes = "1.4"
+bytes = { version = "1.4", features = ["serde"] }
 tokio-rustls = "0.26.1"
 datafusion-postgres = "0.17"
 datafusion-functions-json = "0.54"
@@ -85,7 +85,6 @@ object_store = "0.13.2"
 foyer = { version = "0.22.3", features = ["serde"] }
 ahash = "0.8"
 lru = "0.16.1"
-serde_bytes = "0.11.19"
 dashmap = "6.1"
 parking_lot = "0.12"
 envy = "0.4"
