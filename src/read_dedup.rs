@@ -424,6 +424,12 @@ struct Greatest {
     conv: RowConverter,
     best: HashMap<Box<[u8]>, Cand, ahash::RandomState>,
     batches: Vec<RecordBatch>,
+    /// Winner masks accumulated for CLOSED runs. A bounded stream may contain
+    /// thousands of timestamp runs in one Arrow batch; filtering the whole
+    /// batch at every boundary made that path O(rows × batch_rows). We mark
+    /// winners here and filter each retained batch once when it is safe to
+    /// emit.
+    masks: Vec<Vec<bool>>,
     bytes: usize,
     /// Pool accounting for `batches` (`bytes` mirrors its size). The winner
     /// map is second-order (one small entry per key) and stays untracked.
@@ -433,26 +439,44 @@ struct Greatest {
 impl Greatest {
     fn new(idx: usize, dt: &DataType, reservation: MemoryReservation) -> DFResult<Self> {
         let sf = SortField::new_with_options(dt.clone(), SortOptions { descending: false, nulls_first: true });
-        Ok(Self { idx, conv: RowConverter::new(vec![sf]).map_err(arrow_err)?, best: HashMap::default(), batches: Vec::new(), bytes: 0, reservation })
+        Ok(Self {
+            idx,
+            conv: RowConverter::new(vec![sf]).map_err(arrow_err)?,
+            best: HashMap::default(),
+            batches: Vec::new(),
+            masks: Vec::new(),
+            bytes: 0,
+            reservation,
+        })
     }
 
-    /// Emit the run's winners in input position order and reset. `partial` (a
-    /// `RUN_BUFFER_MAX_BYTES` overflow, not a real run boundary) parks the
-    /// emitted keys in `seen` so the run's tail can't re-emit them — that tail
-    /// degrades to keep-first.
-    fn flush(&mut self, output_projection: Option<&[usize]>, seen: &mut SeenSet, partial: bool) -> DFResult<Vec<RecordBatch>> {
-        self.bytes = 0;
-        self.reservation.free();
-        let batches = std::mem::take(&mut self.batches);
-        if self.best.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut masks: Vec<Vec<bool>> = batches.iter().map(|b| vec![false; b.num_rows()]).collect();
+    /// Close the current bound-value run by marking its winning rows. `partial`
+    /// is the memory-ceiling fallback: park those keys in `seen` so the tail of
+    /// the same run cannot emit them again (the existing keep-first fallback).
+    fn close_run(&mut self, seen: &mut SeenSet, partial: bool) {
         for (k, c) in self.best.drain() {
-            masks[c.batch as usize][c.row as usize] = true;
+            self.masks[c.batch as usize][c.row as usize] = true;
             if partial {
                 seen.insert(k);
             }
+        }
+    }
+
+    /// Emit a closed prefix of retained batches exactly once. Any candidates
+    /// for the still-open run live at or after `count`; their indices are
+    /// shifted after the drain. This keeps at most the trailing cross-batch run
+    /// buffered while completed rows stream onward.
+    fn emit_prefix(&mut self, count: usize, output_projection: Option<&[usize]>) -> DFResult<Vec<RecordBatch>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let batches: Vec<RecordBatch> = self.batches.drain(..count).collect();
+        let masks: Vec<Vec<bool>> = self.masks.drain(..count).collect();
+        let freed: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        self.bytes = self.bytes.saturating_sub(freed);
+        self.reservation.shrink(freed);
+        for cand in self.best.values_mut() {
+            cand.batch -= count as u32;
         }
         batches
             .into_iter()
@@ -491,7 +515,8 @@ impl Dedup {
         // end-of-stream, which is no worse than the blocking SortExec that
         // forcing an ordering used to insert (and is a hash, not a spill).
         if self.bound.is_some() && g.bytes > RUN_BUFFER_MAX_BYTES {
-            out.extend(g.flush(proj, &mut self.seen, true)?);
+            g.close_run(&mut self.seen, true);
+            out.extend(g.emit_prefix(g.batches.len(), proj)?);
         }
         let tbs = g.conv.convert_columns(&[batch.column(g.idx).clone()]).map_err(arrow_err)?;
         let bvals = match self.bound.as_ref() {
@@ -508,9 +533,8 @@ impl Dedup {
             if let (Some(bound), Some(vals)) = (self.bound.as_mut(), bvals.as_ref())
                 && bound.advance(vals[i])
             {
-                out.extend(g.flush(proj, &mut self.seen, false)?);
+                g.close_run(&mut self.seen, false);
                 self.seen.clear();
-                cur = None;
             }
             let key = keys.row(i).data();
             if self.seen.contains(key) {
@@ -531,6 +555,7 @@ impl Dedup {
                     }
                     g.reservation.try_grow(size)?;
                     g.batches.push(batch.clone());
+                    g.masks.push(vec![false; batch.num_rows()]);
                     g.bytes += size;
                     let bi = g.batches.len() as u32 - 1;
                     cur = Some(bi);
@@ -539,13 +564,21 @@ impl Dedup {
             };
             g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into() });
         }
+        // Sorted input guarantees the open run is a suffix. Emit every batch
+        // before the earliest candidate it still owns; a batch containing both
+        // closed winners and the open run waits until the next boundary.
+        let keep_from = g.best.values().map(|c| c.batch as usize).min().unwrap_or(g.batches.len());
+        out.extend(g.emit_prefix(keep_from, proj)?);
         Ok(out)
     }
 
     /// End of stream: emit the still-open run.
     fn finish(&mut self) -> DFResult<Vec<RecordBatch>> {
         match self.greatest.as_mut() {
-            Some(g) => g.flush(self.output_projection.as_deref(), &mut self.seen, false),
+            Some(g) => {
+                g.close_run(&mut self.seen, false);
+                g.emit_prefix(g.batches.len(), self.output_projection.as_deref())
+            }
             None => Ok(Vec::new()),
         }
     }
@@ -827,6 +860,26 @@ mod tests {
             vbatch(&["a"], &[10], &[Some(3)]),
         ]);
         assert_eq!(collect_rows(&plan).await, vec![("b".into(), 10, Some(5)), ("a".into(), 10, Some(7))]);
+    }
+
+    /// A production OTel batch contains many distinct timestamps. Bounded
+    /// greatest-version dedup must filter that Arrow batch once, not once per
+    /// timestamp run (the latter made a nominally streaming 24h scan spend
+    /// seconds rebuilding full-batch Boolean masks).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bounded_greatest_coalesces_many_runs_in_one_input_batch() {
+        let ids: Vec<String> = (0..4096).map(|i| format!("id-{i}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let ts: Vec<i64> = (0..4096).collect();
+        let tb: Vec<Option<i64>> = (0..4096).map(Some).collect();
+        let plan = greatest_plan(vec![vbatch(&id_refs, &ts, &tb)]);
+        let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let mut batches = Vec::new();
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+            batches.push(batch.unwrap());
+        }
+        assert_eq!(batches.len(), 1, "one input batch must not fragment into one output batch per timestamp");
+        assert_eq!(batches[0].num_rows(), 4096);
     }
 
     /// Runs are the unit of emission: keys of a closed run are emitted when the

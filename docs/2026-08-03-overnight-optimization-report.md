@@ -204,3 +204,19 @@ the old whole-growing-partition exclusion obsolete. Fresh per-bin SessionState
 remains intentional; tests proved that sharing cloned catalog/execution state
 can resolve `__dedup_src` against a stale eager snapshot and miss a requeued
 duplicate. The shared maintenance RuntimeEnv remains reused.
+
+The first live convergence wave (before that provider-pruning deploy) removed
+229,469 physical rows in eight committed bins and reduced the representative
+Delta fan-out from 53 to 31 files. Latency immediately improved to 890 ms (1h),
+1.98 s (3h), and 9.11 s (24h). The 24h plan still read 1.58m physical rows for
+711k survivors, so this tenant had not yet reached the dedup waves.
+
+That plan exposed an independent CPU bug in bounded greatest-version dedup.
+At every timestamp transition, the operator built a full-batch Boolean mask and
+filtered the complete Arrow batch to emit one run. A batch containing many
+distinct timestamps was therefore cloned/filtered repeatedly. Closed-run
+winners now accumulate in one mask per retained input batch; only the trailing
+cross-batch timestamp run remains buffered, and each batch is filtered once.
+The ordering, greatest-tiebreak, pool-accounting, partial-flush, and streaming
+LIMIT contracts remain covered by the full dedup test suite. A 4,096-run
+regression emits one output batch rather than one per timestamp.
