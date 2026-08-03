@@ -9265,7 +9265,7 @@ fn cron_period(schedule: &str) -> std::time::Duration {
 /// Charged memory for the brake: cgroup `memory.current` (what memcg OOM-kills
 /// on, page cache included) — deliberately NOT the same number as the WAL
 /// layer's RSS diagnostic, whose statm reader we reuse only as the fallback.
-fn process_memory_bytes() -> Option<usize> {
+pub(crate) fn process_memory_bytes() -> Option<usize> {
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
         && let Ok(v) = raw.trim().parse::<usize>()
     {
@@ -10564,7 +10564,13 @@ fn scan_pressure_permits(total: u32) -> u32 {
             (Some(used), l) if l > 0 => (used * 100 / l) as u64,
             _ => 0,
         };
-        USAGE_PCT.store(pct, Relaxed);
+        let prev = USAGE_PCT.swap(pct, Relaxed);
+        // Tier transitions are rare and load-bearing for OOM post-mortems:
+        // counters die with the process, the log survives it.
+        let (was, now) = (pressure_permit_claim(prev, total), pressure_permit_claim(pct, total));
+        if was != now {
+            warn!("scan pressure valve: {prev}% -> {pct}% of cgroup limit, decode permit claim {was} -> {now} (of {total})");
+        }
     }
     pressure_permit_claim(USAGE_PCT.load(Relaxed), total)
 }

@@ -34,7 +34,12 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // `prof:true` is KEPT so profiling can be re-armed at runtime via the
 // `prof.active` mallctl without a rebuild — flip this to `prof_active:true` (or
 // set it via mallctl) whenever heap attribution is needed again.
-pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+//
+// Re-armed 2026-08-03: the OOMs did NOT stop after the 07-31 attribution fixes
+// (70 cgroup kills over 08-01/02, ~hourly under dashboard load) and the 00:45Z
+// kill was 125GB of pure anon — a regime the 07-31 dumps never covered. Flip
+// back to false once the current eater is named.
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 use std::sync::Arc;
 

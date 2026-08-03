@@ -333,7 +333,16 @@ impl StatsTableProvider {
             // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
             // concurrent decode heap, which is what a Transient budget must cover.
             let (dpeak, dinflight_peak) = (m.decode_peak_batch_bytes.load(Relaxed), m.decode_polls_inflight_peak.load(Relaxed));
+            // The number the OOM killer acts on, live: without this the only
+            // record of a memory climb is the kernel's post-mortem kill line.
+            let (used, limit) =
+                (crate::database::process_memory_bytes().unwrap_or(0) as u64, crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes as u64));
             [
+                rows!["memory";
+                    "charged_bytes" => used,
+                    "limit_bytes" => limit,
+                    "charged_pct" => if limit > 0 { used * 100 / limit } else { 0 },
+                ],
                 rows!["scan_decode";
                     "bytes_total" => m.decode_bytes_total.load(Relaxed),
                     "peak_batch_bytes" => dpeak,
