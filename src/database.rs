@@ -6440,6 +6440,8 @@ impl Database {
     async fn stage_dedup_partition_range(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>, key: Option<DirtyBinKey>,
     ) -> Result<(Vec<StagedBin>, bool)> {
+        use deltalake::delta_datafusion::FileSelection;
+
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
             return Ok((Vec::new(), true));
@@ -6454,15 +6456,28 @@ impl Database {
             let table = table_ref.read().await;
             (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
         };
+        // Restrict provider construction itself, not merely the SQL scan. An
+        // unrestricted provider eagerly materializes statistics for every live
+        // file in the unified table before partition pruning; at production
+        // scale one 10-minute bin therefore planned ~34k files and retained
+        // hundreds of MB of allocator churn. Paths come from this exact eager
+        // snapshot, so the selection cannot omit a file belonging to the
+        // project/date being certified.
+        let partition_files = dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, &date_str);
         // Probe-only provider (chunk detection). The rewrite builds its own
         // provider per attempt — from a FRESH snapshot, with the synthetic
         // source-file column — in `dedup_rewrite_chunk`.
         let provider = TableProviderBuilder::default()
             .with_log_store(log_store)
             .with_eager_snapshot(snapshot)
+            .with_file_selection(FileSelection::from_file_paths(partition_files))
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
+        // A fresh state is intentional: SessionState clones retain mutable
+        // catalog/execution internals and can resolve `__dedup_src` to an older
+        // eager snapshot. FileSelection below removes the expensive all-table
+        // statistics replay that made fresh states harmful in production.
         let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
             self.config.memory.timefusion_query_partitions,
             self.maintenance_runtime_env(),
@@ -6682,11 +6697,13 @@ impl Database {
                 let table = table_ref.read().await;
                 (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
             };
-            use deltalake::delta_datafusion::TableProviderBuilder;
+            use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
+            let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
             let provider = TableProviderBuilder::default()
                 .with_log_store(chunk_log_store)
                 .with_eager_snapshot(Arc::clone(&chunk_snapshot))
                 .with_file_column(DEDUP_FILE_COL)
+                .with_file_selection(FileSelection::from_file_paths(partition_files))
                 .build()
                 .await
                 .map_err(|e| anyhow::anyhow!("dedup rewrite provider: {e}"))?;
@@ -7180,21 +7197,21 @@ impl Database {
         // Do not time out the whole bin: cancelling it discards all staged work and
         // retries the same oversized bin forever.
         let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
-        // Skip TODAY's partition: it's the hot, still-growing partition, so a
-        // dedup replace_where rewrites an ever-larger file set for a handful of
-        // dupes (579 rows / 648s observed). Today's dupes are collapsed at read
-        // time by DedupExec (correct), and the partition is deduped once it seals
-        // (date < today ⇒ eligible tomorrow). Hot-tail light_optimize still
-        // sorts/compacts today independently — this only defers DEDUP, not the
-        // sorted layout that recent-window (1h/6h) queries prune on.
+        // Today's SEALED bins are eligible. The old whole-partition
+        // replace_where path had to skip today because it repeatedly planned
+        // and rewrote a growing partition (579 rows dropped / 648s observed).
+        // Staging is now restricted to snapshot-exact project/date files and
+        // rewrites only files proven to hold the bin, while `sealed_before`
+        // keeps it away from the live MemBuffer/late-arrival window. Deferring
+        // all of today until tomorrow left recent dashboard queries doing >2x
+        // merge-on-read work by construction.
         let today_date = Utc::now().date_naive();
-        let today = today_date.to_string();
         let candidates: Vec<_> = self
             .dedup_dirty_bins
             .iter()
             .filter_map(|entry| {
                 let (project, name, date, bin) = entry.key();
-                (name == table_name && *date != today && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
+                (name == table_name && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
             })
             .collect();
         let (ready, deferred) = Self::select_drain_bins(
@@ -9249,6 +9266,20 @@ struct WaveResult {
 
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
 type DirtyBinKey = (String, String, String, i64);
+
+/// Snapshot-relative files belonging to one physical project/date partition.
+/// Unified tables carry `project_id=` path segments; custom-project tables do
+/// not, because the whole physical table already belongs to that project.
+fn dedup_partition_paths(paths: impl IntoIterator<Item = String>, project_id: &str, date: &str) -> Vec<String> {
+    let date_segment = format!("date={date}");
+    let project_segment = format!("project_id={project_id}");
+    let date_files: Vec<String> = paths.into_iter().filter(|path| path.split('/').any(|segment| segment == date_segment)).collect();
+    if date_files.iter().any(|path| path.split('/').any(|segment| segment.starts_with("project_id="))) {
+        date_files.into_iter().filter(|path| path.split('/').any(|segment| segment == project_segment)).collect()
+    } else {
+        date_files
+    }
+}
 
 /// The extra baggage a dedup unit carries through a wave: the rows it drops
 /// (reported once the unit LANDS, never at staging time) and the dirty-bin it
@@ -11964,6 +11995,19 @@ mod writer_properties_tests {
         assert_eq!(window_dates(0, 2 * day).map(|d| d.len()), Some(3));
         assert_eq!(window_dates(2 * day, 0), None, "inverted window");
         assert_eq!(window_dates(0, 400 * day), None, "wider than a year → keep DedupExec");
+    }
+
+    #[test]
+    fn dedup_file_selection_is_exact_for_unified_and_custom_tables() {
+        let paths = vec![
+            "project_id=p1/date=2026-08-03/a.parquet".to_string(),
+            "project_id=p2/date=2026-08-03/b.parquet".to_string(),
+            "project_id=p1/date=2026-08-02/c.parquet".to_string(),
+        ];
+        assert_eq!(dedup_partition_paths(paths, "p1", "2026-08-03"), vec!["project_id=p1/date=2026-08-03/a.parquet"]);
+
+        let custom = vec!["date=2026-08-03/a.parquet".to_string(), "date=2026-08-02/b.parquet".to_string()];
+        assert_eq!(dedup_partition_paths(custom, "physical-owner", "2026-08-03"), vec!["date=2026-08-03/a.parquet"]);
     }
 
     // Fix #4: batches are globally sorted by the declared lead key before write.
@@ -14822,10 +14866,8 @@ mod tests {
         assert!(!cfg.maintenance.timefusion_dedup_sweep_fallback, "the broad fallback sweep must default off");
         let db = Database::with_config(cfg).await?;
         let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        // A PRIOR calendar date: dedup_dirty_bins_for_table skips today's
-        // (still-growing) partition by design, so the sealed bin must also be
-        // `date < today` to actually be rewritten (26h back is both sealed and
-        // a previous date regardless of time-of-day).
+        // Well beyond the seal lag. Today's sealed bins now follow this same
+        // targeted path; 26h keeps this test deterministic around midnight.
         let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
         let row = |id: &str, observed: &str, timestamp| json_to_batch(vec![test_span_ts(id, observed, &project, timestamp)]);
 
@@ -14833,6 +14875,13 @@ mod tests {
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second", old)?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "successful commits enqueue their timestamp bin");
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let selected = {
+            let table = table.read().await;
+            let snapshot = table.snapshot()?.snapshot();
+            let old_date = chrono::DateTime::<Utc>::from_timestamp_micros(old).unwrap().date_naive().to_string();
+            dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), &project, &old_date)
+        };
+        assert_eq!(selected.len(), 2, "snapshot selection must retain both duplicate-bearing files: {selected:?}");
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1, "sealed bin is physically deduplicated");
         assert!(db.dedup_dirty_bins.is_empty(), "completed sealed bin is consumed");

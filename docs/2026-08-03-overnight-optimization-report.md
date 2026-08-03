@@ -166,3 +166,41 @@ Two safeguards are next:
 The target is still unproven: do not call the work complete until production
 24h p95 is below 500 ms. Compression improves coverage as new files replace
 legacy files; it does not instantly rewrite the existing 128 GB tier.
+
+## Post-`7f792da` production evidence and maintenance follow-up
+
+The deployment recovered cleanly in 245.9 s. Immediately after restart the hot
+tier still held 913 legacy files / 136.5 GB; LZ4 only applies to new demotions,
+so this was an expected pre-turnover baseline. Serialized count samples for
+tenant `98fdd4f3` were:
+
+| window | samples |
+|---|---|
+| 1h | 17.35 s, 17.24 s, 29.89 s |
+| 3h | 11.13 s, 8.08 s, 4.20 s |
+| 24h | 24.17 s, 20.15 s, 20.68 s |
+
+Once restart traffic settled, a warm 1h sample reached 1.2 s but regressed to
+3–5.7 s under concurrent load. Analyzed plans showed the remaining dominant
+cost is physical merge-on-read duplication, not a disabled cache:
+
+| window | physical rows | survivors | Delta files |
+|---|---:|---:|---:|
+| 1h | 82.8k | 41.3k | 41 |
+| 3h | 304k | 133.7k | 50 |
+| 24h | 1.57m | 706.5k | 53 |
+
+The 24h hot leg retained only 32 MB, while its final tombstone/filter stage
+alone used 3–4 s. Foyer served thousands of range hits but saw continued miss
+churn after the restart; caching bytes cannot eliminate dedup over 2.2x the
+logical row count.
+
+The dirty-bin drain already ignores the stale incident-time `batch=1` setting,
+but its providers still replayed the unified table's entire live-file metadata
+for every 10-minute bin. They now use a fail-closed `FileSelection` built from
+the exact eager snapshot and restricted to the physical project/date. Sealed
+bins from today are eligible too: the targeted rewrite and 2h seal guard make
+the old whole-growing-partition exclusion obsolete. Fresh per-bin SessionState
+remains intentional; tests proved that sharing cloned catalog/execution state
+can resolve `__dedup_src` against a stale eager snapshot and miss a requeued
+duplicate. The shared maintenance RuntimeEnv remains reused.
