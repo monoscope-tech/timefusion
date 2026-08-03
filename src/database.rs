@@ -6488,19 +6488,24 @@ impl Database {
         // so a future caller can't inject SQL through the partition predicate. date_str comes from NaiveDate::to_string
         // and is already safe.
         let safe_pid = project_id.replace('\'', "''");
+        // Keep the full partition predicate separate from the dirty-bin probe
+        // scope. `stage_dedup_chunk` removes every file touched by the scoped
+        // chunk, then re-reads those files with `partition_filter` so rows in
+        // adjacent bins survive the replacement. Passing the bin predicate as
+        // `partition_filter` silently kept only ten minutes from a multi-bin
+        // parquet file and dropped the rest (prod 2026-08-03).
+        let partition_filter = format!("project_id = '{}' AND date = DATE '{}'", safe_pid, date_str);
         let filter = if let Some(bin) = bin {
             const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
             let start = chrono::DateTime::from_timestamp_micros(bin * BIN_MICROS).ok_or_else(|| anyhow::anyhow!("invalid dedup bin {bin}"))?;
             let end = start + chrono::Duration::minutes(10);
             format!(
-                "project_id = '{}' AND date = DATE '{}' AND \"timestamp\" >= TIMESTAMP '{}' AND \"timestamp\" < TIMESTAMP '{}'",
-                safe_pid,
-                date_str,
+                "{partition_filter} AND \"timestamp\" >= TIMESTAMP '{}' AND \"timestamp\" < TIMESTAMP '{}'",
                 start.format("%Y-%m-%d %H:%M:%S"),
                 end.format("%Y-%m-%d %H:%M:%S")
             )
         } else {
-            format!("project_id = '{}' AND date = DATE '{}'", safe_pid, date_str)
+            partition_filter.clone()
         };
         // Probe for duplicates BEFORE materializing anything: the common case
         // is zero dupes, and `SELECT *` + collect() of a whole day partition
@@ -6601,13 +6606,16 @@ impl Database {
         // in flight, the semaphore decides how many are decoding at once.
         use futures::stream::StreamExt;
         let permits = self.config.derived.rewrite_permits().max(1);
-        let staged: Vec<Result<BinOutcome<StagedBin>>> = futures::stream::iter(chunks.into_iter().map(|(chunk_filter, label)| {
-            let (filter, key, date_str) = (&filter, key.clone(), date_str.as_str());
-            async move { self.stage_dedup_chunk(table_ref, table_name, project_id, schema, scan_name, filter, &chunk_filter, &label, date_str, key).await }
-        }))
-        .buffer_unordered(permits)
-        .collect()
-        .await;
+        let staged: Vec<Result<BinOutcome<StagedBin>>> =
+            futures::stream::iter(chunks.into_iter().map(|(chunk_filter, label)| {
+                let (partition_filter, key, date_str) = (&partition_filter, key.clone(), date_str.as_str());
+                async move {
+                    self.stage_dedup_chunk(table_ref, table_name, project_id, schema, scan_name, partition_filter, &chunk_filter, &label, date_str, key).await
+                }
+            }))
+            .buffer_unordered(permits)
+            .collect()
+            .await;
         let mut units = Vec::new();
         let mut all_complete = !skipped_any;
         let mut first_err = None;
@@ -7854,6 +7862,26 @@ impl Database {
                 Self::record_wave_landed(&self_landed, data_change);
                 carried.extend(self_landed);
             }
+            // Two dirty 10-minute bins can live in the same compacted parquet
+            // file. Each staged unit is a full-file replacement, so committing
+            // both units would remove the file twice and add two copies of all
+            // its rows. Land only a target-disjoint subset per wave; failed
+            // units are requeued and will re-plan from the replacement file on
+            // the next tick. This is also required for Delta action validity.
+            let mut claimed_targets = std::collections::HashSet::new();
+            let (fresh, overlapping): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|bin| {
+                if bin.target_paths.iter().any(|path| claimed_targets.contains(path)) {
+                    false
+                } else {
+                    claimed_targets.extend(bin.target_paths.iter().cloned());
+                    true
+                }
+            });
+            for bin in &overlapping {
+                debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_overlapping_target");
+            }
+            self.discard_bins(&overlapping).await;
+            failed.extend(overlapping);
             if fresh.is_empty() {
                 drop(commit_guard);
                 return WaveResult { landed: carried, failed };
@@ -14871,9 +14899,15 @@ mod tests {
         let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
         let row = |id: &str, observed: &str, timestamp| json_to_batch(vec![test_span_ts(id, observed, &project, timestamp)]);
 
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "first", old)?], true, None).await?;
+        // The first duplicate shares a parquet file with a row from an adjacent
+        // 10-minute bin. A targeted rewrite must carry that neighbour through;
+        // using the dirty-bin predicate as the full-file re-read predicate
+        // dropped it in production.
+        let neighbour = old - 60 * 60 * 1_000_000;
+        let first_file = json_to_batch(vec![test_span_ts("sealed", "first", &project, old), test_span_ts("neighbour", "keep", &project, neighbour)])?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![first_file], true, None).await?;
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second", old)?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1, "successful commits enqueue their timestamp bin");
+        assert_eq!(db.dedup_dirty_bins.len(), 2, "successful commits enqueue both timestamp bins");
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
         let selected = {
             let table = table.read().await;
@@ -14883,20 +14917,20 @@ mod tests {
         };
         assert_eq!(selected.len(), 2, "snapshot selection must retain both duplicate-bearing files: {selected:?}");
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
-        assert_eq!(delta_physical_row_count(&table).await?, 1, "sealed bin is physically deduplicated");
+        assert_eq!(delta_physical_row_count(&table).await?, 2, "sealed bin is deduplicated without dropping an adjacent-bin row from the same file");
         assert!(db.dedup_dirty_bins.is_empty(), "completed sealed bin is consumed");
 
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "later", old)?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "late retry requeues the previously consumed bin");
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
-        assert_eq!(delta_physical_row_count(&table).await?, 1, "later observed timestamp survives the requeue rewrite");
+        assert_eq!(delta_physical_row_count(&table).await?, 2, "later observed timestamp survives the requeue rewrite and the neighbour remains");
 
         let fresh = Utc::now().timestamp_micros();
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "a", fresh)?], true, None).await?;
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "b", fresh)?], true, None).await?;
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "unsealed bin remains queued without rewrite");
-        assert_eq!(delta_physical_row_count(&table).await?, 3, "unsealed copies remain for read-side dedup");
+        assert_eq!(delta_physical_row_count(&table).await?, 4, "unsealed copies remain for read-side dedup");
         Ok(())
     }
 

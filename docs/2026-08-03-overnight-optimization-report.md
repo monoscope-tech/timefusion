@@ -220,3 +220,34 @@ cross-batch timestamp run remains buffered, and each batch is filtered once.
 The ordering, greatest-tiebreak, pool-accounting, partial-flush, and streaming
 LIMIT contracts remain covered by the full dedup test suite. A 4,096-run
 regression emits one output batch rather than one per timestamp.
+
+## Post-`21d20d8` production evidence and dirty-bin correctness incident
+
+The per-batch dedup fix reduced representative warm 24h counts from 9.11 s to
+1.24–3.22 s. Warm 1h samples were 556–604 ms and warm 3h samples were
+655–741 ms. Foyer was demonstrably active during the run: one repeated 1h
+query added 131 range hits, 27.4 MB served, zero misses, and no hot-tier read.
+The remaining latency is merge-on-read CPU and physical duplication, not a
+disabled object cache. A 24h analyzed plan read 1.62M physical rows from 29
+Delta files for about 715.7k survivors; Delta scan compute was 331 ms and the
+timestamp merge was 251 ms.
+
+The first dirty-bin wave after provider pruning then exposed a correctness bug.
+The same 24h count fell from about 715.7k to 546.8k within minutes, with whole
+hour gaps in the result. The bin-scoped predicate had incorrectly been passed
+as the predicate used to carry rows from each targeted file into its
+replacement. A parquet file spanning several 10-minute bins was therefore
+removed in full but only the selected bin was written back. The fix separates
+the project/date `partition_filter` from the bin-scoped probe filter. A
+regression now puts an adjacent-bin row in the same source file and proves it
+survives physical dedup.
+
+A second guard rejects target-overlapping units within one commit wave. Two
+dirty bins can select the same compacted parquet file; committing both
+full-file replacements would duplicate all carried rows and emit duplicate
+Remove actions. Only one target-disjoint unit lands per wave; overlapping
+units are discarded and requeued to re-plan from the replacement snapshot.
+
+Production data already removed by the faulty commits is not restored by the
+code fix. Recovery must be handled separately from the latency work. The
+<500 ms 24h target remains unproven.
