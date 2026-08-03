@@ -4187,9 +4187,16 @@ impl Database {
         self.runtime_env
             .get_or_init(|| {
                 let pool_size = self.config.derived.query_pool_bytes();
+                use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, TrackConsumersPool};
+                // TrackConsumersPool: "Resources exhausted" errors name the top
+                // pool holders. The 30G pool pinned to 100% twice on 2026-08-03
+                // (07:06Z 45min, ~09:30Z), starving KB-scale DedupExec
+                // reservations and failing enrichment UPDATEs — with a bare
+                // Greedy pool the holder was unattributable.
+                let top = std::num::NonZeroUsize::new(5).unwrap();
                 let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
-                    crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
-                    crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
+                    crate::config::MemoryPoolKind::Greedy => Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(pool_size), top)),
+                    crate::config::MemoryPoolKind::FairSpill => Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), top)),
                 };
                 let meta_cache_bytes = self.config.cache.timefusion_df_metadata_cache_mb * 1024 * 1024;
                 Arc::new(build_query_runtime_env(pool, meta_cache_bytes))
