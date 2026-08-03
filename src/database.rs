@@ -7115,6 +7115,10 @@ impl Database {
             return Ok(());
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+        // Eligible bins drained per table per tick. 8 couldn't keep up with the
+        // enqueue rate (prod backlog 3341, 2026-07-20); 128 drains a 22k
+        // outage backlog in ~a day at half-batch cold reserve.
+        const DIRTY_BIN_DRAIN_BATCH: usize = 128;
         // Per-shard byte budgets in `stage_dedup_chunk` bound Arrow materialization.
         // Do not time out the whole bin: cancelling it discards all staged work and
         // retries the same oversized bin forever.
@@ -7140,7 +7144,13 @@ impl Database {
             candidates,
             today_date,
             self.config.parquet.cold_optimize_after_days(),
-            self.config.maintenance.timefusion_dirty_bin_drain_batch.max(1),
+            // Fixed, not a knob: the env override this replaced
+            // (TIMEFUSION_DIRTY_BIN_DRAIN_BATCH=1, a stale incident throttle
+            // resurrected by every CapRover deploy) froze a 22k-bin backlog at
+            // one bin per tick (2026-08-03). Deleted like the other drifted
+            // memory knobs — the drain self-regulates via flush-health yields,
+            // the memory brake and the rewrite semaphore, not operator envs.
+            DIRTY_BIN_DRAIN_BATCH,
         );
         if !deferred.is_empty() {
             crate::metrics::maintenance_stats().dedup_bins_deferred_cold.fetch_add(deferred.len() as u64, std::sync::atomic::Ordering::Relaxed);
