@@ -73,7 +73,7 @@ use std::{
 
 use datafusion::{
     arrow::{
-        array::{ArrayRef, BooleanArray, RecordBatch},
+        array::{Array, ArrayRef, BooleanArray, RecordBatch},
         compute::{SortOptions, filter_record_batch},
         datatypes::{DataType, SchemaRef},
         row::{RowConverter, SortField},
@@ -420,7 +420,50 @@ impl ExecutionPlan for DedupExec {
 struct Cand {
     batch: u32,
     row: u32,
-    tb: Box<[u8]>,
+    tb: TiebreakValue,
+}
+
+/// Owned winner tiebreak. Timestamp/int64 values stay primitive; other schema
+/// types retain Arrow's generic order-preserving encoding.
+enum TiebreakValue {
+    I64(Option<i64>),
+    Encoded(Box<[u8]>),
+}
+
+enum TiebreakRows<'a> {
+    I64 { values: &'a [i64], column: &'a ArrayRef },
+    Encoded(datafusion::arrow::row::Rows),
+}
+
+impl TiebreakRows<'_> {
+    fn value(&self, row: usize) -> TiebreakRef<'_> {
+        match self {
+            Self::I64 { values, column } => TiebreakRef::I64(column.is_valid(row).then(|| values[row])),
+            Self::Encoded(rows) => TiebreakRef::Encoded(rows.row(row).data()),
+        }
+    }
+}
+
+enum TiebreakRef<'a> {
+    I64(Option<i64>),
+    Encoded(&'a [u8]),
+}
+
+impl TiebreakRef<'_> {
+    fn beats(&self, old: &TiebreakValue) -> bool {
+        match (self, old) {
+            (Self::I64(new), TiebreakValue::I64(old)) => new > old,
+            (Self::Encoded(new), TiebreakValue::Encoded(old)) => *new > &old[..],
+            _ => unreachable!("one Greatest instance uses one tiebreak representation"),
+        }
+    }
+
+    fn into_owned(self) -> TiebreakValue {
+        match self {
+            Self::I64(value) => TiebreakValue::I64(value),
+            Self::Encoded(value) => TiebreakValue::Encoded(value.into()),
+        }
+    }
 }
 
 /// Keep-greatest run state: the open run's batches (Arc clones) and its
@@ -432,7 +475,7 @@ struct Greatest {
     /// encodes lowest, so a pre-existing row loses to any new version). Arrow's
     /// row format compares byte-lexicographically in value order, so `>` on the
     /// encoded bytes *is* `>` on the value, for any type.
-    conv: RowConverter,
+    conv: Option<RowConverter>,
     best: HashMap<Box<[u8]>, Cand, ahash::RandomState>,
     batches: Vec<RecordBatch>,
     /// Winner masks accumulated for CLOSED runs. A bounded stream may contain
@@ -449,16 +492,25 @@ struct Greatest {
 
 impl Greatest {
     fn new(idx: usize, dt: &DataType, reservation: MemoryReservation) -> DFResult<Self> {
-        let sf = SortField::new_with_options(dt.clone(), SortOptions { descending: false, nulls_first: true });
-        Ok(Self {
-            idx,
-            conv: RowConverter::new(vec![sf]).map_err(arrow_err)?,
-            best: HashMap::default(),
-            batches: Vec::new(),
-            masks: Vec::new(),
-            bytes: 0,
-            reservation,
-        })
+        let primitive_i64 = matches!(dt, DataType::Int64 | DataType::Timestamp(..));
+        let conv = (!primitive_i64)
+            .then(|| {
+                let sf = SortField::new_with_options(dt.clone(), SortOptions { descending: false, nulls_first: true });
+                RowConverter::new(vec![sf]).map_err(arrow_err)
+            })
+            .transpose()?;
+        Ok(Self { idx, conv, best: HashMap::default(), batches: Vec::new(), masks: Vec::new(), bytes: 0, reservation })
+    }
+
+    fn tiebreak_rows<'a>(&self, column: &'a ArrayRef) -> DFResult<TiebreakRows<'a>> {
+        match &self.conv {
+            Some(conv) => Ok(TiebreakRows::Encoded(conv.convert_columns(std::slice::from_ref(column)).map_err(arrow_err)?)),
+            None => {
+                let values = bound_slice(column)
+                    .ok_or_else(|| DataFusionError::Internal(format!("DedupExec primitive tiebreak column {} is not i64-backed", self.idx)))?;
+                Ok(TiebreakRows::I64 { values, column })
+            }
+        }
     }
 
     /// Close the current bound-value run by marking its winning rows. `partial`
@@ -529,7 +581,7 @@ impl Dedup {
             g.close_run(&mut self.seen, true);
             out.extend(g.emit_prefix(g.batches.len(), proj)?);
         }
-        let tbs = g.conv.convert_columns(&[batch.column(g.idx).clone()]).map_err(arrow_err)?;
+        let tbs = g.tiebreak_rows(batch.column(g.idx))?;
         let bvals = match self.bound.as_ref() {
             Some(bound) => Some(
                 bound_slice(batch.column(bound.idx))
@@ -551,8 +603,8 @@ impl Dedup {
             if self.seen.contains(key) {
                 continue;
             }
-            let tb = tbs.row(i).data();
-            if g.best.get(key).is_some_and(|c| tb <= &c.tb[..]) {
+            let tb = tbs.value(i);
+            if g.best.get(key).is_some_and(|c| !tb.beats(&c.tb)) {
                 continue;
             }
             let bi = match cur {
@@ -573,7 +625,7 @@ impl Dedup {
                     bi
                 }
             };
-            g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into() });
+            g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into_owned() });
         }
         // Sorted input guarantees the open run is a suffix. Emit every batch
         // before the earliest candidate it still owns; a batch containing both
@@ -801,6 +853,33 @@ mod tests {
         // must still lose to any stamped version, in either arrival order.
         let plan = unbounded_greatest_plan(vec![vbatch(&["c"], &[30], &[None]), vbatch(&["c"], &[30], &[Some(4)])]);
         assert_eq!(collect_rows(&plan).await, vec![("c".into(), 30, Some(4))]);
+    }
+
+    /// Non-i64 tiebreaks retain the generic Arrow row encoding fallback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_greatest_string_tiebreak_uses_generic_ordering() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("tb", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b"])),
+                Arc::new(Int64Array::from(vec![10, 10, 20])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("z"), None])),
+            ],
+        )
+        .unwrap();
+        let plan = DedupExec::with_tiebreak(source(&[vec![batch]], Some(col_asc("ts", 1))), vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap();
+        let batches = datafusion::physical_plan::collect(Arc::new(plan), Arc::new(TaskContext::default())).await.unwrap();
+        let rows = batches.iter().flat_map(|batch| {
+            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let tbs = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..batch.num_rows()).map(move |i| (ids.value(i).to_string(), tbs.is_valid(i).then(|| tbs.value(i).to_string())))
+        });
+        assert_eq!(rows.collect::<Vec<_>>(), vec![("a".into(), Some("z".into())), ("b".into(), None)]);
     }
 
     /// The unbounded run buffer must be POOL-TRACKED: untracked it grows with
