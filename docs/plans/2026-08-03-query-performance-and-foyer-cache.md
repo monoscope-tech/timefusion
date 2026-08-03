@@ -217,6 +217,19 @@ Large Parquet data ranges therefore align to 1MiB edges before fetch/admission.
 This permits nearby refreshes to reuse an entry while bounding extra remote
 bytes to less than 2MiB per request; tiny files retain whole-file caching.
 
+### Production finding: hot IPC projection happens too late
+
+With aligned range caching deployed, three 1h queries took 13.99s, 12.91s, and
+12.08s while inner-store bytes grew by only 18.4MB and range misses by four.
+Foyer was no longer the bottleneck. A concurrent `EXPLAIN ANALYZE` took 19.2s:
+Delta opened 73 files but reported only ~138ms opening and ~191ms processing,
+while the hot leg supplied ~55k rows from 12 Arrow files.
+
+The hot tier previously decoded the complete wide IPC batches from mmap before
+projecting to the four columns required by `COUNT(*)`. That faults unused body
+and attribute buffers from a 135GB tier and defeats the narrow logical plan.
+Projection now runs inside Arrow's `FileDecoder`; unused columns remain cold.
+
 ## Rollout
 
 1. Add observability and benchmark harness.

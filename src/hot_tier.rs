@@ -750,7 +750,15 @@ impl HotTier {
             self.mem_skipped.fetch_add(1, Relaxed);
             return None;
         }
-        let batches = self.read_file(&meta.path)?;
+        // Decode only the columns this query needs. Projecting an already-
+        // decoded full batch is too late: Arrow IPC decoding touches every
+        // column buffer first, page-faulting tens of GB from the mmap for a
+        // four-column count query. Projection at the decoder keeps the unused
+        // body/attribute buffers cold.
+        let batches = match cols {
+            Some(c) => self.read_file_projected(&meta.path, &c.needed)?,
+            None => self.read_file(&meta.path)?,
+        };
         // A file that decodes to NOTHING would pass the schema check below
         // (`first()` is None), report its range and contribute no rows — the one
         // shape that silently excludes a window from Delta and serves it from
@@ -775,19 +783,12 @@ impl HotTier {
         // the first batch to arrive happened to carry — and is fixed at the
         // source in `mem_buffer::align_nullability`. This stays as tolerance for
         // files demoted by an older binary.
-        let Some(batches) = align_nullability(batches.as_ref(), schema) else {
+        let expected_schema = cols.map_or_else(|| schema.clone(), |c| c.schema.clone());
+        let Some(batches) = align_nullability(batches.as_ref(), &expected_schema) else {
             self.schema_drift.fetch_add(1, Relaxed);
             return None;
         };
-        // Project BEFORE filtering: `filter_record_batch` heap-copies every
-        // column it is handed, so an unprojected filter would materialize
-        // `body`/`attributes` for the whole hot window on a 3-column query.
-        // A failure here must not leave the range excluded from Delta.
-        let projected = match cols {
-            Some(c) => batches.iter().map(|b| b.project(&c.needed)).collect::<Result<Vec<_>, _>>().ok()?,
-            None => batches,
-        };
-        let filtered = filter_snapshot(projected, pred);
+        let filtered = filter_snapshot(batches, pred);
         // Cut the predicate-only columns back off (positions are `0..n` by
         // construction in `plan_columns`, so this cannot fail).
         Some(match cols.and_then(|c| c.output.as_ref()) {
@@ -805,7 +806,7 @@ impl HotTier {
             self.read_hits.fetch_add(1, Relaxed);
             return Some(hit.batches.clone());
         }
-        match decode_file(path, false) {
+        match decode_file(path, false, None) {
             Ok(batches) => {
                 self.read_hits.fetch_add(1, Relaxed);
                 let batches = Arc::new(batches);
@@ -815,6 +816,24 @@ impl HotTier {
             Err(e) => {
                 self.read_misses.fetch_add(1, Relaxed);
                 debug!("hot tier file {path:?} unreadable, falling through to Delta: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Projection-aware IPC decode for query legs. Projection-specific batches
+    /// are deliberately not stored in the full-file memo: mixing projections
+    /// under a path-only key is incorrect, while decoding the narrow mmap view
+    /// is cheap and avoids faulting unused column pages into memory.
+    fn read_file_projected(&self, path: &Path, projection: &[usize]) -> Option<Arc<Vec<RecordBatch>>> {
+        match decode_file(path, false, Some(projection)) {
+            Ok(batches) => {
+                self.read_hits.fetch_add(1, Relaxed);
+                Some(Arc::new(batches))
+            }
+            Err(e) => {
+                self.read_misses.fetch_add(1, Relaxed);
+                debug!("hot tier file {path:?} projected decode failed, falling through to Delta: {e:#}");
                 None
             }
         }
@@ -1071,7 +1090,7 @@ fn plan_columns(projection: Option<&[usize]>, filters: &[Expr], schema: &SchemaR
 /// turns a silent realigning COPY into an error — production reads leave it
 /// off (correctness over strictness), tests turn it on to prove the
 /// zero-copy assumption actually holds for files we write.
-fn decode_file(path: &Path, require_alignment: bool) -> anyhow::Result<Vec<RecordBatch>> {
+fn decode_file(path: &Path, require_alignment: bool, projection: Option<&[usize]>) -> anyhow::Result<Vec<RecordBatch>> {
     let file = fs::File::open(path)?;
     // SAFETY: hot-tier files are immutable once renamed into place — we never
     // rewrite one, and GC only unlinks (the mapping survives the unlink), so
@@ -1085,7 +1104,11 @@ fn decode_file(path: &Path, require_alignment: bool) -> anyhow::Result<Vec<Recor
     anyhow::ensure!(footer_len <= trailer_start, "footer length {footer_len} exceeds file");
     let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start]).map_err(|e| anyhow::anyhow!("unparseable IPC footer: {e}"))?;
     let schema = fb_to_schema(footer.schema().ok_or_else(|| anyhow::anyhow!("IPC footer without schema"))?);
-    let mut decoder = FileDecoder::new(Arc::new(schema), footer.version()).with_require_alignment(require_alignment);
+    let decoder = FileDecoder::new(Arc::new(schema), footer.version()).with_require_alignment(require_alignment);
+    let mut decoder = match projection {
+        Some(projection) => decoder.with_projection(projection.to_vec()),
+        None => decoder,
+    };
 
     let slice = |block: &Block| -> anyhow::Result<Buffer> {
         let (offset, block_len) = (block.offset() as usize, block.bodyLength() as usize + block.metaDataLength() as usize);
@@ -1170,7 +1193,7 @@ mod tests {
         assert_eq!(metas.len(), 1);
         // Stored half-open: the inclusive max 200 becomes end 201.
         assert_eq!((metas[0].bucket_id, metas[0].min_ts, metas[0].end_ts), (7, 100, 201));
-        assert_eq!(decode_file(&metas[0].path, true).unwrap(), vec![b], "mmap'd IPC must decode zero-copy and byte-identical");
+        assert_eq!(decode_file(&metas[0].path, true, None).unwrap(), vec![b], "mmap'd IPC must decode zero-copy and byte-identical");
         // Out-of-range windows must not select it.
         assert!(tier.buckets_in_range("p1", "otel_logs_and_spans", Some((201, 300))).is_empty());
         assert!(tier.buckets_in_range("other", "otel_logs_and_spans", None).is_empty());
