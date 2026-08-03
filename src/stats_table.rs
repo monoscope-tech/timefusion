@@ -33,6 +33,8 @@ use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, err
 /// memory pressure in long-running processes.
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 pub type FoyerStatsSnapshot = Arc<dyn Fn() -> FoyerRuntimeStats + Send + Sync>;
+/// (used_bytes, pool_size) of the shared query memory pool, live.
+pub type PoolSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 
 type Row = (&'static str, String, String);
 
@@ -74,6 +76,7 @@ pub struct StatsTableProvider {
     scan_metrics: Option<Arc<ScanMetrics>>,
     cache_sizes: Option<CacheSizeSnapshot>,
     foyer_stats: Option<FoyerStatsSnapshot>,
+    query_pool: Option<PoolSnapshot>,
     schema: SchemaRef,
 }
 
@@ -90,7 +93,7 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, schema }
+        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, query_pool: None, schema }
     }
 
     pub fn with_scan_metrics(self, m: Arc<ScanMetrics>) -> Self {
@@ -103,6 +106,10 @@ impl StatsTableProvider {
 
     pub fn with_foyer_stats(self, f: FoyerStatsSnapshot) -> Self {
         Self { foyer_stats: Some(f), ..self }
+    }
+
+    pub fn with_query_pool(self, f: PoolSnapshot) -> Self {
+        Self { query_pool: Some(f), ..self }
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
@@ -337,11 +344,17 @@ impl StatsTableProvider {
             // record of a memory climb is the kernel's post-mortem kill line.
             let (used, limit) =
                 (crate::database::process_memory_bytes().unwrap_or(0) as u64, crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes as u64));
+            let (pool_used, pool_size) = self.query_pool.as_ref().map_or((0, 0), |f| f());
             [
                 rows!["memory";
                     "charged_bytes" => used,
                     "limit_bytes" => limit,
                     "charged_pct" => if limit > 0 { used * 100 / limit } else { 0 },
+                    // Saturation here surfaces as "Resources exhausted" query
+                    // errors (2026-08-03 07:06: enrichment UPDATEs failing at
+                    // 30.0/30.0 GB), invisible before this row.
+                    "query_pool_used_bytes" => pool_used,
+                    "query_pool_pct" => if pool_size > 0 { pool_used * 100 / pool_size } else { 0 },
                 ],
                 rows!["scan_decode";
                     "bytes_total" => m.decode_bytes_total.load(Relaxed),

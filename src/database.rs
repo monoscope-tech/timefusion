@@ -3126,7 +3126,12 @@ impl Database {
                 crate::stats_table::StatsTableProvider::new(self.buffered_layer().cloned())
                     .with_scan_metrics(self.scan_metrics.clone())
                     .with_cache_sizes(cache_sizes)
-                    .with_foyer_stats(foyer_stats),
+                    .with_foyer_stats(foyer_stats)
+                    .with_query_pool({
+                        let env = self.shared_runtime_env();
+                        let size = self.config.derived.query_pool_bytes();
+                        Arc::new(move || (env.memory_pool.reserved(), size))
+                    }),
             ),
         )?;
 
