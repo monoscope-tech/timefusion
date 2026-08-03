@@ -184,6 +184,11 @@ fn profile_from_env() -> BudgetProfile {
 }
 
 const QUERY_POOL_FRACTION: f64 = 0.25;
+/// Share of the limit reserved for consumers no pool tracks — parquet decode
+/// heap, pgwire parse ASTs, allocator overhead (measured ~10-20 GiB on prod,
+/// 2026-08-03). Carved out before maintenance takes the remainder so the
+/// budget tree can never sanction more than the cgroup holds.
+const UNTRACKED_SLACK_FRACTION: f64 = 0.15;
 /// Ingest MemBuffer share of the limit. Reproduces today's working ratio
 /// (24 GiB of a 120 GiB box).
 const INGEST_BUFFER_FRACTION: f64 = 0.20;
@@ -278,7 +283,20 @@ impl DerivedBudget {
         // Capped at 10% of the limit: the full 6 GiB reserve on an 8 GiB dev
         // box budgeted 142% of the container — the drift class this tree kills.
         let writer_reserve_bytes = (HEAVY_REWRITE_PERMITS * OPTIMIZE_MERGE_TASKS * WRITER_RESERVE_PER_TASK_BYTES).min(memory_limit_bytes / 10);
-        let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes;
+        // UNTRACKED-CONSUMER SLACK, carved out BEFORE maintenance takes the
+        // remainder. Without it the tree hands maintenance everything left and
+        // the box budgets itself to `slack_mb=0 oversubscribed=true` — on prod
+        // that was query 30G + ingest 24G + foyer 12G + writer 6G + maintenance
+        // 48G = 114G of sanctioned allocation on a 120G cgroup, and the
+        // consumers no pool tracks (parquet decode ~10-20G measured 2026-08-03,
+        // giant-INSERT parse ASTs ~7G live, allocator overhead) pushed it over
+        // roughly hourly (70 cgroup kills over 08-01/02). Every subsystem
+        // behaved "legally"; the sum was the bug. 15% ≈ 18G on prod covers the
+        // measured untracked peak; maintenance shrinks (48G → 30G on prod),
+        // which the whale campaign proved harmless (512MB bins sort+spill fine
+        // on 6G pools with 256-row admission batches).
+        let untracked_slack_bytes = (memory_limit_bytes as f64 * UNTRACKED_SLACK_FRACTION) as usize;
+        let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes + untracked_slack_bytes;
         let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
         Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes, profile }
     }
@@ -2124,10 +2142,15 @@ mod tests {
     fn budget_tree_allocates_the_entire_limit() {
         let b = DerivedBudget::from_limits(120 * GIB, 48);
         let total = b.query_pool_bytes + b.ingest_buffer_bytes + b.foyer_memory_bytes + b.writer_reserve_bytes + b.maintenance_pool_bytes;
-        assert_eq!(total, 120 * GIB, "every byte of the limit is handed to some consumer");
+        // The tree must NOT hand out every byte: 15% stays unsanctioned for the
+        // consumers no pool tracks (decode, parse ASTs, allocator overhead).
+        // The old total==limit invariant was the 70-kills-in-3-days bug: every
+        // subsystem at its cap was "legal" and the sum was the OOM.
+        assert_eq!(total, 120 * GIB - (120.0 * GIB as f64 * 0.15) as usize, "tracked consumers + 15% untracked slack == the limit");
         assert_eq!(b.query_pool_bytes, 30 * GIB);
         assert_eq!(b.ingest_buffer_bytes, 24 * GIB);
         assert_eq!(b.foyer_memory_bytes, 12 * GIB);
+        assert_eq!(b.maintenance_pool_bytes, 30 * GIB, "maintenance takes the remainder AFTER slack (was 48G with slack=0)");
     }
 
     /// `TIMEFUSION_MEMORY_BUDGET_GB` exists so a shared host can size TF below
@@ -2225,7 +2248,9 @@ mod tests {
         let b = DerivedBudget::from_limits(120 * GIB, 48);
         assert!(b.heavy_share_bytes() as f64 >= b.maintenance_pool_bytes() as f64 * 0.25 - 1.0);
         let k = b.light_optimize_k(11);
-        assert!((8..=11).contains(&k), "K={k} outside the documented 8..=11 range");
+        // 5 with the 30G post-slack pool (was 8..=11 at 48G): fewer concurrent
+        // per-project sorts is the intended trade for not OOMing the box.
+        assert!((4..=11).contains(&k), "K={k} outside the expected 4..=11 range");
         assert_eq!(b.rewrite_permits(), 2);
         assert_eq!(b.optimize_merge_tasks(), 2);
     }
