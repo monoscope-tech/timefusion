@@ -67,9 +67,7 @@
 //! for the empty `COUNT(*)` projection).
 
 use std::{
-    borrow::Borrow,
     collections::{HashMap, HashSet},
-    hash::{Hash, Hasher},
     sync::Arc,
 };
 
@@ -458,63 +456,6 @@ struct Cand {
     tb: TiebreakValue,
 }
 
-/// Owned winner key with the common telemetry-ID shape stored inline. The
-/// bounded production path clears `best` for every timestamp run; allocating
-/// and freeing one `Box<[u8]>` for each of ~680k logical rows made allocator
-/// traffic a material part of a 24-hour COUNT. IDs and Arrow row encodings are
-/// normally well below 64 bytes, while the heap variant preserves arbitrary
-/// string/key correctness.
-enum WinnerKey {
-    Inline { len: u8, bytes: [u8; 64] },
-    Heap(Box<[u8]>),
-}
-
-impl WinnerKey {
-    fn new(value: &[u8]) -> Self {
-        if value.len() <= 64 {
-            let mut bytes = [0; 64];
-            bytes[..value.len()].copy_from_slice(value);
-            Self::Inline { len: value.len() as u8, bytes }
-        } else {
-            Self::Heap(value.into())
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Inline { len, bytes } => &bytes[..*len as usize],
-            Self::Heap(bytes) => bytes,
-        }
-    }
-
-    fn into_boxed(self) -> Box<[u8]> {
-        match self {
-            Self::Inline { len, bytes } => bytes[..len as usize].into(),
-            Self::Heap(bytes) => bytes,
-        }
-    }
-}
-
-impl Borrow<[u8]> for WinnerKey {
-    fn borrow(&self) -> &[u8] {
-        self.as_bytes()
-    }
-}
-
-impl PartialEq for WinnerKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_bytes() == other.as_bytes()
-    }
-}
-
-impl Eq for WinnerKey {}
-
-impl Hash for WinnerKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_bytes().hash(state);
-    }
-}
-
 /// Owned winner tiebreak. Timestamp/int64 values stay primitive; other schema
 /// types retain Arrow's generic order-preserving encoding.
 enum TiebreakValue {
@@ -568,7 +509,7 @@ struct Greatest {
     /// row format compares byte-lexicographically in value order, so `>` on the
     /// encoded bytes *is* `>` on the value, for any type.
     conv: Option<RowConverter>,
-    best: HashMap<WinnerKey, Cand, ahash::RandomState>,
+    best: HashMap<Box<[u8]>, Cand, ahash::RandomState>,
     batches: Vec<RecordBatch>,
     /// Winner masks accumulated for CLOSED runs. A bounded stream may contain
     /// thousands of timestamp runs in one Arrow batch; filtering the whole
@@ -612,7 +553,7 @@ impl Greatest {
         for (k, c) in self.best.drain() {
             self.masks[c.batch as usize][c.row as usize] = true;
             if partial {
-                seen.insert(k.into_boxed());
+                seen.insert(k);
             }
         }
     }
@@ -750,7 +691,7 @@ impl Dedup {
                     bi
                 }
             };
-            g.best.insert(WinnerKey::new(key), Cand { batch: bi, row: i as u32, tb: tb.into_owned() });
+            g.best.insert(key.into(), Cand { batch: bi, row: i as u32, tb: tb.into_owned() });
         }
         // Sorted input guarantees the open run is a suffix. Emit every batch
         // before the earliest candidate it still owns; a batch containing both
@@ -829,17 +770,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn winner_keys_probe_by_borrowed_bytes_inline_and_heap() {
-        let short = b"98fdd4f3-3544-4087-ad91-1e7ca95aba29";
-        let long = vec![b'x'; 96];
-        let mut winners: HashMap<WinnerKey, usize, ahash::RandomState> = HashMap::default();
-        winners.insert(WinnerKey::new(short), 1);
-        winners.insert(WinnerKey::new(&long), 2);
-        assert_eq!(winners.get(short.as_slice()), Some(&1));
-        assert_eq!(winners.get(long.as_slice()), Some(&2));
-    }
 
     fn batch(ids: &[&str], vals: &[i64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false), Field::new("v", DataType::Int64, false)]));
