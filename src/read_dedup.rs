@@ -84,7 +84,9 @@ use datafusion::{
         memory_pool::{MemoryConsumer, MemoryReservation},
     },
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, RecordOutput},
+        stream::RecordBatchStreamAdapter,
     },
 };
 use futures::StreamExt;
@@ -243,6 +245,7 @@ pub struct DedupExec {
     output_projection: Option<Vec<usize>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DedupExec {
@@ -271,7 +274,7 @@ impl DedupExec {
         };
         let properties =
             Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), input.properties().emission_type, input.properties().boundedness));
-        Ok(Self { input, keys, key_idxs, tiebreak, required_ordering: None, output_projection, schema, properties })
+        Ok(Self { input, keys, key_idxs, tiebreak, required_ordering: None, output_projection, schema, properties, metrics: ExecutionPlanMetricsSet::new() })
     }
 
     /// Declare the ordering keep-greatest needs (see `required_ordering`).
@@ -399,24 +402,49 @@ impl ExecutionPlan for DedupExec {
 
         let input = self.input.execute(partition, context)?;
         let out_schema = self.schema.clone();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let input_rows = MetricBuilder::new(&self.metrics).counter("input_rows", partition);
         // One input batch can yield several output batches (a keep-greatest
         // flush emits one per buffered batch) or none at all; `flat_map` fans
         // them out lazily — an empty result just re-polls the source, and a
         // downstream LIMIT can stop mid-run.
-        let stream = futures::stream::unfold((input, dedup, false), |(mut input, mut dedup, done)| async move {
+        let stream = futures::stream::unfold((input, dedup, baseline, input_rows, false), |(mut input, mut dedup, baseline, input_rows, done)| async move {
             if done {
                 return None;
             }
             let (produced, done) = match input.next().await {
-                None => (dedup.finish(), true),
+                None => {
+                    let produced = {
+                        let _timer = baseline.elapsed_compute().timer();
+                        dedup.finish()
+                    };
+                    baseline.done();
+                    (produced, true)
+                }
                 Some(Err(e)) => (Err(e), false),
-                Some(Ok(batch)) => (dedup.push(&batch), false),
+                Some(Ok(batch)) => {
+                    input_rows.add(batch.num_rows());
+                    let produced = {
+                        let _timer = baseline.elapsed_compute().timer();
+                        dedup.push(&batch)
+                    };
+                    (produced, false)
+                }
             };
-            Some((produced, (input, dedup, done)))
+            if let Ok(batches) = &produced {
+                for batch in batches {
+                    batch.record_output(&baseline);
+                }
+            }
+            Some((produced, (input, dedup, baseline, input_rows, done)))
         })
         .flat_map(|r| futures::stream::iter(r.map_or_else(|e| vec![Err(e)], |bs| bs.into_iter().map(Ok).collect::<Vec<_>>())));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream)))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
