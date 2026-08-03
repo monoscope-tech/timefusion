@@ -623,7 +623,10 @@ async fn bind_pg_listener() -> Result<(tokio::net::TcpListener, u16)> {
     Ok((listener, port))
 }
 
-fn spawn_pgwire(session_ctx: Arc<datafusion::execution::context::SessionContext>, db: Arc<timefusion::database::Database>, listener: tokio::net::TcpListener, shutdown: Arc<Notify>) {
+fn spawn_pgwire(
+    session_ctx: Arc<datafusion::execution::context::SessionContext>, db: Arc<timefusion::database::Database>, listener: tokio::net::TcpListener,
+    shutdown: Arc<Notify>,
+) {
     tokio::spawn(async move {
         let opts = ServerOptions::new();
         let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };

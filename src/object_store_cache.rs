@@ -384,12 +384,7 @@ fn foyer_spawner() -> foyer::Spawner {
     static SPAWNER: std::sync::OnceLock<foyer::Spawner> = std::sync::OnceLock::new();
     SPAWNER
         .get_or_init(|| {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("foyer")
-                .enable_all()
-                .build()
-                .expect("build foyer runtime");
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("foyer").enable_all().build().expect("build foyer runtime");
             foyer::Spawner::from(rt)
         })
         .clone()
