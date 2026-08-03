@@ -300,6 +300,52 @@ impl LoggingSimpleQueryHandler {
         });
         Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
     }
+
+    /// Return every raw action in one Delta commit. This is an audit primitive:
+    /// it reads the transaction log only and never constructs a transaction.
+    async fn run_delta_actions(&self, cmd: DeltaActionsCmd) -> PgWireResult<Vec<Response>> {
+        use datafusion_postgres::pgwire::api::Type;
+
+        let db = require_available(self.db.as_ref(), "DELTA ACTIONS")?;
+        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA ACTIONS: open table '{}': {e}", cmd.table)))?;
+        let log_store = table_ref.read().await.log_store();
+        let bytes = log_store
+            .read_commit_entry(cmd.version)
+            .await
+            .map_err(|e| admin_err(format!("DELTA ACTIONS '{}' VERSION {}: {e}", cmd.table, cmd.version)))?
+            .ok_or_else(|| admin_err(format!("DELTA ACTIONS '{}' VERSION {}: commit not found", cmd.table, cmd.version)))?;
+        let actions = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<deltalake::kernel::Action>(line).map_err(|e| admin_err(format!("decode Delta action: {e}"))))
+            .collect::<PgWireResult<Vec<_>>>()?;
+
+        let fields = Arc::new(
+            ["version", "action", "path", "size_bytes", "action_json"]
+                .into_iter()
+                .map(|name| FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text))
+                .collect::<Vec<_>>(),
+        );
+        let rows = actions.into_iter().map({
+            let fields = fields.clone();
+            move |action| {
+                let (kind, path, size) = match &action {
+                    deltalake::kernel::Action::Add(add) => ("add", add.path.as_str(), add.size.to_string()),
+                    deltalake::kernel::Action::Remove(remove) => ("remove", remove.path.as_str(), remove.size.map(|v| v.to_string()).unwrap_or_default()),
+                    deltalake::kernel::Action::CommitInfo(_) => ("commitInfo", "", String::new()),
+                    _ => ("other", "", String::new()),
+                };
+                let version = cmd.version.to_string();
+                let json = serde_json::to_string(&action).map_err(|e| admin_err(format!("encode Delta action: {e}")))?;
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                for value in [&version, kind, path, &size, &json] {
+                    encoder.encode_field(&value)?;
+                }
+                Ok(encoder.take_row())
+            }
+        });
+        Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
+    }
 }
 
 /// `DELTA HISTORY <table> [LIMIT <n>]` is deliberately read-only.
@@ -328,6 +374,26 @@ pub(crate) fn parse_delta_history(query: &str) -> Result<Option<DeltaHistoryCmd>
         _ => return Err("expected: DELTA HISTORY <table> [LIMIT <n>]".to_string()),
     };
     Ok(Some(DeltaHistoryCmd { table: table.to_string(), limit }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeltaActionsCmd {
+    pub table: String,
+    pub version: u64,
+}
+
+pub(crate) fn parse_delta_actions(query: &str) -> Result<Option<DeltaActionsCmd>, String> {
+    let Some(rest) = strip_command(query, "delta") else { return Ok(None) };
+    let Some(rest) = strip_keyword(rest, "actions", char::is_whitespace) else { return Ok(None) };
+    let mut parts = rest.split_whitespace();
+    let table = parts.next().ok_or("DELTA ACTIONS requires: DELTA ACTIONS <table> VERSION <n>")?;
+    let keyword = parts.next().ok_or("DELTA ACTIONS requires a VERSION")?;
+    let value = parts.next().ok_or("DELTA ACTIONS requires a numeric VERSION")?;
+    if !keyword.eq_ignore_ascii_case("version") || parts.next().is_some() {
+        return Err("expected: DELTA ACTIONS <table> VERSION <n>".to_string());
+    }
+    let version = value.parse::<u64>().map_err(|_| format!("invalid Delta version '{value}'"))?;
+    Ok(Some(DeltaActionsCmd { table: table.to_string(), version }))
 }
 
 /// An intercepted `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'` admin command.
@@ -581,6 +647,9 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         if let Some(cmd) = parse_vacuum(query).map_err(admin_err)? {
             return self.run_vacuum(cmd).await;
         }
+        if let Some(cmd) = parse_delta_actions(query).map_err(admin_err)? {
+            return self.run_delta_actions(cmd).await;
+        }
         if let Some(cmd) = parse_delta_history(query).map_err(admin_err)? {
             return self.run_delta_history(cmd).await;
         }
@@ -704,7 +773,10 @@ pub async fn serve_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_delta_history, parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint, query_template, rewrite_pg_synonyms};
+    use super::{
+        parse_delta_actions, parse_delta_history, parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint, query_template,
+        rewrite_pg_synonyms,
+    };
 
     #[test]
     fn optimize_parses_table_and_date() {
@@ -795,6 +867,16 @@ mod tests {
         assert!(parse_delta_history("DELTA HISTORY t LIMIT 10001").is_err());
         assert!(parse_delta_history("DELTA RESTORE t").is_err());
         assert_eq!(parse_delta_history("SELECT delta FROM t"), Ok(None));
+    }
+
+    #[test]
+    fn delta_actions_requires_one_exact_version() {
+        let cmd = parse_delta_actions("DELTA ACTIONS otel_logs_and_spans VERSION 462919;").unwrap().unwrap();
+        assert_eq!(cmd.table, "otel_logs_and_spans");
+        assert_eq!(cmd.version, 462919);
+        assert!(parse_delta_actions("DELTA ACTIONS t").is_err());
+        assert!(parse_delta_actions("DELTA ACTIONS t VERSION nope").is_err());
+        assert_eq!(parse_delta_actions("SELECT 1"), Ok(None));
     }
 
     #[test]
