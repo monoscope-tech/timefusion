@@ -493,6 +493,27 @@ fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::P
     uri.strip_prefix(prefix).map(|rel| object_store::path::Path::from(rel.trim_start_matches('/')))
 }
 
+/// The table's path WITHIN its bucket (`"s3://bucket/tf/tbl"` → `"tf/tbl"`) —
+/// the namespace the cache keys full files under. Cache inserts happen BELOW
+/// delta-rs' `PrefixStore`, so keys are bucket-relative, while
+/// `relativize_to_prefix` output is table-relative; joining the two yields the
+/// key inserts actually used. Prod 2026-08-03: evict-after-compaction and the
+/// flush-confirm `contains_data` probe both addressed table-relative keys, so
+/// evictions were silent no-ops (47GB of unreachable tombstoned bodies) and
+/// every confirm re-downloaded bytes it had just uploaded.
+fn table_path_in_bucket(prefix: &str) -> &str {
+    prefix.splitn(4, '/').nth(3).unwrap_or("").trim_matches('/')
+}
+
+/// Bucket-relative cache key for a table-relative path (see
+/// [`table_path_in_bucket`]).
+fn bucket_cache_key(table_path: &str, rel: &object_store::path::Path) -> String {
+    match table_path.is_empty() {
+        true => rel.as_ref().to_string(),
+        false => format!("{table_path}/{rel}"),
+    }
+}
+
 /// Select and order the files `warm_cache_for_uris` will warm. Returns
 /// `(path, recent)` pairs: footers warm for every returned file; full-file
 /// warming additionally requires `recent`. With `warm_all_footers` (default)
@@ -3776,6 +3797,7 @@ impl Database {
         // Relativize absolute s3:// URIs against the table root: the cached
         // object store consumes bucket-relative paths.
         let prefix = table_cache_prefix(&table_uri);
+        let table_path = table_path_in_bucket(prefix);
         // Cap the day count before the i64 cast — recency_days is a config
         // value so overflow can't happen in practice, but a silent wrap would
         // turn a misconfiguration into "warm nothing". 3650d (~10y) is well
@@ -3847,7 +3869,9 @@ impl Database {
                 }
                 if warm_full_files && recent {
                     let hit = match shared {
-                        Some(shared) => crate::object_store_cache::warm_full_if_absent(store.as_ref(), shared, &path).await,
+                        Some(shared) => {
+                            crate::object_store_cache::warm_full_if_absent(store.as_ref(), shared, &path, &bucket_cache_key(table_path, &path)).await
+                        }
                         None => crate::object_store_cache::warm_full(store.as_ref(), &path).await,
                     };
                     fetched.fetch_add(hit as usize, std::sync::atomic::Ordering::Relaxed);
@@ -3902,9 +3926,10 @@ impl Database {
         // Same relativization as warm_cache_for_uris: the cache keys full files
         // by their object-store-relative path.
         let prefix = table_cache_prefix(table_uri);
+        let table_path = table_path_in_bucket(prefix);
         let (evicted, dropped) = removed.iter().fold((0usize, 0usize), |(evicted, dropped), u| match relativize_to_prefix(prefix, u) {
             Some(path) => {
-                cache.evict_data_entry(path.as_ref());
+                cache.evict_data_entry(&bucket_cache_key(table_path, &path));
                 (evicted + 1, dropped)
             }
             // Prefix mismatch (trailing-slash or query-string drift between
@@ -13127,6 +13152,21 @@ mod tests {
         let (calls, truncated) = run(Some(super::Brake::Stop("mem"))).await;
         assert!(calls.is_empty(), "stop must start no work at all");
         assert_eq!(truncated, vec![(0, vec!["head".to_string(), "b".to_string(), "c".to_string()])]);
+    }
+
+    /// Cache keys are bucket-relative (inserts happen below the PrefixStore),
+    /// so evict/contains must join the table's in-bucket path back onto the
+    /// table-relative file path — probing with the bare relative path never
+    /// matches (prod 2026-08-03: evictions were no-ops, confirms re-fetched).
+    #[test]
+    fn bucket_cache_key_restores_the_table_path_segment() {
+        let prefix = super::table_cache_prefix("s3://bucket/timefusion/otel_logs_and_spans/proj-1?endpoint=x");
+        assert_eq!(prefix, "s3://bucket/timefusion/otel_logs_and_spans/proj-1");
+        let table_path = super::table_path_in_bucket(prefix);
+        assert_eq!(table_path, "timefusion/otel_logs_and_spans/proj-1");
+        let rel = super::relativize_to_prefix(prefix, "s3://bucket/timefusion/otel_logs_and_spans/proj-1/date=2026-08-03/f.parquet").unwrap();
+        assert_eq!(super::bucket_cache_key(table_path, &rel), "timefusion/otel_logs_and_spans/proj-1/date=2026-08-03/f.parquet");
+        assert_eq!(super::bucket_cache_key("", &rel), "date=2026-08-03/f.parquet", "bucket-rooted tables keep the bare relative key");
     }
 
     #[test]

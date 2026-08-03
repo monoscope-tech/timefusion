@@ -711,8 +711,12 @@ pub fn bypass_active() -> bool {
 /// Influx-oracle confirm costs one free existence probe and only fetches the
 /// gap write-capture left (over its per-upload cap or the process budget).
 /// Returns `true` iff bytes were actually fetched.
-pub async fn warm_full_if_absent(store: &dyn ObjectStore, shared: &SharedFoyerCache, location: &Path) -> bool {
-    !shared.contains_data(location.as_ref()) && warm_full(store, location).await
+/// `cache_key` is the key inserts actually used — bucket-relative, NOT the
+/// table-relative `location` the (prefixed) `store` GETs by. Probing with
+/// `location` made this always-miss in prod (every confirm re-downloaded its
+/// own upload).
+pub async fn warm_full_if_absent(store: &dyn ObjectStore, shared: &SharedFoyerCache, location: &Path, cache_key: &str) -> bool {
+    !shared.contains_data(cache_key) && warm_full(store, location).await
 }
 
 /// Parse the `date=YYYY-MM-DD` Hive partition segment from `s`. `None` for
@@ -1181,7 +1185,15 @@ impl FoyerObjectStoreCache {
             }
 
             // Check if this is likely a metadata request (reading from near the end of the file)
-            let is_metadata_request = range.start >= file_size.saturating_sub(metadata_size_hint);
+            // A file no bigger than the metadata hint is FULL-FILE class, not
+            // metadata: for such a file every range satisfies the footer
+            // proximity test, so the old test routed all its data pages down
+            // the per-(file,range) metadata path — one R2 GET per coalesced
+            // range per query, forever, and the main tier read as unused
+            // (prod 2026-08-03: hits=0/misses=0 with 1703 warmed entries while
+            // a sea of sub-1MB flush files paid per-range GETs). Falling
+            // through caches the whole body in the main tier with ONE GET.
+            let is_metadata_request = file_size > metadata_size_hint && range.start >= file_size.saturating_sub(metadata_size_hint);
             span.record("is_metadata", is_metadata_request);
 
             if is_metadata_request {
@@ -1223,7 +1235,7 @@ impl FoyerObjectStoreCache {
             if let Ok(result) = self.get_cached(location).await {
                 let full = Self::read_payload(result.payload).await?;
                 if range.end <= full.len() as u64 {
-                    return Ok(Bytes::copy_from_slice(&full[range.start as usize..range.end as usize]));
+                    return Ok(Bytes::from(full).slice(range.start as usize..range.end as usize));
                 }
             }
         }
@@ -2919,6 +2931,35 @@ mod tests {
         Ok(())
     }
 
+    /// A parquet file no bigger than the metadata size hint is FULL-FILE
+    /// class: its first data-range read pays ONE inner GET that populates the
+    /// main tier, and every later range on it is a main-tier hit with zero
+    /// inner traffic. Before the fix every range on such a file satisfied the
+    /// footer-proximity test and went down the per-(file,range) metadata path
+    /// — one R2 GET per distinct range per query, forever (prod 2026-08-03:
+    /// main tier read 0/0 while a sea of sub-1MB flush files paid per-range
+    /// GETs).
+    #[tokio::test]
+    async fn tiny_parquet_file_is_cached_whole_not_per_range() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicUsize;
+        let mem = Arc::new(InMemory::new());
+        let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
+        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("tiny_full")).await?;
+        let cache = FoyerObjectStoreCache::new_with_shared_cache(counting, &shared);
+
+        let path = Path::from("tbl/date=2026-01-02/tiny.parquet");
+        let body: Vec<u8> = (0..200u8).collect(); // far below the metadata size hint
+        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
+
+        assert_eq!(&cache.get_range_cached(&path, 0..64).await?[..], &body[0..64]);
+        let after_first = gets.load(Ordering::Relaxed);
+        assert_eq!(&cache.get_range_cached(&path, 64..128).await?[..], &body[64..128]);
+        assert_eq!(&cache.get_range_cached(&path, 10..190).await?[..], &body[10..190]);
+        assert_eq!(gets.load(Ordering::Relaxed), after_first, "later ranges must be main-tier hits, not per-range GETs");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn contains_data_probes_without_populating() -> anyhow::Result<()> {
         let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("contains_probe")).await?;
@@ -2948,14 +2989,14 @@ mod tests {
         cache.put(&captured, PutPayload::from_static(b"captured")).await?; // write-capture path
         mem.put(&skipped, PutPayload::from_static(b"skipped")).await?; // capture was skipped (over cap)
 
-        assert!(!warm_full_if_absent(&cache, &shared, &captured).await, "the captured file costs a probe, not a GET");
-        assert!(warm_full_if_absent(&cache, &shared, &skipped).await, "only the uncaptured file is fetched");
+        assert!(!warm_full_if_absent(&cache, &shared, &captured, captured.as_ref()).await, "the captured file costs a probe, not a GET");
+        assert!(warm_full_if_absent(&cache, &shared, &skipped, skipped.as_ref()).await, "only the uncaptured file is fetched");
         assert_eq!(gets.load(Ordering::Relaxed), 1);
         assert!(shared.contains_data(skipped.as_ref()), "the gap is cached before the caller drains");
 
         // Idempotent: a second pass is pure probes.
-        assert!(!warm_full_if_absent(&cache, &shared, &captured).await);
-        assert!(!warm_full_if_absent(&cache, &shared, &skipped).await);
+        assert!(!warm_full_if_absent(&cache, &shared, &captured, captured.as_ref()).await);
+        assert!(!warm_full_if_absent(&cache, &shared, &skipped, skipped.as_ref()).await);
         assert_eq!(gets.load(Ordering::Relaxed), 1);
 
         cache.shutdown().await?;
