@@ -1260,6 +1260,11 @@ impl BufferedWriteLayer {
             if rewind_applied {
                 self.wal.remove_recovery_rewind_marker();
             }
+            // Quarantine is a separate durability source from the unread WAL
+            // tail. `start_background_tasks` re-drives it through the normal
+            // WAL-first path after the listener can come up; a multi-GiB
+            // quarantine must not turn an exact zero-replay boot into minutes
+            // of 57P03 downtime.
             self.wal.request_reclaim_sweep();
             let recovery_duration_ms = start.elapsed().as_millis() as u64;
             self.wal_recovery_duration_ms.store(recovery_duration_ms, Ordering::Relaxed);
@@ -1689,9 +1694,10 @@ impl BufferedWriteLayer {
             if entries_replayed > 0 { insert_bytes / entries_replayed } else { 0 },
         );
 
-        // Quarantine must never be a quiet outcome. Re-drive is deliberately
-        // started with the other background tasks: a large or deterministically
-        // incompatible quarantine backlog must not hold the listener closed.
+        // Quarantine must never be a quiet outcome. Re-drive runs as a paced,
+        // cancellation-aware background task after the listener can come up;
+        // report the current backlog now so operators still see the loss-class
+        // alarm throughout that repair.
         let (q_files, q_bytes) = crate::wal::quarantine_stats(self.wal.data_dir());
         if q_files > 0 {
             crate::metrics::record_quarantine_backlog();
@@ -1705,7 +1711,7 @@ impl BufferedWriteLayer {
         Ok(stats)
     }
 
-    /// Boot-time quarantine re-drive: each flat `quarantine/*.bin` payload
+    /// Background quarantine re-drive: each flat `quarantine/*.bin` payload
     /// whose `.meta` sidecar says `operation=Insert` is decoded and sent back
     /// through the normal durable insert path (WAL append + MemBuffer), so a
     /// success is acked-durable before the file moves to `quarantine/redriven/`
@@ -1719,6 +1725,9 @@ impl BufferedWriteLayer {
         let redriven_dir = qdir.join(crate::wal::QUARANTINE_REDRIVEN_DIR_NAME);
         let (mut ok, mut failed) = (0u64, 0u64);
         for entry in rd.flatten() {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
             let path = entry.path();
             if path.extension().is_none_or(|e| e != "bin") {
                 continue;
@@ -1759,6 +1768,12 @@ impl BufferedWriteLayer {
                     failed += 1;
                     warn!("quarantine re-drive: {:?} failed, leaving parked: {}", path, e);
                 }
+            }
+            // A quarantine can be several GiB. Keep its repair from taking
+            // every CPU/disk/WAL slot away from live ingest and reads.
+            tokio::select! {
+                () = self.shutdown.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
         }
         if ok + failed > 0 {
@@ -1867,10 +1882,7 @@ impl BufferedWriteLayer {
             // listener serves immediately instead of blocking on the drain.
             spawn_task!(drain_to_budget),
             spawn_task!(finish_hot_tier_open),
-            // Quarantine files are already durable and remain parked on any
-            // failed attempt. Re-drive through the normal WAL-first insert path
-            // after readiness so an incompatible backlog cannot block boot.
-            spawn_task!(redrive_quarantine),
+            spawn_task!(run_quarantine_redrive_task),
         ]);
 
         info!("BufferedWriteLayer background tasks started");
@@ -1881,6 +1893,16 @@ impl BufferedWriteLayer {
         if let Err(e) = tokio::task::spawn_blocking(move || tier.finish_open()).await {
             warn!("hot tier background rescan panicked: {e}");
         }
+    }
+
+    async fn run_quarantine_redrive_task(self: Arc<Self>) {
+        // Let PGWire bind and the post-replay drain start first. The payloads
+        // remain durably parked during this short delay.
+        tokio::select! {
+            () = self.shutdown.cancelled() => return,
+            () = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+        self.redrive_quarantine().await;
     }
 
     async fn run_wal_gc_task(&self) {
@@ -5108,7 +5130,7 @@ mod tests {
 
     /// P0 quarantine re-drive (2026-07-28 silent-loss incidents): a parked
     /// insert payload with a valid Arrow IPC body must go back through the
-    /// durable insert path at boot and be archived under `redriven/`; a
+    /// durable insert path and be archived under `redriven/`; a
     /// torn-tail (undecodable) payload stays parked and keeps the alert
     /// count non-zero.
     #[serial]
@@ -5143,7 +5165,7 @@ mod tests {
         layer.recover_from_wal().await.unwrap();
         assert_eq!(layer.snapshot_stats().mem_total_rows, 0, "quarantine re-drive must not block recovery/readiness");
         layer.start_background_tasks().await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while layer.snapshot_stats().mem_total_rows != 1 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

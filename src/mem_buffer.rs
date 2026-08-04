@@ -140,6 +140,26 @@ fn align_batch_nullability(batch: RecordBatch, declared: Option<&SchemaRef>) -> 
     RecordBatch::try_new(aligned, batch.columns().to_vec()).unwrap_or(batch)
 }
 
+/// Put a registered table's batch in its one declared column order and type
+/// representation before it can establish or join a [`TableBuffer`].
+///
+/// SQL INSERTs may name columns in any order, and older WAL/hot-tier entries
+/// can predate newly-added nullable columns. Treating the first replayed
+/// batch's incidental schema as the table schema made replay depend on the
+/// first producer's field order and Arrow representation. Production on
+/// 2026-08-04 accumulated 5.1 GiB / 5,767 INSERT payloads from this class of
+/// mismatch. Delta's schema caster reorders by name, fills missing nullable
+/// fields, and performs supported representation casts without copying
+/// already-matching arrays.
+fn canonicalize_declared_batch(batch: RecordBatch, declared: Option<&SchemaRef>) -> anyhow::Result<RecordBatch> {
+    let Some(declared) = declared else { return Ok(batch) };
+    if batch.schema_ref() == declared {
+        return Ok(batch);
+    }
+    deltalake::kernel::schema::cast_record_batch(&batch, Arc::clone(declared), true, true)
+        .map_err(|e| anyhow::anyhow!("batch does not match declared table schema: {e}"))
+}
+
 fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
     match (existing, incoming) {
         // Timestamps: unit must match, timezone differences are allowed but logged
@@ -1158,14 +1178,21 @@ impl MemBuffer {
 
         // Fast path: table exists
         if let Some(table) = self.tables.get(&key) {
-            ensure_compatible(table.schema())?;
+            // Registered tables canonicalize the actual batch against their
+            // declared schema in `insert_batch`; comparing the caller's
+            // pre-canonical column order here would reject valid WAL entries.
+            if table.declared.is_none() {
+                ensure_compatible(table.schema())?;
+            }
             return Ok(Arc::clone(&table));
         }
 
         // Slow path: create table using entry API
         match self.tables.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
-                ensure_compatible(entry.get().schema())?;
+                if entry.get().declared.is_none() {
+                    ensure_compatible(entry.get().schema())?;
+                }
                 Ok(Arc::clone(entry.get()))
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -2480,7 +2507,10 @@ impl TableBuffer {
         // the advertised schema, so readers see the declared truth rather than
         // whatever metadata the first batch to arrive happened to carry.
         let declared = crate::schema_loader::get_schema(&table_name).map(|s| s.schema_ref());
-        let schema = declared.as_ref().and_then(|d| align_nullability(&schema, d, None)).unwrap_or(schema);
+        // A registered table has one authoritative schema. Pinning the first
+        // batch instead made replay depend on which SQL column order happened
+        // to arrive first, even though every batch named the same fields.
+        let schema = declared.clone().unwrap_or(schema);
         Self { buckets: DashMap::new(), schema, declared, project_id, table_name }
     }
 
@@ -2507,6 +2537,7 @@ impl TableBuffer {
         // Reconcile against the declared schema BEFORE the batch is stored:
         // every downstream consumer (coalesce, flush, hot-tier demotion, query)
         // then sees one authoritative nullability. See `align_nullability`.
+        let batch = canonicalize_declared_batch(batch, self.declared.as_ref())?;
         let batch = align_batch_nullability(compact_batch(batch), self.declared.as_ref());
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
@@ -2747,11 +2778,30 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{Int64Array, StringViewArray, TimestampMicrosecondArray},
+        array::{Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
 
     use super::*;
+
+    #[test]
+    fn declared_batch_canonicalization_reorders_casts_and_fills_nullable_fields() {
+        // IPC decoders frequently advertise nullable=true even when the array
+        // has no nulls; the declared target may truthfully be NOT NULL.
+        let incoming_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true), Field::new("value", DataType::Int64, true)]));
+        let incoming = RecordBatch::try_new(incoming_schema, vec![Arc::new(StringArray::from(vec!["x"])), Arc::new(Int64Array::from(vec![7]))]).unwrap();
+        let declared = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("optional", DataType::Int64, true),
+        ]));
+
+        let got = canonicalize_declared_batch(incoming, Some(&declared)).unwrap();
+        assert_eq!(got.schema(), declared);
+        assert_eq!(got.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 7);
+        assert_eq!(got.column(1).as_any().downcast_ref::<StringViewArray>().unwrap().value(0), "x");
+        assert!(got.column(2).is_null(0));
+    }
 
     /// The Delta leg excludes the UNION of the tiers' ranges, so merging must
     /// preserve it exactly: adjacent buckets (`end == next start`) collapse,
