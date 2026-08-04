@@ -1,9 +1,17 @@
 # Apply in CapRover's "Service Update Override" for TimeFusion.
 #
 # Safe only after every running task uses a binary that implements both HANDOFF
-# and the WAL takeover.request protocol. The new task remains unhealthy while its early PGWire
-# responder returns 57P03; once it requests the shared WAL lock, the drained
-# predecessor exits and the real PGWire server becomes healthy.
+# and the WAL takeover.request protocol. TCP 5432 is deliberately absent here:
+# the stable srv-timefusion-pgwire-proxy service owns the host-mode port. The
+# new task remains unhealthy while its early PGWire responder returns 57P03;
+# once it requests the shared WAL lock, the drained predecessor exits and the
+# real PGWire server becomes healthy.
+EndpointSpec:
+  Ports:
+    - Protocol: tcp
+      TargetPort: 50051
+      PublishedPort: 50051
+      PublishMode: ingress
 UpdateConfig:
   Parallelism: 1
   Delay: 100000000
