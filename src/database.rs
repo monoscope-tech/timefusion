@@ -8832,9 +8832,10 @@ impl Database {
 
         // Close PostgreSQL connection pool if present
         if let Some(ref pool) = self.config_pool
-            && tokio::time::timeout_at(deadline, pool.close()).await.is_err() {
-                warn!("PostgreSQL pool close exceeded shutdown deadline — dropping connections on process exit");
-            }
+            && tokio::time::timeout_at(deadline, pool.close()).await.is_err()
+        {
+            warn!("PostgreSQL pool close exceeded shutdown deadline — dropping connections on process exit");
+        }
 
         info!("Database shutdown complete");
         Ok(())
