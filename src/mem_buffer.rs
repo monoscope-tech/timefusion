@@ -156,6 +156,18 @@ fn canonicalize_declared_batch(batch: RecordBatch, declared: Option<&SchemaRef>)
     if batch.schema_ref() == declared {
         return Ok(batch);
     }
+    // A direct MemBuffer caller may intentionally provide only a projection
+    // of the registered schema (unit tests and internal narrow paths do this).
+    // Widening that projection would have to invent values for declared
+    // NOT-NULL fields such as `summary`. Preserve the established partial-
+    // batch path; full WAL/client rows still canonicalize, including filling
+    // nullable columns added after an older payload was written.
+    let incoming = batch.schema();
+    if declared.fields().iter().any(|field| !field.is_nullable() && incoming.field_with_name(field.name()).is_err())
+        || incoming.fields().iter().any(|field| declared.field_with_name(field.name()).is_err())
+    {
+        return Ok(batch);
+    }
     // Preserve honest nullability for malformed legacy data. Casting directly
     // to a declared NOT NULL field relabels an array containing nulls as
     // non-nullable; downstream code then trusts a false invariant. Missing
@@ -1239,6 +1251,8 @@ impl MemBuffer {
     pub fn insert_with_hold(
         &self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>,
     ) -> anyhow::Result<()> {
+        let declared = crate::schema_loader::get_schema(table_name).map(|schema| schema.schema_ref());
+        let batch = canonicalize_declared_batch(batch, declared.as_ref())?;
         let schema = batch.schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
         let (mem_delta, bucket_id) = table.insert_batch(batch, timestamp_micros, wal_hold)?;
@@ -2525,10 +2539,10 @@ impl TableBuffer {
         // the advertised schema, so readers see the declared truth rather than
         // whatever metadata the first batch to arrive happened to carry.
         let declared = crate::schema_loader::get_schema(&table_name).map(|s| s.schema_ref());
-        // A registered table has one authoritative schema. Pinning the first
-        // batch instead made replay depend on which SQL column order happened
-        // to arrive first, even though every batch named the same fields.
-        let schema = declared.clone().unwrap_or(schema);
+        // The caller canonicalizes full registered batches before construction.
+        // A deliberately narrow internal batch cannot advertise columns it
+        // does not carry, so retain its shape and align only matching fields.
+        let schema = declared.as_ref().and_then(|d| align_nullability(&schema, d, None)).unwrap_or(schema);
         Self { buckets: DashMap::new(), schema, declared, project_id, table_name }
     }
 
@@ -2822,10 +2836,12 @@ mod tests {
     }
 
     #[test]
-    fn declared_batch_canonicalization_rejects_missing_required_fields() {
+    fn declared_batch_canonicalization_preserves_intentional_partial_batches() {
         let incoming = RecordBatch::try_from_iter(vec![("value", Arc::new(Int64Array::from(vec![7])) as ArrayRef)]).unwrap();
         let declared = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false), Field::new("required", DataType::Utf8, false)]));
-        assert!(canonicalize_declared_batch(incoming, Some(&declared)).is_err());
+        let got = canonicalize_declared_batch(incoming.clone(), Some(&declared)).unwrap();
+        assert_eq!(got.schema(), incoming.schema());
+        assert_eq!(got.num_rows(), 1);
     }
 
     /// The Delta leg excludes the UNION of the tiers' ranges, so merging must
