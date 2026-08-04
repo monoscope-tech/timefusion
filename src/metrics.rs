@@ -486,6 +486,10 @@ atomic_stats! {
     /// (durability outranks compaction) or memory was near the cgroup limit.
     /// Chronic nonzero = compaction is being starved, not protected.
     light_optimize_wal_yields,
+    /// Ticks/waves stopped because at least one MemBuffer bucket exceeded its
+    /// retention target without landing. Unlike the byte-based WAL brake this
+    /// catches small but old persistence debt.
+    light_optimize_flush_debt_yields,
     light_optimize_memory_brakes,
     /// Scans on a `version_append` table where the Delta leg did NOT already
     /// satisfy keep-greatest's ordering, so a `SortExec` was injected over it.

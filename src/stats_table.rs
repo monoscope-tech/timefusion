@@ -303,6 +303,7 @@ impl StatsTableProvider {
             "dedup_bins_committed_total" => m.dedup_bins_committed,
             "dedup_waves_committed_total" => m.dedup_waves_committed,
             "light_optimize_wal_yields_total" => m.light_optimize_wal_yields,
+            "light_optimize_flush_debt_yields_total" => m.light_optimize_flush_debt_yields,
             "light_optimize_memory_brakes_total" => m.light_optimize_memory_brakes,
             "mor_delta_leg_sorts_total" => m.mor_delta_leg_sorts,
             "flush_sort_unsorted_fallbacks_total" => m.flush_sort_unsorted_fallbacks,

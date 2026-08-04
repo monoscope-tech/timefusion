@@ -946,7 +946,12 @@ const_default!(d_wide_scan_lookback_hours: u64 = 2);
 // 256 files is still only ~26 MB — the MB cap does the real bounding, and the
 // 7-day case that motivated the gate blows through the MB cap regardless.
 const_default!(d_wide_scan_max_files: usize = 256);
-const_default!(d_wide_scan_max_mb: u64 = 512);
+// Compressed parquet bytes understate transient Arrow decode heap by an order
+// of magnitude on OTel data. A 222 MB historical file measured ~4 GiB of
+// process growth while 48 row groups decoded in parallel (2026-08-04), so it
+// must participate in the shared decode gate instead of using the small-scan
+// exemption. 64 MB keeps genuinely small, well-pruned history reads ungated.
+const_default!(d_wide_scan_max_mb: u64 = 64);
 const_default!(d_plan_cache_capacity: usize = 2048);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
@@ -2237,6 +2242,7 @@ mod tests {
         assert_eq!(config.cache.block_size_bytes(), 256 * MIB);
         assert_eq!(config.cache.timefusion_foyer_l1_max_entry_mb, 16);
         assert_eq!(config.cache.timefusion_cache_recent_days, 8);
+        assert_eq!(config.memory.timefusion_wide_scan_max_mb, 64);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(config.maintenance.timefusion_evict_after_compaction);
         // Merge-on-read DV is the default write path (and thus what all test

@@ -25,7 +25,7 @@ use std::{
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::{
     arrow::{
-        array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray},
+        array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray},
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     },
     execution::TaskContext,
@@ -78,6 +78,7 @@ fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("version", DataType::Int64, false),
         Field::new("payload", DataType::Utf8, false), // fat body DedupExec must never touch
     ]))
 }
@@ -103,14 +104,19 @@ fn make_batches(total: usize, distinct: usize, sorted: bool) -> Vec<RecordBatch>
         .map(|chunk| {
             let ids: Vec<String> = chunk.iter().map(|&k| format!("id-{k:016x}")).collect();
             let ts: Vec<i64> = chunk.iter().map(|&k| 1_700_000_000_000_000 + k as i64).collect();
-            let cols: Vec<ArrayRef> =
-                vec![Arc::new(StringArray::from(ids)), Arc::new(TimestampMicrosecondArray::from(ts)), Arc::new(StringArray::from(vec![PAYLOAD; chunk.len()]))];
+            let versions: Vec<i64> = chunk.iter().enumerate().map(|(row, &k)| (row as i64) ^ (k as i64)).collect();
+            let cols: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(TimestampMicrosecondArray::from(ts)),
+                Arc::new(Int64Array::from(versions)),
+                Arc::new(StringArray::from(vec![PAYLOAD; chunk.len()])),
+            ];
             RecordBatch::try_new(s.clone(), cols).unwrap()
         })
         .collect()
 }
 
-fn dedup_plan(batches: Vec<RecordBatch>, sorted: bool) -> Arc<dyn ExecutionPlan> {
+fn dedup_plan(batches: Vec<RecordBatch>, sorted: bool, keep_greatest: bool) -> Arc<dyn ExecutionPlan> {
     let s = schema();
     let src = MemorySourceConfig::try_new(&[batches], s.clone(), None).unwrap();
     // Declare the timestamp ordering so DedupExec's Tier-2 bounded-window gate
@@ -122,7 +128,7 @@ fn dedup_plan(batches: Vec<RecordBatch>, sorted: bool) -> Arc<dyn ExecutionPlan>
         src
     };
     let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(src)));
-    Arc::new(DedupExec::new(input, vec!["id".into(), "timestamp".into()], None).unwrap())
+    Arc::new(DedupExec::with_tiebreak(input, vec!["id".into(), "timestamp".into()], keep_greatest.then(|| "version".into()), None).unwrap())
 }
 
 /// Drain the dedup stream, return surviving row count.
@@ -148,16 +154,24 @@ fn bench_dedup(c: &mut Criterion) {
     for &total in &sizes() {
         for &ratio in &DUP_RATIOS {
             let distinct = (total * (100 - ratio) as usize / 100).max(1);
-            for &sorted in &[false, true] {
-                let batches = make_batches(total, distinct, sorted);
-                let tag = format!("n{}m/dup{}/{}", total / 1_000_000, ratio, if sorted { "sorted" } else { "shuffled" });
-                group.throughput(Throughput::Elements(total as u64));
-                group.bench_with_input(BenchmarkId::from_parameter(&tag), &batches, |b, batches| {
-                    b.to_async(&rt).iter(|| {
-                        let plan = dedup_plan(batches.clone(), sorted);
-                        async move { drain(plan).await }
+            for &keep_greatest in &[false, true] {
+                for &sorted in &[false, true] {
+                    let batches = make_batches(total, distinct, sorted);
+                    let tag = format!(
+                        "n{}m/dup{}/{}/{}",
+                        total / 1_000_000,
+                        ratio,
+                        if sorted { "sorted" } else { "shuffled" },
+                        if keep_greatest { "greatest" } else { "first" },
+                    );
+                    group.throughput(Throughput::Elements(total as u64));
+                    group.bench_with_input(BenchmarkId::from_parameter(&tag), &batches, |b, batches| {
+                        b.to_async(&rt).iter(|| {
+                            let plan = dedup_plan(batches.clone(), sorted, keep_greatest);
+                            async move { drain(plan).await }
+                        });
                     });
-                });
+                }
             }
         }
     }
@@ -172,11 +186,19 @@ fn mem_report(rt: &tokio::runtime::Runtime) {
     for &total in &sizes() {
         for &ratio in &DUP_RATIOS {
             let distinct = (total * (100 - ratio) as usize / 100).max(1);
-            for &sorted in &[false, true] {
-                let batches = make_batches(total, distinct, sorted);
-                let (kept, peak, allocs) = measure(|| rt.block_on(drain(dedup_plan(batches, sorted))));
-                let tag = format!("n{}m/dup{}/{}", total / 1_000_000, ratio, if sorted { "s" } else { "x" });
-                println!("{tag:<28} {peak:>14} {allocs:>14} {kept:>10}");
+            for &keep_greatest in &[false, true] {
+                for &sorted in &[false, true] {
+                    let batches = make_batches(total, distinct, sorted);
+                    let (kept, peak, allocs) = measure(|| rt.block_on(drain(dedup_plan(batches, sorted, keep_greatest))));
+                    let tag = format!(
+                        "n{}m/dup{}/{}/{}",
+                        total / 1_000_000,
+                        ratio,
+                        if sorted { "s" } else { "x" },
+                        if keep_greatest { "greatest" } else { "first" },
+                    );
+                    println!("{tag:<28} {peak:>14} {allocs:>14} {kept:>10}");
+                }
             }
         }
     }

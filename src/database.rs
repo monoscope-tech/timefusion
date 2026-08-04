@@ -6415,22 +6415,30 @@ impl Database {
                 .log_data()
                 .iter()
                 .filter_map(|f| {
-                    let date = f.path().split('/').find_map(|s| s.strip_prefix("date="))?.parse::<chrono::NaiveDate>().ok()?;
-                    (Self::date_is_cold(today, date, after_days) && f.size() < target_of(date)).then_some(date)
+                    let path = f.path();
+                    let date = path.split('/').find_map(|s| s.strip_prefix("date="))?.parse::<chrono::NaiveDate>().ok()?;
+                    let project_id = path.split('/').find_map(|s| s.strip_prefix("project_id="))?.to_owned();
+                    (Self::date_is_cold(today, date, after_days) && f.size() < target_of(date)).then_some((date, project_id))
                 })
-                .fold(HashMap::<chrono::NaiveDate, usize>::new(), |mut acc, d| {
-                    *acc.entry(d).or_default() += 1;
+                .fold(HashMap::<(chrono::NaiveDate, String), usize>::new(), |mut acc, key| {
+                    *acc.entry(key).or_default() += 1;
                     acc
                 })
                 .into_iter()
                 // Ties break to the NEWEST date: it is the one queries read.
-                .max_by_key(|&(date, n)| (n, date))
+                .filter(|(_, n)| *n >= 2)
+                .max_by(|((a_date, a_project), a_n), ((b_date, b_project), b_n)| {
+                    a_n.cmp(b_n).then_with(|| a_date.cmp(b_date)).then_with(|| b_project.cmp(a_project))
+                })
         };
-        let Some((date, small_files)) = worst.filter(|&(_, n)| n >= 2) else {
+        let Some(((date, project_id), small_files)) = worst else {
             return Ok(());
         };
-        info!("consolidate-catchup: table={} date={} {} small file(s), running up to {} pass(es)", table_name, date, small_files, max_passes);
-        self.consolidate_date_binned(table_ref, table_name, date, target_of(date), None, max_passes).await
+        info!(
+            "consolidate-catchup: table={} project={} date={} {} small file(s), running up to {} pass(es)",
+            table_name, project_id, date, small_files, max_passes
+        );
+        self.consolidate_date_binned(table_ref, table_name, date, target_of(date), Some(&project_id), max_passes).await
     }
 
     /// Leveled (L2) consolidation of one sealed `date`: per project, repeatedly
@@ -6451,7 +6459,15 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>, max_passes: usize,
     ) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
+        // This path already bounds each rewrite to one event-time bin at the
+        // cold target, so it does not share the whole-partition external-sort
+        // hazard guarded by `timefusion_optimize_sort_by`. Its contract is to
+        // produce disjoint sorted runs: leaving this behind that global kill
+        // switch made the default cold compactor strip ordering from historical
+        // files and forced read-side greatest-version dedup to buffer the full
+        // scan. Always sort/dedup the bounded bin; whole-partition optimize and
+        // recompress remain gated by the kill switch.
+        let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, true);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
         let date_str = date.to_string();
         let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
@@ -8499,6 +8515,11 @@ impl Database {
     /// limit is an imminent OOM: hard STOP.
     fn light_optimize_brake(&self) -> Option<Brake> {
         use std::sync::atomic::Ordering::Relaxed;
+        if let Some(stale_buckets) = self.buffered_layer().map(|layer| layer.stale_unflushed_bucket_count()).filter(|count| *count > 0) {
+            info!(stale_buckets, event = "light_optimize_flush_debt_yield");
+            crate::metrics::maintenance_stats().light_optimize_flush_debt_yields.fetch_add(1, Relaxed);
+            return Some(Brake::Stop("stale_unflushed_buckets"));
+        }
         if self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) {
             info!(event = "light_optimize_wal_yield");
             crate::metrics::maintenance_stats().light_optimize_wal_yields.fetch_add(1, Relaxed);

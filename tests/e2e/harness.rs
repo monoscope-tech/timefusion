@@ -73,6 +73,7 @@ pub struct E2eEnvBuilder {
     sort_skip_bytes: Option<usize>,
     light_optimize_target_size: Option<i64>,
     wide_scan_max_files: Option<usize>,
+    wide_scan_max_mb: Option<u64>,
 }
 
 impl Default for E2eEnvBuilder {
@@ -96,6 +97,7 @@ impl Default for E2eEnvBuilder {
             sort_skip_bytes: None,
             light_optimize_target_size: None,
             wide_scan_max_files: None,
+            wide_scan_max_mb: None,
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
@@ -150,6 +152,10 @@ impl E2eEnvBuilder {
     /// admission gate (the prod default is 256 files).
     pub fn with_wide_scan_max_files(mut self, files: usize) -> Self {
         self.wide_scan_max_files = Some(files);
+        self
+    }
+    pub fn with_wide_scan_max_mb(mut self, mb: u64) -> Self {
+        self.wide_scan_max_mb = Some(mb);
         self
     }
     pub fn with_foyer_enabled(mut self) -> Self {
@@ -266,6 +272,7 @@ impl E2eEnvBuilder {
             sort_skip_bytes: self.sort_skip_bytes,
             light_optimize_target_size: self.light_optimize_target_size,
             wide_scan_max_files: self.wide_scan_max_files,
+            wide_scan_max_mb: self.wide_scan_max_mb,
             page_row_count_limit: self.page_row_count_limit,
             test_id: &test_id,
         });
@@ -372,6 +379,7 @@ impl E2eEnv {
             sort_skip_bytes: self.builder.sort_skip_bytes,
             light_optimize_target_size: self.builder.light_optimize_target_size,
             wide_scan_max_files: self.builder.wide_scan_max_files,
+            wide_scan_max_mb: self.builder.wide_scan_max_mb,
             page_row_count_limit: self.builder.page_row_count_limit,
             test_id: &self.test_id,
         });
@@ -492,6 +500,7 @@ struct BuildCfgArgs<'a> {
     sort_skip_bytes: Option<usize>,
     light_optimize_target_size: Option<i64>,
     wide_scan_max_files: Option<usize>,
+    wide_scan_max_mb: Option<u64>,
     test_id: &'a str,
 }
 
@@ -534,6 +543,9 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     }
     if let Some(files) = args.wide_scan_max_files {
         cfg.memory.timefusion_wide_scan_max_files = files;
+    }
+    if let Some(mb) = args.wide_scan_max_mb {
+        cfg.memory.timefusion_wide_scan_max_mb = mb;
     }
     Arc::new(cfg)
 }

@@ -2071,6 +2071,17 @@ impl BufferedWriteLayer {
         )
     }
 
+    /// Number of buckets that have already exceeded the configured hot-buffer
+    /// retention and still have not landed in Delta.
+    ///
+    /// This is a stronger persistence-debt signal than bytes alone: a small,
+    /// old bucket can sit below the WAL byte threshold indefinitely while
+    /// maintenance rewrites keep winning shared S3/commit capacity. Scheduled
+    /// optimization must yield until these buckets drain.
+    pub fn stale_unflushed_bucket_count(&self) -> usize {
+        self.mem_buffer.count_buckets_with_max_ts_before(self.retention_cutoff_micros())
+    }
+
     /// The emergency-flush predicate: WAL over EITHER threshold (file count or
     /// total on-disk bytes). Cheap (two atomics behind `wal_stats`). Kept on
     /// TOTAL size on purpose: an extra flush is harmless, so a conservative
@@ -2741,7 +2752,7 @@ impl BufferedWriteLayer {
     /// buckets — that lost data. Now we keep them and surface the
     /// condition so an operator can see flushes are stuck.
     fn evict_drained_metadata(&self) {
-        let stuck = self.mem_buffer.count_buckets_with_max_ts_before(self.retention_cutoff_micros());
+        let stuck = self.stale_unflushed_bucket_count();
         if stuck > 0 {
             warn!("{} bucket(s) older than retention ({}min) still in MemBuffer — flush is failing or backed up", stuck, self.config.buffer.retention_mins());
         }
@@ -3596,6 +3607,25 @@ mod tests {
         assert!(wal_backlog_over_threshold(1024, MAX, now - 60_000_000, now));
         // ...but a stale failure does not.
         assert!(!wal_backlog_over_threshold(1024, MAX, now - 10 * 60_000_000, now));
+    }
+
+    /// A byte threshold alone misses small persistence debt. Maintenance must
+    /// be able to see a bucket that has aged beyond retention even when its
+    /// memory footprint is tiny (prod 2026-08-05: light optimize kept running
+    /// while 9 such buckets were already over the 70-minute target).
+    #[test]
+    fn stale_unflushed_bucket_count_tracks_age_not_backlog_size() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        let now = crate::clock::now_micros();
+        let retention = cfg.buffer.retention_mins() as i64 * 60 * 1_000_000;
+
+        layer.mem_buffer.insert("old", "old", create_test_batch("old"), now - retention - 1).unwrap();
+        layer.mem_buffer.insert("hot", "hot", create_test_batch("hot"), now).unwrap();
+
+        assert_eq!(layer.stale_unflushed_bucket_count(), 1, "only the over-retention bucket is persistence debt");
+        assert!(!layer.is_wal_backlog_over_threshold(), "the age brake must cover debt too small for the byte threshold");
     }
 
     /// The stored WAL SQL must be normalized (bare target cols + `source__`

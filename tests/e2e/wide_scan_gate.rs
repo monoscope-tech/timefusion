@@ -95,3 +95,35 @@ async fn deep_but_well_pruned_scan_is_not_gated_while_a_many_file_scan_still_is(
 
     Ok(())
 }
+
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_single_file_over_the_byte_budget_is_gated() -> anyhow::Result<()> {
+    let bucket_secs = 60u64;
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_wide_scan_max_files(usize::MAX)
+        // Zero makes any non-empty selected file exceed the byte exemption.
+        // This keeps the fixture tiny while exercising the same branch as the
+        // 222 MB historical production file that decoded to ~4 GiB of heap.
+        .with_wide_scan_max_mb(0)
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+    let hour = 3_600_000_000i64;
+    let ts = FROZEN_START_MICROS - 40 * hour;
+    insert_at(&client, "byte-budget", ts).await?;
+    env.advance(Duration::from_secs(bucket_secs * 2));
+    env.force_flush().await?;
+
+    let query = "SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' \
+                 AND timestamp > now() - interval '41 hours' ORDER BY timestamp DESC LIMIT 1";
+    let plan = explain(&client, query).await?;
+    assert!(
+        plan.contains("GatedScanExec"),
+        "a deep scan whose selected bytes exceed the exemption must share the decode gate even when it selects one file. Plan was:\n{plan}"
+    );
+    assert_eq!(client.query_one(query, &[]).await?.get::<_, String>(0), "byte-budget");
+    Ok(())
+}
