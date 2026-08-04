@@ -7244,15 +7244,16 @@ impl Database {
                 };
                 let Some(batch) = batch else { break };
                 index.apply_batch(&batch, columns)?;
-                // A three-day dashboard window can touch four UTC partitions.
-                // Reserve room for all four so independently valid daily
-                // indexes cannot evict one another into a permanent rebuild
-                // loop while the query is warming.
-                let per_index_limit = (self.config.derived.logical_count_memory_bytes() / 4).max(1);
+                // The mutable builder intentionally costs more than the packed
+                // resident form. Let it use half of this cache's budget while
+                // retaining the host brake below; applying the four-way
+                // resident limit here prevented large days from ever reaching
+                // `finalize`, where their allocator/hash overhead is released.
+                let build_limit = (self.config.derived.logical_count_memory_bytes() / 2).max(1);
                 anyhow::ensure!(
-                    index.estimated_heap_bytes() <= per_index_limit,
-                    "logical-count partition exceeded its {}MB resident build limit",
-                    per_index_limit / (1024 * 1024)
+                    index.estimated_heap_bytes() <= build_limit,
+                    "logical-count partition exceeded its {}MB temporary build limit",
+                    build_limit / (1024 * 1024)
                 );
                 let host_limit = self.config.derived.memory_brake_limit_bytes();
                 anyhow::ensure!(
@@ -7267,6 +7268,15 @@ impl Database {
         // admission. The packed form is exact and is the representation used
         // by every query and persisted Arrow partition.
         index.finalize()?;
+        // A three-day dashboard window can touch four UTC partitions. Reserve
+        // room for all four after compaction so valid daily indexes cannot
+        // evict one another into a permanent rebuild loop.
+        let per_index_limit = (self.config.derived.logical_count_memory_bytes() / 4).max(1);
+        anyhow::ensure!(
+            index.estimated_heap_bytes() <= per_index_limit,
+            "logical-count partition exceeded its {}MB packed resident limit",
+            per_index_limit / (1024 * 1024)
+        );
 
         // Concurrent appends are safe: the query overlays their new files.
         // A removal/rewrite is not; it would leave winners from files no longer
