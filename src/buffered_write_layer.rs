@@ -465,11 +465,6 @@ pub struct BufferedWriteLayer {
     accepting_writes: std::sync::atomic::AtomicBool,
     active_writes: AtomicU64,
     writes_drained: Notify,
-    /// Real-clock timestamp of the latest successful operator `FLUSH`. The
-    /// deploy workflow issues that command immediately before task replacement;
-    /// a recent value lets SIGTERM use a short WAL-backed handoff even when
-    /// continuous ingestion made the layer non-empty again.
-    planned_handoff_micros: std::sync::atomic::AtomicI64,
     delta_write_callback: Option<DeltaWriteCallback>,
     /// Set alongside `delta_write_callback`; used instead of it when
     /// `TIMEFUSION_FLUSH_COALESCE_COMMITS` is on (see `flush_groups_coalesced`).
@@ -651,20 +646,6 @@ impl BufferedWriteLayer {
         self.accepting_writes.store(false, Ordering::Release);
     }
 
-    /// Record that the operator completed the pre-deploy durability flush.
-    pub fn mark_planned_handoff(&self) {
-        self.planned_handoff_micros.store(chrono::Utc::now().timestamp_micros(), Ordering::Release);
-    }
-
-    /// A deployment normally follows its administrative flush within seconds.
-    /// Keep a generous window for slow orchestration/image pulls; this hint
-    /// only shortens graceful flush effort, never bypasses WAL recovery.
-    pub fn has_recent_planned_handoff(&self) -> bool {
-        const WINDOW_MICROS: i64 = 15 * 60 * 1_000_000;
-        let marked = self.planned_handoff_micros.load(Ordering::Acquire);
-        marked > 0 && chrono::Utc::now().timestamp_micros().saturating_sub(marked) <= WINDOW_MICROS
-    }
-
     async fn wait_for_active_writes_until(&self, deadline: tokio::time::Instant) -> bool {
         loop {
             let notified = self.writes_drained.notified();
@@ -707,7 +688,6 @@ impl BufferedWriteLayer {
             accepting_writes: std::sync::atomic::AtomicBool::new(true),
             active_writes: AtomicU64::new(0),
             writes_drained: Notify::new(),
-            planned_handoff_micros: std::sync::atomic::AtomicI64::new(0),
             delta_write_callback: None,
             coalesced_write_callback: None,
             tantivy_index_callback: None,
@@ -3006,7 +2986,7 @@ impl BufferedWriteLayer {
     /// use `shutdown_by` with the shared absolute deadline instead.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let configured = self.config.buffer.stop_grace();
-        let grace = if self.has_recent_planned_handoff() { configured.min(Duration::from_secs(1)) } else { configured };
+        let grace = if self.is_drained() { configured.min(Duration::from_secs(1)) } else { configured };
         self.shutdown_by(tokio::time::Instant::now() + grace).await
     }
 
@@ -3034,7 +3014,6 @@ impl BufferedWriteLayer {
         // flush retains WAL holds, so moving on is both safe and gives the
         // coalesced shutdown flush a real chance to drain the tail.
         let already_drained = self.is_drained();
-        let planned_handoff = self.has_recent_planned_handoff();
         let cancellation_slice = if already_drained { budget.mul_f32(0.1).min(Duration::from_millis(250)) } else { budget.mul_f32(0.1) };
         let background_deadline = tokio::time::Instant::now() + cancellation_slice;
         let flush_deadline = deadline - budget.mul_f32(0.2); // reserve 20% for the snapshot
@@ -3083,13 +3062,6 @@ impl BufferedWriteLayer {
         // next boot.
         if already_drained && writes_quiesced && self.is_drained() {
             info!("Shutdown flush skipped: write-fenced layer is already fully drained");
-        } else if planned_handoff {
-            // The admin FLUSH immediately preceding a deploy already paid the
-            // remote Delta commit cost. Any rows accepted afterward are WAL
-            // durable. Starting another remote commit here only burns the WAL
-            // lock handoff budget and is usually cancelled mid-request; write
-            // the conservative snapshot below and replay that small tail.
-            info!("Shutdown flush skipped: planned handoff will replay the post-FLUSH WAL tail");
         } else {
             match tokio::time::timeout_at(flush_deadline, self.flush_buckets_where(|_| true)).await {
                 Ok(Ok(stats)) => info!(
@@ -3147,12 +3119,28 @@ impl BufferedWriteLayer {
     /// The outgoing process remains fully available during this wait; paying it
     /// before orchestration starts keeps the replacement from rescanning a
     /// large, already-consumed WAL.
-    pub async fn reclaim_wal_for_planned_handoff(&self) {
+    pub async fn reclaim_wal_after_flush(&self) {
+        let before = self.wal.reclaim_state_counts();
         let epoch = self.wal.request_reclaim_sweep();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !self.wal.reclaim_sweep_complete(epoch) && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let after = self.wal.reclaim_state_counts();
+        info!(
+            "WAL reclaim handoff: before(total={}, eligible={}, locked={}, uncheckpointed={}, open={}), after(total={}, eligible={}, locked={}, uncheckpointed={}, open={}), completed={}",
+            before.total,
+            before.eligible,
+            before.locked,
+            before.uncheckpointed,
+            before.open,
+            after.total,
+            after.eligible,
+            after.locked,
+            after.uncheckpointed,
+            after.open,
+            self.wal.reclaim_sweep_complete(epoch)
+        );
     }
 
     /// Flush one taken bucket: force-flushed marking + in-flight hold
@@ -4707,14 +4695,12 @@ mod tests {
         assert!(layer.is_drained(), "a successful flush must report drained");
     }
 
-    /// A workflow FLUSH may be followed by a small amount of live ingestion
-    /// before CapRover delivers SIGTERM. That tail is already WAL durable; a
-    /// second remote flush would lengthen the outage without improving the
-    /// guarantee. Planned shutdown must checkpoint quickly and leave the tail
-    /// replayable rather than invoking Delta again.
+    /// A workflow FLUSH can be followed by substantial live ingestion before
+    /// CapRover delivers SIGTERM. The admission fence makes that tail finite;
+    /// planned shutdown must flush it rather than turn it into boot replay.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn planned_handoff_skips_redundant_remote_flush_and_keeps_wal_tail() {
+    async fn shutdown_flushes_post_predeploy_flush_tail() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
         let flush_calls = Arc::new(AtomicU64::new(0));
@@ -4724,7 +4710,6 @@ mod tests {
             let calls = Arc::clone(&calls);
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_secs(60)).await;
                 Ok(Vec::new())
             })
         }));
@@ -4732,15 +4717,11 @@ mod tests {
         let project = format!("planned_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
         let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span("tail", "span", &project)]).unwrap();
         layer.insert(&project, "otel_logs_and_spans", vec![batch]).await.unwrap();
-        layer.mark_planned_handoff();
-
-        let started = std::time::Instant::now();
         layer.shutdown().await.unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1), "planned WAL handoff exceeded one second: {:?}", started.elapsed());
-        assert_eq!(flush_calls.load(Ordering::Relaxed), 0, "planned handoff must not start a redundant remote Delta commit");
+        assert_eq!(flush_calls.load(Ordering::Relaxed), 1, "shutdown must flush the finite post-FLUSH tail");
         let snap = layer.wal().load_cursor_snapshot().unwrap();
-        assert!(snap.clean_shutdown && !snap.drained, "post-FLUSH tail requires a clean, non-drained snapshot");
-        assert!(!layer.wal().is_fully_consumed().unwrap(), "post-FLUSH tail must remain unread for replacement replay");
+        assert!(snap.clean_shutdown && snap.drained, "successful final flush must authorize a drained boot");
+        assert!(layer.wal().is_fully_consumed().unwrap(), "replacement must not replay the flushed tail");
     }
 
     /// A wedged ancillary worker must not consume the shutdown flush's entire
@@ -4807,9 +4788,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
         let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
-        assert!(!layer.has_recent_planned_handoff());
-        layer.mark_planned_handoff();
-        assert!(layer.has_recent_planned_handoff(), "successful admin FLUSH must arm the short planned-deploy handoff");
         let worker_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dropped = Arc::clone(&worker_dropped);
         let worker_started = Arc::new(Notify::new());

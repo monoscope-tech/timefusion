@@ -110,6 +110,15 @@ pub struct CursorSnapshot {
     pub entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReclaimStateCounts {
+    pub total: usize,
+    pub eligible: usize,
+    pub locked: usize,
+    pub uncheckpointed: usize,
+    pub open: usize,
+}
+
 /// Hard cap on a single WAL entry's batch payload (1GiB) — the replay
 /// acceptance bound, guarding against unbounded allocation from a corrupted
 /// entry, and the limit for unsplittable payloads (UPDATE...FROM sources,
@@ -752,6 +761,21 @@ impl WalManager {
 
     pub fn reclaim_sweep_complete(&self, epoch: u64) -> bool {
         self.wal.reclaim_sweep_complete(epoch)
+    }
+
+    pub fn reclaim_state_counts(&self) -> ReclaimStateCounts {
+        let prefix = self.data_dir.to_string_lossy();
+        Walrus::file_reclaim_states().into_iter().filter(|(path, ..)| path.starts_with(prefix.as_ref())).fold(
+            ReclaimStateCounts::default(),
+            |mut counts, (_, locked, checkpointed, total, fully_allocated)| {
+                counts.total += 1;
+                counts.eligible += usize::from(locked == 0 && checkpointed >= total && fully_allocated);
+                counts.locked += usize::from(locked > 0);
+                counts.uncheckpointed += usize::from(checkpointed < total);
+                counts.open += usize::from(!fully_allocated);
+                counts
+            },
+        )
     }
 
     pub fn data_dir(&self) -> &PathBuf {

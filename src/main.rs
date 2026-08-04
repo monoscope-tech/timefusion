@@ -479,7 +479,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // replacement back onto dirty recovery (or making a clean claim stale).
     buffered_layer.stop_accepting_writes();
     let preflushed_handoff = buffered_layer.is_drained();
-    let planned_handoff = buffered_layer.has_recent_planned_handoff();
 
     // Stop maintenance first: an in-flight light-optimize/dedup sweep must bail
     // before the buffered-layer flush, not compete with it and then outlive the
@@ -504,21 +503,15 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // slack flows forward automatically because the buffered layer works off
     // the same absolute deadline.
     let configured_grace = cfg.buffer.stop_grace();
-    // The workflow force-flushes before deploy. Once writes are fenced, an
-    // already-drained layer has no durability work left; cap the whole old-task
-    // handoff (connection loops, snapshot, cache close) so the replacement does
-    // not serve 57P03 for the generic 70s dirty-shutdown budget. One second is
-    // still ample for the local cursor-snapshot fsync; every remote/cache phase
-    // shares the same deadline and is safe to abandon. Continuous ingestion
-    // may make the layer non-empty immediately after the
-    // admin FLUSH. A recent successful FLUSH still identifies a planned deploy:
-    // the layer skips a redundant remote flush and hands its small durable WAL
-    // tail to the crash-safe fast reader. Unplanned shutdowns retain the
-    // full correctness-first budget.
-    let grace = if preflushed_handoff || planned_handoff { configured_grace.min(Duration::from_secs(1)) } else { configured_grace };
+    // Only a layer that is STILL drained after the admission fence can use the
+    // constant-time handoff. At production ingest rates tens of thousands of
+    // rows can arrive during an online FLUSH, so a recent FLUSH marker alone is
+    // not evidence that replay is small. A post-FLUSH tail gets the normal
+    // correctness-first budget and is flushed after the fence.
+    let grace = if preflushed_handoff { configured_grace.min(Duration::from_secs(1)) } else { configured_grace };
     let deadline = tokio::time::Instant::now() + grace;
     pgwire_shutdown.cancel();
-    let pg_drain_budget = if preflushed_handoff || planned_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.2) };
+    let pg_drain_budget = if preflushed_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.2) };
     match tokio::time::timeout(pg_drain_budget, pg_task).await {
         Ok(Ok(())) => info!("PGWire drained cleanly"),
         Ok(Err(e)) => error!("PGWire task panicked during drain: {}", e),
@@ -526,7 +519,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
 
     grpc_shutdown.cancel();
-    let grpc_drain_budget = if preflushed_handoff || planned_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.1) };
+    let grpc_drain_budget = if preflushed_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.1) };
     match tokio::time::timeout(grpc_drain_budget, grpc_task).await {
         Ok(Ok(())) => info!("gRPC drained cleanly"),
         Ok(Err(e)) => error!("gRPC task panicked during drain: {}", e),

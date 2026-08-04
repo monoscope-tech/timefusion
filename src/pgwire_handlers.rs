@@ -266,9 +266,8 @@ impl LoggingSimpleQueryHandler {
         // scan the outgoing instance's consumed WAL.
         // Frozen-clock test harnesses skip this operational handoff delay.
         if !crate::clock::is_frozen() {
-            layer.reclaim_wal_for_planned_handoff().await;
+            layer.reclaim_wal_after_flush().await;
         }
-        layer.mark_planned_handoff();
         Ok(vec![Response::Execution(Tag::new(&format!("FLUSH {}", stats.total_rows)))])
     }
 
