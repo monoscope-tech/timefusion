@@ -7,7 +7,7 @@
 //! advance it with every write before using it for a query.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
     sync::{
@@ -24,7 +24,6 @@ use arrow::{
 };
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
 
-const MINUTE_MICROS: i64 = 60 * 1_000_000;
 const FORMAT_VERSION: &str = "1";
 const META_VERSION: &str = "tf.logical_count.version";
 const META_FINGERPRINT: &str = "tf.logical_count.fingerprint";
@@ -38,23 +37,38 @@ struct Winner {
     deleted: bool,
 }
 
-/// Mutable build/overlay form of an exact count index.
-///
-/// `winners` is required for version resolution. `minutes` is the compact
-/// query structure: full minutes are answered from one scalar, while at most
-/// two boundary minutes consult their exact timestamp histogram.
+/// Packed immutable winner metadata. IDs live in one shared byte arena, so a
+/// production partition pays no allocator/header cost per key.
+#[derive(Debug, Clone, Copy)]
+struct PackedWinner {
+    timestamp: i64,
+    tiebreak: i64,
+    id_offset: u32,
+    id_len: u16,
+    flags: u8,
+    _padding: u8,
+}
+
+const FLAG_TIEBREAK_PRESENT: u8 = 1;
+const FLAG_DELETED: u8 = 2;
+
+#[derive(Debug, Clone, Default)]
+struct PackedIndex {
+    winners: Vec<PackedWinner>,
+    ids: Vec<u8>,
+    /// One entry per live winner, sorted. Two binary searches answer any exact
+    /// time window without the former per-timestamp BTree node overhead.
+    live_timestamps: Vec<i64>,
+}
+
+/// Mutable build form plus a packed immutable query form. Builders use the
+/// hash map for exact version resolution, then `finalize` releases it before
+/// cache admission.
 #[derive(Debug, Clone, Default)]
 pub struct LogicalCountIndex {
     winners: HashMap<Box<[u8]>, Winner, ahash::RandomState>,
-    minutes: BTreeMap<i64, MinuteCounts>,
+    packed: Option<PackedIndex>,
     key_bytes: usize,
-    timestamp_buckets: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-struct MinuteCounts {
-    live: u64,
-    by_timestamp: BTreeMap<i64, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,7 +173,8 @@ impl LogicalCountCache {
 
     /// Install only after a builder has covered the complete physical
     /// partition represented by `fingerprint`.
-    pub fn install(&self, key: CountPartition, fingerprint: u64, files: Vec<String>, index: LogicalCountIndex) -> Result<()> {
+    pub fn install(&self, key: CountPartition, fingerprint: u64, files: Vec<String>, mut index: LogicalCountIndex) -> Result<()> {
+        index.finalize()?;
         let path = self.path(&key);
         index.save(&path, fingerprint, &files)?;
         Self::prune_disk_partitions(&path);
@@ -264,13 +279,15 @@ fn key(timestamp: i64, id: &str) -> Box<[u8]> {
     out.into_boxed_slice()
 }
 
-fn minute(timestamp: i64) -> i64 {
-    timestamp.div_euclid(MINUTE_MICROS)
+fn packed_id<'a>(ids: &'a [u8], winner: &PackedWinner) -> &'a [u8] {
+    let start = winner.id_offset as usize;
+    let end = start + usize::from(winner.id_len);
+    &ids[start..end]
 }
 
 impl LogicalCountIndex {
     pub fn new() -> Self {
-        Self { winners: HashMap::default(), minutes: BTreeMap::new(), key_bytes: 0, timestamp_buckets: 0 }
+        Self { winners: HashMap::default(), packed: None, key_bytes: 0 }
     }
 
     /// Apply one physical version. Returns whether it changed the logical row.
@@ -279,24 +296,67 @@ impl LogicalCountIndex {
     /// `None` sorts below every non-null value, and an equal tiebreak does not
     /// replace the existing winner.
     pub fn apply(&mut self, timestamp: i64, id: &str, tiebreak: Option<i64>, deleted: bool) -> bool {
+        assert!(self.packed.is_none(), "cannot mutate a finalized logical-count index");
         let encoded = key(timestamp, id);
         let old = self.winners.get(encoded.as_ref()).copied();
         if old.is_some_and(|winner| tiebreak <= winner.tiebreak) {
             return false;
         }
 
-        let old_live = old.is_some_and(|winner| !winner.deleted);
-        let new_live = !deleted;
         if old.is_none() {
             self.key_bytes = self.key_bytes.saturating_add(encoded.len());
         }
         self.winners.insert(encoded, Winner { tiebreak, deleted });
-        match (old_live, new_live) {
-            (false, true) => self.adjust(timestamp, 1),
-            (true, false) => self.adjust(timestamp, -1),
-            _ => {}
-        }
         true
+    }
+
+    /// Convert the allocation-heavy builder map into the resident query form.
+    pub fn finalize(&mut self) -> Result<()> {
+        if self.packed.is_some() {
+            return Ok(());
+        }
+        let winners = std::mem::take(&mut self.winners);
+        let mut packed = PackedIndex {
+            winners: Vec::with_capacity(winners.len()),
+            ids: Vec::with_capacity(self.key_bytes.saturating_sub(winners.len().saturating_mul(8))),
+            live_timestamps: Vec::with_capacity(winners.len()),
+        };
+        for (key, winner) in winners {
+            let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
+            let id = &key[8..];
+            let id_offset = u32::try_from(packed.ids.len()).context("logical-count ID arena exceeds 4GiB")?;
+            let id_len = u16::try_from(id.len()).context("logical-count ID exceeds 65535 bytes")?;
+            packed.ids.extend_from_slice(id);
+            let mut flags = 0;
+            if winner.tiebreak.is_some() {
+                flags |= FLAG_TIEBREAK_PRESENT;
+            }
+            if winner.deleted {
+                flags |= FLAG_DELETED;
+            } else {
+                packed.live_timestamps.push(timestamp);
+            }
+            packed.winners.push(PackedWinner { timestamp, tiebreak: winner.tiebreak.unwrap_or_default(), id_offset, id_len, flags, _padding: 0 });
+        }
+        let ids = &packed.ids;
+        packed.winners.sort_unstable_by(|left, right| left.timestamp.cmp(&right.timestamp).then_with(|| packed_id(ids, left).cmp(packed_id(ids, right))));
+        packed.live_timestamps.sort_unstable();
+        self.key_bytes = packed.ids.len();
+        self.packed = Some(packed);
+        Ok(())
+    }
+
+    fn winner(&self, timestamp: i64, id: &str) -> Option<Winner> {
+        if let Some(packed) = &self.packed {
+            let pos = packed
+                .winners
+                .binary_search_by(|candidate| candidate.timestamp.cmp(&timestamp).then_with(|| packed_id(&packed.ids, candidate).cmp(id.as_bytes())))
+                .ok()?;
+            let winner = packed.winners[pos];
+            Some(Winner { tiebreak: (winner.flags & FLAG_TIEBREAK_PRESENT != 0).then_some(winner.tiebreak), deleted: winner.flags & FLAG_DELETED != 0 })
+        } else {
+            self.winners.get(key(timestamp, id).as_ref()).copied()
+        }
     }
 
     /// Apply the four-column narrow form emitted by a count-index build:
@@ -366,7 +426,7 @@ impl LogicalCountIndex {
                         }
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        let base = self.winners.get(entry.key().as_ref()).copied();
+                        let base = self.winner(timestamp, id);
                         let current = base.filter(|winner| winner.tiebreak >= candidate.tiebreak).unwrap_or(candidate);
                         entry.insert(Overlay { base, current, timestamp });
                     }
@@ -381,64 +441,53 @@ impl LogicalCountIndex {
         u64::try_from(count).context("logical-count overlay produced an invalid negative/overflow count")
     }
 
-    fn adjust(&mut self, timestamp: i64, delta: i8) {
-        let minute = self.minutes.entry(minute(timestamp)).or_default();
-        if delta > 0 {
-            minute.live += 1;
-            match minute.by_timestamp.entry(timestamp) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(1);
-                    self.timestamp_buckets += 1;
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => *entry.get_mut() += 1,
-            }
-        } else {
-            minute.live -= 1;
-            let remove = {
-                let count = minute.by_timestamp.get_mut(&timestamp).expect("live winner must have a timestamp count");
-                *count -= 1;
-                *count == 0
-            };
-            if remove {
-                minute.by_timestamp.remove(&timestamp);
-                self.timestamp_buckets -= 1;
-            }
-        }
-    }
-
     /// Exact live row count in the half-open interval `[lo, hi)`.
     pub fn count(&self, lo: i64, hi: i64) -> u64 {
         if lo >= hi {
             return 0;
         }
-        let lo_minute = minute(lo);
-        let hi_minute = minute(hi - 1);
-        self.minutes
-            .range(lo_minute..=hi_minute)
-            .map(|(bucket, counts)| {
-                let start = bucket.saturating_mul(MINUTE_MICROS);
-                let end = start.saturating_add(MINUTE_MICROS);
-                if lo <= start && end <= hi { counts.live } else { counts.by_timestamp.range(lo..hi).map(|(_, count)| *count).sum() }
-            })
-            .sum()
+        if let Some(packed) = &self.packed {
+            let start = packed.live_timestamps.partition_point(|timestamp| *timestamp < lo);
+            let end = packed.live_timestamps.partition_point(|timestamp| *timestamp < hi);
+            return u64::try_from(end - start).expect("logical-count partition length fits u64");
+        }
+        u64::try_from(
+            self.winners
+                .iter()
+                .filter(|(key, winner)| {
+                    let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
+                    !winner.deleted && (lo..hi).contains(&timestamp)
+                })
+                .count(),
+        )
+        .expect("logical-count partition length fits u64")
     }
 
     pub fn logical_rows(&self) -> u64 {
-        self.minutes.values().map(|minute| minute.live).sum()
+        if let Some(packed) = &self.packed {
+            u64::try_from(packed.live_timestamps.len()).expect("logical-count partition length fits u64")
+        } else {
+            u64::try_from(self.winners.values().filter(|winner| !winner.deleted).count()).expect("logical-count partition length fits u64")
+        }
     }
 
     pub fn physical_keys(&self) -> usize {
-        self.winners.len()
+        self.packed.as_ref().map_or(self.winners.len(), |packed| packed.winners.len())
     }
 
     /// Conservative resident-size estimate for build admission. Includes the
     /// key bytes plus allocation/hash-table overhead; it intentionally rounds
     /// up because this map lives outside DataFusion's tracked memory pool.
     pub fn estimated_heap_bytes(&self) -> usize {
-        self.key_bytes
-            .saturating_add(self.winners.len().saturating_mul(64))
-            .saturating_add(self.minutes.len().saturating_mul(128))
-            .saturating_add(self.timestamp_buckets.saturating_mul(64))
+        if let Some(packed) = &self.packed {
+            return packed
+                .winners
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PackedWinner>())
+                .saturating_add(packed.ids.capacity())
+                .saturating_add(packed.live_timestamps.capacity().saturating_mul(std::mem::size_of::<i64>()));
+        }
+        self.key_bytes.saturating_add(self.winners.len().saturating_mul(64))
     }
 
     /// Atomically persist the derived winners as Arrow IPC.
@@ -491,12 +540,26 @@ impl LogicalCountIndex {
                 rows.clear();
                 Ok(())
             };
-            for (key, winner) in &self.winners {
-                let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
-                let id = std::str::from_utf8(&key[8..]).context("logical-count key contains non-UTF8 id")?;
-                rows.push((timestamp, id, *winner));
-                if rows.len() == WRITE_ROWS {
-                    write_rows(&mut rows)?;
+            if let Some(packed) = &self.packed {
+                for winner in &packed.winners {
+                    let id = std::str::from_utf8(packed_id(&packed.ids, winner)).context("logical-count key contains non-UTF8 id")?;
+                    rows.push((
+                        winner.timestamp,
+                        id,
+                        Winner { tiebreak: (winner.flags & FLAG_TIEBREAK_PRESENT != 0).then_some(winner.tiebreak), deleted: winner.flags & FLAG_DELETED != 0 },
+                    ));
+                    if rows.len() == WRITE_ROWS {
+                        write_rows(&mut rows)?;
+                    }
+                }
+            } else {
+                for (key, winner) in &self.winners {
+                    let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
+                    let id = std::str::from_utf8(&key[8..]).context("logical-count key contains non-UTF8 id")?;
+                    rows.push((timestamp, id, *winner));
+                    if rows.len() == WRITE_ROWS {
+                        write_rows(&mut rows)?;
+                    }
                 }
             }
             write_rows(&mut rows)?;
@@ -566,6 +629,7 @@ impl LogicalCountIndex {
                 index.apply(timestamps.value(row), ids.value(row), tiebreak, deleted.value(row));
             }
         }
+        index.finalize()?;
         Ok((index, fingerprint, files))
     }
 }
@@ -699,6 +763,22 @@ mod tests {
     }
 
     #[test]
+    fn packed_form_preserves_exact_ranges_and_bounds_resident_bytes() {
+        let mut index = LogicalCountIndex::new();
+        for value in 0..100_000i64 {
+            let id = format!("01234567-89ab-cdef-0123-{value:012}");
+            index.apply(value, &id, Some(value), value % 11 == 0);
+        }
+        index.finalize().unwrap();
+
+        assert_eq!(index.physical_keys(), 100_000);
+        assert_eq!(index.logical_rows(), 90_909);
+        assert_eq!(index.count(25_000, 75_000), 45_454);
+        assert!(index.winners.is_empty(), "the allocation-heavy build map must be released");
+        assert!(index.estimated_heap_bytes() < 7_000_000, "packed 36-byte IDs should stay below 70 bytes/key");
+    }
+
+    #[test]
     fn narrow_batches_build_and_overlay_unflushed_versions_exactly() {
         let columns = LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak: "updated_at", deleted: "deleted" };
         let mut index = LogicalCountIndex::new();
@@ -796,6 +876,7 @@ mod tests {
         let key = |project: &str| CountPartition { project_id: project.into(), table_name: "otel".into(), date: "2026-08-04".into() };
         let mut first = LogicalCountIndex::new();
         first.apply(1, "a", Some(1), false);
+        first.finalize().unwrap();
         let per_entry = first.estimated_heap_bytes();
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), per_entry);
         cache.install(key("a"), 1, vec!["a.parquet".into()], first).unwrap();

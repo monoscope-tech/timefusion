@@ -7263,6 +7263,11 @@ impl Database {
             }
         }
 
+        // Release the allocation-heavy mutable hash map before cache
+        // admission. The packed form is exact and is the representation used
+        // by every query and persisted Arrow partition.
+        index.finalize()?;
+
         // Concurrent appends are safe: the query overlays their new files.
         // A removal/rewrite is not; it would leave winners from files no longer
         // in the table, so refuse publication and let the next miss rebuild.

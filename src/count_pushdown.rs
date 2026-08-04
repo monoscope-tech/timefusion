@@ -326,9 +326,25 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         datafusion::logical_expr::col("timestamp").gt_eq(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(q.lo), Some("UTC".into())))),
         datafusion::logical_expr::col("timestamp").lt(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(hi), Some("UTC".into())))),
     ];
-    let mem_batches = match database.buffered_layer() {
-        Some(layer) => layer.query(&q.project_id, &q.table_name, &filters).ok()?,
-        None => Vec::new(),
+    let (mem_batches, hot_batches) = match database.buffered_layer() {
+        Some(layer) => {
+            let mem = layer.query(&q.project_id, &q.table_name, &filters).ok()?;
+            // The ordinary MOR scan resolves mem ∪ hot ∪ Delta. Omitting
+            // the raw hot-tier versions can leave a newer tombstone/update out
+            // of the cached winner overlay even though the physical Delta base
+            // is complete. Read only the four narrow index columns; files that
+            // the hot tier declines remain represented by the Delta base.
+            let arrow_schema = schema.schema_ref();
+            let projection: Vec<usize> =
+                ["timestamp", "id", tiebreak, deleted].into_iter().map(|column| arrow_schema.index_of(column).ok()).collect::<Option<_>>()?;
+            let mem_ranges = layer.get_bucket_ranges(&q.project_id, &q.table_name);
+            let hot = layer
+                .hot_tier()
+                .query_partitioned(&q.project_id, &q.table_name, Some((q.lo, q.hi)), &mem_ranges, &filters, &arrow_schema, Some(&projection))
+                .await;
+            (mem, hot.partitions.into_iter().flatten().collect())
+        }
+        None => (Vec::new(), Vec::new()),
     };
     let table_ref = database.resolve_table(&q.project_id, &q.table_name).await.ok()?;
     let (indexes, missing, added_files, stale_dates, delta_snapshot, log_store) = {
@@ -374,6 +390,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         return None;
     }
     let mut overlay_batches = mem_batches;
+    overlay_batches.extend(hot_batches);
     overlay_batches.extend(database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?);
     indexes.into_iter().try_fold(0u64, |total, (date, index)| {
         let day_lo = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
