@@ -243,7 +243,10 @@ fn request_reclaim_sweep_deletes_consumed_files_promptly() {
         }
         if std::time::Instant::now() >= deadline {
             let states: Vec<_> = Walrus::file_reclaim_states().into_iter().filter(|(p, ..)| p.starts_with(dir.to_string_lossy().as_ref())).collect();
-            panic!("consumed file not reclaimed within 2s of request_reclaim_sweep (data files={n}, sweep_complete={}); states={states:?}", wal.reclaim_sweep_complete(epoch));
+            panic!(
+                "consumed file not reclaimed within 2s of request_reclaim_sweep (data files={n}, sweep_complete={}); states={states:?}",
+                wal.reclaim_sweep_complete(epoch)
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
