@@ -4688,7 +4688,8 @@ impl Database {
     /// `bound: false` is for DML re-appends only — see
     /// [`crate::buffered_write_layer::BufferedWriteLayer::insert_bounded`].
     pub async fn insert_records_batch_bounded(
-        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::buffered_write_layer::DeltaWatermark>, bound: bool,
+        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool,
+        watermark: Option<&crate::buffered_write_layer::DeltaWatermark>, bound: bool,
     ) -> Result<Vec<String>> {
         let span = tracing::Span::current();
         // Normalize timezone-as-offset (`+00:00`) timestamp columns to the
