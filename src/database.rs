@@ -8430,16 +8430,10 @@ impl Database {
             .vacuum()
             .with_retention_period(chrono::Duration::hours(retention_hours as i64))
             .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
-            // Lite deletes only files named by retained Remove actions. Full
-            // also lists the table directory and classifies unknown parquet as
-            // orphaned. That classification is unsafe while any flush or
-            // maintenance writer is concurrent (including in this process):
-            // vacuum can list from an older cloned snapshot and delete files
-            // committed after that clone (prod 2026-08-04).
-            // Prefer a bounded storage leak over deleting active data. A future
-            // Full sweep needs a distributed maintenance lease plus a refreshed
-            // snapshot immediately before deletion.
-            .with_mode(deltalake::operations::vacuum::VacuumMode::Lite)
+            // Full also sweeps orphaned parquet whose tombstones have already
+            // left the retained log. Keep this mode: bounding the transaction
+            // log must not turn old orphan files into a permanent storage leak.
+            .with_mode(deltalake::operations::vacuum::VacuumMode::Full)
             .await
         {
             Ok((_, metrics)) => {
