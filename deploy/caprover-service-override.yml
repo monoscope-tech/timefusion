@@ -16,4 +16,6 @@ RollbackConfig:
   FailureAction: pause
   Monitor: 15000000000
   MaxFailureRatio: 0.15
-  Order: start-first
+  # A failed replacement has not necessarily received HANDOFF. Stop it first
+  # so the rollback task can acquire the WAL lock without waiting for SIGKILL.
+  Order: stop-first
