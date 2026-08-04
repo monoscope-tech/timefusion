@@ -84,7 +84,7 @@ use datafusion::{
         memory_pool::{MemoryConsumer, MemoryReservation},
     },
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties, Partitioning, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, RecordOutput},
         stream::RecordBatchStreamAdapter,
     },
@@ -221,9 +221,6 @@ fn remap_ordering(
 #[derive(Debug)]
 pub struct DedupExec {
     input: Arc<dyn ExecutionPlan>,
-    /// Global mode owns one merged partition. Partitioned mode is used only
-    /// after hashing every dedup key, so all versions retain one owner.
-    partitioned: bool,
     keys: Vec<String>,
     /// Indices of the key columns within `input.schema()`.
     key_idxs: Vec<usize>,
@@ -257,12 +254,6 @@ impl DedupExec {
     }
 
     pub fn with_tiebreak(input: Arc<dyn ExecutionPlan>, keys: Vec<String>, tiebreak: Option<String>, output_projection: Option<Vec<usize>>) -> DFResult<Self> {
-        Self::with_tiebreak_scope(input, keys, tiebreak, output_projection, false)
-    }
-
-    fn with_tiebreak_scope(
-        input: Arc<dyn ExecutionPlan>, keys: Vec<String>, tiebreak: Option<String>, output_projection: Option<Vec<usize>>, partitioned: bool,
-    ) -> DFResult<Self> {
         let in_schema = input.schema();
         let key_idxs = keys
             .iter()
@@ -281,32 +272,9 @@ impl DedupExec {
             Some(ordering) => datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), [ordering]),
             None => datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
         };
-        let output_partitioning = if partitioned { input.output_partitioning().clone() } else { Partitioning::UnknownPartitioning(1) };
-        let properties = Arc::new(PlanProperties::new(eq, output_partitioning, input.properties().emission_type, input.properties().boundedness));
-        Ok(Self {
-            input,
-            partitioned,
-            keys,
-            key_idxs,
-            tiebreak,
-            required_ordering: None,
-            output_projection,
-            schema,
-            properties,
-            metrics: ExecutionPlanMetricsSet::new(),
-        })
-    }
-
-    pub(crate) fn partitioned_over(&self, input: Arc<dyn ExecutionPlan>) -> DFResult<Self> {
-        Self::with_tiebreak_scope(input, self.keys.clone(), self.tiebreak.clone(), self.output_projection.clone(), true)
-    }
-
-    pub(crate) fn input(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.input
-    }
-
-    pub(crate) fn keys(&self) -> &[String] {
-        &self.keys
+        let properties =
+            Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), input.properties().emission_type, input.properties().boundedness));
+        Ok(Self { input, keys, key_idxs, tiebreak, required_ordering: None, output_projection, schema, properties, metrics: ExecutionPlanMetricsSet::new() })
     }
 
     /// Declare the ordering keep-greatest needs (see `required_ordering`).
@@ -327,7 +295,7 @@ impl DisplayAs for DedupExec {
         // heap in the 2026-07-31 profile. The two are indistinguishable in
         // EXPLAIN without this, so the only symptom is unexplained heap growth.
         let in_schema = self.input.schema();
-        write!(f, "DedupExec: keys=[{}], scope={}, mode=", self.keys.join(", "), if self.partitioned { "hash-partition" } else { "global" })?;
+        write!(f, "DedupExec: keys=[{}], mode=", self.keys.join(", "))?;
         // Which SURVIVOR rule runs matters as much as the seen-set size:
         // unbounded input with a tiebreak now keeps the GREATEST version
         // (buffering to end-of-stream); without a tiebreak it is keep-first.
@@ -352,7 +320,7 @@ impl ExecutionPlan for DedupExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![if self.partitioned { Distribution::UnspecifiedDistribution } else { Distribution::SinglePartition }]
+        vec![Distribution::SinglePartition]
     }
 
     fn required_input_ordering(&self) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
@@ -373,13 +341,13 @@ impl ExecutionPlan for DedupExec {
 
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(
-            DedupExec::with_tiebreak_scope(children[0].clone(), self.keys.clone(), self.tiebreak.clone(), self.output_projection.clone(), self.partitioned)?
+            DedupExec::with_tiebreak(children[0].clone(), self.keys.clone(), self.tiebreak.clone(), self.output_projection.clone())?
                 .requiring(self.required_ordering.clone()),
         ))
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        if !self.partitioned && partition != 0 {
+        if partition != 0 {
             return Err(DataFusionError::Internal(format!("DedupExec only produces partition 0, got {partition}")));
         }
         let in_schema = self.input.schema();

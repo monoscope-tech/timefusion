@@ -3085,7 +3085,6 @@ impl Database {
                 let mut rules = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules;
                 let pos = rules.iter().position(|r| r.name() == "EnforceDistribution").unwrap_or(0);
                 rules.insert(pos, Arc::new(crate::optimizers::OrderedUnionForTopK));
-                rules.insert(pos + 1, Arc::new(crate::optimizers::ParallelCountDedup));
                 rules.push(instrument_rule);
                 rules
             })
