@@ -109,8 +109,10 @@ EXPOSE 80 5432
 
 # Keep the early 57P03 responder out of Swarm's VIP. The probe speaks just
 # enough PostgreSQL to require an AuthenticationRequest from the real server;
-# it becomes healthy within one probe interval of WAL-owner handoff completing.
-HEALTHCHECK --interval=250ms --timeout=500ms --start-period=100ms --retries=4 \
+# it becomes healthy within one startup probe interval of WAL-owner handoff
+# completing. After the first success, probe less often and tolerate transient
+# host/load stalls so Swarm never recycles an otherwise healthy database task.
+HEALTHCHECK --interval=5s --timeout=2s --start-period=10s --start-interval=250ms --retries=3 \
     CMD ["/usr/local/bin/timefusion", "healthcheck"]
 
 # Default telemetry destination: the swarm-internal collector. Image ENV
