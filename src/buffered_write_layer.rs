@@ -3142,18 +3142,17 @@ impl BufferedWriteLayer {
         self.flush_buckets_where(|_| true).await
     }
 
-    /// Give walrus one cleanup tick to unlink files made eligible by a
-    /// successful administrative FLUSH. The outgoing process remains fully
-    /// available during this wait; paying it before orchestration starts keeps
-    /// the replacement from rescanning a large, already-consumed WAL.
+    /// Ask walrus to unlink files made eligible by a successful administrative
+    /// FLUSH and wait for the actual sweep completion (bounded at ten seconds).
+    /// The outgoing process remains fully available during this wait; paying it
+    /// before orchestration starts keeps the replacement from rescanning a
+    /// large, already-consumed WAL.
     pub async fn reclaim_wal_for_planned_handoff(&self) {
-        self.wal.request_reclaim_sweep();
-        let tick = match self.config.buffer.wal_fsync_mode() {
-            crate::config::WalFsyncMode::Milliseconds(ms) => Duration::from_millis(ms.max(1)),
-            crate::config::WalFsyncMode::SyncEach => Duration::from_secs(5),
-            crate::config::WalFsyncMode::None => Duration::from_secs(10),
-        };
-        tokio::time::sleep(tick + Duration::from_millis(250)).await;
+        let epoch = self.wal.request_reclaim_sweep();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !self.wal.reclaim_sweep_complete(epoch) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Flush one taken bucket: force-flushed marking + in-flight hold

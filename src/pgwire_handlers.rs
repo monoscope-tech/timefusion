@@ -261,9 +261,9 @@ impl LoggingSimpleQueryHandler {
                 stats.buckets_failed, stats.buckets_flushed
             )));
         }
-        // Walrus deletes checkpoint-eligible segments on its background tick.
-        // Wait for one tick while this instance is still serving, otherwise
-        // the replacement pays to scan the outgoing instance's consumed WAL.
+        // Wake Walrus's safe reclaim worker and wait for its completion while
+        // this instance is still serving, otherwise the replacement pays to
+        // scan the outgoing instance's consumed WAL.
         // Frozen-clock test harnesses skip this operational handoff delay.
         if !crate::clock::is_frozen() {
             layer.reclaim_wal_for_planned_handoff().await;

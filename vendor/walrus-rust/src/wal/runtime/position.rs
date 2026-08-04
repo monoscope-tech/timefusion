@@ -160,20 +160,30 @@ impl Walrus {
     }
 
     /// Re-evaluate every tracked file's delete-eligibility and ask the
-    /// background worker to run its deletion sweep on the next tick
-    /// (~fsync interval) instead of waiting for the periodic 1000-tick
-    /// cadence. The re-evaluation matters as much as the sweep: a
+    /// background worker to run its deletion sweep immediately instead of
+    /// waiting for the fsync or periodic 1000-tick cadence. The re-evaluation
+    /// matters as much as the sweep: a
     /// checkpoint-time `flush_check` can race `set_fully_allocated` /
     /// block-unlock and miss the enqueue, and its built-in retry only fires
     /// on a future checkpoint of the same file — which never comes after a
     /// final cursor fast-forward (e.g. a boot's cursor restore over a fully
     /// consumed backlog). Safe to call at any time — deletion still happens
     /// on the worker thread with the mmap/fd pool dropped first.
-    pub fn request_reclaim_sweep(&self) {
+    pub fn request_reclaim_sweep(&self) -> u64 {
         for path in FileStateTracker::all_paths() {
             super::allocator::flush_check(path);
         }
+        let epoch = super::SWEEP_REQUEST_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
         super::SWEEP_NOW.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = super::DELETION_THREAD.get() {
+            thread.unpark();
+        }
+        epoch
+    }
+
+    /// True after the deletion worker has processed the requested sweep.
+    pub fn reclaim_sweep_complete(&self, epoch: u64) -> bool {
+        super::SWEEP_COMPLETE_EPOCH.load(std::sync::atomic::Ordering::Acquire) >= epoch
     }
 
     /// Test/diagnostic accessor: every tracked file's reclaim state as

@@ -45,6 +45,9 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
     };
 
     thread::spawn(move || {
+        if owns_deletions {
+            let _ = super::DELETION_THREAD.set(thread::current());
+        }
         let mut pool = pool;
         let tick = tick;
         let del_rx = del_rx;
@@ -54,7 +57,9 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
         let mut ring = io_uring::IoUring::new(2048).expect("Failed to create io_uring");
 
         loop {
-            thread::sleep(Duration::from_millis(sleep_millis));
+            // `unpark` lets a position-safe reclaim request run immediately;
+            // the timeout retains periodic fsync and cleanup behavior.
+            thread::park_timeout(Duration::from_millis(sleep_millis));
 
             // Phase 1: Collect unique paths to flush
             let mut unique = HashSet::new();
@@ -175,6 +180,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
             // a sweep was requested (post-recovery reclaim of a consumed backlog).
             let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
             let forced = owns_deletions && super::SWEEP_NOW.swap(false, Ordering::AcqRel);
+            let forced_epoch = forced.then(|| super::SWEEP_REQUEST_EPOCH.load(Ordering::Acquire));
             if forced || n >= 1000 {
                 // Single background thread owns this loop; the CAS only guards
                 // the tick reset on the periodic path.
@@ -193,6 +199,9 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                                 debug_print!("[reclaim] delete failed for {}: {}", path, e)
                             }
                         }
+                    }
+                    if let Some(epoch) = forced_epoch {
+                        super::SWEEP_COMPLETE_EPOCH.fetch_max(epoch, Ordering::Release);
                     }
                 }
             }

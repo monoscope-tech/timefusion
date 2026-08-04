@@ -743,13 +743,15 @@ impl WalManager {
         self.apply_positions(project_id, table_name, positions.iter().copied().map(Some))
     }
 
-    /// Trigger walrus's position-exact file reclaim sweep on its next
-    /// background tick (~fsync interval) instead of the periodic 1000-tick
-    /// cadence. Called after recovery parks the cursors: a consumed replay
-    /// backlog's files are already checkpoint-eligible, and this reclaims
-    /// the disk immediately rather than ~200s later.
-    pub fn request_reclaim_sweep(&self) {
-        self.wal.request_reclaim_sweep();
+    /// Trigger walrus's position-exact file reclaim worker immediately instead
+    /// of waiting for its fsync or periodic-cleanup tick. Returns an epoch that
+    /// callers can use to wait for completion.
+    pub fn request_reclaim_sweep(&self) -> u64 {
+        self.wal.request_reclaim_sweep()
+    }
+
+    pub fn reclaim_sweep_complete(&self, epoch: u64) -> bool {
+        self.wal.reclaim_sweep_complete(epoch)
     }
 
     pub fn data_dir(&self) -> &PathBuf {

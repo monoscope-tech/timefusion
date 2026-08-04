@@ -153,6 +153,7 @@ jobs:
           CAPROVER_APP: ${{ secrets.CAPTAINROVER_APP_NAME }}
           CAPROVER_TOKEN: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
           PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
+          PREVIOUS_BOOT_MICROS: ${{ steps.production_before.outputs.boot_micros }}
         run: |
           set -euo pipefail
           : "${CAPROVER_SERVER:?CAPTAINROVER_SERVER is required}"
@@ -173,17 +174,16 @@ jobs:
             unready_started_ms=0
             max_unready_ms=0
             while [ ! -e "$probe_stop" ]; do
-              now_ms="$(date +%s%3N)"
-              if timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
+              if timeout 1 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
                 if (( unready_started_ms > 0 )); then
-                  interval_ms=$((now_ms - unready_started_ms))
+                  interval_ms=$(( $(date +%s%3N) - unready_started_ms ))
                   (( interval_ms > max_unready_ms )) && max_unready_ms=$interval_ms
                   unready_started_ms=0
                 fi
               elif (( unready_started_ms == 0 )); then
-                unready_started_ms=$now_ms
+                unready_started_ms="$(date +%s%3N)"
               fi
-              sleep 1
+              sleep 0.1
             done
             if (( unready_started_ms > 0 )); then
               interval_ms=$(( $(date +%s%3N) - unready_started_ms ))
@@ -226,6 +226,20 @@ jobs:
 
           deploy_status=0
           wait "$deploy_pid" || deploy_status=$?
+
+          # CapRover can return after it has submitted the Swarm update but
+          # before the replacement owns PGWire. Keep the concurrent probe alive
+          # until a query proves that a DIFFERENT boot completed recovery;
+          # otherwise stopping it here reports a false 0ms outage.
+          replacement_deadline=$((SECONDS + 720))
+          while (( deploy_status == 0 && SECONDS < replacement_deadline )); do
+            boot_micros="$(timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
+            recovery_complete="$(timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_complete'" 2>/dev/null || true)"
+            if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ]; then
+              break
+            fi
+            sleep 0.5
+          done
           stop_probe
           trap - EXIT
           observed_unready_ms="$(cat "$probe_result")"

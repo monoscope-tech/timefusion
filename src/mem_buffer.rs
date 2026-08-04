@@ -156,7 +156,25 @@ fn canonicalize_declared_batch(batch: RecordBatch, declared: Option<&SchemaRef>)
     if batch.schema_ref() == declared {
         return Ok(batch);
     }
-    deltalake::kernel::schema::cast_record_batch(&batch, Arc::clone(declared), true, true)
+    // Preserve honest nullability for malformed legacy data. Casting directly
+    // to a declared NOT NULL field relabels an array containing nulls as
+    // non-nullable; downstream code then trusts a false invariant. Missing
+    // required fields still stay NOT NULL in the target and are rejected by
+    // the caster.
+    let fields: Vec<FieldRef> = declared
+        .fields()
+        .iter()
+        .map(|field| {
+            batch
+                .schema()
+                .index_of(field.name())
+                .ok()
+                .filter(|&i| !field.is_nullable() && batch.column(i).null_count() > 0)
+                .map_or_else(|| field.clone(), |_| Arc::new(field.as_ref().clone().with_nullable(true)))
+        })
+        .collect();
+    let honest_declared = Arc::new(Schema::new_with_metadata(fields, declared.metadata().clone()));
+    deltalake::kernel::schema::cast_record_batch(&batch, honest_declared, true, true)
         .map_err(|e| anyhow::anyhow!("batch does not match declared table schema: {e}"))
 }
 
@@ -2803,6 +2821,13 @@ mod tests {
         assert!(got.column(2).is_null(0));
     }
 
+    #[test]
+    fn declared_batch_canonicalization_rejects_missing_required_fields() {
+        let incoming = RecordBatch::try_from_iter(vec![("value", Arc::new(Int64Array::from(vec![7])) as ArrayRef)]).unwrap();
+        let declared = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false), Field::new("required", DataType::Utf8, false)]));
+        assert!(canonicalize_declared_batch(incoming, Some(&declared)).is_err());
+    }
+
     /// The Delta leg excludes the UNION of the tiers' ranges, so merging must
     /// preserve it exactly: adjacent buckets (`end == next start`) collapse,
     /// disjoint ones must NOT — merging a gap would hide the Delta rows in it.
@@ -2846,6 +2871,13 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(ts), Arc::new(id)]).unwrap()
     }
 
+    fn nullable_test_declared_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Utf8View, false),
+        ]))
+    }
+
     /// Regression (prod 2026-07-31): MemBuffer pinned whatever nullability the
     /// FIRST batch happened to carry, so a fully-populated `timestamp` arriving
     /// as `nullable=true` made the buffer advertise a schema that disagreed
@@ -2853,16 +2885,14 @@ mod tests {
     /// misses and DataFusion's `physical true vs logical false` aggregate error.
     #[test]
     fn membuffer_takes_nullability_from_declared_schema_not_first_batch() {
-        let buffer = MemBuffer::new();
-        buffer.insert("p1", "otel_logs_and_spans", nullable_otel_batch(false), 1_000).unwrap();
+        let declared = nullable_test_declared_schema();
+        let stored = canonicalize_declared_batch(nullable_otel_batch(false), Some(&declared)).unwrap();
 
-        let advertised = buffer.get_table("p1", "otel_logs_and_spans").unwrap().schema();
-        let stored = buffer.query("p1", "otel_logs_and_spans", &[]).unwrap();
-
-        for schema in [advertised, stored[0].schema()] {
-            for col in ["timestamp", "id"] {
-                assert!(!schema.field_with_name(col).unwrap().is_nullable(), "`{col}` is declared NOT NULL and holds no nulls, so it must not stay nullable");
-            }
+        for col in ["timestamp", "id"] {
+            assert!(
+                !stored.schema().field_with_name(col).unwrap().is_nullable(),
+                "`{col}` is declared NOT NULL and holds no nulls, so it must not stay nullable"
+            );
         }
     }
 
@@ -2871,11 +2901,9 @@ mod tests {
     /// (surfacing the bad data) rather than being relabelled NOT NULL.
     #[test]
     fn declared_not_null_column_holding_nulls_stays_nullable() {
-        let buffer = MemBuffer::new();
-        buffer.insert("p1", "otel_logs_and_spans", nullable_otel_batch(true), 1_000).unwrap();
-
-        let stored = buffer.query("p1", "otel_logs_and_spans", &[]).unwrap();
-        let schema = stored[0].schema();
+        let declared = nullable_test_declared_schema();
+        let stored = canonicalize_declared_batch(nullable_otel_batch(true), Some(&declared)).unwrap();
+        let schema = stored.schema();
         assert!(schema.field_with_name("id").unwrap().is_nullable(), "`id` actually contains a null; relabelling it NOT NULL would lie about the data");
         assert!(!schema.field_with_name("timestamp").unwrap().is_nullable(), "`timestamp` is null-free and must still be tightened");
     }

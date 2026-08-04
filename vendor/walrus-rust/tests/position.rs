@@ -232,18 +232,20 @@ fn request_reclaim_sweep_deletes_consumed_files_promptly() {
     let tail = wal.current_position(topic).unwrap();
     wal.set_persisted_read_position(topic, tail).unwrap();
 
-    wal.request_reclaim_sweep();
+    let started = std::time::Instant::now();
+    let epoch = wal.request_reclaim_sweep();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         let n = data_files();
-        if n <= 1 {
+        if n <= 1 && wal.reclaim_sweep_complete(epoch) {
             break; // fully-consumed file reclaimed; only the active file remains
         }
         if std::time::Instant::now() >= deadline {
             let states: Vec<_> = Walrus::file_reclaim_states().into_iter().filter(|(p, ..)| p.starts_with(dir.to_string_lossy().as_ref())).collect();
-            panic!("consumed file not reclaimed within 15s of request_reclaim_sweep (data files={n}); states={states:?}");
+            panic!("consumed file not reclaimed within 2s of request_reclaim_sweep (data files={n}, sweep_complete={}); states={states:?}", wal.reclaim_sweep_complete(epoch));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
