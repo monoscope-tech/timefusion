@@ -326,7 +326,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         datafusion::logical_expr::col("timestamp").gt_eq(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(q.lo), Some("UTC".into())))),
         datafusion::logical_expr::col("timestamp").lt(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(hi), Some("UTC".into())))),
     ];
-    let (mem_batches, hot_batches) = match database.buffered_layer() {
+    let (mem_batches, mem_ranges, hot) = match database.buffered_layer() {
         Some(layer) => {
             let mem = layer.query(&q.project_id, &q.table_name, &filters).ok()?;
             // The ordinary MOR scan resolves mem ∪ hot ∪ Delta. Omitting
@@ -342,9 +342,9 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
                 .hot_tier()
                 .query_partitioned(&q.project_id, &q.table_name, Some((q.lo, q.hi)), &mem_ranges, &filters, &arrow_schema, Some(&projection))
                 .await;
-            (mem, hot.partitions.into_iter().flatten().collect())
+            (mem, mem_ranges, hot)
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), Default::default()),
     };
     let table_ref = database.resolve_table(&q.project_id, &q.table_name).await.ok()?;
     let (indexes, missing, added_files, stale_dates, delta_snapshot, log_store) = {
@@ -389,13 +389,20 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         }
         return None;
     }
-    let mut overlay_batches = mem_batches;
-    overlay_batches.extend(hot_batches);
-    overlay_batches.extend(database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?);
+    let mut authoritative_batches = mem_batches;
+    authoritative_batches.extend(hot.partitions.into_iter().flatten());
+    let covered_ranges = crate::mem_buffer::merge_ranges([mem_ranges, hot.ranges].concat());
+    let delta_batches = database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?;
     indexes.into_iter().try_fold(0u64, |total, (date, index)| {
         let day_lo = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
         let day_hi = date.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
-        let count = index.count_with_overlay(&overlay_batches, q.lo.max(day_lo), hi.min(day_hi), columns).ok()?;
+        let input = crate::logical_count_index::LogicalCountOverlay {
+            authoritative_batches: &authoritative_batches,
+            delta_batches: &delta_batches,
+            covered_ranges: &covered_ranges,
+            version_gate: hot.version_gate,
+        };
+        let count = index.count_with_covered_overlay(input, q.lo.max(day_lo), hi.min(day_hi), columns).ok()?;
         total.checked_add(count)
     })
 }

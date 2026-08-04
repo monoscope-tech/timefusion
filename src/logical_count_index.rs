@@ -79,6 +79,14 @@ pub struct LogicalCountColumns<'a> {
     pub deleted: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LogicalCountOverlay<'a> {
+    pub authoritative_batches: &'a [RecordBatch],
+    pub delta_batches: &'a [RecordBatch],
+    pub covered_ranges: &'a [(i64, i64)],
+    pub version_gate: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CountPartition {
     pub project_id: String,
@@ -392,6 +400,20 @@ impl LogicalCountIndex {
     /// the temporary map, so the cost follows the hot tail rather than the
     /// full 24-hour cardinality.
     pub fn count_with_overlay(&self, batches: &[RecordBatch], lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
+        self.count_with_covered_overlay(
+            LogicalCountOverlay { authoritative_batches: batches, delta_batches: &[], covered_ranges: &[], version_gate: None },
+            lo,
+            hi,
+            columns,
+        )
+    }
+
+    /// Count after applying the same coverage contract as the ordinary
+    /// `mem ∪ hot ∪ Delta` scan. Rows in `authoritative_batches` replace
+    /// covered Delta rows; `delta_batches` are newly appended Delta files and
+    /// remain subject to the same range/version gate as the indexed base.
+    pub fn count_with_covered_overlay(&self, input: LogicalCountOverlay<'_>, lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
+        let LogicalCountOverlay { authoritative_batches, delta_batches, covered_ranges, version_gate } = input;
         #[derive(Clone, Copy)]
         struct Overlay {
             base: Option<Winner>,
@@ -399,46 +421,90 @@ impl LogicalCountIndex {
             timestamp: i64,
         }
 
+        let base_visible = |timestamp: i64, winner: Winner| {
+            !covered_ranges
+                .iter()
+                .any(|&(start, end)| (start..end).contains(&timestamp) && version_gate.is_none_or(|gate| winner.tiebreak.is_none_or(|stamp| stamp <= gate)))
+        };
         let mut overlay: HashMap<Box<[u8]>, Overlay, ahash::RandomState> = HashMap::default();
-        for batch in batches {
-            let timestamps = timestamp_values(batch, columns.timestamp)?;
-            let ids = StringValues::new(batch, columns.id)?;
-            let tiebreaks = timestamp_values(batch, columns.tiebreak)?;
-            let deleted = batch
-                .column_by_name(columns.deleted)
-                .with_context(|| format!("logical-count overlay missing {}", columns.deleted))?
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .with_context(|| format!("logical-count overlay {} is not Boolean", columns.deleted))?;
-            for row in 0..batch.num_rows() {
-                if timestamps.is_null(row) {
-                    continue;
-                }
-                let timestamp = timestamps.value(row);
-                let id = ids.value(row).with_context(|| format!("logical-count overlay {} is NULL at row {row}", columns.id))?;
-                let encoded = key(timestamp, id);
-                let candidate =
-                    Winner { tiebreak: (!tiebreaks.is_null(row)).then(|| tiebreaks.value(row)), deleted: !deleted.is_null(row) && deleted.value(row) };
-                match overlay.entry(encoded) {
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if candidate.tiebreak > entry.get().current.tiebreak {
-                            entry.get_mut().current = candidate;
-                        }
+        for (batches, authoritative) in [(authoritative_batches, true), (delta_batches, false)] {
+            for batch in batches {
+                let timestamps = timestamp_values(batch, columns.timestamp)?;
+                let ids = StringValues::new(batch, columns.id)?;
+                let tiebreaks = timestamp_values(batch, columns.tiebreak)?;
+                let deleted = batch
+                    .column_by_name(columns.deleted)
+                    .with_context(|| format!("logical-count overlay missing {}", columns.deleted))?
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .with_context(|| format!("logical-count overlay {} is not Boolean", columns.deleted))?;
+                for row in 0..batch.num_rows() {
+                    if timestamps.is_null(row) {
+                        continue;
                     }
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let base = self.winner(timestamp, id);
-                        let current = base.filter(|winner| winner.tiebreak >= candidate.tiebreak).unwrap_or(candidate);
-                        entry.insert(Overlay { base, current, timestamp });
+                    let timestamp = timestamps.value(row);
+                    let id = ids.value(row).with_context(|| format!("logical-count overlay {} is NULL at row {row}", columns.id))?;
+                    let encoded = key(timestamp, id);
+                    let candidate =
+                        Winner { tiebreak: (!tiebreaks.is_null(row)).then(|| tiebreaks.value(row)), deleted: !deleted.is_null(row) && deleted.value(row) };
+                    if !authoritative && !base_visible(timestamp, candidate) {
+                        continue;
+                    }
+                    match overlay.entry(encoded) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            if candidate.tiebreak > entry.get().current.tiebreak {
+                                entry.get_mut().current = candidate;
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let base = self.winner(timestamp, id).filter(|winner| base_visible(timestamp, *winner));
+                            let current = base.filter(|winner| winner.tiebreak >= candidate.tiebreak).unwrap_or(candidate);
+                            entry.insert(Overlay { base, current, timestamp });
+                        }
                     }
                 }
             }
         }
 
         let mut count = i128::from(self.count(lo, hi));
+        if !covered_ranges.is_empty() {
+            count -= i128::from(self.count_covered_live(lo, hi, covered_ranges, version_gate));
+        }
         for state in overlay.values().filter(|state| (lo..hi).contains(&state.timestamp)) {
             count += i128::from(!state.current.deleted) - i128::from(state.base.is_some_and(|winner| !winner.deleted));
         }
         u64::try_from(count).context("logical-count overlay produced an invalid negative/overflow count")
+    }
+
+    fn count_covered_live(&self, lo: i64, hi: i64, covered_ranges: &[(i64, i64)], version_gate: Option<i64>) -> u64 {
+        let visible = |timestamp: i64, winner: Winner| {
+            !winner.deleted
+                && (lo..hi).contains(&timestamp)
+                && covered_ranges
+                    .iter()
+                    .any(|&(start, end)| (start..end).contains(&timestamp) && version_gate.is_none_or(|gate| winner.tiebreak.is_none_or(|stamp| stamp <= gate)))
+        };
+        let count = if let Some(packed) = &self.packed {
+            packed
+                .winners
+                .iter()
+                .filter(|winner| {
+                    visible(
+                        winner.timestamp,
+                        Winner { tiebreak: (winner.flags & FLAG_TIEBREAK_PRESENT != 0).then_some(winner.tiebreak), deleted: winner.flags & FLAG_DELETED != 0 },
+                    )
+                })
+                .count()
+        } else {
+            self.winners
+                .iter()
+                .filter(|(key, winner)| {
+                    let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
+                    visible(timestamp, **winner)
+                })
+                .count()
+        };
+        u64::try_from(count).expect("logical-count partition length fits u64")
     }
 
     /// Exact live row count in the half-open interval `[lo, hi)`.
@@ -797,6 +863,37 @@ mod tests {
         ]);
         assert_eq!(index.count_with_overlay(&[tail], 0, 100, columns).unwrap(), 3);
         assert_eq!(index.logical_rows(), 2, "overlay must not mutate the persistent base");
+    }
+
+    #[test]
+    fn covered_overlay_replaces_delta_rows_like_the_union_scan() {
+        let columns = LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak: "updated_at", deleted: "deleted" };
+        let mut index = LogicalCountIndex::new();
+        index.apply(10, "old", Some(1), false);
+        index.apply(20, "newer-delta", Some(5), false);
+        index.finalize().unwrap();
+        let hot = versions(&[(10, "old", Some(2), Some(true)), (20, "newer-delta", Some(3), Some(true))]);
+
+        let hot_copy = [hot.clone()];
+        let ranges = [(0, 50)];
+        let input = LogicalCountOverlay { authoritative_batches: &hot_copy, delta_batches: &[], covered_ranges: &ranges, version_gate: None };
+        assert_eq!(index.count_with_covered_overlay(input, 0, 100, columns).unwrap(), 0);
+        let hot_copy = [hot];
+        let input = LogicalCountOverlay { authoritative_batches: &hot_copy, delta_batches: &[], covered_ranges: &ranges, version_gate: Some(3) };
+        assert_eq!(index.count_with_covered_overlay(input, 0, 100, columns).unwrap(), 1, "a Delta winner newer than the hot version gate remains visible");
+    }
+
+    #[test]
+    fn covered_delta_append_obeys_the_hot_version_gate() {
+        let columns = LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak: "updated_at", deleted: "deleted" };
+        let mut index = LogicalCountIndex::new();
+        index.finalize().unwrap();
+        let appended = versions(&[(10, "covered", Some(2), Some(false)), (20, "newer", Some(4), Some(false))]);
+
+        let appended = [appended];
+        let ranges = [(0, 50)];
+        let input = LogicalCountOverlay { authoritative_batches: &[], delta_batches: &appended, covered_ranges: &ranges, version_gate: Some(3) };
+        assert_eq!(index.count_with_covered_overlay(input, 0, 100, columns).unwrap(), 1);
     }
 
     #[test]
