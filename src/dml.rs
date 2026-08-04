@@ -907,7 +907,7 @@ async fn perform_version_append(
             l.mark_version_buckets(project_id, table_name, &batches);
         }
         database
-            .insert_records_batch(project_id, table_name, batches, false, None)
+            .insert_records_batch_bounded(project_id, table_name, batches, false, None, false)
             .await
             .map_err(|e| DataFusionError::Execution(format!("merge-on-read append failed for {project_id}/{table_name}: {e}")))?;
     }

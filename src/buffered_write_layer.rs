@@ -1108,8 +1108,16 @@ impl BufferedWriteLayer {
         }
     }
 
-    #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
+        self.insert_bounded(project_id, table_name, batches, true).await
+    }
+
+    /// `bound: false` skips the event-time admission bound — for DML
+    /// re-appends only: tombstones/updates keep the original row's timestamp,
+    /// which may legitimately lie outside the bound (2026-08-04: the bound ate
+    /// the DELETE tombstones aimed at the `date=2238-12-31` garbage itself).
+    #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
+    pub async fn insert_bounded(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, bound: bool) -> anyhow::Result<()> {
         let _admission = self.admit_write().map_err(anyhow::Error::msg)?;
         // Fail fast while the WAL backlog is over its HARD cap (see
         // `wal_hard_backpressure`): acking more work would only deepen an
@@ -1154,7 +1162,7 @@ impl BufferedWriteLayer {
         // like `date=2238-12-31` that no query or retention pass ever visits
         // (prod 2026-08-03). Bounding at flush instead would wedge data that
         // was already acked into the WAL.
-        let batches = bound_event_time(project_id, table_name, batches);
+        let batches = if bound { bound_event_time(project_id, table_name, batches) } else { batches };
         if batches.is_empty() {
             return Ok(());
         }

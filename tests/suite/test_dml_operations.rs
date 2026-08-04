@@ -1090,4 +1090,40 @@ mod tests {
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 4242, "flush persisted the post-DML value");
         Ok(())
     }
+
+    /// Regression (prod 2026-08-04): the admission-time event-time bound ate
+    /// DML tombstones — DELETE on rows with timestamps outside
+    /// [2000-01-01, now+48h] acked but silently never applied, making garbage
+    /// rows (the `date=2238-12-31` partition) undeletable via SQL. DML
+    /// re-appends must bypass the bound: they only rewrite rows that already
+    /// exist in the table.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delete_applies_to_rows_outside_event_time_bound() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+        let db0 = Database::with_config(cfg).await?;
+        let mut ctx = Arc::new(db0.clone()).create_session_context();
+        let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
+        db.setup_session_context(&mut ctx)?;
+
+        let far_future = 8_486_812_800_000_000i64; // 2238-12-31T00:00:00Z
+        let record = serde_json::json!({
+            "id": "junk-2238", "name": "junk", "project_id": "test_project",
+            "timestamp": far_future, "level": "INFO", "status_code": "OK", "duration": 1,
+            "date": "2238-12-31", "hashes": [], "summary": []
+        });
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(vec![record])?;
+        // skip_queue=true: straight to Delta, as prod's junk predates the bound.
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'junk-2238'").await?.collect().await?;
+
+        let df = ctx.sql("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'junk-2238'").await?;
+        let n = df.collect().await?[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(n, 0, "DELETE must apply to rows outside the event-time bound");
+        Ok(())
+    }
 }

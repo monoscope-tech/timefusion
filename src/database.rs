@@ -4682,6 +4682,14 @@ impl Database {
     pub async fn insert_records_batch(
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::buffered_write_layer::DeltaWatermark>,
     ) -> Result<Vec<String>> {
+        self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, watermark, true).await
+    }
+
+    /// `bound: false` is for DML re-appends only — see
+    /// [`crate::buffered_write_layer::BufferedWriteLayer::insert_bounded`].
+    pub async fn insert_records_batch_bounded(
+        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::buffered_write_layer::DeltaWatermark>, bound: bool,
+    ) -> Result<Vec<String>> {
         let span = tracing::Span::current();
         // Normalize timezone-as-offset (`+00:00`) timestamp columns to the
         // IANA `"UTC"` form. Delta-rs Arrow→Delta schema conversion only
@@ -4729,7 +4737,7 @@ impl Database {
         // No files are written synchronously on this path; an empty URI list is correct.
         if !skip_queue && let Some(layer) = self.buffered_layer() {
             span.record("use_queue", "buffered_layer");
-            layer.insert(&project_id, &table_name, batches).await?;
+            layer.insert_bounded(&project_id, &table_name, batches, bound).await?;
             return Ok(Vec::new());
         }
 
