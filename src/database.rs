@@ -4506,16 +4506,36 @@ impl Database {
                 let restored_version = state.version();
                 let mut table = builder()?.build()?;
                 table.state = Some(state);
-                // e.g. the log tail past the snapshot was vacuumed away → full load.
-                table
-                    .update_state()
-                    .await
-                    .inspect_err(|e| warn!("Local snapshot catch-up failed for '{storage_uri}': {e}; falling back to full load"))
-                    .ok()
-                    .map(|()| {
-                        info!("Restored '{storage_uri}' from local snapshot at v{restored_version}, caught up to {:?}", table.version());
-                        table
-                    })
+                // `update_state()` only probes versions *after* the supplied
+                // state. It returns Ok when the local snapshot is ahead of the
+                // durable log, even if its own commit disappeared (prod
+                // 2026-08-04: local otel_metrics v140816, S3 ended at v140806).
+                // Such a zombie snapshot serves removed files and makes every
+                // subsequent commit fail with InvalidTableVersion. Require its
+                // anchor commit to exist; if log cleanup legitimately removed
+                // it behind a newer checkpoint, a full load is also the right
+                // path because it starts from that durable checkpoint.
+                match table.log_store().read_commit_entry(restored_version).await {
+                    Ok(Some(_)) => table
+                        .update_state()
+                        .await
+                        .inspect_err(|e| warn!("Local snapshot catch-up failed for '{storage_uri}': {e}; falling back to full load"))
+                        .ok()
+                        .map(|()| {
+                            info!("Restored '{storage_uri}' from local snapshot at v{restored_version}, caught up to {:?}", table.version());
+                            table
+                        }),
+                    Ok(None) => {
+                        warn!("Local snapshot anchor v{restored_version} is absent for '{storage_uri}'; falling back to durable checkpoint/log load");
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Could not validate local snapshot anchor v{restored_version} for '{storage_uri}': {e}; falling back to durable checkpoint/log load"
+                        );
+                        None
+                    }
+                }
             }
             None => None,
         };
