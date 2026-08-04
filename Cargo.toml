@@ -50,7 +50,6 @@ sqlx = { version = "0.8", features = [
   "uuid",
 ] }
 futures = { version = "0.3.31", features = ["alloc"] }
-rayon = "1.11"
 bytes = { version = "1.4", features = ["serde"] }
 tokio-rustls = "0.26.1"
 datafusion-postgres = "0.17"

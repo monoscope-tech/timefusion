@@ -1260,12 +1260,6 @@ impl BufferedWriteLayer {
             if rewind_applied {
                 self.wal.remove_recovery_rewind_marker();
             }
-            // Quarantine is a separate durability source from the unread WAL
-            // tail. A fully-consumed WAL can still have an INSERT payload that
-            // an older boot parked for re-drive; apply it before declaring
-            // recovery complete. `redrive_quarantine` inserts through the
-            // normal WAL-first path, so the re-driven row remains crash-safe.
-            self.redrive_quarantine().await;
             self.wal.request_reclaim_sweep();
             let recovery_duration_ms = start.elapsed().as_millis() as u64;
             self.wal_recovery_duration_ms.store(recovery_duration_ms, Ordering::Relaxed);
@@ -1492,9 +1486,8 @@ impl BufferedWriteLayer {
                 break;
             }
 
-            use rayon::prelude::*;
             let ready: Vec<_> = chunk
-                .into_par_iter()
+                .into_iter()
                 .map(|(entry, shard, pos, frontier)| {
                     let decoded = (entry.operation == WalOperation::Insert).then(|| {
                         let started = std::time::Instant::now();
@@ -1696,9 +1689,9 @@ impl BufferedWriteLayer {
             if entries_replayed > 0 { insert_bytes / entries_replayed } else { 0 },
         );
 
-        // Quarantine must never be a quiet outcome: re-drive what can go back
-        // through the durable ingest path, then ALERT on whatever remains.
-        self.redrive_quarantine().await;
+        // Quarantine must never be a quiet outcome. Re-drive is deliberately
+        // started with the other background tasks: a large or deterministically
+        // incompatible quarantine backlog must not hold the listener closed.
         let (q_files, q_bytes) = crate::wal::quarantine_stats(self.wal.data_dir());
         if q_files > 0 {
             crate::metrics::record_quarantine_backlog();
@@ -1874,6 +1867,10 @@ impl BufferedWriteLayer {
             // listener serves immediately instead of blocking on the drain.
             spawn_task!(drain_to_budget),
             spawn_task!(finish_hot_tier_open),
+            // Quarantine files are already durable and remain parked on any
+            // failed attempt. Re-drive through the normal WAL-first insert path
+            // after readiness so an incompatible backlog cannot block boot.
+            spawn_task!(redrive_quarantine),
         ]);
 
         info!("BufferedWriteLayer background tasks started");
@@ -3121,6 +3118,20 @@ impl BufferedWriteLayer {
     /// commit per table, `flush_parallelism`-wide).
     pub async fn flush_all_now(&self) -> anyhow::Result<FlushStats> {
         self.flush_buckets_where(|_| true).await
+    }
+
+    /// Give walrus one cleanup tick to unlink files made eligible by a
+    /// successful administrative FLUSH. The outgoing process remains fully
+    /// available during this wait; paying it before orchestration starts keeps
+    /// the replacement from rescanning a large, already-consumed WAL.
+    pub async fn reclaim_wal_for_planned_handoff(&self) {
+        self.wal.request_reclaim_sweep();
+        let tick = match self.config.buffer.wal_fsync_mode() {
+            crate::config::WalFsyncMode::Milliseconds(ms) => Duration::from_millis(ms.max(1)),
+            crate::config::WalFsyncMode::SyncEach => Duration::from_secs(5),
+            crate::config::WalFsyncMode::None => Duration::from_secs(10),
+        };
+        tokio::time::sleep(tick + Duration::from_millis(250)).await;
     }
 
     /// Flush one taken bucket: force-flushed marking + in-flight hold
@@ -5130,6 +5141,15 @@ mod tests {
         std::fs::write(qdir.join("2_insert_corrupt_t.bin"), &data[..data.len() / 2]).unwrap();
         std::fs::write(qdir.join("2_insert_corrupt_t.meta"), meta("insert_corrupt")).unwrap();
         layer.recover_from_wal().await.unwrap();
+        assert_eq!(layer.snapshot_stats().mem_total_rows, 0, "quarantine re-drive must not block recovery/readiness");
+        layer.start_background_tasks().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while layer.snapshot_stats().mem_total_rows != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background quarantine re-drive did not finish");
 
         assert_eq!(layer.snapshot_stats().mem_total_rows, 1, "re-driven payload's row must be back in the store");
         assert!(qdir.join("redriven/1_insert_incompatible_t.bin").exists(), "re-driven payload archived for forensics");

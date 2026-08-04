@@ -90,6 +90,8 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
+    const PROJECTS: usize = 10;
+    const FLUSHED_ROUNDS: usize = 3;
     let mut env = E2eEnv::builder().start().await?;
     {
         let client = env.pg_client().await?;
@@ -97,8 +99,6 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
         //   - many (project, table) topic pairs → many Delta tables to open + scan
         //   - several flush rounds per project → real commit history depth
         //   - a final un-flushed batch per project → WAL replay has actual work
-        const PROJECTS: usize = 10;
-        const FLUSHED_ROUNDS: usize = 3;
         for round in 0..FLUSHED_ROUNDS {
             for p in 0..PROJECTS {
                 for i in 0..5 {
@@ -121,6 +121,17 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     env.restart().await?;
     let restart_elapsed = t0.elapsed();
+
+    // The physical-history optimization scans the unified Delta log once and
+    // then derives each logical project's cursor independently. Verify that no
+    // tenant inherited a co-tenant's cursor and that both the flushed prefix
+    // and unflushed WAL tail survived for every project.
+    let client = env.pg_client().await?;
+    for p in 0..PROJECTS {
+        let project = format!("p-{p}");
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&project]).await?.get(0);
+        assert_eq!(count, (FLUSHED_ROUNDS * 5 + 5) as i64, "dirty restart lost or duplicated rows for {project}");
+    }
 
     // Two bars: ~4s isolated (`cargo nextest run cold_start_under_five_seconds`),
     // but under the full suite's ~10-way parallelism wall-clock inflates ~3x
