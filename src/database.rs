@@ -2794,7 +2794,7 @@ impl Database {
                     info!("Running scheduled vacuum on all tables");
                     for (project_id, table_name, table) in db.all_tables().await {
                         info!("Vacuuming {} (retention: {}h)", Self::table_label(&project_id, &table_name), vacuum_retention);
-                        db.vacuum_table(&table, vacuum_retention).await;
+                        db.vacuum_table(&project_id, &table_name, &table, vacuum_retention).await;
                     }
                 }
             }
@@ -8410,16 +8410,30 @@ impl Database {
     pub async fn vacuum_named(&self, table_name: &str, retention_hours: Option<u64>) -> Result<usize> {
         let retention = retention_hours.unwrap_or(self.config.maintenance.timefusion_vacuum_retention_hours);
         let table_ref = self.get_or_create_unified_table(table_name).await?;
-        Ok(self.vacuum_table(&table_ref, retention).await)
+        Ok(self.vacuum_table("", table_name, &table_ref, retention).await)
     }
 
     /// Returns the number of files deleted (0 on failure — the error is logged).
-    async fn vacuum_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) -> usize {
+    async fn vacuum_table(&self, project_id: &str, table_name: &str, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) -> usize {
         // Log the start of the vacuum operation
         let start_time = std::time::Instant::now();
         info!("Starting vacuum operation with retention period of {} hours", retention_hours);
 
-        // Get a clone of the table to avoid holding the lock during the operation
+        // Full vacuum lists unreferenced parquet as well as retained Remove
+        // actions. Serialize that classification with every local writer and
+        // refresh inside the critical section: cloning before the commit lock
+        // lets a concurrent flush land a file that Full vacuum can mistake for
+        // an orphan. The table RwLock alone is insufficient because commit
+        // paths deliberately clone-update-swap without holding it across IO.
+        let commit_lock = self.commit_lock(project_id, table_name).await;
+        let _commit_guard = commit_lock.lock().await;
+        if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
+            error!("Vacuum aborted: failed to refresh '{}' before Full orphan sweep: {}", Self::table_label(project_id, table_name), e);
+            return 0;
+        }
+
+        // Get a clone so the table RwLock is not held across object-store IO.
+        // The per-physical-table commit lock above keeps this snapshot stable.
         let table_clone = {
             let table = table_ref.read().await;
             table.clone()
@@ -8784,7 +8798,9 @@ impl Database {
         // Shutdown batch queue if present
         if let Some(ref queue) = self.batch_queue {
             info!("Flushing batch queue...");
-            queue.shutdown().await;
+            if tokio::time::timeout_at(deadline, queue.shutdown()).await.is_err() {
+                warn!("Batch queue shutdown exceeded shutdown deadline — proceeding with process teardown");
+            }
         }
 
         // Log final cache stats and shutdown cache
@@ -8796,7 +8812,9 @@ impl Database {
 
         // Close PostgreSQL connection pool if present
         if let Some(ref pool) = self.config_pool {
-            pool.close().await;
+            if tokio::time::timeout_at(deadline, pool.close()).await.is_err() {
+                warn!("PostgreSQL pool close exceeded shutdown deadline — dropping connections on process exit");
+            }
         }
 
         info!("Database shutdown complete");
