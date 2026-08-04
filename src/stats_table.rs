@@ -35,6 +35,8 @@ pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 pub type FoyerStatsSnapshot = Arc<dyn Fn() -> FoyerRuntimeStats + Send + Sync>;
 /// (used_bytes, pool_size) of the shared query memory pool, live.
 pub type PoolSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
+/// (resident partitions, estimated bytes, byte limit, active builders).
+pub type LogicalCountSnapshot = Arc<dyn Fn() -> (usize, usize, usize, usize) + Send + Sync>;
 
 type Row = (&'static str, String, String);
 
@@ -81,6 +83,7 @@ pub struct StatsTableProvider {
     cache_sizes: Option<CacheSizeSnapshot>,
     foyer_stats: Option<FoyerStatsSnapshot>,
     query_pool: Option<PoolSnapshot>,
+    logical_count: Option<LogicalCountSnapshot>,
     schema: SchemaRef,
 }
 
@@ -97,7 +100,7 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, query_pool: None, schema }
+        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, query_pool: None, logical_count: None, schema }
     }
 
     pub fn with_scan_metrics(self, m: Arc<ScanMetrics>) -> Self {
@@ -114,6 +117,10 @@ impl StatsTableProvider {
 
     pub fn with_query_pool(self, f: PoolSnapshot) -> Self {
         Self { query_pool: Some(f), ..self }
+    }
+
+    pub fn with_logical_count(self, f: LogicalCountSnapshot) -> Self {
+        Self { logical_count: Some(f), ..self }
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
@@ -468,7 +475,19 @@ impl StatsTableProvider {
             rows!["scan"; "fast_resolve_cache_entries" => fast_resolve, "provider_cache_entries" => provider]
         });
 
-        let rows: Vec<Row> = [budget, layer, dml, maintenance, plan_cache, scan, foyer, parquet, cache_sizes].into_iter().flatten().collect();
+        let logical_count = self.logical_count.as_ref().map_or_else(Vec::new, |snap| {
+            let (entries, resident, limit, building) = snap();
+            rows!["logical_count";
+                "resident_partitions" => entries,
+                "resident_bytes_estimated" => resident,
+                "resident_mb_estimated" => mib(resident),
+                "resident_limit_bytes" => limit,
+                "resident_limit_mb" => mib(limit),
+                "active_builds" => building,
+            ]
+        });
+
+        let rows: Vec<Row> = [budget, layer, dml, maintenance, plan_cache, scan, foyer, logical_count, parquet, cache_sizes].into_iter().flatten().collect();
         let cols: Vec<ArrayRef> = vec![
             Arc::new(rows.iter().map(|r| Some(r.0)).collect::<StringArray>()),
             Arc::new(rows.iter().map(|r| Some(r.1.as_str())).collect::<StringArray>()),
@@ -550,6 +569,15 @@ mod tests {
             assert_has(&rows, "foyer", key);
         }
         assert!(rows.contains(&("foyer".into(), "cache_dir".into(), "/cache".into())));
+    }
+
+    #[test]
+    fn exposes_logical_count_residency_and_build_activity() {
+        let rows = snapshot_rows(&StatsTableProvider::new(None).with_logical_count(Arc::new(|| (3, 42, 100, 1))));
+        for key in ["resident_partitions", "resident_bytes_estimated", "resident_mb_estimated", "resident_limit_bytes", "resident_limit_mb", "active_builds"] {
+            assert_has(&rows, "logical_count", key);
+        }
+        assert!(rows.contains(&("logical_count".into(), "active_builds".into(), "1".into())));
     }
 
     #[test]

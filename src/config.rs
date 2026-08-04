@@ -326,6 +326,17 @@ impl DerivedBudget {
         self.foyer_memory_bytes
     }
 
+    /// The shared cache reservation is split between raw object bytes and
+    /// exact logical-count indexes. Keeping both inside the existing 10%
+    /// reservation prevents the derived cache from becoming untracked heap.
+    pub fn object_cache_memory_bytes(&self) -> usize {
+        self.foyer_memory_bytes / 2
+    }
+
+    pub fn logical_count_memory_bytes(&self) -> usize {
+        self.foyer_memory_bytes - self.object_cache_memory_bytes()
+    }
+
     pub fn writer_reserve_bytes(&self) -> usize {
         self.writer_reserve_bytes
     }
@@ -474,7 +485,9 @@ pub fn log_derived_budget(b: &DerivedBudget) {
         cores = b.cores,
         query_pool_gb = b.query_pool_bytes() / GIB,
         ingest_buffer_gb = b.buffer_max_bytes() / GIB,
-        foyer_memory_gb = b.foyer_memory_bytes() / GIB,
+        cache_memory_gb = b.foyer_memory_bytes() / GIB,
+        foyer_memory_gb = b.object_cache_memory_bytes() / GIB,
+        logical_count_memory_gb = b.logical_count_memory_bytes() / GIB,
         writer_reserve_gb = b.writer_reserve_bytes() / GIB,
         maintenance_pool_gb = b.maintenance_pool_bytes() / GIB,
         heavy_share_gb = b.heavy_share_bytes() / GIB,

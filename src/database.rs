@@ -1871,6 +1871,12 @@ pub struct Database {
     /// Any commit touching the partition changes its file set → mismatch →
     /// dedup stays on until the next clean sweep pass.
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), u64>>,
+    /// Exact merge-on-read count partitions. Query threads use only the
+    /// process-local front; disk loads and Delta builds are single-flight and
+    /// bounded in the background so a cold cache cannot amplify query load.
+    logical_count_cache: Arc<crate::logical_count_index::LogicalCountCache>,
+    logical_count_building: Arc<dashmap::DashSet<crate::logical_count_index::CountPartition>>,
+    logical_count_build_sem: Arc<tokio::sync::Semaphore>,
     /// Dirty `(project, table, date, 10-minute bin)` keys recorded only after
     /// a Delta append commits. In-memory by design: after restart the
     /// read-side DedupExec remains the correctness backstop.
@@ -2308,6 +2314,10 @@ impl Database {
         let flush_sort_permits = (cfg.maintenance.flush_sort_pool_bytes() / MIN_SPILL_SORT_BYTES).max(1);
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
+        let logical_count_cache = Arc::new(crate::logical_count_index::LogicalCountCache::new(
+            cfg.core.timefusion_data_dir.join("logical_count"),
+            cfg.derived.logical_count_memory_bytes(),
+        ));
         let db = Self {
             config: cfg,
             runtime_env: Arc::new(std::sync::OnceLock::new()),
@@ -2338,6 +2348,12 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
+            logical_count_cache,
+            logical_count_building: Arc::new(dashmap::DashSet::new()),
+            // A build retains one winner per logical key. Serial construction
+            // is deliberate at production cardinality; query execution and
+            // the other cache tiers remain concurrent.
+            logical_count_build_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             dedup_dirty_bins,
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
@@ -3174,6 +3190,14 @@ impl Database {
                     .with_scan_metrics(self.scan_metrics.clone())
                     .with_cache_sizes(cache_sizes)
                     .with_foyer_stats(foyer_stats)
+                    .with_logical_count({
+                        let cache = Arc::clone(&self.logical_count_cache);
+                        let building = Arc::clone(&self.logical_count_building);
+                        Arc::new(move || {
+                            let (entries, resident, limit) = cache.stats();
+                            (entries, resident, limit, building.len())
+                        })
+                    })
                     .with_query_pool({
                         let env = self.shared_runtime_env();
                         let size = self.config.derived.query_pool_bytes();
@@ -7107,6 +7131,169 @@ impl Database {
         })
     }
 
+    fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, Vec<String>)> {
+        let snapshot = table.snapshot()?.snapshot();
+        let files = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), project_id, date);
+        Ok((partition_file_fp(files.clone()), files))
+    }
+
+    /// Memory-only lookup for a base whose files are all present in the table
+    /// snapshot the caller holds. Newly appended files are returned for a
+    /// narrow overlay; any removal/rewrite declines. Filesystem IO is forbidden
+    /// on this query path.
+    pub(crate) fn logical_count_memory_for_files(
+        &self, project_id: &str, table_name: &str, date: &str, files: &std::collections::HashSet<String>,
+    ) -> Option<(Arc<crate::logical_count_index::LogicalCountIndex>, Vec<String>)> {
+        let key = crate::logical_count_index::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
+        self.logical_count_cache.get_memory_appendable(&key, files)
+    }
+
+    pub(crate) async fn logical_count_overlay_batches(
+        &self, snapshot: Arc<deltalake::kernel::EagerSnapshot>, log_store: deltalake::logstore::LogStoreRef, files: Vec<String>,
+        columns: crate::logical_count_index::LogicalCountColumns<'_>,
+    ) -> Result<Vec<RecordBatch>> {
+        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider = TableProviderBuilder::default()
+            .with_log_store(log_store)
+            .with_eager_snapshot(snapshot)
+            .with_file_selection(FileSelection::from_file_paths(files))
+            .build()
+            .await
+            .map_err(|error| anyhow::anyhow!("logical-count overlay provider: {error}"))?;
+        let context = SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env()));
+        context.register_table("__logical_count_overlay", Arc::new(provider))?;
+        Ok(context
+            .table("__logical_count_overlay")
+            .await?
+            .select_columns(&[columns.timestamp, columns.id, columns.tiebreak, columns.deleted])?
+            .collect()
+            .await?)
+    }
+
+    /// Schedule one exact partition build. Concurrent misses share the same
+    /// single-flight key and the global semaphore bounds winner-map memory.
+    pub(crate) fn schedule_logical_count_build(self: &Arc<Self>, project_id: &str, table_name: &str, date: &str, force_refresh: bool) {
+        let key = crate::logical_count_index::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
+        if !self.logical_count_building.insert(key.clone()) {
+            return;
+        }
+        let database = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = database.build_logical_count_partition(&key, force_refresh).await;
+            database.logical_count_building.remove(&key);
+            if let Err(error) = result {
+                warn!(project_id = key.project_id, table_name = key.table_name, date = key.date, %error, "logical-count background build failed");
+            }
+        });
+    }
+
+    async fn build_logical_count_partition(&self, key: &crate::logical_count_index::CountPartition, force_refresh: bool) -> Result<()> {
+        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
+
+        let _permit = tokio::select! {
+            permit = self.logical_count_build_sem.acquire() => permit?,
+            () = self.maintenance_shutdown.cancelled() => return Ok(()),
+        };
+        let started = std::time::Instant::now();
+        let table_ref = self.resolve_table(&key.project_id, &key.table_name).await?;
+        let (fingerprint, files, eager_snapshot, log_store) = {
+            let table = table_ref.read().await;
+            let (fingerprint, files) = Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?;
+            (fingerprint, files, Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
+        };
+
+        // Restart warm-up first tries the persistent Arrow tier off the async
+        // worker. A valid file installs its memory front without scanning Delta.
+        let cache = Arc::clone(&self.logical_count_cache);
+        let disk_key = key.clone();
+        let current_files = files.iter().cloned().collect();
+        if !force_refresh
+            && let Some(added_files) = tokio::task::spawn_blocking(move || cache.load_appendable(&disk_key, &current_files)).await?
+            && added_files <= crate::logical_count_index::MAX_APPEND_OVERLAY_FILES
+        {
+            return Ok(());
+        }
+
+        let declared = get_schema(&key.table_name).ok_or_else(|| anyhow::anyhow!("logical-count table is not registered"))?;
+        anyhow::ensure!(declared.dedup_keys == ["timestamp", "id"], "logical-count currently requires dedup keys [timestamp,id]");
+        let tiebreak = declared.dedup_tiebreak.as_deref().ok_or_else(|| anyhow::anyhow!("logical-count table has no dedup tiebreak"))?;
+        let deleted = declared.tombstone_column.as_deref().ok_or_else(|| anyhow::anyhow!("logical-count table has no tombstone column"))?;
+        let columns = crate::logical_count_index::LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak, deleted };
+        let mut index = crate::logical_count_index::LogicalCountIndex::new();
+
+        if !files.is_empty() {
+            let provider = TableProviderBuilder::default()
+                .with_log_store(log_store)
+                .with_eager_snapshot(eager_snapshot)
+                .with_file_selection(FileSelection::from_file_paths(files.clone()))
+                .build()
+                .await
+                .map_err(|error| anyhow::anyhow!("logical-count provider: {error}"))?;
+            let context =
+                SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()));
+            context.register_table("__logical_count_src", Arc::new(provider))?;
+            let frame = context.table("__logical_count_src").await?.select_columns(&[columns.timestamp, columns.id, columns.tiebreak, columns.deleted])?;
+            let mut stream = frame.execute_stream().await?;
+            loop {
+                let batch = tokio::select! {
+                    batch = stream.try_next() => batch?,
+                    () = self.maintenance_shutdown.cancelled() => return Ok(()),
+                };
+                let Some(batch) = batch else { break };
+                index.apply_batch(&batch, columns)?;
+                // A three-day dashboard window can touch four UTC partitions.
+                // Reserve room for all four so independently valid daily
+                // indexes cannot evict one another into a permanent rebuild
+                // loop while the query is warming.
+                let per_index_limit = (self.config.derived.logical_count_memory_bytes() / 4).max(1);
+                anyhow::ensure!(
+                    index.estimated_heap_bytes() <= per_index_limit,
+                    "logical-count partition exceeded its {}MB resident build limit",
+                    per_index_limit / (1024 * 1024)
+                );
+                let host_limit = self.config.derived.memory_brake_limit_bytes();
+                anyhow::ensure!(
+                    process_memory_bytes().is_none_or(|used| used <= host_limit),
+                    "logical-count build stopped at the host memory brake ({}MB)",
+                    host_limit / (1024 * 1024)
+                );
+            }
+        }
+
+        // Concurrent appends are safe: the query overlays their new files.
+        // A removal/rewrite is not; it would leave winners from files no longer
+        // in the table, so refuse publication and let the next miss rebuild.
+        let current_files = {
+            let table = table_ref.read().await;
+            Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?.1.into_iter().collect::<std::collections::HashSet<_>>()
+        };
+        anyhow::ensure!(files.iter().all(|file| current_files.contains(file)), "logical-count partition was rewritten during build");
+
+        let physical_keys = index.physical_keys();
+        let logical_rows = index.logical_rows();
+        let estimated_bytes = index.estimated_heap_bytes();
+        let file_count = files.len();
+        let cache = Arc::clone(&self.logical_count_cache);
+        let install_key = key.clone();
+        tokio::task::spawn_blocking(move || cache.install(install_key, fingerprint, files, index)).await??;
+        info!(
+            project_id = key.project_id,
+            table_name = key.table_name,
+            date = key.date,
+            fingerprint,
+            file_count,
+            physical_keys,
+            logical_rows,
+            estimated_bytes,
+            elapsed_ms = started.elapsed().as_millis(),
+            "logical-count partition ready"
+        );
+        Ok(())
+    }
+
     /// Sweep every `(project_id, today)` partition in this table via
     /// `dedup_partition`. Skips when Delta version is unchanged since the
     /// last sweep, and skips partitions in failure backoff. Best-effort:
@@ -9456,7 +9643,7 @@ type DirtyBinKey = (String, String, String, i64);
 /// Snapshot-relative files belonging to one physical project/date partition.
 /// Unified tables carry `project_id=` path segments; custom-project tables do
 /// not, because the whole physical table already belongs to that project.
-fn dedup_partition_paths(paths: impl IntoIterator<Item = String>, project_id: &str, date: &str) -> Vec<String> {
+pub(crate) fn dedup_partition_paths(paths: impl IntoIterator<Item = String>, project_id: &str, date: &str) -> Vec<String> {
     let date_segment = format!("date={date}");
     let project_segment = format!("project_id={project_id}");
     let date_files: Vec<String> = paths.into_iter().filter(|path| path.split('/').any(|segment| segment == date_segment)).collect();
@@ -13588,6 +13775,60 @@ mod tests {
         datafusion_functions_json::register_all(&mut ctx)?;
         db.setup_session_context(&mut ctx)?;
         Ok((db, ctx, test_prefix))
+    }
+
+    /// The logical-count fast path must cover the full merge-on-read lifecycle:
+    /// build an exact snapshot base, resolve a newly appended tombstone as a
+    /// narrow overlay, and replace DedupExec in the physical COUNT plan.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logical_count_build_and_append_overlay_are_exact_end_to_end() -> Result<()> {
+        let (db, ctx, prefix) = setup_test_database().await?;
+        let project_id = format!("logical_count_{prefix}");
+        let timestamp = chrono::Utc::now().timestamp_micros() - 60_000_000;
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(timestamp).unwrap().date_naive();
+        let row = |id: &str, deleted: Option<bool>| {
+            serde_json::json!({
+                "timestamp": timestamp,
+                "id": id,
+                "name": id,
+                "project_id": project_id,
+                "date": date.to_string(),
+                "deleted": deleted,
+            })
+        };
+
+        let base = json_to_batch_for("mor_versioned", vec![row("live", None), row("gone", None)])?;
+        db.insert_records_batch(&project_id, "mor_versioned", vec![base], true, None).await?;
+        let key =
+            crate::logical_count_index::CountPartition { project_id: project_id.clone(), table_name: "mor_versioned".to_string(), date: date.to_string() };
+        db.build_logical_count_partition(&key, false).await?;
+
+        let table_ref = db.resolve_table(&project_id, "mor_versioned").await?;
+        let (index, added) = {
+            let table = table_ref.read().await;
+            let (_, files) = Database::logical_count_partition_snapshot(&table, &project_id, &date.to_string())?;
+            db.logical_count_memory_for_files(&project_id, "mor_versioned", &date.to_string(), &files.into_iter().collect())
+                .expect("built index must be memory-resident")
+        };
+        assert!(added.is_empty());
+        assert_eq!(index.count(timestamp, timestamp + 1), 2);
+
+        let tombstone = json_to_batch_for("mor_versioned", vec![row("gone", Some(true))])?;
+        db.insert_records_batch(&project_id, "mor_versioned", vec![tombstone], true, None).await?;
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM mor_versioned WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({timestamp}) AND timestamp < to_timestamp_micros({})",
+            timestamp + 1
+        );
+        let frame = ctx.sql(&sql).await?;
+        let plan = frame.create_physical_plan().await?;
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+        assert!(!rendered.contains("DedupExec"), "logical-count pushdown did not fire:\n{rendered}");
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        let count = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("COUNT returns Int64").value(0);
+        assert_eq!(count, 1, "the appended tombstone must retire its base winner");
+        Ok(())
     }
 
     /// Per-context RuntimeEnvs each granted the full memory budget, so N

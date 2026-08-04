@@ -106,7 +106,7 @@ pub fn apply(config: &mut AppConfig) {
     tune(
         "TIMEFUSION_FOYER_MEMORY_MB",
         &mut config.cache.timefusion_foyer_memory_mb,
-        (config.derived.foyer_memory_bytes() / MB).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB),
+        (config.derived.object_cache_memory_bytes() / MB).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB),
         "MB",
     );
     tune(

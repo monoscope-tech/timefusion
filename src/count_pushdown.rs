@@ -42,6 +42,17 @@ use tracing::debug;
 
 use crate::database::Database;
 
+fn count_result(plan: &LogicalPlan, total: u64) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    let total = i64::try_from(total).map_err(|_| datafusion::error::DataFusionError::Execution("COUNT(*) exceeds Int64".to_string()))?;
+    let out_schema: SchemaRef = Arc::new(plan.schema().as_arrow().clone());
+    if out_schema.fields().len() != 1 || out_schema.field(0).data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    let batch = RecordBatch::try_new(out_schema.clone(), vec![Arc::new(Int64Array::from(vec![total]))])?;
+    let source = MemorySourceConfig::try_new(&[vec![batch]], out_schema, None)?;
+    Ok(Some(Arc::new(DataSourceExec::new(Arc::new(source)))))
+}
+
 /// Predicate classification for one conjunct.
 enum Conjunct {
     ProjectId(String),
@@ -230,6 +241,13 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
     // Only tables served by ProjectRoutingTable qualify (system tables like
     // timefusion_stats share the session but not the storage model).
     let Some(schema) = crate::schema_loader::get_schema(&q.table_name) else { return Ok(None) };
+    if schema.tombstones_possible()
+        && let Some(total) = try_logical_count(database, &q, schema).await
+    {
+        debug!("count_pushdown: answered {}/{} [{}, {}] = {} from logical-count index", q.project_id, q.table_name, q.lo, q.hi, total);
+        crate::metrics::record_logical_count_pushdown_used();
+        return count_result(plan, total);
+    }
     // Tombstones make `stats.numRecords` an over-count in exactly the way
     // deletion vectors do (below), except invisibly: a merge-on-read DELETE is
     // an APPEND, so the file stats count both the tombstone version and the
@@ -280,14 +298,89 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
 
     debug!("count_pushdown: answered {}/{} [{}, {}] = {} from add-action stats", q.project_id, q.table_name, q.lo, q.hi, total);
     crate::metrics::record_count_pushdown_used();
-    // Single-row result matching the plan's output schema (count is Int64).
-    let out_schema: SchemaRef = Arc::new(plan.schema().as_arrow().clone());
-    if out_schema.fields().len() != 1 || out_schema.field(0).data_type() != &DataType::Int64 {
-        return Ok(None);
+    count_result(plan, total)
+}
+
+async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &crate::schema_loader::TableSchema) -> Option<u64> {
+    if schema.dedup_keys != ["timestamp", "id"] {
+        return None;
     }
-    let batch = RecordBatch::try_new(out_schema.clone(), vec![Arc::new(Int64Array::from(vec![total as i64]))])?;
-    let source = MemorySourceConfig::try_new(&[vec![batch]], out_schema, None)?;
-    Ok(Some(Arc::new(DataSourceExec::new(Arc::new(source)))))
+    let tiebreak = schema.dedup_tiebreak.as_deref()?;
+    let deleted = schema.tombstone_column.as_deref()?;
+    let hi = q.hi.checked_add(1)?;
+    let lo_date = chrono::DateTime::from_timestamp_micros(q.lo)?.date_naive();
+    let hi_date = chrono::DateTime::from_timestamp_micros(q.hi)?.date_naive();
+    let days = (hi_date - lo_date).num_days();
+    // The resident budget guarantees four daily indexes at once, which covers
+    // a three-day window crossing four UTC dates. Deeper scans keep the
+    // authoritative plan instead of churning the hot dashboard working set.
+    if !(0..=3).contains(&days) {
+        return None;
+    }
+    let dates: Vec<_> = (0..=days).map(|offset| lo_date + chrono::Duration::days(offset)).collect();
+
+    // Snapshot the unflushed tail before the Delta snapshot. Flush removes a
+    // batch only after publishing its table snapshot, so a transitioning row
+    // appears in at least one leg; an equal winner in both is a no-op overlay.
+    let filters = vec![
+        datafusion::logical_expr::col("timestamp").gt_eq(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(q.lo), Some("UTC".into())))),
+        datafusion::logical_expr::col("timestamp").lt(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(hi), Some("UTC".into())))),
+    ];
+    let mem_batches = match database.buffered_layer() {
+        Some(layer) => layer.query(&q.project_id, &q.table_name, &filters).ok()?,
+        None => Vec::new(),
+    };
+    let table_ref = database.resolve_table(&q.project_id, &q.table_name).await.ok()?;
+    let (indexes, missing, added_files, stale_dates, delta_snapshot, log_store) = {
+        let table = table_ref.read().await;
+        let delta_snapshot = Arc::new(table.snapshot().ok()?.snapshot().clone());
+        let paths: Vec<String> = delta_snapshot.log_data().iter().map(|file| file.path().to_string()).collect();
+        let mut indexes = Vec::with_capacity(dates.len());
+        let mut missing = Vec::new();
+        let mut added_files = Vec::new();
+        let mut stale_dates = Vec::new();
+        for date in &dates {
+            let date_string = date.to_string();
+            let files: std::collections::HashSet<_> =
+                crate::database::dedup_partition_paths(paths.iter().cloned(), &q.project_id, &date_string).into_iter().collect();
+            match database.logical_count_memory_for_files(&q.project_id, &q.table_name, &date_string, &files) {
+                Some((index, mut added)) => {
+                    indexes.push((*date, index));
+                    if !added.is_empty() {
+                        stale_dates.push(date_string);
+                    }
+                    added_files.append(&mut added);
+                }
+                None => missing.push(date_string),
+            }
+        }
+        (indexes, missing, added_files, stale_dates, delta_snapshot, table.log_store())
+    };
+    if !missing.is_empty() {
+        for date in missing {
+            database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, false);
+        }
+        return None;
+    }
+
+    let columns = crate::logical_count_index::LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak, deleted };
+    // Keep the synchronous append delta small. The full rebuild is already
+    // single-flight; a large gap falls back to authoritative DedupExec until
+    // the new base is ready instead of moving that scan onto every query.
+    if added_files.len() > crate::logical_count_index::MAX_APPEND_OVERLAY_FILES {
+        for date in stale_dates {
+            database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, true);
+        }
+        return None;
+    }
+    let mut overlay_batches = mem_batches;
+    overlay_batches.extend(database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?);
+    indexes.into_iter().try_fold(0u64, |total, (date, index)| {
+        let day_lo = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
+        let day_hi = date.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
+        let count = index.count_with_overlay(&overlay_batches, q.lo.max(day_lo), hi.min(day_hi), columns).ok()?;
+        total.checked_add(count)
+    })
 }
 
 /// Extract `(min_ts, max_ts, numRecords)` for this project's files from the
