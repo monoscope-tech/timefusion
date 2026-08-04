@@ -465,6 +465,9 @@ pub struct BufferedWriteLayer {
     accepting_writes: std::sync::atomic::AtomicBool,
     active_writes: AtomicU64,
     writes_drained: Notify,
+    /// Invalidates leased pre-deploy write fences. Shutdown increments this
+    /// again, so an old lease timer can never reopen admission after SIGTERM.
+    handoff_generation: AtomicU64,
     delta_write_callback: Option<DeltaWriteCallback>,
     /// Set alongside `delta_write_callback`; used instead of it when
     /// `TIMEFUSION_FLUSH_COALESCE_COMMITS` is on (see `flush_groups_coalesced`).
@@ -643,6 +646,7 @@ impl BufferedWriteLayer {
     /// existing PGWire sessions may finish; new INSERT/UPDATE/DELETE calls fail
     /// retryably instead of racing the final WAL cursor snapshot.
     pub fn stop_accepting_writes(&self) {
+        self.handoff_generation.fetch_add(1, Ordering::AcqRel);
         self.accepting_writes.store(false, Ordering::Release);
     }
 
@@ -688,6 +692,7 @@ impl BufferedWriteLayer {
             accepting_writes: std::sync::atomic::AtomicBool::new(true),
             active_writes: AtomicU64::new(0),
             writes_drained: Notify::new(),
+            handoff_generation: AtomicU64::new(0),
             delta_write_callback: None,
             coalesced_write_callback: None,
             tantivy_index_callback: None,
@@ -3114,6 +3119,66 @@ impl BufferedWriteLayer {
         self.flush_buckets_where(|_| true).await
     }
 
+    /// Fence new writes and drain the now-finite WAL tail while this process
+    /// remains available for reads. The deploy workflow calls this immediately
+    /// before task replacement, making SIGTERM's local snapshot the only work
+    /// left in the client-visible outage.
+    ///
+    /// The fence is leased: if orchestration never delivers SIGTERM, admission
+    /// automatically reopens after five minutes. Shutdown invalidates the lease
+    /// generation before closing admission, so its permanent fence cannot be
+    /// undone by the timer.
+    pub async fn prepare_deploy_handoff(self: &Arc<Self>) -> anyhow::Result<FlushStats> {
+        const HANDOFF_LEASE: Duration = Duration::from_secs(5 * 60);
+        const DRAIN_BUDGET: Duration = Duration::from_secs(4 * 60);
+
+        let generation = self.handoff_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.accepting_writes.store(false, Ordering::Release);
+
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(HANDOFF_LEASE).await;
+            let Some(layer) = weak.upgrade() else { return };
+            if !layer.shutdown.is_cancelled() && layer.handoff_generation.load(Ordering::Acquire) == generation {
+                layer.accepting_writes.store(true, Ordering::Release);
+                warn!("Deploy handoff lease expired before shutdown; write admission reopened");
+            }
+        });
+
+        let reopen_on_error = || {
+            if !self.shutdown.is_cancelled() && self.handoff_generation.load(Ordering::Acquire) == generation {
+                self.accepting_writes.store(true, Ordering::Release);
+            }
+        };
+        let deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
+        if !self.wait_for_active_writes_until(deadline).await {
+            reopen_on_error();
+            anyhow::bail!("HANDOFF timed out waiting for admitted writers; write admission reopened");
+        }
+        let stats = match tokio::time::timeout_at(deadline, self.flush_buckets_where(|_| true)).await {
+            Ok(Ok(stats)) => stats,
+            Ok(Err(e)) => {
+                reopen_on_error();
+                return Err(e.context("HANDOFF flush failed; write admission reopened"));
+            }
+            Err(_) => {
+                reopen_on_error();
+                anyhow::bail!("HANDOFF flush exceeded four minutes; write admission reopened");
+            }
+        };
+        if stats.buckets_failed > 0 || !self.is_drained() {
+            reopen_on_error();
+            anyhow::bail!("HANDOFF left {} failed bucket(s) or undrained WAL state; write admission reopened", stats.buckets_failed);
+        }
+        info!(
+            "Deploy handoff ready: write-fenced and drained ({} bucket(s), {} rows); lease={}s",
+            stats.buckets_flushed,
+            stats.total_rows,
+            HANDOFF_LEASE.as_secs()
+        );
+        Ok(stats)
+    }
+
     /// Ask walrus to unlink files made eligible by a successful administrative
     /// FLUSH and wait for the actual sweep completion (bounded at ten seconds).
     /// The outgoing process remains fully available during this wait; paying it
@@ -4722,6 +4787,45 @@ mod tests {
         let snap = layer.wal().load_cursor_snapshot().unwrap();
         assert!(snap.clean_shutdown && snap.drained, "successful final flush must authorize a drained boot");
         assert!(layer.wal().is_fully_consumed().unwrap(), "replacement must not replay the flushed tail");
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deploy_handoff_fences_writes_and_makes_shutdown_constant_time() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _wm| Box::pin(async { Ok(Vec::new()) })));
+        let layer = Arc::new(layer);
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span("handoff", "span", "p")]).unwrap();
+        layer.insert("p", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
+
+        let stats = layer.prepare_deploy_handoff().await.unwrap();
+        assert_eq!(stats.buckets_failed, 0);
+        assert!(layer.is_drained());
+        let err = layer.insert("p", "otel_logs_and_spans", vec![batch]).await.unwrap_err();
+        assert!(err.to_string().contains("draining for deployment"));
+
+        let started = std::time::Instant::now();
+        layer.shutdown().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "drained handoff shutdown must stay constant-time");
+        let snap = layer.wal().load_cursor_snapshot().unwrap();
+        assert!(snap.clean_shutdown && snap.drained);
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_deploy_handoff_reopens_write_admission() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _wm| Box::pin(async { anyhow::bail!("injected Delta failure") })));
+        let layer = Arc::new(layer);
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span("handoff", "span", "p")]).unwrap();
+        layer.insert("p", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
+
+        assert!(layer.prepare_deploy_handoff().await.is_err());
+        layer.insert("p", "otel_logs_and_spans", vec![batch]).await.expect("failed handoff must reopen writes");
     }
 
     /// A wedged ancillary worker must not consume the shutdown flush's entire

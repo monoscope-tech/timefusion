@@ -271,6 +271,17 @@ impl LoggingSimpleQueryHandler {
         Ok(vec![Response::Execution(Tag::new(&format!("FLUSH {}", stats.total_rows)))])
     }
 
+    /// Execute `HANDOFF`: lease a write-admission fence, drain the finite tail,
+    /// and keep serving reads until the orchestrator replaces this task.
+    async fn run_handoff(&self) -> PgWireResult<Vec<Response>> {
+        let layer = require_available(self.db.as_ref().and_then(|d| d.buffered_layer()), "HANDOFF")?;
+        let stats = layer.prepare_deploy_handoff().await.map_err(|e| admin_err(format!("HANDOFF: {e}")))?;
+        if !crate::clock::is_frozen() {
+            layer.reclaim_wal_after_flush().await;
+        }
+        Ok(vec![Response::Execution(Tag::new(&format!("HANDOFF {}", stats.total_rows)))])
+    }
+
     /// Read recent Delta commit metadata without requiring direct object-store
     /// credentials on the operator's machine.
     async fn run_delta_history(&self, cmd: DeltaHistoryCmd) -> PgWireResult<Vec<Response>> {
@@ -626,6 +637,12 @@ pub(crate) fn parse_flush(query: &str) -> bool {
     strip_command(query, "flush").is_some_and(str::is_empty)
 }
 
+/// Parse the leased pre-deploy write fence. Kept distinct from `FLUSH`, which
+/// remains an online maintenance command and must not change admission state.
+pub(crate) fn parse_handoff(query: &str) -> bool {
+    strip_command(query, "handoff").is_some_and(str::is_empty)
+}
+
 /// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept.
 ///
 /// `ABORT [ WORK | TRANSACTION ]` is a Postgres alias for `ROLLBACK`. Hasql's
@@ -748,8 +765,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let query = rewritten.as_ref();
 
         // Admin commands, caught before DataFusion (whose parser rejects all
-        // three): OPTIMIZE compaction, VACUUM file reclamation, and FLUSH
-        // (drain MemBuffer to Delta — pre-deploy hook).
+        // OPTIMIZE/VACUUM maintenance plus FLUSH and HANDOFF durability hooks.
         if let Some(cmd) = parse_optimize(query).map_err(admin_err)? {
             return self.run_optimize(cmd).await;
         }
@@ -767,6 +783,9 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         }
         if parse_flush(query) {
             return self.run_flush().await;
+        }
+        if parse_handoff(query) {
+            return self.run_handoff().await;
         }
 
         let span = tracing::Span::current();
@@ -861,7 +880,7 @@ fn handler_factory(
 }
 
 /// Start the server with custom handlers. `db` enables the admin commands
-/// (OPTIMIZE / VACUUM / FLUSH); without it they error as unavailable.
+/// (OPTIMIZE / VACUUM / FLUSH / HANDOFF); without it they error as unavailable.
 pub async fn serve_with_logging(
     session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -886,8 +905,8 @@ pub async fn serve_with_listener(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint,
-        query_template, rewrite_pg_synonyms,
+        parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_handoff, parse_optimize, parse_vacuum, query_dimensions,
+        query_fingerprint, query_template, rewrite_pg_synonyms,
     };
 
     #[test]
@@ -967,6 +986,14 @@ mod tests {
         assert!(!parse_flush("FLUSH t"));
         assert!(!parse_flush("SELECT flushed FROM t"));
         assert!(!parse_flush("flush_log"));
+    }
+
+    #[test]
+    fn handoff_parses_bare_only() {
+        assert!(parse_handoff("HANDOFF"));
+        assert!(parse_handoff("  handoff ; "));
+        assert!(!parse_handoff("HANDOFF now"));
+        assert!(!parse_handoff("SELECT handoff FROM t"));
     }
 
     #[test]
