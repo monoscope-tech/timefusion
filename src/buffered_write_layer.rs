@@ -90,6 +90,52 @@ pub(crate) fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> std::
     f.sync_all()
 }
 
+/// Event timestamps below this (2000-01-01T00:00:00Z) or more than
+/// [`EVENT_TIME_MAX_FUTURE_MICROS`] past ingest time are client unit errors
+/// (seconds/millis where micros belong), not data.
+const EVENT_TIME_MIN_MICROS: i64 = 946_684_800_000_000;
+const EVENT_TIME_MAX_FUTURE_MICROS: i64 = 48 * 3600 * 1_000_000;
+
+/// Admission-time sanity bound on the table's event-time column: rows outside
+/// [2000-01-01, now+48h] are dropped with a metric + warn. Null timestamps and
+/// non-microsecond columns pass through untouched. See the call site in
+/// [`BufferedWriteLayer::insert`] for why this must run before the WAL append.
+fn bound_event_time(project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    use arrow::array::TimestampMicrosecondArray;
+    let time_col = crate::dml_coalescer::table_time_column(table_name);
+    let hi = crate::clock::now_micros() + EVENT_TIME_MAX_FUTURE_MICROS;
+    let mut dropped = 0u64;
+    let bounded: Vec<RecordBatch> = batches
+        .into_iter()
+        .filter_map(|batch| {
+            let Some(ts) = batch.column_by_name(time_col).and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>()) else {
+                return Some(batch);
+            };
+            if let (Some(min), Some(max)) = (arrow::compute::min(ts), arrow::compute::max(ts))
+                && min >= EVENT_TIME_MIN_MICROS
+                && max <= hi
+            {
+                return Some(batch);
+            }
+            let mask: arrow::array::BooleanArray = ts.iter().map(|v| Some(v.is_none_or(|v| (EVENT_TIME_MIN_MICROS..=hi).contains(&v)))).collect();
+            dropped += mask.iter().filter(|keep| *keep == Some(false)).count() as u64;
+            match arrow::compute::filter_record_batch(&batch, &mask) {
+                Ok(kept) if kept.num_rows() == 0 => None,
+                Ok(kept) => Some(kept),
+                Err(e) => {
+                    error!("event-time bound filter failed, admitting batch unfiltered: {e}");
+                    Some(batch)
+                }
+            }
+        })
+        .collect();
+    if dropped > 0 {
+        warn!("dropped {dropped} rows with event timestamps outside [2000-01-01, now+48h] for {project_id}/{table_name} — client timestamp unit error?");
+        crate::metrics::record_event_time_bounded(project_id, table_name, dropped);
+    }
+    bounded
+}
+
 /// Returns false when the payload could not be persisted — the WAL is then
 /// the entry's ONLY copy, and recovery must not advance past it.
 fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &str, reason: &str) -> bool {
@@ -1022,6 +1068,17 @@ impl BufferedWriteLayer {
         // fat UPDATE entries re-inflated the buffer to 772GB on every
         // replay). MemBuffer's insert re-runs this as a cheap no-op.
         let batches: Vec<RecordBatch> = batches.into_iter().map(crate::mem_buffer::compact_batch).collect();
+
+        // Drop rows with absurd event timestamps before anything is reserved
+        // or made durable: `date` is derived from `timestamp`, so a client
+        // unit error (seconds where micros belong) mints garbage partitions
+        // like `date=2238-12-31` that no query or retention pass ever visits
+        // (prod 2026-08-03). Bounding at flush instead would wedge data that
+        // was already acked into the WAL.
+        let batches = bound_event_time(project_id, table_name, batches);
+        if batches.is_empty() {
+            return Ok(());
+        }
 
         // Reserve memory atomically before writing - prevents race condition.
         // Applies backpressure (synchronous flush-to-Delta + retry) instead of
@@ -3288,6 +3345,34 @@ mod tests {
     fn create_test_batch(project_id: &str) -> RecordBatch {
         // Use test_span helper which creates data matching the default schema
         json_to_batch(vec![test_span("test1", "span1", project_id), test_span("test2", "span2", project_id), test_span("test3", "span3", project_id)]).unwrap()
+    }
+
+    /// Bogus client event timestamps (a sec-vs-micros unit error puts rows in
+    /// year 2238) must be dropped at admission, before the WAL append — they
+    /// otherwise mint garbage Delta partitions (prod 2026-08-03:
+    /// `date=2238-12-31`, 16 files) that no query or retention pass ever
+    /// touches.
+    #[tokio::test]
+    async fn insert_drops_rows_with_absurd_event_timestamps() {
+        use crate::test_utils::test_helpers::test_span_ts;
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+
+        let now = crate::clock::now_micros();
+        let far_future = 8_486_812_800_000_000i64; // 2238-12-31T00:00:00Z
+        let ancient = 100_000_000i64; // 1970-01-01T00:01:40Z — pre-2000 garbage
+        let batch = json_to_batch(vec![
+            test_span_ts("ok", "span-ok", "pbound", now),
+            test_span_ts("bad-future", "span-future", "pbound", far_future),
+            test_span_ts("bad-past", "span-past", "pbound", ancient),
+        ])
+        .unwrap();
+
+        layer.insert("pbound", "otel_logs_and_spans", vec![batch]).await.unwrap();
+
+        let ids = crate::test_utils::test_helpers::query_col_strings(&layer, "pbound", "otel_logs_and_spans", "id");
+        assert_eq!(ids, vec!["ok"], "only the sane-timestamp row may be admitted, got {ids:?}");
     }
 
     /// A deep backlog must drain as MANY bounded commits, not one unbounded one.

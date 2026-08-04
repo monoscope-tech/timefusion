@@ -64,6 +64,7 @@ counter_registry! {
     ingest_inserts             => "timefusion.ingest.inserts": "Ingest insert calls accepted",
     ingest_rows                => "timefusion.ingest.rows": "Rows accepted into MemBuffer",
     ingest_errors              => "timefusion.ingest.errors": "Ingest call failures",
+    ingest_event_time_bounded  => "timefusion.ingest.event_time_bounded_rows": "Rows dropped at admission for event timestamps outside the sanity bounds (pre-2000 or >48h future) — a client unit error otherwise mints garbage date partitions",
     wal_corruption             => "timefusion.wal.corruption_events": "WAL entries that failed to deserialize or replay",
     quarantine_redriven        => "timefusion.wal.quarantine_redriven": "Quarantined WAL payloads successfully re-ingested through the durable insert path at boot",
     quarantine_backlog         => "timefusion.wal.quarantine_backlog_events": "Boot-time detections of a non-empty quarantine after re-drive — acked data is NOT in the store. PAGE if > 0",
@@ -280,6 +281,12 @@ pub fn record_insert(project_id: &str, table_name: &str, rows: u64) {
 pub fn record_ingest_error(project_id: &str, table_name: &str) {
     if let Some(m) = METRICS.get() {
         m.ingest_errors.add(1, &ingest_attrs(project_id, table_name));
+    }
+}
+
+pub fn record_event_time_bounded(project_id: &str, table_name: &str, rows: u64) {
+    if let Some(m) = METRICS.get() {
+        m.ingest_event_time_bounded.add(rows, &ingest_attrs(project_id, table_name));
     }
 }
 
