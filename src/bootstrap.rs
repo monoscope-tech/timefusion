@@ -52,7 +52,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
 
     // Pre-init WAL GC (gated + drained-flag consumption inside the helper —
     // same call as main.rs so the e2e path mirrors prod).
-    crate::wal::boot_wal_gc(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age());
+    crate::wal::boot_wal_gc(&cfg.core.wal_dir());
 
     let t_layer = std::time::Instant::now();
     let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?

@@ -228,7 +228,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
     // TantivyPredicateRewriter — callers don't need to know tantivy exists.
     // Pre-init WAL GC (gated + drained-flag consumption inside the helper).
-    timefusion::wal::boot_wal_gc(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age());
+    timefusion::wal::boot_wal_gc(&cfg.core.wal_dir());
 
     let t_layer = std::time::Instant::now();
     let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?

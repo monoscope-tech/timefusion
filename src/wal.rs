@@ -1387,7 +1387,7 @@ impl WalDirLock {
 ///
 /// Deletes dead files before walrus enumerates the dir (accumulated leaks
 /// dominated startup — 467 GB / 12-min boot, see `wal_bloat_startup.md`).
-/// A pure-mtime sweep is sound ONLY when the previous life's shutdown flush
+/// A complete sweep is sound ONLY when the previous life's shutdown flush
 /// fully drained (snapshot `drained=true`): otherwise the old files may BE
 /// the un-flushed backlog (2026-07-08 acked-write loss). After sweeping, the
 /// drained claim is consumed (rewritten false): this life will accept new
@@ -1395,7 +1395,7 @@ impl WalDirLock {
 /// stale claim must not authorize the NEXT boot's sweep. Dirty/undrained
 /// boot: skip — the floor-aware runtime sweep (first pass right after replay
 /// parks the cursors) reclaims instead.
-pub fn boot_wal_gc(wal_dir: &std::path::Path, max_age: std::time::Duration) {
+pub fn boot_wal_gc(wal_dir: &std::path::Path) {
     let t = std::time::Instant::now();
     let Some(mut snap) = read_cursor_snapshot(wal_dir).filter(|s| s.drained) else {
         info!("bootstrap.phase=wal_gc skipped=not_drained (runtime sweep reclaims post-replay)");
@@ -1408,6 +1408,13 @@ pub fn boot_wal_gc(wal_dir: &std::path::Path, max_age: std::time::Duration) {
     // rewrite would resurrect drained=true for the next boot's unsound sweep
     // after this boot's deletions already persisted.
     snap.drained = false;
+    // The authorized sweep removes the read-position index and every WAL
+    // segment. Old block/offset pairs therefore have no meaning in the fresh
+    // Walrus generation; restoring them could make a newly-created block look
+    // consumed. Empty positions mean origin, matching the empty WAL. If power
+    // fails after this durable rewrite but before deletion, the next boot
+    // conservatively replays the still-present (already Delta-committed) rows.
+    snap.entries.clear();
     let target = cursor_snapshot_path_in(wal_dir);
     if let Err(e) = write_json_atomic(&target, &snap, true, "cursor snapshot") {
         // Fail closed: without a durable consume the authorization must not
@@ -1427,7 +1434,10 @@ pub fn boot_wal_gc(wal_dir: &std::path::Path, max_age: std::time::Duration) {
         }
         return;
     }
-    match gc_wal_files(wal_dir, max_age, None) {
+    // `drained=true` is stronger than an age heuristic: all WAL-backed data is
+    // already in Delta and write admission was fenced before the claim. Delete
+    // even recent segments so Walrus startup is independent of prior WAL size.
+    match gc_wal_files(wal_dir, std::time::Duration::ZERO, None) {
         Ok((deleted, bytes_freed)) => info!("bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}", t.elapsed().as_millis()),
         Err(e) => warn!("bootstrap.phase=wal_gc error={e} elapsed_ms={}", t.elapsed().as_millis()),
     }
@@ -2376,27 +2386,34 @@ mod tests {
             .unwrap();
             std::fs::write(&snap_path, bytes).unwrap();
         };
-        let max_age = std::time::Duration::from_secs(60);
-
         make_old_file();
-        boot_wal_gc(root, max_age); // missing snapshot → skip
+        boot_wal_gc(root); // missing snapshot → skip
         std::fs::write(&snap_path, b"not json").unwrap();
-        boot_wal_gc(root, max_age); // unreadable → skip
+        boot_wal_gc(root); // unreadable → skip
         write_snap(true, false, SNAPSHOT_VERSION);
-        boot_wal_gc(root, max_age); // clean but NOT drained (partial flush) → skip
+        boot_wal_gc(root); // clean but NOT drained (partial flush) → skip
         write_snap(true, true, 999);
-        boot_wal_gc(root, max_age); // version mismatch → skip
+        boot_wal_gc(root); // version mismatch → skip
         assert!(old_file.exists(), "un-drained/unreadable snapshots must never authorize the mtime sweep");
 
-        // drained=true authorizes exactly one sweep, then is consumed.
+        // drained=true authorizes exactly one complete generation sweep, then
+        // is consumed. Recent segments and the read index are dead too: age
+        // must not turn prior WAL volume into replacement startup latency.
+        let recent_file = root.join("1780000000000");
+        let read_index = root.join("read_offset_idx_index.db");
+        std::fs::write(&recent_file, b"recent").unwrap();
+        std::fs::write(&read_index, b"positions").unwrap();
         write_snap(true, true, SNAPSHOT_VERSION);
-        boot_wal_gc(root, max_age);
+        boot_wal_gc(root);
         assert!(!old_file.exists(), "drained snapshot must run the sweep");
+        assert!(!recent_file.exists(), "drained sweep must remove recent WAL segments");
+        assert!(!read_index.exists(), "drained sweep must remove positions for the deleted WAL generation");
         let reread: CursorSnapshot = serde_json::from_slice(&std::fs::read(&snap_path).unwrap()).unwrap();
         assert!(!reread.drained, "the drained claim must be consumed by the boot that used it");
         assert!(reread.clean_shutdown, "consuming drained must not clobber the cursor-restore flag");
+        assert!(reread.entries.is_empty(), "positions from deleted WAL generations must not be restored");
         make_old_file();
-        boot_wal_gc(root, max_age);
+        boot_wal_gc(root);
         assert!(old_file.exists(), "second boot must not reuse the consumed drained claim");
 
         // Fail-closed (2026-07-08 review finding 3): if the drained flag
@@ -2405,7 +2422,7 @@ mod tests {
         // rewrite resurrects the authorization after files are gone).
         write_snap(true, true, SNAPSHOT_VERSION);
         std::fs::create_dir_all(meta.join("cursor_snapshot.json.tmp")).unwrap(); // blocks File::create(tmp)
-        boot_wal_gc(root, max_age);
+        boot_wal_gc(root);
         assert!(old_file.exists(), "sweep must be skipped when the drained consume fails");
         assert!(!snap_path.exists(), "unconsumable drained snapshot must be deleted (fail closed)");
     }
