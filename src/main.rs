@@ -268,7 +268,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // shorter) Delta verifier to catch commits made after the last snapshot.
     let wal_ref = buffered_layer.wal();
     let t_snap = std::time::Instant::now();
-    let skip_delta_scan = wal_ref.load_cursor_snapshot().is_some_and(|snap| {
+    let clean_snapshot = wal_ref.load_cursor_snapshot().is_some_and(|snap| {
         // age_secs is surfaced in the boot log only — not gating the skip. See
         // CursorSnapshot docs for the single-writer assumption and the `rm`
         // escape hatch. Backwards clock skew (NTP correction, snapshot ported
@@ -291,9 +291,30 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             }
         }
     });
-    info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
+    // A dirty/missing snapshot normally requires the expensive remote scan.
+    // But when every durable cursor is already at its exact local WAL tail and
+    // no interrupted-recovery marker exists, there is no payload whose cursor
+    // Delta could advance. This covers the common deploy failure mode where
+    // pre-deploy FLUSH drained successfully but the old container was killed
+    // before it could write clean_shutdown=true.
+    let local_wal_consumed = !clean_snapshot
+        && match wal_ref.can_skip_delta_reconcile() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Local WAL tail/cursor proof failed, retaining Delta reconciliation: {e}");
+                false
+            }
+        };
+    let skip_delta_scan = clean_snapshot || local_wal_consumed;
+    info!(
+        "bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} clean_snapshot={clean_snapshot} local_wal_consumed={local_wal_consumed} elapsed_ms={}",
+        t_snap.elapsed().as_millis()
+    );
     if skip_delta_scan {
-        info!("Skipping Delta-derived cursor reconciliation (cursor snapshot is clean)");
+        info!(
+            "Skipping Delta-derived cursor reconciliation ({})",
+            if clean_snapshot { "cursor snapshot is clean" } else { "all local WAL cursors exactly match their tails" }
+        );
     } else {
         info!(
             "Running Delta-derived cursor reconciliation (snapshot missing/dirty); scan_depth={}, concurrency={} \
@@ -452,6 +473,14 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Fence writes immediately. datafusion-postgres stops its accept loop but
+    // does not join per-connection tasks; without this barrier an already-
+    // accepted INSERT could append after the final flush/snapshot, forcing the
+    // replacement back onto dirty recovery (or making a clean claim stale).
+    buffered_layer.stop_accepting_writes();
+    let preflushed_handoff = buffered_layer.is_drained();
+    let planned_handoff = buffered_layer.has_recent_planned_handoff();
+
     // Stop maintenance first: an in-flight light-optimize/dedup sweep must bail
     // before the buffered-layer flush, not compete with it and then outlive the
     // Foyer cache (a running sweep hitting a closed cache previously hung
@@ -474,17 +503,31 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // cursor snapshot — the phase that determines next-boot cost; their unused
     // slack flows forward automatically because the buffered layer works off
     // the same absolute deadline.
-    let grace = cfg.buffer.stop_grace();
+    let configured_grace = cfg.buffer.stop_grace();
+    // The workflow force-flushes before deploy. Once writes are fenced, an
+    // already-drained layer has no durability work left; cap the whole old-task
+    // handoff (connection loops, snapshot, cache close) so the replacement does
+    // not serve 57P03 for the generic 70s dirty-shutdown budget. One second is
+    // still ample for the local cursor-snapshot fsync; every remote/cache phase
+    // shares the same deadline and is safe to abandon. Continuous ingestion
+    // may make the layer non-empty immediately after the
+    // admin FLUSH. A recent successful FLUSH still identifies a planned deploy:
+    // the layer skips a redundant remote flush and hands its small durable WAL
+    // tail to the crash-safe fast reader. Unplanned shutdowns retain the
+    // full correctness-first budget.
+    let grace = if preflushed_handoff || planned_handoff { configured_grace.min(Duration::from_secs(1)) } else { configured_grace };
     let deadline = tokio::time::Instant::now() + grace;
     pgwire_shutdown.cancel();
-    match tokio::time::timeout(grace.mul_f32(0.2), pg_task).await {
+    let pg_drain_budget = if preflushed_handoff || planned_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.2) };
+    match tokio::time::timeout(pg_drain_budget, pg_task).await {
         Ok(Ok(())) => info!("PGWire drained cleanly"),
         Ok(Err(e)) => error!("PGWire task panicked during drain: {}", e),
         Err(_) => warn!("PGWire drain exceeded its slice of the stop grace — proceeding; in-flight queries may be reset"),
     }
 
     grpc_shutdown.cancel();
-    match tokio::time::timeout(grace.mul_f32(0.1), grpc_task).await {
+    let grpc_drain_budget = if preflushed_handoff || planned_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.1) };
+    match tokio::time::timeout(grpc_drain_budget, grpc_task).await {
         Ok(Ok(())) => info!("gRPC drained cleanly"),
         Ok(Err(e)) => error!("gRPC task panicked during drain: {}", e),
         Err(_) => error!("gRPC drain exceeded its slice of the stop grace — proceeding; in-flight requests may be reset"),
@@ -493,8 +536,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     if let Err(e) = buffered_layer.shutdown_by(deadline).await {
         error!("Error during buffered layer shutdown: {}", e);
     }
-    sleep(Duration::from_millis(500)).await;
-
     // Share the same absolute `deadline` as the buffered-layer flush above so
     // the whole serial shutdown fits one stop-grace budget — every phase that
     // can block on a slow Delta/S3 backend (DML drain, foyer `close()`) is
@@ -505,9 +546,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
 
     info!("Shutdown complete.");
-
-    // Shutdown telemetry to ensure all spans are flushed
-    telemetry::shutdown_telemetry();
+    // Do not synchronously flush OTLP here. Its exporter has a 10-second
+    // network timeout, and `_wal_dir_lock` must remain held until this future
+    // returns so no detached runtime work can overlap the replacement's WAL
+    // access. Losing the final telemetry batch is preferable to extending a
+    // planned database outage; normal batches are exported continuously.
 
     Ok(())
 }

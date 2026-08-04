@@ -261,6 +261,7 @@ impl LoggingSimpleQueryHandler {
                 stats.buckets_failed, stats.buckets_flushed
             )));
         }
+        layer.mark_planned_handoff();
         Ok(vec![Response::Execution(Tag::new(&format!("FLUSH {}", stats.total_rows)))])
     }
 

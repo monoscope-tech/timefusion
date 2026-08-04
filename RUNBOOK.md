@@ -29,12 +29,32 @@ prints what was derived.
 
 ## Liveness & readiness probes
 
-- **Cold start** is dominated by WAL replay. Replay time is `O(retention
-  × throughput)`. With default 70-min retention and moderate ingest,
-  expect 10–30s before the SQL endpoint accepts queries.
-- **Readiness probe**: set to `tcp_check pgwire_port` with `initial-delay
-  ≥ expected_wal_replay_seconds`. Kubernetes default 30s is usually
-  sufficient; bump to 60-120s for high-volume tenants.
+- **Planned deploy start** should be sub-second after the old process releases
+  the WAL lock. Pre-deploy `FLUSH` advances every durable cursor to its exact
+  shard tail; startup proves that equality locally and skips both the remote
+  Delta reconciliation and WAL replay. This remains safe after an unclean stop:
+  any late write moves the tail, and any interrupted recovery leaves a rewind
+  marker, so either condition automatically selects full recovery.
+- **Dirty start with unflushed data** is still `O(unflushed entries)` and stays
+  correctness-first: reconcile Delta watermarks, then replay the remaining WAL.
+- A successful administrative `FLUSH` records a 15-minute planned-handoff hint
+  in the running process. If live ingestion refills the buffer before SIGTERM,
+  shutdown skips a redundant remote flush, writes a conservative cursor
+  snapshot, and leaves that new tail in the durable WAL. The planned handoff is
+  capped at one second; unplanned shutdowns retain the full configured grace.
+- Replay advances Walrus read heads in memory under a durable rewind marker and
+  fsyncs each shard cursor once when parking it. It must not regress to one
+  cursor-index fsync per WAL entry; that cost produced 22–68 second replays for
+  10k–32k entries in production.
+- INSERT payload decode and Arrow-buffer compaction run in parallel chunks,
+  bounded by both 64 entries and 32 MiB of encoded payload. Application remains
+  in WAL order so keep-last dedup and interleaved DML semantics do not change.
+- The local hot-tier index rebuild runs after readiness. Until its derived
+  directory index is warm, queries fall through to authoritative Delta data.
+- **Readiness probe**: keep the rolling-deploy TCP behavior described below,
+  but alert on more than 10 seconds from deployment handoff to a new boot that
+  reports `wal.recovery_complete=true`. Planned deployments should not consume
+  that budget.
 - **Liveness probe**: keep a longer timeout than readiness. WAL fsync
   pauses (with `wal_fsync_mode=sync_each`) can briefly delay the event
   loop; don't kill the pod for a 200ms blip.
@@ -128,13 +148,21 @@ process lifetime.
 
 ## GitHub deployment verification
 
-The deployment workflow records the current `buffered_layer.boot_micros`, deploys
+The deployment workflow records the current `buffered_layer.boot_micros` and a
+wall-clock timestamp immediately before it asks CapRover to deploy. While the
+CapRover CLI pulls/schedules the image, the workflow attempts another `FLUSH`
+every 12 seconds so sustained ingestion cannot rebuild a minutes-old WAL tail.
+It also probes `SELECT 1` once per second throughout the rollout, deploys
 one replacement, then waits for a *different* boot ID with
 `wal.recovery_complete=true`. This avoids treating a routable pgwire listener
 or an old Swarm task as proof that the replacement has finished WAL recovery.
 
-The workflow waits up to 12 minutes for recovery and rejects a completed replay
-over 10 minutes. Inspect the replacement with:
+The workflow waits up to 12 minutes so a correctness-preserving dirty recovery
+is allowed to finish, but fails the deployment check when the longest observed
+continuous client-visible unready interval exceeds 10 seconds or WAL recovery
+itself exceeds 5 seconds. Total rollout wall time is reported separately and
+does not count image-pull time while the old database remains healthy. Inspect
+the replacement with:
 
 ```sql
 SELECT component, key, value

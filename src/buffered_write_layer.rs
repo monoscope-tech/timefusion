@@ -458,6 +458,18 @@ pub struct BufferedWriteLayer {
     /// the waiting heap bounded exactly as the permit comment above demands.
     demote_pending: Arc<std::sync::atomic::AtomicUsize>,
     shutdown: CancellationToken,
+    /// Write-admission barrier for graceful handoff. Closing it before server
+    /// connection drain prevents already-accepted PGWire sockets from appending
+    /// after the shutdown flush/snapshot (the accept loop itself does not join
+    /// its spawned connection tasks).
+    accepting_writes: std::sync::atomic::AtomicBool,
+    active_writes: AtomicU64,
+    writes_drained: Notify,
+    /// Real-clock timestamp of the latest successful operator `FLUSH`. The
+    /// deploy workflow issues that command immediately before task replacement;
+    /// a recent value lets SIGTERM use a short WAL-backed handoff even when
+    /// continuous ingestion made the layer non-empty again.
+    planned_handoff_micros: std::sync::atomic::AtomicI64,
     delta_write_callback: Option<DeltaWriteCallback>,
     /// Set alongside `delta_write_callback`; used instead of it when
     /// `TIMEFUSION_FLUSH_COALESCE_COMMITS` is on (see `flush_groups_coalesced`).
@@ -602,7 +614,69 @@ impl std::fmt::Debug for BufferedWriteLayer {
     }
 }
 
+struct WriteAdmission<'a> {
+    layer: &'a BufferedWriteLayer,
+}
+
+impl Drop for WriteAdmission<'_> {
+    fn drop(&mut self) {
+        if self.layer.active_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.layer.writes_drained.notify_waiters();
+        }
+    }
+}
+
 impl BufferedWriteLayer {
+    fn admit_write(&self) -> Result<WriteAdmission<'_>, &'static str> {
+        if !self.accepting_writes.load(Ordering::Acquire) {
+            return Err("TimeFusion is draining for deployment; retry on the replacement");
+        }
+        self.active_writes.fetch_add(1, Ordering::AcqRel);
+        // Close-vs-increment race: the shutdown thread stores false before it
+        // waits for this counter. Recheck after increment so every admitted
+        // writer is either visible to that wait or rejected here.
+        if !self.accepting_writes.load(Ordering::Acquire) {
+            if self.active_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.writes_drained.notify_waiters();
+            }
+            return Err("TimeFusion is draining for deployment; retry on the replacement");
+        }
+        Ok(WriteAdmission { layer: self })
+    }
+
+    /// Close write admission before network-server drain. Idempotent. Reads on
+    /// existing PGWire sessions may finish; new INSERT/UPDATE/DELETE calls fail
+    /// retryably instead of racing the final WAL cursor snapshot.
+    pub fn stop_accepting_writes(&self) {
+        self.accepting_writes.store(false, Ordering::Release);
+    }
+
+    /// Record that the operator completed the pre-deploy durability flush.
+    pub fn mark_planned_handoff(&self) {
+        self.planned_handoff_micros.store(chrono::Utc::now().timestamp_micros(), Ordering::Release);
+    }
+
+    /// A deployment normally follows its administrative flush within seconds.
+    /// Keep a generous window for slow orchestration/image pulls; this hint
+    /// only shortens graceful flush effort, never bypasses WAL recovery.
+    pub fn has_recent_planned_handoff(&self) -> bool {
+        const WINDOW_MICROS: i64 = 15 * 60 * 1_000_000;
+        let marked = self.planned_handoff_micros.load(Ordering::Acquire);
+        marked > 0 && chrono::Utc::now().timestamp_micros().saturating_sub(marked) <= WINDOW_MICROS
+    }
+
+    async fn wait_for_active_writes_until(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            let notified = self.writes_drained.notified();
+            if self.active_writes.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.active_writes.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+
     /// Create a new BufferedWriteLayer with explicit config and a function
     /// registry. The registry MUST be the same one the runtime SessionContext
     /// uses so WAL replay can resolve UDFs in stored UPDATE/DELETE SQL.
@@ -626,10 +700,14 @@ impl BufferedWriteLayer {
             wal,
             mem_buffer,
             // `open` rescans the dir, so a restart comes back warm.
-            hot_tier: crate::hot_tier::HotTier::open(cfg.core.hot_tier_dir(), cfg.buffer.hot_tier_retention(), cfg.buffer.hot_tier_limits()),
+            hot_tier: crate::hot_tier::HotTier::open_lazy(cfg.core.hot_tier_dir(), cfg.buffer.hot_tier_retention(), cfg.buffer.hot_tier_limits()),
             demote_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             demote_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown: CancellationToken::new(),
+            accepting_writes: std::sync::atomic::AtomicBool::new(true),
+            active_writes: AtomicU64::new(0),
+            writes_drained: Notify::new(),
+            planned_handoff_micros: std::sync::atomic::AtomicI64::new(0),
             delta_write_callback: None,
             coalesced_write_callback: None,
             tantivy_index_callback: None,
@@ -1032,6 +1110,7 @@ impl BufferedWriteLayer {
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
+        let _admission = self.admit_write().map_err(anyhow::Error::msg)?;
         // Fail fast while the WAL backlog is over its HARD cap (see
         // `wal_hard_backpressure`): acking more work would only deepen an
         // unbounded, hours-to-recover backlog. The producer's DLQ replays.
@@ -1168,7 +1247,40 @@ impl BufferedWriteLayer {
         // consuming anything. Replay-created buckets are pinned at P0 below;
         // the cursor is parked at the surviving holds after the loop and the
         // marker removed only then. See `write_recovery_rewind_marker`.
-        self.wal.apply_recovery_rewind_marker().map_err(|e| anyhow::anyhow!("recovery rewind marker apply failed: {}", e))?;
+        let rewind_applied = self.wal.apply_recovery_rewind_marker().map_err(|e| anyhow::anyhow!("recovery rewind marker apply failed: {}", e))?;
+
+        // Exact zero-replay fast path. Comparing each persisted cursor with
+        // the actual shard tail proves there is no unread WAL payload; unlike
+        // trusting `clean_shutdown`, this also catches writes accepted late in
+        // the PGWire drain. Apply a crash-rewind marker first so an interrupted
+        // prior recovery can never be mistaken for a consumed log. Avoiding a
+        // new fsync'd rewind marker plus topic/shard iterator setup makes the
+        // normal fully-drained deployment path effectively constant-time.
+        if self.wal.is_fully_consumed().map_err(|e| anyhow::anyhow!("WAL tail/cursor check failed: {}", e))? {
+            if rewind_applied {
+                self.wal.remove_recovery_rewind_marker();
+            }
+            // Quarantine is a separate durability source from the unread WAL
+            // tail. A fully-consumed WAL can still have an INSERT payload that
+            // an older boot parked for re-drive; apply it before declaring
+            // recovery complete. `redrive_quarantine` inserts through the
+            // normal WAL-first path, so the re-driven row remains crash-safe.
+            self.redrive_quarantine().await;
+            self.wal.request_reclaim_sweep();
+            let recovery_duration_ms = start.elapsed().as_millis() as u64;
+            self.wal_recovery_duration_ms.store(recovery_duration_ms, Ordering::Relaxed);
+            self.wal_recovery_complete.store(true, Ordering::Relaxed);
+            info!("WAL recovery complete: exact cursor/tail match, no replay required, duration={}ms", recovery_duration_ms);
+            return Ok(RecoveryStats {
+                entries_replayed: 0,
+                batches_recovered: 0,
+                oldest_entry_timestamp: None,
+                newest_entry_timestamp: None,
+                recovery_duration_ms,
+                corrupted_entries_skipped: 0,
+                tantivy_files_deferred: 0,
+            });
+        }
         let p0 = self.wal.write_recovery_rewind_marker().map_err(|e| anyhow::anyhow!("recovery rewind marker write failed: {}", e))?;
 
         // Gate cursor-snapshot writes for the whole replay (see
@@ -1234,13 +1346,19 @@ impl BufferedWriteLayer {
         // it dropped, permanently losing any acked write that sat un-flushed
         // longer than retention (2026-07-08 incident: crash-loop backlog aged
         // past the cutoff and the re-drive couldn't backfill).
-        let mut process_entry = |entry: WalEntry, shard: usize, pos: walrus_rust::WalPosition| {
+        let mut process_entry = |entry: WalEntry,
+                                 shard: usize,
+                                 pos: walrus_rust::WalPosition,
+                                 predecoded_insert: Option<(Result<RecordBatch, crate::wal::WalError>, u128)>| {
             let entry_start = std::time::Instant::now();
             match entry.operation {
                 WalOperation::Insert => {
                     insert_bytes += entry.data.len() as u64;
-                    let decoded = deserialize_record_batch(&entry.data);
-                    insert_decode_nanos += entry_start.elapsed().as_nanos();
+                    let (decoded, decode_nanos) = predecoded_insert.unwrap_or_else(|| {
+                        let decode_start = std::time::Instant::now();
+                        (deserialize_record_batch(&entry.data).map(crate::mem_buffer::compact_batch), decode_start.elapsed().as_nanos())
+                    });
+                    insert_decode_nanos += decode_nanos;
                     match decoded {
                         Ok(batch) => {
                             if batch.num_rows() == 0 {
@@ -1345,50 +1463,99 @@ impl BufferedWriteLayer {
         let mut replay_reliefs = 0u64;
         let mut drain_task: Option<JoinHandle<()>> = None;
         let mut iter = self.wal.replay_iter().map_err(|e| anyhow::anyhow!("WAL replay iterator init failed: {}", e))?;
-        while let Some((entry, shard, pos)) = iter.next_entry() {
-            process_entry(entry, shard, pos);
-            // Back off (entry-count gate) only when a completed drain LEFT
-            // pressure standing — that's the flushes-failing case. A drain
-            // that relieved pressure re-arms immediately.
-            if let Some(h) = drain_task.as_ref()
-                && h.is_finished()
-            {
-                drain_task = None;
-                relief_gate = if self.is_memory_pressure() { iter.total + RELIEF_BACKOFF_ENTRIES } else { 0 };
-                // A drain just durably committed its buckets to Delta and
-                // released their holds — advance the rewind marker to the new
-                // watermark (in-progress topic's frontier + live holds) so a
-                // crash from here resumes past the drained data. Skip once any
-                // quarantine write has failed: that entry is WAL-only, so the
-                // marker must not advance past it (the frontier is monotonic, so
-                // freezing here keeps the marker at-or-below the failed entry;
-                // the end-of-replay bail then preserves it).
-                if quarantine_failures.load(Ordering::Relaxed) == 0 {
-                    let (cur_topic, frontier) = iter.frontier();
-                    self.refresh_replay_rewind_marker(&p0, cur_topic, frontier);
-                }
-                #[cfg(test)]
-                if replay_reliefs >= self.test_crash_after_reliefs.load(Ordering::Relaxed) {
-                    // Simulated crash mid-replay: the marker is advanced and the
-                    // drained buckets are durable; leave it in place (bail paths
-                    // do) so the next boot resumes from it. The just-finished
-                    // drain is already awaited (is_finished()).
-                    anyhow::bail!("test: simulated crash mid-replay after {} relief(s)", replay_reliefs);
+        let mut processed_total = 0u64;
+        let mut applied_frontiers: std::collections::HashMap<(String, String), ShardHolds> = std::collections::HashMap::new();
+        const DECODE_CHUNK_ENTRIES: usize = 64;
+        const DECODE_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+        loop {
+            // Prefetch only a small bounded chunk. Each item captures the
+            // iterator frontier immediately after it was yielded; if a relief
+            // commit finishes while later entries decode in parallel, its
+            // rewind marker uses the frontier of the last APPLIED item, never
+            // the iterator's prefetched-ahead head.
+            let mut chunk = Vec::with_capacity(DECODE_CHUNK_ENTRIES);
+            let mut chunk_bytes = 0usize;
+            for _ in 0..DECODE_CHUNK_ENTRIES {
+                let Some((entry, shard, pos)) = iter.next_entry() else { break };
+                chunk_bytes = chunk_bytes.saturating_add(entry.data.len());
+                let frontier = iter.frontier();
+                chunk.push((entry, shard, pos, frontier));
+                // Entries may be as large as WAL_SPLIT_TARGET. Bound retained
+                // payload bytes as well as count so parallel decode cannot turn
+                // 64 unusually large entries into a multi-GiB boot spike. One
+                // oversize final entry is allowed and processed in this chunk.
+                if chunk_bytes >= DECODE_CHUNK_BYTES {
+                    break;
                 }
             }
-            if drain_task.is_none() && iter.total >= relief_gate && self.is_memory_pressure() {
-                replay_reliefs += 1;
-                info!(
-                    "WAL replay: memory pressure at entry {} ({}MB buffered) — draining oldest buckets in background (relief #{})",
-                    iter.total,
-                    self.effective_memory_bytes() / (1024 * 1024),
-                    replay_reliefs
-                );
-                let this = Arc::clone(self);
-                drain_task = Some(tokio::spawn(async move { this.drain_replay_backlog().await }));
+            if chunk.is_empty() {
+                break;
             }
-            while self.is_hard_memory_pressure() && drain_task.as_ref().is_some_and(|h| !h.is_finished()) {
-                let _ = tokio::time::timeout(Duration::from_millis(100), self.flush_tick_notify.notified()).await;
+
+            use rayon::prelude::*;
+            let ready: Vec<_> = chunk
+                .into_par_iter()
+                .map(|(entry, shard, pos, frontier)| {
+                    let decoded = (entry.operation == WalOperation::Insert).then(|| {
+                        let started = std::time::Instant::now();
+                        let batch = deserialize_record_batch(&entry.data).map(crate::mem_buffer::compact_batch);
+                        (batch, started.elapsed().as_nanos())
+                    });
+                    (entry, shard, pos, frontier, decoded)
+                })
+                .collect();
+
+            for (entry, shard, pos, (safe_topic, safe_frontier), decoded) in ready {
+                process_entry(entry, shard, pos, decoded);
+                processed_total += 1;
+                if let Some((project_id, table_name)) = safe_topic {
+                    // `None` means this shard is exhausted. With volatile read
+                    // heads its durable cursor is still P0, so normalize an
+                    // exhausted shard to the immutable startup write tail.
+                    // Persisting that tail in the external rewind marker is
+                    // safe because write admission has not opened yet.
+                    let normalized = (0..self.wal.shards_per_topic())
+                        .map(|s| safe_frontier.get(s).copied().flatten().or_else(|| self.wal.current_position_for_shard(&project_id, &table_name, s).ok()))
+                        .collect();
+                    applied_frontiers.insert((project_id, table_name), normalized);
+                }
+                // Back off (entry-count gate) only when a completed drain LEFT
+                // pressure standing — that's the flushes-failing case. A drain
+                // that relieved pressure re-arms immediately.
+                if let Some(h) = drain_task.as_ref()
+                    && h.is_finished()
+                {
+                    drain_task = None;
+                    relief_gate = if self.is_memory_pressure() { processed_total + RELIEF_BACKOFF_ENTRIES } else { 0 };
+                    // A drain just durably committed its buckets to Delta and
+                    // released their holds — advance the rewind marker only to
+                    // this applied entry's captured frontier.
+                    if quarantine_failures.load(Ordering::Relaxed) == 0 {
+                        self.refresh_replay_rewind_marker(&p0, &applied_frontiers);
+                    }
+                    #[cfg(test)]
+                    if replay_reliefs >= self.test_crash_after_reliefs.load(Ordering::Relaxed) {
+                        // Simulated crash mid-replay: the marker is advanced and the
+                        // drained buckets are durable; leave it in place (bail paths
+                        // do) so the next boot resumes from it. The just-finished
+                        // drain is already awaited (is_finished()).
+                        anyhow::bail!("test: simulated crash mid-replay after {} relief(s)", replay_reliefs);
+                    }
+                }
+                if drain_task.is_none() && processed_total >= relief_gate && self.is_memory_pressure() {
+                    replay_reliefs += 1;
+                    info!(
+                        "WAL replay: memory pressure at entry {} ({}MB buffered) — draining oldest buckets in background (relief #{})",
+                        processed_total,
+                        self.effective_memory_bytes() / (1024 * 1024),
+                        replay_reliefs
+                    );
+                    let this = Arc::clone(self);
+                    drain_task = Some(tokio::spawn(async move { this.drain_replay_backlog().await }));
+                }
+                while self.is_hard_memory_pressure() && drain_task.as_ref().is_some_and(|h| !h.is_finished()) {
+                    let _ = tokio::time::timeout(Duration::from_millis(100), self.flush_tick_notify.notified()).await;
+                }
             }
         }
         // The drain mutates the hold/orphan state the cursor parking below
@@ -1451,12 +1618,18 @@ impl BufferedWriteLayer {
         let shards = self.wal.shards_per_topic();
         for (project_id, table_name) in p0.keys() {
             let holds = self.recovery_parking_holds(project_id, table_name, shards);
-            if holds.iter().any(Option::is_some)
-                && let Err(e) = self.wal.set_positions_allow_rewind(project_id, table_name, &holds)
-            {
-                // Cursor stays at tail with the marker gone would lose the
-                // unflushed replayed buckets on a crash — keep the marker and
-                // surface the failure instead.
+            // Replay advances walrus's read heads only in memory; persist once
+            // per shard here instead of fsyncing the cursor index once per
+            // entry. A shard with live buffered data parks at its earliest
+            // hold; a hold-free shard parks at the write tail consumed by this
+            // boot. Startup is single-writer, so that tail cannot race an
+            // append before write admission opens below.
+            let tails: ShardHolds = (0..shards).map(|shard| self.wal.current_position_for_shard(project_id, table_name, shard).ok()).collect();
+            let parked = merge_wal_holds(&tails, &holds);
+            if let Err(e) = self.wal.set_positions_allow_rewind(project_id, table_name, &parked) {
+                // Removing the marker after a partial cursor write could skip
+                // an unflushed replayed bucket on a crash — keep the marker
+                // and surface the failure instead.
                 anyhow::bail!("failed to park WAL cursor for {}.{} after replay: {}", project_id, table_name, e);
             }
         }
@@ -1700,9 +1873,17 @@ impl BufferedWriteLayer {
             // MemBuffer; this flushes it down under budget in the background so the
             // listener serves immediately instead of blocking on the drain.
             spawn_task!(drain_to_budget),
+            spawn_task!(finish_hot_tier_open),
         ]);
 
         info!("BufferedWriteLayer background tasks started");
+    }
+
+    async fn finish_hot_tier_open(&self) {
+        let tier = Arc::clone(&self.hot_tier);
+        if let Err(e) = tokio::task::spawn_blocking(move || tier.finish_open()).await {
+            warn!("hot tier background rescan panicked: {e}");
+        }
     }
 
     async fn run_wal_gc_task(&self) {
@@ -2611,30 +2792,21 @@ impl BufferedWriteLayer {
     /// a crash resumes from the earliest still-un-drained entry rather than the
     /// pre-recovery cursor. Called after a mid-replay drain commits.
     ///
-    /// Per-topic baseline (min'd with live holds, but NOT the commit floor, so it
-    /// advances freely):
-    /// - the in-progress topic (`cur_topic`): the iterator `frontier` — the next
-    ///   entry each shard will yield; everything before it is applied+covered.
-    ///   Exhausted shards fall back to the persisted read cursor (fully read).
-    /// - every other topic: its persisted read cursor. Not-yet-started topics
-    ///   keep their pre-recovery cursor (P0), so they are NOT rewound to ORIGIN;
-    ///   completed topics sit at their consumed tail.
+    /// `applied_frontiers` contains the next unprocessed position for every
+    /// topic replay has touched; exhausted shards are normalized to their
+    /// startup write tails. Topics not yet touched retain their durable P0.
+    /// Each baseline is min'd with live holds, but NOT the commit floor, so it
+    /// advances freely after relief commits while never crossing buffered data.
     ///
     /// Best-effort: a failure only means a crash re-replays a bit more.
     fn refresh_replay_rewind_marker(
-        &self, p0: &std::collections::HashMap<(String, String), ShardHolds>, cur_topic: Option<(String, String)>, frontier: ShardHolds,
+        &self, p0: &std::collections::HashMap<(String, String), ShardHolds>, applied_frontiers: &std::collections::HashMap<(String, String), ShardHolds>,
     ) {
-        let shards = self.wal.shards_per_topic();
         let positions: std::collections::HashMap<(String, String), ShardHolds> = p0
             .keys()
             .map(|(p, t)| {
-                let read_cursor = self.wal.persisted_read_positions(p, t).unwrap_or_else(|_| vec![None; shards]);
-                let baseline = if cur_topic.as_ref().is_some_and(|(cp, ct)| cp == p && ct == t) {
-                    // Frontier for the in-progress topic; read cursor per exhausted shard.
-                    (0..shards).map(|s| frontier.get(s).copied().flatten().or_else(|| read_cursor.get(s).copied().flatten())).collect()
-                } else {
-                    read_cursor
-                };
+                let baseline =
+                    applied_frontiers.get(&(p.clone(), t.clone())).cloned().unwrap_or_else(|| p0.get(&(p.clone(), t.clone())).cloned().unwrap_or_default());
                 ((p.clone(), t.clone()), self.merge_holds_over_baseline(p, t, baseline))
             })
             .collect();
@@ -2814,7 +2986,9 @@ impl BufferedWriteLayer {
     /// that already spent part of the grace on earlier drain phases (main.rs)
     /// use `shutdown_by` with the shared absolute deadline instead.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.shutdown_by(tokio::time::Instant::now() + self.config.buffer.stop_grace()).await
+        let configured = self.config.buffer.stop_grace();
+        let grace = if self.has_recent_planned_handoff() { configured.min(Duration::from_secs(1)) } else { configured };
+        self.shutdown_by(tokio::time::Instant::now() + grace).await
     }
 
     #[instrument(skip(self))]
@@ -2831,17 +3005,50 @@ impl BufferedWriteLayer {
         // clean_shutdown=false → next boot paid delta_cursor_reconcile + a full
         // blocking replay. Keep TIMEFUSION_STOP_GRACE_SECS below the
         // orchestrator grace (Docker `StopGracePeriod`).
+        self.stop_accepting_writes();
         self.shutdown.cancel();
         let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Cancellation-aware workers normally stop in one scheduler turn. Give
+        // them a small, explicit slice instead of letting the first wedged task
+        // consume the whole flush allocation. A task still running after this
+        // slice is already bounded by the same shutdown token and its in-flight
+        // flush retains WAL holds, so moving on is both safe and gives the
+        // coalesced shutdown flush a real chance to drain the tail.
+        let already_drained = self.is_drained();
+        let planned_handoff = self.has_recent_planned_handoff();
+        let cancellation_slice = if already_drained { budget.mul_f32(0.1).min(Duration::from_millis(250)) } else { budget.mul_f32(0.1) };
+        let background_deadline = tokio::time::Instant::now() + cancellation_slice;
         let flush_deadline = deadline - budget.mul_f32(0.2); // reserve 20% for the snapshot
         debug!("Shutdown budget: {:?}", budget);
 
-        // Wait for background tasks to stop, bounded by the flush deadline.
-        for handle in self.take_background_tasks().await {
-            match tokio::time::timeout_at(flush_deadline, handle).await {
+        // The admission fence above makes zero an enduring state: once these
+        // writers leave, no accepted connection can append behind the final
+        // flush/snapshot. Bound the wait; a writer that ignores the deadline
+        // forces clean_shutdown=false below, preserving correctness via dirty
+        // recovery instead of delaying WAL-lock handoff indefinitely.
+        let writes_quiesced = self.wait_for_active_writes_until(background_deadline).await;
+        if !writes_quiesced {
+            warn!("{} write(s) still active at shutdown cutoff; cursor snapshot will be marked dirty", self.active_writes.load(Ordering::Acquire));
+        }
+
+        // Wait briefly for background tasks to stop. This is deliberately a
+        // separate deadline from the shutdown flush: before this split a hung
+        // worker could spend 80% of the stop grace, leaving zero time to drain
+        // and turning its entire WAL tail into next-boot replay downtime.
+        for mut handle in self.take_background_tasks().await {
+            match tokio::time::timeout_at(background_deadline, &mut handle).await {
                 Ok(Ok(())) => debug!("Background task completed cleanly"),
                 Ok(Err(e)) => warn!("Background task panicked: {}", e),
-                Err(_) => warn!("Background task did not stop before shutdown flush deadline"),
+                Err(_) => {
+                    // Dropping a JoinHandle detaches the task. That is unsafe
+                    // during a rolling handoff: after this function returns,
+                    // the replacement owns the same WAL directory. Abort and
+                    // join so no old worker can touch WAL state behind the new
+                    // owner's lock.
+                    warn!("Background task did not stop within its shutdown slice; aborting before WAL handoff");
+                    handle.abort();
+                    let _ = handle.await;
+                }
             }
         }
 
@@ -2855,13 +3062,24 @@ impl BufferedWriteLayer {
         // — the future is dropped mid-flight (airborne holds stay registered,
         // pinning the cursor) and unflushed buckets replay from the WAL on
         // next boot.
-        match tokio::time::timeout_at(flush_deadline, self.flush_buckets_where(|_| true)).await {
-            Ok(Ok(stats)) => info!(
-                "Shutdown flush: {} bucket(s) flushed ({} rows), {} failed; remainder (if any) replays from WAL",
-                stats.buckets_flushed, stats.total_rows, stats.buckets_failed
-            ),
-            Ok(Err(e)) => warn!("Shutdown flush error: {} — WAL holds all data", e),
-            Err(_) => info!("Shutdown flush deadline reached; remainder replays from WAL"),
+        if already_drained && writes_quiesced && self.is_drained() {
+            info!("Shutdown flush skipped: write-fenced layer is already fully drained");
+        } else if planned_handoff {
+            // The admin FLUSH immediately preceding a deploy already paid the
+            // remote Delta commit cost. Any rows accepted afterward are WAL
+            // durable. Starting another remote commit here only burns the WAL
+            // lock handoff budget and is usually cancelled mid-request; write
+            // the conservative snapshot below and replay that small tail.
+            info!("Shutdown flush skipped: planned handoff will replay the post-FLUSH WAL tail");
+        } else {
+            match tokio::time::timeout_at(flush_deadline, self.flush_buckets_where(|_| true)).await {
+                Ok(Ok(stats)) => info!(
+                    "Shutdown flush: {} bucket(s) flushed ({} rows), {} failed; remainder (if any) replays from WAL",
+                    stats.buckets_flushed, stats.total_rows, stats.buckets_failed
+                ),
+                Ok(Err(e)) => warn!("Shutdown flush error: {} — WAL holds all data", e),
+                Err(_) => info!("Shutdown flush deadline reached; remainder replays from WAL"),
+            }
         }
 
         // ALWAYS write the clean-shutdown snapshot (even after a partial flush):
@@ -2870,10 +3088,11 @@ impl BufferedWriteLayer {
         // which is exactly why `drained` (the boot-GC authorizer) is a separate,
         // honest claim: only true when nothing un-flushed remains anywhere
         // (buckets, airborne takes, orphans).
-        let drained = self.is_drained();
+        let clean_shutdown = writes_quiesced && self.active_writes.load(Ordering::Acquire) == 0;
+        let drained = clean_shutdown && self.is_drained();
         let wal_for_snap = self.wal.clone();
-        match tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(move || wal_for_snap.write_cursor_snapshot(true, drained))).await {
-            Ok(Ok(Ok(()))) => info!("Cursor snapshot written (clean_shutdown=true, drained={drained})"),
+        match tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(move || wal_for_snap.write_cursor_snapshot(clean_shutdown, drained))).await {
+            Ok(Ok(Ok(()))) => info!("Cursor snapshot written (clean_shutdown={clean_shutdown}, drained={drained})"),
             Ok(Ok(Err(e))) => warn!("Cursor snapshot on shutdown failed: {} — next boot will Delta-scan", e),
             Ok(Err(join_err)) => warn!("Cursor snapshot blocking task panicked: {} — next boot will Delta-scan", join_err),
             Err(_) => warn!("Cursor snapshot did not finish before shutdown deadline — next boot will Delta-scan"),
@@ -3180,6 +3399,7 @@ impl BufferedWriteLayer {
     /// Returns the number of rows deleted.
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
+        let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
         self.invalidate_hot_tier(project_id, table_name, predicate, None);
         // Log to WAL first for durability. Failure here means the delete is
@@ -3202,6 +3422,7 @@ impl BufferedWriteLayer {
     pub fn update(
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
     ) -> datafusion::error::Result<u64> {
+        let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &std::collections::HashSet::new());
         self.invalidate_hot_tier(project_id, table_name, predicate, None);
@@ -3225,6 +3446,7 @@ impl BufferedWriteLayer {
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>,
         assignments: &[(String, datafusion::logical_expr::Expr)], source: &crate::dml::UpdateSource,
     ) -> datafusion::error::Result<u64> {
+        let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         let source_cols: std::collections::HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
         let predicate_sql = predicate.map(|p| Self::normalized_wal_sql(p, &source_cols));
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &source_cols);
@@ -3846,16 +4068,14 @@ mod tests {
                 fl.fetch_add(1, Ordering::Relaxed);
                 fr.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
                 // Resumable-replay invariant: a mid-replay commit's watermark
-                // may advance past P0 (ORIGIN here), but MUST NOT exceed the
-                // durable read cursor — everything ≤ the read cursor with no
-                // live hold is flushed, so a next-boot Delta-derive to that
-                // watermark can't skip an un-read entry. The read cursor only
-                // advances during replay, so reading it now (≥ its value when
-                // `wm` was computed) is a valid upper bound.
+                // must not exceed the durable P0 cursor. Volatile replay no
+                // longer advances Walrus's on-disk cursor per entry; an absent
+                // persisted cursor is semantically ORIGIN (the rewind marker
+                // stores that explicit normalization).
                 let read_cursor = wal_probe.persisted_read_positions(&p, &t).unwrap_or_default();
                 for (shard, claimed) in wm.iter().enumerate() {
                     if let Some(claimed) = claimed
-                        && read_cursor.get(shard).copied().flatten().is_none_or(|rc| *claimed > rc)
+                        && *claimed > read_cursor.get(shard).copied().flatten().unwrap_or(walrus_rust::WalPosition::ORIGIN)
                     {
                         tc.fetch_add(1, Ordering::Relaxed);
                     }
@@ -4453,6 +4673,128 @@ mod tests {
         let snap = layer.wal().load_cursor_snapshot().expect("snapshot written on shutdown");
         assert!(snap.clean_shutdown && snap.drained, "a fully-drained shutdown must claim drained=true");
         assert!(layer.is_drained(), "a successful flush must report drained");
+    }
+
+    /// A workflow FLUSH may be followed by a small amount of live ingestion
+    /// before CapRover delivers SIGTERM. That tail is already WAL durable; a
+    /// second remote flush would lengthen the outage without improving the
+    /// guarantee. Planned shutdown must checkpoint quickly and leave the tail
+    /// replayable rather than invoking Delta again.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn planned_handoff_skips_redundant_remote_flush_and_keeps_wal_tail() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
+        let flush_calls = Arc::new(AtomicU64::new(0));
+        let calls = Arc::clone(&flush_calls);
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+        let project = format!("planned_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span("tail", "span", &project)]).unwrap();
+        layer.insert(&project, "otel_logs_and_spans", vec![batch]).await.unwrap();
+        layer.mark_planned_handoff();
+
+        let started = std::time::Instant::now();
+        layer.shutdown().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "planned WAL handoff exceeded one second: {:?}", started.elapsed());
+        assert_eq!(flush_calls.load(Ordering::Relaxed), 0, "planned handoff must not start a redundant remote Delta commit");
+        let snap = layer.wal().load_cursor_snapshot().unwrap();
+        assert!(snap.clean_shutdown && !snap.drained, "post-FLUSH tail requires a clean, non-drained snapshot");
+        assert!(!layer.wal().is_fully_consumed().unwrap(), "post-FLUSH tail must remain unread for replacement replay");
+    }
+
+    /// A wedged ancillary worker must not consume the shutdown flush's entire
+    /// allocation. The WAL tail is the only startup-critical work: if it is
+    /// drainable inside the grace period, shutdown must drain it and persist a
+    /// drained snapshot even when a background handle ignores cancellation.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wedged_background_task_does_not_starve_shutdown_flush() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 1);
+        let project = format!("bg{}", &uuid::Uuid::new_v4().to_string()[..4]);
+        let table = project.clone();
+
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _wm| Box::pin(async { Ok(Vec::new()) })));
+        let layer = Arc::new(layer);
+        layer.background_tasks.lock().await.push(tokio::spawn(async {
+            // Deliberately ignores the layer's cancellation token.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }));
+
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span("x", "spanX", &project)]).unwrap();
+        layer.insert(&project, &table, vec![batch]).await.unwrap();
+
+        layer.shutdown().await.unwrap();
+        let snap = layer.wal().load_cursor_snapshot().expect("snapshot written on shutdown");
+        assert!(snap.clean_shutdown && snap.drained, "the drainable WAL tail must not be left for startup behind a wedged worker");
+        assert!(layer.is_drained());
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_write_fence_rejects_late_appends_and_marks_active_writer_dirty() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 1);
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+
+        // Model a request accepted before SIGTERM that is still inside the
+        // write path. The barrier must wait only to its deadline, then refuse
+        // to make a clean claim that this late writer could invalidate.
+        let active = layer.admit_write().unwrap();
+        layer.stop_accepting_writes();
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span("late", "span", "p")]).unwrap();
+        let err = layer.insert("p", "otel_logs_and_spans", vec![batch]).await.unwrap_err();
+        assert!(err.to_string().contains("draining for deployment"));
+
+        layer.shutdown().await.unwrap();
+        let snap = layer.wal().load_cursor_snapshot().expect("dirty snapshot still records conservative cursors");
+        assert!(!snap.clean_shutdown && !snap.drained, "an active pre-fence writer forbids clean/drained claims");
+        drop(active);
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn already_drained_shutdown_caps_wedged_worker_handoff_to_250ms() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+        assert!(!layer.has_recent_planned_handoff());
+        layer.mark_planned_handoff();
+        assert!(layer.has_recent_planned_handoff(), "successful admin FLUSH must arm the short planned-deploy handoff");
+        let worker_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = Arc::clone(&worker_dropped);
+        let worker_started = Arc::new(Notify::new());
+        let started_signal = Arc::clone(&worker_started);
+        layer.background_tasks.lock().await.push(tokio::spawn(async move {
+            let _drop_probe = Dropped(dropped);
+            started_signal.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }));
+        worker_started.notified().await;
+
+        let started = std::time::Instant::now();
+        layer.shutdown().await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "an already-drained deploy handoff must not spend 7s on a wedged worker");
+        assert!(worker_dropped.load(Ordering::Acquire), "timed-out worker must be aborted and joined before the WAL lock can pass to the replacement");
+        let snap = layer.wal().load_cursor_snapshot().unwrap();
+        assert!(snap.clean_shutdown && snap.drained);
     }
 
     /// 2026-07-08 review findings 1+5+6: an orphan (failed commit whose rows

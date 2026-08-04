@@ -64,13 +64,13 @@ tr:last-child td{border-bottom:none}
 </style>
 <div class="wrap">
 <h1>Active parquet files per project × day — otel_logs_and_spans</h1>
-<p class="sub">unified table on R2 · snapshot v463266 · 2026-08-04 01:33 CEST (08-03 23:33 UTC — the 08-03 partition is still live) · goal: sealed day ≈ 1 file/GB</p>
+<p class="sub">unified table on R2 · snapshot v463266 · 2026-08-04 01:33 CEST · ⚠ CORRECTION 03:20 CEST: the "shred→heal" pattern below was DATA LOSS, not healing — see the note</p>
 
 <div class="tiles">
-  <div class="tile"><div class="k">Dedup wave</div><div class="v">healed</div><div class="d">the 08-01/08-02 shreds all re-collapsed to 1 file — every non-whale sealed day through 08-02 is back at the floor (only 6297304f's 07-30/31 at 49/9 remain)</div></div>
-  <div class="tile"><div class="k">Whale 08-02</div><div class="v">164 <span class="dim">files</span></div><div class="d">healing steadily: 275 (20:09 peak) → 223 → 164; bytes settled at 15.6GB (was 25.1 pre-dedup)</div></div>
-  <div class="tile"><div class="k">Whale 08-03</div><div class="v">0.46 <span class="dim">GB</span></div><div class="d">day nearly sealed (UTC) at 41 files and only 0.46GB — vs 22–85GB every other day; whale ingest collapsed, check upstream</div></div>
-  <div class="tile"><div class="k">Restarts</div><div class="v">~30 min <span class="dim">cadence</span></div><div class="d">last kill ~00:33; ~00:57 and ~01:22 CEST were clean shutdowns (deploys?) — drain-leak climb still unattributed</div></div>
+  <div class="tile"><div class="k">⚠ Data loss (confirmed)</div><div class="v" style="color:var(--danger)">3/3 <span class="dim">audited</span></div><div class="d">drain dropped rows outside each 10-min bin: 00000000/08-01 −99.95%, 28f62f01/08-02 −96.9%, whale/08-02 −35% of keys. Fix 981ea6d deployed; full audit running</div></div>
+  <div class="tile"><div class="k">Recovery window</div><div class="v">guarded</div><div class="d">all lost rows still in unvacuumed parquet; VACUUM_RETENTION forced 720h (default would have deleted them from 18:15Z 08-04). DO NOT VACUUM</div></div>
+  <div class="tile"><div class="k">Whale 08-03 low volume</div><div class="v">benign</div><div class="d">whale = monoscope self-observability; volume ∝ TF internal churn — the drop is the churn fixes, not lost customer data</div></div>
+  <div class="tile"><div class="k">Restarts</div><div class="v">~10–30 min</div><div class="d">drain-leak climb still unattributed; revert image 251c410 deployed ~02:30 CEST — watching whether kills continue on it</div></div>
 </div>
 
 <div class="legend">
@@ -87,7 +87,7 @@ tr:last-child td{border-bottom:none}
 </table>
 </div>
 
-<p class="note"><b>Reading it:</b> each cell is the live count of active Add actions for that (project, day); sealed day ≈ 1 file/GB is the target. <b>The 08-03 dedup sweep is essentially over and it healed everything it touched:</b> every non-whale shred from yesterday (08-02 at 17:22; 08-01's 88/58/35/29-file spikes at 20:09) re-collapsed to <b>1 file</b>. Only 6297304f's 07-30/31 (49/9 files) predate the sweep and still await a pass. <b>The whale's 08-02 keeps healing</b>: 275 (20:09 peak) → 223 → <b>164</b>, bytes settled at 15.6GB — dedup removed ~38% of the MOR-dribble day's bytes (plausible given its 1,277-file dribble; a row-count check against a pre-dedup version is still the cheap way to be sure). <b>Whale ingest genuinely collapsed on 08-03</b>: the UTC day is nearly sealed at just 0.46GB vs 22–85GB every other day this window — check the tenant's upstream pipeline. <b>Restarts continue ~every 30 min</b> — last OOM kill ~00:33 CEST; the ~00:57/~01:22 cycles were clean shutdowns (deploys?); the ~7GB/min drain-leak climb is still unattributed. Leftovers: whale sealed days are unsorted 1GB compacts (quiet-season SortBy); 3 giant DML quarantine payloads; 16 files in the garbage <code>date=2238-12-31</code> partition (excluded).</p>
+<p class="note"><b>⚠ CORRECTION (03:20 CEST):</b> the row-count audit proved the "shred→heal to 1 file" pattern celebrated in earlier revisions was <b>data loss, not compaction</b>. The unthrottled dirty-bin drain (13:00–17:30Z) passed its 10-minute bin predicate as the partition filter, so each bin rewrite removed whole multi-bin parquet files and re-wrote only its own ten minutes — the "1 file / ≈0GB" end state IS the loss signature. Audited so far: 00000000/08-01 lost 1,357,023 of 1,357,744 keys (99.95%, survivors are hour 13 only); 28f62f01/08-02 lost 2,324,817 (96.9%, survivors span 12:40–13:19); whale/08-02 lost ~35% (~7.8M keys, bin-shaped holes). Zero tombstoned winners — every missing key is real loss. <b>The bleeding is stopped</b> (fix <code>981ea6d</code>, deployed in <code>251c410</code>) and <b>every lost row is still recoverable</b> from removed-but-unvacuumed parquet — vacuum retention is forced to 720h on the service (the 24h default would have started deleting at 18:15Z today); a full-table audit + recovery re-append is in progress. Whale 08-03 "ingest collapse" resolved separately as benign (self-observability volume ∝ TF churn). Leftovers: OOM restarts continue (~10–30 min, unattributed); 6297304f 07-30/31 pre-sweep fragmentation; 3 giant DML quarantine payloads; 16 files in <code>date=2238-12-31</code> (excluded).</p>
 
 <p class="foot">Counts = active Adds in the Delta snapshot (tombstones excluded) · whale row shaded thresholds ×10 (its 1GB floor is ~40–100 files/day)</p>
 </div>

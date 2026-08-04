@@ -524,19 +524,36 @@ impl HotTier {
     /// and `limits` are the tier's entire policy; it enforces them itself, so
     /// callers only ever say `gc(now)`.
     pub fn open(root: PathBuf, retention: Option<Duration>, limits: HotTierLimits) -> Arc<Self> {
+        let tier = Self::open_lazy(root, retention, limits);
+        tier.finish_open();
+        tier
+    }
+
+    /// Construct the cache without walking its directory. Until
+    /// [`Self::finish_open`] completes, missing index entries simply fall
+    /// through to Delta, so application readiness need not wait on a large
+    /// derived-cache scan.
+    pub fn open_lazy(root: PathBuf, retention: Option<Duration>, limits: HotTierLimits) -> Arc<Self> {
         let tier = Arc::new(Self { root, retention, limits, ..Default::default() });
         if let Err(e) = fs::create_dir_all(&tier.root) {
             warn!("hot tier disabled for this process — cannot create {:?}: {e}", tier.root);
         }
-        tier.rescan();
-        if retention.is_none() {
+        tier
+    }
+
+    /// Complete a lazy open by rebuilding the derived index and enforcing the
+    /// disabled-tier cleanup policy. Safe to run while queries are served:
+    /// the index maps are concurrent and an entry not loaded yet falls through
+    /// to the authoritative Delta leg.
+    pub fn finish_open(&self) {
+        self.rescan();
+        if self.retention.is_none() {
             // Disabled, but still responsible for its own directory: without
             // this a previous run's files sit there forever, unbounded and
             // invisible (the disk-leak failure mode of the orphaned spill dirs
             // and the never-evicted tantivy cache).
-            tier.gc(0);
+            self.gc(0);
         }
-        tier
     }
 
     /// Demote one committed bucket, whose rows span the INCLUSIVE `[min_ts,

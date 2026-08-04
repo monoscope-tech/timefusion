@@ -34,6 +34,20 @@ impl Walrus {
     /// its real WAL position so a crash mid-replay can resume rather than
     /// re-read the whole log.
     pub fn read_next_with_position(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<(Entry, WalPosition)>> {
+        self.read_next_with_position_inner(col_name, checkpoint, checkpoint)
+    }
+
+    /// Advance the in-memory read head without persisting the cursor index.
+    ///
+    /// This is intended for a caller that owns a separate durable replay
+    /// transaction/rewind marker and will explicitly persist its final cursor.
+    /// A process crash therefore replays from that marker instead of trusting
+    /// this volatile head, avoiding one index fsync per replayed entry.
+    pub fn read_next_volatile_with_position(&self, col_name: &str) -> io::Result<Option<(Entry, WalPosition)>> {
+        self.read_next_with_position_inner(col_name, true, false)
+    }
+
+    fn read_next_with_position_inner(&self, col_name: &str, checkpoint: bool, persist_checkpoint: bool) -> io::Result<Option<(Entry, WalPosition)>> {
         const TAIL_FLAG: u64 = 1u64 << 63;
         let info_arc = if let Some(arc) = {
             let map = self.reader.data.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned"))?;
@@ -137,7 +151,14 @@ impl Walrus {
 
                 if off >= block.used {
                     debug_print!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
-                    BlockStateTracker::set_checkpointed_true(block.id as usize);
+                    // A volatile replay head is protected by an external
+                    // rewind marker, not by walrus's persisted index. Do not
+                    // make its block reclaimable until the caller explicitly
+                    // persists the final cursor; a crash must still be able to
+                    // rewind into this block.
+                    if persist_checkpoint {
+                        BlockStateTracker::set_checkpointed_true(block.id as usize);
+                    }
                     info.cur_block_idx += 1;
                     info.cur_block_offset = 0;
                     continue;
@@ -150,12 +171,13 @@ impl Walrus {
                         let mut maybe_persist = None;
                         if checkpoint {
                             info.cur_block_offset = new_off;
-                            maybe_persist = if self.should_persist(&mut info, false) { Some((info.cur_block_idx as u64, new_off)) } else { None };
+                            maybe_persist =
+                                if persist_checkpoint && self.should_persist(&mut info, false) { Some((info.cur_block_idx as u64, new_off)) } else { None };
                         }
 
                         // Drop the column lock before touching the index to avoid lock inversion
                         drop(info);
-                        if checkpoint {
+                        if persist_checkpoint {
                             if let Some((idx_val, off_val)) = maybe_persist {
                                 if let Ok(mut idx_guard) = self.read_offset_index.write() {
                                     let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);
@@ -195,7 +217,7 @@ impl Walrus {
                     if let Some((idx, _)) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id) {
                         info.cur_block_idx = idx;
                         info.cur_block_offset = tail_off.min(info.chain[idx].used);
-                        if checkpoint {
+                        if persist_checkpoint {
                             if self.should_persist(&mut info, true) {
                                 if let Ok(mut idx_guard) = self.read_offset_index.write() {
                                     let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
@@ -208,7 +230,7 @@ impl Walrus {
                     } else {
                         // rebase tail to current active block at 0
                         persisted_tail = Some((active_block.id, 0));
-                        if checkpoint {
+                        if persist_checkpoint {
                             if self.should_persist(&mut info, true) {
                                 if let Ok(mut idx_guard) = self.read_offset_index.write() {
                                     let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
@@ -230,7 +252,7 @@ impl Walrus {
                 } else {
                     persisted_tail = Some((active_block.id, 0));
                 }
-                if checkpoint && !has_prior_state {
+                if persist_checkpoint && !has_prior_state {
                     if self.should_persist(&mut info, true) {
                         if let Ok(mut idx_guard) = self.read_offset_index.write() {
                             let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
@@ -269,10 +291,11 @@ impl Walrus {
                         if checkpoint {
                             info.tail_block_id = active_block.id;
                             info.tail_offset = new_off;
-                            maybe_persist = if self.should_persist(&mut info, false) { Some((tail_block_id | TAIL_FLAG, new_off)) } else { None };
+                            maybe_persist =
+                                if persist_checkpoint && self.should_persist(&mut info, false) { Some((tail_block_id | TAIL_FLAG, new_off)) } else { None };
                         }
                         drop(info);
-                        if checkpoint {
+                        if persist_checkpoint {
                             if let Some((idx_val, off_val)) = maybe_persist {
                                 if let Ok(mut idx_guard) = self.read_offset_index.write() {
                                     let _ = idx_guard.set(col_name.to_string(), idx_val, off_val);

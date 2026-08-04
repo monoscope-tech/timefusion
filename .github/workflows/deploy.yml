@@ -96,6 +96,13 @@ jobs:
           docker kill tf-smoke >/dev/null 2>&1 || true
           exit 1
 
+      # Install the same CLI used by caprover/deploy-from-github@v1.1.2 before
+      # starting the handoff clock. Pin it: the upstream action installs an
+      # unpinned latest package inside its container, which makes deploy
+      # behavior change underneath us.
+      - name: Install CapRover deploy client
+        run: npm install --global caprover@2.3.1
+
       # Flush the accumulated backlog before handoff. Writes that arrive after
       # this point remain WAL-durable; stop-first plus the WAL lock makes the
       # replacement replay that small tail safely.
@@ -135,21 +142,108 @@ jobs:
           : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
           boot_micros="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" || true)"
           echo "boot_micros=${boot_micros}" >> "$GITHUB_OUTPUT"
+          # Record total rollout wall time separately from the concurrent SQL
+          # probe's actual client-visible unready interval.
+          echo "handoff_started_epoch_ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
 
       - id: deploy
         name: Deploy Image to CapRover
-        uses: caprover/deploy-from-github@v1.1.2
-        with:
-          server: ${{ secrets.CAPTAINROVER_SERVER }}
-          app: ${{ secrets.CAPTAINROVER_APP_NAME }}
-          token: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
-          image: ${{ env.IMAGE_URL }}
+        env:
+          CAPROVER_SERVER: ${{ secrets.CAPTAINROVER_SERVER }}
+          CAPROVER_APP: ${{ secrets.CAPTAINROVER_APP_NAME }}
+          CAPROVER_TOKEN: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
+          PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
+        run: |
+          set -euo pipefail
+          : "${CAPROVER_SERVER:?CAPTAINROVER_SERVER is required}"
+          : "${CAPROVER_APP:?CAPTAINROVER_APP_NAME is required}"
+          : "${CAPROVER_TOKEN:?CAPTAINROVER_APP_TOKEN is required}"
+          : "${PGURL:?TIMEFUSION_PG_URL is required}"
+          export PGMAXPROTOCOLVERSION=3.0
+
+          # Measure client-visible unavailability concurrently with the opaque
+          # CapRover rollout. Total deploy wall time includes image pull while
+          # the old task is healthy; it is not database downtime. Persist the
+          # longest continuous SELECT failure interval for the verification
+          # step instead.
+          probe_dir="$(mktemp -d)"
+          probe_stop="$probe_dir/stop"
+          probe_result="$probe_dir/max_unready_ms"
+          (
+            unready_started_ms=0
+            max_unready_ms=0
+            while [ ! -e "$probe_stop" ]; do
+              now_ms="$(date +%s%3N)"
+              if timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
+                if (( unready_started_ms > 0 )); then
+                  interval_ms=$((now_ms - unready_started_ms))
+                  (( interval_ms > max_unready_ms )) && max_unready_ms=$interval_ms
+                  unready_started_ms=0
+                fi
+              elif (( unready_started_ms == 0 )); then
+                unready_started_ms=$now_ms
+              fi
+              sleep 1
+            done
+            if (( unready_started_ms > 0 )); then
+              interval_ms=$(( $(date +%s%3N) - unready_started_ms ))
+              (( interval_ms > max_unready_ms )) && max_unready_ms=$interval_ms
+            fi
+            echo "$max_unready_ms" > "$probe_result"
+          ) &
+          probe_pid=$!
+          stop_probe() {
+            touch "$probe_stop"
+            wait "$probe_pid"
+          }
+          trap stop_probe EXIT
+
+          # The former GitHub action is exactly this CLI command. Run it in
+          # parallel with periodic administrative flushes so image pull and
+          # Swarm scheduling cannot rebuild a minutes-old WAL tail between the
+          # one pre-deploy FLUSH and SIGTERM. FLUSH remains online: arrivals
+          # during a commit stay WAL-durable and are picked up by the next pass.
+          caprover deploy \
+            --caproverUrl "$CAPROVER_SERVER" \
+            --appToken "$CAPROVER_TOKEN" \
+            --appName "$CAPROVER_APP" \
+            -i "$IMAGE_URL" >caprover-deploy.log 2>&1 &
+          deploy_pid=$!
+
+          while kill -0 "$deploy_pid" 2>/dev/null; do
+            # Respect TimeFusion's 10s FLUSH rate limit and poll the deploy
+            # process during the wait so a quick rollout is not delayed.
+            for _ in $(seq 1 6); do
+              kill -0 "$deploy_pid" 2>/dev/null || break 2
+              sleep 2
+            done
+            if timeout 60 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH' >/dev/null 2>&1; then
+              echo "rolling FLUSH completed while CapRover deploy was in progress"
+            else
+              echo "rolling FLUSH unavailable (handoff likely underway); WAL recovery remains authoritative"
+            fi
+          done
+
+          deploy_status=0
+          wait "$deploy_pid" || deploy_status=$?
+          stop_probe
+          trap - EXIT
+          observed_unready_ms="$(cat "$probe_result")"
+          echo "observed_unready_ms=$observed_unready_ms" >> "$GITHUB_OUTPUT"
+          cat caprover-deploy.log
+          (( deploy_status == 0 )) || exit "$deploy_status"
 
       - name: Verify production recovery
         env:
           PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
           PREVIOUS_BOOT_MICROS: ${{ steps.production_before.outputs.boot_micros }}
-          MAX_WAL_RECOVERY_MS: '600000'
+          HANDOFF_STARTED_EPOCH_MS: ${{ steps.production_before.outputs.handoff_started_epoch_ms }}
+          OBSERVED_UNREADY_MS: ${{ steps.deploy.outputs.observed_unready_ms }}
+          # A planned deploy is pre-flushed. Exact local cursor/tail equality
+          # now skips both Delta reconciliation and replay, so minutes-class
+          # recovery is a regression, not an expected operating mode.
+          MAX_WAL_RECOVERY_MS: '5000'
+          MAX_READY_WAIT_SECS: '10'
           RECOVERY_WAIT_SECS: '720'
         run: |
           set -euo pipefail
@@ -164,7 +258,12 @@ jobs:
             recovery_complete="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_complete'" || true)"
             recovery_ms="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_duration_ms'" || true)"
             if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ] && [[ "$recovery_ms" =~ ^[0-9]+$ ]]; then
+              ready_elapsed_ms=$(( $(date +%s%3N) - HANDOFF_STARTED_EPOCH_MS ))
+              ready_wait=$(( (ready_elapsed_ms + 999) / 1000 ))
+              [[ "$OBSERVED_UNREADY_MS" =~ ^[0-9]+$ ]] || { echo "::error::rollout readiness probe did not produce a valid downtime measurement: '$OBSERVED_UNREADY_MS'"; exit 1; }
+              (( OBSERVED_UNREADY_MS <= MAX_READY_WAIT_SECS * 1000 )) || { echo "::error::replacement returned 57P03/not-ready continuously for ${OBSERVED_UNREADY_MS}ms (budget $((MAX_READY_WAIT_SECS * 1000))ms)"; exit 1; }
               (( recovery_ms <= MAX_WAL_RECOVERY_MS )) || { echo "::error::WAL recovery took ${recovery_ms}ms (budget ${MAX_WAL_RECOVERY_MS}ms)"; exit 1; }
+              echo "rollout completed in ${ready_elapsed_ms}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
               exit 0
             fi
             sleep 2
@@ -173,4 +272,4 @@ jobs:
           exit 1
 
       - name: Show Deployment Output
-        run: 'echo "Deployment URL: ${{ steps.deploy.outputs.url }}"'
+        run: 'echo "CapRover deployment and recovery verification completed"'

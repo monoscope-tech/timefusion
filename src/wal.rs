@@ -566,7 +566,7 @@ impl WalManager {
         // must finish before the next borrows it.
         for shard in 0..self.shards_per_topic {
             let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-            while let Some((entry, _)) = Self::next_from_shard(&self.wal, &walrus_key, checkpoint, &mut error_count) {
+            while let Some((entry, _)) = Self::next_from_shard(&self.wal, &walrus_key, checkpoint, true, &mut error_count) {
                 if entry.timestamp_micros >= cutoff {
                     results.push(entry);
                 }
@@ -616,9 +616,10 @@ impl WalManager {
 
     /// Read the next entry from a shard, skipping corrupted ones. Returns
     /// `None` at end of stream. Shared by `WalReplayIter`'s k-way merge.
-    fn next_from_shard(wal: &Walrus, key: &str, checkpoint: bool, errors: &mut usize) -> Option<(WalEntry, WalPosition)> {
+    fn next_from_shard(wal: &Walrus, key: &str, checkpoint: bool, persist_checkpoint: bool, errors: &mut usize) -> Option<(WalEntry, WalPosition)> {
         loop {
-            match wal.read_next_with_position(key, checkpoint) {
+            let next = if checkpoint && !persist_checkpoint { wal.read_next_volatile_with_position(key) } else { wal.read_next_with_position(key, checkpoint) };
+            match next {
                 Ok(Some((d, pos))) => match deserialize_wal_entry(&d.data) {
                     Ok(entry) => return Some((entry, pos)),
                     Err(e @ WalError::UnsupportedVersion { .. }) => {
@@ -701,6 +702,37 @@ impl WalManager {
     /// whose cursor has never been persisted.
     pub fn persisted_read_positions(&self, project_id: &str, table_name: &str) -> Result<Vec<Option<WalPosition>>, WalError> {
         self.for_each_shard(project_id, table_name, |k| self.wal.persisted_read_position(k))
+    }
+
+    /// True when every WAL shard's durable read cursor is exactly at its
+    /// current write tail. This is a stronger startup fast-path proof than a
+    /// clean-shutdown flag: a write accepted late during server drain moves
+    /// the tail and makes this false, while a leftover recovery-rewind marker
+    /// rewinds the cursor before this check and likewise makes it false.
+    ///
+    /// `None` is equivalent to origin only for a never-written shard. Any
+    /// non-origin tail without a cursor contains unread data and must replay.
+    pub fn is_fully_consumed(&self) -> Result<bool, WalError> {
+        for (project_id, table_name) in self.list_topic_pairs() {
+            let tails = self.current_position(&project_id, &table_name)?;
+            let cursors = self.persisted_read_positions(&project_id, &table_name)?;
+            if tails.into_iter().zip(cursors).any(|(tail, cursor)| cursor.unwrap_or(WalPosition::ORIGIN) != tail) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether startup may skip remote Delta cursor reconciliation based only
+    /// on local WAL state. A leftover rewind marker vetoes the shortcut: its
+    /// currently persisted cursor may be at the tail only because a previous
+    /// replay crashed after consuming entries, and applying the marker will
+    /// make those entries unread again.
+    pub fn can_skip_delta_reconcile(&self) -> Result<bool, WalError> {
+        if self.recovery_rewind_path().exists() {
+            return Ok(false);
+        }
+        self.is_fully_consumed()
     }
 
     /// Set the walrus persisted-read cursor per shard. Used at startup to
@@ -1161,7 +1193,10 @@ impl WalReplayIter<'_> {
     /// Prefetch the shard's next entry into `pending[shard]` + the heap,
     /// preserving the one-in-flight-entry-per-shard invariant.
     fn prime(&mut self, shard: usize) {
-        if let Some(next) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, &mut self.errors) {
+        // Recovery owns a durable rewind marker and explicitly parks every
+        // cursor before removing it, so persisting walrus's index for every
+        // prefetched entry is redundant and costs one fsync per entry.
+        if let Some(next) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, false, &mut self.errors) {
             self.heap.push(std::cmp::Reverse((next.0.timestamp_micros, shard)));
             self.pending[shard] = Some(next);
         }
@@ -1592,6 +1627,38 @@ mod tests {
         }
     }
 
+    /// Recovery may advance its read head without an index fsync per entry
+    /// because the external rewind marker remains durable until this single
+    /// final cursor write. The volatile API must not accidentally persist an
+    /// intermediate cursor, and the final parked tail must survive reopen.
+    #[serial_test::serial]
+    #[test]
+    fn volatile_replay_persists_only_the_final_parked_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let table = format!("volatile_{}", uuid::Uuid::new_v4().simple());
+        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::None, 1).unwrap();
+        let batch = create_test_batch();
+        for _ in 0..8 {
+            wal.append_batch("proj", &table, std::slice::from_ref(&batch), |_, _| {}).unwrap();
+        }
+
+        let key = WalManager::walrus_topic_key("proj", &table, 0);
+        let mut read = 0;
+        while wal.wal.read_next_volatile_with_position(&key).unwrap().is_some() {
+            read += 1;
+        }
+        assert_eq!(read, 8);
+        assert_eq!(wal.wal.persisted_read_position(&key).unwrap(), None, "volatile replay must not fsync an intermediate cursor");
+
+        let tail = wal.current_position_for_shard("proj", &table, 0).unwrap();
+        wal.set_positions_allow_rewind("proj", &table, &[Some(tail)]).unwrap();
+        drop(wal);
+
+        let reopened = WalManager::with_fsync_mode_and_shards(path, crate::config::WalFsyncMode::None, 1).unwrap();
+        assert!(reopened.is_fully_consumed().unwrap(), "the one final parked cursor write must survive reopen");
+    }
+
     /// 2026-07-08 prod incident: a 121MB acked INSERT sat in the WAL until the
     /// next boot, where replay's `deserialize_record_batch` size cap rejected
     /// it → quarantined → the acked write silently dropped. The cap must be
@@ -1839,6 +1906,37 @@ mod tests {
         wal.remove_recovery_rewind_marker();
         assert!(!wal.apply_recovery_rewind_marker().unwrap(), "marker gone after removal");
         wal.remove_recovery_rewind_marker(); // idempotent
+    }
+
+    /// The zero-replay proof is position-exact: an appended entry makes the
+    /// WAL non-consumed, advancing only to an earlier position is still
+    /// non-consumed, and advancing to the actual tail makes it consumed.
+    /// Empty shards (`None` cursor, origin tail) are harmless.
+    #[test]
+    #[serial_test::serial]
+    fn fully_consumed_requires_every_cursor_at_its_exact_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = format!("fc_{}", uuid::Uuid::new_v4().simple());
+        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+
+        assert!(wal.is_fully_consumed().unwrap(), "an empty WAL has nothing to replay");
+        wal.append("proj", &table, &create_test_batch()).unwrap();
+        assert!(!wal.is_fully_consumed().unwrap(), "an append beyond an absent cursor must replay");
+
+        let tails = wal.current_position("proj", &table).unwrap();
+        wal.merge_persisted_positions("proj", &table, &tails.iter().copied().map(Some).collect::<Vec<_>>()).unwrap();
+        assert!(wal.is_fully_consumed().unwrap(), "cursor equality with every shard tail proves zero replay");
+        assert!(wal.can_skip_delta_reconcile().unwrap(), "a fully consumed WAL needs no remote cursor derivation");
+
+        // A marker means those tail cursors may be consumed-ahead state from a
+        // crashed replay. It must veto the remote-scan shortcut even before it
+        // is applied and rewinds them.
+        wal.write_recovery_rewind_marker().unwrap();
+        assert!(!wal.can_skip_delta_reconcile().unwrap(), "an interrupted-recovery marker must retain Delta reconciliation");
+        wal.remove_recovery_rewind_marker();
+
+        wal.append("proj", &table, &create_test_batch()).unwrap();
+        assert!(!wal.is_fully_consumed().unwrap(), "a late accepted write must invalidate the zero-replay proof");
     }
 
     /// Round-trip cursor snapshot: write, drop the manager, re-open, restore.

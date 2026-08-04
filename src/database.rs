@@ -1991,6 +1991,12 @@ pub struct Database {
     /// checkpoint drivers. In-memory only: after a restart
     /// the first tick checkpoints every table once, which is harmless.
     checkpoint_versions: Arc<dashmap::DashMap<String, u64>>,
+    /// Serializes local staged-intent manifest append/rewrite operations.
+    /// Orphan reconciliation runs after readiness and may finish while a
+    /// maintenance wave records a new intent; without this lock its compacting
+    /// rewrite could overwrite that append and remove the only targeted-cleanup
+    /// record for a subsequently orphaned parquet file.
+    staged_intent_manifest_lock: Arc<std::sync::Mutex<()>>,
     /// Where the last truncated light-optimize tick stopped, as an index into
     /// that tick's debt-ordered project list. The next tick rotates its plan by
     /// this so an overloaded box degrades to "every project within k ticks"
@@ -2351,6 +2357,7 @@ impl Database {
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
 
         Ok(db)
@@ -2643,15 +2650,22 @@ impl Database {
             });
         }
 
-        // Before any maintenance job can stage new work: delete the staged
-        // parquet of bins that never reached their wave commit because the
-        // process died between staging and committing. Best-effort by
-        // construction — see `reconcile_staged_intents`.
-        // Custom-storage tables stage into the same manifest (the hot-compact
-        // cron covers them too), so `all_tables` covers both or their orphans
-        // are never targeted at all.
-        for (_project_id, table_name, table) in db.all_tables().await {
-            db.reconcile_staged_intents(&table, &table_name).await;
+        // Delete staged parquet left by an interrupted wave after readiness.
+        // This is best-effort derived-data cleanup, not recovery: serial R2
+        // DELETE latency must not hold PGWire in 57P03. The manifest rewrite is
+        // serialized with new appends, and the minimum-age gate excludes work
+        // staged by this process, so cleanup remains safe if a cron tick starts
+        // concurrently. `all_tables` includes custom-storage tables too.
+        {
+            let cleanup_db = Arc::clone(&db);
+            tokio::spawn(async move {
+                for (_project_id, table_name, table) in cleanup_db.all_tables().await {
+                    if cleanup_db.maintenance_shutdown.is_cancelled() {
+                        return;
+                    }
+                    cleanup_db.reconcile_staged_intents(&table, &table_name).await;
+                }
+            });
         }
 
         // Hot compact — bin-pack today's small files (every ~5 min). Runs WITHOUT
@@ -5464,36 +5478,52 @@ impl Database {
     /// so this can't make recovery worse than today's at-least-once behaviour.
     pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::wal::WalManager) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
-        let totals: Vec<usize> = stream::iter(wal.list_topic_pairs())
-            .map(|(project_id, table_name)| async move { self.derive_wal_cursor_for_table(wal, &project_id, &table_name).await.unwrap_or(0) })
+
+        // Group logical WAL topics by physical Delta log. Default-storage
+        // projects share one unified table, so opening and scanning that table
+        // once per project made a dirty boot pay the same remote snapshot load
+        // dozens of times. Custom-storage topics retain their isolated group.
+        let custom = self.custom_storage_keys().await;
+        let mut physical: std::collections::HashMap<(String, String), Vec<(String, String)>> = std::collections::HashMap::new();
+        for (project_id, table_name) in wal.list_topic_pairs() {
+            let physical_project = if custom.contains(&(project_id.clone(), table_name.clone())) { project_id.clone() } else { String::new() };
+            physical.entry((physical_project, table_name.clone())).or_default().push((project_id, table_name));
+        }
+        let totals: Vec<usize> = stream::iter(physical.into_values())
+            .map(|topics| async move { self.derive_wal_cursors_for_physical_table(wal, topics).await.unwrap_or(0) })
             .buffer_unordered(self.config.buffer.delta_scan_concurrency())
             .collect()
             .await;
         Ok(totals.into_iter().sum())
     }
 
-    async fn derive_wal_cursor_for_table(&self, wal: &crate::wal::WalManager, project_id: &str, table_name: &str) -> anyhow::Result<usize> {
+    async fn derive_wal_cursors_for_physical_table(&self, wal: &crate::wal::WalManager, topics: Vec<(String, String)>) -> anyhow::Result<usize> {
+        let Some((representative_project, representative_table)) = topics.first() else { return Ok(0) };
         // Scan recent commits; replay-derived commits without a watermark
         // contribute nothing so they can't reset the MAX backward.
-        let Ok(table_ref) = self.resolve_table(project_id, table_name).await else {
+        let Ok(table_ref) = self.resolve_table(representative_project, representative_table).await else {
             return Ok(0);
         };
         let table = table_ref.read().await;
         let commits: Vec<_> = match table.history(Some(self.config.buffer.delta_scan_depth())).await {
             Ok(it) => it.collect(),
             Err(e) => {
-                debug!("derive_wal_cursor: history unavailable for {}/{}: {}", project_id, table_name, e);
+                debug!("derive_wal_cursor: history unavailable for {}/{}: {}", representative_project, representative_table, e);
                 return Ok(0);
             }
         };
         drop(table);
 
-        let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic(), project_id, table_name);
-        let advanced = wal.merge_persisted_positions(project_id, table_name, &delta_max)?;
-        if advanced > 0 {
-            info!("Delta-derived cursor advance: project={}, table={}, shards_advanced={}", project_id, table_name, advanced);
+        let mut total_advanced = 0;
+        for (project_id, table_name) in topics {
+            let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic(), &project_id, &table_name);
+            let advanced = wal.merge_persisted_positions(&project_id, &table_name, &delta_max)?;
+            if advanced > 0 {
+                info!("Delta-derived cursor advance: project={}, table={}, shards_advanced={}", project_id, table_name, advanced);
+            }
+            total_advanced += advanced;
         }
-        Ok(advanced)
+        Ok(total_advanced)
     }
 
     /// Optimize the Delta table using Z-ordering on timestamp and id columns
@@ -8143,6 +8173,7 @@ impl Database {
     /// must never fail the compaction, only widen the VACUUM backstop's job.
     fn record_staged_intent(&self, entry: &StagedIntent) {
         use std::io::Write;
+        let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.staged_intent_path();
         let write = (|| -> std::io::Result<()> {
             if let Some(dir) = path.parent() {
@@ -8160,6 +8191,7 @@ impl Database {
     /// after the wave commits or after its staged parquet is cleaned up, i.e.
     /// once the entry can no longer describe an orphan.
     fn clear_staged_intent(&self, wave_ids: &[&str]) {
+        let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.staged_intent_path();
         let Ok(contents) = std::fs::read_to_string(&path) else { return };
         let kept: Vec<String> = parse_staged_intents(&contents)
@@ -8180,10 +8212,13 @@ impl Database {
     async fn reconcile_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
         use object_store::ObjectStoreExt;
         let path = self.staged_intent_path();
-        let Ok(contents) = std::fs::read_to_string(&path) else { return };
+        let contents = {
+            let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Ok(contents) = std::fs::read_to_string(&path) else { return };
+            contents
+        };
         let entries = parse_staged_intents(&contents);
         if entries.is_empty() {
-            let _ = std::fs::remove_file(&path);
             return;
         }
         let (referenced, store) = {
