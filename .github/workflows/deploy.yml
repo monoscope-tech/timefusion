@@ -103,9 +103,10 @@ jobs:
       - name: Install CapRover deploy client
         run: npm install --global caprover@2.3.1
 
-      # New binaries support HANDOFF: fence writes with a five-minute lease,
-      # drain the finite tail while reads stay online, then make SIGTERM local
-      # snapshot-only. FLUSH is the compatibility path for the first rollout.
+      # First pay the large backlog flush while reads+writes remain online.
+      # New binaries then HANDOFF-fence writes and drain only arrivals from that
+      # online flush; SIGTERM becomes local snapshot-only. Old binaries use the
+      # successful FLUSH as the compatibility path for the first rollout.
       - name: Prepare production handoff
         env:
           PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
@@ -124,19 +125,25 @@ jobs:
           # PGMAXPROTOCOLVERSION: env form (not URI param) — older libpq ignores
           # unknown env vars but rejects unknown URI params.
           export PGMAXPROTOCOLVERSION=3.0
-          if timeout 300 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'HANDOFF' 2>&1; then
-            echo "write-fenced handoff ready; production remains read-available"
-            exit 0
-          fi
-          echo "HANDOFF unavailable or failed; falling back to online FLUSH"
+          flush_ok=false
           for attempt in $(seq 1 3); do
             if timeout 300 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH' 2>&1; then
-              echo "flush ok (attempt $attempt)"; exit 0
+              echo "online flush ok (attempt $attempt)"
+              flush_ok=true
+              break
             fi
             echo "flush attempt $attempt failed or timed out; retrying in 15s"
             sleep 15
           done
-          echo "::warning::pre-deploy FLUSH never succeeded; proceeding (tail is WAL-durable, replay will recover it)"
+          if timeout 300 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'HANDOFF' 2>&1; then
+            echo "write-fenced tail drain ready; production remains read-available"
+            exit 0
+          fi
+          if $flush_ok; then
+            echo "HANDOFF unsupported by outgoing binary; using successful FLUSH compatibility path"
+            exit 0
+          fi
+          echo "::warning::neither pre-deploy FLUSH nor HANDOFF succeeded; proceeding (tail is WAL-durable, replay will recover it)"
 
       - name: Record production boot
         id: production_before
