@@ -1,0 +1,19 @@
+# Apply in CapRover's "Service Update Override" for TimeFusion.
+#
+# Safe only after every running task uses a binary that implements both HANDOFF
+# and the WAL takeover.request protocol. The new task remains unhealthy while its early PGWire
+# responder returns 57P03; once it requests the shared WAL lock, the drained
+# predecessor exits and the real PGWire server becomes healthy.
+UpdateConfig:
+  Parallelism: 1
+  Delay: 100000000
+  FailureAction: pause
+  Monitor: 15000000000
+  MaxFailureRatio: 0.15
+  Order: start-first
+RollbackConfig:
+  Parallelism: 1
+  FailureAction: pause
+  Monitor: 15000000000
+  MaxFailureRatio: 0.15
+  Order: start-first

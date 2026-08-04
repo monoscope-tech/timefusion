@@ -70,6 +70,9 @@ fn main() -> anyhow::Result<()> {
     dotenv().ok();
 
     let subcommand = std::env::args().nth(1);
+    if subcommand.as_deref() == Some("healthcheck") {
+        return run_pgwire_healthcheck();
+    }
     // CLI helper: `timefusion encrypt-secret <plaintext>` — prints ciphertext
     // for use in `timefusion_projects` rows, then exits. Needs no config.
     if subcommand.as_deref() == Some("encrypt-secret") {
@@ -97,6 +100,35 @@ fn main() -> anyhow::Result<()> {
         Some("migrate-columns") => rt.block_on(run_migrate_columns_cli(cfg)),
         _ => rt.block_on(async_main(cfg)),
     }
+}
+
+/// Docker readiness probe that distinguishes the early 57P03 responder from
+/// the real PGWire server. A PostgreSQL AuthenticationRequest (`R`) proves the
+/// request reached the real handler; the early responder returns ErrorResponse
+/// (`E`) with SQLSTATE 57P03 and therefore stays out of a start-first VIP.
+fn run_pgwire_healthcheck() -> anyhow::Result<()> {
+    let port = std::env::var("TIMEFUSION_PGWIRE_PORT").or_else(|_| std::env::var("PGWIRE_PORT")).ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(5432);
+    pgwire_ready_at(([127, 0, 0, 1], port).into())
+}
+
+fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    let timeout = std::time::Duration::from_millis(750);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    let body = b"user\0timefusion_healthcheck\0database\0postgres\0\0";
+    let mut startup = Vec::with_capacity(8 + body.len());
+    startup.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+    startup.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
+    startup.extend_from_slice(body);
+    stream.write_all(&startup)?;
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag)?;
+    anyhow::ensure!(tag[0] == b'R', "PGWire is bound but not ready (response tag {:?})", tag[0] as char);
+    Ok(())
 }
 
 fn init_cli_tracing() {
@@ -455,6 +487,21 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     };
 
+    // In a start-first rollout the replacement binds its isolated listener,
+    // then blocks on the shared WAL flock and writes a takeover request. A
+    // successful HANDOFF has already fenced writes and drained every hold, so
+    // the predecessor can exit at that exact moment while continuing to serve
+    // reads until the replacement actually exists. Without HANDOFF readiness,
+    // requests are ignored and SIGTERM remains the only shutdown authority.
+    let takeover_signal = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if buffered_layer.is_deploy_handoff_ready() && timefusion::wal::takeover_requested(&cfg.core.wal_dir()) {
+                break;
+            }
+        }
+    };
+
     // Wait for shutdown signal. Borrow `pg_task` so we can still await it
     // in the drain phase below — the select! only watches it for early
     // failure, not for ownership.
@@ -470,6 +517,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
         _ = term_signal => {
             info!("Received SIGTERM, initiating graceful shutdown");
+        }
+        _ = takeover_signal => {
+            info!("Start-first replacement requested drained WAL ownership; initiating graceful handoff");
         }
     }
 
@@ -760,5 +810,32 @@ async fn reconcile_tantivy(db: &Database, table: &str) {
         Ok((0, 0, 0)) => {}
         Ok((built, removed, blobs)) => println!("tantivy reconcile: built={built} manifest_entries_removed={removed} blobs_deleted={blobs}"),
         Err(e) => eprintln!("tantivy reconcile FAILED (indexes stale until the next reconcile or server backfill): {e}"),
+    }
+}
+
+#[cfg(test)]
+mod healthcheck_tests {
+    use super::pgwire_ready_at;
+
+    fn one_response(tag: u8) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let remaining = u32::from_be_bytes(length).saturating_sub(4) as usize;
+            let mut startup = vec![0u8; remaining];
+            stream.read_exact(&mut startup).unwrap();
+            stream.write_all(&[tag]).unwrap();
+        });
+        addr
+    }
+
+    #[test]
+    fn readiness_accepts_authentication_and_rejects_early_error() {
+        assert!(pgwire_ready_at(one_response(b'R')).is_ok());
+        assert!(pgwire_ready_at(one_response(b'E')).is_err());
     }
 }

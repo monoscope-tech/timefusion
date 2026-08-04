@@ -274,10 +274,11 @@ jobs:
             if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ] && [[ "$recovery_ms" =~ ^[0-9]+$ ]]; then
               ready_elapsed_ms=$(( $(date +%s%3N) - HANDOFF_STARTED_EPOCH_MS ))
               ready_wait=$(( (ready_elapsed_ms + 999) / 1000 ))
+              echo "rollout measurement: total ${ready_elapsed_ms}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
               [[ "$OBSERVED_UNREADY_MS" =~ ^[0-9]+$ ]] || { echo "::error::rollout readiness probe did not produce a valid downtime measurement: '$OBSERVED_UNREADY_MS'"; exit 1; }
               (( OBSERVED_UNREADY_MS <= MAX_READY_WAIT_SECS * 1000 )) || { echo "::error::replacement returned 57P03/not-ready continuously for ${OBSERVED_UNREADY_MS}ms (budget $((MAX_READY_WAIT_SECS * 1000))ms)"; exit 1; }
               (( recovery_ms <= MAX_WAL_RECOVERY_MS )) || { echo "::error::WAL recovery took ${recovery_ms}ms (budget ${MAX_WAL_RECOVERY_MS}ms)"; exit 1; }
-              echo "rollout completed in ${ready_elapsed_ms}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
+              echo "rollout completed within recovery and availability budgets"
               exit 0
             fi
             sleep 2

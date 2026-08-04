@@ -107,6 +107,12 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 
 EXPOSE 80 5432
 
+# Keep the early 57P03 responder out of Swarm's VIP. The probe speaks just
+# enough PostgreSQL to require an AuthenticationRequest from the real server;
+# it becomes healthy within one probe interval of WAL-owner handoff completing.
+HEALTHCHECK --interval=250ms --timeout=500ms --start-period=100ms --retries=4 \
+    CMD ["/usr/local/bin/timefusion", "healthcheck"]
+
 # Default telemetry destination: the swarm-internal collector. Image ENV
 # loses to service-level env, so operators can still override per deploy.
 # Spans default off (per-query volume); logs + metrics flow.

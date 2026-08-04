@@ -42,6 +42,7 @@ pub enum WalError {
 /// (topic list, WAL version stamp, cursor snapshot, dedup dirty bins, delta
 /// snapshots). Skipped by WAL GC.
 pub const META_DIR: &str = ".timefusion_meta";
+const TAKEOVER_REQUEST_FILE: &str = "takeover.request";
 
 /// `<data_dir>/.timefusion_meta/<file>`.
 pub fn meta_path(data_dir: &Path, file: &str) -> PathBuf {
@@ -1351,21 +1352,30 @@ impl WalDirLock {
         loop {
             match file.try_lock_exclusive() {
                 Ok(true) => {
+                    clear_takeover_request(wal_dir);
                     if waits > 0 {
                         info!("WAL dir lock acquired after waiting for a previous process to exit");
                     }
                     return Ok(Self { _file: file });
                 }
                 // Ok(false) = another live TimeFusion process owns the WAL.
-                // Log every ~10s (20 × 500ms). A normal handoff clears in
+                // Poll quickly during the brief start-first overlap so lock
+                // transfer does not add a visible half-second outage. Log only
+                // every ~10s (400 × 25ms). A normal handoff clears in
                 // seconds; escalate to error past ~60s so a wedged predecessor
                 // (readiness stays TCP-green, masking the stall) is loud, not a
                 // silent hang. We still never steal — the orchestrator's
                 // stop-grace SIGKILL is what bounds a truly stuck predecessor.
                 Ok(false) => {
-                    if waits.is_multiple_of(20) {
-                        let secs = waits / 2;
-                        if waits >= 120 {
+                    // In start-first mode the drained predecessor retains this
+                    // lock while serving reads. This marker asks it to enter
+                    // its normal graceful-exit path; it never authorizes this
+                    // contender to touch WAL state before acquiring the lock.
+                    if waits.is_multiple_of(400) {
+                        let request = meta_dir.join(TAKEOVER_REQUEST_FILE);
+                        let _ = std::fs::write(&request, format!("pid={} requested_at_micros={}\n", std::process::id(), chrono::Utc::now().timestamp_micros()));
+                        let secs = waits / 40;
+                        if waits >= 2_400 {
                             error!(
                                 "WAL dir {:?} still locked by another TimeFusion process after {secs}s — predecessor may be wedged (check for a stuck/duplicate instance)",
                                 path
@@ -1375,11 +1385,23 @@ impl WalDirLock {
                         }
                     }
                     waits += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
                 Err(e) => return Err(WalError::Io(e)),
             }
         }
+    }
+}
+
+pub fn takeover_requested(wal_dir: &std::path::Path) -> bool {
+    wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE).is_file()
+}
+
+pub fn clear_takeover_request(wal_dir: &std::path::Path) {
+    match std::fs::remove_file(wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("could not clear WAL takeover request: {e}"),
     }
 }
 
@@ -1397,7 +1419,7 @@ impl WalDirLock {
 /// parks the cursors) reclaims instead.
 pub fn boot_wal_gc(wal_dir: &std::path::Path) {
     let t = std::time::Instant::now();
-    let Some(mut snap) = read_cursor_snapshot(wal_dir).filter(|s| s.drained) else {
+    let Some(mut snap) = read_cursor_snapshot(wal_dir).filter(|s| s.clean_shutdown && s.drained) else {
         info!("bootstrap.phase=wal_gc skipped=not_drained (runtime sweep reclaims post-replay)");
         return;
     };
@@ -2234,6 +2256,28 @@ mod tests {
         assert!(other.try_lock_exclusive().unwrap(), "lock must be acquirable after the holder drops");
     }
 
+    #[tokio::test]
+    async fn wal_lock_contender_requests_takeover_and_clears_marker_on_acquire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_path_buf();
+        let owner = WalDirLock::acquire(&path).await.unwrap();
+        let contender_path = path.clone();
+        let contender = tokio::spawn(async move { WalDirLock::acquire(&contender_path).await.unwrap() });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !takeover_requested(&path) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocked replacement must publish a takeover request");
+
+        drop(owner);
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(2), contender).await.unwrap().unwrap();
+        assert!(!takeover_requested(&path), "new WAL owner must clear the consumed request");
+        drop(replacement);
+    }
+
     #[test]
     fn gc_wal_files_skips_meta_and_respects_cutoff() {
         use std::time::Duration;
@@ -2392,6 +2436,8 @@ mod tests {
         boot_wal_gc(root); // unreadable → skip
         write_snap(true, false, SNAPSHOT_VERSION);
         boot_wal_gc(root); // clean but NOT drained (partial flush) → skip
+        write_snap(false, true, SNAPSHOT_VERSION);
+        boot_wal_gc(root); // inconsistent dirty+drained claim → fail closed
         write_snap(true, true, 999);
         boot_wal_gc(root); // version mismatch → skip
         assert!(old_file.exists(), "un-drained/unreadable snapshots must never authorize the mtime sweep");

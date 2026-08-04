@@ -468,6 +468,10 @@ pub struct BufferedWriteLayer {
     /// Invalidates leased pre-deploy write fences. Shutdown increments this
     /// again, so an old lease timer can never reopen admission after SIGTERM.
     handoff_generation: AtomicU64,
+    /// True only after HANDOFF fenced admission, quiesced admitted writers,
+    /// and flushed every WAL-backed hold. A start-first replacement may then
+    /// ask this process to relinquish the single-writer WAL lock.
+    deploy_handoff_ready: std::sync::atomic::AtomicBool,
     delta_write_callback: Option<DeltaWriteCallback>,
     /// Set alongside `delta_write_callback`; used instead of it when
     /// `TIMEFUSION_FLUSH_COALESCE_COMMITS` is on (see `flush_groups_coalesced`).
@@ -647,7 +651,17 @@ impl BufferedWriteLayer {
     /// retryably instead of racing the final WAL cursor snapshot.
     pub fn stop_accepting_writes(&self) {
         self.handoff_generation.fetch_add(1, Ordering::AcqRel);
+        self.deploy_handoff_ready.store(false, Ordering::Release);
         self.accepting_writes.store(false, Ordering::Release);
+    }
+
+    /// Whether a start-first replacement may safely trigger this process's
+    /// graceful exit while reads are still being served.
+    pub fn is_deploy_handoff_ready(&self) -> bool {
+        self.deploy_handoff_ready.load(Ordering::Acquire)
+            && !self.accepting_writes.load(Ordering::Acquire)
+            && self.active_writes.load(Ordering::Acquire) == 0
+            && self.is_drained()
     }
 
     async fn wait_for_active_writes_until(&self, deadline: tokio::time::Instant) -> bool {
@@ -693,6 +707,7 @@ impl BufferedWriteLayer {
             active_writes: AtomicU64::new(0),
             writes_drained: Notify::new(),
             handoff_generation: AtomicU64::new(0),
+            deploy_handoff_ready: std::sync::atomic::AtomicBool::new(false),
             delta_write_callback: None,
             coalesced_write_callback: None,
             tantivy_index_callback: None,
@@ -3133,6 +3148,8 @@ impl BufferedWriteLayer {
         const DRAIN_BUDGET: Duration = Duration::from_secs(4 * 60);
 
         let generation = self.handoff_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.deploy_handoff_ready.store(false, Ordering::Release);
+        crate::wal::clear_takeover_request(self.wal.data_dir());
         self.accepting_writes.store(false, Ordering::Release);
 
         let weak = Arc::downgrade(self);
@@ -3140,6 +3157,7 @@ impl BufferedWriteLayer {
             tokio::time::sleep(HANDOFF_LEASE).await;
             let Some(layer) = weak.upgrade() else { return };
             if !layer.shutdown.is_cancelled() && layer.handoff_generation.load(Ordering::Acquire) == generation {
+                layer.deploy_handoff_ready.store(false, Ordering::Release);
                 layer.accepting_writes.store(true, Ordering::Release);
                 warn!("Deploy handoff lease expired before shutdown; write admission reopened");
             }
@@ -3147,6 +3165,7 @@ impl BufferedWriteLayer {
 
         let reopen_on_error = || {
             if !self.shutdown.is_cancelled() && self.handoff_generation.load(Ordering::Acquire) == generation {
+                self.deploy_handoff_ready.store(false, Ordering::Release);
                 self.accepting_writes.store(true, Ordering::Release);
             }
         };
@@ -3176,6 +3195,7 @@ impl BufferedWriteLayer {
             stats.total_rows,
             HANDOFF_LEASE.as_secs()
         );
+        self.deploy_handoff_ready.store(true, Ordering::Release);
         Ok(stats)
     }
 
@@ -4803,11 +4823,13 @@ mod tests {
         let stats = layer.prepare_deploy_handoff().await.unwrap();
         assert_eq!(stats.buckets_failed, 0);
         assert!(layer.is_drained());
+        assert!(layer.is_deploy_handoff_ready(), "drained write fence must authorize start-first ownership request");
         let err = layer.insert("p", "otel_logs_and_spans", vec![batch]).await.unwrap_err();
         assert!(err.to_string().contains("draining for deployment"));
 
         let started = std::time::Instant::now();
         layer.shutdown().await.unwrap();
+        assert!(!layer.is_deploy_handoff_ready(), "shutdown must invalidate the leased takeover authorization");
         assert!(started.elapsed() < Duration::from_secs(1), "drained handoff shutdown must stay constant-time");
         let snap = layer.wal().load_cursor_snapshot().unwrap();
         assert!(snap.clean_shutdown && snap.drained);
@@ -4825,6 +4847,7 @@ mod tests {
         layer.insert("p", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
 
         assert!(layer.prepare_deploy_handoff().await.is_err());
+        assert!(!layer.is_deploy_handoff_ready());
         layer.insert("p", "otel_logs_and_spans", vec![batch]).await.expect("failed handoff must reopen writes");
     }
 
