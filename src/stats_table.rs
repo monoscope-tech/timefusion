@@ -67,6 +67,10 @@ fn pct(n: u64, d: u64) -> String {
     format!("{:.1}", if d > 0 { n as f64 * 100.0 / d as f64 } else { 0.0 })
 }
 
+fn avg(total: u64, samples: u64) -> u64 {
+    total.checked_div(samples).unwrap_or(0)
+}
+
 fn or_null<T: ToString>(v: Option<T>) -> String {
     v.map_or_else(|| "null".to_string(), |v| v.to_string())
 }
@@ -337,6 +341,10 @@ impl StatsTableProvider {
             let (total, skipped) = (m.scans_total.load(Relaxed), m.scans_skipped_delta.load(Relaxed));
             let (fr_hits, fr_misses) = (m.fast_resolve_hits.load(Relaxed), m.fast_resolve_misses.load(Relaxed));
             let (pc_hits, pc_misses) = (m.provider_cache_hits.load(Relaxed), m.provider_cache_misses.load(Relaxed));
+            let provider_builds = m.provider_build_total.load(Relaxed);
+            let provider_scans = m.provider_scan_total.load(Relaxed);
+            let mem_plans = m.mem_plan_total.load(Relaxed);
+            let hot_plans = m.hot_plan_total.load(Relaxed);
             // Parquet decode heap — the largest consumer outside every budget.
             // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
             // concurrent decode heap, which is what a Transient budget must cover.
@@ -380,6 +388,14 @@ impl StatsTableProvider {
                     "provider_cache_evictions" => m.provider_cache_evictions.load(Relaxed),
                     "provider_cache_hit_pct" => pct(pc_hits, pc_hits + pc_misses),
                     "provider_build_abandoned" => m.provider_build_abandoned.load(Relaxed),
+                    "provider_build_us_avg" => avg(m.provider_build_us_total.load(Relaxed), provider_builds),
+                    "provider_build_total" => provider_builds,
+                    "provider_scan_us_avg" => avg(m.provider_scan_us_total.load(Relaxed), provider_scans),
+                    "provider_scan_total" => provider_scans,
+                    "mem_plan_us_avg" => avg(m.mem_plan_us_total.load(Relaxed), mem_plans),
+                    "mem_plan_total" => mem_plans,
+                    "hot_plan_us_avg" => avg(m.hot_plan_us_total.load(Relaxed), hot_plans),
+                    "hot_plan_total" => hot_plans,
                     "lat_p50_us_approx" => m.latency_percentile_us(0.50),
                     "lat_p95_us_approx" => m.latency_percentile_us(0.95),
                     "lat_p99_us_approx" => m.latency_percentile_us(0.99),
@@ -538,7 +554,7 @@ mod tests {
 
     #[test]
     fn exposes_dml_retry_outcomes() {
-        let rows = snapshot_rows(&StatsTableProvider::new(None));
+        let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
 
         for (component, key) in [
             ("dml", "occ_conflicts_total"),
@@ -549,6 +565,10 @@ mod tests {
             ("maintenance", "cron_long_running_total"),
             ("parquet", "metadata_cache_hits"),
             ("parquet", "bytes_read"),
+            ("scan", "provider_build_us_avg"),
+            ("scan", "provider_scan_us_avg"),
+            ("scan", "mem_plan_us_avg"),
+            ("scan", "hot_plan_us_avg"),
         ] {
             assert_has(&rows, component, key);
         }

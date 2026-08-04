@@ -178,6 +178,18 @@ pub struct ScanMetrics {
     /// sustained traffic flags either very frequent compaction or a
     /// pathological version-churn pattern worth investigating.
     pub provider_build_abandoned: std::sync::atomic::AtomicU64,
+    /// Planning-stage wall time. Totals pair with counts so
+    /// `timefusion_stats` can expose an average without a lock or histogram.
+    /// These deliberately stop before execution: they explain the gap between
+    /// `EXPLAIN` wall time and the physical operators' elapsed metrics.
+    pub provider_build_us_total: std::sync::atomic::AtomicU64,
+    pub provider_build_total: std::sync::atomic::AtomicU64,
+    pub provider_scan_us_total: std::sync::atomic::AtomicU64,
+    pub provider_scan_total: std::sync::atomic::AtomicU64,
+    pub mem_plan_us_total: std::sync::atomic::AtomicU64,
+    pub mem_plan_total: std::sync::atomic::AtomicU64,
+    pub hot_plan_us_total: std::sync::atomic::AtomicU64,
+    pub hot_plan_total: std::sync::atomic::AtomicU64,
     /// Latency histogram of the full `ProjectRoutingTable::scan` call in
     /// microseconds. Buckets are powers of two so reads at any duration land
     /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
@@ -8418,10 +8430,16 @@ impl Database {
             .vacuum()
             .with_retention_period(chrono::Duration::hours(retention_hours as i64))
             .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
-            // Full: also sweep files whose tombstones already left the
-            // checkpoint (pruned at deletedFileRetentionDuration) — Lite can
-            // no longer see those and they'd leak storage forever.
-            .with_mode(deltalake::operations::vacuum::VacuumMode::Full)
+            // Lite deletes only files named by retained Remove actions. Full
+            // also lists the table directory and classifies unknown parquet as
+            // orphaned. That classification is unsafe while any flush or
+            // maintenance writer is concurrent (including in this process):
+            // vacuum can list from an older cloned snapshot and delete files
+            // committed after that clone (prod 2026-08-04).
+            // Prefer a bounded storage leak over deleting active data. A future
+            // Full sweep needs a distributed maintenance lease plus a refreshed
+            // snapshot immediately before deletion.
+            .with_mode(deltalake::operations::vacuum::VacuumMode::Lite)
             .await
         {
             Ok((_, metrics)) => {
@@ -10314,6 +10332,7 @@ impl ProjectRoutingTable {
         // cache exists to solve).
         let provider = cell
             .get_or_try_init(|| async {
+                let started = std::time::Instant::now();
                 let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
                 // Build the delta-rs table provider with our session so its scan
                 // inherits `schema_force_view_types=false` (set in
@@ -10324,12 +10343,14 @@ impl ProjectRoutingTable {
                 // READ-ONLY scan, so it's safe (unlike DV write ops, which need row
                 // positions preserved). Reclaims row-group/page pruning that DV
                 // otherwise disables table-wide — the recent-window dashboard lever.
-                if let Some(ss) = session_state {
+                let result = if let Some(ss) = session_state {
                     table.table_provider().with_session(Arc::new(ss)).with_pushdown_with_deletion_vectors(true).await
                 } else {
                     table.table_provider().with_pushdown_with_deletion_vectors(true).await
-                }
-                .map_err(|e| DataFusionError::External(Box::new(e)))
+                };
+                self.database.scan_metrics.provider_build_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.database.scan_metrics.provider_build_us_total.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                result.map_err(|e| DataFusionError::External(Box::new(e)))
             })
             .await?
             .clone();
@@ -10368,7 +10389,11 @@ impl ProjectRoutingTable {
                 .collect::<Vec<_>>()
         });
 
-        let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await?;
+        let started = std::time::Instant::now();
+        let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await;
+        self.database.scan_metrics.provider_scan_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.database.scan_metrics.provider_scan_us_total.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let delta_plan = delta_plan?;
 
         // Determine target schema based on projection
         let target_schema = match projection {
@@ -11463,10 +11488,13 @@ impl TableProvider for ProjectRoutingTable {
         // its match-bearing sibling sits in another leg breaks keep-greatest,
         // so the mem leg gets no tree.
         let mem_tree = text_match_tree.as_ref().filter(|_| mutable.is_none());
+        let mem_plan_started = std::time::Instant::now();
         let mem_leg = layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, mem_tree).unwrap_or_else(|e| {
             warn!("Failed to query mem buffer: {}", e);
             Default::default()
         });
+        scan_metrics.mem_plan_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        scan_metrics.mem_plan_us_total.fetch_add(mem_plan_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         let mem_partitions = mem_leg.partitions;
 
         // Hot-tier third leg (P1) — see `HotTier::query_partitioned` for the
@@ -11493,6 +11521,7 @@ impl TableProvider for ProjectRoutingTable {
         // (the hot leg serves pre-dedup rows and relies on `DedupExec`).
         let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters), layer.hot_tier_retention_micros());
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
+        let hot_plan_started = std::time::Instant::now();
         let hot: crate::hot_tier::HotLeg = match skip_delta || too_deep {
             true => Default::default(),
             false => {
@@ -11502,6 +11531,8 @@ impl TableProvider for ProjectRoutingTable {
                     .await
             }
         };
+        scan_metrics.hot_plan_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        scan_metrics.hot_plan_us_total.fetch_add(hot_plan_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         let (hot_partitions, hot_ranges, version_gate, hot_sorted, hot_bytes) = (hot.partitions, hot.ranges, hot.version_gate, hot.sorted, hot.bytes);
 
         // Nothing above Delta to union with: query Delta alone.
