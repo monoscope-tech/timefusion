@@ -7916,14 +7916,23 @@ impl Database {
         // vs completed, bins landed, brakes hit) must be readable from one log
         // line, not reconstructed from counter scrapes (2026-08-05 review:
         // brake-starved ticks were invisible until SSH + grep).
-        let snap = || [m.light_optimize_projects_planned.load(Relaxed), m.light_optimize_projects_completed.load(Relaxed), m.light_optimize_bins_committed.load(Relaxed), m.light_optimize_memory_brakes.load(Relaxed)];
+        let snap = || {
+            [
+                m.light_optimize_projects_planned.load(Relaxed),
+                m.light_optimize_projects_completed.load(Relaxed),
+                m.light_optimize_bins_committed.load(Relaxed),
+                m.light_optimize_memory_brakes.load(Relaxed),
+            ]
+        };
         let before = snap();
         let result = self.optimize_table_light(table, table_name).await;
         let [planned, completed, bins, brakes] = std::array::from_fn(|i| snap()[i] - before[i]);
         let elapsed = t0.elapsed();
         match result {
             Ok(()) if elapsed > OPTIMIZE_WARN => {
-                warn!("Light optimize for {label} took {elapsed:?} (exceeds {OPTIMIZE_WARN:?} threshold): planned={planned} completed={completed} bins={bins} brakes={brakes}");
+                warn!(
+                    "Light optimize for {label} took {elapsed:?} (exceeds {OPTIMIZE_WARN:?} threshold): planned={planned} completed={completed} bins={bins} brakes={brakes}"
+                );
                 m.light_optimize_timed_out.fetch_add(1, Relaxed);
             }
             Ok(()) => info!("Light optimize completed for {label} in {elapsed:?}: planned={planned} completed={completed} bins={bins} brakes={brakes}"),
