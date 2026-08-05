@@ -7908,20 +7908,28 @@ impl Database {
     /// One table's hot-tail compaction (bin-pack today's small files). The 180s
     /// deadline is a warning threshold, not a cancellation.
     async fn run_hot_compact_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
         const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         let t0 = std::time::Instant::now();
-        match self.optimize_table_light(table, table_name).await {
-            Ok(()) => {
-                if t0.elapsed() > OPTIMIZE_WARN {
-                    warn!("Light optimize for {label} took {:?} (exceeds {OPTIMIZE_WARN:?} warning threshold)", t0.elapsed());
-                    crate::metrics::maintenance_stats().light_optimize_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    info!("Light optimize completed for {label}");
-                }
+        let m = crate::metrics::maintenance_stats();
+        // Per-tick counter deltas in every outcome line — tick health (planned
+        // vs completed, bins landed, brakes hit) must be readable from one log
+        // line, not reconstructed from counter scrapes (2026-08-05 review:
+        // brake-starved ticks were invisible until SSH + grep).
+        let snap = || [m.light_optimize_projects_planned.load(Relaxed), m.light_optimize_projects_completed.load(Relaxed), m.light_optimize_bins_committed.load(Relaxed), m.light_optimize_memory_brakes.load(Relaxed)];
+        let before = snap();
+        let result = self.optimize_table_light(table, table_name).await;
+        let [planned, completed, bins, brakes] = std::array::from_fn(|i| snap()[i] - before[i]);
+        let elapsed = t0.elapsed();
+        match result {
+            Ok(()) if elapsed > OPTIMIZE_WARN => {
+                warn!("Light optimize for {label} took {elapsed:?} (exceeds {OPTIMIZE_WARN:?} threshold): planned={planned} completed={completed} bins={bins} brakes={brakes}");
+                m.light_optimize_timed_out.fetch_add(1, Relaxed);
             }
+            Ok(()) => info!("Light optimize completed for {label} in {elapsed:?}: planned={planned} completed={completed} bins={bins} brakes={brakes}"),
             Err(e) => {
-                crate::metrics::maintenance_stats().light_optimize_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                error!("Light optimize failed for {label}: {e}");
+                m.light_optimize_failed.fetch_add(1, Relaxed);
+                error!("Light optimize failed for {label} in {elapsed:?} (planned={planned} completed={completed} bins={bins} brakes={brakes}): {e}");
             }
         }
     }
