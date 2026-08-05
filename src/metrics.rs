@@ -517,6 +517,10 @@ atomic_stats! {
     dirty_bin_eligible,
     dirty_bin_processed,
     dirty_bin_requeued,
+    /// Queued bins consumed by the whole-date BATCH probe without per-bin
+    /// staging (every flushed bin is enqueued, so in prod ~97% of queued bins
+    /// carry no duplicates at all). Also counted in `dirty_bin_processed`.
+    dirty_bin_batch_probe_clean,
     dirty_bin_dropped_rows,
     dirty_bin_rewrite_duration_ms,
     /// Cold-owned dirty bins (date old enough that the nightly consolidate owns
@@ -534,6 +538,12 @@ atomic_stats! {
     /// 10-day backlog pinned the commit path and starved flush for a whole
     /// container life). Chronic nonzero = flush is unhealthy, not dedup.
     dedup_passes_flush_yields,
+    /// Per-bin STAGING attempts killed at the deadline and requeued. The
+    /// deadline exists so one hung object-store read can't wedge the drain
+    /// for hours behind the 1-permit maintenance semaphore (prod 2026-08-05:
+    /// 6.5h stall, skips=77). Repeated hits are the same bin retrying —
+    /// an oversized bin that can't finish inside the deadline, not noise.
+    dedup_bin_stage_timeouts,
     /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
     /// on a per-table commit lock a flush was already waiting for — the flush
     /// starvation of prod 2026-07-30, where durability waited >600s behind

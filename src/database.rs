@@ -1194,6 +1194,7 @@ fn is_transient_s3_err(msg: &str) -> bool {
 /// FILES hold the duplicate window's rows so it can commit exact Remove+Add
 /// actions instead of a predicate-evaluated replace_where.
 const DEDUP_FILE_COL: &str = "__tf_dedup_file";
+const DEDUP_SCAN_NAME: &str = "__dedup_src";
 
 /// Order-insensitive fingerprint of a partition's live file set (read-side
 /// dedup skip): sorted-uris hash, so any add/remove/rewrite changes it.
@@ -6555,38 +6556,25 @@ impl Database {
         Ok((dropped, complete && result.failed.is_empty()))
     }
 
-    /// Probe one partition/bin for duplicates and STAGE (never commit) a
-    /// replacement parquet set per duplicate-bearing chunk. Returns the staged
-    /// units plus `complete` — false when duplicate-bearing work was skipped
-    /// (unsealed chunks, budget guards, vanished snapshot rows), which forbids
-    /// certifying the partition clean.
-    async fn stage_dedup_partition_range(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>, key: Option<DirtyBinKey>,
-    ) -> Result<(Vec<StagedBin>, bool)> {
-        use deltalake::delta_datafusion::FileSelection;
-
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        if schema.dedup_keys.is_empty() {
-            return Ok((Vec::new(), true));
-        }
-        let date_str = date.to_string();
-
-        // Bypass ProjectRoutingTable: its MemBuffer union would feed in-flight
-        // rows to dedup, then `replace_where` would write them to Delta —
-        // double-writing on the next real flush.
-        use deltalake::delta_datafusion::TableProviderBuilder;
+    /// Probe-only DataFusion ctx over ONE (project, date) partition's snapshot
+    /// files, registered as [`DEDUP_SCAN_NAME`]. Bypasses ProjectRoutingTable:
+    /// its MemBuffer union would feed in-flight rows to dedup, which would then
+    /// be written to Delta — double-writing on the next real flush.
+    ///
+    /// Restricts provider construction itself, not merely the SQL scan. An
+    /// unrestricted provider eagerly materializes statistics for every live
+    /// file in the unified table before partition pruning; at production
+    /// scale one 10-minute bin therefore planned ~34k files and retained
+    /// hundreds of MB of allocator churn. Paths come from this exact eager
+    /// snapshot, so the selection cannot omit a file belonging to the
+    /// project/date being certified.
+    async fn dedup_probe_ctx(&self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, date_str: &str) -> Result<datafusion::prelude::SessionContext> {
+        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
         let (snapshot, log_store) = {
             let table = table_ref.read().await;
             (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
         };
-        // Restrict provider construction itself, not merely the SQL scan. An
-        // unrestricted provider eagerly materializes statistics for every live
-        // file in the unified table before partition pruning; at production
-        // scale one 10-minute bin therefore planned ~34k files and retained
-        // hundreds of MB of allocator churn. Paths come from this exact eager
-        // snapshot, so the selection cannot omit a file belonging to the
-        // project/date being certified.
-        let partition_files = dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, &date_str);
+        let partition_files = dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
         // Probe-only provider (chunk detection). The rewrite builds its own
         // provider per attempt — from a FRESH snapshot, with the synthetic
         // source-file column — in `dedup_rewrite_chunk`.
@@ -6598,15 +6586,80 @@ impl Database {
             .await
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
         // A fresh state is intentional: SessionState clones retain mutable
-        // catalog/execution internals and can resolve `__dedup_src` to an older
-        // eager snapshot. FileSelection below removes the expensive all-table
+        // catalog/execution internals and can resolve the scan name to an older
+        // eager snapshot. FileSelection above removes the expensive all-table
         // statistics replay that made fresh states harmful in production.
         let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
             self.config.memory.timefusion_query_partitions,
             self.maintenance_runtime_env(),
         ));
-        let scan_name = "__dedup_src";
-        ctx.register_table(scan_name, Arc::new(provider))?;
+        ctx.register_table(DEDUP_SCAN_NAME, Arc::new(provider))?;
+        Ok(ctx)
+    }
+
+    /// The 10-minute duplicate probe: returns the bucket starts whose
+    /// dedup-key groups have count > 1 under `filter`. Aggregates group keys
+    /// only — bounded by key cardinality, not row width (a `SELECT *` +
+    /// collect() of a whole day partition transiently allocated tens of GB
+    /// outside any memory pool — prod's 2026-06-11 OOM crash loop).
+    async fn dup_bin_starts(ctx: &datafusion::prelude::SessionContext, filter: &str, keys_csv: &str) -> Result<Vec<chrono::NaiveDateTime>> {
+        let probe = format!(
+            "SELECT CAST(date_bin(INTERVAL '10 minutes', \"timestamp\", TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
+             (SELECT \"timestamp\", count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {filter} GROUP BY {keys_csv}) AS g \
+             WHERE c > 1 GROUP BY 1 ORDER BY 1"
+        );
+        let mut starts = Vec::new();
+        for batch in ctx.sql(&probe).await?.collect().await? {
+            let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+            let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
+            for i in 0..col.len() {
+                if col.is_null(i) {
+                    continue;
+                }
+                // CAST .. AS VARCHAR may append fractional seconds or a
+                // timezone suffix; the leading 19 chars are the datetime.
+                if let Some(start) = col.value(i).get(..19).and_then(|h19| {
+                    chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%dT%H:%M:%S")
+                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%d %H:%M:%S"))
+                        .ok()
+                }) {
+                    starts.push(start);
+                }
+            }
+        }
+        Ok(starts)
+    }
+
+    /// BATCH probe (2026-08-05): classify EVERY 10-minute bin of one
+    /// (project, date) with a single duplicate probe, returning the bin ids
+    /// that contain duplicates. A dup group shares one exact `timestamp` (it
+    /// is a dedup key), so the group's bin is derived exactly — only valid
+    /// when `timestamp` is a dedup key.
+    async fn probe_dup_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str) -> Result<std::collections::HashSet<i64>> {
+        const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str).await?;
+        let safe_pid = project_id.replace('\'', "''");
+        let filter = format!("project_id = '{safe_pid}' AND date = DATE '{date_str}'");
+        let keys_csv = schema.dedup_keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ");
+        Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / BIN_MICROS).collect())
+    }
+
+    /// Probe one partition/bin for duplicates and STAGE (never commit) a
+    /// replacement parquet set per duplicate-bearing chunk. Returns the staged
+    /// units plus `complete` — false when duplicate-bearing work was skipped
+    /// (unsealed chunks, budget guards, vanished snapshot rows), which forbids
+    /// certifying the partition clean.
+    async fn stage_dedup_partition_range(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>, key: Option<DirtyBinKey>,
+    ) -> Result<(Vec<StagedBin>, bool)> {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        if schema.dedup_keys.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let date_str = date.to_string();
+        let ctx = self.dedup_probe_ctx(table_ref, project_id, &date_str).await?;
+        let scan_name = DEDUP_SCAN_NAME;
         // project_id is currently always a UUID/controlled identifier, but defend in depth: escape single quotes
         // so a future caller can't inject SQL through the partition predicate. date_str comes from NaiveDate::to_string
         // and is already safe.
@@ -6652,21 +6705,7 @@ impl Database {
             // >2.1GB of string data — past Arrow's i32 offset limit ("Offset
             // overflow error: 2222394106" in prod) and tens of GB materialized.
             // 10 minutes matches the flush-bucket granularity.
-            let probe = format!(
-                "SELECT CAST(date_bin(INTERVAL '10 minutes', \"timestamp\", TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
-                 (SELECT \"timestamp\", count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS g \
-                 WHERE c > 1 GROUP BY 1 ORDER BY 1"
-            );
-            let mut hours = Vec::new();
-            for batch in ctx.sql(&probe).await?.collect().await? {
-                let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
-                let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
-                for i in 0..col.len() {
-                    if !col.is_null(i) {
-                        hours.push(col.value(i).to_string());
-                    }
-                }
-            }
+            //
             // Rewriting an hour that late data may still flush into races
             // replace_where against the append (the stale materialized chunk
             // would win and drop the fresh rows — same race the old
@@ -6675,15 +6714,10 @@ impl Database {
             // rewritten; newer dupes clear on a later sweep.
             let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
             let mut skipped_unsealed = 0usize;
-            let built: Vec<_> = hours
+            let built: Vec<_> = Self::dup_bin_starts(&ctx, &filter, &keys_csv)
+                .await?
                 .into_iter()
-                .filter_map(|h| {
-                    // CAST .. AS VARCHAR may append fractional seconds or a
-                    // timezone suffix; the leading 19 chars are the datetime.
-                    let h19 = h.get(..19)?;
-                    let start = chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%dT%H:%M:%S")
-                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%d %H:%M:%S"))
-                        .ok()?;
+                .filter_map(|start| {
                     let end = start + chrono::Duration::minutes(10);
                     if end > sealed_before {
                         debug!("dedup: skipping unsealed chunk starting {start} (cleared on a later sweep)");
@@ -7533,7 +7567,9 @@ impl Database {
         (ready, deferred)
     }
 
-    async fn dedup_dirty_bins_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, flush_healthy: &(dyn Fn() -> bool + Sync)) -> Result<()> {
+    async fn dedup_dirty_bins_for_table(
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, flush_healthy: &(dyn Fn() -> bool + Sync), stage_deadline: std::time::Duration,
+    ) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
             return Ok(());
@@ -7551,9 +7587,9 @@ impl Database {
         // enqueue rate (prod backlog 3341, 2026-07-20); 128 drains a 22k
         // outage backlog in ~a day at half-batch cold reserve.
         const DIRTY_BIN_DRAIN_BATCH: usize = 128;
-        // Per-shard byte budgets in `stage_dedup_chunk` bound Arrow materialization.
-        // Do not time out the whole bin: cancelling it discards all staged work and
-        // retries the same oversized bin forever.
+        // Per-shard byte budgets in `stage_dedup_chunk` bound Arrow
+        // materialization; `stage_deadline` bounds each bin's WALL CLOCK (see
+        // the call site in `run_dedup_for_table`).
         let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
         // Today's SEALED bins are eligible. The old whole-partition
         // replace_where path had to skip today because it repeatedly planned
@@ -7597,6 +7633,22 @@ impl Database {
         if ready.is_empty() {
             return Ok(());
         }
+        // Phase 3 (2026-08-05): BATCH the probes. Every flushed bin is
+        // enqueued, so most queued bins carry no duplicates at all (~97% in
+        // prod: 601 probed clean vs 18 rewritten) — yet each paid its own
+        // partition-restricted probe scan. One whole-date probe classifies
+        // every queued bin of a (project, date) at once; only dup-bearing
+        // bins continue into per-bin staging. Probe failure or timeout fails
+        // OPEN to the per-bin path.
+        let ready = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
+            self.batch_probe_classify(table, table_name, ready, stage_deadline).await
+        } else {
+            ready
+        };
+        if ready.is_empty() {
+            self.persist_dirty_bins();
+            return Ok(());
+        }
         // Phase 2 (2026-07-29): bins STAGE in parallel and commit in WAVES.
         // Previously each bin rewrote and committed strictly one at a time —
         // serialization was deliberate, because concurrent per-bin commits to
@@ -7628,7 +7680,23 @@ impl Database {
             info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
             let started = std::time::Instant::now();
             let staged = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
-                Ok(parsed) => self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())).await,
+                // Timing out a bin discards its staged work (any uploaded
+                // parquet is uncommitted and falls to VACUUM) and retries it
+                // next pass — acceptable now that per-shard byte budgets keep
+                // legitimate bins to minutes, after an UNBOUNDED staging read
+                // wedged the whole drain for 6.5h behind the 1-permit
+                // maintenance semaphore (prod 2026-08-05). The Err lands in
+                // the ordinary failure arm below: requeue + warn.
+                Ok(parsed) => {
+                    match tokio::time::timeout(stage_deadline, self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone()))).await
+                    {
+                        Ok(staged) => staged,
+                        Err(_) => {
+                            crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Err(anyhow::anyhow!("staging exceeded the {stage_deadline:?} per-bin deadline (hung object-store read?)"))
+                        }
+                    }
+                }
                 Err(e) => Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}")),
             };
             (key, started.elapsed(), staged)
@@ -7684,6 +7752,47 @@ impl Database {
         }
         self.persist_dirty_bins();
         Ok(())
+    }
+
+    /// Runs the batch probe over each (project, date) with ≥2 queued bins and
+    /// strips the probe-clean bins out of `ready`, consuming them. Group keys
+    /// are dequeued BEFORE the probe so dirtiness enqueued while it runs
+    /// re-queues the bin (the same ordering the per-bin path relies on). A
+    /// singleton keeps the per-bin path — its bin-scoped probe prunes to ten
+    /// minutes of files where the whole-date probe scans them all.
+    async fn batch_probe_classify(
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, deadline: std::time::Duration,
+    ) -> Vec<(String, String, i64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut groups: std::collections::HashMap<(&str, &str), Vec<i64>> = Default::default();
+        for (project, date, bin) in &ready {
+            groups.entry((project, date)).or_default().push(*bin);
+        }
+        let mut clean: std::collections::HashSet<(String, String, i64)> = Default::default();
+        for ((project, date), bins) in groups {
+            if bins.len() < 2 || chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+                continue;
+            }
+            for bin in &bins {
+                self.dedup_dirty_bins.remove(&(project.to_string(), table_name.to_string(), date.to_string(), *bin));
+            }
+            match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, project, date)).await {
+                Ok(Ok(dup_bins)) => {
+                    let stats = crate::metrics::maintenance_stats();
+                    let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).collect();
+                    stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
+                    stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
+                    info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
+                    clean.extend(cleared.into_iter().map(|b| (project.to_string(), date.to_string(), *b)));
+                }
+                Ok(Err(error)) => warn!(project, table_name, date, %error, event = "dedup_batch_probe_failure"),
+                Err(_) => {
+                    crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
+                    warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
+                }
+            }
+        }
+        ready.into_iter().filter(|b| !clean.contains(b)).collect()
     }
 
     /// Wave-commit gate: a pass can outlive its start-of-pass health check (a
@@ -7757,7 +7866,12 @@ impl Database {
         }
         const DEDUP_WARN: std::time::Duration = std::time::Duration::from_secs(90);
         let t0 = std::time::Instant::now();
-        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy()).await {
+        // Deadline per bin STAGING attempt, not per pass — generous enough
+        // that only a pathological hang trips it (typical bins stage in
+        // seconds; sharded oversized bins in minutes, including rewrite-sem
+        // waits shared with light-optimize).
+        const DEDUP_BIN_STAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
+        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
                 warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
                 crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -15437,19 +15551,19 @@ mod tests {
             dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), &project, &old_date)
         };
         assert_eq!(selected.len(), 2, "snapshot selection must retain both duplicate-bearing files: {selected:?}");
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 2, "sealed bin is deduplicated without dropping an adjacent-bin row from the same file");
         assert!(db.dedup_dirty_bins.is_empty(), "completed sealed bin is consumed");
 
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "later", old)?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "late retry requeues the previously consumed bin");
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 2, "later observed timestamp survives the requeue rewrite and the neighbour remains");
 
         let fresh = Utc::now().timestamp_micros();
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "a", fresh)?], true, None).await?;
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "b", fresh)?], true, None).await?;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "unsealed bin remains queued without rewrite");
         assert_eq!(delta_physical_row_count(&table).await?, 4, "unsealed copies remain for read-side dedup");
         Ok(())
@@ -15475,10 +15589,71 @@ mod tests {
         // Healthy at pass start, unhealthy for exactly one mid-pass sample.
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let flaky = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &flaky).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &flaky, std::time::Duration::MAX).await?;
         assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2, "the unhealthy sample must have been consumed");
         assert_eq!(delta_physical_row_count(&table).await?, 1, "a transient unhealthy flush sample must not forfeit the staged dedup work");
         assert!(db.dedup_dirty_bins.is_empty(), "bin is consumed, not requeued");
+        Ok(())
+    }
+
+    /// One whole-date probe classifies every queued bin of a (project, date):
+    /// probe-clean bins are consumed WITHOUT per-bin staging scans (every
+    /// flushed bin is enqueued, so in prod ~97% of queued bins carry no
+    /// duplicates), and dup-bearing bins still dedup through the per-bin path.
+    #[tokio::test]
+    async fn dirty_dedup_batch_probe_consumes_clean_bins() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-batchprobe-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        // Noon of the day 26h ago: ±20 min can never cross a date boundary,
+        // and the bins are sealed far beyond the 2h lag.
+        let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
+        let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        const TEN_MIN: i64 = 10 * 60 * 1_000_000;
+        let row = |id: &str, observed: &str, ts: i64| json_to_batch(vec![test_span_ts(id, observed, &project, ts)]);
+        // Three bins on one date: one duplicate pair, two clean singles.
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("dup", "first", base)?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("dup", "second", base)?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean1", "only", base - TEN_MIN)?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean2", "only", base - 2 * TEN_MIN)?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 3);
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(crate::metrics::maintenance_stats().dirty_bin_batch_probe_clean.load(Relaxed), 2, "both clean bins are consumed by the batch probe alone");
+        assert!(db.dedup_dirty_bins.is_empty(), "clean and dup bins are all consumed");
+        assert_eq!(delta_physical_row_count(&table).await?, 3, "the duplicate collapsed; clean rows untouched");
+        Ok(())
+    }
+
+    /// A hung staging read must not wedge the drain: the per-bin deadline
+    /// converts the hang into an ordinary requeue and the pass moves on
+    /// (prod 2026-08-05: one unbounded read held the 1-permit maintenance
+    /// semaphore for 6.5h while the cron logged skips=77).
+    #[tokio::test]
+    async fn dirty_dedup_bin_staging_deadline_requeues_instead_of_wedging() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-deadline-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
+        let row = |observed: &str| json_to_batch(vec![test_span_ts("sealed", observed, &project, old)]);
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1);
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+
+        // A 1ms deadline fires before any real staging read can complete —
+        // standing in for the hung GET.
+        use std::sync::atomic::Ordering::Relaxed;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_millis(1)).await?;
+        assert!(crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.load(Relaxed) >= 1, "the per-bin deadline must fire");
+        assert_eq!(db.dedup_dirty_bins.len(), 1, "the timed-out bin is requeued, not lost");
+        assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
+
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        assert_eq!(delta_physical_row_count(&table).await?, 1, "the requeued bin dedups under a sane deadline");
+        assert!(db.dedup_dirty_bins.is_empty());
         Ok(())
     }
 
@@ -15556,7 +15731,7 @@ mod tests {
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
         // Batch of 1 with a cold-only queue still serves it (lowest priority ≠
         // never), so the drain deduplicates rather than abandoning the rows.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
         assert_eq!(
             crate::metrics::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
             deferred_before,
@@ -15584,7 +15759,7 @@ mod tests {
 
         let yields_before = crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false, std::time::Duration::MAX).await?;
         assert_eq!(
             crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
             yields_before + 1,
@@ -15594,7 +15769,7 @@ mod tests {
         assert_eq!(delta_physical_row_count(&table).await?, 2, "no rewrite happened; read-side dedup keeps results correct");
 
         // Healthy again ⇒ the same bin drains normally.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1);
         Ok(())
     }
