@@ -6635,7 +6635,9 @@ impl Database {
     /// that contain duplicates. A dup group shares one exact `timestamp` (it
     /// is a dedup key), so the group's bin is derived exactly — only valid
     /// when `timestamp` is a dedup key.
-    async fn probe_dup_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str) -> Result<std::collections::HashSet<i64>> {
+    async fn probe_dup_bins(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str,
+    ) -> Result<std::collections::HashSet<i64>> {
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str).await?;
@@ -7640,11 +7642,8 @@ impl Database {
         // every queued bin of a (project, date) at once; only dup-bearing
         // bins continue into per-bin staging. Probe failure or timeout fails
         // OPEN to the per-bin path.
-        let ready = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
-            self.batch_probe_classify(table, table_name, ready, stage_deadline).await
-        } else {
-            ready
-        };
+        let ready =
+            if schema.dedup_keys.iter().any(|k| k == "timestamp") { self.batch_probe_classify(table, table_name, ready, stage_deadline).await } else { ready };
         if ready.is_empty() {
             self.persist_dirty_bins();
             return Ok(());
@@ -7688,7 +7687,11 @@ impl Database {
                 // maintenance semaphore (prod 2026-08-05). The Err lands in
                 // the ordinary failure arm below: requeue + warn.
                 Ok(parsed) => {
-                    match tokio::time::timeout(stage_deadline, self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone()))).await
+                    match tokio::time::timeout(
+                        stage_deadline,
+                        self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())),
+                    )
+                    .await
                     {
                         Ok(staged) => staged,
                         Err(_) => {
