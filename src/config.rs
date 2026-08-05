@@ -183,7 +183,13 @@ fn profile_from_env() -> BudgetProfile {
     }
 }
 
-const QUERY_POOL_FRACTION: f64 = 0.25;
+// 0.20 (24 GiB prod), down from 0.25: sampled pool usage sat at 0 while the
+// 70% memory brake — only ~2 GiB above the committed total — chronically
+// halted light-compaction waves (prod 2026-08-05: brake fired mid-tick with
+// 9 of 9 hot metrics projects still pending). The freed 6 GiB is brake
+// headroom; a query past its pool spills (one slower scan), while a stopped
+// hot-tail compaction backlogs the whole table.
+const QUERY_POOL_FRACTION: f64 = 0.20;
 /// Share of the limit reserved for consumers no pool tracks — parquet decode
 /// heap, pgwire parse ASTs, allocator overhead (measured ~10-20 GiB on prod,
 /// 2026-08-03). Carved out before maintenance takes the remainder so the
@@ -281,8 +287,8 @@ impl DerivedBudget {
         // Fixed fraction, not the old TIMEFUSION_MEMORY_FRACTION knob: prod set
         // 0.75 calibrated against the hand-set 26 GB limit; applied to the real
         // 120 GiB cgroup it would take 90 GiB and crush maintenance to the
-        // floor (K=1) — the drift-class bug this tree exists to kill. 0.25 of
-        // the real limit (30 GiB prod) is ~1.5x the old effective pool.
+        // floor (K=1) — the drift-class bug this tree exists to kill. 0.20 of
+        // the real limit (24 GiB prod) is ~1.25x the old effective pool.
         let query_pool_bytes = (memory_limit_bytes as f64 * QUERY_POOL_FRACTION) as usize;
         let ingest_buffer_bytes = (memory_limit_bytes as f64 * INGEST_BUFFER_FRACTION) as usize;
         let foyer_memory_bytes = (memory_limit_bytes as f64 * FOYER_MEMORY_FRACTION) as usize;
@@ -2178,13 +2184,13 @@ mod tests {
         // The old total==limit invariant was the 70-kills-in-3-days bug: every
         // subsystem at its cap was "legal" and the sum was the OOM.
         assert_eq!(total, 120 * GIB - (120.0 * GIB as f64 * 0.15) as usize, "tracked consumers + 15% untracked slack == the limit");
-        assert_eq!(b.query_pool_bytes, 30 * GIB);
+        assert_eq!(b.query_pool_bytes, 24 * GIB);
         assert_eq!(b.ingest_buffer_bytes, 24 * GIB);
         assert_eq!(b.foyer_memory_bytes, 12 * GIB);
-        // 24 GiB since 2026-08-03 evening: each rewrite permit adds 3 GiB of
-        // writer reserve, which comes out of the maintenance remainder (30G at
-        // permits=2, 27G at 3, 48G with slack=0).
-        assert_eq!(b.maintenance_pool_bytes, 24 * GIB, "maintenance takes the remainder AFTER slack");
+        // 120 - (24 query + 24 buffer + 12 foyer + 12 writer reserve + 18 slack).
+        // Was 24 GiB at query=30; the 2026-08-05 brake-headroom cut hands the
+        // freed 6 GiB to the maintenance remainder.
+        assert_eq!(b.maintenance_pool_bytes, 30 * GIB, "maintenance takes the remainder AFTER slack");
     }
 
     /// `TIMEFUSION_MEMORY_BUDGET_GB` exists so a shared host can size TF below
@@ -2196,7 +2202,7 @@ mod tests {
     fn memory_budget_override_scales_whole_tree_and_only_lowers() {
         let full = DerivedBudget::from_limits(120 * GIB, 48);
         let capped = DerivedBudget::from_limits(80 * GIB, 48);
-        assert_eq!(capped.query_pool_bytes, 20 * GIB);
+        assert_eq!(capped.query_pool_bytes, 16 * GIB);
         assert_eq!(capped.ingest_buffer_bytes, 16 * GIB);
         assert_eq!(capped.foyer_memory_bytes, 8 * GIB);
         assert!(capped.maintenance_pool_bytes < full.maintenance_pool_bytes, "maintenance shrinks with the rest, not at its expense");
