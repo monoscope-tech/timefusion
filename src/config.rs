@@ -802,13 +802,19 @@ const_default!(d_cold_optimize_after_days: u64 = 1);
 const_default!(d_stats_cache_size: usize = 50);
 // Observability data is high-churn and rarely time-traveled; the only hard
 // floor is that retention must outlive any in-flight query (which holds a Delta
-// snapshot referencing files vacuum would delete). With no query running beyond
-// ~1h, 24h is still a 24x safety margin. This value also drives
+// snapshot referencing files vacuum would delete). This value also drives
 // `delta.deletedFileRetentionDuration` (set at create + reconciled at load):
 // Remove tombstones stay in every checkpoint for this long, and prod's 5-min
 // compaction churn at the 7-day delta default accumulated 38.5k tombstones
 // (93% of checkpoint actions) replayed on every snapshot refresh.
-const_default!(d_vacuum_retention: u64 = 24);
+//
+// 72h, not 24h: removed-but-unvacuumed files are the ONLY recovery source
+// after a bad rewrite, and the default is what a deploy-wiped env falls back
+// to. 2026-08-05: the 00:15 vacuum fired inside exactly that window (env
+// wiped by an auto-deploy, replacement task blocked on the WAL lock) and
+// permanently destroyed ~7.3M rows' recovery source at 24h retention. A
+// 3-day floor keeps one bad daytime incident recoverable across a weekend.
+const_default!(d_vacuum_retention: u64 = 72);
 // Delta _delta_log (transaction-log) retention. Keeps the log directory small
 // (~commit-rate × retention files) so every commit's version-discovery LIST stays
 // cheap. Delta's default is 30 DAYS — which let the log grow to 68k objects and
