@@ -313,10 +313,12 @@ impl StatsTableProvider {
             "dirty_bin_eligible_total" => m.dirty_bin_eligible,
             "dirty_bin_processed_total" => m.dirty_bin_processed,
             "dirty_bin_requeued_total" => m.dirty_bin_requeued,
+            "dirty_bin_batch_probe_clean_total" => m.dirty_bin_batch_probe_clean,
             "dirty_bin_dropped_rows_total" => m.dirty_bin_dropped_rows,
             "dirty_bin_rewrite_duration_ms_total" => m.dirty_bin_rewrite_duration_ms,
             "dedup_bins_deferred_cold_total" => m.dedup_bins_deferred_cold,
             "dedup_passes_flush_yields_total" => m.dedup_passes_flush_yields,
+            "dedup_bin_stage_timeouts_total" => m.dedup_bin_stage_timeouts,
             "wave_commits_yielded_to_flush_total" => m.wave_commits_yielded_to_flush,
             // Runs exceeding the long-running warning threshold. Slow progress
             // is allowed; sustained nonzero with no completion = wedged.

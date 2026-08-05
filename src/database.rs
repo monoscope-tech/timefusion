@@ -7586,9 +7586,13 @@ impl Database {
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
         // Eligible bins drained per table per tick. 8 couldn't keep up with the
-        // enqueue rate (prod backlog 3341, 2026-07-20); 128 drains a 22k
-        // outage backlog in ~a day at half-batch cold reserve.
-        const DIRTY_BIN_DRAIN_BATCH: usize = 128;
+        // enqueue rate (prod backlog 3341, 2026-07-20); 128 was sized for the
+        // per-bin-probe cost model and drained a 22k backlog in ~a day. With
+        // the batch probe, per-pass cost is ~one probe per (project, date)
+        // GROUP plus staging for the dup-bearing minority (~3%), so a large
+        // batch classifies a whole backlog in a handful of cheap probes — a
+        // 25k queue spans only ~140 groups (2026-08-05).
+        const DIRTY_BIN_DRAIN_BATCH: usize = 1024;
         // Per-shard byte budgets in `stage_dedup_chunk` bound Arrow
         // materialization; `stage_deadline` bounds each bin's WALL CLOCK (see
         // the call site in `run_dedup_for_table`).
