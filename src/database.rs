@@ -7640,21 +7640,14 @@ impl Database {
             self.dedup_dirty_bins.insert(key, ());
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
-        // Between-chunk gate: a pass can outlive its start-of-pass health check
-        // (a full drain batch is minutes of rewrites). Once flush falls behind,
-        // stop COMMITTING and put every remaining bin back — the stream is not
-        // dropped, because an in-flight staging future has already removed its
-        // key from the queue and cancelling it would lose the bin.
-        let mut yielded_to_flush = false;
+        // Once the wave gate gives up on flush recovery, stop committing but
+        // KEEP DRAINING the stream — an in-flight staging future has already
+        // removed its key from the queue and dropping it would lose the bin.
+        let mut committing = true;
         while let Some((key, elapsed, staged)) = staging.next().await {
             let stats = crate::metrics::maintenance_stats();
             let (project_id, _, date, bin) = key.clone();
-            if !yielded_to_flush && !flush_healthy() {
-                yielded_to_flush = true;
-                stats.dedup_passes_flush_yields.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                info!(table_name, event = "dedup_drain_flush_yield");
-            }
-            if yielded_to_flush {
+            if !committing {
                 requeue(key, &stats.dirty_bin_requeued);
                 continue;
             }
@@ -7683,21 +7676,44 @@ impl Database {
                 }
             }
             if wave.len() >= DEDUP_WAVE_UNITS {
-                self.commit_dedup_wave(table, table_name, std::mem::take(&mut wave)).await;
+                committing = self.commit_dedup_wave_when_flush_healthy(table, table_name, &mut wave, flush_healthy, &requeue).await;
             }
         }
         if !wave.is_empty() {
-            if yielded_to_flush {
-                let stats = crate::metrics::maintenance_stats();
-                for key in wave.iter().filter_map(|unit| unit.dedup.as_ref().and_then(|d| d.key.clone())) {
-                    requeue(key, &stats.dirty_bin_requeued);
-                }
-            } else {
-                self.commit_dedup_wave(table, table_name, wave).await;
-            }
+            self.commit_dedup_wave_when_flush_healthy(table, table_name, &mut wave, flush_healthy, &requeue).await;
         }
         self.persist_dirty_bins();
         Ok(())
+    }
+
+    /// Wave-commit gate: a pass can outlive its start-of-pass health check (a
+    /// full drain batch is minutes of rewrites), and dedup must not compete
+    /// with persistence for the commit lock — but ONE transient unhealthy
+    /// sample must not forfeit the batch either. Latching used to requeue
+    /// every remaining bin after a single bad sample, silently discarding an
+    /// entire 128-bin pass at boot (~75 min of staging, prod 2026-08-05).
+    /// Waits (bounded) for flush to recover; if it doesn't, requeues this
+    /// wave and returns false so the pass stops committing.
+    async fn commit_dedup_wave_when_flush_healthy(
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, wave: &mut Vec<StagedBin>, flush_healthy: &(dyn Fn() -> bool + Sync),
+        requeue: &(dyn Fn(DirtyBinKey, &std::sync::atomic::AtomicU64) + Sync),
+    ) -> bool {
+        const FLUSH_RECOVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        let t0 = std::time::Instant::now();
+        while !flush_healthy() {
+            if t0.elapsed() >= FLUSH_RECOVERY_WAIT {
+                let stats = crate::metrics::maintenance_stats();
+                stats.dedup_passes_flush_yields.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(table_name, requeued = wave.len(), event = "dedup_drain_flush_yield");
+                for key in wave.drain(..).filter_map(|unit| unit.dedup.as_ref().and_then(|d| d.key.clone())) {
+                    requeue(key, &stats.dirty_bin_requeued);
+                }
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        self.commit_dedup_wave(table, table_name, std::mem::take(wave)).await;
+        true
     }
 
     /// Commit one dedup wave and settle its units' dirty-bin bookkeeping: a unit
@@ -15436,6 +15452,33 @@ mod tests {
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "unsealed bin remains queued without rewrite");
         assert_eq!(delta_physical_row_count(&table).await?, 4, "unsealed copies remain for read-side dedup");
+        Ok(())
+    }
+
+    /// One transient flush-unhealthy sample mid-pass must not discard the
+    /// batch's staged work. The old latch requeued every remaining bin after a
+    /// single bad sample — at boot that silently forfeited an entire 128-bin
+    /// pass (~75 min of staging, prod 2026-08-05). A wave whose commit finds
+    /// flush unhealthy waits for recovery instead.
+    #[tokio::test]
+    async fn dirty_dedup_drain_survives_transient_flush_unhealthy() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-transient-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
+        let row = |id: &str, observed: &str| json_to_batch(vec![test_span_ts(id, observed, &project, old)]);
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "first")?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second")?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1);
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+
+        // Healthy at pass start, unhealthy for exactly one mid-pass sample.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let flaky = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &flaky).await?;
+        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2, "the unhealthy sample must have been consumed");
+        assert_eq!(delta_physical_row_count(&table).await?, 1, "a transient unhealthy flush sample must not forfeit the staged dedup work");
+        assert!(db.dedup_dirty_bins.is_empty(), "bin is consumed, not requeued");
         Ok(())
     }
 
