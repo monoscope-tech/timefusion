@@ -7667,6 +7667,10 @@ impl Database {
         // Short passes keep whatever leaks pass-scoped — it frees at pass
         // end. Overflow goes straight back on the queue for the next tick.
         const DIRTY_BIN_STAGE_BATCH: usize = 64;
+        // Stage recent dates first for the same reason the probes classify
+        // them first: a dup-bearing bin on today's partition taxes every
+        // live query until it's rewritten.
+        ready.sort_by(|(_, da, ba), (_, db, bb)| db.cmp(da).then(bb.cmp(ba)));
         if ready.len() > DIRTY_BIN_STAGE_BATCH {
             for (project, date, bin) in ready.split_off(DIRTY_BIN_STAGE_BATCH) {
                 self.dedup_dirty_bins.insert((project, table_name.to_string(), date, bin), ());
@@ -7809,7 +7813,11 @@ impl Database {
         let permits = self.config.derived.rewrite_permits().max(1);
         let mut groups: Vec<((String, String), Vec<i64>)> =
             groups.into_iter().filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()).collect();
-        groups.sort_by_key(|(_, bins)| std::cmp::Reverse(bins.len()));
+        // Recent dates first (queries hit them, and dup-bearing bins there
+        // force read-side DedupExec on every query — 2026-08-06: a 0.2% dup
+        // fraction cost 6297304f a 10x latency penalty); largest group as
+        // the tiebreak so each provider built still retires the most bins.
+        groups.sort_by(|((_, da), a), ((_, db), b)| db.cmp(da).then(b.len().cmp(&a.len())));
         groups.truncate(BATCH_PROBE_GROUPS);
         let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
             for bin in &bins {
