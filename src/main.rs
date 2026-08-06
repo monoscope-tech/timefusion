@@ -98,7 +98,22 @@ fn main() -> anyhow::Result<()> {
         Some("redrive-dml") => rt.block_on(run_redrive_dml_cli(cfg)),
         Some("optimize") => rt.block_on(run_optimize_cli(cfg)),
         Some("migrate-columns") => rt.block_on(run_migrate_columns_cli(cfg)),
-        _ => rt.block_on(async_main(cfg)),
+        _ => {
+            let result = rt.block_on(async_main(cfg));
+            // The server path must END THE PROCESS here: dropping the runtime
+            // waits on lingering blocking/detached threads, and twice on
+            // 2026-08-06 that hang left a post-"Shutdown complete." zombie
+            // container that blocked swarm from starting the replacement
+            // (pgwire outage until a manual `docker stop`). Everything durable
+            // is already on disk by now, so skip teardown and exit.
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("fatal: {e:#}");
+                    std::process::exit(1)
+                }
+            }
+        }
     }
 }
 
