@@ -7789,10 +7789,8 @@ impl Database {
         use futures::stream::StreamExt;
         let permits = self.config.derived.rewrite_permits().max(1);
         let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(
-            groups
-                .into_iter()
-                .filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
-                .map(|((project, date), bins)| async move {
+            groups.into_iter().filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()).map(
+                |((project, date), bins)| async move {
                     for bin in &bins {
                         self.dedup_dirty_bins.remove(&(project.to_string(), table_name.to_string(), date.to_string(), *bin));
                     }
@@ -7815,7 +7813,8 @@ impl Database {
                             Vec::new()
                         }
                     }
-                }),
+                },
+            ),
         )
         .buffer_unordered(permits)
         .collect::<Vec<_>>()
