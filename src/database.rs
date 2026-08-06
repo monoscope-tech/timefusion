@@ -7873,11 +7873,15 @@ impl Database {
         }
         const DEDUP_WARN: std::time::Duration = std::time::Duration::from_secs(90);
         let t0 = std::time::Instant::now();
-        // Deadline per bin STAGING attempt, not per pass — generous enough
-        // that only a pathological hang trips it (typical bins stage in
-        // seconds; sharded oversized bins in minutes, including rewrite-sem
-        // waits shared with light-optimize).
-        const DEDUP_BIN_STAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
+        // Deadline per bin STAGING attempt, not per pass. It must clear the
+        // WORST legitimate bin, not the typical one: a dup-bearing bin in a
+        // fragmented partition re-reads multi-bin files (~3.4M rows/chunk
+        // observed) and shares the rewrite sem with light-optimize's
+        // hour-long passes — at 900s, 36 such bins (6297304f/08-03,
+        // 2026-08-06) timed out on EVERY pass, an infinite requeue loop that
+        // dragged each pass by hours while the bins never finished. 3600s
+        // still bounds the hung-read wedge this exists for (was 6.5h).
+        const DEDUP_BIN_STAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
         match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
                 warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
