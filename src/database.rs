@@ -7811,34 +7811,30 @@ impl Database {
             groups.into_iter().filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()).collect();
         groups.sort_by_key(|(_, bins)| std::cmp::Reverse(bins.len()));
         groups.truncate(BATCH_PROBE_GROUPS);
-        let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(
-            groups.into_iter().map(
-                |((project, date), bins)| async move {
-                    for bin in &bins {
-                        self.dedup_dirty_bins.remove(&(project.clone(), table_name.to_string(), date.clone(), *bin));
-                    }
-                    match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, &project, &date)).await {
-                        Ok(Ok(dup_bins)) => {
-                            let stats = crate::metrics::maintenance_stats();
-                            let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
-                            stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
-                            stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
-                            info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
-                            cleared
-                        }
-                        Ok(Err(error)) => {
-                            warn!(project, table_name, date, %error, event = "dedup_batch_probe_failure");
-                            Vec::new()
-                        }
-                        Err(_) => {
-                            crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
-                            warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
-                            Vec::new()
-                        }
-                    }
-                },
-            ),
-        )
+        let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
+            for bin in &bins {
+                self.dedup_dirty_bins.remove(&(project.clone(), table_name.to_string(), date.clone(), *bin));
+            }
+            match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, &project, &date)).await {
+                Ok(Ok(dup_bins)) => {
+                    let stats = crate::metrics::maintenance_stats();
+                    let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
+                    stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
+                    stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
+                    info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
+                    cleared
+                }
+                Ok(Err(error)) => {
+                    warn!(project, table_name, date, %error, event = "dedup_batch_probe_failure");
+                    Vec::new()
+                }
+                Err(_) => {
+                    crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
+                    warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
+                    Vec::new()
+                }
+            }
+        }))
         .buffer_unordered(permits)
         .collect::<Vec<_>>()
         .await
