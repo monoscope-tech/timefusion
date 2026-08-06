@@ -7667,14 +7667,21 @@ impl Database {
         // Short passes keep whatever leaks pass-scoped — it frees at pass
         // end. Overflow goes straight back on the queue for the next tick.
         const DIRTY_BIN_STAGE_BATCH: usize = 64;
-        // Stage recent dates first for the same reason the probes classify
-        // them first: a dup-bearing bin on today's partition taxes every
-        // live query until it's rewritten.
+        // Recent dates get a small RESERVED quota — a dup-bearing bin on
+        // today's partition taxes every live query until it's rewritten — but
+        // must not monopolize the pass: hot-partition rewrites are the
+        // slowest (10-23 min each on 2026-08-06), and giving them all 64
+        // slots stalled the sealed backlog flat. The remaining slots go to
+        // the OLDEST bins so the backlog keeps draining.
+        const DIRTY_BIN_STAGE_RECENT_SLOTS: usize = 16;
         ready.sort_by(|(_, da, ba), (_, db, bb)| db.cmp(da).then(bb.cmp(ba)));
         if ready.len() > DIRTY_BIN_STAGE_BATCH {
-            for (project, date, bin) in ready.split_off(DIRTY_BIN_STAGE_BATCH) {
+            let mut rest = ready.split_off(DIRTY_BIN_STAGE_RECENT_SLOTS);
+            rest.reverse(); // oldest-first for the backlog share
+            for (project, date, bin) in rest.split_off(DIRTY_BIN_STAGE_BATCH - ready.len()) {
                 self.dedup_dirty_bins.insert((project, table_name.to_string(), date, bin), ());
             }
+            ready.extend(rest);
         }
         // Phase 2 (2026-07-29): bins STAGE in parallel and commit in WAVES.
         // Previously each bin rewrote and committed strictly one at a time —
