@@ -7591,8 +7591,14 @@ impl Database {
         // the batch probe, per-pass cost is ~one probe per (project, date)
         // GROUP plus staging for the dup-bearing minority (~3%), so a large
         // batch classifies a whole backlog in a handful of cheap probes — a
-        // 25k queue spans only ~140 groups (2026-08-05).
-        const DIRTY_BIN_DRAIN_BATCH: usize = 1024;
+        // 25k queue spans only ~140 groups (2026-08-05). Clean bins are
+        // consumed in the probe phase BEFORE the staging stream, so this cap
+        // directly limits how much of the backlog each (long) pass can
+        // retire — at 1024 a 20k backlog needed ~20 passes of 1-2h each.
+        // 16384 admits any realistic backlog whole; per-pass cost stays
+        // bounded by the GROUP count (probes) plus the dup-bearing minority
+        // (staging, wave-committed incrementally under the flush gate).
+        const DIRTY_BIN_DRAIN_BATCH: usize = 16384;
         // Per-shard byte budgets in `stage_dedup_chunk` bound Arrow
         // materialization; `stage_deadline` bounds each bin's WALL CLOCK (see
         // the call site in `run_dedup_for_table`).
@@ -7775,30 +7781,48 @@ impl Database {
         for (project, date, bin) in &ready {
             groups.entry((project, date)).or_default().push(*bin);
         }
-        let mut clean: std::collections::HashSet<(String, String, i64)> = Default::default();
-        for ((project, date), bins) in groups {
-            if bins.len() < 2 || chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
-                continue;
-            }
-            for bin in &bins {
-                self.dedup_dirty_bins.remove(&(project.to_string(), table_name.to_string(), date.to_string(), *bin));
-            }
-            match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, project, date)).await {
-                Ok(Ok(dup_bins)) => {
-                    let stats = crate::metrics::maintenance_stats();
-                    let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).collect();
-                    stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
-                    stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
-                    info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
-                    clean.extend(cleared.into_iter().map(|b| (project.to_string(), date.to_string(), *b)));
-                }
-                Ok(Err(error)) => warn!(project, table_name, date, %error, event = "dedup_batch_probe_failure"),
-                Err(_) => {
-                    crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
-                    warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
-                }
-            }
-        }
+        // Probes run CONCURRENTLY (they were sequential until 2026-08-06 —
+        // ~140 groups × seconds-to-a-minute each serialized the whole
+        // classification phase). Bounded by the rewrite permits like every
+        // other maintenance scan; probes are key-only aggregates, not row
+        // materializations, so the memory cost per probe is small.
+        use futures::stream::StreamExt;
+        let permits = self.config.derived.rewrite_permits().max(1);
+        let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(
+            groups
+                .into_iter()
+                .filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
+                .map(|((project, date), bins)| async move {
+                    for bin in &bins {
+                        self.dedup_dirty_bins.remove(&(project.to_string(), table_name.to_string(), date.to_string(), *bin));
+                    }
+                    match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, project, date)).await {
+                        Ok(Ok(dup_bins)) => {
+                            let stats = crate::metrics::maintenance_stats();
+                            let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.to_string(), date.to_string(), *b)).collect();
+                            stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
+                            stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
+                            info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
+                            cleared
+                        }
+                        Ok(Err(error)) => {
+                            warn!(project, table_name, date, %error, event = "dedup_batch_probe_failure");
+                            Vec::new()
+                        }
+                        Err(_) => {
+                            crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
+                            warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
+                            Vec::new()
+                        }
+                    }
+                }),
+        )
+        .buffer_unordered(permits)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
         ready.into_iter().filter(|b| !clean.contains(b)).collect()
     }
 
