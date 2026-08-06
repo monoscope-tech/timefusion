@@ -7652,11 +7652,25 @@ impl Database {
         // every queued bin of a (project, date) at once; only dup-bearing
         // bins continue into per-bin staging. Probe failure or timeout fails
         // OPEN to the per-bin path.
-        let ready =
+        let mut ready =
             if schema.dedup_keys.iter().any(|k| k == "timestamp") { self.batch_probe_classify(table, table_name, ready, stage_deadline).await } else { ready };
         if ready.is_empty() {
             self.persist_dirty_bins();
             return Ok(());
+        }
+        // STAGING admission is capped SEPARATELY from classification: staging
+        // is the phase implicated in the never-attributed pass-scoped RSS
+        // leak (~7GB/min over long passes — the 2026-08-03 OOM×4, mitigated
+        // then by capping the whole batch at 128). Raising the batch to 1024
+        // reintroduced multi-hour passes and the host went down under memory
+        // pressure on 2026-08-06 ~10:25Z (load ~400, SSH unresponsive).
+        // Short passes keep whatever leaks pass-scoped — it frees at pass
+        // end. Overflow goes straight back on the queue for the next tick.
+        const DIRTY_BIN_STAGE_BATCH: usize = 64;
+        if ready.len() > DIRTY_BIN_STAGE_BATCH {
+            for (project, date, bin) in ready.split_off(DIRTY_BIN_STAGE_BATCH) {
+                self.dedup_dirty_bins.insert((project, table_name.to_string(), date, bin), ());
+            }
         }
         // Phase 2 (2026-07-29): bins STAGE in parallel and commit in WAVES.
         // Previously each bin rewrote and committed strictly one at a time —
@@ -7784,12 +7798,21 @@ impl Database {
         // Probes run CONCURRENTLY (they were sequential until 2026-08-06 —
         // ~140 groups × seconds-to-a-minute each serialized the whole
         // classification phase). Bounded by the rewrite permits like every
-        // other maintenance scan; probes are key-only aggregates, not row
-        // materializations, so the memory cost per probe is small.
+        // other maintenance scan. Probe RESULTS are key-only aggregates, but
+        // each probe builds a provider + eager snapshot over a whole date's
+        // files — allocator churn jemalloc retains as RSS — so groups per
+        // pass are capped too, largest first (most clean bins retired per
+        // provider built). The rest keep their queue entries and classify on
+        // later ticks.
+        const BATCH_PROBE_GROUPS: usize = 16;
         use futures::stream::StreamExt;
         let permits = self.config.derived.rewrite_permits().max(1);
+        let mut groups: Vec<((String, String), Vec<i64>)> =
+            groups.into_iter().filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()).collect();
+        groups.sort_by_key(|(_, bins)| std::cmp::Reverse(bins.len()));
+        groups.truncate(BATCH_PROBE_GROUPS);
         let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(
-            groups.into_iter().filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()).map(
+            groups.into_iter().map(
                 |((project, date), bins)| async move {
                     for bin in &bins {
                         self.dedup_dirty_bins.remove(&(project.clone(), table_name.to_string(), date.clone(), *bin));
