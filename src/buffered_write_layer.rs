@@ -309,6 +309,14 @@ fn wal_backlog_over_threshold(backlog_bytes: u64, max_unflushed_bytes: u64, last
     last_flush_failure_micros > 0 && now_micros.saturating_sub(last_flush_failure_micros) < FLUSH_FAILURE_BRAKE_WINDOW_MICROS
 }
 
+/// Pure emergency-flush predicate (see `is_wal_over_threshold` for why the
+/// bytes leg is UNFLUSHED backlog, never on-disk size). Split out like
+/// `wal_backlog_over_threshold` so the disk-residue immunity is testable
+/// with injected numbers.
+fn wal_emergency_flush_needed(file_count: usize, max_files: usize, unflushed_bytes: u64, max_unflushed_bytes: u64) -> bool {
+    (max_files > 0 && file_count > max_files) || unflushed_bytes > max_unflushed_bytes
+}
+
 /// Per-shard walrus watermark snapshot at bucket-seal time. `None` for shards
 /// the bucket never wrote to. The callback writes this into the Delta commit
 /// metadata so a crash-mid-flush can derive the cursor from Delta on restart.
@@ -2023,11 +2031,12 @@ impl BufferedWriteLayer {
             // restart replay bounded.
             if self.is_wal_over_threshold() {
                 warn!(
-                    "WAL over threshold (files {}/{}, bytes {}MB/{}MB), triggering emergency flush",
+                    "WAL over threshold (files {}/{}, unflushed {}MB/{}MB, disk {}MB), triggering emergency flush",
                     file_count,
                     self.config.effective_wal_max_files(),
-                    total_bytes / (1024 * 1024),
-                    self.config.effective_wal_max_unflushed_bytes() / (1024 * 1024)
+                    self.unflushed_backlog_bytes() / (1024 * 1024),
+                    self.config.effective_wal_max_unflushed_bytes() / (1024 * 1024),
+                    total_bytes / (1024 * 1024)
                 );
                 if let Err(e) = self.flush_all_now().await {
                     error!("Emergency WAL flush failed: {}", e);
@@ -2090,15 +2099,23 @@ impl BufferedWriteLayer {
         self.mem_buffer.count_buckets_with_max_ts_before(self.retention_cutoff_micros())
     }
 
-    /// The emergency-flush predicate: WAL over EITHER threshold (file count or
-    /// total on-disk bytes). Cheap (two atomics behind `wal_stats`). Kept on
-    /// TOTAL size on purpose: an extra flush is harmless, so a conservative
-    /// signal is correct here — unlike the compaction brake, where a permanently
-    /// engaged signal starves compaction (see `is_wal_backlog_over_threshold`).
+    /// The emergency-flush predicate: file sprawl OR a real unflushed backlog.
+    /// The bytes leg compares UNFLUSHED bytes, not total on-disk size: on-disk
+    /// residue is age/pin-bound (the GC floor), so a disk-based signal engages
+    /// PERMANENTLY once residue exceeds the threshold — and here a permanently
+    /// engaged signal means `flush_all_now` across all topics every ~60s,
+    /// pounding the per-table commit locks and starving maintenance commits
+    /// (2026-08-06 03:56Z: ~15GB flushed residue vs ~780MB unflushed; the
+    /// storm froze the dedup drain for hours). "An extra flush is harmless"
+    /// only holds when flushing can actually shrink the signal; it cannot
+    /// shrink disk residue — only GC's age+floor can.
     pub fn is_wal_over_threshold(&self) -> bool {
-        let (file_count, total_bytes) = self.wal.wal_stats();
-        let max_files = self.config.effective_wal_max_files();
-        (max_files > 0 && file_count > max_files) || total_bytes > self.config.effective_wal_max_unflushed_bytes()
+        wal_emergency_flush_needed(
+            self.wal.wal_stats().0,
+            self.config.effective_wal_max_files(),
+            self.unflushed_backlog_bytes(),
+            self.config.effective_wal_max_unflushed_bytes(),
+        )
     }
 
     /// HARD WAL cap — a DISK-RUNAWAY breaker (2026-07-26 merge storm: WAL
@@ -3615,6 +3632,23 @@ mod tests {
         assert!(wal_backlog_over_threshold(1024, MAX, now - 60_000_000, now));
         // ...but a stale failure does not.
         assert!(!wal_backlog_over_threshold(1024, MAX, now - 10 * 60_000_000, now));
+    }
+
+    /// The EMERGENCY-FLUSH gate must be disk-residue-immune too. Prod
+    /// 2026-08-06 03:56Z: age/pin-bound residue held on-disk WAL at ~15GB
+    /// against the 12GiB threshold while unflushed sat ~780MB — the old
+    /// disk-bytes signal fired `flush_all_now` every ~60s forever, pounding
+    /// the commit locks and freezing the dedup drain.
+    #[test]
+    fn wal_emergency_flush_ignores_disk_residue_and_fires_on_backlog_or_sprawl() {
+        const MAX: u64 = 12 * 1024 * 1024 * 1024;
+        // Flushed residue over threshold with a tiny backlog: no storm.
+        assert!(!wal_emergency_flush_needed(15, 50, 780 * 1024 * 1024, MAX));
+        // Real unflushed backlog fires.
+        assert!(wal_emergency_flush_needed(15, 50, MAX + 1, MAX));
+        // File sprawl fires regardless of bytes; max_files=0 disables that leg.
+        assert!(wal_emergency_flush_needed(51, 50, 0, MAX));
+        assert!(!wal_emergency_flush_needed(51, 0, 0, MAX));
     }
 
     /// A byte threshold alone misses small persistence debt. Maintenance must
