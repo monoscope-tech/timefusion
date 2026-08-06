@@ -7777,9 +7777,9 @@ impl Database {
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, deadline: std::time::Duration,
     ) -> Vec<(String, String, i64)> {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut groups: std::collections::HashMap<(&str, &str), Vec<i64>> = Default::default();
+        let mut groups: std::collections::HashMap<(String, String), Vec<i64>> = Default::default();
         for (project, date, bin) in &ready {
-            groups.entry((project, date)).or_default().push(*bin);
+            groups.entry((project.clone(), date.clone())).or_default().push(*bin);
         }
         // Probes run CONCURRENTLY (they were sequential until 2026-08-06 —
         // ~140 groups × seconds-to-a-minute each serialized the whole
@@ -7792,12 +7792,12 @@ impl Database {
             groups.into_iter().filter(|((_, date), bins)| bins.len() >= 2 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()).map(
                 |((project, date), bins)| async move {
                     for bin in &bins {
-                        self.dedup_dirty_bins.remove(&(project.to_string(), table_name.to_string(), date.to_string(), *bin));
+                        self.dedup_dirty_bins.remove(&(project.clone(), table_name.to_string(), date.clone(), *bin));
                     }
-                    match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, project, date)).await {
+                    match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, &project, &date)).await {
                         Ok(Ok(dup_bins)) => {
                             let stats = crate::metrics::maintenance_stats();
-                            let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.to_string(), date.to_string(), *b)).collect();
+                            let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
                             stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
                             stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
                             info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
