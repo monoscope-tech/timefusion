@@ -5922,10 +5922,27 @@ impl Database {
     /// it goes first within the round).
     /// TODO: weight the debt score by read traffic — a partition nobody queries
     /// is deferred work, not urgent work (needs per-project query counters).
+    /// `repair_dates` are SEALED dates (yesterday backwards) scanned for footer
+    /// repair ONLY: an unsorted file there is admitted, everything else is left
+    /// alone. Scoping them to repair is the point — a sealed partition is
+    /// already consolidated, so re-binning its small files would rewrite history
+    /// every tick for no read benefit.
+    ///
+    /// Without this the repair was `date=today`-only and an unsorted file that
+    /// survived midnight was immortal: nothing else runs often enough to catch
+    /// it (see the daily-cron note below). One such file disables the reader's
+    /// all-or-nothing footer ordering for EVERY scan whose window touches that
+    /// date, so a single leftover forced `DedupExec` into its unbounded
+    /// `full-set` seen-set for all 24h dashboard queries. Measured on prod
+    /// 2026-08-06, project 6297304f: 39 stale files on `date=2026-08-05` made
+    /// the same top-100 query take 130s across the midnight boundary versus
+    /// 0.81s inside today (and OOM past the 2 GiB per-query dedup cap).
     fn select_all_hot_bins(
-        table: &DeltaTable, schema: &crate::schema_loader::TableSchema, today_str: &str, target_size: i64, min_files: usize, sorted_run_cap: i64,
+        table: &DeltaTable, schema: &crate::schema_loader::TableSchema, today_str: &str, repair_dates: &[String], target_size: i64, min_files: usize,
+        sorted_run_cap: i64,
     ) -> Result<Vec<(String, Vec<String>)>> {
         let date_marker = format!("date={today_str}/");
+        let repair_markers: Vec<String> = repair_dates.iter().map(|d| format!("date={d}/")).collect();
         let seal = seal_micros_now();
         // Only a table that declares a sort order has a footer to repair.
         let repairable = !schema.sorting_columns.is_empty();
@@ -5935,26 +5952,12 @@ impl Database {
             .snapshot()?
             .log_data()
             .iter()
-            .filter(|file| file.path().contains(&date_marker))
-            // Tag-first: both exclusions are pure metadata, so a converged file
-            // or an over-cap sorted run never reaches the stats parse.
+            // Tag-first: every exclusion below is pure metadata, so a converged
+            // file, an over-cap sorted run, or an already-sorted sealed file
+            // never reaches the stats parse.
             .filter_map(|file| {
                 let (size, sorted_run) = (file.size(), is_sorted_run(&file.tags()));
-                // A converged file is normally done — EXCEPT when it is converged
-                // and UNSORTED. Such a file declares no `sorting_columns`, and one
-                // of them disables the reader's all-or-nothing footer ordering for
-                // every scan that touches it (costing the streaming top-N pushdown
-                // and bounded dedup). Nothing else repairs it: the daily
-                // consolidate/recompress crons rarely survive this process's restart
-                // cadence, so hot-tail is the only pass that runs often enough to be
-                // relied on. `select_tail_bin` admits at most one per bin, so the
-                // backlog drains over ticks instead of rewriting several
-                // hundred-megabyte files at once.
-                let converged_done = size >= converged && (sorted_run || !repairable);
-                let over_cap_run = size >= sorted_run_cap && sorted_run;
-                if converged_done || over_cap_run {
-                    return None;
-                }
+                hot_bin_admits(&file.path(), &date_marker, &repair_markers, size, sorted_run, repairable, converged, sorted_run_cap).then_some(())?;
                 // `stats()` is reached only past both tag/size exclusions.
                 let path = file.path();
                 let project_id = path.split('/').find_map(|s| s.strip_prefix("project_id=")).filter(|p| !p.is_empty()).map(str::to_owned)?;
@@ -8027,6 +8030,10 @@ impl Database {
         let today = crate::clock::now_micros();
         let today = chrono::DateTime::from_timestamp_micros(today).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let today_str = today.to_string();
+        // Sealed dates carried along for footer repair only (see
+        // `select_all_hot_bins`), derived from the same virtual clock as `today`.
+        let repair_dates: Vec<String> =
+            (1..=self.config.maintenance.timefusion_light_optimize_repair_days).filter_map(|d| today.checked_sub_days(chrono::Days::new(d))).map(|d| d.to_string()).collect();
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let min_files = self.config.maintenance.timefusion_compact_min_files;
@@ -8035,7 +8042,7 @@ impl Database {
         // wrote. Bins are ordered by compaction debt.
         let mut planned = {
             let table = table_ref.read().await;
-            Self::select_all_hot_bins(&table, schema, &today_str, target_size, min_files, target_size / 2)?
+            Self::select_all_hot_bins(&table, schema, &today_str, &repair_dates, target_size, min_files, target_size / 2)?
         };
         // Rotation cursor: start where the last truncated tick stopped so the
         // same tail is never skipped twice in a row (a truncated tick otherwise
@@ -8087,7 +8094,7 @@ impl Database {
                 }
             },
             |bins, round| {
-                let (plan, today_str) = (&plan, today_str.as_str());
+                let (plan, today_str, repair_dates) = (&plan, today_str.as_str(), repair_dates.as_slice());
                 async move {
                     let staged = bins.len();
                     let failed = self.commit_wave(table_ref, table_name, &[format!("date={today_str}/")], false, bins, round).await.failed.len();
@@ -8107,7 +8114,7 @@ impl Database {
                     if round + 1 < MAX_WAVES && std::time::Instant::now() < deadline {
                         let next = {
                             let table = table_ref.read().await;
-                            Self::select_all_hot_bins(&table, schema, today_str, target_size, min_files, target_size / 2).unwrap_or_default()
+                            Self::select_all_hot_bins(&table, schema, today_str, repair_dates, target_size, min_files, target_size / 2).unwrap_or_default()
                         };
                         *plan.lock().await = next.into_iter().collect();
                     }
@@ -10122,6 +10129,38 @@ impl TailAdd {
 /// output runs time-DISJOINT, so file-range pruning can exclude files outside a
 /// query's window (arrival-time binning left every file overlapping →
 /// files_ranges_pruned=56→56, i.e. no pruning).
+/// Does this file enter the hot-tail candidate set? Decided from PATH AND TAGS
+/// ONLY, so a rejected file never reaches the (expensive) Add-stats JSON parse.
+///
+/// Two scopes, and the difference is the whole point:
+/// - **today** — full bin-packing: pack small files, fold sub-cap sorted runs,
+///   skip converged ones (re-selecting a converged file alone rewrites it 1→1
+///   forever) EXCEPT when converged-and-unsorted, which is a repair candidate.
+/// - **a sealed date in `repair_markers`** — repair ONLY: admit the unsorted
+///   files, and nothing else at any size. A sealed partition is already
+///   consolidated, so size-based re-binning there would rewrite settled history
+///   every tick for no read benefit.
+///
+/// Repairing sealed dates at all is the 2026-08-06 fix: the pass was
+/// today-only, so an unsorted file that survived midnight was immortal, and one
+/// of those disables the reader's all-or-nothing footer ordering for every scan
+/// whose window touches that date — forcing `DedupExec` into its unbounded
+/// `full-set` seen-set (prod: 130s vs 0.81s for the same top-100 query, and OOM
+/// past the 2 GiB per-query cap).
+#[allow(clippy::too_many_arguments)]
+fn hot_bin_admits(
+    path: &str, today_marker: &str, repair_markers: &[String], size: i64, sorted_run: bool, repairable: bool, converged: i64, sorted_run_cap: i64,
+) -> bool {
+    if path.contains(today_marker) {
+        let converged_done = size >= converged && (sorted_run || !repairable);
+        let over_cap_run = size >= sorted_run_cap && sorted_run;
+        return !(converged_done || over_cap_run);
+    }
+    // Only an unsorted file on a lookback date has repair work left. `repairable`
+    // is false for a table that declares no sort order — nothing to repair.
+    repairable && !sorted_run && repair_markers.iter().any(|m| path.contains(m.as_str()))
+}
+
 pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64) -> Vec<String> {
     let cap = target_size.max(1);
     let converged = cap - cap / 8;
@@ -13376,6 +13415,46 @@ mod tests {
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
         let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None }, f("a", 10, false, 1, 2)];
         assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL), Vec::<String>::new());
+    }
+
+    /// Scope admission for the hot tail. The sealed-date arm is the 2026-08-06
+    /// regression guard: an unsorted file that survived midnight used to be
+    /// unreachable forever, which forced `full-set` dedup on every query whose
+    /// window crossed that date (prod project 6297304f: 130s vs 0.81s).
+    #[test]
+    fn hot_bin_admits_repairs_sealed_dates_without_rebinning_them() {
+        const TARGET: i64 = 1000;
+        const CONVERGED: i64 = TARGET - TARGET / 8; // 875
+        const CAP: i64 = TARGET / 2;
+        let today = "date=2026-08-06/";
+        let repair: Vec<String> = vec!["date=2026-08-05/".into()];
+        let p = |d: &str| format!("timefusion/otel_logs_and_spans/project_id=abc/{d}part-x.parquet");
+        let admits =
+            |path: &str, size, sorted, repairable| super::hot_bin_admits(path, today, &repair, size, sorted, repairable, CONVERGED, CAP);
+
+        // TODAY — unchanged behaviour.
+        assert!(admits(&p(today), 10, false, true), "small file today packs");
+        assert!(!admits(&p(today), 900, true, true), "converged sorted run today is done");
+        assert!(admits(&p(today), 900, false, true), "converged UNSORTED today is a repair candidate");
+
+        // SEALED, in the lookback window — repair only.
+        let sealed = "date=2026-08-05/";
+        assert!(admits(&p(sealed), 900, false, true), "the immortal file: converged + unsorted on a sealed date IS repaired");
+        assert!(admits(&p(sealed), 10, false, true), "any unsorted file on a sealed date is repairable regardless of size");
+        assert!(!admits(&p(sealed), 10, true, true), "a SORTED small file on a sealed date must NOT be re-binned — settled history stays put");
+        assert!(!admits(&p(sealed), 900, true, true), "nor a sorted converged one");
+        assert!(!admits(&p(sealed), 900, false, false), "a table declaring no sort order has no footer to repair");
+
+        // OUTSIDE the lookback window — untouched at any size or tag.
+        let old = "date=2026-07-01/";
+        assert!(!admits(&p(old), 10, false, true), "an unsorted file outside the lookback is out of scope");
+        assert!(!admits(&p(old), 900, false, true));
+
+        // Lookback 0 restores today-only behaviour.
+        assert!(
+            !super::hot_bin_admits(&p(sealed), today, &[], 900, false, true, CONVERGED, CAP),
+            "empty repair window == the old today-only pass"
+        );
     }
 
     /// Wave commit blast radius: ONE stale bin must lose only its own actions.

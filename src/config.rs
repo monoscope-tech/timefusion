@@ -868,6 +868,7 @@ const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
 const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
+const_default!(d_repair_lookback_days: u64 = 2);
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
 // cold target. Calendar-age driven; idempotent (skips ≥-target files).
@@ -1808,6 +1809,17 @@ pub struct MaintenanceConfig {
     pub timefusion_light_optimize_enabled: bool,
     #[serde(default = "d_light_optimize_target")]
     pub timefusion_light_optimize_target_size: i64,
+    /// Sealed dates (yesterday backwards) the hot tail also scans for FOOTER
+    /// REPAIR — rewriting files that carry no `sorting_columns` so the reader's
+    /// all-or-nothing ordering claim survives. Repair only: sorted files on
+    /// those dates are never re-binned, so settled history isn't rewritten.
+    ///
+    /// Default 2 covers the yesterday-crossing window every 24h dashboard query
+    /// uses. 0 restores the old today-only behaviour, under which an unsorted
+    /// file that survived midnight was never repaired and forced `full-set`
+    /// dedup on every query touching that date (prod 2026-08-06: 130s vs 0.81s).
+    #[serde(default = "d_repair_lookback_days")]
+    pub timefusion_light_optimize_repair_days: u64,
     // Concurrent merge tasks per optimize run — formerly
     // `TIMEFUSION_OPTIMIZE_MAX_CONCURRENT_TASKS`. Now `derived.optimize_merge_tasks()`.
     #[serde(default = "d_light_schedule")]
