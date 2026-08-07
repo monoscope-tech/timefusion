@@ -103,6 +103,7 @@ pub fn ordered_children(
     // is the cheaper shape for both callers.
     let sort = |c: &Arc<dyn ExecutionPlan>| Arc::new(SortExec::new(req.clone(), Arc::clone(c)).with_preserve_partitioning(true).with_fetch(fetch)) as _;
     let mut out = Vec::with_capacity(children.len());
+    let mut recovered = 0;
     for (i, (child, s)) in children.iter().zip(sat).enumerate() {
         out.push(match (s, sortable.get(i).copied().unwrap_or(true)) {
             (true, _) => Arc::clone(child),
@@ -115,13 +116,17 @@ pub fn ordered_children(
             // and restores the ordering the whole scan lost.
             (false, false) => match recover_nested_ordering(child, req, fetch)? {
                 Some(fixed) => {
-                    NESTED_ORDERING_RECOVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    recovered += 1;
                     fixed
                 }
+                // One unrecoverable leg voids the rewrite, so any recovery
+                // counted above is discarded with it — hence counting only
+                // once the whole rewrite is adopted.
                 None => return Ok(None),
             },
         });
     }
+    NESTED_ORDERING_RECOVERED.fetch_add(recovered, std::sync::atomic::Ordering::Relaxed);
     Ok(Some(out))
 }
 
