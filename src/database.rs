@@ -5963,7 +5963,7 @@ impl Database {
             .filter(|add| add.size() < target_size.max(1)) // cheap gate before the stats parse
             .map(|add| TailAdd::from_stats(add.path().to_string(), add.size(), is_sorted_run(&add.tags()), add.stats().as_deref()))
             .collect();
-        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now()))
+        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), false))
     }
 
     /// ONE tag-first walk of the snapshot that plans a bin for EVERY hot project
@@ -6026,7 +6026,7 @@ impl Database {
             .into_iter()
             .map(|(project_id, adds)| {
                 let debt = adds.len();
-                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal), debt)
+                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal, policy.prefer_repair), debt)
             })
             .filter(|(_, bin, _)| !bin.is_empty())
             .collect();
@@ -8111,6 +8111,7 @@ impl Database {
             // Repair reach is its own knob (see `timefusion_repair_max_file_bytes`);
             // larger legacy files belong to `optimize --recompress`.
             repair_max_bytes: self.config.maintenance.timefusion_repair_max_file_bytes as i64,
+            prefer_repair: repair_preferred_tick(crate::clock::now_micros()),
         };
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
         // snapshot (see `plan` below) so a wave never re-selects the run it just
@@ -10285,6 +10286,10 @@ struct HotBinPolicy<'a> {
     /// are legacy (pre-`timefusion_writer_max_file_bytes`) and belong to the
     /// off-box `timefusion optimize` CLI, not a 5-minute tick.
     repair_max_bytes: i64,
+    /// This tick lets a pending repair outrank packing — the periodic override
+    /// that keeps the sealed backlog from starving on a busy project. See
+    /// `repair_preferred_tick`.
+    prefer_repair: bool,
 }
 
 impl HotBinPolicy<'_> {
@@ -10296,7 +10301,7 @@ impl HotBinPolicy<'_> {
     }
 }
 
-pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64) -> Vec<String> {
+pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, prefer_repair: bool) -> Vec<String> {
     let cap = target_size.max(1);
     let converged = cap - cap / 8;
     // An oversized file that is NOT a sorted run is a REPAIR candidate, not a
@@ -10346,18 +10351,47 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     if files.len() < 2 {
         files.clear();
     }
-    // Repair runs in the GAPS, never against the primary path: only once a
-    // project has no packable slice left does a tick spend itself rewriting one
-    // oversized unsorted file. Preempting normal packing would starve it while
-    // a backlog of legacy files drained. Steady state is exactly when the gaps
-    // appear — the sub-target backlog is packed into converged runs, and the
-    // leftover poison files are what remain.
+    // Repair normally runs in the GAPS: only once a project has no packable
+    // slice left does a tick spend itself rewriting one oversized unsorted file,
+    // so normal packing is never starved.
+    //
+    // That rests on "the gaps eventually appear", which held while repair was
+    // scoped to TODAY — a single partition converges once its sub-target files
+    // are packed into runs. It is FALSE for the sealed-date repair: a project
+    // that is still ingesting always has a packable slice in today's partition,
+    // so the gap never comes and its sealed backlog never drains. Measured on
+    // prod 2026-08-07: the backlog fell 1,243 -> ~940 (the quiet projects) and
+    // then stopped dead, with 723 of the survivors belonging to the single
+    // BUSIEST project — i.e. repair starved exactly where it was needed most.
+    //
+    // `prefer_repair` is the caller's periodic override (see
+    // `repair_preferred_tick`): on those ticks a pending repair outranks
+    // packing, so the finite sealed backlog drains while the continuous
+    // small-file work still gets the majority of ticks.
+    let pending_repair = || fresh.iter().find(|(_, _, _, repair)| *repair).map(|(path, _, _, _)| vec![path.to_string()]);
+    if prefer_repair && let Some(bin) = pending_repair() {
+        return bin;
+    }
     if files.is_empty()
-        && let Some((path, _, _, _)) = fresh.iter().find(|(_, _, _, repair)| *repair)
+        && let Some(bin) = pending_repair()
     {
-        return vec![path.to_string()];
+        return bin;
     }
     files
+}
+
+/// Does this tick prefer repair over packing? Every `REPAIR_TICK_PERIOD`-th
+/// 5-minute tick, derived from the clock so it needs no shared state and stays
+/// deterministic under the virtual-time test harness.
+///
+/// A minority share on purpose: the sealed repair backlog is FINITE (it only
+/// grows when a rewrite writes an unsorted file, which `UnsortedFallback` now
+/// prevents), while small-file packing is continuous and must keep the majority
+/// of ticks.
+fn repair_preferred_tick(now_micros: i64) -> bool {
+    const REPAIR_TICK_PERIOD: i64 = 3;
+    const TICK_MICROS: i64 = 5 * 60 * 1_000_000;
+    now_micros.div_euclid(TICK_MICROS).rem_euclid(REPAIR_TICK_PERIOD) == 0
 }
 
 /// Split staged bins into (committable, stale) against the live file set of the
@@ -13527,12 +13561,12 @@ mod tests {
         // Seal lag: a file whose newest event is past the seal is still filling
         // (prod 2026-07-20: compacting it lost every OCC race).
         let unsealed = vec![f("a", 10, false, 1, 1), f("b", 10, false, 2, SEAL + 1)];
-        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL), Vec::<String>::new(), "unsealed files leave < min_files");
+        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, false), Vec::<String>::new(), "unsealed files leave < min_files");
 
         // Converged (>= 7/8 target) files are never re-selected: rewriting one
         // alone is a 1→1 rewrite forever.
         let converged = vec![f("big", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, false), vec!["a", "b"]);
 
         // REPAIR: an oversized file that is NOT a sorted run declares no
         // `sorting_columns`, and one of those disables the reader's
@@ -13542,43 +13576,94 @@ mod tests {
         // is repaired, but only in the GAPS: while a project still has a
         // packable slice, that slice wins.
         let poisoned = vec![f("big_unsorted", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL), vec!["a", "b"], "normal packing must not be starved by a pending repair");
+        assert_eq!(
+            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, false),
+            vec!["a", "b"],
+            "normal packing must not be starved by a pending repair"
+        );
         let only_poison = vec![f("big_unsorted", 900, false, 1, 2)];
         assert_eq!(
-            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL),
+            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, false),
             vec!["big_unsorted"],
             "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files"
         );
         // ...and exactly one per bin, so a backlog drains across ticks instead
         // of rewriting several hundred-megabyte files in a single pass.
         let many_poison = vec![f("p1", 900, false, 1, 2), f("p2", 950, false, 3, 4), f("p3", 800, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL).len(), 1, "one repair per bin");
+        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, false).len(), 1, "one repair per bin");
         // A converged file that IS a sorted run stays done — repairing it would
         // be a 1->1 rewrite forever.
         let healthy = vec![f("big_sorted", 900, true, 1, 2)];
-        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL).is_empty(), "a converged sorted run is never re-selected");
+        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, false).is_empty(), "a converged sorted run is never re-selected");
 
         // Sorted runs fold only while under the cap; an over-cap run is excluded.
         let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL), vec!["run_small", "a"], "only the sub-cap run folds");
+        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, false), vec!["run_small", "a"], "only the sub-cap run folds");
 
         // Earliest contiguous slice up to cap, ordered by EVENT time (input
         // order is deliberately scrambled) — this is what makes runs disjoint.
         let pack = vec![f("third", 600, false, 30, 31), f("first", 600, false, 10, 11), f("second", 300, false, 20, 21)];
-        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL), vec!["first", "second"], "packs earliest slice, stops at cap");
+        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, false), vec!["first", "second"], "packs earliest slice, stops at cap");
 
         // min_files gate.
-        assert_eq!(super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL), Vec::<String>::new());
+        assert_eq!(super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, false), Vec::<String>::new());
 
         // A lone over-cap-adjacent file must not wedge the pass: selection skips
         // past it to the next slice rather than returning a 1-file bin.
         let lone = vec![f("lone", 800, false, 1, 2), f("a", 300, false, 10, 11), f("b", 300, false, 12, 13)];
-        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, false), vec!["a", "b"]);
 
         // Files with no event-time stats can't be binned disjointly (the
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
         let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None }, f("a", 10, false, 1, 2)];
-        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL), Vec::<String>::new());
+        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, false), Vec::<String>::new());
+    }
+
+    /// Repair must not starve on a project that never runs out of packing work.
+    ///
+    /// The gap-filling rule ("repair only when no packable slice exists") was
+    /// written when repair was scoped to TODAY, where a partition converges. It
+    /// does not hold once sealed dates are in scope: a still-ingesting project
+    /// always has a packable slice in today's partition, so its sealed backlog
+    /// never drains. Prod 2026-08-07: the backlog fell 1,243 -> ~940 and then
+    /// stopped, with 723 of the survivors on the single busiest project.
+    #[test]
+    fn periodic_tick_lets_repair_preempt_packing_so_a_busy_project_drains() {
+        const TARGET: i64 = 1000;
+        const SEAL: i64 = 10_000;
+        let f = |path: &str, size: i64, sorted: bool, min: i64, max: i64| super::TailAdd {
+            path: path.into(),
+            size,
+            is_sorted_run: sorted,
+            event_range: Some((min, max)),
+        };
+        // A busy project: a packable slice AND a pending repair, every tick.
+        let busy = vec![f("poison", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
+
+        // Normal ticks keep packing first — repair never preempts the primary path.
+        assert_eq!(super::select_tail_bin(&busy, TARGET, 2, TARGET / 4, SEAL, false), vec!["a", "b"], "packing keeps priority on a normal tick");
+
+        // On a repair-preferred tick the poison file wins, so the backlog drains
+        // even though a packable slice existed. This is the whole fix.
+        assert_eq!(
+            super::select_tail_bin(&busy, TARGET, 2, TARGET / 4, SEAL, true),
+            vec!["poison"],
+            "a repair-preferred tick must drain the backlog even when packing work exists"
+        );
+
+        // With nothing to repair, a preferred tick still packs — the override
+        // must never waste a tick.
+        let clean = vec![f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)];
+        assert_eq!(super::select_tail_bin(&clean, TARGET, 2, TARGET / 4, SEAL, true), vec!["a", "b"], "no repair pending => still pack");
+
+        // Cadence: a minority of ticks, and stable across the 5-minute grid.
+        let tick = 5 * 60 * 1_000_000i64;
+        let preferred: Vec<bool> = (0..6).map(|i| super::repair_preferred_tick(i * tick)).collect();
+        assert_eq!(preferred, vec![true, false, false, true, false, false], "every 3rd tick, so packing keeps the majority");
+        // Same tick, different instants within it => same decision (no flapping mid-tick).
+        assert!(super::repair_preferred_tick(0) && super::repair_preferred_tick(tick - 1));
+        // Negative (pre-epoch, virtual clock) must not panic or skew the cadence.
+        assert!(!super::repair_preferred_tick(-tick));
     }
 
     /// Scope admission for the hot tail. The sealed-date arm is the 2026-08-06
@@ -13598,6 +13683,7 @@ mod tests {
             min_files: 2,
             sorted_run_cap: TARGET / 2,
             repair_max_bytes: REPAIR_MAX,
+            prefer_repair: false,
         };
         let with_repair = super::HotBinPolicy { repair_dates: &repair, ..policy(&[]) };
         let admits = |path: &str, size, sorted, repairable| super::hot_bin_admits(path, today, &repair, size, sorted, repairable, &with_repair);
