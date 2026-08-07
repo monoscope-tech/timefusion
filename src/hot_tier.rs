@@ -351,6 +351,10 @@ pub struct HotTierStats {
     /// expected — a drifted file contributes zero rows while the tier still
     /// looks healthy).
     pub mem_skipped: u64,
+    /// Files whose rows were ALL filtered out. They must contribute no
+    /// exclusion either; nonzero means windows are falling through to Delta
+    /// (correct) rather than vanishing (the 2026-08-07 hole shape).
+    pub empty_after_filter: u64,
     pub schema_drift: u64,
     pub gc_deleted: u64,
     pub gc_bytes_freed: u64,
@@ -426,6 +430,7 @@ pub struct HotTier {
     read_hits: AtomicU64,
     read_misses: AtomicU64,
     mem_skipped: AtomicU64,
+    empty_after_filter: AtomicU64,
     schema_drift: AtomicU64,
     gc_deleted: AtomicU64,
     gc_bytes_freed: AtomicU64,
@@ -742,6 +747,18 @@ impl HotTier {
             // Range and partition are pushed TOGETHER, after the check: a file
             // whose rows we refuse to hold must also not be excluded from the
             // Delta leg, or its window is served by nobody.
+            // Contributing NOTHING must also mean excluding nothing. `ranges`
+            // excludes a whole TIME WINDOW from the Delta leg, but a file only
+            // ever vouches for the rows it actually hands over; when the
+            // predicate retains none, the exclusion would still hide every Delta
+            // row in that window and the leg would serve no replacement — the
+            // window is then served by nobody. Skipping is safe in the other
+            // direction: the same predicate filters the Delta copy identically,
+            // so falling through cannot duplicate rows.
+            if filtered.is_empty() {
+                self.empty_after_filter.fetch_add(1, Relaxed);
+                continue;
+            }
             let bytes: u64 = filtered.iter().map(|b| b.get_array_memory_size() as u64).sum();
             if used + bytes > self.limits.leg_budget_bytes {
                 self.leg_budget_stops.fetch_add(1, Relaxed);
@@ -759,9 +776,7 @@ impl HotTier {
             if versioned {
                 gate = Some(gate.unwrap_or(i64::MAX).min(meta.max_stamp.unwrap_or(i64::MIN)));
             }
-            if !filtered.is_empty() {
-                partitions.push(filtered);
-            }
+            partitions.push(filtered);
         }
         HotLeg { partitions, ranges, version_gate: gate, sorted, bytes: used }
     }
@@ -1080,6 +1095,7 @@ impl HotTier {
             read_hits: self.read_hits.load(Relaxed),
             read_misses: self.read_misses.load(Relaxed),
             mem_skipped: self.mem_skipped.load(Relaxed),
+            empty_after_filter: self.empty_after_filter.load(Relaxed),
             schema_drift: self.schema_drift.load(Relaxed),
             gc_deleted: self.gc_deleted.load(Relaxed),
             gc_bytes_freed: self.gc_bytes_freed.load(Relaxed),
@@ -1678,6 +1694,36 @@ mod tests {
         assert!(parts.is_empty(), "no rows");
         assert!(ranges.is_empty(), "and NO exclusion range: the window must fall through to Delta, not vanish");
         assert_eq!(tier.stats().read_misses, 1, "counted as a miss, like any other unusable file");
+    }
+
+    /// PROD 2026-08-07 — the hole shape. A file whose rows the predicate ALL
+    /// filters out used to push its range anyway (`ranges.push` was
+    /// unconditional; only `partitions.push` was guarded), excluding that whole
+    /// time window from the Delta leg while contributing nothing to serve it.
+    /// Customers saw it as recurring multi-minute gaps in their dashboards; the
+    /// bad plan's predicate literally excluded 09:15:05-09:19:58 that day.
+    ///
+    /// A time-range exclusion may only be claimed by a file that actually hands
+    /// over rows — it vouches for the rows it holds, never for a window.
+    #[tokio::test]
+    async fn file_filtered_to_nothing_contributes_no_range() {
+        use datafusion::prelude::{col, lit};
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        tier.demote("p1", "t", 1, &[batch(8)], 10, 20);
+
+        // Matches no row in the file, so the leg retains nothing.
+        let never = col("ts").eq(lit(i64::MIN));
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[never], &schema(), None).await;
+        assert!(parts.is_empty(), "no rows survive the predicate");
+        assert!(ranges.is_empty(), "and NO exclusion range: the window must fall through to Delta, not vanish");
+        assert_eq!(tier.stats().empty_after_filter, 1);
+
+        // Control: a predicate that DOES match still claims its range, or the
+        // Delta leg would double-count the rows the hot tier just served.
+        let all = col("ts").gt_eq(lit(i64::MIN));
+        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[all], &schema(), None).await;
+        assert!(!parts.is_empty() && ranges.len() == 1, "serving rows ⇒ claim the range");
     }
 
     /// A project/table name that can't round-trip through a path component is

@@ -220,41 +220,44 @@ impl StatsTableProvider {
                         "quarantine_mb" => mb(s.quarantine_bytes as f64),
                     ],
                     rows!["hot_tier";
-                        "tables" => h.tables,
-                        "files" => h.files,
-                        "bytes" => h.bytes,
-                        "writes_total" => h.writes,
-                        "write_failures_total" => h.write_failures,
-                        "read_hits_total" => h.read_hits,
-                        "read_misses_total" => h.read_misses,
-                        "mem_skipped_total" => h.mem_skipped,
-                        "schema_drift_total" => h.schema_drift,
-                        "gc_deleted_total" => h.gc_deleted,
-                        "gc_bytes_freed_total" => h.gc_bytes_freed,
-                        "invalidated_total" => h.invalidated,
-                        // DML statements scoped to their own time window vs. those
-                        // that had to drop the whole table. `invalidations_full_total`
-                        // dominating means the range derivation isn't matching the
-                        // workload's predicate shapes — the tier is back to paying for
-                        // files every enrichment statement throws away.
-                        "invalidations_ranged_total" => h.invalidations_ranged,
-                        "invalidations_full_total" => h.invalidations_full,
-                        // Tables that stopped demoting because a DML kept dropping
-                        // their files before any query read them (continuous
-                        // whole-table enrichment). Non-zero is the tier working as
-                        // intended; it used to be an invisible silent waste.
-                        "suppressed_tables" => h.suppressed_tables,
-                        "suppressions_total" => h.suppressions,
-                        // The two heap bounds. `memo_bytes` is the mapping the decode
-                        // memo pins (LRU-capped); `leg_budget_stops_total` counts scans
-                        // that hit the per-query hot-leg byte budget and served the
-                        // remaining windows from Delta instead — sustained non-zero
-                        // means the budget, not retention, is the tier's real size.
-                        "memo_files" => h.memo_files,
-                        "memo_bytes" => h.memo_bytes,
-                        "memo_evicted_total" => h.memo_evicted,
-                        "leg_budget_stops_total" => h.leg_budget_stops,
-                    ],
+                                "tables" => h.tables,
+                                "files" => h.files,
+                                "bytes" => h.bytes,
+                                "writes_total" => h.writes,
+                                "write_failures_total" => h.write_failures,
+                                "read_hits_total" => h.read_hits,
+                                "read_misses_total" => h.read_misses,
+                                "mem_skipped_total" => h.mem_skipped,
+                    // Files whose rows were all filtered out; they now contribute no
+                    // exclusion range either. See hot_tier::read_leg.
+                    "empty_after_filter_total" => h.empty_after_filter,
+                                "schema_drift_total" => h.schema_drift,
+                                "gc_deleted_total" => h.gc_deleted,
+                                "gc_bytes_freed_total" => h.gc_bytes_freed,
+                                "invalidated_total" => h.invalidated,
+                                // DML statements scoped to their own time window vs. those
+                                // that had to drop the whole table. `invalidations_full_total`
+                                // dominating means the range derivation isn't matching the
+                                // workload's predicate shapes — the tier is back to paying for
+                                // files every enrichment statement throws away.
+                                "invalidations_ranged_total" => h.invalidations_ranged,
+                                "invalidations_full_total" => h.invalidations_full,
+                                // Tables that stopped demoting because a DML kept dropping
+                                // their files before any query read them (continuous
+                                // whole-table enrichment). Non-zero is the tier working as
+                                // intended; it used to be an invisible silent waste.
+                                "suppressed_tables" => h.suppressed_tables,
+                                "suppressions_total" => h.suppressions,
+                                // The two heap bounds. `memo_bytes` is the mapping the decode
+                                // memo pins (LRU-capped); `leg_budget_stops_total` counts scans
+                                // that hit the per-query hot-leg byte budget and served the
+                                // remaining windows from Delta instead — sustained non-zero
+                                // means the budget, not retention, is the tier's real size.
+                                "memo_files" => h.memo_files,
+                                "memo_bytes" => h.memo_bytes,
+                                "memo_evicted_total" => h.memo_evicted,
+                                "leg_budget_stops_total" => h.leg_budget_stops,
+                            ],
                     h.suppressed
                         .iter()
                         .map(|((project, table), secs)| ("hot_tier", format!("suppressed.{project}.{table}"), format!("cooldown_secs_remaining={secs}")))
