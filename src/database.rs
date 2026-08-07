@@ -3003,15 +3003,25 @@ impl Database {
         // Enable bloom filter pruning if available in Parquet files
         let _ = options.set("datafusion.execution.parquet.bloom_filter_on_read", "true");
 
-        // Batch size = DataFusion's 8192 default. A prior 65536 (8×) was set for
-        // "time-series throughput", but on the wide otel schema (body/attributes/
-        // resource are KB-wide byte-view columns) it made every CoalesceBatchesExec
-        // in-progress buffer hold 65536 wide rows — per partition, per concurrent
-        // query — and that buffering is NOT pool-accounted. Heap profiling
-        // (2026-07-05) showed InProgressByteViewArray::coalesce as the dominant
-        // live consumer at 10-27GB. 8192 cuts the per-buffer footprint 8× for
-        // negligible per-batch overhead on an IO-bound DB.
-        let _ = options.set("datafusion.execution.batch_size", "8192");
+        // Batch size 2048, down from 65536 in two steps. The wide otel schema
+        // (body/attributes/resource are KB-wide byte-view columns) makes every
+        // per-partition, per-query decode buffer cost `batch_size × row width`,
+        // and none of it is pool-accounted. 2026-07-05 heap profiling caught
+        // `InProgressByteViewArray::coalesce` at 10-27GB and 65536 → 8192 fixed
+        // that layer; 2026-08-07 profiling caught the layer below it, parquet's
+        // own `ByteArrayDecoder` / `extend_from_dictionary` offset buffers, at
+        // ~29GB — 32% of live heap, with `scan_decode.peak_batch_bytes` at 63MB
+        // for ONE batch. `worst_case_heap_mb` models this as inflight × peak
+        // batch (~1GB) and is wrong by ~30× because a decoder holds far more
+        // than the batch it is about to emit.
+        //
+        // 2048 is not a guess: it is what `build_optimize_session_state` has run
+        // on these exact rows since the 2026-07-12 merge-memory work. The
+        // coalescer follows `batch_size` — a neighbouring
+        // `coalesce_target_batch_size` setting was silently dead (no such
+        // DataFusion option; `options.set` returned Err into a `let _`) and is
+        // removed rather than left implying a bound it never applied.
+        let _ = options.set("datafusion.execution.batch_size", "2048");
 
         // Optimize for sorted data (timestamps are typically sorted)
         let _ = options.set("datafusion.optimizer.prefer_existing_sort", "true");
@@ -3045,7 +3055,6 @@ impl Database {
 
         // Memory management for large time-series queries
         let _ = options.set("datafusion.execution.coalesce_batches", "true");
-        let _ = options.set("datafusion.execution.coalesce_target_batch_size", "8192");
 
         // Enable all optimizer rules for maximum optimization
         let _ = options.set("datafusion.optimizer.max_passes", "5");
@@ -12922,6 +12931,20 @@ mod tests {
         for t in ["variant_bench", "mor_dormant"] {
             assert!(!ProjectRoutingTable::references_tombstone(t, &deleted));
         }
+    }
+
+    /// The QUERY session's decode buffers cost `batch_size × row width` per
+    /// partition per concurrent query and are invisible to the memory pool, so
+    /// the bound has to be the config. 2026-07-05 caught the coalescer at
+    /// 10-27GB with 65536; 2026-08-07 caught parquet's own byte-array decoders
+    /// at ~29GB (32% of live heap) with 8192.
+    #[tokio::test]
+    async fn query_session_bounds_the_wide_row_decode_buffers() -> Result<()> {
+        let db = Database::with_config(create_test_config("query-batch-size")).await?;
+        let state = Arc::new(db).create_session_context().state();
+        let exec = &state.config().options().execution;
+        assert_eq!(exec.batch_size, 2048, "wide otel rows: one 8192-row batch measured 63MB");
+        Ok(())
     }
 
     /// The optimize/dedup session must carry a bounded batch size and a sort
