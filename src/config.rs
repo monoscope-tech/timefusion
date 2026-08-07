@@ -843,6 +843,7 @@ const_default!(d_compact_min_files: usize = 5);
 // opens ≈ 1.2s). A larger target collapses today's sealed slices into a few
 // large event-time-disjoint runs so recent queries open a handful of files.
 const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
+const_default!(d_writer_max_file_bytes: usize = 512 * MIB);
 // 256 MiB. This was briefly raised to 4 GiB (2026-08-01) so that large prod
 // flush buckets — ~170 MB compressed, ~2.9 GB in memory at the measured ~17x
 // zstd ratio — would be sorted rather than written with no `sorting_columns`
@@ -1809,6 +1810,22 @@ pub struct MaintenanceConfig {
     pub timefusion_light_optimize_enabled: bool,
     #[serde(default = "d_light_optimize_target")]
     pub timefusion_light_optimize_target_size: i64,
+    /// Byte ceiling for ONE output file from a rewrite that writes through
+    /// `RecordBatchWriter`. That writer has no target-size support of its own —
+    /// `flush()` emits one file per partition no matter how much was buffered —
+    /// so the rewrite paths cut the file themselves once the buffer passes this.
+    ///
+    /// Unbounded outputs are how prod grew active files of 712 MB (median
+    /// unsorted) up to 2.34 GB. Beyond the wasted read granularity, an oversized
+    /// file is effectively unrepairable: re-sorting it needs its rows in memory,
+    /// which at prod's ~17x zstd ratio is far past any sort budget, so once one
+    /// lands without a `sorting_columns` footer it stays that way.
+    ///
+    /// Cutting is free for correctness here: each cut lands on a contiguous
+    /// slice of an already-sorted stream, so every piece keeps an honest sorted
+    /// footer AND the pieces are event-time disjoint (better file pruning).
+    #[serde(default = "d_writer_max_file_bytes")]
+    pub timefusion_writer_max_file_bytes: usize,
     /// Sealed dates (yesterday backwards) the hot tail also scans for FOOTER
     /// REPAIR — rewriting files that carry no `sorting_columns` so the reader's
     /// all-or-nothing ordering claim survives. Repair only: sorted files on

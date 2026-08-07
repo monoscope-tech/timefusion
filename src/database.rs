@@ -4349,25 +4349,55 @@ impl Database {
     /// sort writes a file with no `sorting_columns` footer, and one such file
     /// disables the reader's all-or-nothing ordering for every scan touching
     /// the partition. Spilling is the better failure mode.
-    async fn sort_flush_group(&self, schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (FlushBatches, bool) {
+    ///
+    /// `fallback` decides what happens when even that fails — see
+    /// [`UnsortedFallback`]. The two callers want opposite things, and getting
+    /// it wrong is how prod ended up 55% unsorted.
+    async fn sort_flush_group(
+        &self, schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>, fallback: UnsortedFallback,
+    ) -> Result<(FlushBatches, bool)> {
+        // An empty group, or a table declaring no sort order, has no footer to
+        // lose: `sorted = false` there is not a degradation and must not abort.
+        let nothing_to_declare = batches.is_empty() || schema.sorting_columns.is_empty();
         let ceiling = self.config.maintenance.timefusion_sort_skip_bytes;
         let total: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-        if total <= ceiling || batches.is_empty() || schema.sorting_columns.is_empty() {
+        if total <= ceiling || nothing_to_declare {
             // `usize::MAX`: the size decision is made here, so the in-process
             // helper must not second-guess it and silently skip.
-            return sort_batches_by_schema(schema, batches, usize::MAX);
+            let (out, sorted) = sort_batches_by_schema(schema, batches, usize::MAX);
+            // `sort_batches_by_schema` also degrades on its own (schema merge,
+            // row encoding, lexsort), so the guard belongs here, not only on the
+            // escalation branch.
+            anyhow::ensure!(
+                sorted || nothing_to_declare || fallback == UnsortedFallback::Allow,
+                "in-process sort degraded to unsorted on a rewrite path; keeping the committed inputs instead"
+            );
+            return Ok((out, sorted));
         }
         match self.sort_flush_group_spilling(schema, &batches).await {
             Some(sorted) => {
                 debug!("flush sort: escalated {} MB group to the spilling DataFusion sort", total / (1 << 20));
-                (FlushBatches::Ready(sorted.into_iter()), true)
+                Ok((FlushBatches::Ready(sorted.into_iter()), true))
             }
-            // Never lose rows to a sort failure: write the originals unsorted.
-            // Counted because one such file disables the reader's ordering for
-            // its whole partition — this must never be silent (2026-08-03).
             None => {
+                // A REWRITE must not buy a transient failure with a permanent
+                // one. Its inputs are already committed and already sorted, so
+                // aborting costs one compaction cycle; writing the group
+                // unsorted costs the partition's declared ordering FOREVER
+                // (nothing re-sorts a converged file) and, because
+                // `derive_common_ordering` is all-or-nothing, degrades every
+                // scan whose window touches that date.
+                anyhow::ensure!(
+                    fallback == UnsortedFallback::Allow,
+                    "escalated sort of a {} MB rewrite group failed; keeping the committed inputs rather than replacing them with an unsorted file",
+                    total / (1 << 20)
+                );
+                // Ingest has no such choice — the rows exist nowhere else, so
+                // losing them is not on the table. Counted because one such file
+                // disables the reader's ordering for its whole partition — this
+                // must never be silent (2026-08-03).
                 crate::metrics::record_flush_sort_unsorted_fallback();
-                (FlushBatches::Ready(batches.into_iter()), false)
+                Ok((FlushBatches::Ready(batches.into_iter()), false))
             }
         }
     }
@@ -4643,7 +4673,9 @@ impl Database {
         // SortingColumn footer is honest and the page index localizes the lead
         // key. `sorted` is false when a schema-evolved bucket can't be combined
         // (we then write unsorted) — declare the footer only when it's true.
-        let (batches, sorted) = self.sort_flush_group(schema, batches).await;
+        // Ingest: these rows are not committed anywhere else yet, so an unsorted
+        // write beats losing them (`UnsortedFallback::Allow` never errors).
+        let (batches, sorted) = self.sort_flush_group(schema, batches, UnsortedFallback::Allow).await?;
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
         let staging_table = { table_ref.read().await.clone() };
@@ -4805,12 +4837,22 @@ impl Database {
             // (safe=true, add_missing=true mirrors WriteBuilder's own coercion).
             let target_schema = writer.arrow_schema();
             let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
+            let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
             let adds: Vec<Action> = async {
+                let mut staged = Vec::new();
                 for b in batches {
                     let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
                     writer.write(casted).await?;
+                    // A single flush bucket can be enormous (the MemBuffer
+                    // ceiling is GBs), and `RecordBatchWriter::flush` would emit
+                    // it as ONE file. Cut at the ceiling — on a sorted stream
+                    // each piece keeps its footer and stays time-disjoint.
+                    if writer.buffer_len() >= max_file_bytes {
+                        staged.extend(writer.flush().await?);
+                    }
                 }
-                writer.flush().await
+                staged.extend(writer.flush().await?);
+                Ok::<_, deltalake::DeltaTableError>(staged)
             }
             .instrument(stage_span)
             .await
@@ -5114,6 +5156,7 @@ impl Database {
             }
         }
 
+        let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
         let staged: Vec<(usize, (String, String), Result<StagedUnit>)> = stream::iter(stageable)
             .map(|(i, prep, key)| async move {
                 let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, staged_writer, .. } = prep;
@@ -5123,11 +5166,17 @@ impl Database {
                 // columns filled with nulls), mirroring the per-project path.
                 let target_schema = writer.arrow_schema();
                 let adds = async {
+                    let mut staged = Vec::new();
                     for b in batches {
                         let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
                         writer.write(casted).await?;
+                        // Same file-size ceiling as the per-project path.
+                        if writer.buffer_len() >= max_file_bytes {
+                            staged.extend(writer.flush().await?);
+                        }
                     }
-                    writer.flush().await
+                    staged.extend(writer.flush().await?);
+                    Ok::<_, deltalake::DeltaTableError>(staged)
                 }
                 .await
                 .map(|adds| adds.into_iter().map(Action::Add).collect::<Vec<Action>>())
@@ -5938,16 +5987,13 @@ impl Database {
     /// the same top-100 query take 130s across the midnight boundary versus
     /// 0.81s inside today (and OOM past the 2 GiB per-query dedup cap).
     fn select_all_hot_bins(
-        table: &DeltaTable, schema: &crate::schema_loader::TableSchema, today_str: &str, repair_dates: &[String], target_size: i64, min_files: usize,
-        sorted_run_cap: i64,
+        table: &DeltaTable, schema: &crate::schema_loader::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
     ) -> Result<Vec<(String, Vec<String>)>> {
         let date_marker = format!("date={today_str}/");
-        let repair_markers: Vec<String> = repair_dates.iter().map(|d| format!("date={d}/")).collect();
+        let repair_markers: Vec<String> = policy.repair_dates.iter().map(|d| format!("date={d}/")).collect();
         let seal = seal_micros_now();
         // Only a table that declares a sort order has a footer to repair.
         let repairable = !schema.sorting_columns.is_empty();
-        let cap = target_size.max(1);
-        let converged = cap - cap / 8;
         let per_project = table
             .snapshot()?
             .log_data()
@@ -5957,7 +6003,7 @@ impl Database {
             // never reaches the stats parse.
             .filter_map(|file| {
                 let (size, sorted_run) = (file.size(), is_sorted_run(&file.tags()));
-                hot_bin_admits(&file.path(), &date_marker, &repair_markers, size, sorted_run, repairable, converged, sorted_run_cap).then_some(())?;
+                hot_bin_admits(&file.path(), &date_marker, &repair_markers, size, sorted_run, repairable, policy).then_some(())?;
                 // `stats()` is reached only past both tag/size exclusions.
                 let path = file.path();
                 let project_id = path.split('/').find_map(|s| s.strip_prefix("project_id=")).filter(|p| !p.is_empty()).map(str::to_owned)?;
@@ -5971,7 +6017,7 @@ impl Database {
             .into_iter()
             .map(|(project_id, adds)| {
                 let debt = adds.len();
-                (project_id, select_tail_bin(&adds, target_size, min_files, sorted_run_cap, seal), debt)
+                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal), debt)
             })
             .filter(|(_, bin, _)| !bin.is_empty())
             .collect();
@@ -7089,15 +7135,25 @@ impl Database {
                     // Variant struct columns may still be BinaryView if the partition
                     // mixes tiers — cast to Binary so the write accepts the schema.
                     let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-                    let (deduped, sorted) = self.sort_flush_group(schema, deduped).await;
+                    // Rewrite: the files this replaces are committed and sorted.
+                    // Rather than swap them for one unsorted output, fail the bin
+                    // and let the next sweep retry (`Forbid`).
+                    let (deduped, sorted) = self.sort_flush_group(schema, deduped, UnsortedFallback::Forbid).await?;
                     let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
                     let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                         .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
                         .with_writer_properties(writer_properties);
                     let target_schema = writer.arrow_schema();
+                    let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
                     for b in deduped {
                         let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
                         writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
+                        // Bound the output file (see `timefusion_writer_max_file_bytes`):
+                        // a whole-chunk rewrite is exactly where the multi-GB,
+                        // unrepairable files came from.
+                        if writer.buffer_len() >= max_file_bytes {
+                            adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
+                        }
                     }
                     adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
                 }
@@ -8032,17 +8088,27 @@ impl Database {
         let today_str = today.to_string();
         // Sealed dates carried along for footer repair only (see
         // `select_all_hot_bins`), derived from the same virtual clock as `today`.
-        let repair_dates: Vec<String> =
-            (1..=self.config.maintenance.timefusion_light_optimize_repair_days).filter_map(|d| today.checked_sub_days(chrono::Days::new(d))).map(|d| d.to_string()).collect();
+        let repair_dates: Vec<String> = (1..=self.config.maintenance.timefusion_light_optimize_repair_days)
+            .filter_map(|d| today.checked_sub_days(chrono::Days::new(d)))
+            .map(|d| d.to_string())
+            .collect();
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
-        let min_files = self.config.maintenance.timefusion_compact_min_files;
+        let policy = HotBinPolicy {
+            repair_dates: &repair_dates,
+            target_size,
+            min_files: self.config.maintenance.timefusion_compact_min_files,
+            sorted_run_cap: target_size / 2,
+            // A hot tick repairs files up to the size the writers now cap
+            // outputs at; anything larger is legacy and belongs to the off-box CLI.
+            repair_max_bytes: self.config.maintenance.timefusion_writer_max_file_bytes as i64,
+        };
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
         // snapshot (see `plan` below) so a wave never re-selects the run it just
         // wrote. Bins are ordered by compaction debt.
         let mut planned = {
             let table = table_ref.read().await;
-            Self::select_all_hot_bins(&table, schema, &today_str, &repair_dates, target_size, min_files, target_size / 2)?
+            Self::select_all_hot_bins(&table, schema, &today_str, &policy)?
         };
         // Rotation cursor: start where the last truncated tick stopped so the
         // same tail is never skipped twice in a row (a truncated tick otherwise
@@ -8094,7 +8160,7 @@ impl Database {
                 }
             },
             |bins, round| {
-                let (plan, today_str, repair_dates) = (&plan, today_str.as_str(), repair_dates.as_slice());
+                let (plan, today_str, policy) = (&plan, today_str.as_str(), &policy);
                 async move {
                     let staged = bins.len();
                     let failed = self.commit_wave(table_ref, table_name, &[format!("date={today_str}/")], false, bins, round).await.failed.len();
@@ -8114,7 +8180,7 @@ impl Database {
                     if round + 1 < MAX_WAVES && std::time::Instant::now() < deadline {
                         let next = {
                             let table = table_ref.read().await;
-                            Self::select_all_hot_bins(&table, schema, today_str, repair_dates, target_size, min_files, target_size / 2).unwrap_or_default()
+                            Self::select_all_hot_bins(&table, schema, today_str, policy).unwrap_or_default()
                         };
                         *plan.lock().await = next.into_iter().collect();
                     }
@@ -8242,6 +8308,15 @@ impl Database {
                 Err(e) => Err(e),
             }?;
             let mut rows_staged = 0usize;
+            let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
+            let tag_sorted = |mut add: deltalake::kernel::Add| {
+                // Tag the output so the next tick's selection treats it as a
+                // sorted run (folded only while under the sorted-run cap).
+                if sorted {
+                    add.tags.get_or_insert_with(Default::default).insert(SORTED_RUN_TAG.to_string(), Some("true".to_string()));
+                }
+                Action::Add(add)
+            };
             while let Some(batch) = stream.next().await {
                 let batch = cast_variant_columns_to_binary(batch?)?;
                 if batch.num_rows() == 0 {
@@ -8250,20 +8325,20 @@ impl Database {
                 rows_staged += batch.num_rows();
                 let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                 writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
+                // Cut the file at the ceiling instead of buffering the whole bin
+                // into one Add. The cut is on a contiguous slice of the sorted
+                // stream, so each piece keeps an honest footer and the pieces
+                // stay event-time disjoint.
+                if writer.buffer_len() >= max_file_bytes {
+                    adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
+                }
             }
             drop(stream);
             let _ = ctx.deregister_table(&bin_table);
             if rows_staged == 0 {
                 return Ok(());
             }
-            adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(|mut add| {
-                // Tag the output so the next tick's selection treats it as a
-                // sorted run (folded only while under the sorted-run cap).
-                if sorted {
-                    add.tags.get_or_insert_with(Default::default).insert(SORTED_RUN_TAG.to_string(), Some("true".to_string()));
-                }
-                Action::Add(add)
-            }));
+            adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
             Ok(())
         }
         .await;
@@ -9393,6 +9468,29 @@ const MERGE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MERGE_CHUNK_ROWS_MIN: usize = 1_024;
 const MERGE_CHUNK_ROWS_MAX: usize = 65_536;
 
+/// May this caller write a group UNSORTED when the sort can't be completed
+/// within budget?
+///
+/// The asymmetry is the whole point. An unsorted file declares no
+/// `sorting_columns` footer, and the reader's `derive_common_ordering` is
+/// all-or-nothing — ONE of them voids the declared ordering for every scan
+/// touching that partition, dropping `DedupExec` to its unbounded `full-set`
+/// seen-set. Nothing ever re-sorts a converged file, so the cost is permanent.
+/// Prod reached 1,263 of 2,290 active files unsorted (55%, 20 projects) this
+/// way; the median one was 712 MB, i.e. ~12 GB of in-memory Arrow at prod's
+/// ~17x zstd ratio — far past any in-process sort budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsortedFallback {
+    /// INGEST only. The rows exist nowhere else yet, so refusing to write them
+    /// would lose data; an unsorted file is the lesser evil (and is counted).
+    Allow,
+    /// REWRITE paths (dedup / consolidate / compact). Their inputs are already
+    /// committed and already sorted, so failing the rewrite costs one cycle and
+    /// the next tick retries — while replacing those inputs with a single
+    /// unsorted output is an unrecoverable, partition-wide read regression.
+    Forbid,
+}
+
 /// Batches a flush/rewrite writes, either eagerly held or produced on demand by
 /// the streaming sort-merge. Iterating yields writer-sized chunks; the merge
 /// frees each sorted run (and its encoded keys) as it is drained, so the whole
@@ -10147,18 +10245,46 @@ impl TailAdd {
 /// whose window touches that date — forcing `DedupExec` into its unbounded
 /// `full-set` seen-set (prod: 130s vs 0.81s for the same top-100 query, and OOM
 /// past the 2 GiB per-query cap).
-#[allow(clippy::too_many_arguments)]
-fn hot_bin_admits(
-    path: &str, today_marker: &str, repair_markers: &[String], size: i64, sorted_run: bool, repairable: bool, converged: i64, sorted_run_cap: i64,
-) -> bool {
+fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], size: i64, sorted_run: bool, repairable: bool, policy: &HotBinPolicy<'_>) -> bool {
     if path.contains(today_marker) {
-        let converged_done = size >= converged && (sorted_run || !repairable);
-        let over_cap_run = size >= sorted_run_cap && sorted_run;
+        let converged_done = size >= policy.converged() && (sorted_run || !repairable);
+        let over_cap_run = size >= policy.sorted_run_cap && sorted_run;
         return !(converged_done || over_cap_run);
     }
     // Only an unsorted file on a lookback date has repair work left. `repairable`
     // is false for a table that declares no sort order — nothing to repair.
-    repairable && !sorted_run && repair_markers.iter().any(|m| path.contains(m.as_str()))
+    //
+    // `repair_max_bytes` keeps a tick's rewrite bounded. Legacy partitions hold
+    // files far past any current target (prod: up to 2.34 GB, written before
+    // `timefusion_writer_max_file_bytes` bounded the writers); pulling one into
+    // a 5-minute tick is a large read+sort+write for a single file. They still
+    // get repaired — by the off-box `timefusion optimize` CLI, which is where a
+    // multi-GB rewrite belongs — just not from the hot path.
+    repairable && !sorted_run && size <= policy.repair_max_bytes && repair_markers.iter().any(|m| path.contains(m.as_str()))
+}
+
+/// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
+/// travel together through planning, admission and binning.
+struct HotBinPolicy<'a> {
+    /// SEALED dates (yesterday backwards) scanned for footer repair only.
+    /// Empty restores the old today-only pass.
+    repair_dates: &'a [String],
+    target_size: i64,
+    min_files: usize,
+    sorted_run_cap: i64,
+    /// Largest file a hot tick will rewrite to repair its footer. Bigger ones
+    /// are legacy (pre-`timefusion_writer_max_file_bytes`) and belong to the
+    /// off-box `timefusion optimize` CLI, not a 5-minute tick.
+    repair_max_bytes: i64,
+}
+
+impl HotBinPolicy<'_> {
+    /// A file at or past 7/8 of target is "converged" — re-selecting it alone
+    /// would rewrite it 1→1 forever.
+    fn converged(&self) -> i64 {
+        let cap = self.target_size.max(1);
+        cap - cap / 8
+    }
 }
 
 pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64) -> Vec<String> {
@@ -13423,14 +13549,20 @@ mod tests {
     /// window crossed that date (prod project 6297304f: 130s vs 0.81s).
     #[test]
     fn hot_bin_admits_repairs_sealed_dates_without_rebinning_them() {
-        const TARGET: i64 = 1000;
-        const CONVERGED: i64 = TARGET - TARGET / 8; // 875
-        const CAP: i64 = TARGET / 2;
+        const TARGET: i64 = 1000; // → converged at 7/8 = 875
+        const REPAIR_MAX: i64 = 2000; // hot ticks repair up to here; larger is off-box CLI work
         let today = "date=2026-08-06/";
         let repair: Vec<String> = vec!["date=2026-08-05/".into()];
         let p = |d: &str| format!("timefusion/otel_logs_and_spans/project_id=abc/{d}part-x.parquet");
-        let admits =
-            |path: &str, size, sorted, repairable| super::hot_bin_admits(path, today, &repair, size, sorted, repairable, CONVERGED, CAP);
+        let policy = |repair_dates: &'static [String]| super::HotBinPolicy {
+            repair_dates,
+            target_size: TARGET,
+            min_files: 2,
+            sorted_run_cap: TARGET / 2,
+            repair_max_bytes: REPAIR_MAX,
+        };
+        let with_repair = super::HotBinPolicy { repair_dates: &repair, ..policy(&[]) };
+        let admits = |path: &str, size, sorted, repairable| super::hot_bin_admits(path, today, &repair, size, sorted, repairable, &with_repair);
 
         // TODAY — unchanged behaviour.
         assert!(admits(&p(today), 10, false, true), "small file today packs");
@@ -13444,6 +13576,10 @@ mod tests {
         assert!(!admits(&p(sealed), 10, true, true), "a SORTED small file on a sealed date must NOT be re-binned — settled history stays put");
         assert!(!admits(&p(sealed), 900, true, true), "nor a sorted converged one");
         assert!(!admits(&p(sealed), 900, false, false), "a table declaring no sort order has no footer to repair");
+        // A legacy multi-GB file must NOT be dragged into a 5-minute tick; the
+        // off-box CLI owns those. (Prod holds actives up to 2.34 GB.)
+        assert!(!admits(&p(sealed), REPAIR_MAX + 1, false, true), "an oversized legacy file is left to the off-box optimize CLI");
+        assert!(admits(&p(sealed), REPAIR_MAX, false, true), "exactly at the ceiling is still hot-repairable");
 
         // OUTSIDE the lookback window — untouched at any size or tag.
         let old = "date=2026-07-01/";
@@ -13451,10 +13587,7 @@ mod tests {
         assert!(!admits(&p(old), 900, false, true));
 
         // Lookback 0 restores today-only behaviour.
-        assert!(
-            !super::hot_bin_admits(&p(sealed), today, &[], 900, false, true, CONVERGED, CAP),
-            "empty repair window == the old today-only pass"
-        );
+        assert!(!super::hot_bin_admits(&p(sealed), today, &[], 900, false, true, &policy(&[])), "empty repair window == the old today-only pass");
     }
 
     /// Wave commit blast radius: ONE stale bin must lose only its own actions.
@@ -14057,6 +14190,50 @@ mod tests {
         Arc::new(cfg)
     }
 
+    /// A REWRITE must never buy a transient sort failure with a permanent read
+    /// regression. Its inputs are already committed and already sorted, so
+    /// replacing them with one unsorted output voids the partition's declared
+    /// ordering forever (`derive_common_ordering` is all-or-nothing, and nothing
+    /// re-sorts a converged file). Prod reached 55% of active files unsorted
+    /// this way. Ingest keeps the fallback — its rows exist nowhere else.
+    ///
+    /// Degradation is forced here by an unmergeable schema (`id` Utf8 vs Int64),
+    /// which is one of the several ways `sort_batches_by_schema` gives up — so
+    /// the guard is exercised on the in-process path, not just on escalation.
+    #[tokio::test]
+    async fn rewrite_aborts_rather_than_writing_an_unsorted_file() -> Result<()> {
+        use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
+        let db = Database::with_config(create_test_config("rewrite-no-unsorted")).await?;
+        let table = get_schema("otel_logs_and_spans").expect("registered");
+        let batch = |id: ArrayRef| {
+            let ts: TimestampMicrosecondArray = (0..4i64).map(Some).collect();
+            let schema = arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("timestamp", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
+                arrow_schema::Field::new("id", id.data_type().clone(), false),
+            ]);
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts) as ArrayRef, id]).unwrap()
+        };
+        let conflicting = || {
+            vec![batch(Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef), batch(Arc::new(Int64Array::from(vec![1i64, 2, 3, 4])) as ArrayRef)]
+        };
+
+        // `FlushBatches` is a lazy iterator, not `Debug` — match rather than `expect_err`.
+        let err = match db.sort_flush_group(table, conflicting(), UnsortedFallback::Forbid).await {
+            Ok(_) => panic!("a rewrite must fail, not silently degrade to an unsorted file"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("keeping the committed inputs"), "the error must say the inputs were kept, got: {err}");
+
+        // Ingest still degrades rather than losing rows — and says so honestly.
+        let (_, sorted) = db.sort_flush_group(table, conflicting(), UnsortedFallback::Allow).await?;
+        assert!(!sorted, "ingest writes the group unsorted and must NOT claim a sorted footer");
+
+        // An empty group has no footer to lose: not a degradation, never an abort.
+        let (_, sorted) = db.sort_flush_group(table, vec![], UnsortedFallback::Forbid).await?;
+        assert!(!sorted, "empty group is trivially unsorted but must not abort a rewrite");
+        Ok(())
+    }
+
     /// prod 2026-08-03 ~21:00Z: escalated flush sorts starved their own shared
     /// FairSpillPool and silently wrote UNSORTED files. Each plan fanned out to
     /// `MAINTENANCE_MAX_PARTITIONS` ExternalSorters (32 MB merge reservation
@@ -14092,7 +14269,7 @@ mod tests {
             })
             .collect();
 
-        let (out, escalated) = db.sort_flush_group(table, batches).await;
+        let (out, escalated) = db.sort_flush_group(table, batches, UnsortedFallback::Allow).await?;
         assert!(escalated, "the spilling sort starved its own pool and fell back to writing unsorted");
         let FlushBatches::Ready(it) = out else { panic!("escalated path yields Ready batches") };
         let sorted: Vec<RecordBatch> = it.collect();
