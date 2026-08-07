@@ -93,26 +93,98 @@ pub fn ordered_children(
     children: &[Arc<dyn ExecutionPlan>], req: &LexOrdering, fetch: Option<usize>, sortable: &[bool], require_ordered_child: bool,
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
     let sat: Vec<bool> = children.iter().map(|c| c.properties().equivalence_properties().ordering_satisfy(req.iter().cloned())).collect::<Result<Vec<_>>>()?;
-    let unsortable = |i: usize| !sortable.get(i).copied().unwrap_or(true);
-    let leave_alone = sat.iter().all(|&s| s) || sat.iter().enumerate().any(|(i, &s)| !s && unsortable(i)) || (require_ordered_child && !sat.iter().any(|&s| s));
-    Ok((!leave_alone).then(|| {
-        children
-            .iter()
-            .zip(sat)
-            // `preserve_partitioning`: sort each input partition independently
-            // (in parallel) and keep them, rather than requiring — and getting —
-            // a `CoalescePartitionsExec` that serialises the leg. Per-partition
-            // ordering is what the union advertises and what the merge above
-            // consumes, so this is the cheaper shape for both callers.
-            .map(|(c, s)| {
-                if s {
-                    Arc::clone(c)
-                } else {
-                    Arc::new(SortExec::new(req.clone(), Arc::clone(c)).with_preserve_partitioning(true).with_fetch(fetch)) as Arc<dyn ExecutionPlan>
+    if sat.iter().all(|&s| s) || (require_ordered_child && !sat.iter().any(|&s| s)) {
+        return Ok(None);
+    }
+    // `preserve_partitioning`: sort each input partition independently (in
+    // parallel) and keep them, rather than requiring — and getting — a
+    // `CoalescePartitionsExec` that serialises the leg. Per-partition ordering
+    // is what the union advertises and what the merge above consumes, so this
+    // is the cheaper shape for both callers.
+    let sort = |c: &Arc<dyn ExecutionPlan>| Arc::new(SortExec::new(req.clone(), Arc::clone(c)).with_preserve_partitioning(true).with_fetch(fetch)) as _;
+    let mut out = Vec::with_capacity(children.len());
+    for (i, (child, s)) in children.iter().zip(sat).enumerate() {
+        out.push(match (s, sortable.get(i).copied().unwrap_or(true)) {
+            (true, _) => Arc::clone(child),
+            (false, true) => sort(child),
+            // An unsortable leg (a whole-window parquet scan) must not grow a
+            // blocking sort — but it may still be a UNION whose branches are
+            // only partly unordered, which is the shape the delta-rs fork
+            // produces when a handful of files carry no `sorting_columns`
+            // footer. Sorting just those branches costs a fraction of the leg
+            // and restores the ordering the whole scan lost.
+            (false, false) => match recover_nested_ordering(child, req, fetch)? {
+                Some(fixed) => {
+                    NESTED_ORDERING_RECOVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    fixed
                 }
-            })
-            .collect()
-    }))
+                None => return Ok(None),
+            },
+        });
+    }
+    Ok(Some(out))
+}
+
+/// Largest unordered branch (bytes) we will sort to recover a leg's ordering.
+/// The point is to rescue a leg poisoned by a few stragglers, never to sort a
+/// whole window: past this the leg stays unordered and the caller bails, which
+/// is the pre-existing behaviour.
+const MAX_NESTED_SORT_BYTES: usize = 512 * 1024 * 1024;
+
+/// Rewrites of this shape actually applied — a steady climb means the footer
+/// repair still has stragglers; a steady zero means every scan declares.
+pub static NESTED_ORDERING_RECOVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Legs left unordered because the unordered branch was too big to sort.
+pub static NESTED_ORDERING_TOO_BIG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn branch_bytes(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    plan.partition_statistics(None).ok().and_then(|s| s.total_byte_size.get_value().copied()).unwrap_or(usize::MAX)
+}
+
+/// Make `plan` satisfy `req` by sorting only the unordered branches of a union
+/// nested inside it. Descends through single-child operators and *verifies* the
+/// rewrite (`ordering_satisfy` on the rebuilt node) rather than assuming any
+/// operator propagates ordering — `DeltaScanExec` re-derives its ordering from
+/// its input yet leaves `maintains_input_order` at the default `false`, so a
+/// declaration-based descent would give up on exactly the plan this exists for.
+fn recover_nested_ordering(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<usize>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(here) = resolve_ordering(req, &plan.schema()) else { return Ok(None) };
+    let rewritten = match downcast::<UnionExec>(plan.as_ref()) {
+        Some(union) => {
+            let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
+            let sat: Vec<bool> =
+                children.iter().map(|c| c.properties().equivalence_properties().ordering_satisfy(here.iter().cloned())).collect::<Result<Vec<_>>>()?;
+            // Mixed only: with no ordered branch there is nothing to merge
+            // toward and this would sort the entire leg.
+            if sat.iter().all(|&s| s) || !sat.iter().any(|&s| s) {
+                return Ok(None);
+            }
+            let unordered_bytes: usize = children.iter().zip(&sat).filter(|(_, s)| !**s).map(|(c, _)| branch_bytes(c)).sum();
+            if unordered_bytes > MAX_NESTED_SORT_BYTES {
+                NESTED_ORDERING_TOO_BIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(None);
+            }
+            let ordered: Vec<Arc<dyn ExecutionPlan>> = children
+                .iter()
+                .zip(sat)
+                .map(|(c, s)| match s {
+                    true => Arc::clone(c),
+                    false => Arc::new(SortExec::new(here.clone(), Arc::clone(c)).with_preserve_partitioning(true).with_fetch(fetch)) as _,
+                })
+                .collect();
+            UnionExec::try_new(ordered)? as Arc<dyn ExecutionPlan>
+        }
+        None => {
+            let children = plan.children();
+            if children.len() != 1 {
+                return Ok(None);
+            }
+            let Some(child) = recover_nested_ordering(children[0], req, fetch)? else { return Ok(None) };
+            Arc::clone(plan).with_new_children(vec![child])?
+        }
+    };
+    // Self-validating: adopt only if the rebuilt node really does satisfy `req`.
+    Ok(rewritten.properties().equivalence_properties().ordering_satisfy(here.iter().cloned())?.then_some(rewritten))
 }
 
 /// Walk down from a fetching sort through single-child order-preserving
@@ -213,14 +285,19 @@ mod tests {
     #[derive(Debug)]
     struct MockLeaf {
         props: Arc<PlanProperties>,
+        bytes: usize,
     }
 
     impl MockLeaf {
         fn leaf(schema: SchemaRef, ordering: Option<LexOrdering>) -> Arc<dyn ExecutionPlan> {
+            Self::sized(schema, ordering, 1024)
+        }
+
+        fn sized(schema: SchemaRef, ordering: Option<LexOrdering>, bytes: usize) -> Arc<dyn ExecutionPlan> {
             // `Option<LexOrdering>` is an iterator of 0..1 orderings — no branch needed.
             let eq = EquivalenceProperties::new_with_orderings(schema, ordering);
             let props = Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), EmissionType::Incremental, Boundedness::Bounded));
-            Arc::new(MockLeaf { props })
+            Arc::new(MockLeaf { props, bytes })
         }
     }
 
@@ -245,6 +322,11 @@ mod tests {
         }
         fn execute(&self, _p: usize, _c: Arc<datafusion::execution::TaskContext>) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
             unimplemented!()
+        }
+        fn partition_statistics(&self, _p: Option<usize>) -> Result<Arc<datafusion::common::Statistics>> {
+            let mut s = datafusion::common::Statistics::new_unknown(&self.schema());
+            s.total_byte_size = datafusion::common::stats::Precision::Exact(self.bytes);
+            Ok(Arc::new(s))
         }
     }
 
@@ -307,7 +389,7 @@ mod tests {
         assert_eq!(count_sorts(&out[0]), 1, "the mem leg is sorted");
         assert_eq!(count_sorts(&out[1]), 0, "the already-ordered Delta leg is untouched");
 
-        // mem (sortable) ∪ delta (UNORDERED, unsortable) → bail entirely: a
+        // mem (sortable) ∪ delta (UNORDERED LEAF, unsortable) → bail entirely: a
         // blocking sort over a whole-window parquet scan is the 2026-07-21 OOM.
         assert!(ordered_children(&[mem.clone(), delta_unordered], &ord, None, &[true, false], false).unwrap().is_none());
 
@@ -316,6 +398,54 @@ mod tests {
         assert!(ordered_children(std::slice::from_ref(&mem), &ord, None, &[true], false).unwrap().is_some());
         // ...unless the caller is the top-K rule, which requires an ordered peer.
         assert!(ordered_children(std::slice::from_ref(&mem), &ord, None, &[true], true).unwrap().is_none());
+    }
+
+    /// The production Delta leg: a `DeltaScanExec`-style wrapper over the union
+    /// the delta-rs fork builds when some files carry no `sorting_columns`
+    /// footer — an ordered branch plus an isolated non-declaring one.
+    fn delta_leg(s: &SchemaRef, ord: &LexOrdering, unordered_bytes: usize) -> Arc<dyn ExecutionPlan> {
+        let inner = UnionExec::try_new(vec![
+            MockLeaf::sized(s.clone(), Some(ord.clone()), 8 << 30),
+            MockLeaf::sized(s.clone(), None, unordered_bytes),
+        ])
+        .unwrap();
+        Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(datafusion::physical_expr::expressions::lit(true), inner).unwrap())
+    }
+
+    // Regression (prod 2026-08-07): a 30-day scan of `otel_logs_and_spans` had
+    // 25 of 30 files declaring `[timestamp DESC]` and 5 declaring nothing. The
+    // Delta leg is unsortable, so `ordered_children` bailed, the mem∪delta union
+    // advertised no ordering, and `DedupExec` fell back to `full-set` mode —
+    // which buffered the whole 62M-row scan and failed the query at its 2 GiB
+    // ceiling. Sorting only the isolated non-declaring BRANCH restores the leg's
+    // ordering for a fraction of the cost.
+    #[test]
+    fn recovers_ordering_by_sorting_only_the_non_declaring_branch() {
+        let (s, ord) = (schema(), ts_desc());
+        let mem = MockLeaf::leaf(s.clone(), None);
+        let delta = delta_leg(&s, &ord, 16 << 20);
+
+        let out = ordered_children(&[mem, delta], &ord, None, &[true, false], false).unwrap().expect("nested mixed union is recoverable");
+
+        assert!(
+            out[1].properties().equivalence_properties().ordering_satisfy(ord.iter().cloned()).unwrap(),
+            "the Delta leg must advertise the ordering after the rewrite"
+        );
+        // One sort over the mem leg, one over the non-declaring branch only —
+        // NOT one over the whole Delta leg.
+        assert_eq!(count_sorts(&out[0]), 1, "mem leg sorted");
+        assert_eq!(count_sorts(&out[1]), 1, "exactly one sort, over the non-declaring branch");
+    }
+
+    // Guard: the rescue is bounded. A non-declaring branch bigger than
+    // `MAX_NESTED_SORT_BYTES` is a whole-window sort by another name, so the
+    // leg stays unordered and the caller bails as it did before.
+    #[test]
+    fn refuses_to_sort_an_oversized_non_declaring_branch() {
+        let (s, ord) = (schema(), ts_desc());
+        let mem = MockLeaf::leaf(s.clone(), None);
+        let delta = delta_leg(&s, &ord, MAX_NESTED_SORT_BYTES + 1);
+        assert!(ordered_children(&[mem, delta], &ord, None, &[true, false], false).unwrap().is_none());
     }
 
     // Guard: when no child is ordered (Delta pushdown off during mixed-footer
