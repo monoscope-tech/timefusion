@@ -8165,7 +8165,32 @@ impl Database {
                         return (project_id, Ok(BinOutcome::Converged));
                     }
                     info!(table_name, project_id, date = %today, selected_files = files.len(), round, event = "light_optimize_tail_selected");
-                    let staged = self.stage_hot_bin(table_ref, table_name, schema, &project_id, files).await;
+                    // Bound the bin by what is LEFT of the tick, the same way
+                    // the dedup drain bounds its own staging. Without it a
+                    // single slow bin runs past the budget and the invocation
+                    // never returns, so the cron cannot re-plan: prod
+                    // 2026-08-07 planned once, committed 5 of 14 bins, logged
+                    // `light_optimize_tick_budget_exhausted`, and then sat for
+                    // 30+ minutes with `cron_long_running` climbing while the
+                    // repair backlog stopped draining entirely. (Changing the
+                    // per-file size ceiling 3 GiB -> 1 GiB did nothing, which is
+                    // what ruled the cause out as bytes and in as wall clock.)
+                    //
+                    // Discarding a timed-out bin is safe and already the
+                    // established trade here: its parquet is uploaded but
+                    // uncommitted, so it falls to VACUUM, and the next tick
+                    // re-selects the same files.
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        // Out of budget before we began: report nothing staged
+                        // rather than a failure, so the truncation path (not the
+                        // error path) accounts for it.
+                        return (project_id, Ok(BinOutcome::Converged));
+                    }
+                    let staged = match tokio::time::timeout(left, self.stage_hot_bin(table_ref, table_name, schema, &project_id, files)).await {
+                        Ok(staged) => staged,
+                        Err(_) => Err(anyhow::anyhow!("hot bin staging exceeded the {left:?} left in the tick budget")),
+                    };
                     (project_id, staged)
                 }
             },
