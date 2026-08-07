@@ -152,8 +152,26 @@ impl Bound {
     /// run (state built for the old run may then be dropped). A run opens on the
     /// first row ever, or on a value strictly past `last` in the sort direction.
     fn advance(&mut self, t: i64) -> bool {
+        // A value moving AGAINST the declared direction proves this scan's
+        // advertised ordering is false — a parquet footer's `sorting_columns` is
+        // lying. Dedup stays sound either way (`dedup_key_idxs`), but this is the
+        // only direct signal that the hot-tail footer repair still has work to
+        // do; a zero here across prod would exonerate footers entirely and send
+        // the 2026-08-07 under-count investigation elsewhere.
+        if let Some(l) = self.last
+            && if self.desc { t > l } else { t < l }
+        {
+            ORDERING_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.last.is_none_or(|l| if self.desc { t < l } else { t > l }) && self.last.replace(t).is_some()
     }
+}
+
+/// Rows observed out of the order their scan declared. See `Bound::advance`.
+pub(crate) static ORDERING_VIOLATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn ordering_violations() -> u64 {
+    ORDERING_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The i64-backed values of a bound column (timestamps / Int64), for cheap
@@ -180,10 +198,60 @@ fn sort_col(se: &datafusion::physical_expr::PhysicalSortExpr) -> Option<&datafus
     crate::optimizers::downcast(se.expr.as_ref())
 }
 
+/// Emergency kill switch for bounded[timestamp] dedup. Defaults ON.
+///
+/// Correctness does NOT depend on this — `dedup_key_idxs` keeps the operator
+/// sound under a lying footer. Turning it off is a big hammer with a real cost:
+/// bounded mode is what lets keep-greatest emit per run instead of buffering to
+/// end-of-stream, so disabling it also disables LIMIT early termination
+/// (`keep_greatest_limit_terminates_early` runs unbounded and does not finish).
+/// A "top 100" log-explorer query would scan the whole window. Reach for it only
+/// if a bounded scan is proven to be serving wrong rows again.
+static BOUNDED_DEDUP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn bounded_dedup_enabled() -> bool {
+    *BOUNDED_DEDUP_ENABLED.get_or_init(|| true)
+}
+
+/// Set the bounded-dedup kill switch. No-op after the first call (OnceLock).
+pub fn set_bounded_dedup_enabled(enabled: bool) {
+    let _ = BOUNDED_DEDUP_ENABLED.set(enabled);
+}
+
+/// The dedup key columns to hash, given the chosen bound.
+///
+/// The bound column is ALWAYS retained. It used to be filtered out here: within
+/// a *genuinely* sorted run the bound is constant, so encoding it into every key
+/// is redundant, and dropping it saved one timestamp encoding per physical row.
+///
+/// That reasoning holds only while the declared ordering is TRUE. A parquet
+/// footer missing/misreporting `sorting_columns` makes a scan declare
+/// `output_ordering=[timestamp DESC]` over data that is not in that order (see
+/// the hot-tail footer repair). The bound then never advances across the
+/// mis-ordered stretch, one "run" spans many timestamps, and a key reduced to
+/// `id` alone collapses rows that differ only in `timestamp` — distinct rows.
+/// Prod 2026-08-07: a single minute read 132 rows instead of 1620, surfacing as
+/// multi-minute holes in customer dashboards.
+///
+/// Keeping the bound in the key makes bounded mode fail-SAFE: a false ordering
+/// can now only under-dedup (emit a duplicate), never drop a distinct row.
+fn dedup_key_idxs(bound: Option<&Bound>, key_idxs: &[usize]) -> Vec<usize> {
+    let _ = bound;
+    key_idxs.to_vec()
+}
+
 /// Enable bounded mode iff the input's leading sort column is a dedup key of an
-/// i64-backed type. That guarantees equal dedup keys share the bound value, so
-/// clearing on a bound advance can never evict a key that could still recur.
-fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &SchemaRef) -> Option<Bound> {
+/// i64-backed type AND `timefusion_read_dedup_bounded` is on.
+///
+/// The ordering here is *declared*, never verified — `output_ordering()` is only
+/// as trustworthy as the parquet footer behind it. `dedup_key_idxs` keeps the
+/// operator sound when that declaration lies; the flag is the kill switch for
+/// when it lies badly enough to matter, and defaults OFF until the footer repair
+/// has drained the poisoned files.
+fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &SchemaRef, enabled: bool) -> Option<Bound> {
+    if !enabled {
+        return None;
+    }
     let se = input.properties().output_ordering()?.iter().next()?;
     let col = sort_col(se)?;
     (keys.iter().any(|k| k == col.name()) && matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))).then(|| Bound {
@@ -302,7 +370,7 @@ impl DisplayAs for DedupExec {
         // Reading `full-set` alone used to hide that difference, and under
         // merge-on-read keep-first silently serves the pre-update row.
         let survivor = if self.tiebreak.as_ref().is_some_and(|tb| in_schema.index_of(tb).is_ok()) { "greatest" } else { "first" };
-        match detect_bound(&self.input, &self.keys, &in_schema) {
+        match detect_bound(&self.input, &self.keys, &in_schema, bounded_dedup_enabled()) {
             Some(b) => write!(f, "bounded[{}]/{survivor}", in_schema.field(b.idx).name()),
             None => write!(f, "full-set/{survivor}"),
         }
@@ -351,18 +419,8 @@ impl ExecutionPlan for DedupExec {
             return Err(DataFusionError::Internal(format!("DedupExec only produces partition 0, got {partition}")));
         }
         let in_schema = self.input.schema();
-        let bound = detect_bound(&self.input, &self.keys, &in_schema);
-        // Within a bounded run the bound column is constant, and both `seen`
-        // and `greatest.best` are cleared when that value advances. Encoding it
-        // into every hash key is therefore redundant. Production's key is
-        // `(timestamp, id)` bounded by timestamp, so this removes one timestamp
-        // encoding from every physical row while preserving full composite-key
-        // identity across runs. Retain it for a one-column key so RowConverter
-        // never receives an empty schema.
-        let key_idxs = match &bound {
-            Some(bound) if self.key_idxs.len() > 1 => self.key_idxs.iter().copied().filter(|idx| *idx != bound.idx).collect(),
-            _ => self.key_idxs.clone(),
-        };
+        let bound = detect_bound(&self.input, &self.keys, &in_schema, bounded_dedup_enabled());
+        let key_idxs = dedup_key_idxs(bound.as_ref(), &self.key_idxs);
         // A bound lets keep-greatest emit per run without buffering the stream,
         // so it is the preferred shape — but it is no longer REQUIRED. Refusing
         // to run unbounded is what forced `version_append` scans to manufacture
@@ -959,6 +1017,59 @@ mod tests {
         assert_eq!(o2.num_rows(), 1, "(a,11) survives once; second (a,11) is a same-run dup");
         assert_eq!(seen.len(), 1, "seen-set bounded to the current run, not O(all distinct)");
         assert_eq!(bound.last, Some(11));
+    }
+
+    /// A parquet footer that DECLARES `timestamp DESC` over data not actually in
+    /// that order makes the bound never advance, so one "run" spans many
+    /// timestamps. Reducing the key to `id` alone (the old optimisation) then
+    /// collapsed rows differing only in `timestamp` — distinct rows. Prod
+    /// 2026-08-07: one minute read 132 rows instead of 1620, seen by customers
+    /// as multi-minute holes in their dashboards.
+    #[test]
+    fn bounded_dedup_false_ordering_does_not_collapse_distinct_timestamps() {
+        // Declared DESC, actually ASCENDING — the footer lied.
+        let mut bound = Bound { idx: 1, desc: true, last: None };
+        let b = batch(&["a", "a"], &[5, 10]);
+
+        // The reduced key (`id` only) is what lost the rows.
+        let reduced = RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
+        let mut seen = SeenSet::default();
+        let lost = dedup_first(&b, &keys_of(&b, &[0], &reduced), &mut seen, None, Some(&mut bound)).unwrap().unwrap();
+        assert_eq!(lost.num_rows(), 1, "documents the old bug: (a,5) and (a,10) collapsed");
+
+        // `dedup_key_idxs` must therefore RETAIN the bound column, making the
+        // operator fail-safe under a false ordering.
+        assert_eq!(dedup_key_idxs(Some(&Bound { idx: 1, desc: true, last: None }), &[0, 1]), vec![0, 1], "bound column must stay in the dedup key");
+
+        let full = RowConverter::new(vec![SortField::new(DataType::Utf8), SortField::new(DataType::Int64)]).unwrap();
+        let mut bound2 = Bound { idx: 1, desc: true, last: None };
+        let mut seen2 = SeenSet::default();
+        let kept = dedup_first(&b, &keys_of(&b, &[0, 1], &full), &mut seen2, None, Some(&mut bound2)).unwrap().unwrap();
+        assert_eq!(kept.num_rows(), 2, "(a,5) and (a,10) are DISTINCT rows and must both survive");
+    }
+
+    /// The kill switch must actually reach `detect_bound`: with bounded dedup
+    /// disabled, no ordering — however confidently declared — selects bounded
+    /// mode. It defaults ON (disabling it also disables LIMIT early
+    /// termination), so correctness must not depend on it.
+    #[test]
+    fn bounded_dedup_kill_switch_forces_full_set() {
+        let plan = greatest_plan(vec![vbatch(&["a", "a"], &[5, 10], &[Some(1), Some(2)])]);
+        let schema = plan.input.schema();
+        assert!(detect_bound(&plan.input, &plan.keys, &schema, false).is_none(), "flag off ⇒ full-set regardless of declared ordering");
+        assert!(bounded_dedup_enabled(), "default must stay ON: full-set has no LIMIT early termination");
+    }
+
+    /// An out-of-order row must be COUNTED, so prod can tell whether footers
+    /// actually lie rather than inferring it.
+    #[test]
+    fn advance_counts_declared_ordering_violations() {
+        let before = ordering_violations();
+        let mut b = Bound { idx: 0, desc: true, last: None };
+        b.advance(10); // first row: no baseline, no violation
+        b.advance(5); // DESC-consistent
+        b.advance(9); // moves back UP under a DESC claim → violation
+        assert_eq!(ordering_violations(), before + 1);
     }
 
     /// EXPLAIN must say WHICH seen-set mode a scan will run. `full-set` retains

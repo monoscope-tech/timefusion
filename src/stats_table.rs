@@ -274,6 +274,13 @@ impl StatsTableProvider {
             "retry_exhausted_total" => d.retry_exhausted,
         ];
 
+        // NONZERO = a scan advertised an ordering its data does not honour, i.e.
+        // a parquet footer's `sorting_columns` is lying. Drives the hot-tail
+        // footer repair; see read_dedup::Bound::advance.
+        let read_dedup = rows![@atomic "read_dedup";
+            "ordering_violations_total" => crate::read_dedup::ORDERING_VIOLATIONS,
+        ];
+
         let m = crate::metrics::maintenance_stats();
         let maintenance = rows![@atomic "maintenance";
             "checkpoints_created" => m.checkpoints_created,
@@ -490,7 +497,8 @@ impl StatsTableProvider {
             ]
         });
 
-        let rows: Vec<Row> = [budget, layer, dml, maintenance, plan_cache, scan, foyer, logical_count, parquet, cache_sizes].into_iter().flatten().collect();
+        let rows: Vec<Row> =
+            [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, parquet, cache_sizes].into_iter().flatten().collect();
         let cols: Vec<ArrayRef> = vec![
             Arc::new(rows.iter().map(|r| Some(r.0)).collect::<StringArray>()),
             Arc::new(rows.iter().map(|r| Some(r.1.as_str())).collect::<StringArray>()),

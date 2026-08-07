@@ -1956,6 +1956,19 @@ pub struct MaintenanceConfig {
     /// validated on prod-shaped data.
     #[serde(default)]
     pub timefusion_read_dedup_skip_swept: bool,
+    /// Allow `DedupExec` to run in streaming `bounded[timestamp]` mode, which
+    /// trusts the scan's DECLARED `output_ordering` — i.e. the parquet footer's
+    /// `sorting_columns`. A footer that lies makes one "run" span many
+    /// timestamps; prod 2026-08-07 read 132 rows where 1620 existed, surfacing
+    /// as multi-minute holes in customer dashboards.
+    ///
+    /// Defaults ON: the row loss came from bounded mode ALSO dropping the bound
+    /// column from the dedup key, which `dedup_key_idxs` no longer does. This is
+    /// only an emergency kill switch, and not a cheap one — bounded mode carries
+    /// LIMIT early termination, so turning it off makes "top N" queries scan the
+    /// whole window.
+    #[serde(default = "d_true")]
+    pub timefusion_read_dedup_bounded: bool,
     /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only
     /// fires when the window is fully flushed, dedup-provably-clean, and
