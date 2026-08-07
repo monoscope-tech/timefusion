@@ -869,7 +869,7 @@ impl QueryHook for PlanCacheHook {
     /// Trailing placeholders the mixed path injects — the Parse/Describe path
     /// hides these from the client's ParameterDescription. Equals the number of
     /// values `extra_execute_params` appends for the same statement.
-    fn injected_param_count(&self, statement: &Statement) -> usize {
+    fn injected_param_count(&self, statement: Option<&Statement>) -> usize {
         self.extra_execute_params(statement).len()
     }
 
@@ -878,9 +878,11 @@ impl QueryHook for PlanCacheHook {
     /// client's params before substitution, so `now()` is re-evaluated on every
     /// execute. Empty for the pure path (M=0, substituted at parse) and for any
     /// statement we didn't shape-cache — surplus is ignored by the executor.
-    fn extra_execute_params(&self, statement: &Statement) -> Vec<ScalarValue> {
-        // `None` base = the pure path (substituted at parse) or a statement we
-        // never shape-cached — nothing to inject either way.
+    fn extra_execute_params(&self, statement: Option<&Statement>) -> Vec<ScalarValue> {
+        // `None` statement = a bulk data statement whose AST the portal store
+        // no longer pins; `None` base = the pure path (substituted at parse) or
+        // a statement we never shape-cached. Nothing to inject either way.
+        let Some(statement) = statement else { return Vec::new() };
         self.mixed_time_fn_base(statement).and_then(|base| parameterize_statement(statement, base, false)).map_or_else(Vec::new, |(_, values)| values)
     }
 
@@ -891,7 +893,7 @@ impl QueryHook for PlanCacheHook {
     }
 
     async fn handle_extended_query(
-        &self, _statement: &Statement, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext, _client: &mut dyn HookClient,
+        &self, _statement: Option<&Statement>, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext, _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         // Only intercept DML — for SELECTs the vendored path is fine.
         // The win here is post-substitution constant folding of `CAST(Literal, T)`
@@ -1065,19 +1067,23 @@ mod tests {
         let hook = PlanCacheHook::new(64, true);
         let mixed = parse("SELECT id FROM t WHERE project_id = $1 AND ts > now() - INTERVAL '1 hour'");
         // Two executes → two fresh instants (never frozen), one value each ($2).
-        let a = hook.extra_execute_params(&mixed);
-        let b = hook.extra_execute_params(&mixed);
+        let a = hook.extra_execute_params(Some(&mixed));
+        let b = hook.extra_execute_params(Some(&mixed));
         assert_eq!(a.len(), 1);
         match (&a[0], &b[0]) {
             (ScalarValue::TimestampNanosecond(Some(x), _), ScalarValue::TimestampNanosecond(Some(y), _)) => assert!(y >= x, "monotonic fresh instant"),
             _ => panic!("expected tz-aware nanosecond timestamps"),
         }
         // Pure path (no client bind) substitutes at parse → no execute-time extras.
-        assert!(hook.extra_execute_params(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now()")).is_empty());
+        assert!(hook.extra_execute_params(Some(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now()"))).is_empty());
         // No time fn → nothing to inject.
-        assert!(hook.extra_execute_params(&parse("SELECT id FROM t WHERE project_id = $1")).is_empty());
+        assert!(hook.extra_execute_params(Some(&parse("SELECT id FROM t WHERE project_id = $1"))).is_empty());
         // Flag off → feature disabled entirely.
-        assert!(PlanCacheHook::new(64, false).extra_execute_params(&mixed).is_empty());
+        assert!(PlanCacheHook::new(64, false).extra_execute_params(Some(&mixed)).is_empty());
+        // Bulk data statements no longer pin their AST past Parse; nothing to
+        // inject into one, so a dropped AST must not panic or over-count.
+        assert!(hook.extra_execute_params(None).is_empty());
+        assert_eq!(hook.injected_param_count(None), 0);
     }
 
     #[test]
