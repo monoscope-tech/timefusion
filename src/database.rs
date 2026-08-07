@@ -12054,8 +12054,14 @@ impl TableProvider for ProjectRoutingTable {
                 // into a NEW file, files overlap, and the blocking SortExec
                 // that "fixes" that exhausted the 27.5GB query pool on prod
                 // 2026-08-02 (1h ~13s, 3h timing out). `ordered_children`
-                // bails (None) whenever an unsortable leg misses `req`, so a
-                // Delta sort is structurally impossible here.
+                // never sorts an unsortable leg whole; it may sort the small
+                // non-declaring BRANCH of the leg's own union (the delta-rs
+                // fork isolates those files), which is bounded by
+                // `MAX_NESTED_SORT_BYTES` and bails to the old behaviour above
+                // it. Without that, five footer-less files out of thirty voided
+                // the ordering for a whole 30-day scan and pinned DedupExec in
+                // `full-set` mode until it hit its 2 GiB ceiling and failed the
+                // query outright (2026-08-07).
                 //
                 // The in-memory legs (mem, hot) ARE sortable: their data is
                 // already materialized, the sort is bounded and cheap, and a
