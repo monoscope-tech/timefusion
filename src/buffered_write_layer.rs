@@ -2605,7 +2605,7 @@ impl BufferedWriteLayer {
                     // after its rows committed, so this file holds every row the
                     // bucket carried. That is the coverage claim; `read_leg`
                     // still refuses it if the bucket has more than one file.
-                    tier.demote(&p, &t, id, &batches, min, max, true);
+                    tier.demote(&p, &t, crate::hot_tier::Bucket { bucket_id: id, batches: &batches, min_ts: min, max_ts: max, covers_window: true });
                 }
             })
             .await;
@@ -3905,8 +3905,8 @@ mod tests {
         let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
         let batch = create_test_batch(&project);
         let tier = layer.hot_tier().clone();
-        tier.demote(&project, &table, 1, std::slice::from_ref(&batch), 1_000, 1_999, true);
-        tier.demote(&project, &table, 2, &[batch], 10_000, 10_999, true);
+        tier.demote(&project, &table, crate::hot_tier::Bucket { bucket_id: 1, batches: std::slice::from_ref(&batch), min_ts: 1_000, max_ts: 1_999, covers_window: true });
+        tier.demote(&project, &table, crate::hot_tier::Bucket { bucket_id: 2, batches: &[batch], min_ts: 10_000, max_ts: 10_999, covers_window: true });
 
         use datafusion::prelude::lit;
         let ts = |micros: i64| lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())));
