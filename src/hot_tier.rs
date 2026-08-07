@@ -226,6 +226,18 @@ pub struct HotBucketMeta {
     /// in, or by an older binary) — the gate then admits every stamped row,
     /// which is conservative, never wrong.
     pub max_stamp: Option<i64>,
+    /// True only when this file holds EVERY row in `[min_ts, end_ts]` at or
+    /// below `max_stamp` — the precondition the Delta-scan range exclusion
+    /// silently assumed and nothing enforced (prod 2026-08-07: a window read
+    /// 4322 rows against a true 11349, because the file claimed its whole span
+    /// while holding only the rows one drain happened to carry).
+    ///
+    /// Set by the writer when a FULL bucket drain produced the file. Absent on
+    /// files from an older binary, which is the safe default: no claim, so the
+    /// window falls through to Delta. Necessary but NOT sufficient — a bucket
+    /// demoted more than once has several files each covering part of the
+    /// span, so `read_leg` additionally requires the bucket to have exactly one.
+    pub covers_window: bool,
     pub path: PathBuf,
 }
 
@@ -355,6 +367,9 @@ pub struct HotTierStats {
     /// exclusion either; nonzero means windows are falling through to Delta
     /// (correct) rather than vanishing (the 2026-08-07 hole shape).
     pub empty_after_filter: u64,
+    /// Windows served WITHOUT claiming a Delta exclusion because coverage was
+    /// not proven. These are the reads that would previously have lost rows.
+    pub unproven_windows: u64,
     pub schema_drift: u64,
     pub gc_deleted: u64,
     pub gc_bytes_freed: u64,
@@ -431,6 +446,7 @@ pub struct HotTier {
     read_misses: AtomicU64,
     mem_skipped: AtomicU64,
     empty_after_filter: AtomicU64,
+    unproven_windows: AtomicU64,
     schema_drift: AtomicU64,
     gc_deleted: AtomicU64,
     gc_bytes_freed: AtomicU64,
@@ -493,6 +509,11 @@ fn parse_meta(path: PathBuf, bytes: u64) -> Option<HotBucketMeta> {
     // A trailing `s` on the seq component marks a SORTED file. Its absence is
     // what a pre-sort binary's files (and unsortable batches) look like, so the
     // default is the safe one: no ordering claim.
+    // Markers ride on the seq component, order `<n>[s][c]`. Absence is what a
+    // pre-marker binary's files look like, so both defaults are the safe ones:
+    // no ordering claim, and no coverage claim.
+    let covers_window = seq.ends_with('c');
+    let seq = seq.trim_end_matches('c');
     let sorted = seq.ends_with('s');
     Some(HotBucketMeta {
         bucket_id: bucket_id.parse().ok()?,
@@ -501,6 +522,7 @@ fn parse_meta(path: PathBuf, bytes: u64) -> Option<HotBucketMeta> {
         seq: seq.trim_end_matches('s').parse().ok()?,
         max_stamp: stamp.map(str::parse).transpose().ok()?,
         sorted,
+        covers_window,
         bytes,
         path,
     })
@@ -564,7 +586,7 @@ impl HotTier {
     /// Demote one committed bucket, whose rows span the INCLUSIVE `[min_ts,
     /// max_ts]` MemBuffer tracks. Best-effort: a failure is counted and
     /// logged, never propagated (the rows are already durable in Delta).
-    pub fn demote(&self, project_id: &str, table_name: &str, bucket_id: i64, batches: &[RecordBatch], min_ts: i64, max_ts: i64) {
+    pub fn demote(&self, project_id: &str, table_name: &str, bucket_id: i64, batches: &[RecordBatch], min_ts: i64, max_ts: i64, covers_window: bool) {
         if self.retention.is_none() || min_ts > max_ts || batches.iter().all(|b| b.num_rows() == 0) {
             return;
         }
@@ -573,7 +595,7 @@ impl HotTier {
         if health.suppressed() {
             return;
         }
-        match self.write_bucket(project_id, table_name, bucket_id, batches, min_ts, max_ts + 1) {
+        match self.write_bucket(project_id, table_name, bucket_id, batches, min_ts, max_ts + 1, covers_window) {
             Ok(Some(meta)) => {
                 self.writes.fetch_add(1, Relaxed);
                 health.demoted.fetch_add(1, Relaxed);
@@ -614,7 +636,7 @@ impl HotTier {
     }
 
     fn write_bucket(
-        &self, project_id: &str, table_name: &str, bucket_id: i64, batches: &[RecordBatch], min_ts: i64, end_ts: i64,
+        &self, project_id: &str, table_name: &str, bucket_id: i64, batches: &[RecordBatch], min_ts: i64, end_ts: i64, covers_window: bool,
     ) -> anyhow::Result<Option<HotBucketMeta>> {
         if !safe_component(project_id) || !safe_component(table_name) {
             debug!("hot tier skipping {project_id}.{table_name}: name is not a safe path component");
@@ -645,7 +667,8 @@ impl HotTier {
             .and_then(|c| max_stamp_of(batches, &c));
         let stamp_suffix = max_stamp.map(|s| format!("_{s}")).unwrap_or_default();
         let sort_marker = if sorted { "s" } else { "" };
-        let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{sort_marker}{stamp_suffix}.{EXT}"));
+        let covers_marker = if covers_window { "c" } else { "" };
+        let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{sort_marker}{covers_marker}{stamp_suffix}.{EXT}"));
         crate::wal::write_atomic_with(&path, true, |f| {
             // Compress each IPC buffer independently. FileDecoder projection
             // skips unrequested buffers before decompression, so a narrow query
@@ -657,7 +680,7 @@ impl HotTier {
             batches.iter().try_for_each(|b| w.write(b)).map_err(std::io::Error::other)?;
             w.finish().map_err(std::io::Error::other)
         })?;
-        Ok(Some(HotBucketMeta { bucket_id, seq, min_ts, end_ts, max_stamp, sorted, bytes: fs::metadata(&path)?.len(), path }))
+        Ok(Some(HotBucketMeta { bucket_id, seq, min_ts, end_ts, max_stamp, sorted, covers_window, bytes: fs::metadata(&path)?.len(), path }))
     }
 
     /// Files whose row range overlaps `query_range` — a CLOSED `[lo, hi]`
@@ -732,6 +755,13 @@ impl HotTier {
         // one unmarked file (older binary, unsortable batches) retracts the
         // claim for all of them — `try_with_sort_information` declares one
         // ordering for the whole source.
+        // A bucket demoted more than once has several files, each holding part
+        // of the span while `min_ts..end_ts` spans it — so no single one may
+        // claim the window even if its own drain was complete.
+        let mut files_per_bucket: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for m in metas {
+            *files_per_bucket.entry(m.bucket_id).or_default() += 1;
+        }
         let (mut partitions, mut ranges, mut used, mut gate, mut sorted) = (Vec::new(), Vec::new(), 0u64, None::<i64>, orders);
         for meta in metas {
             let Some(filtered) = self.materialize(meta, mem_ranges, cols.as_ref(), &pred, schema) else { continue };
@@ -767,7 +797,14 @@ impl HotTier {
             }
             used += bytes;
             sorted &= meta.sorted;
-            ranges.push(meta.range());
+            // Serve the rows either way; only the EXCLUSION needs proof. An
+            // unproven window is read from both legs and DedupExec collapses
+            // the overlap — slower, never wrong.
+            if meta.covers_window && files_per_bucket.get(&meta.bucket_id) == Some(&1) {
+                ranges.push(meta.range());
+            } else {
+                self.unproven_windows.fetch_add(1, Relaxed);
+            }
             // The gate travels with the range it guards: a file that cannot
             // vouch for a stamp (`None`) drops it to `i64::MIN`, which admits
             // every stamped Delta row in the excluded windows — the safe
@@ -1096,6 +1133,7 @@ impl HotTier {
             read_misses: self.read_misses.load(Relaxed),
             mem_skipped: self.mem_skipped.load(Relaxed),
             empty_after_filter: self.empty_after_filter.load(Relaxed),
+            unproven_windows: self.unproven_windows.load(Relaxed),
             schema_drift: self.schema_drift.load(Relaxed),
             gc_deleted: self.gc_deleted.load(Relaxed),
             gc_bytes_freed: self.gc_bytes_freed.load(Relaxed),
@@ -1237,7 +1275,7 @@ mod tests {
         let b =
             RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vec![100i64; 4096])), Arc::new(StringArray::from(vec!["repeated payload"; 4096]))])
                 .unwrap();
-        tier.demote("p1", "otel_logs_and_spans", 7, std::slice::from_ref(&b), 100, 200);
+        tier.demote("p1", "otel_logs_and_spans", 7, std::slice::from_ref(&b), 100, 200, true);
 
         let metas = tier.buckets_in_range("p1", "otel_logs_and_spans", Some((150, 300)));
         assert_eq!(metas.len(), 1);
@@ -1257,7 +1295,7 @@ mod tests {
     async fn leg_projects_before_filtering_and_reports_its_range() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("p1", "t", 1, &[batch(8)], 10, 20);
+        tier.demote("p1", "t", 1, &[batch(8)], 10, 20, true);
         let filters = vec![datafusion::prelude::col("ts").gt(datafusion::prelude::lit(5i64))];
         // Project only `name`; `ts` is predicate-only and must not leak out.
         let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &filters, &schema(), Some(&vec![1])).await;
@@ -1304,8 +1342,8 @@ mod tests {
         let tier = open(&dir);
         // `mor_versioned` is the shipped `version_append` schema; the gate keys
         // off the registry, not off the batch, exactly as the write path does.
-        tier.demote("p1", "mor_versioned", 1, &[rows(vec![100, 400])], 0, 1);
-        tier.demote("p1", "mor_versioned", 2, &[rows(vec![200, 300])], 2, 3);
+        tier.demote("p1", "mor_versioned", 1, &[rows(vec![100, 400])], 0, 1, true);
+        tier.demote("p1", "mor_versioned", 2, &[rows(vec![200, 300])], 2, 3, true);
 
         let leg = tier.query_partitioned("p1", "mor_versioned", None, &[], &[], &versioned, None).await;
         assert_eq!(leg.version_gate, Some(300), "the gate is the least per-file maximum, so no file's newer rows are excluded");
@@ -1320,13 +1358,13 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![0i64, 1])), Arc::new(TimestampMicrosecondArray::from(vec![None, None]).with_timezone("UTC"))],
         )
         .unwrap();
-        tier.demote("p1", "mor_versioned", 3, &[unstamped], 4, 5);
+        tier.demote("p1", "mor_versioned", 3, &[unstamped], 4, 5, true);
         let leg = tier.query_partitioned("p1", "mor_versioned", None, &[], &[], &versioned, None).await;
         assert_eq!(leg.version_gate, Some(i64::MIN), "an unstamped file must not let the gate hide newer Delta rows");
 
         // A table that does not append versions gets no gate at all — its
         // exclusion stands unweakened, byte-for-byte the pre-merge-on-read plan.
-        tier.demote("p1", "t", 1, &[batch(4)], 10, 20);
+        tier.demote("p1", "t", 1, &[batch(4)], 10, 20, true);
         let leg = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         assert_eq!(leg.version_gate, None);
 
@@ -1341,7 +1379,7 @@ mod tests {
     fn torn_file_is_absent_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("p1", "t", 1, &[batch(32)], 10, 20);
+        tier.demote("p1", "t", 1, &[batch(32)], 10, 20, true);
         let path = tier.buckets_in_range("p1", "t", None)[0].path.clone();
 
         let full = fs::read(&path).unwrap();
@@ -1358,8 +1396,8 @@ mod tests {
     fn rescan_rebuilds_index_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("p1", "t", 1, &[batch(8)], 10, 20);
-        tier.demote("p1", "t", 2, &[batch(8)], 30, 40);
+        tier.demote("p1", "t", 1, &[batch(8)], 10, 20, true);
+        tier.demote("p1", "t", 2, &[batch(8)], 30, 40, true);
         drop(tier);
 
         // Simulated restart: fresh instance over the same root.
@@ -1368,7 +1406,7 @@ mod tests {
         assert_eq!(metas.iter().map(|m| (m.bucket_id, m.min_ts, m.end_ts)).collect::<Vec<_>>(), vec![(1, 10, 21), (2, 30, 41)]);
         assert_eq!(*restarted.read_file(&metas[0].path).unwrap(), vec![batch(8)]);
         // A post-restart demotion must not collide with a recovered seq.
-        restarted.demote("p1", "t", 2, &[batch(8)], 41, 42);
+        restarted.demote("p1", "t", 2, &[batch(8)], 41, 42, true);
         assert_eq!(restarted.buckets_in_range("p1", "t", None).len(), 3);
     }
 
@@ -1377,8 +1415,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(1)), limits(u64::MAX));
         let now = 10_000_000i64;
-        tier.demote("p1", "t", 1, &[batch(8)], 1, 2); // ancient
-        tier.demote("p1", "t", 2, &[batch(8)], now - 1000, now); // fresh
+        tier.demote("p1", "t", 1, &[batch(8)], 1, 2, true); // ancient
+        tier.demote("p1", "t", 2, &[batch(8)], now - 1000, now, true); // fresh
         // Regression guard for ba8820e: a generic recursive deleter ate the WAL
         // quarantine dir. GC must only ever unlink our own `*.arrow` files.
         let foreign = dir.path().join("p1").join("t").join("do_not_delete.bin");
@@ -1402,14 +1440,14 @@ mod tests {
     #[test]
     fn disabled_tier_sweeps_instead_of_leaking() {
         let dir = tempfile::tempdir().unwrap();
-        open(&dir).demote("p1", "t", 1, &[batch(8)], 10, 20);
+        open(&dir).demote("p1", "t", 1, &[batch(8)], 10, 20, true);
         let foreign = dir.path().join("p1").join("t").join("do_not_delete.bin");
         fs::File::create(&foreign).unwrap().write_all(b"payload").unwrap();
 
         let off = HotTier::open(dir.path().to_path_buf(), None, limits(u64::MAX));
         assert_eq!(off.stats().files, 0, "a disabled tier must not strand the previous run's files");
         assert!(foreign.exists());
-        off.demote("p1", "t", 2, &[batch(8)], 10, 20);
+        off.demote("p1", "t", 2, &[batch(8)], 10, 20, true);
         assert_eq!(off.stats().files, 0, "and must not demote either");
     }
 
@@ -1417,8 +1455,8 @@ mod tests {
     fn invalidate_drops_every_file_for_the_table() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("p1", "t", 1, &[batch(8)], 10, 20);
-        tier.demote("p2", "t", 1, &[batch(8)], 10, 20);
+        tier.demote("p1", "t", 1, &[batch(8)], 10, 20, true);
+        tier.demote("p2", "t", 1, &[batch(8)], 10, 20, true);
         tier.invalidate("p1", "t");
         assert!(tier.buckets_in_range("p1", "t", None).is_empty());
         assert_eq!(tier.buckets_in_range("p2", "t", None).len(), 1, "invalidation is per (project, table)");
@@ -1434,10 +1472,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         // Ranges stored half-open: demote(min, max) → [min, max+1).
-        tier.demote("p1", "t", 1, &[batch(4)], 100, 199); // [100, 200) — abuts window start
-        tier.demote("p1", "t", 2, &[batch(4)], 250, 350); // [250, 351) — overlaps
-        tier.demote("p1", "t", 3, &[batch(4)], 400, 500); // [400, 501) — starts at window end
-        tier.demote("p1", "t", 4, &[batch(4)], 600, 700); // far outside
+        tier.demote("p1", "t", 1, &[batch(4)], 100, 199, true); // [100, 200) — abuts window start
+        tier.demote("p1", "t", 2, &[batch(4)], 250, 350, true); // [250, 351) — overlaps
+        tier.demote("p1", "t", 3, &[batch(4)], 400, 500, true); // [400, 501) — starts at window end
+        tier.demote("p1", "t", 4, &[batch(4)], 600, 700, true); // far outside
 
         tier.invalidate_range("p1", "t", 200, 400);
         assert_eq!(
@@ -1461,8 +1499,8 @@ mod tests {
     fn one_sided_window_still_scopes_the_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("p1", "t", 1, &[batch(4)], 100, 199);
-        tier.demote("p1", "t", 2, &[batch(4)], 300, 400);
+        tier.demote("p1", "t", 1, &[batch(4)], 100, 199, true);
+        tier.demote("p1", "t", 2, &[batch(4)], 300, 400, true);
 
         tier.invalidate_range("p1", "t", 250, i64::MAX);
         assert_eq!(tier.buckets_in_range("p1", "t", None).iter().map(|m| m.bucket_id).collect::<Vec<_>>(), vec![1]);
@@ -1478,7 +1516,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         for i in 0..PROBE_DEMOTES as i64 {
-            tier.demote("p1", "t", i, &[batch(4)], 10, 20);
+            tier.demote("p1", "t", i, &[batch(4)], 10, 20, true);
             // A DML window nowhere near the demoted rows: nothing dropped,
             // nothing wasted.
             tier.invalidate_range("p1", "t", 10_000, 20_000);
@@ -1502,7 +1540,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         for i in 0..PROBE_DEMOTES as i64 {
-            tier.demote("p1", "t", i, &[batch(4)], 10, 20);
+            tier.demote("p1", "t", i, &[batch(4)], 10, 20, true);
             tier.invalidate("p1", "t");
         }
         let s = tier.stats();
@@ -1510,12 +1548,12 @@ mod tests {
         assert_eq!(s.suppressed[0].0, (Arc::from("p1"), Arc::from("t")));
 
         for i in 0..10 {
-            tier.demote("p1", "t", 100 + i, &[batch(4)], 10, 20);
+            tier.demote("p1", "t", 100 + i, &[batch(4)], 10, 20, true);
         }
         let s = tier.stats();
         assert_eq!((s.files, s.writes), (0, PROBE_DEMOTES), "a suppressed table writes nothing");
         // Another table is judged entirely on its own files.
-        tier.demote("p2", "t", 1, &[batch(4)], 10, 20);
+        tier.demote("p2", "t", 1, &[batch(4)], 10, 20, true);
         assert_eq!(tier.stats().files, 1);
     }
 
@@ -1525,7 +1563,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         for i in 0..50i64 {
-            tier.demote("p1", "t", i, &[batch(2)], i * 100, i * 100 + 50);
+            tier.demote("p1", "t", i, &[batch(2)], i * 100, i * 100 + 50, true);
         }
         let s = tier.stats();
         assert_eq!((s.files, s.suppressions, s.suppressed_tables), (50, 0, 0));
@@ -1540,15 +1578,15 @@ mod tests {
         let tier = open(&dir);
         let t0 = crate::clock::set_micros(crate::clock::now_micros());
         for i in 0..PROBE_DEMOTES as i64 {
-            tier.demote("p1", "t", i, &[batch(4)], 10, 20);
+            tier.demote("p1", "t", i, &[batch(4)], 10, 20, true);
             tier.invalidate("p1", "t");
         }
         assert_eq!(tier.stats().suppressions, 1);
-        tier.demote("p1", "t", 10, &[batch(4)], 10, 20);
+        tier.demote("p1", "t", 10, &[batch(4)], 10, 20, true);
         assert_eq!(tier.stats().files, 0, "still inside the cooldown");
 
         crate::clock::set_micros(t0 + SUPPRESSION_COOLDOWN.as_micros() as i64 + 1);
-        tier.demote("p1", "t", 11, &[batch(4)], 10, 20);
+        tier.demote("p1", "t", 11, &[batch(4)], 10, 20, true);
         let s = tier.stats();
         assert_eq!((s.files, s.suppressed_tables), (1, 0), "cooldown elapsed → demotion resumes");
         // ...and if the workload hasn't changed, one wasted probe file is
@@ -1566,11 +1604,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         for i in 0..PROBE_DEMOTES as i64 - 1 {
-            tier.demote("p1", "t", i, &[batch(4)], 10, 20);
+            tier.demote("p1", "t", i, &[batch(4)], 10, 20, true);
             tier.invalidate("p1", "t");
         }
         // Convicted by this write (3 wasted of 4), but the file itself stays.
-        tier.demote("p1", "t", 3, &[batch(4)], 10, 20);
+        tier.demote("p1", "t", 3, &[batch(4)], 10, 20, true);
         let s = tier.stats();
         assert_eq!((s.suppressed_tables, s.files), (1, 1));
 
@@ -1613,13 +1651,13 @@ mod tests {
         // Budget for ~2 files: measure one file's post-filter footprint first.
         let probe = tempfile::tempdir().unwrap();
         let t0 = HotTier::open(probe.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX));
-        t0.demote("p1", "t", 0, &[batch(64)], 0, 10);
+        t0.demote("p1", "t", 0, &[batch(64)], 0, 10, true);
         let HotLeg { partitions: parts, .. } = t0.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         let one: u64 = parts.into_iter().flatten().map(|b| b.get_array_memory_size() as u64).sum();
 
         let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { leg_budget_bytes: one * 2, ..limits(u64::MAX) });
         for i in 0..5i64 {
-            tier.demote("p1", "t", i, &[batch(64)], i * 100, i * 100 + 10);
+            tier.demote("p1", "t", i, &[batch(64)], i * 100, i * 100 + 10, true);
         }
         let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
         assert_eq!(parts.len(), 2, "the budget admits two files' worth and stops");
@@ -1643,7 +1681,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let big = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX));
         for i in 0..3i64 {
-            big.demote("p1", "t", i, &[batch(64)], i * 100, i * 100 + 10);
+            big.demote("p1", "t", i, &[batch(64)], i * 100, i * 100 + 10, true);
         }
         let metas = big.buckets_in_range("p1", "t", None);
         let file_bytes = metas[0].bytes;
@@ -1682,7 +1720,7 @@ mod tests {
     async fn zero_batch_file_contributes_no_range() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("p1", "t", 1, &[batch(8)], 10, 20);
+        tier.demote("p1", "t", 1, &[batch(8)], 10, 20, true);
         let path = tier.buckets_in_range("p1", "t", None)[0].path.clone();
 
         // A well-formed IPC file carrying the schema and no record batches.
@@ -1710,7 +1748,7 @@ mod tests {
         use datafusion::prelude::{col, lit};
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("p1", "t", 1, &[batch(8)], 10, 20);
+        tier.demote("p1", "t", 1, &[batch(8)], 10, 20, true);
 
         // Matches no row in the file, so the leg retains nothing.
         let never = col("ts").eq(lit(i64::MIN));
@@ -1726,6 +1764,39 @@ mod tests {
         assert!(!parts.is_empty() && ranges.len() == 1, "serving rows ⇒ claim the range");
     }
 
+    /// PROD 2026-08-07 — the hole. A file claimed a Delta exclusion over its
+    /// whole `[min_ts, end_ts]` while holding only the rows one drain carried.
+    /// Delta legitimately holds other rows in that span (a later drain of the
+    /// same bucket, late arrivals), and the exclusion hid them: project
+    /// 00000000, 09:14-09:21 read 4322 rows against a true 11349.
+    ///
+    /// A range may only be claimed with coverage PROVEN — and one complete
+    /// drain is not proof when the bucket was demoted more than once.
+    #[tokio::test]
+    async fn range_is_claimed_only_when_coverage_is_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+
+        // One full drain of a bucket: proven, so it may exclude its window.
+        tier.demote("p1", "t", 1, &[batch(4)], 10, 20, true);
+        let HotLeg { ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        assert_eq!(ranges.len(), 1, "a proven, single-file bucket claims its window");
+
+        // A SECOND drain of the SAME bucket: each file now holds only part of
+        // the span, so neither may claim it — even though both were full drains.
+        tier.demote("p1", "t", 1, &[batch(4)], 21, 30, true);
+        let HotLeg { partitions, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        assert!(ranges.is_empty(), "multi-file bucket must claim NOTHING: neither file covers the span");
+        assert_eq!(partitions.len(), 2, "but both files still SERVE their rows");
+
+        // A file from an older binary carries no claim and must not invent one.
+        tier.demote("p2", "t", 1, &[batch(4)], 10, 20, false);
+        let HotLeg { partitions, ranges, .. } = tier.query_partitioned("p2", "t", None, &[], &[], &schema(), None).await;
+        assert!(ranges.is_empty(), "unproven coverage ⇒ no exclusion; the window falls through to Delta");
+        assert_eq!(partitions.len(), 1, "rows are still served");
+        assert!(tier.stats().unproven_windows >= 3);
+    }
+
     /// A project/table name that can't round-trip through a path component is
     /// silently NOT demoted — a lossy mapping could collide two tenants in one
     /// directory, and rescan reconstructs the key from the directory name.
@@ -1733,8 +1804,8 @@ mod tests {
     fn unsafe_names_are_not_demoted() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        tier.demote("../escape", "t", 1, &[batch(8)], 10, 20);
-        tier.demote("p1", "sub/dir", 1, &[batch(8)], 10, 20);
+        tier.demote("../escape", "t", 1, &[batch(8)], 10, 20, true);
+        tier.demote("p1", "sub/dir", 1, &[batch(8)], 10, 20, true);
         assert_eq!(tier.stats().files, 0);
         assert_eq!(tier.stats().write_failures, 0, "an unsafe name is a skip, not a failure");
     }

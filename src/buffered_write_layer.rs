@@ -2601,7 +2601,11 @@ impl BufferedWriteLayer {
             let _ = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 for (p, t, id, batches, min, max) in work {
-                    tier.demote(&p, &t, id, &batches, min, max);
+                    // `drained` = the bucket was fully removed from the buffer
+                    // after its rows committed, so this file holds every row the
+                    // bucket carried. That is the coverage claim; `read_leg`
+                    // still refuses it if the bucket has more than one file.
+                    tier.demote(&p, &t, id, &batches, min, max, true);
                 }
             })
             .await;
@@ -3901,8 +3905,8 @@ mod tests {
         let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
         let batch = create_test_batch(&project);
         let tier = layer.hot_tier().clone();
-        tier.demote(&project, &table, 1, std::slice::from_ref(&batch), 1_000, 1_999);
-        tier.demote(&project, &table, 2, &[batch], 10_000, 10_999);
+        tier.demote(&project, &table, 1, std::slice::from_ref(&batch), 1_000, 1_999, true);
+        tier.demote(&project, &table, 2, &[batch], 10_000, 10_999, true);
 
         use datafusion::prelude::lit;
         let ts = |micros: i64| lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())));
