@@ -285,11 +285,6 @@ impl StatsTableProvider {
         // footer repair; see read_dedup::Bound::advance.
         let read_dedup = rows![@atomic "read_dedup";
             "ordering_violations_total" => crate::read_dedup::ORDERING_VIOLATIONS,
-            // Scans whose ordering was rescued by sorting only the delta-rs
-            // non-declaring branch, and those left unordered because that
-            // branch was too big. Both climbing = footer repair is behind.
-            "nested_ordering_recovered_total" => crate::optimizers::NESTED_ORDERING_RECOVERED,
-            "nested_ordering_too_big_total" => crate::optimizers::NESTED_ORDERING_TOO_BIG,
         ];
 
         let m = crate::metrics::maintenance_stats();

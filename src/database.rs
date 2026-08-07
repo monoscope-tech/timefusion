@@ -12063,14 +12063,23 @@ impl TableProvider for ProjectRoutingTable {
                 // into a NEW file, files overlap, and the blocking SortExec
                 // that "fixes" that exhausted the 27.5GB query pool on prod
                 // 2026-08-02 (1h ~13s, 3h timing out). `ordered_children`
-                // never sorts an unsortable leg whole; it may sort the small
-                // non-declaring BRANCH of the leg's own union (the delta-rs
-                // fork isolates those files), which is bounded by
-                // `MAX_NESTED_SORT_BYTES` and bails to the old behaviour above
-                // it. Without that, five footer-less files out of thirty voided
-                // the ordering for a whole 30-day scan and pinned DedupExec in
-                // `full-set` mode until it hit its 2 GiB ceiling and failed the
-                // query outright (2026-08-07).
+                // bails (None) whenever an unsortable leg misses `req`, so a
+                // Delta sort is structurally impossible here.
+                //
+                // 2026-08-07 tried to relax this: when the Delta leg is itself
+                // a union of an ordered majority plus the delta-rs fork's
+                // isolated non-declaring files, sort ONLY that branch. It did
+                // fix the 30-day scan (which otherwise pins DedupExec in
+                // `full-set` mode until its 2 GiB ceiling fails the query) —
+                // and then reproduced 2026-08-02 under load: with
+                // `preserve_partitioning`, prod ran ~48 `ExternalSorterMerge`
+                // reservations of 2-3.6 GB each, `can spill: false`,
+                // saturating the whole 24 GB query pool so unrelated queries
+                // could not allocate 10 MB for DedupExec. A byte/share gate on
+                // the branch cannot bound that: the cost scales with
+                // partitions, and the only plan-time size signal is whole-FILE
+                // bytes. Reverted. The 30-day scan needs the footer-less files
+                // REPAIRED (`optimize --recompress`), not sorted at read time.
                 //
                 // The in-memory legs (mem, hot) ARE sortable: their data is
                 // already materialized, the sort is bounded and cheap, and a
