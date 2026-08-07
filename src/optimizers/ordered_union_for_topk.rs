@@ -125,13 +125,23 @@ pub fn ordered_children(
     Ok(Some(out))
 }
 
-/// Largest unordered branch (bytes, as Delta add-action stats report it) we
-/// will sort to recover a leg's ordering. The point is to rescue a leg poisoned
-/// by a few stragglers, never to sort a whole window: past this the leg stays
-/// unordered and the caller bails, which is the pre-existing behaviour. A sort
-/// under it still spills through the query pool rather than growing unbounded,
-/// so this bounds *latency*, not safety.
-const MAX_NESTED_SORT_BYTES: usize = 256 * 1024 * 1024;
+/// The unordered branch may be at most this share of the leg. "A few stragglers
+/// poisoning the majority" is the case worth rescuing; a leg that is mostly
+/// unordered is a whole-window sort by another name, and that is what exhausted
+/// the query pool on 2026-08-02.
+///
+/// A ratio, not an absolute size, because the only size signal available here
+/// is `total_byte_size` off the Delta add actions — whole-FILE bytes, while the
+/// scan may project 4 of 89 columns. Any absolute threshold would therefore be
+/// wrong by an unknown factor and, worse, wrong in the direction that silently
+/// disables the rescue on exactly the big-file tables that need it. The ratio
+/// is invariant to that error since both sides are measured the same way.
+/// `MAX_NESTED_SORT_BYTES` remains as a backstop for a scan so large that even
+/// a small share of it is unreasonable; a sort under it still spills through
+/// the query pool rather than growing unbounded, so it bounds latency, not
+/// safety.
+const MAX_NESTED_SORT_SHARE: f64 = 0.25;
+const MAX_NESTED_SORT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// Rewrites of this shape actually applied — a steady climb means the footer
 /// repair still has stragglers; a steady zero means every scan declares.
@@ -161,13 +171,18 @@ fn recover_nested_ordering(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fet
             if sat.iter().all(|&s| s) || !sat.iter().any(|&s| s) {
                 return Ok(None);
             }
-            let unordered_bytes: usize = children.iter().zip(&sat).filter(|(_, s)| !**s).map(|(c, _)| branch_bytes(c)).sum();
-            if unordered_bytes > MAX_NESTED_SORT_BYTES {
+            // `branch_bytes` yields `usize::MAX` for a branch with no size
+            // stat, which fails both guards below — unknown size declines.
+            let sized: Vec<(usize, bool)> = children.iter().zip(&sat).map(|(c, s)| (branch_bytes(c), *s)).collect();
+            let unordered_bytes: usize = sized.iter().filter(|(_, s)| !s).map(|(b, _)| *b).sum();
+            let total_bytes: usize = sized.iter().map(|(b, _)| *b).sum();
+            let oversized = unordered_bytes > MAX_NESTED_SORT_BYTES || total_bytes == 0 || unordered_bytes as f64 > total_bytes as f64 * MAX_NESTED_SORT_SHARE;
+            if oversized {
                 NESTED_ORDERING_TOO_BIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::debug!(unordered_bytes, cap = MAX_NESTED_SORT_BYTES, "scan ordering not recovered: non-declaring branch too big to sort");
+                tracing::debug!(unordered_bytes, total_bytes, "scan ordering not recovered: non-declaring branch too big to sort");
                 return Ok(None);
             }
-            tracing::debug!(unordered_bytes, branches = children.len(), "sorting the non-declaring branch to recover scan ordering");
+            tracing::debug!(unordered_bytes, total_bytes, branches = children.len(), "sorting the non-declaring branch to recover scan ordering");
             let ordered: Vec<Arc<dyn ExecutionPlan>> = children
                 .iter()
                 .zip(sat)
@@ -408,11 +423,8 @@ mod tests {
     /// the delta-rs fork builds when some files carry no `sorting_columns`
     /// footer — an ordered branch plus an isolated non-declaring one.
     fn delta_leg(s: &SchemaRef, ord: &LexOrdering, unordered_bytes: usize) -> Arc<dyn ExecutionPlan> {
-        let inner = UnionExec::try_new(vec![
-            MockLeaf::sized(s.clone(), Some(ord.clone()), 8 << 30),
-            MockLeaf::sized(s.clone(), None, unordered_bytes),
-        ])
-        .unwrap();
+        let inner =
+            UnionExec::try_new(vec![MockLeaf::sized(s.clone(), Some(ord.clone()), 8 << 30), MockLeaf::sized(s.clone(), None, unordered_bytes)]).unwrap();
         Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(datafusion::physical_expr::expressions::lit(true), inner).unwrap())
     }
 
@@ -448,8 +460,15 @@ mod tests {
     fn refuses_to_sort_an_oversized_non_declaring_branch() {
         let (s, ord) = (schema(), ts_desc());
         let mem = MockLeaf::leaf(s.clone(), None);
+        // Ordered branch is 8 GiB in `delta_leg`, so 4 GiB unordered is both
+        // over the absolute cap and over the 25% share.
         let delta = delta_leg(&s, &ord, MAX_NESTED_SORT_BYTES + 1);
-        assert!(ordered_children(&[mem, delta], &ord, None, &[true, false], false).unwrap().is_none());
+        assert!(ordered_children(&[mem.clone(), delta], &ord, None, &[true, false], false).unwrap().is_none());
+
+        // ...and a branch well under the absolute cap is still refused when it
+        // is most of the leg: that is a whole-window sort, not a rescue.
+        let majority = delta_leg(&s, &ord, 6 << 30);
+        assert!(ordered_children(&[mem, majority], &ord, None, &[true, false], false).unwrap().is_none());
     }
 
     // Guard: when no child is ordered (Delta pushdown off during mixed-footer
