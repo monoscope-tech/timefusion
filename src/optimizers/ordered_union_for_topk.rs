@@ -125,11 +125,13 @@ pub fn ordered_children(
     Ok(Some(out))
 }
 
-/// Largest unordered branch (bytes) we will sort to recover a leg's ordering.
-/// The point is to rescue a leg poisoned by a few stragglers, never to sort a
-/// whole window: past this the leg stays unordered and the caller bails, which
-/// is the pre-existing behaviour.
-const MAX_NESTED_SORT_BYTES: usize = 512 * 1024 * 1024;
+/// Largest unordered branch (bytes, as Delta add-action stats report it) we
+/// will sort to recover a leg's ordering. The point is to rescue a leg poisoned
+/// by a few stragglers, never to sort a whole window: past this the leg stays
+/// unordered and the caller bails, which is the pre-existing behaviour. A sort
+/// under it still spills through the query pool rather than growing unbounded,
+/// so this bounds *latency*, not safety.
+const MAX_NESTED_SORT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Rewrites of this shape actually applied — a steady climb means the footer
 /// repair still has stragglers; a steady zero means every scan declares.
@@ -162,8 +164,10 @@ fn recover_nested_ordering(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fet
             let unordered_bytes: usize = children.iter().zip(&sat).filter(|(_, s)| !**s).map(|(c, _)| branch_bytes(c)).sum();
             if unordered_bytes > MAX_NESTED_SORT_BYTES {
                 NESTED_ORDERING_TOO_BIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(unordered_bytes, cap = MAX_NESTED_SORT_BYTES, "scan ordering not recovered: non-declaring branch too big to sort");
                 return Ok(None);
             }
+            tracing::debug!(unordered_bytes, branches = children.len(), "sorting the non-declaring branch to recover scan ordering");
             let ordered: Vec<Arc<dyn ExecutionPlan>> = children
                 .iter()
                 .zip(sat)
