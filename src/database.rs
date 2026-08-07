@@ -1663,6 +1663,15 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 // Parquet footer key-value metadata key recording the ZSTD level used to
 // write the file. Read by `recompress_partition` to skip files already
 // at-or-above the target tier without rewriting.
+/// What a `recompress_partition` call actually did. The CLI used to print
+/// "rewritten (sorted footer restored)" unconditionally, including on the
+/// tier-probe skip — which is how a poisoned partition looked repaired for
+/// hours while nothing had changed (2026-08-07). A skip must say so.
+pub enum RecompressOutcome {
+    Rewritten { files: usize },
+    Skipped(&'static str),
+}
+
 const COMPRESSION_TIER_KEY: &str = "timefusion.compression_tier";
 
 #[derive(Clone, Serialize, Deserialize, sqlx::FromRow, derive_more::Debug)]
@@ -6270,7 +6279,7 @@ impl Database {
     /// OOM-killed a 5 GiB pod and then evicted a 6 GiB one).
     pub async fn recompress_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_level: i32, project: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<RecompressOutcome> {
         use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
         use object_store::{ObjectStoreExt, path::Path as OsPath};
 
@@ -6294,7 +6303,7 @@ impl Database {
         };
         if uris.is_empty() {
             debug!("recompress: no files in partition date={} for table={}", date_str, table_name);
-            return Ok(());
+            return Ok(RecompressOutcome::Skipped("no files in partition"));
         }
 
         // Recompress rewrites whole partitions — same pool-invisible Arrow
@@ -6338,13 +6347,49 @@ impl Database {
             }
         };
 
+        // A partition holding an UNSORTED file is never "done", whatever its
+        // compression tier. The tier probe alone made this unreachable: prod
+        // 2026-08-07 had a 924 MB file with `sorting_columns=()` stamped
+        // tier 9, so every `--recompress` at level <= 9 skipped it — and then
+        // printed success. That file is exactly what this command exists to
+        // repair, and it voided the declared ordering for every scan of the
+        // last 30 days. Probe the footers (a ranged read each, and the same
+        // metadata cache the scan would warm) and let sortedness veto the skip.
+        let declares_order = get_schema(table_name).is_some_and(|s| !s.sorting_columns.is_empty());
+        let any_unsorted = match declares_order {
+            false => false,
+            true => {
+                let object_store = log_store.object_store(None);
+                let mut found = false;
+                for uri in &uris {
+                    let Some(rel) = uri.strip_prefix(table_prefix).map(|s| s.trim_start_matches('/')) else { continue };
+                    let path = OsPath::from(rel);
+                    let Ok(meta) = object_store.head(&path).await else { continue };
+                    let mut reader = ParquetObjectReader::new(object_store.clone(), path).with_file_size(meta.size);
+                    // An unreadable footer is not evidence of sortedness; leave
+                    // `found` alone and let the tier probe decide.
+                    if let Ok(pq) = reader.get_metadata(None).await
+                        && pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty()))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            }
+        };
+
         // If probe failed or tier is unknown, fall through to rewrite — safer
         // than skipping a partition that may still be at hot tier.
         if let Some(t) = probe_tier
             && t >= target_level
+            && !any_unsorted
         {
             debug!("recompress: skip date={} table={} (already at tier {})", date_str, table_name, t);
-            return Ok(());
+            return Ok(RecompressOutcome::Skipped("already at target tier and every footer is sorted"));
+        }
+        if any_unsorted {
+            info!("recompress: date={} table={} has file(s) with no sorted footer — rewriting despite tier", date_str, table_name);
         }
 
         info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
@@ -6428,7 +6473,7 @@ impl Database {
                 // on a recompressed partition paid full S3 reads (1.5 s
                 // observed against OVH).
                 self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
-                Ok(())
+                Ok(RecompressOutcome::Rewritten { files: pre_uris.len() })
             }
             Err(e) => {
                 error!("recompress failed for date={} table={}: {}", date_str, table_name, e);
@@ -14940,7 +14985,8 @@ mod tests {
             // Re-run at the same tier — footer probe must detect tier=9 and skip,
             // so the file set is unchanged. If skip is broken, this assertion
             // fails because Optimize emits a fresh part file.
-            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, None).await?;
+            let rerun = db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, None).await?;
+            assert!(matches!(rerun, RecompressOutcome::Skipped(_)), "rerun at same tier must report a SKIP, not a rewrite");
             let files_after_rerun: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             assert_eq!(files_after, files_after_rerun, "rerun at same tier must skip");
 

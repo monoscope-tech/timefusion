@@ -59,7 +59,7 @@ use timefusion::{
     buffered_write_layer::BufferedWriteLayer,
     clock,
     config::{self, AppConfig},
-    database::Database,
+    database::{Database, RecompressOutcome},
     secret_crypto, telemetry,
 };
 use tokio::time::{Duration, sleep};
@@ -774,12 +774,11 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     if recompress {
         for d in &dates {
             let level = cfg.parquet.timefusion_zstd_compression_level;
+            let scope = project.as_deref().map(|p| format!(" project={p}")).unwrap_or_default();
             match db.recompress_partition(&table_ref, &table, *d, level, project.as_deref()).await {
-                Ok(()) => println!(
-                    "  recompress date={d}{}: rewritten (sorted footer restored)",
-                    project.as_deref().map(|p| format!(" project={p}")).unwrap_or_default()
-                ),
-                Err(e) => eprintln!("  recompress date={d}: FAILED: {e}"),
+                Ok(RecompressOutcome::Rewritten { files }) => println!("  recompress date={d}{scope}: rewritten from {files} file(s) (sorted footer restored)"),
+                Ok(RecompressOutcome::Skipped(why)) => println!("  recompress date={d}{scope}: SKIPPED — {why}"),
+                Err(e) => eprintln!("  recompress date={d}{scope}: FAILED: {e}"),
             }
         }
         reconcile_tantivy(&db, &table).await;
