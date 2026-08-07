@@ -1667,6 +1667,7 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 /// "rewritten (sorted footer restored)" unconditionally, including on the
 /// tier-probe skip — which is how a poisoned partition looked repaired for
 /// hours while nothing had changed (2026-08-07). A skip must say so.
+#[derive(Debug)]
 pub enum RecompressOutcome {
     Rewritten { files: usize },
     Skipped(&'static str),
@@ -6448,8 +6449,26 @@ impl Database {
         // sorted so `declare_sorted` above is honest.
         // `project_id` is a partition column, so scoping BOTH the scan and the
         // overwrite predicate leaves every other tenant's files on that date
-        // untouched by the commit.
-        let scope = project.map(|p| format!(" AND project_id = '{p}'")).unwrap_or_default();
+        // untouched by the commit — correct, and pinned by
+        // `recompress_scoped_to_a_project_leaves_other_projects_untouched`.
+        //
+        // DISABLED: it also DEADLOCKS the write. Prod 2026-08-08, same date and
+        // data, only the scope varying:
+        //   unscoped, 80 files, 40 GiB  → 270-520% CPU, writes, progresses
+        //   scoped,    2 files,  6 GiB  → 0% CPU forever, right after `write_operation`
+        //   scoped,    2 files, 24 GiB  → grew to 3.5 GB, then the SAME 0% stall
+        // So it is neither memory nor the budget. Prime suspect is the
+        // `replace_where` conjunction over TWO partition columns in delta-rs.
+        // Until that is understood, refuse the flag rather than hang: an
+        // unscoped rewrite of the same date is slower but WORKS, and a hang is
+        // the worst possible failure for a repair tool (it looks like progress).
+        if project.is_some() {
+            anyhow::bail!(
+                "recompress --project is disabled: the scoped replace_where deadlocks the write (2026-08-08). \
+                 Re-run without --project to rewrite the whole date; it needs more memory but completes."
+            );
+        }
+        let scope = String::new();
         let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{scope}{order_by}")).await?.into_optimized_plan()?;
 
         let replace_pred = format!("date = '{date_str}'{scope}");
@@ -10686,6 +10705,53 @@ fn consolidate_optimize_type(schema: &crate::schema_loader::TableSchema, allow_s
 /// rewrite rows into Z-order or concatenation, so they MUST pass `false` —
 /// declaring an order the data doesn't have is a latent wrong-results bug for
 /// any reader that trusts it. SortBy is the rewrite path that may pass `true`.
+/// Rows per parquet row group, derived from the configured row-group byte
+/// target and the schema's estimated row width.
+///
+/// The row group — not the file — is what parquet prunes and decodes at, so its
+/// size sets how much data a selective query must actually touch and hold.
+/// TF only ever set the BYTE cap (`set_max_row_group_bytes`), which parquet
+/// checks against `get_estimated_total_bytes()` — an in-progress estimate that
+/// under-reports the finished row group by ~10x on this schema. At the
+/// configured 128 MiB it therefore never fired, and row groups were governed by
+/// parquet's own `DEFAULT_MAX_ROW_GROUP_ROW_COUNT` (1,048,576). Measured on prod
+/// 2026-08-08: 1,042,663 rows and 971 MB - 1.7 GB *uncompressed* per row group,
+/// which is the read amplification and the parquet-decode heap both showing up
+/// in the same place.
+///
+/// The ROW cap is exact (`buffered_rows >= max`), so it is the honest lever.
+/// Deriving it here means the byte target stays the thing an operator reasons
+/// about while the value that actually binds tracks the schema — nobody has to
+/// hand-tune a row count per table.
+///
+/// Width is estimated from declared types, not from data: a static estimate
+/// cannot capture that two tenants on the SAME schema measured 977 vs 1767
+/// bytes/row, but it does not need to. Moving 1M rows to ~100k is the win; the
+/// residual 2x spread across tenants is second order.
+fn row_group_row_count(schema: &crate::schema_loader::TableSchema, target_bytes: usize) -> usize {
+    /// Encoded-but-uncompressed bytes a value of this type costs. Variable-width
+    /// types are the telemetry payload (body/attributes/resource), so they
+    /// dominate; the constants are deliberately rough and only need to put the
+    /// row width in the right order of magnitude.
+    fn width(data_type: &str) -> usize {
+        match data_type.split(',').next().unwrap_or(data_type).trim() {
+            "Boolean" => 1,
+            "Int32" | "Date32" | "Float32" => 4,
+            "Int64" | "Float64" | "UInt64" => 8,
+            t if t.starts_with("Timestamp") => 8,
+            "Variant" => 256,
+            t if t.starts_with("List") => 64,
+            // Utf8 and anything unrecognised: a telemetry string column.
+            _ => 48,
+        }
+    }
+    let row_bytes: usize = schema.fields.iter().map(|f| width(&f.data_type)).sum::<usize>().max(1);
+    // Floor keeps footer/dictionary overhead from dominating on narrow tables;
+    // ceiling is parquet's own default, so this can only ever make row groups
+    // SMALLER than the behaviour it replaces.
+    (target_bytes / row_bytes).clamp(32_768, 1_048_576)
+}
+
 fn build_writer_properties(
     parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool,
 ) -> WriterProperties {
@@ -10717,6 +10783,9 @@ fn build_writer_properties(
     let builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(zstd_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap())))
         .set_max_row_group_bytes(Some(max_row_group_size))
+        // Exact companion to the byte cap above, which does not bind — see
+        // `row_group_row_count`.
+        .set_max_row_group_row_count(Some(row_group_row_count(schema, max_row_group_size)))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(8388608)
         // Page-level stats only where they prune (the declared sort keys, set
@@ -13088,6 +13157,28 @@ mod tests {
     /// with "Resources exhausted" (prod 2026-07-12). Guards the config half of
     /// that fix; the dedicated maintenance pool + spill dir are covered by the
     /// dedup_compaction integration tests.
+    /// The byte cap TF sets does NOT bind: parquet checks it against
+    /// `get_estimated_total_bytes()`, which under-reports the finished row
+    /// group by ~10x on the otel schema, so at 128 MiB row groups fell back to
+    /// parquet's own 1,048,576-row default — measured on prod 2026-08-08 at
+    /// 1,042,663 rows and up to 1.7 GB uncompressed each. The derived ROW cap
+    /// is what actually bounds them, and it must land far below that default.
+    #[test]
+    fn row_group_row_count_binds_far_below_the_parquet_default() {
+        const PARQUET_DEFAULT: usize = 1024 * 1024;
+        let otel = crate::schema_loader::get_schema("otel_logs_and_spans").expect("otel schema");
+        let rows = super::row_group_row_count(otel, 128 * 1024 * 1024);
+        assert!(rows < PARQUET_DEFAULT / 4, "otel row groups must shrink at least 4x, got {rows}");
+        assert!(rows >= 32_768, "floor keeps footer overhead from dominating, got {rows}");
+
+        // Monotonic in the operator-facing byte target, so raising the target
+        // raises the value that actually binds.
+        assert!(super::row_group_row_count(otel, 256 * 1024 * 1024) > rows);
+        // ...and it can never exceed the default it replaces, whatever the
+        // target — a huge target must not silently restore 1M-row row groups.
+        assert_eq!(super::row_group_row_count(otel, usize::MAX / 2), PARQUET_DEFAULT);
+    }
+
     #[test]
     fn optimize_session_sets_batch_size_and_spill_reservation() {
         let state = build_optimize_session_state(0, Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
@@ -14897,16 +14988,14 @@ mod tests {
         Ok(())
     }
 
-    /// A `--project`-scoped recompress must rewrite ONLY that tenant's files
-    /// and leave every other tenant's files on the same date byte-identical.
-    /// The scope is what makes the job small enough to run on an ordinary
-    /// runner (2026-08-07: one tenant's date was 2 files where the unscoped
-    /// rewrite pulled in 80 and OOM-killed the pod), but it is only safe if
-    /// the `replace_where` predicate is narrowed alongside the scan — a scan
-    /// narrowed without the predicate would TOMBSTONE the other tenants.
+    /// `--project` scoping is REFUSED while its deadlock is unexplained
+    /// (2026-08-08). Refusing beats both alternatives: hanging (what it does)
+    /// and silently ignoring the flag (which would rewrite every tenant on the
+    /// date without the caller asking). Re-enable only with a test that the
+    /// scoped write actually completes.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn recompress_scoped_to_a_project_leaves_other_projects_untouched() -> Result<()> {
+    async fn recompress_refuses_project_scope_and_leaves_data_intact() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
             let (db, ctx, prefix) = setup_test_database().await?;
             let (target, other) = (format!("target_{prefix}"), format!("other_{prefix}"));
@@ -14923,15 +15012,19 @@ mod tests {
             let (t_before, o_before) = (files(format!("project_id={target}/"))?, files(format!("project_id={other}/"))?);
             assert!(t_before.len() > 1 && o_before.len() > 1, "both tenants need >1 file for the rewrite to be non-trivial");
 
-            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, Some(target.as_str())).await?;
-
-            assert_ne!(files(format!("project_id={target}/"))?, t_before, "the scoped project must be rewritten");
+            // The scope is REFUSED, not silently ignored: it deadlocks the
+            // write (see `recompress_partition`), and a repair tool that hangs
+            // is worse than one that declines. Silently ignoring it would
+            // rewrite every tenant on the date behind the caller's back.
+            let err = db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, Some(target.as_str())).await.unwrap_err();
+            assert!(err.to_string().contains("--project is disabled"), "must refuse, got: {err}");
+            assert_eq!(files(format!("project_id={target}/"))?, t_before, "a refused scope must not have written anything");
             assert_eq!(files(format!("project_id={other}/"))?, o_before, "every other project's files must be untouched");
-            // And the other tenant's ROWS must still be readable — a too-wide
-            // `replace_where` would tombstone them while leaving the URIs above
-            // looking unchanged only until the next snapshot.
+
+            // Unscoped still works and preserves every tenant's rows.
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, None).await?;
             let rows = ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{other}'")).await?.collect().await?;
-            assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2, "other project's rows must survive");
+            assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2, "other project's rows must survive the rewrite");
 
             db.shutdown().await?;
             Ok::<_, anyhow::Error>(())
