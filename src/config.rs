@@ -844,6 +844,7 @@ const_default!(d_compact_min_files: usize = 5);
 // large event-time-disjoint runs so recent queries open a handful of files.
 const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
 const_default!(d_writer_max_file_bytes: usize = 512 * MIB);
+const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
 // 256 MiB. This was briefly raised to 4 GiB (2026-08-01) so that large prod
 // flush buckets — ~170 MB compressed, ~2.9 GB in memory at the measured ~17x
 // zstd ratio — would be sorted rather than written with no `sorting_columns`
@@ -1826,6 +1827,17 @@ pub struct MaintenanceConfig {
     /// footer AND the pieces are event-time disjoint (better file pruning).
     #[serde(default = "d_writer_max_file_bytes")]
     pub timefusion_writer_max_file_bytes: usize,
+    /// Largest file a 5-minute hot tick will rewrite purely to repair its
+    /// missing `sorting_columns` footer.
+    ///
+    /// Deliberately SEPARATE from `timefusion_writer_max_file_bytes` even though
+    /// they default the same: that one caps what we WRITE, this caps what we
+    /// pull into a tick to REPAIR. Raising the repair reach to cover legacy
+    /// files should not also start emitting bigger files. Anything above this
+    /// is left to `timefusion optimize --recompress`, which force-rewrites a
+    /// whole date and is the only thing that can touch a single-file partition.
+    #[serde(default = "d_repair_max_file_bytes")]
+    pub timefusion_repair_max_file_bytes: usize,
     /// Sealed dates (yesterday backwards) the hot tail also scans for FOOTER
     /// REPAIR — rewriting files that carry no `sorting_columns` so the reader's
     /// all-or-nothing ordering claim survives. Repair only: sorted files on

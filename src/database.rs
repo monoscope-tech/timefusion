@@ -8099,9 +8099,9 @@ impl Database {
             target_size,
             min_files: self.config.maintenance.timefusion_compact_min_files,
             sorted_run_cap: target_size / 2,
-            // A hot tick repairs files up to the size the writers now cap
-            // outputs at; anything larger is legacy and belongs to the off-box CLI.
-            repair_max_bytes: self.config.maintenance.timefusion_writer_max_file_bytes as i64,
+            // Repair reach is its own knob (see `timefusion_repair_max_file_bytes`);
+            // larger legacy files belong to `optimize --recompress`.
+            repair_max_bytes: self.config.maintenance.timefusion_repair_max_file_bytes as i64,
         };
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
         // snapshot (see `plan` below) so a wave never re-selects the run it just

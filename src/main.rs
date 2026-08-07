@@ -682,6 +682,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut concurrency: Option<usize> = None;
     let mut consolidate = false;
     let mut dedup = false;
+    let mut recompress = false;
     let mut target_size_mb: Option<i64> = None;
     // Two-token flags need lookahead into the arg iterator, so this stays a loop.
     let mut it = std::env::args().skip(2);
@@ -698,11 +699,12 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
             "--concurrency" => concurrency = Some(it.next().context("--concurrency needs a value")?.parse().context("--concurrency must be an integer")?),
             "--consolidate" => consolidate = true,
             "--dedup" => dedup = true,
+            "--recompress" => recompress = true,
             "--target-size-mb" => {
                 target_size_mb = Some(it.next().context("--target-size-mb needs a value")?.parse().context("--target-size-mb must be an integer")?)
             }
             other => anyhow::bail!(
-                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--consolidate [--target-size-mb N]] [--dedup] [--dry-run])"
+                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--consolidate [--target-size-mb N]] [--dedup] [--recompress] [--dry-run])"
             ),
         }
     }
@@ -756,6 +758,29 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         return db.shutdown().await;
     }
 
+    // `--recompress` is the ONLY force-rewrite. Bin-packing (`Compact`/`SortBy`,
+    // and `consolidate`'s leveled variant) skips files already at target AND
+    // drops single-file bins, so a lone file can never be rewritten by them —
+    // which is exactly the shape of a partition poisoned by ONE file with no
+    // `sorting_columns` footer. On prod 2026-08-07 that was 448 of 501 poisoned
+    // partitions: `optimize` and `--consolidate` both reported success having
+    // changed nothing (`removed=0 added=0`, file bytes identical).
+    //
+    // `recompress_partition` rewrites the whole date through `replace_where`
+    // with the schema ORDER BY, regardless of file count or size, so the output
+    // carries an honest sorted footer. It is per-DATE (all projects), not
+    // per-project — the overwrite predicate is `date = '...'`.
+    if recompress {
+        for d in &dates {
+            let level = cfg.parquet.timefusion_zstd_compression_level;
+            match db.recompress_partition(&table_ref, &table, *d, level).await {
+                Ok(()) => println!("  recompress date={d}: rewritten (sorted footer restored)"),
+                Err(e) => eprintln!("  recompress date={d}: FAILED: {e}"),
+            }
+        }
+        reconcile_tantivy(&db, &table).await;
+        return db.shutdown().await;
+    }
     println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
     if consolidate || dedup {
         // Leveled event-time-disjoint consolidation (the cold sweep's engine,
