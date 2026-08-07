@@ -2097,7 +2097,7 @@ impl BufferedWriteLayer {
     /// maintenance rewrites keep winning shared S3/commit capacity. Scheduled
     /// optimization must yield until these buckets drain.
     pub fn stale_unflushed_bucket_count(&self) -> usize {
-        self.mem_buffer.count_buckets_with_max_ts_before(self.retention_cutoff_micros())
+        self.mem_buffer.count_buckets_dwelling_since(self.retention_cutoff_micros())
     }
 
     /// The emergency-flush predicate: file sprawl OR a real unflushed backlog.
@@ -3656,22 +3656,34 @@ mod tests {
         assert!(!wal_emergency_flush_needed(51, 0, 0, MAX));
     }
 
-    /// A byte threshold alone misses small persistence debt. Maintenance must
-    /// be able to see a bucket that has aged beyond retention even when its
-    /// memory footprint is tiny (prod 2026-08-05: light optimize kept running
-    /// while 9 such buckets were already over the 70-minute target).
+    /// A byte threshold alone misses small persistence debt (prod 2026-08-05:
+    /// light optimize kept running while 9 buckets were already over the
+    /// 70-minute target), so the brake needs an AGE signal — but the age that
+    /// matters is DWELL, not event time.
+    ///
+    /// Prod 2026-08-07: counting by `max_timestamp` reported debt for a bucket
+    /// buffered seconds earlier, because a merge-on-read UPDATE appends the
+    /// row's ORIGINAL timestamp. monoscope enriches continuously, so one such
+    /// bucket was almost always present and `light_optimize_brake` hard-STOPped
+    /// forever — 25 minutes, `light_optimize_bins_committed_total = 0`, while
+    /// flush was healthy. Backdated arrivals are not persistence debt.
     #[test]
-    fn stale_unflushed_bucket_count_tracks_age_not_backlog_size() {
+    fn stale_unflushed_bucket_count_measures_dwell_not_event_time() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
         let layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
         let now = crate::clock::now_micros();
         let retention = cfg.buffer.retention_mins() as i64 * 60 * 1_000_000;
 
-        layer.mem_buffer.insert("old", "old", create_test_batch("old"), now - retention - 1).unwrap();
+        // A merge-on-read version append: buffered NOW, carrying event time
+        // from well beyond retention.
+        layer.mem_buffer.insert("mor", "mor", create_test_batch("mor"), now - retention - 1).unwrap();
         layer.mem_buffer.insert("hot", "hot", create_test_batch("hot"), now).unwrap();
 
-        assert_eq!(layer.stale_unflushed_bucket_count(), 1, "only the over-retention bucket is persistence debt");
+        assert_eq!(layer.stale_unflushed_bucket_count(), 0, "a backdated arrival is not persistence debt");
+        // A cutoff past both insertions proves the count keys on dwell: these
+        // same buckets ARE debt once they have actually sat here that long.
+        assert_eq!(layer.mem_buffer.count_buckets_dwelling_since(now + 1_000_000), 2, "both buckets are debt once they have dwelled");
         assert!(!layer.is_wal_backlog_over_threshold(), "the age brake must cover debt too small for the byte threshold");
     }
 

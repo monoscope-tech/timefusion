@@ -1894,11 +1894,21 @@ impl MemBuffer {
         true
     }
 
-    /// Count buckets whose `max_timestamp` is older than `cutoff_micros`.
-    /// Used by the eviction task to surface buckets that have aged past
-    /// retention without being flushed (which means flushes are stuck).
-    pub fn count_buckets_with_max_ts_before(&self, cutoff_micros: i64) -> usize {
-        self.tables.iter().map(|t| t.value().buckets.iter().filter(|b| b.value().max_timestamp.load(Ordering::Relaxed) < cutoff_micros).count()).sum()
+    /// Count buckets that have DWELLED here since before `cutoff_micros` —
+    /// i.e. persistence debt: buffered long ago and still not flushed.
+    ///
+    /// Dwell (`created_micros`), never the rows' `max_timestamp`. Event time
+    /// says nothing about whether flush is keeping up: a merge-on-read UPDATE
+    /// appends the row's ORIGINAL timestamp, so a bucket created seconds ago
+    /// can hold hours-old event time. Under monoscope's continuous enrichment
+    /// there is essentially always such a bucket, and reading it as debt made
+    /// `light_optimize_brake` hard-STOP forever — prod 2026-08-07 ran 25
+    /// minutes with `light_optimize_bins_committed_total = 0`, 12 flush-debt
+    /// yields and `stale_buckets=1`, while flush was healthy (0 failures,
+    /// oldest dwell 12 min). Same bug class the 2026-06-29 dwell fix caught in
+    /// `oldest_bucket_age`; this caller was missed.
+    pub fn count_buckets_dwelling_since(&self, cutoff_micros: i64) -> usize {
+        self.tables.iter().map(|t| t.value().buckets.iter().filter(|b| b.value().created_micros < cutoff_micros).count()).sum()
     }
 
     #[instrument(skip(self))]
