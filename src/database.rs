@@ -6261,16 +6261,35 @@ impl Database {
     /// would leave mixed tiers — the next sweep then sees the probe's tier
     /// and may skip, but the partition will be re-evaluated the day after.
     /// Acceptable for an idempotent daily job.
-    pub async fn recompress_partition(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_level: i32) -> Result<()> {
+    /// `project` scopes the rewrite to one `project_id=` partition. A whole
+    /// date of `otel_logs_and_spans` is tens of GB across every tenant, which
+    /// needs a big box; ONE tenant's day is usually a couple of files and fits
+    /// on a small runner. Since the poison this exists for is per-file, the
+    /// narrow scope is also the honest unit of repair (2026-08-07: repairing
+    /// one tenant's date meant 2 files instead of 80, after the unscoped job
+    /// OOM-killed a 5 GiB pod and then evicted a 6 GiB one).
+    pub async fn recompress_partition(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_level: i32, project: Option<&str>,
+    ) -> Result<()> {
         use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
         use object_store::{ObjectStoreExt, path::Path as OsPath};
 
         let date_str = date.to_string();
         let date_marker = format!("date={}", date_str);
+        // Both the SQL and the `replace_where` predicate interpolate this, so
+        // reject anything that isn't a bare partition token. `date_str` is
+        // already safe (a parsed `NaiveDate`).
+        if let Some(p) = project
+            && !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("recompress: refusing project id with unsafe characters: {p:?}");
+        }
+        let project_marker = project.map(|p| format!("project_id={p}/"));
 
         let (uris, log_store, table_uri) = {
             let table = table_ref.read().await;
-            let uris: Vec<String> = table.get_file_uris()?.filter(|u| u.contains(&date_marker)).collect();
+            let uris: Vec<String> =
+                table.get_file_uris()?.filter(|u| u.contains(&date_marker) && project_marker.as_ref().is_none_or(|m| u.contains(m.as_str()))).collect();
             (uris, table.log_store(), table.table_url().to_string())
         };
         if uris.is_empty() {
@@ -6382,9 +6401,13 @@ impl Database {
         // Literal date is safe: `date_str` is a parsed `chrono::NaiveDate`. The
         // `order_by` clause (quoted identifiers) makes the rewrite globally
         // sorted so `declare_sorted` above is honest.
-        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{order_by}")).await?.into_optimized_plan()?;
+        // `project_id` is a partition column, so scoping BOTH the scan and the
+        // overwrite predicate leaves every other tenant's files on that date
+        // untouched by the commit.
+        let scope = project.map(|p| format!(" AND project_id = '{p}'")).unwrap_or_default();
+        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{scope}{order_by}")).await?.into_optimized_plan()?;
 
-        let replace_pred = format!("date = '{date_str}'");
+        let replace_pred = format!("date = '{date_str}'{scope}");
         let write_result = table_clone
             .write(Vec::<RecordBatch>::new())
             .with_input_plan(input_plan)
@@ -6424,7 +6447,7 @@ impl Database {
         let today = Utc::now().date_naive();
         for days_ago in age_min_days..age_max_days {
             let date = today - chrono::Duration::days(days_ago as i64);
-            if let Err(e) = self.recompress_partition(table_ref, table_name, date, target_level).await {
+            if let Err(e) = self.recompress_partition(table_ref, table_name, date, target_level, None).await {
                 warn!("recompress_tier_window: skipping date={} after error: {}", date, e);
             }
         }
@@ -14829,6 +14852,49 @@ mod tests {
         Ok(())
     }
 
+    /// A `--project`-scoped recompress must rewrite ONLY that tenant's files
+    /// and leave every other tenant's files on the same date byte-identical.
+    /// The scope is what makes the job small enough to run on an ordinary
+    /// runner (2026-08-07: one tenant's date was 2 files where the unscoped
+    /// rewrite pulled in 80 and OOM-killed the pod), but it is only safe if
+    /// the `replace_where` predicate is narrowed alongside the scan — a scan
+    /// narrowed without the predicate would TOMBSTONE the other tenants.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recompress_scoped_to_a_project_leaves_other_projects_untouched() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let (target, other) = (format!("target_{prefix}"), format!("other_{prefix}"));
+            let today = chrono::Utc::now().date_naive();
+            for (pid, ids) in [(&target, ["t1", "t2"]), (&other, ["o1", "o2"])] {
+                for id in ids {
+                    let batch = json_to_batch(vec![test_span(id, "span", pid)])?;
+                    db.insert_records_batch(pid, "otel_logs_and_spans", vec![batch], true, None).await?;
+                }
+            }
+            let table_ref = get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans").await.expect("table created");
+            let files =
+                |m: String| -> Result<Vec<String>> { Ok(futures::executor::block_on(table_ref.read()).get_file_uris()?.filter(|u| u.contains(&m)).collect()) };
+            let (t_before, o_before) = (files(format!("project_id={target}/"))?, files(format!("project_id={other}/"))?);
+            assert!(t_before.len() > 1 && o_before.len() > 1, "both tenants need >1 file for the rewrite to be non-trivial");
+
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, Some(target.as_str())).await?;
+
+            assert_ne!(files(format!("project_id={target}/"))?, t_before, "the scoped project must be rewritten");
+            assert_eq!(files(format!("project_id={other}/"))?, o_before, "every other project's files must be untouched");
+            // And the other tenant's ROWS must still be readable — a too-wide
+            // `replace_where` would tombstone them while leaving the URIs above
+            // looking unchanged only until the next snapshot.
+            let rows = ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{other}'")).await?.collect().await?;
+            assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2, "other project's rows must survive");
+
+            db.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
+    }
+
     /// End-to-end test of `recompress_partition`. Skip behavior is the
     /// load-bearing property: if the footer-tier probe breaks, the daily
     /// cron rewrites every partition every night. We assert via file-set
@@ -14861,7 +14927,7 @@ mod tests {
             // First recompress at tier 9 — must rewrite files.
             let files_before: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             assert!(!files_before.is_empty(), "expected files in today's partition");
-            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9).await?;
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, None).await?;
             let files_after: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             assert_ne!(files_before, files_after, "first recompress must rewrite files");
 
@@ -14874,12 +14940,12 @@ mod tests {
             // Re-run at the same tier — footer probe must detect tier=9 and skip,
             // so the file set is unchanged. If skip is broken, this assertion
             // fails because Optimize emits a fresh part file.
-            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9).await?;
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9, None).await?;
             let files_after_rerun: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             assert_eq!(files_after, files_after_rerun, "rerun at same tier must skip");
 
             // Downgrade target — also skip.
-            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 3).await?;
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 3, None).await?;
             let files_after_downgrade: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             assert_eq!(files_after, files_after_downgrade, "downgrade target must skip");
 

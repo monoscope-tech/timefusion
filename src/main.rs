@@ -766,15 +766,19 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // partitions: `optimize` and `--consolidate` both reported success having
     // changed nothing (`removed=0 added=0`, file bytes identical).
     //
-    // `recompress_partition` rewrites the whole date through `replace_where`
+    // `recompress_partition` rewrites the partition through `replace_where`
     // with the schema ORDER BY, regardless of file count or size, so the output
-    // carries an honest sorted footer. It is per-DATE (all projects), not
-    // per-project — the overwrite predicate is `date = '...'`.
+    // carries an honest sorted footer. `--project` narrows the overwrite
+    // predicate to `date = '...' AND project_id = '...'`, which is what makes
+    // the job small enough to run on an ordinary runner.
     if recompress {
         for d in &dates {
             let level = cfg.parquet.timefusion_zstd_compression_level;
-            match db.recompress_partition(&table_ref, &table, *d, level).await {
-                Ok(()) => println!("  recompress date={d}: rewritten (sorted footer restored)"),
+            match db.recompress_partition(&table_ref, &table, *d, level, project.as_deref()).await {
+                Ok(()) => println!(
+                    "  recompress date={d}{}: rewritten (sorted footer restored)",
+                    project.as_deref().map(|p| format!(" project={p}")).unwrap_or_default()
+                ),
                 Err(e) => eprintln!("  recompress date={d}: FAILED: {e}"),
             }
         }
