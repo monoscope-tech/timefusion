@@ -8324,8 +8324,15 @@ impl Database {
                     // ranged read against the same metadata cache the scan
                     // warms, versus a whole-file sort of a file that was
                     // already fine.
+                    // `Retry`, NOT `Converged`: clearing a suspect means this
+                    // project's NEXT candidate is still unexamined, and
+                    // `Converged` drops it from the rest of the tick. A project
+                    // whose recent sealed dates hold several untagged-but-sorted
+                    // flush outputs would then clear exactly one per tick and
+                    // could take days to reach the file that actually poisons
+                    // its scans — while looking busy the whole time.
                     if pass == TailPass::Repair && self.repair_bin_already_sorted(table_ref, &files).await {
-                        return (project_id, Ok(BinOutcome::Converged));
+                        return (project_id, Ok(BinOutcome::Retry));
                     }
                     // Bound the bin by what is LEFT of the tick, the same way
                     // the dedup drain bounds its own staging. Without it a
