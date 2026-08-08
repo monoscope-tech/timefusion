@@ -1997,12 +1997,20 @@ pub struct MaintenanceConfig {
     #[serde(default = "d_snapshot_reconcile")]
     pub timefusion_snapshot_reconcile_commits: u64,
     /// Commit staged-but-uncommitted footer-repair parquet found at boot,
-    /// instead of deleting it and re-doing the 40+ minute rewrite. OFF for the
-    /// first deploy so the widened manifest ships and gets exercised before
-    /// anything commits from it; turning it off again reverts to plain
-    /// reconcile-and-delete. Only data-preserving (compaction/repair) bins are
-    /// eligible — dedup bins drop rows and stay cleanup-only.
-    #[serde(default)]
+    /// instead of deleting it and re-doing the 40+ minute rewrite. Setting it
+    /// false reverts to plain reconcile-and-delete. Only data-preserving
+    /// (compaction/repair) bins are eligible — dedup bins drop rows and stay
+    /// cleanup-only.
+    ///
+    /// Shipped OFF for one deploy so the widened manifest was written and
+    /// exercised before anything committed from it; 7f572e7 and 5ec0097 both ran
+    /// in prod, so that condition is met and the default is now ON. It has to
+    /// be: a repair bin is a single 40+ minute whole-file rewrite, and prod was
+    /// replacing the task every 15-28 minutes (deploys plus healthcheck
+    /// replacements), so every pass discarded a complete staged output and the
+    /// same file stayed poisoned for days. Resume is what makes the rewrite
+    /// survive a restart at all.
+    #[serde(default = "d_true")]
     pub timefusion_repair_resume_enabled: bool,
     /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
     #[serde(default = "d_dedup_lookback_days")]
