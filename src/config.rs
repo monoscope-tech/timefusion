@@ -870,7 +870,7 @@ const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
 const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
-const_default!(d_footer_repair_schedule: String = "0 0 */3 * * *");
+const_default!(d_footer_repair_schedule: String = "0 30 */3 * * *");
 const_default!(d_repair_lookback_days: u64 = 2);
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
