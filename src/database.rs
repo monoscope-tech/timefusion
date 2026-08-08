@@ -10561,7 +10561,17 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     // A lone repair file is real work — it is the only way an oversized
     // unsorted file ever gets rewritten — so it does not need `min_files`
     // company to justify a pass.
-    let repairs_present = fresh.iter().any(|(_, _, _, repair)| *repair);
+    // A repair pass sees ONLY sealed footer-less files — `hot_bin_admits`
+    // already applied every scope test — so on that pass every candidate is
+    // repair work, whatever its size. The `is_repair` size test exists solely
+    // to tell "converged but unsorted, repair it" from "small, pack it" on
+    // TODAY's partition, and that distinction is meaningless here. Applying it
+    // anyway stranded small sealed footer-less files: neither pass would touch
+    // them (Pack has no sealed dates in scope), yet ONE of them poisons its
+    // date's scan exactly as thoroughly as a 1 GiB one — the reader's
+    // `derive_common_ordering` is all-or-nothing and does not care about size.
+    let is_candidate = |repair: bool| pass == TailPass::Repair || repair;
+    let repairs_present = fresh.iter().any(|(_, _, _, repair)| is_candidate(*repair));
     if fresh.len() < min_files && !repairs_present {
         return vec![];
     }
@@ -10581,7 +10591,6 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     if pass == TailPass::Repair {
         return fresh
             .iter()
-            .filter(|(_, _, _, repair)| *repair)
             .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
             .map(|(path, _, _, _)| vec![path.to_string()])
             .unwrap_or_default();
@@ -13958,12 +13967,24 @@ mod tests {
         let same_day = vec![f("huge", 999, 500), f("small", 880, 500)];
         assert_eq!(super::select_tail_bin(&same_day, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["small"], "smallest first within a date");
 
-        // A repair pass NEVER packs, even when a fat packable slice is present:
-        // packing is the other cron's job and would spend the repair budget.
+        // A repair pass NEVER packs — it returns ONE file, never a bin, even
+        // when several candidates could be packed together. Packing is the other
+        // cron's job and a multi-file bin would spend the repair budget on it.
         let mixed = vec![f("poison", 900, 500), f("a", 10, 600), f("b", 10, 700)];
-        assert_eq!(super::select_tail_bin(&mixed, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["poison"]);
-        let no_poison = vec![f("a", 10, 600), f("b", 10, 700)];
-        assert!(super::select_tail_bin(&no_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair).is_empty(), "nothing to repair => no work");
+        assert_eq!(super::select_tail_bin(&mixed, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["b"], "one file, the newest");
+        // A SMALL sealed footer-less file is repair work too. `hot_bin_admits`
+        // has already established these are sealed and untagged, and one small
+        // unsorted file voids its date's scan ordering exactly like a 1 GiB one
+        // — `derive_common_ordering` is all-or-nothing and size-blind. Requiring
+        // `size >= converged` here stranded them: Pack has no sealed dates in
+        // scope, so nothing would ever have rewritten them.
+        let small_only = vec![f("tiny_old", 10, 100), f("tiny_new", 10, 900)];
+        assert_eq!(
+            super::select_tail_bin(&small_only, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair),
+            vec!["tiny_new"],
+            "a small sealed footer-less file is still repair work, newest first"
+        );
+        assert!(super::select_tail_bin(&[], TARGET, 2, TARGET / 4, SEAL, TailPass::Repair).is_empty(), "nothing admitted => no work");
     }
 
     /// Today's partition still repairs itself in the GAPS of the packing pass —
