@@ -8348,6 +8348,9 @@ impl Database {
                 self.light_optimize_cursor.store(resume, Relaxed);
             },
             || self.light_optimize_brake(),
+            // Repair commits per bin: its bins are few and minutes long, so a
+            // restart mid-wave must not discard the ones already finished.
+            pass == TailPass::Repair,
             |project_id, round| {
                 let (schema, plan) = (schema, &plan);
                 async move {
@@ -10769,6 +10772,39 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     files
 }
 
+/// One commit per bin, or one for the whole wave. See the call site: batching is
+/// a throughput optimisation for packing and a durability liability for repair.
+fn staged_chunks<T>(staged: Vec<T>, per_bin: bool) -> Vec<Vec<T>> {
+    match per_bin {
+        true => staged.into_iter().map(|bin| vec![bin]).collect(),
+        false => match staged.is_empty() {
+            true => vec![],
+            false => vec![staged],
+        },
+    }
+}
+
+#[cfg(test)]
+mod staged_chunk_tests {
+    /// Repair commits per bin; packing commits once per wave.
+    ///
+    /// Wave batching is why wave commits are ~40x rarer than the per-bin
+    /// commits they replaced (2026-07-29: ~130 commits a tick drove OCC ladders
+    /// to attempt 9-20). Right for packing — many quick bins. Wrong for repair —
+    /// few bins, minutes each — where it holds every finished rewrite hostage to
+    /// the slowest one, so a deploy or a healthcheck restart discards the whole
+    /// wave instead of just the bin in flight. Prod 2026-08-08 lost entire
+    /// passes that way twice in one morning.
+    #[test]
+    fn repair_commits_each_bin_separately_so_a_restart_loses_only_one() {
+        assert_eq!(super::staged_chunks(vec!["a", "b", "c"], true), vec![vec!["a"], vec!["b"], vec!["c"]], "repair: one commit per bin");
+        assert_eq!(super::staged_chunks(vec!["a", "b", "c"], false), vec![vec!["a", "b", "c"]], "packing: one commit per wave");
+        // An empty wave must not produce a commit call in either mode.
+        assert!(super::staged_chunks(Vec::<&str>::new(), false).is_empty());
+        assert!(super::staged_chunks(Vec::<&str>::new(), true).is_empty());
+    }
+}
+
 /// Split staged bins into (committable, stale) against the live file set of the
 /// refreshed snapshot. One conflicting file used to fail one commit of one bin;
 /// with a batched wave commit, dropping only the stale bin's actions keeps the
@@ -10842,7 +10878,7 @@ enum Brake {
 #[allow(clippy::too_many_arguments)] // scheduling params are positional by design; a struct would just rename them
 async fn round_robin_bins<F, Fut, T, C, CFut>(
     projects: Vec<String>, max_rounds: usize, concurrency: usize, deadline: std::time::Instant, on_truncate: impl Fn(usize, &[String]),
-    should_pause: impl Fn() -> Option<Brake>, op: F, commit_wave: C,
+    should_pause: impl Fn() -> Option<Brake>, commit_each_bin: bool, op: F, commit_wave: C,
 ) -> usize
 where
     F: Fn(String, usize) -> Fut,
@@ -10935,8 +10971,20 @@ where
                 }
             }
         }
-        if !staged.is_empty() {
-            failed += commit_wave(staged, round).await;
+        // A wave normally commits ONCE, which is what made wave commits ~40x
+        // rarer than the per-bin commits they replaced (2026-07-29: ~130 commits
+        // a tick drove OCC ladders to attempt 9-20). That batching is right for
+        // packing, whose bins are many and quick.
+        //
+        // Repair is the opposite shape and the batching hurts it twice over:
+        // its bins are FEW and each is minutes long, so per-bin commits cost a
+        // handful of extra commits per tick rather than a hundred; and holding
+        // every finished bin hostage until the slowest one lands means a restart
+        // — a deploy, or the healthcheck replacing the task — throws away every
+        // completed rewrite in the wave, not just the one in flight. Prod
+        // 2026-08-08 lost whole passes that way twice in one morning.
+        for chunk in staged_chunks(staged, commit_each_bin) {
+            failed += commit_wave(chunk, round).await;
         }
     }
     failed
@@ -14501,6 +14549,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             |_, _| panic!("must not truncate: deadline is far away"),
             || None,
+            false,
             |project_id, round| {
                 let seen = seen.clone();
                 async move {
@@ -14544,6 +14593,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             |_, _| panic!("must not truncate"),
             || None,
+            false,
             |project_id, round| {
                 let seen = seen.clone();
                 async move {
@@ -14577,6 +14627,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             |_, _| panic!("must not truncate"),
             || None,
+            false,
             |project_id, round| {
                 let seen = seen.clone();
                 async move {
@@ -14613,6 +14664,7 @@ mod tests {
             std::time::Instant::now(), // already expired
             move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.len())),
             || None,
+            false,
             |project_id, _| async move { (project_id, Ok(super::BinOutcome::Staged(()))) },
             |_bins, _round| async { 0 },
         )
@@ -14645,6 +14697,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.to_vec())),
             move || (gate.load(std::sync::atomic::Ordering::SeqCst) > 0).then_some(super::Brake::Stop("mem")),
+            false,
             |project_id, _round| {
                 let (seen, admitted) = (seen.clone(), admitted.clone());
                 async move {
@@ -14682,6 +14735,7 @@ mod tests {
                 std::time::Instant::now() + std::time::Duration::from_secs(60),
                 move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.to_vec())),
                 move || brake,
+                false,
                 |project_id, round| {
                     let seen = seen.clone();
                     async move {
