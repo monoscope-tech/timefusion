@@ -15547,9 +15547,8 @@ mod tests {
         let (out, escalated) = db.sort_flush_group(table, batches, UnsortedFallback::Allow).await?;
         assert!(escalated, "the pool could not admit one batch, so the group was written UNSORTED — the footer-poison path");
         let FlushBatches::Ready(it) = out else { panic!("escalated path yields Ready batches") };
-        let stamps: Vec<i64> = it
-            .flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec())
-            .collect();
+        let stamps: Vec<i64> =
+            it.flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec()).collect();
         assert_eq!(stamps.len() as i64, rows_per_batch * batches_n, "the sort must not lose or duplicate rows");
         assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
         Ok(())
