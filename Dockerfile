@@ -112,7 +112,25 @@ EXPOSE 80 5432
 # it becomes healthy within one startup probe interval of WAL-owner handoff
 # completing. After the first success, probe less often and tolerate transient
 # host/load stalls so Swarm never recycles an otherwise healthy database task.
-HEALTHCHECK --interval=5s --timeout=2s --start-period=10s --start-interval=250ms --retries=3 \
+#
+# timeout 2s->5s, retries 3->5 (prod 2026-08-08). The old budget replaced a
+# HEALTHY task: the handshake was measured at 0.896s under ordinary load with no
+# deploy in flight, and 3 consecutive misses inside 15s is not evidence that a
+# database is dead — it is evidence that it is busy. Each replacement killed an
+# in-flight footer repair, discarding a 40-minute rewrite, which is why the
+# backlog never drained. 5s x 5 retries = ~25s of continuous failure before
+# Swarm acts, still far inside any real outage.
+#
+# Only interval/timeout/start-interval/retries live here: CapRover overrides
+# StartPeriod at the service level (900s), and Swarm merges the two — a
+# zero-valued service field inherits the image's. So changing these DOES take
+# effect on the deployed service; verify with
+# `docker service inspect srv-captain--timefusion` after the deploy.
+#
+# `--timeout` must stay above 3x `pgwire_ready_at`'s per-operation deadline
+# (connect + write + read, 1.5s each in src/main.rs), or Docker kills the probe
+# before it can report its own verdict.
+HEALTHCHECK --interval=5s --timeout=5s --start-period=10s --start-interval=250ms --retries=5 \
     CMD ["/usr/local/bin/timefusion", "healthcheck"]
 
 # Default telemetry destination: the swarm-internal collector. Image ENV

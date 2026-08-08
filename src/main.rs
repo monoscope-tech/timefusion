@@ -126,10 +126,23 @@ fn run_pgwire_healthcheck() -> anyhow::Result<()> {
     pgwire_ready_at(([127, 0, 0, 1], port).into())
 }
 
+/// Per-operation deadline for the readiness probe, so its worst case is 3x this
+/// (connect + write + read) and must stay inside the Dockerfile's
+/// `HEALTHCHECK --timeout` (pinned by `probe_worst_case_fits_the_docker_timeout`).
+///
+/// Was 750ms, and that was the actual killer (prod 2026-08-08): a probe measured
+/// at 0.896s with no deploy in flight and the server perfectly healthy, three of
+/// those in a row, and Swarm replaced the task — mid footer repair, discarding a
+/// 40-minute rewrite. The handshake competes for the same runtime as ingest and
+/// maintenance, so sub-second is not a budget a loaded database can hold. This
+/// is a LIVENESS probe: the question is "is this still a database", not "is it
+/// fast right now".
+const PROBE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
-    let timeout = std::time::Duration::from_millis(750);
+    let timeout = PROBE_OP_TIMEOUT;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -880,5 +893,29 @@ mod healthcheck_tests {
     fn readiness_accepts_authentication_and_rejects_early_error() {
         assert!(pgwire_ready_at(one_response(b'R')).is_ok());
         assert!(pgwire_ready_at(one_response(b'E')).is_err());
+    }
+
+    /// The probe and the Dockerfile are one budget split across two files, and
+    /// the split is only correct in one direction: if Docker's `--timeout` is
+    /// below the probe's own worst case, Docker kills the probe before it can
+    /// report a verdict, and every slow-but-alive moment counts as a failure.
+    /// That is the prod 2026-08-08 shape — a HEALTHY task replaced mid-repair.
+    #[test]
+    fn probe_worst_case_fits_the_docker_timeout() {
+        let line = include_str!("../Dockerfile").lines().find(|l| l.starts_with("HEALTHCHECK ")).expect("Dockerfile must declare a HEALTHCHECK");
+        let flag = |name: &str| -> u64 {
+            line.split_whitespace()
+                .find_map(|f| f.strip_prefix(name))
+                .and_then(|v| v.strip_suffix('s').unwrap_or(v).parse().ok())
+                .unwrap_or_else(|| panic!("HEALTHCHECK is missing {name}: {line}"))
+        };
+        let docker_timeout = std::time::Duration::from_secs(flag("--timeout="));
+        // connect + write + read, each bounded by PROBE_OP_TIMEOUT.
+        let worst_case = super::PROBE_OP_TIMEOUT * 3;
+        assert!(
+            worst_case <= docker_timeout,
+            "the probe can take up to {worst_case:?} but Docker kills it at {docker_timeout:?} — raise --timeout or lower PROBE_OP_TIMEOUT"
+        );
+        assert!(flag("--retries=") >= 5, "3 consecutive misses inside 15s is 'busy', not 'dead' (prod 2026-08-08)");
     }
 }
