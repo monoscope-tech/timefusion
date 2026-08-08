@@ -688,6 +688,11 @@ fn build_optimize_session_state_with_batch(
 /// at 4 partitions, hence 2.
 const MAINTENANCE_MAX_PARTITIONS: usize = 2;
 
+/// How long after boot the one-shot footer repair waits. Long enough for WAL
+/// replay and snapshot load to finish, short enough that a process which only
+/// lives ~20 minutes between deploys still gets a repair pass in.
+const STARTUP_REPAIR_DELAY: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Config tuning shared by every delta-rs maintenance session.
 /// `schema_force_view_types=false` keeps Variant columns as `Binary` (not
 /// `BinaryView`) so delta_kernel's unshredded-variant schema check passes; the
@@ -2779,11 +2784,25 @@ impl Database {
         // Disjoint partitions from the packing pass (sealed vs today), so the
         // two crons never contend for the same files. Shares
         // `timefusion_light_optimize_enabled` as the incident kill switch.
+        // ONE guard for every repair entry point. `spawn_cron_job` tracks its
+        // in-flight run in a LOCAL variable, so it can only skip ticks it
+        // started itself — a separately spawned repair (the startup pass below)
+        // is invisible to it. Two concurrent repair passes would each take
+        // `k/2` light-rewrite permits and together starve packing, which is the
+        // prod 2026-08-08 05:09 incident. A shared `try_lock` is what makes
+        // "repair never overlaps repair" true rather than merely intended.
+        let repair_guard = Arc::new(tokio::sync::Mutex::new(()));
         spawn_cron_job("Footer repair", &self.config.maintenance.timefusion_footer_repair_schedule, cancel.clone(), {
             let db = db.clone();
+            let repair_guard = repair_guard.clone();
             move || {
                 let db = db.clone();
+                let repair_guard = repair_guard.clone();
                 async move {
+                    let Ok(_guard) = repair_guard.try_lock() else {
+                        info!("Scheduled footer repair skipped — a repair pass is already running");
+                        return;
+                    };
                     if !db.config.maintenance.timefusion_light_optimize_enabled || db.config.maintenance.timefusion_light_optimize_repair_days == 0 {
                         return;
                     }
@@ -2797,6 +2816,49 @@ impl Database {
                 }
             }
         });
+
+        // ...and once shortly after boot, because waiting for the next tick is
+        // dead time this process usually does not have.
+        //
+        // `spawn_cron_job` only ever fires on schedule, so a restart costs up to
+        // a full repair period before repair runs at all. That is fine when
+        // restarts are rare and fatal when they are not: prod 2026-08-08 saw
+        // deploys every ~20 minutes against an hourly schedule, and the 23:30
+        // pass was killed at 23:32 by one — after which the next attempt was
+        // 58 minutes away. A backlog that only drains between restarts never
+        // drains if restarts outpace the schedule.
+        //
+        // The delay lets boot settle (WAL replay, snapshot load) before a heavy
+        // rewrite competes with it; the memory brake and tick budget bound it
+        // exactly as they bound a scheduled tick. It takes `repair_guard`, so a
+        // still-running startup pass makes the next cron tick stand down (and
+        // vice versa) — see the guard's comment for why the cron's own skip
+        // logic cannot do this.
+        {
+            let db = db.clone();
+            let cancel = cancel.clone();
+            let repair_guard = repair_guard.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(STARTUP_REPAIR_DELAY) => {}
+                }
+                let Ok(_guard) = repair_guard.try_lock() else {
+                    info!("Startup footer repair skipped — a repair pass is already running");
+                    return;
+                };
+                if !db.config.maintenance.timefusion_light_optimize_enabled || db.config.maintenance.timefusion_light_optimize_repair_days == 0 {
+                    return;
+                }
+                info!(delay_secs = STARTUP_REPAIR_DELAY.as_secs(), "Running startup footer repair (not waiting for the next tick)");
+                for (project_id, table_name, table) in db.all_tables().await {
+                    if db.maintenance_shutdown.is_cancelled() {
+                        return;
+                    }
+                    db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), TailPass::Repair).await;
+                }
+            });
+        }
 
         // Dedup — collapse duplicates in sealed (< today) partitions on its own
         // cron, decoupled from hot compaction above. Keeps the job_sem so it stays
@@ -15569,6 +15631,24 @@ mod tests {
         assert_eq!(stamps.len() as i64, rows_per_batch * batches_n, "the sort must not lose or duplicate rows");
         assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
         Ok(())
+    }
+
+    /// Repair must never overlap repair. The startup pass and the cron are
+    /// SEPARATE tasks, and `spawn_cron_job` tracks its in-flight run in a local
+    /// variable — so it can only skip ticks it started itself and is blind to
+    /// the startup pass. Two concurrent repair passes each take `k/2`
+    /// light-rewrite permits and together starve packing (prod 2026-08-08
+    /// 05:09). The shared `try_lock` is what makes the exclusion real; this
+    /// pins the semantics the two call sites depend on.
+    #[tokio::test]
+    async fn a_second_repair_pass_stands_down_while_one_is_running() {
+        let guard = Arc::new(tokio::sync::Mutex::new(()));
+        let held = guard.clone().try_lock_owned().expect("first pass takes the guard");
+        // The other entry point must DECLINE, not queue: a repair pass runs for
+        // up to 144 minutes, so blocking would pile ticks up behind it.
+        assert!(guard.try_lock().is_err(), "a second repair pass must stand down while one holds the guard");
+        drop(held);
+        assert!(guard.try_lock().is_ok(), "the guard must release when the pass finishes, or repair stops forever");
     }
 
     async fn setup_test_database() -> Result<(Database, SessionContext, String)> {
