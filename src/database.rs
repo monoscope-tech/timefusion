@@ -13856,7 +13856,10 @@ mod tests {
         assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["first", "second"], "packs earliest slice, stops at cap");
 
         // min_files gate.
-        assert_eq!(super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new());
+        assert_eq!(
+            super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack),
+            Vec::<String>::new()
+        );
 
         // A lone over-cap-adjacent file must not wedge the pass: selection skips
         // past it to the next slice rather than returning a 1-file bin.
