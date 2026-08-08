@@ -6485,14 +6485,14 @@ impl Database {
 
         match write_result {
             Ok(new_table) => {
-                info!("recompress: date={} table={} rewritten at zstd={} (was {} files)", date_str, table_name, target_level, pre_uris.len());
+                info!("recompress: date={} table={} rewritten at zstd={} (was {} files)", date_str, table_name, target_level, uris.len());
                 // Swap + warm-added/evict-removed like the other optimize
                 // paths. A bare swap left the rewritten cold-tier files
                 // un-warmed and the tombstoned ones cached — the next query
                 // on a recompressed partition paid full S3 reads (1.5 s
                 // observed against OVH).
                 self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
-                Ok(RecompressOutcome::Rewritten { files: pre_uris.len() })
+                Ok(RecompressOutcome::Rewritten { files: uris.len() })
             }
             Err(e) => {
                 error!("recompress failed for date={} table={}: {}", date_str, table_name, e);
