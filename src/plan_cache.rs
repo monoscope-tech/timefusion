@@ -552,11 +552,30 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     let mut stmt = stmt.clone();
     let mut values: Vec<ScalarValue> = Vec::new();
 
-    // Push `v` and return the `$N` placeholder referencing its new position —
-    // the bookkeeping shared by every literal-lifting site below.
+    // Push `v` and return the `$N` placeholder referencing its position — the
+    // bookkeeping shared by every literal-lifting site below.
+    //
+    // An identical literal REUSES its placeholder instead of taking a new one,
+    // and that is what makes a GROUP BY survive parameterization. DataFusion
+    // requires each SELECT expression to appear in GROUP BY *as the same
+    // expression*, so monoscope's chart query —
+    // `SELECT extract(epoch from time_bucket(60, timestamp)) … GROUP BY
+    // time_bucket(60, timestamp) ORDER BY time_bucket(60, timestamp)` — lifted
+    // the one `60` into `$1`, `$5` and `$6`, the three `time_bucket` calls
+    // stopped being equal, and the shape build failed with "Column in SELECT
+    // must be in GROUP BY or an aggregate function". Every dashboard chart then
+    // re-planned from scratch, forever (prod 2026-08-08, `shape build failed`
+    // logged continuously).
+    //
+    // Reusing is semantics-preserving: both sites bind the same value. It does
+    // narrow the template — `f(5) … g(5)` and `f(5) … g(7)` are now different
+    // shapes — which is correct, just a different cache key.
     fn placeholder_for(values: &mut Vec<ScalarValue>, base: usize, v: ScalarValue) -> Value {
-        values.push(v);
-        Value::Placeholder(format!("${}", base + values.len()))
+        let idx = values.iter().position(|existing| *existing == v).unwrap_or_else(|| {
+            values.push(v);
+            values.len() - 1
+        });
+        Value::Placeholder(format!("${}", base + idx + 1))
     }
 
     // Parameterize a numeric literal ONLY when reached as a value-context child
@@ -1049,6 +1068,23 @@ mod tests {
     /// The prod-breaking shape: monoscope's service graph, ~5500 planning
     /// failures/hour. `count(*)` must reach the planner as `count(1)` so the
     /// `ORDER BY 6` ordinal resolves against the same expression.
+    /// monoscope's chart shape: one literal, three `time_bucket` calls across
+    /// SELECT / GROUP BY / ORDER BY. They must lift to the SAME placeholder or
+    /// the GROUP BY stops matching the SELECT and the shape build fails — which
+    /// is what kept every dashboard chart out of the plan cache on prod.
+    #[test]
+    fn one_literal_lifts_to_one_placeholder_so_group_by_still_matches_select() {
+        let stmt = parse(
+            "SELECT EXTRACT(EPOCH FROM time_bucket(60, timestamp)), count(*) FROM t \
+             WHERE project_id = 'p' GROUP BY time_bucket(60, timestamp) ORDER BY time_bucket(60, timestamp) DESC",
+        );
+        let (param, values) = parameterize_statement(&stmt, 0, true).expect("has literals");
+        let text = param.to_string();
+        assert_eq!(values, vec![ScalarValue::Int64(Some(60)), ScalarValue::Utf8(Some("p".into()))], "the repeated 60 is stored once");
+        assert_eq!(text.matches("time_bucket($1,").count(), 3, "all three time_bucket calls share one placeholder: {text}");
+        assert!(!text.contains("$3"), "no placeholder beyond the two distinct literals: {text}");
+    }
+
     #[test]
     fn count_star_is_normalized_so_an_order_by_ordinal_can_resolve_it() {
         let stmt = parse("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 2 DESC");
