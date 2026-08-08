@@ -872,7 +872,7 @@ const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_footer_repair_schedule: String = "0 30 * * * *");
 const_default!(d_footer_repair_budget_secs: u64 = 8640);
-const_default!(d_repair_lookback_days: u64 = 2);
+const_default!(d_repair_lookback_days: u64 = 31);
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
 // cold target. Calendar-age driven; idempotent (skips ≥-target files).
@@ -1845,10 +1845,20 @@ pub struct MaintenanceConfig {
     /// all-or-nothing ordering claim survives. Repair only: sorted files on
     /// those dates are never re-binned, so settled history isn't rewritten.
     ///
-    /// Default 2 covers the yesterday-crossing window every 24h dashboard query
-    /// uses. 0 restores the old today-only behaviour, under which an unsorted
-    /// file that survived midnight was never repaired and forced `full-set`
-    /// dedup on every query touching that date (prod 2026-08-06: 130s vs 0.81s).
+    /// Default 31 — one file with no `sorting_columns` footer voids the ordering
+    /// claim for EVERY query whose window touches its date, so the lookback has
+    /// to cover the windows users actually ask for. Users query 30 days; a
+    /// 2-day default (the old value, sized for the yesterday-crossing 24h
+    /// dashboard) leaves a 28-day hole in which one poisoned file pins every
+    /// wide query at `full-set` dedup forever. Prod 2026-08-08: exactly that,
+    /// on 2026-07-30 for two tenants.
+    ///
+    /// Do NOT set this far past the query window "to be safe". Admission offers
+    /// every un-verified sealed file, so the lookback IS the suspect-set size:
+    /// prod ran 75 and the pass spent itself clearing correctly-sorted files at
+    /// ~1.24/min without ever reaching a rewrite. 0 restores the old today-only
+    /// behaviour, under which an unsorted file that survived midnight was never
+    /// repaired at all (prod 2026-08-06: 130s vs 0.81s).
     #[serde(default = "d_repair_lookback_days")]
     pub timefusion_light_optimize_repair_days: u64,
     // Concurrent merge tasks per optimize run — formerly

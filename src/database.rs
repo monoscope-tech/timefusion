@@ -6080,7 +6080,28 @@ impl Database {
             })
             .filter(|(_, bin, _)| !bin.is_empty())
             .collect();
-        planned.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        // Packing goes MOST-fragmented first — that partition opens the most
+        // files per query, so it is the most urgent. Repair inverts it:
+        // SHORTEST-JOB-FIRST.
+        //
+        // A repair backlog is finite per project, so the goal is to finish
+        // projects, not to nibble at the biggest. A project with 3 candidates
+        // can be made clean — and its users unblocked — inside one tick; one
+        // with 300 cannot be finished in any tick, and putting it first means it
+        // holds the (deliberately narrow) repair slots for the whole pass while
+        // everyone else waits behind the wave barrier.
+        //
+        // Prod 2026-08-08, exactly that: 65 minutes into a 144-minute pass, the
+        // two tenants whose users were actually blocked — 3 and 28 candidates —
+        // had not been served at all, because the whale project's hundreds of
+        // candidates sorted first and its multi-GB rewrites occupied both slots.
+        // Widening the admission reach the same morning made it worse, by
+        // promoting that project's 1.6-2.3 GB files from "ineligible" to
+        // "eligible and first in line".
+        match policy.pass {
+            TailPass::Pack => planned.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0))),
+            TailPass::Repair => planned.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0))),
+        }
         Ok(planned.into_iter().map(|(project_id, bin, _)| (project_id, bin)).collect())
     }
 
@@ -8275,31 +8296,7 @@ impl Database {
         if cursor > 0 && cursor < planned.len() {
             planned.rotate_left(cursor);
         }
-        // Clear false suspects in BULK, before the round-robin, not one bin per
-        // round. Admission offers every un-verified sealed file because the sort
-        // TAG cannot be trusted (0870559), so on a 75-day lookback the genuinely
-        // unsorted files are a handful among thousands of correctly-sorted ones.
-        // Draining that one-per-round measured ~1.2 clears/min on prod
-        // 2026-08-08 with ZERO rewrites — the pass looked busy for half an hour
-        // and never reached real work. A footer read is one ranged GET against
-        // the cache the scan warms, so doing them concurrently up front costs
-        // seconds and leaves the rounds to spend their budget on rewrites.
-        if pass == TailPass::Repair && !planned.is_empty() {
-            use futures::StreamExt;
-            let before = planned.len();
-            let checked: Vec<_> = futures::stream::iter(planned.into_iter())
-                .map(|(project_id, files)| async move {
-                    let sorted = self.repair_bin_already_sorted(table_ref, &files).await;
-                    (project_id, files, sorted)
-                })
-                .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
-                .collect()
-                .await;
-            planned = checked.into_iter().filter(|(_, _, sorted)| !sorted).map(|(p, f, _)| (p, f)).collect();
-            if before != planned.len() {
-                info!(table_name, cleared = before - planned.len(), remaining = planned.len(), event = "footer_repair_suspects_bulk_cleared");
-            }
-        }
+        planned = self.drop_verified_sorted_bins(table_ref, table_name, pass, planned).await;
         if planned.is_empty() {
             return Ok(());
         }
@@ -8434,6 +8431,12 @@ impl Database {
                             let table = table_ref.read().await;
                             Self::select_all_hot_bins(&table, schema, today_str, policy).unwrap_or_default()
                         };
+                        // Filter the RE-PLAN too. Filtering only round 0 is what
+                        // made the first attempt at this useless: every later
+                        // round re-selected unverified suspects and fell back to
+                        // one clear per round, leaving the measured rate at
+                        // 1.24/min with zero rewrites either way.
+                        let next = self.drop_verified_sorted_bins(table_ref, table_name, pass, next).await;
                         *plan.lock().await = next.into_iter().collect();
                     }
                     failed
@@ -9107,6 +9110,45 @@ impl Database {
     /// Wall-clock budget for one light-optimize tick. Bounds the round-robin so a
     /// backlog can't run past its own cron period and stack ticks (prod 2026-07-29:
     /// "still in progress after 600s" on a 300s schedule).
+    /// Drop bins whose files all already declare a `sorting_columns` footer,
+    /// verifying them CONCURRENTLY.
+    ///
+    /// Admission offers every un-verified sealed file because the sort tag
+    /// cannot be trusted to mean the footer is sorted (0870559), so across a
+    /// multi-week lookback the genuinely unsorted files are a handful among
+    /// thousands of correctly-sorted ones. Clearing those one bin per round
+    /// measured ~1.24 clears/min with ZERO rewrites on prod 2026-08-08 — the
+    /// pass looked busy for half an hour and never reached real work.
+    ///
+    /// A footer read is one ranged GET against the cache the scan warms;
+    /// a rewrite is a whole-file sort. Paying the reads up front, in bulk, is
+    /// what leaves the rounds' budget for rewrites. Must be applied to EVERY
+    /// plan including each round's re-plan — filtering only the first plan
+    /// leaves later rounds re-selecting the same suspects, which is why the
+    /// first version of this changed nothing.
+    async fn drop_verified_sorted_bins(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass, planned: Vec<(String, Vec<String>)>,
+    ) -> Vec<(String, Vec<String>)> {
+        if pass != TailPass::Repair || planned.is_empty() {
+            return planned;
+        }
+        use futures::StreamExt;
+        let before = planned.len();
+        let checked: Vec<(String, Vec<String>, bool)> = futures::stream::iter(planned)
+            .map(|(project_id, files)| async move {
+                let sorted = self.repair_bin_already_sorted(table_ref, &files).await;
+                (project_id, files, sorted)
+            })
+            .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
+            .collect()
+            .await;
+        let kept: Vec<(String, Vec<String>)> = checked.into_iter().filter(|(_, _, sorted)| !sorted).map(|(p, f, _)| (p, f)).collect();
+        if before != kept.len() {
+            info!(table_name, cleared = before - kept.len(), remaining = kept.len(), event = "footer_repair_suspects_bulk_cleared");
+        }
+        kept
+    }
+
     /// Is every file in a repair bin already carrying a `sorting_columns`
     /// footer? Then there is nothing to repair and the bin is recorded so
     /// admission stops offering it (`repair_verified_sorted`).
