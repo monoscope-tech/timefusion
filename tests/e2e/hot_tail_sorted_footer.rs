@@ -59,7 +59,7 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
     }
 
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    env.db().optimize_table_light(&table_ref, "otel_logs_and_spans").await?;
+    env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Pack).await?;
 
     // Fresh rows so the scan spans MemBuffer ∪ the compacted Delta partition —
     // the shape a dashboard query actually takes.
@@ -152,7 +152,7 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
     // Several ticks: repair takes ONE file per bin and only once a project has
     // no packable slice left, so a backlog drains gradually by design.
     for _ in 0..6 {
-        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans").await?;
+        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Pack).await?;
     }
 
     let after: Vec<String> = {
@@ -171,7 +171,7 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
     // infinite 1->1 rewrite loop.
     let settled: Vec<String> = {
         for _ in 0..3 {
-            env.db().optimize_table_light(&table_ref, "otel_logs_and_spans").await?;
+            env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Pack).await?;
         }
         let t = table_ref.read().await;
         t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect()

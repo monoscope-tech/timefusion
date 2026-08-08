@@ -2717,7 +2717,7 @@ impl Database {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
-                        db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name)).await;
+                        db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), TailPass::Pack).await;
                     }
                     // Hot compaction only ever touches TODAY's partition, so a
                     // sealed day the daily cold sweep failed to finish stays
@@ -2731,6 +2731,35 @@ impl Database {
                         if let Err(e) = db.consolidate_catchup(&table, &table_name, passes).await {
                             warn!("consolidate-catchup failed for '{}': {}", table_name, e);
                         }
+                    }
+                }
+            }
+        });
+
+        // Footer repair — rewrite sealed-date files that carry no
+        // `sorting_columns`, on its OWN cron. It was a periodic override inside
+        // the hot-compact tick above until 2026-08-08, which could not work:
+        // one repair unit is a whole 700 MB - 1 GiB file and the 5-minute
+        // schedule derives a 240s budget, so every attempt was discarded at the
+        // deadline and re-selected identically on the next override tick —
+        // zero progress forever, plus a third of packing capacity spent on it.
+        // Disjoint partitions from the packing pass (sealed vs today), so the
+        // two crons never contend for the same files. Shares
+        // `timefusion_light_optimize_enabled` as the incident kill switch.
+        spawn_cron_job("Footer repair", &self.config.maintenance.timefusion_footer_repair_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
+                    if !db.config.maintenance.timefusion_light_optimize_enabled || db.config.maintenance.timefusion_light_optimize_repair_days == 0 {
+                        return;
+                    }
+                    info!("Running scheduled footer repair on sealed partitions");
+                    for (project_id, table_name, table) in db.all_tables().await {
+                        if db.maintenance_shutdown.is_cancelled() {
+                            return;
+                        }
+                        db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), TailPass::Repair).await;
                     }
                 }
             }
@@ -5973,7 +6002,7 @@ impl Database {
             .filter(|add| add.size() < target_size.max(1)) // cheap gate before the stats parse
             .map(|add| TailAdd::from_stats(add.path().to_string(), add.size(), is_sorted_run(&add.tags()), add.stats().as_deref()))
             .collect();
-        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), false))
+        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), TailPass::Pack))
     }
 
     /// ONE tag-first walk of the snapshot that plans a bin for EVERY hot project
@@ -6036,7 +6065,7 @@ impl Database {
             .into_iter()
             .map(|(project_id, adds)| {
                 let debt = adds.len();
-                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal, policy.prefer_repair), debt)
+                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal, policy.pass), debt)
             })
             .filter(|(_, bin, _)| !bin.is_empty())
             .collect();
@@ -8123,7 +8152,7 @@ impl Database {
 
     /// One table's hot-tail compaction (bin-pack today's small files). The 180s
     /// deadline is a warning threshold, not a cancellation.
-    async fn run_hot_compact_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str) {
+    async fn run_hot_compact_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str, pass: TailPass) {
         use std::sync::atomic::Ordering::Relaxed;
         const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         let t0 = std::time::Instant::now();
@@ -8141,7 +8170,7 @@ impl Database {
             ]
         };
         let before = snap();
-        let result = self.optimize_table_light(table, table_name).await;
+        let result = self.optimize_table_light(table, table_name, pass).await;
         let [planned, completed, bins, brakes] = std::array::from_fn(|i| snap()[i] - before[i]);
         let elapsed = t0.elapsed();
         match result {
@@ -8172,7 +8201,7 @@ impl Database {
     /// of 11 hot projects unreached on a 5-min cron (prod 2026-07-29).
     ///
     /// `TIMEFUSION_LIGHT_OPTIMIZE_ENABLED=false` remains the incident kill switch.
-    pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
+    pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         // `crate::clock`, not `Utc::now()`: the hot tail scopes itself to TODAY's
         // partition and to an event-time seal window, so a wall-clock read here
@@ -8182,12 +8211,16 @@ impl Database {
         let today = crate::clock::now_micros();
         let today = chrono::DateTime::from_timestamp_micros(today).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let today_str = today.to_string();
-        // Sealed dates carried along for footer repair only (see
-        // `select_all_hot_bins`), derived from the same virtual clock as `today`.
-        let repair_dates: Vec<String> = (1..=self.config.maintenance.timefusion_light_optimize_repair_days)
-            .filter_map(|d| today.checked_sub_days(chrono::Days::new(d)))
-            .map(|d| d.to_string())
-            .collect();
+        // Sealed dates scanned for footer repair (see `select_all_hot_bins`),
+        // derived from the same virtual clock as `today`. A packing pass carries
+        // none: the two passes own disjoint partitions (see `TailPass`).
+        let repair_dates: Vec<String> = match pass {
+            TailPass::Pack => vec![],
+            TailPass::Repair => (1..=self.config.maintenance.timefusion_light_optimize_repair_days)
+                .filter_map(|d| today.checked_sub_days(chrono::Days::new(d)))
+                .map(|d| d.to_string())
+                .collect(),
+        };
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let policy = HotBinPolicy {
@@ -8198,7 +8231,7 @@ impl Database {
             // Repair reach is its own knob (see `timefusion_repair_max_file_bytes`);
             // larger legacy files belong to `optimize --recompress`.
             repair_max_bytes: self.config.maintenance.timefusion_repair_max_file_bytes as i64,
-            prefer_repair: repair_preferred_tick(crate::clock::now_micros()),
+            pass,
         };
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
         // snapshot (see `plan` below) so a wave never re-selects the run it just
@@ -8218,7 +8251,7 @@ impl Database {
             return Ok(());
         }
         crate::metrics::maintenance_stats().light_optimize_projects_planned.fetch_add(planned.len() as u64, Relaxed);
-        info!(table_name, date = %today, projects = planned.len(), event = "light_optimize_planned");
+        info!(table_name, date = %today, ?pass, projects = planned.len(), event = "light_optimize_planned");
         let project_ids: Vec<String> = planned.iter().map(|(project_id, _)| project_id.clone()).collect();
         // Bins the current wave should stage, replaced wholesale by each wave's
         // post-commit re-plan. A project absent from the map has no work left
@@ -8229,7 +8262,7 @@ impl Database {
         // Bound total rounds so a large backlog can't wedge the tick even if the
         // wall-clock budget is raised.
         const MAX_WAVES: usize = 12;
-        let deadline = std::time::Instant::now() + self.light_optimize_tick_budget();
+        let deadline = std::time::Instant::now() + self.tail_pass_tick_budget(pass);
         let order_index: HashMap<String, usize> = project_ids.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect();
         let failed = round_robin_bins(
             project_ids,
@@ -8285,7 +8318,14 @@ impl Database {
                 let (plan, today_str, policy) = (&plan, today_str.as_str(), &policy);
                 async move {
                     let staged = bins.len();
-                    let failed = self.commit_wave(table_ref, table_name, &[format!("date={today_str}/")], false, bins, round).await.failed.len();
+                    // Scope the warm/evict diff to the dates this pass actually rewrote.
+                    // Handing a repair wave today's marker would diff the wrong
+                    // partition entirely.
+                    let markers: Vec<String> = match pass {
+                        TailPass::Pack => vec![format!("date={today_str}/")],
+                        TailPass::Repair => policy.repair_dates.iter().map(|d| format!("date={d}/")).collect(),
+                    };
+                    let failed = self.commit_wave(table_ref, table_name, &markers, false, bins, round).await.failed.len();
                     // Round 0 only: one bin per project, so this is directly
                     // comparable to `projects_planned` (the alert is
                     // completed < planned for N consecutive ticks).
@@ -8977,9 +9017,18 @@ impl Database {
     /// Wall-clock budget for one light-optimize tick. Bounds the round-robin so a
     /// backlog can't run past its own cron period and stack ticks (prod 2026-07-29:
     /// "still in progress after 600s" on a 300s schedule).
-    fn light_optimize_tick_budget(&self) -> std::time::Duration {
-        let period = cron_period(&self.config.maintenance.timefusion_light_optimize_schedule);
-        self.config.derived.tick_budget(period)
+    /// Each pass is budgeted from its OWN cron period, because their units are
+    /// orders of magnitude apart: a packing bin is a handful of small files, a
+    /// repair bin is one 700 MB - 1 GiB whole-file rewrite. Sharing the 5-minute
+    /// period gave repair 240s for work that needs minutes, and `stage_hot_bin`
+    /// discards an over-budget bin — so repair could never finish, at any
+    /// backlog size (prod 2026-08-08).
+    fn tail_pass_tick_budget(&self, pass: TailPass) -> std::time::Duration {
+        let schedule = match pass {
+            TailPass::Pack => &self.config.maintenance.timefusion_light_optimize_schedule,
+            TailPass::Repair => &self.config.maintenance.timefusion_footer_repair_schedule,
+        };
+        self.config.derived.tick_budget(cron_period(schedule))
     }
 
     /// Inner optimize loop for the COLD consolidate path (the 5-min hot tail
@@ -10369,6 +10418,11 @@ impl TailAdd {
 /// past the 2 GiB per-query cap).
 fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], size: i64, sorted_run: bool, repairable: bool, policy: &HotBinPolicy<'_>) -> bool {
     if path.contains(today_marker) {
+        // A repair pass owns sealed dates only. Admitting today's files too
+        // would let packing work back into a budget reserved for repair.
+        if policy.pass == TailPass::Repair {
+            return false;
+        }
         let converged_done = size >= policy.converged() && (sorted_run || !repairable);
         let over_cap_run = size >= policy.sorted_run_cap && sorted_run;
         return !(converged_done || over_cap_run);
@@ -10398,10 +10452,30 @@ struct HotBinPolicy<'a> {
     /// are legacy (pre-`timefusion_writer_max_file_bytes`) and belong to the
     /// off-box `timefusion optimize` CLI, not a 5-minute tick.
     repair_max_bytes: i64,
-    /// This tick lets a pending repair outrank packing — the periodic override
-    /// that keeps the sealed backlog from starving on a busy project. See
-    /// `repair_preferred_tick`.
-    prefer_repair: bool,
+    /// Which of the two disjoint jobs this pass is running. See [`TailPass`].
+    pass: TailPass,
+}
+
+/// The hot tail runs two jobs that were one, and the merge is what broke both.
+///
+/// Packing is CONTINUOUS (today's small files, forever) and each unit is small.
+/// Footer repair is FINITE (a fixed backlog of sealed files) and each unit is a
+/// whole 700 MB - 1 GiB file: read, global sort, write ~20M wide rows. Sharing
+/// the 5-minute cron gave repair a 240s slice of a budget it cannot fit in, and
+/// `stage_hot_bin` DISCARDS a bin that outruns the budget and re-selects the
+/// identical file next time — so a repair unit that needs 6 minutes never
+/// completes, at any backlog size, while burning every third packing tick to
+/// produce nothing (prod 2026-08-08: `completed=0 bins=0` on exactly the
+/// 15-minute-apart ticks, forever).
+///
+/// Splitting them lets each get the budget its unit size actually needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TailPass {
+    /// Today's partition only: bin-pack small files. Never touches sealed dates.
+    Pack,
+    /// Sealed dates only: rewrite ONE footer-less file per project so the
+    /// reader's all-or-nothing ordering claim survives. Never touches today.
+    Repair,
 }
 
 impl HotBinPolicy<'_> {
@@ -10413,7 +10487,7 @@ impl HotBinPolicy<'_> {
     }
 }
 
-pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, prefer_repair: bool) -> Vec<String> {
+pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass) -> Vec<String> {
     let cap = target_size.max(1);
     let converged = cap - cap / 8;
     // An oversized file that is NOT a sorted run is a REPAIR candidate, not a
@@ -10439,6 +10513,26 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
         return vec![];
     }
     fresh.sort_unstable_by_key(|(_, min, _, _)| *min);
+    // A repair pass rewrites exactly one file: NEWEST first, and among equals
+    // the SMALLEST.
+    //
+    // Newest-first because the poison is all-or-nothing over the query window —
+    // the most RECENT footer-less date is the wall a user hits, so repairing it
+    // is what widens the window. Oldest-first (what the shared pass did, by
+    // taking `fresh.first()` after an ascending sort) repaired the dates
+    // fewest queries reach, and picked the big legacy files most likely to
+    // outrun the budget: it moved the wall not at all.
+    //
+    // Smallest-first inside a date so one un-finishable file cannot head-of-line
+    // block the rest of that date behind it.
+    if pass == TailPass::Repair {
+        return fresh
+            .iter()
+            .filter(|(_, _, _, repair)| *repair)
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
+            .map(|(path, _, _, _)| vec![path.to_string()])
+            .unwrap_or_default();
+    }
     // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
     // per tick. Small commit converges quickly and shrinks the conflict window;
     // later ticks pack the next (strictly later) slice.
@@ -10463,47 +10557,19 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     if files.len() < 2 {
         files.clear();
     }
-    // Repair normally runs in the GAPS: only once a project has no packable
-    // slice left does a tick spend itself rewriting one oversized unsorted file,
-    // so normal packing is never starved.
-    //
-    // That rests on "the gaps eventually appear", which held while repair was
-    // scoped to TODAY — a single partition converges once its sub-target files
-    // are packed into runs. It is FALSE for the sealed-date repair: a project
-    // that is still ingesting always has a packable slice in today's partition,
-    // so the gap never comes and its sealed backlog never drains. Measured on
-    // prod 2026-08-07: the backlog fell 1,243 -> ~940 (the quiet projects) and
-    // then stopped dead, with 723 of the survivors belonging to the single
-    // BUSIEST project — i.e. repair starved exactly where it was needed most.
-    //
-    // `prefer_repair` is the caller's periodic override (see
-    // `repair_preferred_tick`): on those ticks a pending repair outranks
-    // packing, so the finite sealed backlog drains while the continuous
-    // small-file work still gets the majority of ticks.
-    let pending_repair = || fresh.iter().find(|(_, _, _, repair)| *repair).map(|(path, _, _, _)| vec![path.to_string()]);
-    if prefer_repair && let Some(bin) = pending_repair() {
-        return bin;
-    }
+    // Gap rule, for TODAY only: once a project has no packable slice left, spend
+    // the tick rewriting one oversized unsorted file instead. Today's partition
+    // does converge, so the gap reliably appears — which is why this works here
+    // and did NOT work for sealed dates, where a still-ingesting project always
+    // has a packable slice and the gap never comes (prod 2026-08-07: the sealed
+    // backlog fell 1,243 -> ~940 and stopped dead). Sealed dates are the
+    // `TailPass::Repair` cron's job now, not this fallback's.
     if files.is_empty()
-        && let Some(bin) = pending_repair()
+        && let Some((path, _, _, _)) = fresh.iter().find(|(_, _, _, repair)| *repair)
     {
-        return bin;
+        return vec![path.to_string()];
     }
     files
-}
-
-/// Does this tick prefer repair over packing? Every `REPAIR_TICK_PERIOD`-th
-/// 5-minute tick, derived from the clock so it needs no shared state and stays
-/// deterministic under the virtual-time test harness.
-///
-/// A minority share on purpose: the sealed repair backlog is FINITE (it only
-/// grows when a rewrite writes an unsorted file, which `UnsortedFallback` now
-/// prevents), while small-file packing is continuous and must keep the majority
-/// of ticks.
-fn repair_preferred_tick(now_micros: i64) -> bool {
-    const REPAIR_TICK_PERIOD: i64 = 3;
-    const TICK_MICROS: i64 = 5 * 60 * 1_000_000;
-    now_micros.div_euclid(TICK_MICROS).rem_euclid(REPAIR_TICK_PERIOD) == 0
 }
 
 /// Split staged bins into (committable, stale) against the live file set of the
@@ -13745,12 +13811,12 @@ mod tests {
         // Seal lag: a file whose newest event is past the seal is still filling
         // (prod 2026-07-20: compacting it lost every OCC race).
         let unsealed = vec![f("a", 10, false, 1, 1), f("b", 10, false, 2, SEAL + 1)];
-        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, false), Vec::<String>::new(), "unsealed files leave < min_files");
+        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new(), "unsealed files leave < min_files");
 
         // Converged (>= 7/8 target) files are never re-selected: rewriting one
         // alone is a 1→1 rewrite forever.
         let converged = vec![f("big", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, false), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["a", "b"]);
 
         // REPAIR: an oversized file that is NOT a sorted run declares no
         // `sorting_columns`, and one of those disables the reader's
@@ -13761,58 +13827,84 @@ mod tests {
         // packable slice, that slice wins.
         let poisoned = vec![f("big_unsorted", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
         assert_eq!(
-            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, false),
+            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack),
             vec!["a", "b"],
             "normal packing must not be starved by a pending repair"
         );
         let only_poison = vec![f("big_unsorted", 900, false, 1, 2)];
         assert_eq!(
-            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, false),
+            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack),
             vec!["big_unsorted"],
             "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files"
         );
         // ...and exactly one per bin, so a backlog drains across ticks instead
         // of rewriting several hundred-megabyte files in a single pass.
         let many_poison = vec![f("p1", 900, false, 1, 2), f("p2", 950, false, 3, 4), f("p3", 800, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, false).len(), 1, "one repair per bin");
+        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack).len(), 1, "one repair per bin");
         // A converged file that IS a sorted run stays done — repairing it would
         // be a 1->1 rewrite forever.
         let healthy = vec![f("big_sorted", 900, true, 1, 2)];
-        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, false).is_empty(), "a converged sorted run is never re-selected");
+        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack).is_empty(), "a converged sorted run is never re-selected");
 
         // Sorted runs fold only while under the cap; an over-cap run is excluded.
         let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, false), vec!["run_small", "a"], "only the sub-cap run folds");
+        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["run_small", "a"], "only the sub-cap run folds");
 
         // Earliest contiguous slice up to cap, ordered by EVENT time (input
         // order is deliberately scrambled) — this is what makes runs disjoint.
         let pack = vec![f("third", 600, false, 30, 31), f("first", 600, false, 10, 11), f("second", 300, false, 20, 21)];
-        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, false), vec!["first", "second"], "packs earliest slice, stops at cap");
+        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["first", "second"], "packs earliest slice, stops at cap");
 
         // min_files gate.
-        assert_eq!(super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, false), Vec::<String>::new());
+        assert_eq!(super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new());
 
         // A lone over-cap-adjacent file must not wedge the pass: selection skips
         // past it to the next slice rather than returning a 1-file bin.
         let lone = vec![f("lone", 800, false, 1, 2), f("a", 300, false, 10, 11), f("b", 300, false, 12, 13)];
-        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, false), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["a", "b"]);
 
         // Files with no event-time stats can't be binned disjointly (the
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
         let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None }, f("a", 10, false, 1, 2)];
-        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, false), Vec::<String>::new());
+        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new());
     }
 
-    /// Repair must not starve on a project that never runs out of packing work.
+    /// A repair pass rewrites the NEWEST poisoned file, not the oldest.
     ///
-    /// The gap-filling rule ("repair only when no packable slice exists") was
-    /// written when repair was scoped to TODAY, where a partition converges. It
-    /// does not hold once sealed dates are in scope: a still-ingesting project
-    /// always has a packable slice in today's partition, so its sealed backlog
-    /// never drains. Prod 2026-08-07: the backlog fell 1,243 -> ~940 and then
-    /// stopped, with 723 of the survivors on the single busiest project.
+    /// The poison is all-or-nothing over a query window: the most recent
+    /// footer-less date is the wall a user's `WHERE timestamp >= …` hits, so
+    /// repairing it is the only thing that widens the window. The shared pass
+    /// took `fresh.first()` after an ASCENDING sort by event time — i.e. the
+    /// oldest, which no query window reaches first and which is also the big
+    /// legacy file most likely to outrun the budget. Prod 2026-08-08: talstack
+    /// 6297304f was walled at 8 days by ONE file on 2026-07-30 while repair
+    /// ground on May.
     #[test]
-    fn periodic_tick_lets_repair_preempt_packing_so_a_busy_project_drains() {
+    fn repair_pass_takes_the_newest_poisoned_file_then_the_smallest() {
+        const TARGET: i64 = 1000;
+        const SEAL: i64 = 10_000;
+        let f = |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)) };
+        let backlog = vec![f("may", 900, 10), f("july", 900, 500), f("june", 950, 100)];
+        assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["july"], "newest poisoned file first");
+
+        // Same date: take the smallest, so one un-finishable giant cannot
+        // head-of-line block everything behind it.
+        let same_day = vec![f("huge", 999, 500), f("small", 880, 500)];
+        assert_eq!(super::select_tail_bin(&same_day, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["small"], "smallest first within a date");
+
+        // A repair pass NEVER packs, even when a fat packable slice is present:
+        // packing is the other cron's job and would spend the repair budget.
+        let mixed = vec![f("poison", 900, 500), f("a", 10, 600), f("b", 10, 700)];
+        assert_eq!(super::select_tail_bin(&mixed, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["poison"]);
+        let no_poison = vec![f("a", 10, 600), f("b", 10, 700)];
+        assert!(super::select_tail_bin(&no_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair).is_empty(), "nothing to repair => no work");
+    }
+
+    /// Today's partition still repairs itself in the GAPS of the packing pass —
+    /// the sealed-date split must not orphan an oversized unsorted file written
+    /// today, which no `TailPass::Repair` tick will ever see (it excludes today).
+    #[test]
+    fn pack_pass_still_repairs_todays_oversized_unsorted_file_when_nothing_packs() {
         const TARGET: i64 = 1000;
         const SEAL: i64 = 10_000;
         let f = |path: &str, size: i64, sorted: bool, min: i64, max: i64| super::TailAdd {
@@ -13821,33 +13913,13 @@ mod tests {
             is_sorted_run: sorted,
             event_range: Some((min, max)),
         };
-        // A busy project: a packable slice AND a pending repair, every tick.
+        // Packing keeps priority while a packable slice exists.
         let busy = vec![f("poison", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
+        assert_eq!(super::select_tail_bin(&busy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["a", "b"], "packing first");
 
-        // Normal ticks keep packing first — repair never preempts the primary path.
-        assert_eq!(super::select_tail_bin(&busy, TARGET, 2, TARGET / 4, SEAL, false), vec!["a", "b"], "packing keeps priority on a normal tick");
-
-        // On a repair-preferred tick the poison file wins, so the backlog drains
-        // even though a packable slice existed. This is the whole fix.
-        assert_eq!(
-            super::select_tail_bin(&busy, TARGET, 2, TARGET / 4, SEAL, true),
-            vec!["poison"],
-            "a repair-preferred tick must drain the backlog even when packing work exists"
-        );
-
-        // With nothing to repair, a preferred tick still packs — the override
-        // must never waste a tick.
-        let clean = vec![f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)];
-        assert_eq!(super::select_tail_bin(&clean, TARGET, 2, TARGET / 4, SEAL, true), vec!["a", "b"], "no repair pending => still pack");
-
-        // Cadence: a minority of ticks, and stable across the 5-minute grid.
-        let tick = 5 * 60 * 1_000_000i64;
-        let preferred: Vec<bool> = (0..6).map(|i| super::repair_preferred_tick(i * tick)).collect();
-        assert_eq!(preferred, vec![true, false, false, true, false, false], "every 3rd tick, so packing keeps the majority");
-        // Same tick, different instants within it => same decision (no flapping mid-tick).
-        assert!(super::repair_preferred_tick(0) && super::repair_preferred_tick(tick - 1));
-        // Negative (pre-epoch, virtual clock) must not panic or skew the cadence.
-        assert!(!super::repair_preferred_tick(-tick));
+        // Once it runs out, the tick spends itself on today's poisoned file.
+        let converged = vec![f("poison", 900, false, 1, 2)];
+        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["poison"], "gap rule repairs today");
     }
 
     /// Scope admission for the hot tail. The sealed-date arm is the 2026-08-06
@@ -13867,7 +13939,7 @@ mod tests {
             min_files: 2,
             sorted_run_cap: TARGET / 2,
             repair_max_bytes: REPAIR_MAX,
-            prefer_repair: false,
+            pass: TailPass::Pack,
         };
         let with_repair = super::HotBinPolicy { repair_dates: &repair, ..policy(&[]) };
         let admits = |path: &str, size, sorted, repairable| super::hot_bin_admits(path, today, &repair, size, sorted, repairable, &with_repair);
@@ -13896,6 +13968,15 @@ mod tests {
 
         // Lookback 0 restores today-only behaviour.
         assert!(!super::hot_bin_admits(&p(sealed), today, &[], 900, false, true, &policy(&[])), "empty repair window == the old today-only pass");
+
+        // A REPAIR pass owns sealed dates and nothing else. Letting today's
+        // files in would spend a budget sized for one whole-file rewrite on
+        // packing work the 5-minute cron already does.
+        let repair_pass = super::HotBinPolicy { pass: TailPass::Repair, ..with_repair };
+        let admits_repair = |path: &str, size, sorted| super::hot_bin_admits(path, today, &repair, size, sorted, true, &repair_pass);
+        assert!(!admits_repair(&p(today), 10, false), "a repair pass never packs today");
+        assert!(!admits_repair(&p(today), 900, false), "not even today's poisoned file — the Pack gap rule owns that");
+        assert!(admits_repair(&p(sealed), 900, false), "sealed poisoned file is exactly its job");
     }
 
     /// Wave commit blast radius: ONE stale bin must lose only its own actions.

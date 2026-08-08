@@ -870,6 +870,7 @@ const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
 const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
+const_default!(d_footer_repair_schedule: String = "0 */20 * * * *");
 const_default!(d_repair_lookback_days: u64 = 2);
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
@@ -1853,6 +1854,14 @@ pub struct MaintenanceConfig {
     // `TIMEFUSION_OPTIMIZE_MAX_CONCURRENT_TASKS`. Now `derived.optimize_merge_tasks()`.
     #[serde(default = "d_light_schedule")]
     pub timefusion_light_optimize_schedule: String,
+    /// Sealed-date FOOTER REPAIR, on its own cron. Split out of the hot-tail
+    /// tick 2026-08-08: a repair unit is one 700 MB - 1 GiB whole-file rewrite,
+    /// which does not fit the 240s budget a 5-min schedule derives, and an
+    /// over-budget bin is discarded and re-selected identically — so repair
+    /// could never complete while burning every third packing tick. Default
+    /// 20 min, i.e. a 16-minute budget per repair.
+    #[serde(default = "d_footer_repair_schedule")]
+    pub timefusion_footer_repair_schedule: String,
     /// Dirty-bin dedup of sealed (< today) partitions. Runs on its OWN cron,
     /// decoupled from hot-tail compaction: dedup churning an old-date backlog
     /// must not starve today's compaction (they touch disjoint partitions —

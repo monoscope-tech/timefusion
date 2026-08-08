@@ -253,7 +253,7 @@ async fn optimize_preserves_all_partition_values() -> Result<()> {
     assert_eq!(pre[0].column(0).as_primitive::<Int64Type>().value(0), 6, "pre-optimize row count");
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-    db.optimize_table_light(&table_ref, "otel_logs_and_spans").await?;
+    db.optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Pack).await?;
 
     // Compacted files must keep the full (project_id, date) partition path…
     let date_str = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
