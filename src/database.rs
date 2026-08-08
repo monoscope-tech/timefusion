@@ -8303,7 +8303,35 @@ impl Database {
         if cursor > 0 && cursor < planned.len() {
             planned.rotate_left(cursor);
         }
-        planned = self.drop_verified_sorted_bins(table_ref, table_name, pass, planned).await;
+        // Clearing a project's suspect must not cost it the tick. A repair pass
+        // selects ONE file per project, and admission offers every un-verified
+        // sealed file, so the selected one is usually a correctly sorted file
+        // nothing has read yet. Verifying it cleared the project and dropped it
+        // for the rest of the tick — one file of progress per TICK, while the
+        // pass reported converging. Prod 2026-08-08 logged `cleared=20
+        // remaining=1` on every hourly firing with none of the poisoned files
+        // changing; 6297304f's `date=2026-07-16` holds 142 objects of which 12
+        // are unsorted, i.e. ~142 hours to reach them at that rate.
+        //
+        // So re-plan after each clear and keep going. `repair_verified_sorted`
+        // makes every re-plan skip what was just checked, so a tick walks a
+        // project's candidates until it finds real work or runs out — within one
+        // tick instead of one per tick.
+        for _ in 0..REPAIR_RESELECT_ROUNDS {
+            let before = planned.len();
+            planned = self.drop_verified_sorted_bins(table_ref, table_name, pass, planned).await;
+            if pass != TailPass::Repair || planned.len() == before {
+                break;
+            }
+            let next = {
+                let table = table_ref.read().await;
+                Self::select_all_hot_bins(&table, schema, &today_str, &policy)?
+            };
+            if next.is_empty() {
+                break;
+            }
+            planned = next;
+        }
         if planned.is_empty() {
             return Ok(());
         }
@@ -10729,6 +10757,12 @@ fn host_mem_available_bytes() -> Option<u64> {
 /// Concurrent footer verifications while clearing false repair suspects. These
 /// are metadata-cache-backed ranged reads, not rewrites, so this is bounded by
 /// object-store round trips rather than memory.
+/// How many times one repair tick may re-select after clearing false suspects.
+/// Bounded so a project whose sealed dates are ENTIRELY well-formed cannot spin
+/// the planner for the whole budget; `repair_verified_sorted` persists for the
+/// process, so the next tick resumes where this one stopped.
+const REPAIR_RESELECT_ROUNDS: usize = 12;
+
 const REPAIR_VERIFY_CONCURRENCY: usize = 16;
 
 const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
