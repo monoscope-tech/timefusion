@@ -10513,11 +10513,20 @@ fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], siz
     // a 5-minute tick is a large read+sort+write for a single file. They still
     // get repaired — by the off-box `timefusion optimize` CLI, which is where a
     // multi-GB rewrite belongs — just not from the hot path.
-    repairable
-        && !sorted_run
-        && size <= policy.repair_max_bytes
-        && !policy.verified_sorted.contains(path)
-        && repair_markers.iter().any(|m| path.contains(m.as_str()))
+    // NOT `!sorted_run`. The tag is `delta-rs.optimize.sort_by`, written by the
+    // optimizer that produced the file — it records INTENT, and it can disagree
+    // with the footer that queries actually read. Prod 2026-08-08: the two files
+    // pinning both complaining tenants' 30-day queries (925 MB and 1038 MB on
+    // `date=2026-07-30`) carry the tag and have `sorting_columns=()`. Keying
+    // admission off the tag made them permanently invisible to repair: 45
+    // minutes of ticks selected only 08-08, 08-07 and 07-31 while the boundary
+    // sat at `9d full-set`.
+    //
+    // So every un-verified sealed file is a suspect, and the FOOTER decides.
+    // `verified_sorted` makes that one ranged read per file per process, not per
+    // tick — and `repair_bin_already_sorted` populates it precisely so a
+    // tag-less-but-sorted file stops being offered.
+    repairable && size <= policy.repair_max_bytes && !policy.verified_sorted.contains(path) && repair_markers.iter().any(|m| path.contains(m.as_str()))
 }
 
 /// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
@@ -14068,8 +14077,18 @@ mod tests {
         let sealed = "date=2026-08-05/";
         assert!(admits(&p(sealed), 900, false, true), "the immortal file: converged + unsorted on a sealed date IS repaired");
         assert!(admits(&p(sealed), 10, false, true), "any unsorted file on a sealed date is repairable regardless of size");
-        assert!(!admits(&p(sealed), 10, true, true), "a SORTED small file on a sealed date must NOT be re-binned — settled history stays put");
-        assert!(!admits(&p(sealed), 900, true, true), "nor a sorted converged one");
+        // The sort TAG no longer grants immunity. It records the optimizer's
+        // INTENT and can disagree with the footer queries actually read — prod
+        // 2026-08-08 had tagged files with `sorting_columns=()` pinning both
+        // complaining tenants' 30-day queries, permanently invisible to repair.
+        assert!(admits(&p(sealed), 10, true, true), "a tagged file is still only a SUSPECT; the footer decides");
+        assert!(admits(&p(sealed), 900, true, true), "including a converged one");
+        // Settled history still stays put — enforced by the footer read, which
+        // records genuinely-sorted files so they are never offered again.
+        cleared.insert(p(sealed));
+        assert!(!admits(&p(sealed), 10, true, true), "a VERIFIED-sorted file is not re-binned");
+        assert!(!admits(&p(sealed), 900, false, true), "verification outranks even an absent tag");
+        cleared.remove(&p(sealed));
         assert!(!admits(&p(sealed), 900, false, false), "a table declaring no sort order has no footer to repair");
         // A legacy multi-GB file must NOT be dragged into a 5-minute tick; the
         // off-box CLI owns those. (Prod holds actives up to 2.34 GB.)
