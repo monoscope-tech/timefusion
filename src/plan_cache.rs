@@ -450,8 +450,8 @@ fn normalize_count_star(stmt: &Statement) -> Option<Statement> {
     use std::ops::ControlFlow;
 
     use datafusion::sql::sqlparser::ast::{
-        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind, SelectItem, SetExpr, Value, ValueWithSpan,
-        visit_expressions, visit_expressions_mut,
+        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind, SelectItem, SetExpr, Value, ValueWithSpan, visit_expressions,
+        visit_expressions_mut,
     };
 
     let Statement::Query(query) = stmt else { return None };
@@ -466,7 +466,8 @@ fn normalize_count_star(stmt: &Statement) -> Option<Statement> {
         let Some(item) = n.parse::<usize>().ok().filter(|i| *i > 0).and_then(|i| select.projection.get(i - 1)) else { return false };
         let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = item else { return false };
         // Bare `count(*)` already resolves; only a WRAPPED one breaks.
-        !is_count_star(e) && visit_expressions(e, |inner: &SqlExpr| if is_count_star(inner) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }).is_break()
+        !is_count_star(e)
+            && visit_expressions(e, |inner: &SqlExpr| if is_count_star(inner) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }).is_break()
     });
     if !points_at_wrapped_count_star {
         return None;
