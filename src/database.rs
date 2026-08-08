@@ -8280,6 +8280,17 @@ impl Database {
                 m.light_optimize_timed_out.fetch_add(1, Relaxed);
             }
             Ok(()) => info!("Light optimize completed for {label} in {elapsed:?}: planned={planned} completed={completed} bins={bins} brakes={brakes}"),
+            // PARTIAL is not FAILED. `optimize_table_light` returns Err if ANY
+            // bin failed, so a tick that compacted 6 of 9 projects logged at
+            // ERROR identically to one that compacted nothing. That cost real
+            // diagnosis time on 2026-08-08: the otel_metrics recovery from
+            // `completed=0` to `completed=6` was invisible, because both states
+            // printed the same red line. Reserve ERROR for "this tick achieved
+            // nothing", which is the condition actually worth paging on.
+            Err(e) if bins > 0 => {
+                m.light_optimize_failed.fetch_add(1, Relaxed);
+                warn!("Light optimize PARTIAL for {label} in {elapsed:?} (planned={planned} completed={completed} bins={bins} brakes={brakes}): {e}");
+            }
             Err(e) => {
                 m.light_optimize_failed.fetch_add(1, Relaxed);
                 error!("Light optimize failed for {label} in {elapsed:?} (planned={planned} completed={completed} bins={bins} brakes={brakes}): {e}");
