@@ -8240,7 +8240,14 @@ impl Database {
     /// The admission policy for one tail pass. `budget` is an input, not a
     /// detail: a repair pass's reach is derived from how long it may run.
     fn tail_pass_policy<'a>(&'a self, pass: TailPass, budget: std::time::Duration, repair_dates: &'a [String]) -> HotBinPolicy<'a> {
-        let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
+        // A packing bin is only worth assembling if the tick can finish it —
+        // see `pack_target_bytes`. Repair takes ONE file and bounds it with
+        // `repair_max_bytes` below, so its target stays the configured value
+        // (there it only sets the converged/sorted-run thresholds).
+        let target_size = match pass {
+            TailPass::Pack => pack_target_bytes(self.config.maintenance.timefusion_light_optimize_target_size, budget),
+            TailPass::Repair => self.config.maintenance.timefusion_light_optimize_target_size,
+        };
         HotBinPolicy {
             repair_dates,
             target_size,
@@ -10930,8 +10937,38 @@ fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], siz
 /// that — not the five-minute-tick knob — is the honest ceiling. Never smaller
 /// than the configured value, so raising the knob still widens the reach.
 pub(crate) fn repair_reach_bytes(configured: i64, budget: std::time::Duration) -> i64 {
-    const INPUT_BYTES_PER_SEC: i64 = 460_000;
-    configured.max(budget.as_secs().min(i64::MAX as u64) as i64 * INPUT_BYTES_PER_SEC)
+    configured.max(budget_bytes(budget))
+}
+
+/// Input bytes one hot-tail rewrite sustains per second. Measured on prod
+/// 2026-08-08: an uncontended rewrite of a 1.19 GB partition streamed its output
+/// in **43 minutes**. The same night's packing bins ran 0.65-3.1 MB/s under
+/// 5-way concurrency, so this stays the conservative floor for both users.
+const INPUT_BYTES_PER_SEC: i64 = 460_000;
+
+fn budget_bytes(budget: std::time::Duration) -> i64 {
+    (budget.as_secs().min(i64::MAX as u64) as i64).saturating_mul(INPUT_BYTES_PER_SEC)
+}
+
+/// Largest bin a PACKING pass will assemble, derived from the time it has.
+///
+/// The mirror of [`repair_reach_bytes`] and the same constant: repair WIDENS its
+/// reach to fill a long budget, packing SHRINKS its unit to fit a short one. A
+/// bin that cannot be rewritten inside the tick is discarded at the deadline and
+/// the next tick re-selects the identical files, so an oversized target does not
+/// merely run late — it produces NOTHING, forever, while burning the whole
+/// budget.
+///
+/// Prod 2026-08-08: `otel_metrics` logged `planned=9 completed=0 bins=0` on
+/// every tick for hours, five bins each timing out at exactly the 240s deadline,
+/// because the 256 MB target needs ~250s+ at the rate above. The 240s budget
+/// admits ~110 MB, so the bins now finish and the table compacts at all.
+///
+/// `sorted_run_cap` and `converged` are both derived from the value this
+/// returns, so the whole policy shrinks together and a freshly packed run still
+/// lands above the cap — otherwise smaller outputs would be re-selected forever.
+pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) -> i64 {
+    configured.min(budget_bytes(budget)).max(1)
 }
 
 /// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
@@ -17233,6 +17270,32 @@ mod footer_repair_schedule_tests {
         assert_eq!(super::repair_reach_bytes(8 * GIB, budget), 8 * GIB, "a larger configured cap still wins");
         // A short budget must not pretend it can finish a huge file.
         assert!(super::repair_reach_bytes(0, std::time::Duration::from_secs(240)) < GIB / 4, "240s reaches only a small file");
+    }
+
+    /// Prod 2026-08-08: `otel_metrics` logged `planned=9 completed=0 bins=0` on
+    /// EVERY 10-minute tick for hours — five bins, each timing out at exactly
+    /// the 240s deadline, discarded, then re-selected identically next tick.
+    /// A bin the tick cannot finish does not run late, it produces NOTHING
+    /// forever, so the packing unit has to be sized by the time available.
+    #[test]
+    fn a_packing_bin_is_sized_to_what_the_tick_can_actually_finish() {
+        const MB: i64 = 1024 * 1024;
+        let tick = std::time::Duration::from_secs(240);
+        let target = super::pack_target_bytes(256 * MB, tick);
+        // Measured throughput was 0.65-3.1 MB/s under 5-way concurrency, so the
+        // 256 MB target needed ~250s+ against a 240s deadline — it missed by a
+        // hair, every time. Whatever we pick must clear the deadline at the
+        // conservative floor the constant encodes.
+        let secs_to_rewrite = target / super::INPUT_BYTES_PER_SEC;
+        assert!(secs_to_rewrite <= 240, "a bin must be finishable inside its own tick, got {secs_to_rewrite}s for {target} bytes");
+        assert!(target < 256 * MB, "the 256 MB target is exactly what could not finish");
+        // A freshly packed run must land ABOVE the sorted-run cap the same
+        // target derives (`target / 2`), or every output is re-selected next
+        // tick and packing becomes a rewrite loop.
+        assert!(target > target / 2, "a full bin must exceed the sorted-run cap it derives");
+        // Never widens: a generous budget leaves the operator's target alone.
+        assert_eq!(super::pack_target_bytes(64 * MB, std::time::Duration::from_secs(3600)), 64 * MB, "a budget with room keeps the configured target");
+        assert!(super::pack_target_bytes(256 * MB, std::time::Duration::from_secs(0)) >= 1, "a zero budget must not produce a zero-size cap");
     }
 
     /// The repair budget is derived from the schedule string, so a 5-vs-6-field
