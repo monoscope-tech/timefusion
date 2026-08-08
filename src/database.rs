@@ -1897,6 +1897,16 @@ pub struct Database {
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
     /// pacing. Cleared on success; in-memory only (a restart retries once).
     dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
+    /// Repair candidates whose footer turned out to be SORTED after all, so the
+    /// pass stops re-selecting them. The `delta-rs.optimize.sort_by` tag that
+    /// drives admission is not equivalent to "has a `sorting_columns` footer":
+    /// the flush path sorts and stamps a correct footer WITHOUT the tag, so an
+    /// untagged file is only a *suspect*. Measured on prod 2026-08-08, project
+    /// 6297304f: `date=2026-07-09` is untagged and its footer IS sorted, while
+    /// `2026-07-30` and `2026-07-08` are untagged and genuinely unsorted — so
+    /// admission by tag alone would rewrite a healthy 716 MB file for nothing.
+    /// One footer read per file per process, then it is excluded.
+    repair_verified_sorted: Arc<dashmap::DashSet<String>>,
     /// Caps concurrent HEAVY maintenance rewrites — and ONLY those: dedup
     /// dirty-bin staging (`stage_dedup_chunk`), full optimize (Z-order /
     /// consolidate), nightly light-consolidate (`optimize_table_light_inner`)
@@ -2367,6 +2377,7 @@ impl Database {
             logical_count_build_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             dedup_dirty_bins,
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
+            repair_verified_sorted: Arc::new(dashmap::DashSet::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
@@ -8232,6 +8243,7 @@ impl Database {
             // larger legacy files belong to `optimize --recompress`.
             repair_max_bytes: self.config.maintenance.timefusion_repair_max_file_bytes as i64,
             pass,
+            verified_sorted: &self.repair_verified_sorted,
         };
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
         // snapshot (see `plan` below) so a wave never re-selects the run it just
@@ -8285,6 +8297,15 @@ impl Database {
                         return (project_id, Ok(BinOutcome::Converged));
                     }
                     info!(table_name, project_id, date = %today, selected_files = files.len(), round, event = "light_optimize_tail_selected");
+                    // Admission picked this file off the ABSENT sort tag, which
+                    // is only a suspicion (see `repair_verified_sorted`). Read
+                    // the footer before spending minutes rewriting it: one
+                    // ranged read against the same metadata cache the scan
+                    // warms, versus a whole-file sort of a file that was
+                    // already fine.
+                    if pass == TailPass::Repair && self.repair_bin_already_sorted(table_ref, &files).await {
+                        return (project_id, Ok(BinOutcome::Converged));
+                    }
                     // Bound the bin by what is LEFT of the tick, the same way
                     // the dedup drain bounds its own staging. Without it a
                     // single slow bin runs past the budget and the invocation
@@ -9017,6 +9038,32 @@ impl Database {
     /// Wall-clock budget for one light-optimize tick. Bounds the round-robin so a
     /// backlog can't run past its own cron period and stack ticks (prod 2026-07-29:
     /// "still in progress after 600s" on a 300s schedule).
+    /// Is every file in a repair bin already carrying a `sorting_columns`
+    /// footer? Then there is nothing to repair and the bin is recorded so
+    /// admission stops offering it (`repair_verified_sorted`).
+    ///
+    /// An unreadable footer is NOT evidence of sortedness — same rule as the
+    /// `--recompress` probe — so it returns false and the rewrite proceeds.
+    async fn repair_bin_already_sorted(&self, table_ref: &Arc<RwLock<DeltaTable>>, files: &[String]) -> bool {
+        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+        use object_store::{ObjectStoreExt, path::Path as OsPath};
+        let object_store = { table_ref.read().await.log_store().object_store(None) };
+        for path in files {
+            let os_path = OsPath::from(path.as_str());
+            let Ok(meta) = object_store.head(&os_path).await else { return false };
+            let mut reader = ParquetObjectReader::new(object_store.clone(), os_path).with_file_size(meta.size);
+            let Ok(pq) = reader.get_metadata(None).await else { return false };
+            if pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty())) {
+                return false;
+            }
+        }
+        for path in files {
+            self.repair_verified_sorted.insert(path.clone());
+        }
+        info!(files = files.len(), event = "footer_repair_suspect_cleared");
+        true
+    }
+
     /// Each pass is budgeted from its OWN cron period, because their units are
     /// orders of magnitude apart: a packing bin is a handful of small files, a
     /// repair bin is one 700 MB - 1 GiB whole-file rewrite. Sharing the 5-minute
@@ -10436,7 +10483,11 @@ fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], siz
     // a 5-minute tick is a large read+sort+write for a single file. They still
     // get repaired — by the off-box `timefusion optimize` CLI, which is where a
     // multi-GB rewrite belongs — just not from the hot path.
-    repairable && !sorted_run && size <= policy.repair_max_bytes && repair_markers.iter().any(|m| path.contains(m.as_str()))
+    repairable
+        && !sorted_run
+        && size <= policy.repair_max_bytes
+        && !policy.verified_sorted.contains(path)
+        && repair_markers.iter().any(|m| path.contains(m.as_str()))
 }
 
 /// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
@@ -10454,6 +10505,8 @@ struct HotBinPolicy<'a> {
     repair_max_bytes: i64,
     /// Which of the two disjoint jobs this pass is running. See [`TailPass`].
     pass: TailPass,
+    /// Suspects a footer read already cleared — see `repair_verified_sorted`.
+    verified_sorted: &'a dashmap::DashSet<String>,
 }
 
 /// The hot tail runs two jobs that were one, and the merge is what broke both.
@@ -13936,6 +13989,7 @@ mod tests {
         let today = "date=2026-08-06/";
         let repair: Vec<String> = vec!["date=2026-08-05/".into()];
         let p = |d: &str| format!("timefusion/otel_logs_and_spans/project_id=abc/{d}part-x.parquet");
+        let cleared: dashmap::DashSet<String> = dashmap::DashSet::new();
         let policy = |repair_dates: &'static [String]| super::HotBinPolicy {
             repair_dates,
             target_size: TARGET,
@@ -13943,6 +13997,7 @@ mod tests {
             sorted_run_cap: TARGET / 2,
             repair_max_bytes: REPAIR_MAX,
             pass: TailPass::Pack,
+            verified_sorted: &cleared,
         };
         let with_repair = super::HotBinPolicy { repair_dates: &repair, ..policy(&[]) };
         let admits = |path: &str, size, sorted, repairable| super::hot_bin_admits(path, today, &repair, size, sorted, repairable, &with_repair);
@@ -13980,6 +14035,16 @@ mod tests {
         assert!(!admits_repair(&p(today), 10, false), "a repair pass never packs today");
         assert!(!admits_repair(&p(today), 900, false), "not even today's poisoned file — the Pack gap rule owns that");
         assert!(admits_repair(&p(sealed), 900, false), "sealed poisoned file is exactly its job");
+
+        // The sort TAG is not the FOOTER. The flush path writes a correct
+        // `sorting_columns` footer without stamping the tag, so an untagged file
+        // is only a SUSPECT — prod 2026-08-08, project 6297304f: `2026-07-09` is
+        // untagged with a sorted footer (716 MB), while `2026-07-30` and
+        // `2026-07-08` are untagged and genuinely unsorted. Admitting on the tag
+        // alone rewrites healthy files. Once a footer read clears a suspect it
+        // must never be offered again.
+        cleared.insert(p(sealed));
+        assert!(!admits_repair(&p(sealed), 900, false), "a suspect whose footer read came back SORTED is out of the candidate set");
     }
 
     /// Wave commit blast radius: ONE stale bin must lose only its own actions.
