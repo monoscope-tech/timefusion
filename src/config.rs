@@ -870,7 +870,8 @@ const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
 const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
-const_default!(d_footer_repair_schedule: String = "0 30 */3 * * *");
+const_default!(d_footer_repair_schedule: String = "0 30 * * * *");
+const_default!(d_footer_repair_budget_secs: u64 = 8640);
 const_default!(d_repair_lookback_days: u64 = 2);
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
@@ -1881,6 +1882,21 @@ pub struct MaintenanceConfig {
     /// rate, plus the large units can actually finish.
     #[serde(default = "d_footer_repair_schedule")]
     pub timefusion_footer_repair_schedule: String,
+    /// How long ONE repair pass may run, in seconds — deliberately INDEPENDENT
+    /// of the schedule above, unlike every other maintenance tick.
+    ///
+    /// Everywhere else, budget = 80% of the cron period, which forces a single
+    /// trade-off: frequent attempts XOR a long run. Repair needs both. Its unit
+    /// is a whole 700 MB - 1 GiB file that measured 43 minutes to rewrite
+    /// contention-free on prod, so the budget must be hours; but tying cadence
+    /// to that means the first attempt after a restart is hours away, and a
+    /// process that restarts on every deploy would rarely repair anything.
+    ///
+    /// `spawn_cron_job` SKIPS overlapping ticks rather than queueing them, so a
+    /// short period with a long budget is well-defined: a pass starts soon after
+    /// boot, runs as long as it needs, and the ticks it overruns are dropped.
+    #[serde(default = "d_footer_repair_budget_secs")]
+    pub timefusion_footer_repair_budget_secs: u64,
     /// Dirty-bin dedup of sealed (< today) partitions. Runs on its OWN cron,
     /// decoupled from hot-tail compaction: dedup churning an old-date backlog
     /// must not starve today's compaction (they touch disjoint partitions —

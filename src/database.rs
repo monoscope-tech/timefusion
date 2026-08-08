@@ -9092,11 +9092,13 @@ impl Database {
     /// discards an over-budget bin — so repair could never finish, at any
     /// backlog size (prod 2026-08-08).
     fn tail_pass_tick_budget(&self, pass: TailPass) -> std::time::Duration {
-        let schedule = match pass {
-            TailPass::Pack => &self.config.maintenance.timefusion_light_optimize_schedule,
-            TailPass::Repair => &self.config.maintenance.timefusion_footer_repair_schedule,
-        };
-        self.config.derived.tick_budget(cron_period(schedule))
+        match pass {
+            TailPass::Pack => self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_light_optimize_schedule)),
+            // Repair's run length is set OUTRIGHT, not derived from its period —
+            // see `timefusion_footer_repair_budget_secs`. Tying it to the period
+            // forces "frequent attempts XOR a long run", and repair needs both.
+            TailPass::Repair => std::time::Duration::from_secs(self.config.maintenance.timefusion_footer_repair_budget_secs),
+        }
     }
 
     /// Inner optimize loop for the COLD consolidate path (the 5-min hot tail
@@ -16674,13 +16676,16 @@ mod footer_repair_schedule_tests {
     /// failure the split exists to remove.
     #[test]
     fn default_footer_repair_budget_clears_a_measured_whole_file_rewrite() {
-        let period = super::cron_period(&crate::config::AppConfig::default().maintenance.timefusion_footer_repair_schedule);
-        assert_eq!(period, std::time::Duration::from_secs(3 * 3600), "3-hour period");
-        // 80% of the period = 144 minutes. The measured contention-free rewrite
-        // of prod's blocking file was 43 minutes; at `concurrency = k/2` expect
-        // 2-3x that, so the budget must clear ~130 minutes with margin.
-        let budget = period.mul_f64(0.8);
+        let cfg = crate::config::AppConfig::default();
+        let period = super::cron_period(&cfg.maintenance.timefusion_footer_repair_schedule);
+        assert_eq!(period, std::time::Duration::from_secs(3600), "tries hourly, so a restart repairs something soon");
+        // The run length is INDEPENDENT of that period. The measured
+        // contention-free rewrite of prod's blocking file was 43 minutes; at
+        // `concurrency = k/2` expect 2-3x, so the budget must clear ~130 with
+        // margin. Overlapping ticks are skipped, so budget > period is sound.
+        let budget = std::time::Duration::from_secs(cfg.maintenance.timefusion_footer_repair_budget_secs);
         assert_eq!(budget, std::time::Duration::from_secs(8640), "144-minute budget");
         assert!(budget >= std::time::Duration::from_secs(43 * 60 * 3), "must clear 3x the measured solo rewrite");
+        assert!(budget > period, "a long run must not be capped by a short cadence");
     }
 }
