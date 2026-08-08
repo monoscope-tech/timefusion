@@ -8270,7 +8270,28 @@ impl Database {
         // this tick and drops out of the round-robin.
         let plan: tokio::sync::Mutex<HashMap<String, Vec<String>>> = tokio::sync::Mutex::new(planned.into_iter().collect());
 
-        let concurrency = self.config.derived.light_optimize_k(project_ids.len());
+        // A repair wave takes ONE rewrite slot, never the pool.
+        //
+        // `stage_hot_bin` acquires `light_rewrite_sem`, and BOTH passes share it.
+        // Giving repair its own long budget without capping its concurrency let
+        // a single wave hold every permit for the whole 48 minutes, so the
+        // 5-minute packing tick blocked in `acquire()` and burned its entire
+        // 240s budget waiting — prod 2026-08-08 05:09, five projects at once
+        // reporting `hot bin staging exceeded the 239.99s left in the tick
+        // budget`, with the same signature during the earlier 16-minute repair
+        // at 04:24. That trades the repair starvation for a packing starvation,
+        // which is worse: packing is continuous and latency-critical, repair is
+        // a finite background backlog.
+        //
+        // Half the pool, so packing always keeps the majority. On prod that is
+        // k=5 (22.5 GB light share / 4 GB per sort, under a 12-core bound), so
+        // repair takes 2 and packing keeps 3 — enough to drain a finite backlog
+        // without ever being able to block the continuous job.
+        let k = self.config.derived.light_optimize_k(project_ids.len());
+        let concurrency = match pass {
+            TailPass::Pack => k,
+            TailPass::Repair => (k / 2).max(1),
+        };
         // Bound total rounds so a large backlog can't wedge the tick even if the
         // wall-clock budget is raised.
         const MAX_WAVES: usize = 12;
