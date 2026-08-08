@@ -219,3 +219,21 @@ ORDER BY 2 DESC, 1 ASC
 service_a 2
 service_b 2
 service_c 1
+
+# A repeated literal reached from two different value contexts now shares one
+# placeholder. Pins that the shared type still plans and evaluates.
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans
+WHERE project_id = 'agg_test' AND duration >= 150000000 AND duration <= 300000000
+----
+4
+
+query TI rowsort
+SELECT level, COUNT(*) FROM otel_logs_and_spans
+WHERE project_id = 'agg_test' AND duration > 100000000
+GROUP BY level
+HAVING COUNT(*) >= 1
+----
+ERROR 1
+INFO 2
+WARN 1
