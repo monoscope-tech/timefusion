@@ -718,9 +718,21 @@ fn maintenance_session_config(base: datafusion::prelude::SessionConfig, batch_si
 fn build_delta_write_session_state(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> datafusion::execution::session_state::SessionState {
+    build_delta_write_session_state_with_batch(target_partitions, runtime_env, "8192")
+}
+
+/// `batch_size` is the sort's indivisible admission unit, and merge memory
+/// scales with fan-in x batch — the same relationship
+/// [`build_optimize_session_state_with_batch`] exists for. The flush escalation
+/// sort needs it MORE than repair does, because it has the worst combination in
+/// the system: the largest batch (8192) against the smallest pool (the 1 GB
+/// `flush_sort_pool`, vs maintenance's 22.5 GB).
+fn build_delta_write_session_state_with_batch(
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_size: &str,
+) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     let base: SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
-    let cfg = maintenance_session_config(base, "8192", target_partitions);
+    let cfg = maintenance_session_config(base, batch_size, target_partitions);
     SessionStateBuilder::new()
         .with_config(cfg)
         .with_runtime_env(runtime_env)
@@ -4529,7 +4541,22 @@ impl Database {
         // starved the FairSpillPool into the unsorted fallback (prod
         // 2026-08-03). A single-partition sort is slower but has no merge exec
         // and spills within its fair share, so the footer stays honest.
-        let state = build_delta_write_session_state(1, self.flush_sort_runtime_env());
+        // SMALL batches, for the same reason `repair_session_state` uses them
+        // (6ef5ccf): `ExternalSorterMerge` allocates per spill-run per batch, so
+        // its ask scales with `batch_size`. Prod 2026-08-08, AFTER the one-permit
+        // fix below had already given this sort the whole pool to itself:
+        //
+        //   Failed to allocate additional 545.4 MB for ExternalSorterMerge[0]
+        //   with 539.8 MB already allocated - 484.2 MB remain available
+        //
+        // 539.8 + 484.2 = the full 1024 MB pool, so contention was NOT the
+        // remaining cause — the merge simply tried to double a half-pool
+        // reservation. The group was 6252 MB, which spills into a wide merge,
+        // and 8192-row batches make every run's slice 32x what repair now uses.
+        // Shrinking the batch costs scan throughput on an already-slow path and
+        // buys the allocation; the alternative is writing the group UNSORTED,
+        // which poisons the partition's footer ordering for every later scan.
+        let state = build_delta_write_session_state_with_batch(1, self.flush_sort_runtime_env(), "256");
         let ctx = SessionContext::new_with_state(state);
         let name = format!("flush_sort_{}", uuid::Uuid::new_v4().simple());
         ctx.register_table(&name, Arc::new(MemTable::try_new(arrow_schema, vec![unified]).ok()?)).ok()?;
@@ -15474,6 +15501,56 @@ mod tests {
             .flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec())
             .collect();
         assert_eq!(stamps.len(), 160_000, "the sort must not lose or duplicate rows");
+        assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
+        Ok(())
+    }
+
+    /// A batch is the sort's INDIVISIBLE admission unit, so a pool that cannot
+    /// hold one batch cannot spill its way out of trouble — it just fails, and
+    /// the flush path then writes the group UNSORTED, poisoning the partition's
+    /// footer ordering for every later scan.
+    ///
+    /// Prod 2026-08-08, with the sort already alone in its pool:
+    ///   Failed to allocate additional 545.4 MB for ExternalSorterMerge[0] with
+    ///   539.8 MB already allocated - 484.2 MB remain available
+    /// (539.8 + 484.2 = the whole 1024 MB pool, on a 6252 MB group.)
+    ///
+    /// Wide rows make one 8192-row batch larger than the 64 MB floor pool, which
+    /// is the same shape at test scale. `256` — what `repair_session_state` uses
+    /// for the same reason — admits and spills.
+    #[tokio::test]
+    async fn flush_sort_batch_is_small_enough_for_its_pool_to_admit_one() -> Result<()> {
+        use arrow::array::{StringArray, TimestampMicrosecondArray};
+        let mut cfg = (*create_test_config("flush-sort-wide-rows")).clone();
+        cfg.maintenance.timefusion_sort_skip_bytes = 0; // every group escalates
+        cfg.maintenance.timefusion_flush_sort_pool_mb = 64; // the config floor
+        let db = Database::with_config(Arc::new(cfg)).await?;
+
+        let table = get_schema("otel_logs_and_spans").expect("registered");
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("timestamp", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+        ]));
+        // ~8 KB per row: one 8192-row batch would be ~65 MB, just over the 64 MB
+        // pool, so the OLD batch size cannot admit a single batch. Scrambled
+        // event time so an append-ordered pass-through cannot fake a sort.
+        let (rows_per_batch, batches_n) = (1_000i64, 16i64);
+        let batches: Vec<RecordBatch> = (0..batches_n)
+            .map(|b| {
+                let ts: TimestampMicrosecondArray =
+                    (0..rows_per_batch).map(|i| Some((b * rows_per_batch + i).wrapping_mul(2_654_435_761) % 1_000_000_000)).collect();
+                let ids = StringArray::from_iter_values((0..rows_per_batch).map(|i| format!("{b:04}-{i:06}-{}", "x".repeat(8_000))));
+                RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(ts), Arc::new(ids)]).unwrap()
+            })
+            .collect();
+
+        let (out, escalated) = db.sort_flush_group(table, batches, UnsortedFallback::Allow).await?;
+        assert!(escalated, "the pool could not admit one batch, so the group was written UNSORTED — the footer-poison path");
+        let FlushBatches::Ready(it) = out else { panic!("escalated path yields Ready batches") };
+        let stamps: Vec<i64> = it
+            .flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec())
+            .collect();
+        assert_eq!(stamps.len() as i64, rows_per_batch * batches_n, "the sort must not lose or duplicate rows");
         assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
         Ok(())
     }
