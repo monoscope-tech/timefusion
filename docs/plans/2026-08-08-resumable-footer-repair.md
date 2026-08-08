@@ -1,6 +1,22 @@
 # Resumable footer repair
 
-**Status:** not started. Prerequisite work is shipped (see "What already exists").
+**Status:** IMPLEMENTED, shipped OFF. `resumable_staged_bin` is called from the
+per-project closure in `optimize_table_light`, right after the footer probe and
+before staging; a hit returns `BinOutcome::Staged` so the normal `commit_wave`
+lands it. Gated on `TIMEFUSION_REPAIR_RESUME_ENABLED` (default false).
+Two deviations from the sketch below, both deliberate:
+ - **not gated on `TailPass::Repair`.** A packing bin is equally
+   data-preserving, and today's oversized unsorted file is repaired by the PACK
+   pass. A packing bin's inputs change every tick so the lookup almost always
+   misses; the cost of a miss is one small local file read.
+ - `plan_tail_pass` / `tail_pass_policy` were split out of `optimize_table_light`
+   so the e2e can stage the EXACT bin the next pass re-selects — resume keys on
+   input-set equality, so a hand-picked file list would prove nothing.
+
+Tests: `database::tests::resume_*` (the pure verdict table) and
+`tests/e2e/repair_resume.rs` (stage → abandon → restart → commit-not-restage,
+plus the stale-twin decline + reclaim, and the kill-switch no-op).
+Remaining: the prod rollout below.
 **Problem:** a footer-repair rewrite takes 40+ minutes. Any process restart —
 a deploy, or the healthcheck replacing the swarm task — throws that work away
 and the next pass starts the same file from scratch. Prod 2026-08-08 lost two

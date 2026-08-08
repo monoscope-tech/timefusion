@@ -391,6 +391,7 @@ impl E2eEnv {
             wide_scan_max_files: self.builder.wide_scan_max_files,
             wide_scan_max_mb: self.builder.wide_scan_max_mb,
             page_row_count_limit: self.builder.page_row_count_limit,
+            repair_resume: self.builder.repair_resume,
             test_id: &self.test_id,
         });
 

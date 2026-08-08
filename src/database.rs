@@ -2701,8 +2701,6 @@ impl Database {
                     if cleanup_db.maintenance_shutdown.is_cancelled() {
                         return;
                     }
-                    // Resume FIRST: reconcile then deletes only what resume declined.
-                    cleanup_db.resume_staged_intents(&table, &table_name).await;
                     cleanup_db.reconcile_staged_intents(&table, &table_name).await;
                 }
             });
@@ -7361,7 +7359,7 @@ impl Database {
                 paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
                 // Cleanup-only: a dedup rewrite DROPS rows, so the resume path's
                 // row-preservation check can't tell a valid staging from a
-                // truncated one. See `resume_staged_intents`.
+                // truncated one. See `resumable_staged_bin`.
                 target_paths: Vec::new(),
                 adds: Vec::new(),
             });
@@ -8227,46 +8225,24 @@ impl Database {
         }
     }
 
-    /// Hot-tail compaction for one table, as plan-once → rewrite-parallel →
-    /// commit-once WAVES (design doc: docs/compaction-redesign-2026-07-29.md).
-    ///
-    /// Per tick: ONE tag-first metadata walk plans a bin for every hot project
-    /// (`select_all_hot_bins`), each round's bins are rewritten to staged parquet
-    /// in parallel WITHOUT touching the Delta log, and the whole round lands in
-    /// ONE `CommitBuilder` transaction. This replaces the per-bin
-    /// `OptimizeBuilder` path: it was 132 metadata walks and ~130 commits per
-    /// tick on one shared log, where the commits alone (OCC ladders to attempt
-    /// 9-20) were most of a 40-65s pass, and the per-project greedy drain left 8
-    /// of 11 hot projects unreached on a 5-min cron (prod 2026-07-29).
-    ///
-    /// `TIMEFUSION_LIGHT_OPTIMIZE_ENABLED=false` remains the incident kill switch.
-    pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass) -> Result<()> {
-        use std::sync::atomic::Ordering::Relaxed;
-        // `crate::clock`, not `Utc::now()`: the hot tail scopes itself to TODAY's
-        // partition and to an event-time seal window, so a wall-clock read here
-        // makes the whole pass unreachable from the virtual-time e2e harness —
-        // which is why this path had no end-to-end coverage and shipped writing
-        // every output unsorted. In production the clock IS the wall clock.
-        let today = crate::clock::now_micros();
-        let today = chrono::DateTime::from_timestamp_micros(today).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
-        let today_str = today.to_string();
-        // Sealed dates scanned for footer repair (see `select_all_hot_bins`),
-        // derived from the same virtual clock as `today`. A packing pass carries
-        // none: the two passes own disjoint partitions (see `TailPass`).
-        let repair_dates: Vec<String> = match pass {
+    /// Sealed dates a REPAIR pass scans for footer repair (yesterday backwards).
+    /// A packing pass carries none: the two passes own disjoint partitions.
+    fn repair_dates(&self, today: chrono::NaiveDate, pass: TailPass) -> Vec<String> {
+        match pass {
             TailPass::Pack => vec![],
             TailPass::Repair => (1..=self.config.maintenance.timefusion_light_optimize_repair_days)
                 .filter_map(|d| today.checked_sub_days(chrono::Days::new(d)))
                 .map(|d| d.to_string())
                 .collect(),
-        };
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        }
+    }
+
+    /// The admission policy for one tail pass. `budget` is an input, not a
+    /// detail: a repair pass's reach is derived from how long it may run.
+    fn tail_pass_policy<'a>(&'a self, pass: TailPass, budget: std::time::Duration, repair_dates: &'a [String]) -> HotBinPolicy<'a> {
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
-        // Needed at PLANNING time, not just for the deadline: a repair pass's
-        // admission reach is derived from how long it may actually run.
-        let budget = self.tail_pass_tick_budget(pass);
-        let policy = HotBinPolicy {
-            repair_dates: &repair_dates,
+        HotBinPolicy {
+            repair_dates,
             target_size,
             min_files: self.config.maintenance.timefusion_compact_min_files,
             sorted_run_cap: target_size / 2,
@@ -8288,13 +8264,24 @@ impl Database {
             },
             pass,
             verified_sorted: &self.repair_verified_sorted,
-        };
+        }
+    }
+
+    /// Plan one tail pass: which projects have work and which files each bin
+    /// takes. Split out of [`Self::optimize_table_light`] so a test can
+    /// reproduce the EXACT bin the next real pass will select — resume is keyed
+    /// on input-set equality, so a hand-picked file list would prove nothing.
+    async fn plan_tail_pass(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today_str: &str, policy: &HotBinPolicy<'_>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
-        // snapshot (see `plan` below) so a wave never re-selects the run it just
-        // wrote. Bins are ordered by compaction debt.
+        // snapshot so a wave never re-selects the run it just wrote. Bins are
+        // ordered by compaction debt.
         let mut planned = {
             let table = table_ref.read().await;
-            Self::select_all_hot_bins(&table, schema, &today_str, &policy)?
+            Self::select_all_hot_bins(&table, schema, today_str, policy)?
         };
         // Rotation cursor: start where the last truncated tick stopped so the
         // same tail is never skipped twice in a row (a truncated tick otherwise
@@ -8319,19 +8306,71 @@ impl Database {
         // tick instead of one per tick.
         for _ in 0..REPAIR_RESELECT_ROUNDS {
             let before = planned.len();
-            planned = self.drop_verified_sorted_bins(table_ref, table_name, pass, planned).await;
-            if pass != TailPass::Repair || planned.len() == before {
+            planned = self.drop_verified_sorted_bins(table_ref, table_name, policy.pass, planned).await;
+            if policy.pass != TailPass::Repair || planned.len() == before {
                 break;
             }
             let next = {
                 let table = table_ref.read().await;
-                Self::select_all_hot_bins(&table, schema, &today_str, &policy)?
+                Self::select_all_hot_bins(&table, schema, today_str, policy)?
             };
             if next.is_empty() {
                 break;
             }
             planned = next;
         }
+        Ok(planned)
+    }
+
+    /// TEST SEAM: plan one tail pass, stage its first bin, and ABANDON it —
+    /// staged parquet on the object store plus an intent line on disk, and no
+    /// commit. That is the state a process killed mid-rewrite leaves behind,
+    /// and going through the real planner is the point: resume matches on
+    /// input-set equality, so the bin must be the one the next pass re-selects.
+    /// Returns the abandoned bin's `(project_id, input paths)`.
+    #[doc(hidden)]
+    pub async fn stage_and_abandon_first_bin(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        let today = chrono::DateTime::from_timestamp_micros(crate::clock::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
+        let repair_dates = self.repair_dates(today, pass);
+        let policy = self.tail_pass_policy(pass, self.tail_pass_tick_budget(pass), &repair_dates);
+        let planned = self.plan_tail_pass(table_ref, table_name, &today.to_string(), &policy).await?;
+        let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        match self.stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone()).await? {
+            BinOutcome::Staged(_) => Ok(Some((project_id, files))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Hot-tail compaction for one table, as plan-once → rewrite-parallel →
+    /// commit-once WAVES (design doc: docs/compaction-redesign-2026-07-29.md).
+    ///
+    /// Per tick: ONE tag-first metadata walk plans a bin for every hot project
+    /// (`select_all_hot_bins`), each round's bins are rewritten to staged parquet
+    /// in parallel WITHOUT touching the Delta log, and the whole round lands in
+    /// ONE `CommitBuilder` transaction. This replaces the per-bin
+    /// `OptimizeBuilder` path: it was 132 metadata walks and ~130 commits per
+    /// tick on one shared log, where the commits alone (OCC ladders to attempt
+    /// 9-20) were most of a 40-65s pass, and the per-project greedy drain left 8
+    /// of 11 hot projects unreached on a 5-min cron (prod 2026-07-29).
+    ///
+    /// `TIMEFUSION_LIGHT_OPTIMIZE_ENABLED=false` remains the incident kill switch.
+    pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // `crate::clock`, not `Utc::now()`: the hot tail scopes itself to TODAY's
+        // partition and to an event-time seal window, so a wall-clock read here
+        // makes the whole pass unreachable from the virtual-time e2e harness —
+        // which is why this path had no end-to-end coverage and shipped writing
+        // every output unsorted. In production the clock IS the wall clock.
+        let today = chrono::DateTime::from_timestamp_micros(crate::clock::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
+        let today_str = today.to_string();
+        let repair_dates = self.repair_dates(today, pass);
+        let budget = self.tail_pass_tick_budget(pass);
+        let policy = self.tail_pass_policy(pass, budget, &repair_dates);
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let planned = self.plan_tail_pass(table_ref, table_name, &today_str, &policy).await?;
         if planned.is_empty() {
             return Ok(());
         }
@@ -8409,6 +8448,22 @@ impl Database {
                     // its scans — while looking busy the whole time.
                     if pass == TailPass::Repair && self.repair_bin_already_sorted(table_ref, &files).await {
                         return (project_id, Ok(BinOutcome::Retry));
+                    }
+                    // Did a previous attempt already WRITE this exact rewrite?
+                    // Then commit it instead of spending another 40 minutes on
+                    // it. Selection is deterministic given the snapshot, so the
+                    // first pass after a restart re-selects the killed pass's
+                    // files and finds its own abandoned output here.
+                    //
+                    // NOT gated on `TailPass::Repair`: a packing bin is equally
+                    // data-preserving, and today's oversized unsorted file is
+                    // repaired by the PACK pass (see
+                    // `pack_pass_still_repairs_todays_oversized_unsorted_file_when_nothing_packs`)
+                    // — those rewrites are just as long. A packing bin's inputs
+                    // change every tick, so the lookup almost always misses; the
+                    // cost of that miss is one small local file read.
+                    if let Some(bin) = self.resumable_staged_bin(table_ref, table_name, &project_id, &files).await {
+                        return (project_id, Ok(BinOutcome::Staged(bin)));
                     }
                     // Bound the bin by what is LEFT of the tick, the same way
                     // the dedup drain bounds its own staging. Without it a
@@ -8490,17 +8545,6 @@ impl Database {
         self.checkpoint_after_waves(table_ref, table_name).await;
         anyhow::ensure!(failed == 0, "Light optimize failed for {failed} hot bin(s)");
         Ok(())
-    }
-
-    /// TEST SEAM: stage one bin and ABANDON it — staged parquet on the object
-    /// store plus an intent line in the manifest, and no commit. That is exactly
-    /// the state a process killed mid-repair leaves behind, and it has no other
-    /// producer: production always hands a staged bin straight to `commit_wave`.
-    /// Returns false when the bin staged nothing (converged / raced).
-    #[doc(hidden)]
-    pub async fn stage_hot_bin_and_abandon(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, files: Vec<String>) -> Result<bool> {
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        Ok(matches!(self.stage_hot_bin(table_ref, table_name, schema, project_id, files).await?, BinOutcome::Staged(_)))
     }
 
     /// Stage ONE bin's rewrite: read exactly the selected files, sort by the
@@ -8667,7 +8711,7 @@ impl Database {
             paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
             // Recorded so a restart RESUMES this bin instead of re-staging it:
             // the inputs make staleness decidable, the Adds rebuild the bin
-            // without re-reading footers. See `resume_staged_intents`.
+            // without re-reading footers. See `resumable_staged_bin`.
             target_paths: files.clone(),
             adds: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.clone()) } else { None }).collect(),
         });
@@ -9038,50 +9082,56 @@ impl Database {
         }
     }
 
-    /// Boot-time RESUME: commit staged parquet a killed process had already
-    /// written, instead of throwing it away. A footer-repair bin is one 700MB-1GiB
-    /// whole-file rewrite that takes 40+ minutes, so a deploy — or the
-    /// healthcheck replacing the swarm task — used to discard the entire rewrite
-    /// and make the next pass start it over (prod 2026-08-08 lost two passes in
-    /// one morning). With this, loss is bounded to the bytes not yet written.
+    /// RESUME a repair bin that a previous attempt already WROTE: return its
+    /// staged output as a ready [`StagedBin`] instead of spending another 40+
+    /// minutes rewriting the same file. A footer-repair bin is one 700MB-1GiB
+    /// whole-file rewrite, so a deploy — or the healthcheck replacing the swarm
+    /// task — used to discard the whole thing and make the next pass start over
+    /// (prod 2026-08-08 lost two passes in one morning). Loss is now bounded to
+    /// the bytes not yet written.
     ///
-    /// Runs immediately BEFORE [`Self::reconcile_staged_intents`], which then
-    /// deletes only what resume declined. Every decline is safe by construction:
-    /// the staged parquet is invisible to readers until the atomic commit, so a
-    /// declined entry costs a re-stage, never correctness.
+    /// Hooked at bin SELECTION rather than at boot, keyed on "an intent whose
+    /// inputs are exactly the bin we were about to stage". The restart case then
+    /// falls out for free — selection is deterministic given the snapshot, so
+    /// the first pass after a restart re-selects the killed pass's files — and
+    /// the same lookup also covers a stage whose commit lost an OCC race inside
+    /// one process. Returning a `StagedBin` means there is no second COMMIT path
+    /// either: `commit_wave` lands it with the same lock, flush priority,
+    /// liveness re-check and OCC ladder, and clears the intent on success.
     ///
-    /// Returns the number of entries it committed.
-    pub async fn resume_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> usize {
+    /// `None` is always safe: the caller stages normally, and the declined
+    /// entry's parquet falls to the boot-time reconcile / VACUUM. Staged parquet
+    /// is invisible to readers until the atomic commit, so the only thing these
+    /// checks stand in front of is a bad COMMIT.
+    async fn resumable_staged_bin(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, files: &[String]) -> Option<StagedBin> {
         use deltalake::kernel::Action;
         use object_store::{ObjectStoreExt, path::Path as OsPath};
         use std::sync::atomic::Ordering::Relaxed;
         if !self.config.maintenance.timefusion_repair_resume_enabled {
-            return 0;
+            return None;
         }
-        let path = self.staged_intent_path();
         let contents = {
             let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Ok(contents) = std::fs::read_to_string(&path) else { return 0 };
-            contents
+            std::fs::read_to_string(self.staged_intent_path()).ok()?
         };
-        let entries = parse_staged_intents(&contents);
-        // Only the paths this manifest mentions — the snapshot has ~26k files and
-        // resume must not parse every one of their stats blobs.
-        let interest: std::collections::HashSet<&str> = entries
-            .iter()
-            .filter(|e| e.table_name == table_name)
-            .flat_map(|e| e.target_paths.iter().chain(e.adds.iter().map(|a| &a.path)))
-            .map(String::as_str)
+        let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        // Set equality, not order: the bin is a SET of inputs, and admission may
+        // legitimately hand them over in a different order than last time.
+        let candidates: Vec<StagedIntent> = parse_staged_intents(&contents)
+            .into_iter()
+            .filter(|e| e.project_id == project_id && e.target_paths.len() == files.len())
+            .filter(|e| e.target_paths.iter().all(|p| wanted.contains(p.as_str())))
             .collect();
-        if interest.is_empty() {
-            return 0;
+        if candidates.is_empty() {
+            return None;
         }
+        // Only the paths in play — the snapshot holds ~26k files and this must
+        // not parse every one of their stats blobs.
+        let interest: std::collections::HashSet<&str> =
+            candidates.iter().flat_map(|e| e.target_paths.iter().chain(e.adds.iter().map(|a| &a.path))).map(String::as_str).collect();
         let (live, target_adds, store) = {
             let table = table_ref.read().await;
-            let Ok(snapshot) = table.snapshot() else {
-                warn!("staged-intent resume skipped for '{table_name}': no snapshot loaded");
-                return 0;
-            };
+            let snapshot = table.snapshot().ok()?;
             let mut live: std::collections::HashMap<String, Option<i64>> = std::collections::HashMap::new();
             let mut target_adds: std::collections::HashMap<String, deltalake::kernel::Add> = std::collections::HashMap::new();
             for file in snapshot.log_data().iter() {
@@ -9103,22 +9153,24 @@ impl Database {
         let live_view: std::collections::HashMap<&str, Option<i64>> = live.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let stats = crate::metrics::maintenance_stats();
-        let mut resumed = 0usize;
-        for entry in &entries {
+        for entry in &candidates {
             match classify_resume(entry, table_name, now_secs, &live_view) {
                 ResumeVerdict::Skip => continue,
                 ResumeVerdict::AlreadyLanded => {
-                    info!(table_name, wave_id = %entry.wave_id, event = "staged_intent_already_landed");
+                    // The commit landed and only the bookkeeping was lost. Never
+                    // re-commit: that would Remove the files it just Added.
+                    info!(table_name, project_id, wave_id = %entry.wave_id, event = "staged_intent_already_landed");
                     self.clear_staged_intent(&[entry.wave_id.as_str()]);
                 }
                 ResumeVerdict::Stale => {
                     stats.repair_resume_declined_stale.fetch_add(1, Relaxed);
-                    info!(table_name, wave_id = %entry.wave_id, event = "staged_intent_resume_stale");
+                    info!(table_name, project_id, wave_id = %entry.wave_id, event = "staged_intent_resume_stale");
                 }
                 ResumeVerdict::RowMismatch { target_rows, staged_rows } => {
                     stats.repair_resume_row_mismatch.fetch_add(1, Relaxed);
                     error!(
                         table_name,
+                        project_id,
                         wave_id = %entry.wave_id,
                         target_rows,
                         staged_rows,
@@ -9131,7 +9183,7 @@ impl Database {
                 ResumeVerdict::Commit => {
                     // The one network check: a process killed mid-PUT leaves a
                     // short (or absent) object under a name the manifest already
-                    // knows, and its stats would still add up.
+                    // knows, and its recorded stats would still add up.
                     let mut complete = true;
                     for add in &entry.adds {
                         let meta = store.head(&OsPath::from(add.path.as_str())).await;
@@ -9142,42 +9194,33 @@ impl Database {
                     }
                     if !complete {
                         stats.repair_resume_declined_incomplete.fetch_add(1, Relaxed);
-                        info!(table_name, wave_id = %entry.wave_id, event = "staged_intent_resume_incomplete");
+                        info!(table_name, project_id, wave_id = %entry.wave_id, event = "staged_intent_resume_incomplete");
                         continue;
                     }
                     let targets: Vec<deltalake::kernel::Add> = entry.target_paths.iter().filter_map(|p| target_adds.get(p).cloned()).collect();
                     let (removes, adds) = staged_actions(&targets, entry.adds.iter().cloned().map(Action::Add).collect(), false);
-                    let bin = StagedBin {
-                        project_id: entry.project_id.clone(),
+                    stats.repair_resumed.fetch_add(1, Relaxed);
+                    info!(table_name, project_id, wave_id = %entry.wave_id, files = entry.target_paths.len(), event = "staged_intent_resumed");
+                    return Some(StagedBin {
+                        project_id: project_id.to_string(),
                         wave_id: entry.wave_id.clone(),
                         target_paths: entry.target_paths.clone(),
                         removes,
                         adds,
                         stage_store: Arc::clone(&store),
                         dedup: None,
-                    };
-                    // `commit_wave` re-verifies liveness under the commit lock,
-                    // honours flush priority and runs the OCC ladder — a second
-                    // commit path here would be a second place to get that wrong.
-                    let markers = date_markers_for(&entry.target_paths);
-                    if self.commit_wave(table_ref, table_name, &markers, false, vec![bin], 0).await.landed.is_empty() {
-                        warn!(table_name, wave_id = %entry.wave_id, event = "staged_intent_resume_commit_failed");
-                    } else {
-                        stats.repair_resumed.fetch_add(1, Relaxed);
-                        resumed += 1;
-                        info!(table_name, wave_id = %entry.wave_id, files = entry.target_paths.len(), event = "staged_intent_resumed");
-                    }
+                    });
                 }
             }
         }
-        resumed
+        None
     }
 
     /// Boot-time orphan sweep: delete staged parquet the Delta log doesn't
     /// reference, BY KEY (no LIST — R2 listing is a known incident source).
     /// Every failure mode degrades to a `warn!` and a no-op: the manifest is a
     /// cleanup aid, correctness never depends on it.
-    async fn reconcile_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
+    pub async fn reconcile_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
         use object_store::ObjectStoreExt;
         let path = self.staged_intent_path();
         let contents = {
@@ -10552,13 +10595,6 @@ fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: 
         (Some(t), Some(s)) if t == s => ResumeVerdict::Commit,
         (t, s) => ResumeVerdict::RowMismatch { target_rows: rows(t), staged_rows: rows(s) },
     }
-}
-
-/// The `date=…/` prefixes a set of files spans, for scoping a wave's cache
-/// warm/evict diff. Deduped, order-stable.
-fn date_markers_for(paths: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    paths.iter().filter_map(|p| p.split('/').find(|s| s.starts_with("date="))).filter(|d| seen.insert(d.to_string())).map(|d| format!("{d}/")).collect()
 }
 
 /// One bin rewritten to staged parquet but NOT yet committed. Uncommitted Adds
@@ -14843,16 +14879,6 @@ mod tests {
         let entry = resume_intent(&["in1"], vec![resume_add("out1", 100)]);
         let live = resume_live(&[("out1", Some(100))]);
         assert_eq!(super::classify_resume(&entry, "logs", 100_000, &live), super::ResumeVerdict::AlreadyLanded);
-    }
-
-    #[test]
-    fn date_markers_are_deduped_per_partition() {
-        let paths = [
-            "project_id=a/date=2026-08-07/x.parquet".to_string(),
-            "project_id=b/date=2026-08-07/y.parquet".to_string(),
-            "date=2026-08-06/z.parquet".to_string(),
-        ];
-        assert_eq!(super::date_markers_for(&paths), vec!["date=2026-08-07/", "date=2026-08-06/"]);
     }
 
     /// Stats trimming (2026-07-29): the Add stats column list must be the narrow

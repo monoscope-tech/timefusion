@@ -131,7 +131,8 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
     let entries = backdate_manifest(&env)?;
     assert_eq!(entries.len(), 1, "the abandoned bin must have left an intent line");
     let entry = &entries[0];
-    let mut recorded_inputs: Vec<String> = entry["target_paths"].as_array().cloned().unwrap_or_default().iter().filter_map(|p| p.as_str().map(str::to_string)).collect();
+    let mut recorded_inputs: Vec<String> =
+        entry["target_paths"].as_array().cloned().unwrap_or_default().iter().filter_map(|p| p.as_str().map(str::to_string)).collect();
     recorded_inputs.sort();
     let mut expected = inputs.clone();
     expected.sort();
@@ -239,6 +240,9 @@ async fn resume_is_a_no_op_while_the_kill_switch_is_off() -> anyhow::Result<()> 
 
     env.db().optimize_table_light(&table_ref, TABLE, TailPass::Pack).await?;
     let after = live_files(&env).await?;
-    assert!(after.iter().all(|p| !staged.contains(p)), "with the kill switch off, nothing may be committed from the manifest: after={after:?} staged={staged:?}");
+    assert!(
+        after.iter().all(|p| !staged.contains(p)),
+        "with the kill switch off, nothing may be committed from the manifest: after={after:?} staged={staged:?}"
+    );
     Ok(())
 }
