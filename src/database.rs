@@ -16673,10 +16673,14 @@ mod footer_repair_schedule_tests {
     /// cron mix-up would silently hand repair the wrong budget — the exact
     /// failure the split exists to remove.
     #[test]
-    fn default_footer_repair_schedule_is_hourly() {
+    fn default_footer_repair_budget_clears_a_measured_whole_file_rewrite() {
         let period = super::cron_period(&crate::config::AppConfig::default().maintenance.timefusion_footer_repair_schedule);
-        assert_eq!(period, std::time::Duration::from_secs(3600), "hourly period");
-        // 80% of the period, i.e. 48 minutes — enough for a whole-file rewrite.
-        assert_eq!(period.mul_f64(0.8), std::time::Duration::from_secs(2880), "48-minute budget");
+        assert_eq!(period, std::time::Duration::from_secs(3 * 3600), "3-hour period");
+        // 80% of the period = 144 minutes. The measured contention-free rewrite
+        // of prod's blocking file was 43 minutes; at `concurrency = k/2` expect
+        // 2-3x that, so the budget must clear ~130 minutes with margin.
+        let budget = period.mul_f64(0.8);
+        assert_eq!(budget, std::time::Duration::from_secs(8640), "144-minute budget");
+        assert!(budget >= std::time::Duration::from_secs(43 * 60 * 3), "must clear 3x the measured solo rewrite");
     }
 }

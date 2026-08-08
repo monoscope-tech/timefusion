@@ -870,7 +870,7 @@ const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
 const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
-const_default!(d_footer_repair_schedule: String = "0 0 * * * *");
+const_default!(d_footer_repair_schedule: String = "0 0 */3 * * *");
 const_default!(d_repair_lookback_days: u64 = 2);
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
@@ -1860,14 +1860,25 @@ pub struct MaintenanceConfig {
     /// over-budget bin is discarded and re-selected identically — so repair
     /// could never complete while burning every third packing tick.
     ///
-    /// HOURLY, i.e. a 48-minute budget. A 20-minute schedule (16-minute budget)
-    /// was tried first on prod 2026-08-08 and committed 18 repair bins in one
-    /// tick — but still could not finish the single file that walls both named
-    /// tenants (`date=2026-07-30`, 969 MB, 19.7M rows, 96 columns: decode,
-    /// global sort with spill, rewrite). An over-budget bin is DISCARDED and
-    /// re-selected, so a unit that does not fit never completes at any cadence.
-    /// Fewer, longer ticks strictly dominate for a backlog whose units are
-    /// whole large files.
+    /// EVERY 3 HOURS, i.e. a 144-minute budget — sized from a measurement, not
+    /// a guess. On prod 2026-08-08 a contention-free rewrite of the partition
+    /// that walls both named tenants (`date=2026-07-30`, 969 MB, 19.7M rows,
+    /// 96 columns) took **43 minutes** of streaming output; the same work under
+    /// five concurrent repair bins was ~13x slower and produced one part in 48
+    /// minutes. At `concurrency = k/2` expect roughly 2-3x the solo time, so
+    /// ~90-130 minutes, and the budget needs margin over that.
+    ///
+    /// A 20-minute schedule (16-minute budget) and then an hourly one (48) were
+    /// both tried on prod the same morning: each committed real work (18 and 46
+    /// repair bins respectively) and each still discarded the big file at the
+    /// deadline. An over-budget bin is DISCARDED and re-selected, so a unit that
+    /// does not fit never completes AT ANY CADENCE.
+    ///
+    /// Longer ticks cost nothing in throughput: a wave serves every pending
+    /// project (concurrency bounds parallelism, not the count), so bins per tick
+    /// are bounded by wall clock, and slot-minutes per day are identical at any
+    /// period. Fewer, longer ticks therefore strictly dominate — same drain
+    /// rate, plus the large units can actually finish.
     #[serde(default = "d_footer_repair_schedule")]
     pub timefusion_footer_repair_schedule: String,
     /// Dirty-bin dedup of sealed (< today) partitions. Runs on its OWN cron,
