@@ -10778,7 +10778,17 @@ where
                 }
                 Ok(BinOutcome::Retry) => pending.push(project_id),
                 Ok(BinOutcome::Converged) => {}
-                Err(_) => failed += 1,
+                // The error was discarded here, so the only trace a failing bin
+                // left was the aggregate "failed for N hot bin(s)" — which names
+                // no project, no round and no cause. Prod 2026-08-08:
+                // `otel_metrics` burned its whole 240s budget every single tick
+                // with `planned=2 completed=0` and there was nothing in the logs
+                // to say why. A dropped bin is the one outcome that always wants
+                // a reason.
+                Err(error) => {
+                    warn!(project_id, round, %error, event = "light_optimize_bin_failed");
+                    failed += 1;
+                },
             }
         }
         if !staged.is_empty() {
