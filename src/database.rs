@@ -10486,7 +10486,10 @@ enum ResumeVerdict {
     /// staged output would resurrect removed rows or drop new ones.
     Stale,
     /// Output rows != input rows — a truncated staging. Never commit this.
-    RowMismatch { target_rows: i64, staged_rows: i64 },
+    RowMismatch {
+        target_rows: i64,
+        staged_rows: i64,
+    },
     Commit,
 }
 
@@ -10527,12 +10530,7 @@ fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: 
 /// warm/evict diff. Deduped, order-stable.
 fn date_markers_for(paths: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    paths
-        .iter()
-        .filter_map(|p| p.split('/').find(|s| s.starts_with("date=")))
-        .filter(|d| seen.insert(d.to_string()))
-        .map(|d| format!("{d}/"))
-        .collect()
+    paths.iter().filter_map(|p| p.split('/').find(|s| s.starts_with("date="))).filter(|d| seen.insert(d.to_string())).map(|d| format!("{d}/")).collect()
 }
 
 /// One bin rewritten to staged parquet but NOT yet committed. Uncommitted Adds
@@ -14815,7 +14813,11 @@ mod tests {
 
     #[test]
     fn date_markers_are_deduped_per_partition() {
-        let paths = ["project_id=a/date=2026-08-07/x.parquet".to_string(), "project_id=b/date=2026-08-07/y.parquet".to_string(), "date=2026-08-06/z.parquet".to_string()];
+        let paths = [
+            "project_id=a/date=2026-08-07/x.parquet".to_string(),
+            "project_id=b/date=2026-08-07/y.parquet".to_string(),
+            "date=2026-08-06/z.parquet".to_string(),
+        ];
         assert_eq!(super::date_markers_for(&paths), vec!["date=2026-08-07/", "date=2026-08-06/"]);
     }
 
