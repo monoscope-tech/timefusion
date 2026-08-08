@@ -10610,11 +10610,7 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     // Smallest-first inside a date so one un-finishable file cannot head-of-line
     // block the rest of that date behind it.
     if pass == TailPass::Repair {
-        return fresh
-            .iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
-            .map(|(path, _, _, _)| vec![path.to_string()])
-            .unwrap_or_default();
+        return fresh.iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2))).map(|(path, _, _, _)| vec![path.to_string()]).unwrap_or_default();
     }
     // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
     // per tick. Small commit converges quickly and shrinks the conflict window;
