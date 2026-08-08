@@ -8275,6 +8275,31 @@ impl Database {
         if cursor > 0 && cursor < planned.len() {
             planned.rotate_left(cursor);
         }
+        // Clear false suspects in BULK, before the round-robin, not one bin per
+        // round. Admission offers every un-verified sealed file because the sort
+        // TAG cannot be trusted (0870559), so on a 75-day lookback the genuinely
+        // unsorted files are a handful among thousands of correctly-sorted ones.
+        // Draining that one-per-round measured ~1.2 clears/min on prod
+        // 2026-08-08 with ZERO rewrites — the pass looked busy for half an hour
+        // and never reached real work. A footer read is one ranged GET against
+        // the cache the scan warms, so doing them concurrently up front costs
+        // seconds and leaves the rounds to spend their budget on rewrites.
+        if pass == TailPass::Repair && !planned.is_empty() {
+            use futures::StreamExt;
+            let before = planned.len();
+            let checked: Vec<_> = futures::stream::iter(planned.into_iter())
+                .map(|(project_id, files)| async move {
+                    let sorted = self.repair_bin_already_sorted(table_ref, &files).await;
+                    (project_id, files, sorted)
+                })
+                .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
+                .collect()
+                .await;
+            planned = checked.into_iter().filter(|(_, _, sorted)| !sorted).map(|(p, f, _)| (p, f)).collect();
+            if before != planned.len() {
+                info!(table_name, cleared = before - planned.len(), remaining = planned.len(), event = "footer_repair_suspects_bulk_cleared");
+            }
+        }
         if planned.is_empty() {
             return Ok(());
         }
@@ -10424,6 +10449,11 @@ fn host_mem_available_bytes() -> Option<u64> {
 
 /// Tag the fork stamps on sorted-run outputs (delta-rs optimize.rs). Kept in
 /// sync by the exact rev pin; a fork rename would need a deliberate bump.
+/// Concurrent footer verifications while clearing false repair suspects. These
+/// are metadata-cache-backed ranged reads, not rewrites, so this is bounded by
+/// object-store round trips rather than memory.
+const REPAIR_VERIFY_CONCURRENCY: usize = 16;
+
 const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
 
 fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
