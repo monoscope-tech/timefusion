@@ -10788,7 +10788,7 @@ where
                 Err(error) => {
                     warn!(project_id, round, %error, event = "light_optimize_bin_failed");
                     failed += 1;
-                },
+                }
             }
         }
         if !staged.is_empty() {
