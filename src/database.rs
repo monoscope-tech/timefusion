@@ -8599,6 +8599,14 @@ impl Database {
         // Bytes read into this rewrite — free here (the Adds are already mapped)
         // and the divisor that turns staging duration into observed R2 throughput.
         let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
+        // Emitted BEFORE the rewrite, because the interesting bins are the ones
+        // that never reach `wave_bin_staged`. A timed-out bin used to report
+        // only "exceeded the Ns left in the tick budget" — no size, no file
+        // count, no permit wait — so diagnosing it meant guessing at which of
+        // bytes, file count or contention was the binding constraint (prod
+        // 2026-08-08: two wrong hypotheses before this line existed). With it,
+        // a failure is a subtraction against the matching start line.
+        info!(table_name, project_id, selected_files = targets.len(), bytes_in, permit_wait_ms, event = "wave_bin_staging_started");
         let stage_store = staging_table.log_store().object_store(None);
         let mut adds: Vec<Action> = Vec::new();
         let staged: Result<()> = async {
@@ -10971,6 +10979,19 @@ fn budget_bytes(budget: std::time::Duration) -> i64 {
     (budget.as_secs().min(i64::MAX as u64) as i64).saturating_mul(INPUT_BYTES_PER_SEC)
 }
 
+/// A packing bin may consume at most this fraction of the tick, leaving the
+/// rest as margin. Sizing a bin to fill the WHOLE budget looks efficient and is
+/// the same bug in slower clothing: it leaves nothing for the commit, and any
+/// dip below the assumed rate turns the tick's entire output into zero.
+///
+/// Prod 2026-08-08 measured a **6x spread in rewrite rate between tables** on
+/// identically sized bins — `otel_logs_and_spans` did 107 MB in 37.7s
+/// (2.8 MB/s) while `otel_metrics` did 107 MB in 198s and 106 MB in 225s
+/// (0.47-0.54 MB/s). A single global rate estimate therefore cannot be tight;
+/// it can only be safe. Half the budget puts the slowest observed table at
+/// ~117s of a 240s tick and still lets a fast one run several rounds.
+const PACK_BUDGET_FRACTION: u32 = 2;
+
 /// Largest bin a PACKING pass will assemble, derived from the time it has.
 ///
 /// The mirror of [`repair_reach_bytes`] and the same constant: repair WIDENS its
@@ -10981,15 +11002,16 @@ fn budget_bytes(budget: std::time::Duration) -> i64 {
 /// budget.
 ///
 /// Prod 2026-08-08: `otel_metrics` logged `planned=9 completed=0 bins=0` on
-/// every tick for hours, five bins each timing out at exactly the 240s deadline,
-/// because the 256 MB target needs ~250s+ at the rate above. The 240s budget
-/// admits ~110 MB, so the bins now finish and the table compacts at all.
+/// every tick for hours because the 256 MB target needs ~583s at the rate
+/// above. Capping at the budget took it to `completed=6`; capping at
+/// [`PACK_BUDGET_FRACTION`] of the budget is what removes the remaining
+/// stragglers, which were landing at 198s and 225s against a 240s deadline.
 ///
 /// `sorted_run_cap` and `converged` are both derived from the value this
 /// returns, so the whole policy shrinks together and a freshly packed run still
 /// lands above the cap — otherwise smaller outputs would be re-selected forever.
 pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) -> i64 {
-    configured.min(budget_bytes(budget)).max(1)
+    configured.min(budget_bytes(budget / PACK_BUDGET_FRACTION)).max(1)
 }
 
 /// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
@@ -17334,12 +17356,15 @@ mod footer_repair_schedule_tests {
         const MB: i64 = 1024 * 1024;
         let tick = std::time::Duration::from_secs(240);
         let target = super::pack_target_bytes(256 * MB, tick);
-        // Measured throughput was 0.65-3.1 MB/s under 5-way concurrency, so the
-        // 256 MB target needed ~250s+ against a 240s deadline — it missed by a
-        // hair, every time. Whatever we pick must clear the deadline at the
-        // conservative floor the constant encodes.
-        let secs_to_rewrite = target / super::INPUT_BYTES_PER_SEC;
-        assert!(secs_to_rewrite <= 240, "a bin must be finishable inside its own tick, got {secs_to_rewrite}s for {target} bytes");
+        // The SLOWEST rate measured across tables, not the average: prod
+        // 2026-08-08 saw a 6x spread on identically sized bins —
+        // otel_logs_and_spans 107MB/37.7s (2.8 MB/s) vs otel_metrics
+        // 106MB/225s (0.47 MB/s). Sizing for the average is what left the
+        // metrics bins at 198s and 225s of a 240s tick, one dip from producing
+        // nothing, so the bin must fit at the slow end with margin to spare.
+        const SLOWEST_BYTES_PER_SEC: i64 = 470_000;
+        let secs_at_slowest = target / SLOWEST_BYTES_PER_SEC;
+        assert!(secs_at_slowest * 2 <= 240, "a bin must fit the tick at the SLOWEST measured rate with margin, got {secs_at_slowest}s of a 240s tick");
         assert!(target < 256 * MB, "the 256 MB target is exactly what could not finish");
         // A freshly packed run must land ABOVE the sorted-run cap the same
         // target derives (`target / 2`), or every output is re-selected next
@@ -17347,6 +17372,12 @@ mod footer_repair_schedule_tests {
         assert!(target > target / 2, "a full bin must exceed the sorted-run cap it derives");
         // Never widens: a generous budget leaves the operator's target alone.
         assert_eq!(super::pack_target_bytes(64 * MB, std::time::Duration::from_secs(3600)), 64 * MB, "a budget with room keeps the configured target");
+        // Bigger budget, bigger unit — the sizing must track the budget, not be
+        // a second hardcoded constant.
+        assert!(
+            super::pack_target_bytes(256 * MB, std::time::Duration::from_secs(480)) > super::pack_target_bytes(256 * MB, tick),
+            "doubling the tick must admit a larger bin"
+        );
         assert!(super::pack_target_bytes(256 * MB, std::time::Duration::from_secs(0)) >= 1, "a zero budget must not produce a zero-size cap");
     }
 
