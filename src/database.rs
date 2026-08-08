@@ -16649,3 +16649,17 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod footer_repair_schedule_tests {
+    /// The repair budget is derived from the schedule string, so a 5-vs-6-field
+    /// cron mix-up would silently hand repair the wrong budget — the exact
+    /// failure the split exists to remove.
+    #[test]
+    fn default_footer_repair_schedule_is_hourly() {
+        let period = super::cron_period(&crate::config::AppConfig::default().maintenance.timefusion_footer_repair_schedule);
+        assert_eq!(period, std::time::Duration::from_secs(3600), "hourly period");
+        // 80% of the period, i.e. 48 minutes — enough for a whole-file rewrite.
+        assert_eq!(period.mul_f64(0.8), std::time::Duration::from_secs(2880), "48-minute budget");
+    }
+}
