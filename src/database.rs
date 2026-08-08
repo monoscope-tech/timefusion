@@ -4541,6 +4541,12 @@ impl Database {
         // starved the FairSpillPool into the unsorted fallback (prod
         // 2026-08-03). A single-partition sort is slower but has no merge exec
         // and spills within its fair share, so the footer stays honest.
+        // Shared by BOTH callers of `sort_flush_group`: the flush path
+        // (`UnsortedFallback::Allow`) and the dedup rewrite path
+        // (`UnsortedFallback::Forbid`). They run on one 1 GB pool, so the
+        // batch size below governs a 6.25 GB rewrite group as much as a flush
+        // group — prod 2026-08-08 failed both within the same second.
+        //
         // SMALL batches, for the same reason `repair_session_state` uses them
         // (6ef5ccf): `ExternalSorterMerge` allocates per spill-run per batch, so
         // its ask scales with `batch_size`. Prod 2026-08-08, AFTER the one-permit
