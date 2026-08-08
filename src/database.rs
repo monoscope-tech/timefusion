@@ -8234,14 +8234,30 @@ impl Database {
         };
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
+        // Needed at PLANNING time, not just for the deadline: a repair pass's
+        // admission reach is derived from how long it may actually run.
+        let budget = self.tail_pass_tick_budget(pass);
         let policy = HotBinPolicy {
             repair_dates: &repair_dates,
             target_size,
             min_files: self.config.maintenance.timefusion_compact_min_files,
             sorted_run_cap: target_size / 2,
-            // Repair reach is its own knob (see `timefusion_repair_max_file_bytes`);
-            // larger legacy files belong to `optimize --recompress`.
-            repair_max_bytes: self.config.maintenance.timefusion_repair_max_file_bytes as i64,
+            // On a REPAIR pass the reach is what the budget can actually finish,
+            // not the hot-tick knob. `timefusion_repair_max_file_bytes` was sized
+            // to stop a FIVE-MINUTE tick dragging in a multi-GB file; repair now
+            // owns a 144-minute pass, so applying that number there refuses work
+            // it has ample room for — permanently, since a file the pass will not
+            // admit is never a candidate at any budget or cadence.
+            //
+            // Prod 2026-08-08, the cost of getting this wrong: shipbubble's
+            // `date=2026-07-30` is pinned by a **1,088,634,971-byte** file, 14 MB
+            // over the 1 GiB prod setting. Its 30-day queries could not be fixed
+            // by ANY amount of budget, concurrency or cadence tuning, because
+            // `hot_bin_admits` never even considered the file.
+            repair_max_bytes: match pass {
+                TailPass::Pack => self.config.maintenance.timefusion_repair_max_file_bytes as i64,
+                TailPass::Repair => repair_reach_bytes(self.config.maintenance.timefusion_repair_max_file_bytes as i64, budget),
+            },
             pass,
             verified_sorted: &self.repair_verified_sorted,
         };
@@ -8295,7 +8311,7 @@ impl Database {
         // Bound total rounds so a large backlog can't wedge the tick even if the
         // wall-clock budget is raised.
         const MAX_WAVES: usize = 12;
-        let deadline = std::time::Instant::now() + self.tail_pass_tick_budget(pass);
+        let deadline = std::time::Instant::now() + budget;
         let order_index: HashMap<String, usize> = project_ids.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect();
         let failed = round_robin_bins(
             project_ids,
@@ -10527,6 +10543,18 @@ fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], siz
     // tick — and `repair_bin_already_sorted` populates it precisely so a
     // tag-less-but-sorted file stops being offered.
     repairable && size <= policy.repair_max_bytes && !policy.verified_sorted.contains(path) && repair_markers.iter().any(|m| path.contains(m.as_str()))
+}
+
+/// Largest file a REPAIR pass will admit, derived from the time it actually has.
+///
+/// Measured on prod 2026-08-08: an uncontended rewrite of a 1.19 GB partition
+/// streamed its output in **43 minutes**, i.e. ~460 KB of input per second. A
+/// pass may therefore admit roughly `budget * 460 KB/s` and still finish, and
+/// that — not the five-minute-tick knob — is the honest ceiling. Never smaller
+/// than the configured value, so raising the knob still widens the reach.
+pub(crate) fn repair_reach_bytes(configured: i64, budget: std::time::Duration) -> i64 {
+    const INPUT_BYTES_PER_SEC: i64 = 460_000;
+    configured.max(budget.as_secs().min(i64::MAX as u64) as i64 * INPUT_BYTES_PER_SEC)
 }
 
 /// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
@@ -16697,6 +16725,23 @@ mod tests {
 
 #[cfg(test)]
 mod footer_repair_schedule_tests {
+    /// A repair pass must admit what its BUDGET can finish, not what a
+    /// five-minute tick could. Prod 2026-08-08: shipbubble's `date=2026-07-30`
+    /// was pinned by a 1,088,634,971-byte file — 14 MB over the 1 GiB prod
+    /// setting — so it was never a candidate, and no budget, concurrency or
+    /// cadence change could ever have repaired that tenant.
+    #[test]
+    fn repair_reach_follows_the_budget_and_admits_the_file_that_pinned_shipbubble() {
+        const GIB: i64 = 1073741824;
+        let budget = std::time::Duration::from_secs(8640); // the 144-minute default
+        let reach = super::repair_reach_bytes(GIB, budget);
+        assert!(reach > 1_088_634_971, "the file that pinned shipbubble must be admitted, got {reach}");
+        // Never narrower than what the operator asked for.
+        assert_eq!(super::repair_reach_bytes(8 * GIB, budget), 8 * GIB, "a larger configured cap still wins");
+        // A short budget must not pretend it can finish a huge file.
+        assert!(super::repair_reach_bytes(0, std::time::Duration::from_secs(240)) < GIB / 4, "240s reaches only a small file");
+    }
+
     /// The repair budget is derived from the schedule string, so a 5-vs-6-field
     /// cron mix-up would silently hand repair the wrong budget — the exact
     /// failure the split exists to remove.
