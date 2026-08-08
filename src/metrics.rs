@@ -551,6 +551,21 @@ atomic_stats! {
     /// re-staged later, so this is deferred work, not lost work. Chronic nonzero
     /// = flush is saturating the commit path and compaction is being crowded out.
     wave_commits_yielded_to_flush,
+    /// Boot-time resume of a staged-but-uncommitted footer-repair bin: the
+    /// rewrite survived the restart that killed its process, so the next pass
+    /// doesn't redo the (40+ minute) work. See `resume_staged_intents`.
+    repair_resumed,
+    /// Resume declined: an input file was rewritten underneath the staged
+    /// output, so committing it would resurrect removed rows.
+    repair_resume_declined_stale,
+    /// Resume declined: a staged output object is missing or the wrong size —
+    /// the process died mid-PUT.
+    repair_resume_declined_incomplete,
+    /// Resume declined because output rows != input rows. A repair is
+    /// row-preserving by construction, so this must be ZERO forever; nonzero
+    /// means a truncated staging that would have DROPPED rows, or a broken
+    /// assumption. PAGE if > 0.
+    repair_resume_row_mismatch,
     /// Cron ticks skipped because the previous run of the same job was still
     /// in flight. A steadily growing value = a wedged/overlong job body.
     cron_ticks_skipped,

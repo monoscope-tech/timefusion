@@ -74,6 +74,7 @@ pub struct E2eEnvBuilder {
     light_optimize_target_size: Option<i64>,
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
+    repair_resume: bool,
 }
 
 impl Default for E2eEnvBuilder {
@@ -106,6 +107,7 @@ impl Default for E2eEnvBuilder {
             // exercise the coalescer defer/drain path in tests.
             dml_coalesce_secs: 0,
             page_row_count_limit: None,
+            repair_resume: false,
         }
     }
 }
@@ -133,6 +135,13 @@ impl E2eEnvBuilder {
     /// nothing and the assertion reads as a product bug.
     pub fn with_hot_tier(mut self, hours: u64) -> Self {
         self.hot_tier_retention_hours = hours;
+        self
+    }
+    /// Commit staged-but-uncommitted repair parquet at boot instead of deleting
+    /// it. Off in prod for the first deploy, so a test that asserts on resume
+    /// MUST turn it on or the resume path is a silent no-op.
+    pub fn with_repair_resume(mut self) -> Self {
+        self.repair_resume = true;
         self
     }
     /// Shrink the in-process sort budget (in-memory Arrow bytes) so a test can
@@ -274,6 +283,7 @@ impl E2eEnvBuilder {
             wide_scan_max_files: self.wide_scan_max_files,
             wide_scan_max_mb: self.wide_scan_max_mb,
             page_row_count_limit: self.page_row_count_limit,
+            repair_resume: self.repair_resume,
             test_id: &test_id,
         });
 
@@ -501,6 +511,7 @@ struct BuildCfgArgs<'a> {
     light_optimize_target_size: Option<i64>,
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
+    repair_resume: bool,
     test_id: &'a str,
 }
 
@@ -529,6 +540,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_optimize_sort_by = args.optimize_sort_by;
     cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
+    cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
     cfg.buffer.timefusion_hot_tier_retention_hours = args.hot_tier_retention_hours;

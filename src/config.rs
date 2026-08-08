@@ -1996,6 +1996,14 @@ pub struct MaintenanceConfig {
     /// from an incremental-replay bug. 0 disables reconciliation.
     #[serde(default = "d_snapshot_reconcile")]
     pub timefusion_snapshot_reconcile_commits: u64,
+    /// Commit staged-but-uncommitted footer-repair parquet found at boot,
+    /// instead of deleting it and re-doing the 40+ minute rewrite. OFF for the
+    /// first deploy so the widened manifest ships and gets exercised before
+    /// anything commits from it; turning it off again reverts to plain
+    /// reconcile-and-delete. Only data-preserving (compaction/repair) bins are
+    /// eligible — dedup bins drop rows and stay cleanup-only.
+    #[serde(default)]
+    pub timefusion_repair_resume_enabled: bool,
     /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
     #[serde(default = "d_dedup_lookback_days")]
     pub timefusion_dedup_lookback_days: u64,

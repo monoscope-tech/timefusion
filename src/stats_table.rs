@@ -333,6 +333,11 @@ impl StatsTableProvider {
             "dedup_passes_flush_yields_total" => m.dedup_passes_flush_yields,
             "dedup_bin_stage_timeouts_total" => m.dedup_bin_stage_timeouts,
             "wave_commits_yielded_to_flush_total" => m.wave_commits_yielded_to_flush,
+            "repair_resumed_total" => m.repair_resumed,
+            "repair_resume_declined_stale_total" => m.repair_resume_declined_stale,
+            "repair_resume_declined_incomplete_total" => m.repair_resume_declined_incomplete,
+            // MUST stay 0 — nonzero = a staged repair whose rows didn't add up.
+            "repair_resume_row_mismatch_total" => m.repair_resume_row_mismatch,
             // Runs exceeding the long-running warning threshold. Slow progress
             // is allowed; sustained nonzero with no completion = wedged.
             "cron_long_running_total" => m.cron_long_running,

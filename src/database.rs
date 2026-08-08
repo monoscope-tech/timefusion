@@ -2701,6 +2701,8 @@ impl Database {
                     if cleanup_db.maintenance_shutdown.is_cancelled() {
                         return;
                     }
+                    // Resume FIRST: reconcile then deletes only what resume declined.
+                    cleanup_db.resume_staged_intents(&table, &table_name).await;
                     cleanup_db.reconcile_staged_intents(&table, &table_name).await;
                 }
             });
@@ -7357,6 +7359,11 @@ impl Database {
                 project_id: project_id.to_string(),
                 recorded_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                 paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
+                // Cleanup-only: a dedup rewrite DROPS rows, so the resume path's
+                // row-preservation check can't tell a valid staging from a
+                // truncated one. See `resume_staged_intents`.
+                target_paths: Vec::new(),
+                adds: Vec::new(),
             });
             debug!(table_name, project_id, chunk = label, files = targets.len(), before, after, event = "dedup_chunk_staged");
             return Ok(BinOutcome::Staged(StagedBin {
@@ -8457,6 +8464,17 @@ impl Database {
         Ok(())
     }
 
+    /// TEST SEAM: stage one bin and ABANDON it — staged parquet on the object
+    /// store plus an intent line in the manifest, and no commit. That is exactly
+    /// the state a process killed mid-repair leaves behind, and it has no other
+    /// producer: production always hands a staged bin straight to `commit_wave`.
+    /// Returns false when the bin staged nothing (converged / raced).
+    #[doc(hidden)]
+    pub async fn stage_hot_bin_and_abandon(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, files: Vec<String>) -> Result<bool> {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        Ok(matches!(self.stage_hot_bin(table_ref, table_name, schema, project_id, files).await?, BinOutcome::Staged(_)))
+    }
+
     /// Stage ONE bin's rewrite: read exactly the selected files, sort by the
     /// schema keys, write staged parquet, and return the Remove+Add actions for
     /// the wave commit. No Delta commit and no table lock — pure object-store +
@@ -8619,6 +8637,11 @@ impl Database {
             project_id: project_id.to_string(),
             recorded_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
+            // Recorded so a restart RESUMES this bin instead of re-staging it:
+            // the inputs make staleness decidable, the Adds rebuild the bin
+            // without re-reading footers. See `resume_staged_intents`.
+            target_paths: files.clone(),
+            adds: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.clone()) } else { None }).collect(),
         });
         // Data-preserving compaction: BOTH sides carry data_change=false so the
         // fork's snapshot-isolation downgrade applies and concurrent ingest
@@ -8985,6 +9008,141 @@ impl Database {
         if let Err(e) = write {
             warn!("staged-intent manifest compaction failed ({:?}): {}", path, e);
         }
+    }
+
+    /// Boot-time RESUME: commit staged parquet a killed process had already
+    /// written, instead of throwing it away. A footer-repair bin is one 700MB-1GiB
+    /// whole-file rewrite that takes 40+ minutes, so a deploy — or the
+    /// healthcheck replacing the swarm task — used to discard the entire rewrite
+    /// and make the next pass start it over (prod 2026-08-08 lost two passes in
+    /// one morning). With this, loss is bounded to the bytes not yet written.
+    ///
+    /// Runs immediately BEFORE [`Self::reconcile_staged_intents`], which then
+    /// deletes only what resume declined. Every decline is safe by construction:
+    /// the staged parquet is invisible to readers until the atomic commit, so a
+    /// declined entry costs a re-stage, never correctness.
+    ///
+    /// Returns the number of entries it committed.
+    pub async fn resume_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> usize {
+        use deltalake::kernel::Action;
+        use object_store::{ObjectStoreExt, path::Path as OsPath};
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.config.maintenance.timefusion_repair_resume_enabled {
+            return 0;
+        }
+        let path = self.staged_intent_path();
+        let contents = {
+            let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Ok(contents) = std::fs::read_to_string(&path) else { return 0 };
+            contents
+        };
+        let entries = parse_staged_intents(&contents);
+        // Only the paths this manifest mentions — the snapshot has ~26k files and
+        // resume must not parse every one of their stats blobs.
+        let interest: std::collections::HashSet<&str> = entries
+            .iter()
+            .filter(|e| e.table_name == table_name)
+            .flat_map(|e| e.target_paths.iter().chain(e.adds.iter().map(|a| &a.path)))
+            .map(String::as_str)
+            .collect();
+        if interest.is_empty() {
+            return 0;
+        }
+        let (live, target_adds, store) = {
+            let table = table_ref.read().await;
+            let Ok(snapshot) = table.snapshot() else {
+                warn!("staged-intent resume skipped for '{table_name}': no snapshot loaded");
+                return 0;
+            };
+            let mut live: std::collections::HashMap<String, Option<i64>> = std::collections::HashMap::new();
+            let mut target_adds: std::collections::HashMap<String, deltalake::kernel::Add> = std::collections::HashMap::new();
+            for file in snapshot.log_data().iter() {
+                let file_path = file.path().into_owned();
+                if !interest.contains(file_path.as_str()) {
+                    continue;
+                }
+                // A deletion vector makes the file's LOGICAL row count smaller
+                // than its `numRecords`, and the rewrite read logical rows — so
+                // comparing against `numRecords` would flag every DV'd input as
+                // a mismatch and decline the very bins this exists to save.
+                let dropped = file.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality);
+                live.insert(file_path.clone(), file.num_records().and_then(|n| i64::try_from(n).ok()).map(|n| n - dropped));
+                #[allow(deprecated)]
+                target_adds.insert(file_path, file.add_action());
+            }
+            (live, target_adds, table.log_store().object_store(None))
+        };
+        let live_view: std::collections::HashMap<&str, Option<i64>> = live.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let stats = crate::metrics::maintenance_stats();
+        let mut resumed = 0usize;
+        for entry in &entries {
+            match classify_resume(entry, table_name, now_secs, &live_view) {
+                ResumeVerdict::Skip => continue,
+                ResumeVerdict::AlreadyLanded => {
+                    info!(table_name, wave_id = %entry.wave_id, event = "staged_intent_already_landed");
+                    self.clear_staged_intent(&[entry.wave_id.as_str()]);
+                }
+                ResumeVerdict::Stale => {
+                    stats.repair_resume_declined_stale.fetch_add(1, Relaxed);
+                    info!(table_name, wave_id = %entry.wave_id, event = "staged_intent_resume_stale");
+                }
+                ResumeVerdict::RowMismatch { target_rows, staged_rows } => {
+                    stats.repair_resume_row_mismatch.fetch_add(1, Relaxed);
+                    error!(
+                        table_name,
+                        wave_id = %entry.wave_id,
+                        target_rows,
+                        staged_rows,
+                        targets = ?entry.target_paths,
+                        staged = ?entry.adds.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(),
+                        event = "staged_intent_resume_row_mismatch",
+                        "REFUSING to resume a repair whose staged rows don't match its inputs — this would have dropped rows"
+                    );
+                }
+                ResumeVerdict::Commit => {
+                    // The one network check: a process killed mid-PUT leaves a
+                    // short (or absent) object under a name the manifest already
+                    // knows, and its stats would still add up.
+                    let mut complete = true;
+                    for add in &entry.adds {
+                        let meta = store.head(&OsPath::from(add.path.as_str())).await;
+                        if meta.map_or(true, |m| i64::try_from(m.size).unwrap_or(-1) != add.size) {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if !complete {
+                        stats.repair_resume_declined_incomplete.fetch_add(1, Relaxed);
+                        info!(table_name, wave_id = %entry.wave_id, event = "staged_intent_resume_incomplete");
+                        continue;
+                    }
+                    let targets: Vec<deltalake::kernel::Add> = entry.target_paths.iter().filter_map(|p| target_adds.get(p).cloned()).collect();
+                    let (removes, adds) = staged_actions(&targets, entry.adds.iter().cloned().map(Action::Add).collect(), false);
+                    let bin = StagedBin {
+                        project_id: entry.project_id.clone(),
+                        wave_id: entry.wave_id.clone(),
+                        target_paths: entry.target_paths.clone(),
+                        removes,
+                        adds,
+                        stage_store: Arc::clone(&store),
+                        dedup: None,
+                    };
+                    // `commit_wave` re-verifies liveness under the commit lock,
+                    // honours flush priority and runs the OCC ladder — a second
+                    // commit path here would be a second place to get that wrong.
+                    let markers = date_markers_for(&entry.target_paths);
+                    if self.commit_wave(table_ref, table_name, &markers, false, vec![bin], 0).await.landed.is_empty() {
+                        warn!(table_name, wave_id = %entry.wave_id, event = "staged_intent_resume_commit_failed");
+                    } else {
+                        stats.repair_resumed.fetch_add(1, Relaxed);
+                        resumed += 1;
+                        info!(table_name, wave_id = %entry.wave_id, files = entry.target_paths.len(), event = "staged_intent_resumed");
+                    }
+                }
+            }
+        }
+        resumed
     }
 
     /// Boot-time orphan sweep: delete staged parquet the Delta log doesn't
@@ -10267,6 +10425,17 @@ struct StagedIntent {
     #[serde(default)]
     recorded_at: u64,
     paths: Vec<String>,
+    /// Input files this staged output replaces. Empty on pre-resume entries and
+    /// on dedup entries, which are then cleanup-only. Without it an entry says
+    /// only "these objects exist", never "and they may replace those" — which
+    /// is enough to delete an orphan and not enough to commit one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_paths: Vec<String>,
+    /// The staged Add actions verbatim, so a resume rebuilds the bin without
+    /// re-reading a single footer. Tens of KB per entry (per-column stats over
+    /// ~96 columns) against a handful of live entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    adds: Vec<deltalake::kernel::Add>,
 }
 
 /// Parse the append-only manifest, SKIPPING any line that doesn't decode. The
@@ -10298,6 +10467,71 @@ fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs:
         .flat_map(|e| e.paths.iter())
         .filter(|p| !referenced.contains(p.as_str()))
         .cloned()
+        .collect()
+}
+
+/// What boot-time resume should do with one staged-intent entry. Decided
+/// WITHOUT IO so every branch is unit-testable; the caller does the one check
+/// that needs the network (are the staged objects actually there, at the
+/// recorded size) only for entries that reach [`ResumeVerdict::Commit`].
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeVerdict {
+    /// Another table's entry, a cleanup-only (pre-resume or dedup) entry, or one
+    /// still inside the rolling-deploy age window.
+    Skip,
+    /// Our own Adds are already live: the commit landed before the crash. Clear
+    /// the intent, never re-commit.
+    AlreadyLanded,
+    /// An input left the snapshot, so someone rewrote it underneath us and the
+    /// staged output would resurrect removed rows or drop new ones.
+    Stale,
+    /// Output rows != input rows — a truncated staging. Never commit this.
+    RowMismatch { target_rows: i64, staged_rows: i64 },
+    Commit,
+}
+
+/// `live` maps every path in the current snapshot to its `numRecords`
+/// (`None` = the Add carries no stats, which makes row preservation
+/// unverifiable and is therefore never committable).
+fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: &std::collections::HashMap<&str, Option<i64>>) -> ResumeVerdict {
+    // Same age gate, same reason, as `staged_orphan_deletions`: on an
+    // overlapping rolling deploy a still-running instance may be mid-staging,
+    // and committing its half-written output is exactly the hazard.
+    if entry.table_name != table_name
+        || entry.target_paths.is_empty()
+        || entry.adds.is_empty()
+        || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS
+    {
+        return ResumeVerdict::Skip;
+    }
+    // Staged parquet is uuid-named by the writer, so nobody else can produce
+    // those paths — live ⇒ our commit landed (same argument as `bin_adds_live`).
+    if entry.adds.iter().all(|a| live.contains_key(a.path.as_str())) {
+        return ResumeVerdict::AlreadyLanded;
+    }
+    if !entry.target_paths.iter().all(|p| live.contains_key(p.as_str())) {
+        return ResumeVerdict::Stale;
+    }
+    let rows = |sum: Option<i64>| sum.unwrap_or(-1);
+    let target_rows: Option<i64> = entry.target_paths.iter().filter_map(|p| live.get(p.as_str())).copied().sum();
+    let staged_rows: Option<i64> = entry.adds.iter().map(|a| a.get_stats().ok().flatten().map(|s| s.num_records)).sum();
+    match (target_rows, staged_rows) {
+        // A repair is data-preserving by construction, so this equality is the
+        // ONLY thing standing between a killed-mid-staging bin and silent row loss.
+        (Some(t), Some(s)) if t == s => ResumeVerdict::Commit,
+        (t, s) => ResumeVerdict::RowMismatch { target_rows: rows(t), staged_rows: rows(s) },
+    }
+}
+
+/// The `date=…/` prefixes a set of files spans, for scoping a wave's cache
+/// warm/evict diff. Deduped, order-stable.
+fn date_markers_for(paths: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .iter()
+        .filter_map(|p| p.split('/').find(|s| s.starts_with("date=")))
+        .filter(|d| seen.insert(d.to_string()))
+        .map(|d| format!("{d}/"))
         .collect()
 }
 
@@ -14480,6 +14714,8 @@ mod tests {
         let entries = super::parse_staged_intents(contents);
         assert_eq!(entries.len(), 1, "only the intact line survives: {entries:?}");
         assert_eq!(entries[0].paths, vec!["p1", "p2"]);
+        // Pre-resume lines carry neither resume field and stay cleanup-only.
+        assert!(entries[0].target_paths.is_empty() && entries[0].adds.is_empty());
         assert!(super::parse_staged_intents("").is_empty());
         assert!(super::parse_staged_intents("garbage").is_empty());
     }
@@ -14495,6 +14731,8 @@ mod tests {
             project_id: "p".into(),
             recorded_at: 100_000 - age_secs,
             paths: paths.iter().map(|s| s.to_string()).collect(),
+            target_paths: Vec::new(),
+            adds: Vec::new(),
         };
         let old = super::STAGED_INTENT_MIN_AGE_SECS + 1;
         let entries = vec![
@@ -14512,6 +14750,73 @@ mod tests {
         // Nothing to delete when every staged file landed.
         let all_live: std::collections::HashSet<String> = ["committed", "orphan1", "orphan2"].iter().map(|s| s.to_string()).collect();
         assert!(super::staged_orphan_deletions(&entries, "logs", 100_000, &all_live).is_empty());
+    }
+
+    fn resume_add(path: &str, rows: i64) -> deltalake::kernel::Add {
+        deltalake::kernel::Add { path: path.into(), size: 10, stats: Some(format!(r#"{{"numRecords":{rows}}}"#)), ..Default::default() }
+    }
+
+    fn resume_intent(targets: &[&str], adds: Vec<deltalake::kernel::Add>) -> super::StagedIntent {
+        super::StagedIntent {
+            wave_id: "w1".into(),
+            table_name: "logs".into(),
+            project_id: "p".into(),
+            recorded_at: 100_000 - (super::STAGED_INTENT_MIN_AGE_SECS + 1),
+            paths: adds.iter().map(|a| a.path.clone()).collect(),
+            target_paths: targets.iter().map(|s| s.to_string()).collect(),
+            adds,
+        }
+    }
+
+    fn resume_live<'a>(files: &[(&'a str, Option<i64>)]) -> std::collections::HashMap<&'a str, Option<i64>> {
+        files.iter().copied().collect()
+    }
+
+    /// A staged repair only commits when EVERY input is still live and the rows
+    /// add up. Everything else declines and leaves the work for reconcile —
+    /// declining costs a re-stage, committing wrongly costs rows.
+    #[test]
+    fn resume_commits_only_a_row_preserving_rewrite_of_still_live_inputs() {
+        use super::ResumeVerdict::*;
+        let live = resume_live(&[("in1", Some(30)), ("in2", Some(70))]);
+        let ok = resume_intent(&["in1", "in2"], vec![resume_add("out1", 100)]);
+        assert_eq!(super::classify_resume(&ok, "logs", 100_000, &live), Commit);
+        // Another table's entry is not this reconcile's to judge.
+        assert_eq!(super::classify_resume(&ok, "metrics", 100_000, &live), Skip);
+        // Young: a still-running instance on a shared volume may be mid-staging.
+        let young = super::StagedIntent { recorded_at: 100_000 - 10, ..ok.clone() };
+        assert_eq!(super::classify_resume(&young, "logs", 100_000, &live), Skip);
+        // Pre-resume (and dedup) entries carry neither field: cleanup-only.
+        let legacy = super::StagedIntent { target_paths: Vec::new(), adds: Vec::new(), ..ok.clone() };
+        assert_eq!(super::classify_resume(&legacy, "logs", 100_000, &live), Skip);
+        // An input was rewritten underneath us — the output is garbage.
+        assert_eq!(super::classify_resume(&ok, "logs", 100_000, &resume_live(&[("in1", Some(30))])), Stale);
+        // Truncated staging: the case that would silently drop 30 rows.
+        let short = resume_intent(&["in1", "in2"], vec![resume_add("out1", 70)]);
+        assert_eq!(super::classify_resume(&short, "logs", 100_000, &live), RowMismatch { target_rows: 100, staged_rows: 70 });
+        // Unverifiable is not the same as verified: no stats ⇒ never commit.
+        let no_stats = resume_intent(&["in1", "in2"], vec![deltalake::kernel::Add { path: "out1".into(), size: 10, ..Default::default() }]);
+        assert_eq!(super::classify_resume(&no_stats, "logs", 100_000, &live), RowMismatch { target_rows: 100, staged_rows: -1 });
+        assert_eq!(
+            super::classify_resume(&ok, "logs", 100_000, &resume_live(&[("in1", None), ("in2", Some(70))])),
+            RowMismatch { target_rows: -1, staged_rows: 100 }
+        );
+    }
+
+    /// Staged parquet is uuid-named, so its presence in the snapshot can only
+    /// mean OUR commit landed before the crash — clear the intent, never
+    /// re-commit (re-committing would remove files the landed commit added).
+    #[test]
+    fn resume_clears_an_entry_whose_commit_already_landed() {
+        let entry = resume_intent(&["in1"], vec![resume_add("out1", 100)]);
+        let live = resume_live(&[("out1", Some(100))]);
+        assert_eq!(super::classify_resume(&entry, "logs", 100_000, &live), super::ResumeVerdict::AlreadyLanded);
+    }
+
+    #[test]
+    fn date_markers_are_deduped_per_partition() {
+        let paths = ["project_id=a/date=2026-08-07/x.parquet".to_string(), "project_id=b/date=2026-08-07/y.parquet".to_string(), "date=2026-08-06/z.parquet".to_string()];
+        assert_eq!(super::date_markers_for(&paths), vec!["date=2026-08-07/", "date=2026-08-06/"]);
     }
 
     /// Stats trimming (2026-07-29): the Add stats column list must be the narrow

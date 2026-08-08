@@ -7,9 +7,12 @@ and the next pass starts the same file from scratch. Prod 2026-08-08 lost two
 passes this way in one morning (an 08:02 deploy, and an unexplained same-image
 replacement at 06:45), each discarding ~2 GB of already-written parquet.
 
-**Goal:** after a restart, a repair pass commits work that was already staged
-instead of redoing it. Loss becomes "the bytes not yet written", not "the whole
-rewrite".
+**Goal:** a repair pass commits work that was already staged instead of redoing
+it. Loss becomes "the bytes not yet written", not "the whole rewrite".
+
+**Shape in one sentence:** before staging a bin, look for a staged-intent whose
+input set is exactly this bin's, and if it is still valid, return it as an
+already-staged bin so the normal commit path lands it.
 
 ---
 
@@ -19,7 +22,7 @@ rewrite".
 |---|---|---|
 | `StagedIntent` | `database.rs` (`struct StagedIntent`) | `{wave_id, table_name, project_id, recorded_at, paths}`, appended to `<data_dir>/staged_intent.jsonl` before a bin's commit. Survives restarts. |
 | `record_staged_intent` / `clear_staged_intent` | `database.rs` | append / rewrite-without. Serialized by `staged_intent_manifest_lock`. |
-| `reconcile_staged_intents` | `database.rs` | at boot: deletes staged parquet whose entry is old and whose files are unreferenced by the snapshot. **Deletion only — this is the hook to extend.** |
+| `reconcile_staged_intents` | `database.rs` | at boot: deletes staged parquet whose entry is old and whose files are unreferenced by the snapshot. **Deletion only — leave it alone; resume runs earlier, at bin selection, and reconcile then cleans up whatever resume declined.** |
 | `parse_staged_intents` | `database.rs` | lenient JSONL parse; a torn tail degrades to fewer entries, never a boot failure. Keep that property. |
 | `StagedBin` | `database.rs` (`struct StagedBin`) | `{project_id, wave_id, target_paths, removes, adds, stage_store, dedup}`. `target_paths` is the INPUT file list; `adds`/`removes` are ready Delta actions. |
 | `split_live_bins` | `database.rs` | partitions bins on "every `target_paths` entry still live in the snapshot". Exactly the staleness guard a resume needs. |
@@ -80,18 +83,44 @@ tens of KB per entry. Fine for a JSONL file with a handful of live entries; if i
 ever isn't, drop `stats` from the manifest and re-read it from the staged file's
 footer on resume.
 
-### 2. Resume before reconcile, at boot
+### 2. Resume at bin selection, not at boot
 
-Add `resume_staged_intents(&self, table_ref, table_name) -> usize` and call it
-from the same place as `reconcile_staged_intents`, **immediately before it** —
-reconcile then deletes only what resume declined.
+Hook it where the pass is **about to stage a bin**, in the per-project closure in
+`optimize_table_light` — the same place the footer probe
+(`repair_bin_already_sorted`) already short-circuits work:
 
-For each entry belonging to `table_name`, with `target_paths` and `adds` non-empty:
+```rust
+if pass == TailPass::Repair
+    && let Some(bin) = self.resumable_staged_bin(table_ref, table_name, &project_id, &files).await
+{
+    return (project_id, Ok(BinOutcome::Staged(bin)));   // commit it, don't re-stage
+}
+```
+
+This is deliberately NOT a boot-time sweep. Keying on "an intent whose
+`target_paths` set equals the bin we were about to stage" means:
+
+- the boot case falls out for free — the first pass after a restart selects the
+  same file (selection is deterministic given the snapshot) and finds its own
+  abandoned output;
+- it also works *within* a session, e.g. a bin whose commit failed on OCC after
+  a successful stage;
+- the lookup is direct. A boot sweep has to walk the manifest and reverse-map
+  each entry back onto a snapshot, which is the same checks in a more awkward
+  direction, and it duplicates the selection logic that decides what is worth
+  repairing at all.
+
+`resumable_staged_bin` returns `Some` only if ALL of the following hold. For each
+manifest entry matching `(table_name, project_id)` whose `target_paths` set
+equals `files`, with `adds` non-empty:
 
 1. **Age gate.** Skip entries younger than the existing max-wave-age threshold.
    Same reason `reconcile` has one: on an overlapping rolling deploy a
-   still-running instance may be mid-staging, and resuming its entry would
-   commit a half-written output. Reuse the constant, do not invent a second one.
+   still-running instance may be mid-staging, and adopting its entry would commit
+   a half-written output. Reuse the constant, do not invent a second one. Note
+   this is the one cost of the bin-selection hook over a boot sweep — the first
+   pass after a fast restart may be inside the window and decline; it resumes on
+   the next tick. Prefer that over racing a live writer.
 2. **Already landed?** If `bin_adds_live(...)`, the commit succeeded before the
    crash. Clear the intent, count it, move on. (Do not re-commit.)
 3. **Staleness.** Every `target_paths` entry must be live in the snapshot. Else
@@ -101,14 +130,16 @@ For each entry belonging to `table_name`, with `target_paths` and `adds` non-emp
 5. **Row preservation.** Sum `numRecords` from the snapshot's live Add stats for
    `target_paths`, and from the recorded `adds`. Must be equal. Else decline and
    log loudly — this is the case that would have dropped rows.
-6. **Commit.** Rebuild the bin and hand it to the existing commit path:
+6. **Return a `StagedBin`.** Rebuild it and let the normal path commit it:
    ```rust
    let (removes, adds) = staged_actions(&targets, adds, false);
-   // then the same commit_wave(...) route a live bin takes
+   StagedBin { project_id, wave_id, target_paths: files, removes, adds, stage_store, dedup: None }
    ```
-   Reuse `commit_wave` rather than writing a second commit path — it holds the
-   commit lock, honours flush priority, re-verifies liveness under the lock, and
-   handles the OCC ladder. On success `clear_staged_intent`.
+   Returning `BinOutcome::Staged` means there is **no second commit path at all**
+   — it goes through the same `commit_wave` a freshly-staged bin does, which
+   holds the commit lock, honours flush priority, re-verifies liveness under the
+   lock, handles the OCC ladder, and clears the intent on success. That reuse is
+   most of the safety argument; resist any temptation to commit inline.
 
 ### 3. Metrics and logging
 
@@ -166,9 +197,11 @@ resume, assert resume declines and reconcile deletes the staged output.
 - **Dedup bins.** They are row-dropping (`data_change = true`), so invariant 2
   does not hold and a different validity argument is needed. Leave them
   cleanup-only.
-- **Mid-pass resume.** Boot-time resume covers the restart case, which is the
-  one that hurts. Checking for a resumable intent before staging each bin is a
-  later refinement.
+- **A boot-time sweep.** Superseded: the bin-selection hook covers the restart
+  case (the first pass after a restart re-selects the same file and finds its own
+  output) and needs no second code path. Only add a sweep if a real case appears
+  where a staged output is worth committing even though no pass would select its
+  inputs — none is known.
 - **Making the rewrite itself faster or smaller.** Time-slicing a large file's
   rewrite is a separate plan; resume makes the current unit survivable, not
   cheaper.
