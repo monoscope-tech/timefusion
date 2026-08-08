@@ -4327,16 +4327,7 @@ impl Database {
         let spill_dir = self.config.core.timefusion_data_dir.join(spill_subdir);
         let _ = std::fs::create_dir_all(&spill_dir);
         reap_orphaned_spill_dirs(&spill_dir);
-        // (3) a spill CEILING that reflects the volume actually behind the
-        // directory. DataFusion defaults to 100 GB regardless, so setting the
-        // spill dir without setting this leaves the two unrelated: prod
-        // 2026-08-08 a footer-repair rewrite died with "used disk space during
-        // the spilling process has exceeded the allowable limit of 100.0 GB"
-        // on a host with 443 GB free. Derived, not configured — an operator
-        // cannot know this number better than the filesystem does, and a wrong
-        // one either wastes the volume or fails a rewrite that would have fit.
-        let max_temp = spill_ceiling_bytes(&spill_dir);
-        let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir])).with_max_temp_directory_size(max_temp);
+        let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
         Arc::new(
             RuntimeEnvBuilder::new()
                 .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
@@ -10761,30 +10752,6 @@ fn row_group_row_count(schema: &crate::schema_loader::TableSchema, target_bytes:
     (target_bytes / row_bytes).clamp(32_768, 1_048_576)
 }
 
-/// Spill ceiling for a maintenance runtime: most of the free space on the
-/// volume holding `spill_dir`, less a reserve so a runaway sort errors its own
-/// query instead of filling the disk out from under the WAL and the Delta log.
-///
-/// Derived rather than configured. DataFusion defaults this to 100 GB with no
-/// relationship to the volume actually behind the directory, so setting the
-/// spill dir (which `build_spill_runtime_env` does with care) without setting
-/// this leaves the two unrelated — prod 2026-08-08 killed a footer-repair
-/// rewrite with "used disk space during the spilling process has exceeded the
-/// allowable limit of 100.0 GB" on a host with 443 GB free. An operator cannot
-/// know this number better than the filesystem does.
-fn spill_ceiling_bytes(spill_dir: &std::path::Path) -> u64 {
-    /// What DataFusion would have used anyway: the safe answer when the
-    /// filesystem cannot be queried. Never claim more than we could verify.
-    const FALLBACK: u64 = 100 * 1024 * 1024 * 1024;
-    /// Headroom kept free whatever the volume size, so spill can never be the
-    /// thing that stops a flush from committing.
-    const RESERVE: u64 = 32 * 1024 * 1024 * 1024;
-    let Ok(avail) = fs4::available_space(spill_dir) else { return FALLBACK };
-    // On a volume too small to give the reserve, fall back to half of what is
-    // there: a sort that cannot fit in that is one we WANT to fail early.
-    avail.saturating_sub(RESERVE).max(FALLBACK.min(avail / 2))
-}
-
 fn build_writer_properties(
     parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool,
 ) -> WriterProperties {
@@ -13196,28 +13163,6 @@ mod tests {
     /// parquet's own 1,048,576-row default — measured on prod 2026-08-08 at
     /// 1,042,663 rows and up to 1.7 GB uncompressed each. The derived ROW cap
     /// is what actually bounds them, and it must land far below that default.
-    /// Setting the spill DIRECTORY without setting the spill CEILING leaves the
-    /// two unrelated: DataFusion caps at 100 GB regardless of the volume, which
-    /// killed a prod footer-repair rewrite on 2026-08-08 with 443 GB free. The
-    /// ceiling must track real free space, and must never exceed it.
-    #[test]
-    fn spill_ceiling_tracks_the_volume_not_a_constant() {
-        const DATAFUSION_DEFAULT: u64 = 100 * 1024 * 1024 * 1024;
-        let dir = tempfile::tempdir().unwrap();
-        let avail = fs4::available_space(dir.path()).expect("temp dir is on a real filesystem");
-        let ceiling = super::spill_ceiling_bytes(dir.path());
-
-        assert!(ceiling <= avail, "must never promise more than the filesystem has: {ceiling} > {avail}");
-        assert!(ceiling > 0, "a usable volume must yield a usable ceiling");
-        // On any volume with meaningful headroom the ceiling must beat the
-        // constant it replaces — otherwise this change bought nothing.
-        if avail > DATAFUSION_DEFAULT + 64 * 1024 * 1024 * 1024 {
-            assert!(ceiling > DATAFUSION_DEFAULT, "large volume must lift the 100 GB default, got {ceiling}");
-        }
-        // An unqueryable path falls back rather than guessing high.
-        assert_eq!(super::spill_ceiling_bytes(std::path::Path::new("/nonexistent-volume-xyz")), DATAFUSION_DEFAULT);
-    }
-
     #[test]
     fn row_group_row_count_binds_far_below_the_parquet_default() {
         const PARQUET_DEFAULT: usize = 1024 * 1024;
