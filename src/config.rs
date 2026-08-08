@@ -2489,4 +2489,17 @@ mod tests {
         assert_eq!(config.effective_wal_max_unflushed_bytes(), 12_000 * MIB as u64);
         assert_eq!(config.effective_wal_max_files(), 300);
     }
+
+    /// The lookback IS the suspect-set size (admission offers every unverified
+    /// sealed file), so it is bounded on BOTH sides: too small leaves a hole
+    /// where one footer-less file pins every wide query at `full-set` dedup
+    /// forever (prod 2026-08-08, 2026-07-30, two tenants, a 2-day default); too
+    /// large spends the pass clearing correctly-sorted files instead of
+    /// rewriting (prod ran 75 at ~1.24 clears/min with zero rewrites).
+    #[test]
+    fn repair_lookback_covers_the_query_window_without_flooding() {
+        let d = super::d_repair_lookback_days();
+        assert!(d >= 30, "must cover the 30-day window users actually query, got {d}");
+        assert!(d <= 45, "must not balloon the suspect set beyond the query window, got {d}");
+    }
 }
