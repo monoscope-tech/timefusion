@@ -420,6 +420,75 @@ const PARAMETERIZABLE_TIME_FNS: &[&str] = &["now", "current_timestamp", "stateme
 /// so a query using any of these stays on the bypass path.
 const UNPARAMETERIZABLE_TIME_FNS: &[&str] = &["current_date", "today", "current_time", "localtime"];
 
+/// True if `e` is exactly the bare `count(*)` idiom.
+fn is_count_star(e: &datafusion::sql::sqlparser::ast::Expr) -> bool {
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    matches!(e, SqlExpr::Function(f)
+        if fn_name_is_one_of(f, &["count"])
+            && matches!(&f.args, FunctionArguments::List(l) if matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)])))
+}
+
+/// Rewrite `count(*)` to `count(1)` — but ONLY for a statement that DataFusion
+/// rejects today, i.e. one whose `ORDER BY <ordinal>` points at a select item
+/// that wraps `count(*)` in a larger expression. `None` for everything else.
+///
+/// The narrowness is the point, and it is a correctness requirement rather than
+/// caution. `count(*)` and `count(1)` compute the same thing, but they do not
+/// NAME the same thing: the wire-visible column for `SELECT count(*)` is
+/// `count(*)`, and the shape cache lifts the injected `1` into a placeholder on
+/// top of that, so a blanket rewrite renamed the column to `count($1)` for every
+/// caller (caught by
+/// `normalizing_count_star_leaves_the_output_column_name_alone`). Restricting
+/// the rewrite to statements that currently fail to plan at all means no
+/// working query can change shape or name — a query that errors has no output
+/// contract to break.
+///
+/// A bare `SELECT count(*) ... ORDER BY 1` is deliberately excluded: DataFusion
+/// already resolves that ordinal, so it does not need — and must not get — the
+/// rewrite.
+fn normalize_count_star(stmt: &Statement) -> Option<Statement> {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind, SelectItem, SetExpr, Value, ValueWithSpan,
+        visit_expressions, visit_expressions_mut,
+    };
+
+    let Statement::Query(query) = stmt else { return None };
+    let OrderByKind::Expressions(order_exprs) = &query.order_by.as_ref()?.kind else { return None };
+    let SetExpr::Select(select) = &*query.body else { return None };
+
+    // An ordinal is 1-based and only an integer literal counts; `ORDER BY x`
+    // resolves by name and never hits this bug.
+    let points_at_wrapped_count_star = order_exprs.iter().any(|o| {
+        let SqlExpr::Value(v) = &o.expr else { return false };
+        let Value::Number(n, _) = &v.value else { return false };
+        let Some(item) = n.parse::<usize>().ok().filter(|i| *i > 0).and_then(|i| select.projection.get(i - 1)) else { return false };
+        let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = item else { return false };
+        // Bare `count(*)` already resolves; only a WRAPPED one breaks.
+        !is_count_star(e) && visit_expressions(e, |inner: &SqlExpr| if is_count_star(inner) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }).is_break()
+    });
+    if !points_at_wrapped_count_star {
+        return None;
+    }
+
+    let mut out = stmt.clone();
+    let _: ControlFlow<()> = visit_expressions_mut(&mut out, |e: &mut SqlExpr| {
+        if is_count_star(e)
+            && let SqlExpr::Function(f) = e
+            && let FunctionArguments::List(list) = &mut f.args
+            && let [FunctionArg::Unnamed(arg)] = list.args.as_mut_slice()
+        {
+            *arg = FunctionArgExpr::Expr(SqlExpr::Value(ValueWithSpan {
+                value: Value::Number("1".into(), false),
+                span: datafusion::sql::sqlparser::tokenizer::Span::empty(),
+            }));
+        }
+        ControlFlow::Continue(())
+    });
+    Some(out)
+}
+
 /// Case-insensitive match of a call's last name segment against `names`.
 fn fn_name_is_one_of(f: &datafusion::sql::sqlparser::ast::Function, names: &[&str]) -> bool {
     f.name.0.last().and_then(|n| n.as_ident()).is_some_and(|i| names.iter().any(|n| n.eq_ignore_ascii_case(&i.value)))
@@ -739,6 +808,25 @@ impl PlanCacheHook {
     /// The cached-plan lookup shared by BOTH protocol paths: cheap AST-kind
     /// gate, the time-fn guards, then the shape / verbatim caches. `None` =
     /// not cacheable, caller falls back to the normal parse→optimize pipeline.
+    /// Normalize `count(*)` before planning, then plan.
+    ///
+    /// `count(*)` and `count(1)` are exactly equivalent (`1` is never NULL), but
+    /// DataFusion plans the aggregate as `count(Int64(1))` while an `ORDER BY`
+    /// *ordinal* resolves to the expression as WRITTEN in the select list. When
+    /// that select item wraps the call — `count(*)::int8` — the two never match
+    /// and planning fails with "Column in ORDER BY must be in GROUP BY or an
+    /// aggregate function". Postgres accepts it. monoscope's service graph is
+    /// exactly this shape and it was the single largest error source on prod
+    /// (~5500/hour, 2026-08-08).
+    ///
+    /// This has to happen at the AST level, not as a text rewrite: the same
+    /// rewrite over raw SQL would also hit INSERTs, and monoscope inserts
+    /// arbitrary span bodies and log text that can contain `count(*)` as data.
+    ///
+    /// A rewritten statement must never return `None`, because the caller then
+    /// falls through to a planner that re-plans the ORIGINAL statement — which
+    /// is the broken one. So when the normal path declines a rewritten
+    /// statement, plan it here instead of handing back the un-normalized form.
     async fn cached_plan(&self, statement: &Statement, session_context: &SessionContext) -> Option<PgWireResult<LogicalPlan>> {
         // Cheap AST-variant gate first: skipping non-DML here avoids paying for
         // `Statement::to_string()` on every Parse message regardless of
@@ -746,6 +834,26 @@ impl PlanCacheHook {
         if !matches!(statement, Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_)) {
             return None;
         }
+        let Some(normalized) = normalize_count_star(statement) else {
+            return self.cached_plan_normalized(statement, session_context).await;
+        };
+        match self.cached_plan_normalized(&normalized, session_context).await {
+            Some(result) => Some(result),
+            None => {
+                let state = session_context.state();
+                Some(
+                    state
+                        .statement_to_plan(DfStatement::Statement(Box::new(normalized)))
+                        .await
+                        .map(crate::insert_coerce::rewrite_plan)
+                        .and_then(|plan| state.optimize(&plan))
+                        .map_err(api_err),
+                )
+            }
+        }
+    }
+
+    async fn cached_plan_normalized(&self, statement: &Statement, session_context: &SessionContext) -> Option<PgWireResult<LogicalPlan>> {
         // now()/current_date/... are const-folded by the optimizer using the
         // query start time — a verbatim-cached optimized plan would freeze them.
         // With time-fn shape caching on, route now()-bearing SELECTs to the shape
@@ -937,6 +1045,63 @@ mod tests {
         Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0)
     }
 
+    /// The prod-breaking shape: monoscope's service graph, ~5500 planning
+    /// failures/hour. `count(*)` must reach the planner as `count(1)` so the
+    /// `ORDER BY 6` ordinal resolves against the same expression.
+    #[test]
+    fn count_star_is_normalized_so_an_order_by_ordinal_can_resolve_it() {
+        let stmt = parse("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 2 DESC");
+        let out = normalize_count_star(&stmt).expect("rewritten").to_string();
+        assert!(out.contains("COUNT(1)"), "count(*) becomes count(1): {out}");
+        assert!(!out.contains("COUNT(*)"), "no wildcard call survives: {out}");
+    }
+
+    /// Only statements DataFusion rejects today may be rewritten — a working
+    /// query must keep its exact output column names. See `normalize_count_star`.
+    #[test]
+    fn normalize_count_star_never_touches_a_query_that_already_works() {
+        for sql in [
+            // No ORDER BY at all.
+            "SELECT COUNT(*)::int8 FROM t",
+            // Ordinal resolves to a BARE count(*), which DataFusion handles.
+            "SELECT src, COUNT(*) FROM t GROUP BY src ORDER BY 2 DESC",
+            // Ordinal points at a different select item than the wrapped count.
+            "SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 1 ASC",
+            // ORDER BY by name/alias already resolves.
+            "SELECT src, COUNT(*)::int8 AS c FROM t GROUP BY src ORDER BY c DESC",
+        ] {
+            assert!(normalize_count_star(&parse(sql)).is_none(), "must decline: {sql}");
+        }
+    }
+
+    /// A statement with nothing to rewrite must return `None` — that is what
+    /// keeps it on the ordinary cache path instead of forcing a fresh plan.
+    #[test]
+    fn normalize_count_star_declines_when_there_is_no_wildcard_count() {
+        for sql in [
+            "SELECT COUNT(id)::int8 FROM t ORDER BY 1",
+            "SELECT COUNT(DISTINCT level)::int8 FROM t ORDER BY 1",
+            "SELECT SUM(d)::int8 FROM t ORDER BY 1",
+            // A qualified wildcard is not the count(*) idiom and is left alone.
+            "SELECT COUNT(t.*)::int8 FROM t ORDER BY 1",
+        ] {
+            assert!(normalize_count_star(&parse(sql)).is_none(), "must decline: {sql}");
+        }
+    }
+
+    /// The reason this is an AST rewrite and not a text rewrite: monoscope
+    /// inserts arbitrary span bodies and log text, and a regex over raw SQL
+    /// would corrupt any row whose DATA contains `count(*)`.
+    #[test]
+    fn insert_data_containing_the_text_count_star_is_never_rewritten() {
+        let stmt = parse("INSERT INTO t (body) VALUES ('the query was count(*) over spans')");
+        assert!(normalize_count_star(&stmt).is_none(), "a string literal is data, not a call");
+        // A neighbouring string literal survives a genuine rewrite untouched.
+        let mixed = parse("SELECT a, CAST(COUNT(*) AS int8), 'count(*)' FROM s GROUP BY a ORDER BY 2 DESC");
+        let out = normalize_count_star(&mixed).expect("rewritten").to_string();
+        assert!(out.contains("COUNT(1)") && out.contains("'count(*)'"), "call rewritten, literal preserved: {out}");
+    }
+
     #[test]
     fn parameterize_extracts_strings_and_value_context_numbers_in_walk_order() {
         let stmt = parse("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100");
@@ -1104,6 +1269,27 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(MemTable::try_new(schema.clone(), vec![vec![]]).unwrap())).unwrap();
         ctx
+    }
+
+    /// The end-to-end property: the shape that failed to plan now plans, and the
+    /// shapes we decline keep their exact wire-visible column name.
+    #[tokio::test]
+    async fn the_broken_ordinal_shape_plans_and_working_shapes_keep_their_names() {
+        let ctx = test_ctx();
+        let plan = async |stmt: Statement| ctx.state().statement_to_plan(DfStatement::Statement(Box::new(stmt))).await;
+
+        // Before: this is the monoscope service-graph shape and it does not plan.
+        let broken = parse("SELECT project_id, COUNT(*)::int8 FROM t GROUP BY project_id ORDER BY 2 DESC");
+        assert!(plan(broken.clone()).await.is_err(), "the bug this fixes must still be reproducible without the rewrite");
+        // After: normalized, it plans.
+        let fixed = normalize_count_star(&broken).expect("rewritten");
+        assert!(plan(fixed).await.is_ok(), "normalized ordinal resolves");
+
+        // A query we decline is byte-identical, so its column name cannot move.
+        for sql in ["SELECT COUNT(*) FROM t", "SELECT COUNT(*)::int8 FROM t"] {
+            assert!(normalize_count_star(&parse(sql)).is_none(), "declined: {sql}");
+        }
+        assert_eq!(plan(parse("SELECT COUNT(*) FROM t")).await.expect("plans").schema().field(0).name(), "count(*)");
     }
 
     #[tokio::test]

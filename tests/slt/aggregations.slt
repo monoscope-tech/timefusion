@@ -190,3 +190,32 @@ query I
 SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
 ----
 5
+
+# ORDER BY <ordinal> pointing at a CAST-wrapped COUNT(*).
+#
+# Postgres accepts this; TimeFusion rejected it with "Column in ORDER BY must
+# be in GROUP BY or an aggregate function", because the ordinal resolves to the
+# un-normalised `count(*)` while the select list planned `count(Int64(1))`.
+# monoscope's service graph is exactly this shape and it was the single largest
+# error source on prod (~5500/hour, 2026-08-08).
+query TI
+SELECT name, COUNT(*)::int8 FROM otel_logs_and_spans
+WHERE project_id = 'agg_test'
+GROUP BY name
+ORDER BY 2 DESC, 1 ASC
+----
+service_a 2
+service_b 2
+service_c 1
+
+# The same shape without the cast already worked — pinned so a fix can't
+# regress it.
+query TI
+SELECT name, COUNT(*) FROM otel_logs_and_spans
+WHERE project_id = 'agg_test'
+GROUP BY name
+ORDER BY 2 DESC, 1 ASC
+----
+service_a 2
+service_b 2
+service_c 1
