@@ -2329,10 +2329,7 @@ impl Database {
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1);
-        // Each concurrent spilling sort needs a workable slice of the shared
-        // FairSpillPool or its merge phase starves — see `flush_sort_gate`.
-        const MIN_SPILL_SORT_BYTES: usize = 512 << 20;
-        let flush_sort_permits = (cfg.maintenance.flush_sort_pool_bytes() / MIN_SPILL_SORT_BYTES).max(1);
+        let flush_sort_permits = flush_sort_permits(cfg.maintenance.flush_sort_pool_bytes());
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         let logical_count_cache = Arc::new(crate::logical_count_index::LogicalCountCache::new(
@@ -10929,6 +10926,30 @@ fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], siz
     repairable && size <= policy.repair_max_bytes && !policy.verified_sorted.contains(path) && repair_markers.iter().any(|m| path.contains(m.as_str()))
 }
 
+/// Pool bytes one escalated flush sort needs to finish without being refused.
+///
+/// 512 MB was too small, MEASURED (prod 2026-08-08). A single sort's merge
+/// phase reached **675 MB** and was then refused 96.9 MB with "18.4 MB remain
+/// available for the total memory pool: fair(pool_size: 1024.0 MB)" — the whole
+/// 1 GB pool was gone, because the 512 MB divisor had admitted a SECOND sort
+/// alongside it. Every such refusal writes the group UNSORTED, and one unsorted
+/// file disables the reader's all-or-nothing footer ordering for its entire
+/// partition: the flush path was manufacturing exactly the footer poison the
+/// repair pass exists to clean up.
+const MIN_SPILL_SORT_BYTES: usize = 1 << 30;
+
+/// How many escalated flush sorts may run at once on a pool of `pool_bytes`.
+///
+/// At the 1 GB default this is ONE: escalated sorts serialize. That is the trade
+/// the gate was always meant to make — "queueing costs latency on an already
+/// oversized group; losing the slice costs the partition's footer ordering on
+/// every later scan" — and concurrency is bought back by raising
+/// `TIMEFUSION_FLUSH_SORT_POOL_MB`, not by pretending a sort fits in half a
+/// gigabyte.
+pub(crate) fn flush_sort_permits(pool_bytes: usize) -> usize {
+    (pool_bytes / MIN_SPILL_SORT_BYTES).max(1)
+}
+
 /// Largest file a REPAIR pass will admit, derived from the time it actually has.
 ///
 /// Measured on prod 2026-08-08: an uncontended rewrite of a 1.19 GB partition
@@ -17270,6 +17291,37 @@ mod footer_repair_schedule_tests {
         assert_eq!(super::repair_reach_bytes(8 * GIB, budget), 8 * GIB, "a larger configured cap still wins");
         // A short budget must not pretend it can finish a huge file.
         assert!(super::repair_reach_bytes(0, std::time::Duration::from_secs(240)) < GIB / 4, "240s reaches only a small file");
+    }
+
+    /// Prod 2026-08-08: an escalated flush sort's merge phase reached 675 MB and
+    /// was refused 96.9 MB more with only "18.4 MB remain available for the
+    /// total memory pool: fair(pool_size: 1024.0 MB)" — the 512 MB divisor had
+    /// admitted a second sort into a pool that cannot feed two. A refusal writes
+    /// the group UNSORTED, and one unsorted file kills the reader's
+    /// all-or-nothing footer ordering for the whole partition, so the flush path
+    /// was manufacturing the very poison the repair pass cleans up.
+    #[test]
+    fn a_flush_sort_slice_covers_the_largest_measured_sort() {
+        const MB: usize = 1 << 20;
+        // The measured peak, plus room for the allocation that was refused.
+        const MEASURED_PEAK: usize = 675 * MB + 97 * MB;
+        for pool in [1024 * MB, 2048 * MB, 4096 * MB, 64 * MB] {
+            let slice = pool / super::flush_sort_permits(pool);
+            assert!(
+                slice >= MEASURED_PEAK || pool < MEASURED_PEAK,
+                "a {}MB pool admits {} sorts, giving each {}MB — below the {}MB a real sort was measured needing",
+                pool / MB,
+                super::flush_sort_permits(pool),
+                slice / MB,
+                MEASURED_PEAK / MB
+            );
+        }
+        assert_eq!(super::flush_sort_permits(1024 * MB), 1, "two 675MB sorts do not fit in the 1GB default pool");
+        // Concurrency is bought by raising the pool, not by shrinking the slice.
+        assert!(super::flush_sort_permits(4096 * MB) > 1, "a pool with real room must still allow concurrent sorts");
+        // The 64MB config floor cannot feed even one sort, but must never yield
+        // zero permits — that would deadlock every escalation.
+        assert_eq!(super::flush_sort_permits(64 * MB), 1, "the floor must still admit one sort");
     }
 
     /// Prod 2026-08-08: `otel_metrics` logged `planned=9 completed=0 bins=0` on
