@@ -654,6 +654,16 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
 fn build_optimize_session_state(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> datafusion::execution::session_state::SessionState {
+    build_optimize_session_state_with_batch(target_partitions, runtime_env, None)
+}
+
+/// `batch_override` shrinks the sort's indivisible admission unit. Merge memory
+/// scales with fan-in x batch, so a whole-file repair — the one rewrite whose
+/// input is a single ~1 GiB file and whose sort therefore spills into a wide
+/// merge — needs a smaller batch than the packing bins it shares a pool with.
+fn build_optimize_session_state_with_batch(
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>,
+) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
     // wide — 8192-row decode batches measured up to 145MB (2026-07-27). Quartering
@@ -662,7 +672,7 @@ fn build_optimize_session_state(
     // budget profile the batch drops to 256 rows — a batch is the sort's
     // indivisible admission unit, and small-cgroup pools must be able to admit
     // one before spilling can engage.
-    let batch_size = crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size());
+    let batch_size = batch_override.unwrap_or_else(|| crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size()));
     let cfg = maintenance_session_config(SessionConfig::new(), batch_size, target_partitions);
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
@@ -1752,6 +1762,8 @@ pub struct Database {
     /// `dirty_dedup_bins_enqueue_seal_and_requeue`).
     maintenance_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
     light_optimize_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
+    /// Repair-only session: same pool, smaller batches. See `repair_session_state`.
+    repair_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
     unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
@@ -2345,6 +2357,7 @@ impl Database {
             flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
             light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
+            repair_session_state: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
@@ -4542,6 +4555,31 @@ impl Database {
     fn light_optimize_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.light_optimize_session_state
             .get_or_init(|| build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env()))
+            .clone()
+    }
+
+    /// Same pool as packing, deliberately SMALLER batches.
+    ///
+    /// A repair bin is one whole file — prod's worst is 1,088,634,971 bytes,
+    /// which decodes to tens of GB of Arrow, spills many times, and then merges
+    /// those runs. `SortPreservingMergeExec` allocates per spill-run per batch,
+    /// so its ask scales with `batch_size` while a packing bin's (a handful of
+    /// small files, shallow merge) barely moves. Sharing 2048 with packing is
+    /// what made the merge ask 64.3 MB against 25.3 MB of headroom and fail:
+    ///
+    ///   Resources exhausted: Failed to allocate additional 64.3 MB for
+    ///   SortPreservingMergeExec[0] ... fair(pool_size: 22.5 GB)
+    ///
+    /// 256 is not a new number — it is what the MaintenanceCli budget profile
+    /// already uses, for exactly this reason ("a batch is the sort's
+    /// indivisible admission unit, and small pools must be able to admit one
+    /// before spilling can engage"). Trading scan throughput for an allocation
+    /// that fits is the right trade on a rewrite that otherwise never lands.
+    fn repair_session_state(&self) -> datafusion::execution::session_state::SessionState {
+        self.repair_session_state
+            .get_or_init(|| {
+                build_optimize_session_state_with_batch(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env(), Some("256"))
+            })
             .clone()
     }
 
@@ -8342,7 +8380,7 @@ impl Database {
         let planned = self.plan_tail_pass(table_ref, table_name, &today.to_string(), &policy).await?;
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        match self.stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone()).await? {
+        match self.stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), pass).await? {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
             _ => Ok(None),
         }
@@ -8491,7 +8529,7 @@ impl Database {
                         // error path) accounts for it.
                         return (project_id, Ok(BinOutcome::Converged));
                     }
-                    let staged = match tokio::time::timeout(left, self.stage_hot_bin(table_ref, table_name, schema, &project_id, files)).await {
+                    let staged = match tokio::time::timeout(left, self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, pass)).await {
                         Ok(staged) => staged,
                         Err(_) => Err(anyhow::anyhow!("hot bin staging exceeded the {left:?} left in the tick budget")),
                     };
@@ -8564,6 +8602,7 @@ impl Database {
     /// fresh bin. `Converged` = nothing worth staging.
     async fn stage_hot_bin(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, project_id: &str, files: Vec<String>,
+        pass: TailPass,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
         // One read-lock, one table clone per bin: the pinned scan snapshot and
@@ -8622,7 +8661,10 @@ impl Database {
             // The light session state forces non-view Parquet types: Variant
             // columns are Struct{Binary, Binary} on disk and a view-typed read
             // blows the rewrite up mid-scan with "Expected Binary, got BinaryView".
-            let ctx = datafusion::prelude::SessionContext::new_with_state(self.light_optimize_session_state());
+            let ctx = datafusion::prelude::SessionContext::new_with_state(match pass {
+                TailPass::Pack => self.light_optimize_session_state(),
+                TailPass::Repair => self.repair_session_state(),
+            });
             // Unique per staging: the cached session state's clone SHARES its
             // catalog, so a fixed name collides across the k concurrent
             // stagings ("The table hot_bin already exists", prod 2026-07-30 —
@@ -11163,6 +11205,28 @@ fn staged_chunks<T>(staged: Vec<T>, per_bin: bool) -> Vec<Vec<T>> {
             true => vec![],
             false => vec![staged],
         },
+    }
+}
+
+#[cfg(test)]
+mod repair_batch_tests {
+    /// A repair bin is ONE whole file — prod's worst is 1,088,634,971 bytes —
+    /// so its sort spills many runs and `SortPreservingMergeExec` allocates per
+    /// run per batch. A packing bin (a handful of small files, shallow merge)
+    /// does not. Sharing packing's 2048 is what made the merge ask 64.3 MB
+    /// against 25.3 MB of headroom and fail the whole rewrite.
+    #[test]
+    fn repair_sorts_with_smaller_batches_than_packing() {
+        use datafusion::execution::runtime_env::RuntimeEnv;
+        let batch = |state: &datafusion::execution::session_state::SessionState| {
+            state.config().options().execution.batch_size
+        };
+        let pack = super::build_optimize_session_state(0, std::sync::Arc::new(RuntimeEnv::default()));
+        let repair = super::build_optimize_session_state_with_batch(0, std::sync::Arc::new(RuntimeEnv::default()), Some("256"));
+        assert_eq!(batch(&repair), 256, "repair shrinks the sort's indivisible admission unit");
+        assert!(batch(&repair) < batch(&pack), "packing keeps the wider batch: {} vs {}", batch(&pack), batch(&repair));
+        // The override must not disturb the shared parallelism cap.
+        assert_eq!(repair.config().options().execution.target_partitions, pack.config().options().execution.target_partitions);
     }
 }
 
