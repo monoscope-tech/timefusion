@@ -386,3 +386,89 @@ not a query-planner change.
 
 `out/*.txt` — full `EXPLAIN ANALYZE` dumps, `<project8>_<range>_<query>.txt`.
 `bench.sh` regenerates any cell; `table.py` / `bytes.py` rebuild the tables.
+
+## Implementation status of A-G (2026-08-10)
+
+| item | status | commit |
+|---|---|---|
+| A repair the day-9 partition | **done** (code fix, not an ops action) | `fix(repair): walk down sort parallelism…` |
+| B gate: I/O vs decode | **done**, reframed — see below | `perf(scan): charge the wide-scan gate for decode HEAP…` |
+| C cache admission for repeated wide scans | **done** | `perf(cache): let a REPEATED wide scan warm…` |
+| D rollups | **specified, not built** — see below | — |
+| E pushdown on swept partitions | **done** | `perf(read): push dashboard predicates into a sweep-certified window` |
+| F coalesce Golden Signals | **specified, not built** — needs a monoscope feature | — |
+| G hot-tier extension | **done** (disk-bound window) | `perf(hot-tier): let the disk cap…` |
+
+**B was reframed, deliberately.** "Fetch outside the permit" is not implementable:
+`poll_next` fuses fetch and decode, and moving decode to an ungated producer
+recreates the unbounded decode heap the gate exists to prevent. What shipped
+attacks the same waste from the measurable side — the gate charged every poll
+for a 145 MB worst-case batch while real batches measured 0.19-0.23 MB — and
+leaves the heap ceiling untouched, which was the explicit constraint.
+
+### D. Rollups — why this is specified rather than started
+
+CLAUDE.md is explicit: "Minimum code that solves the problem. Nothing
+speculative", "Delete unused code completely". A routing predicate with no
+rollup table behind it, or a build pipeline nothing reads, is exactly the dead
+scaffolding those rules forbid — so this is either built whole or not begun.
+Whole is a multi-session feature. The spec below is what it needs; §5a-5d of
+`2026-07-16-dashboard-query-performance.md` remains the design of record.
+
+Build order, each step independently useful and testable:
+
+1. **Sibling Delta table** `otel_rollup_1m`, same `[project_id, date]`
+   partitioning so `ProjectRoutingTable` gives multi-tenant isolation free.
+   Columns: `bucket`, the dimension set, `request_count`, `error_count`,
+   `duration_sum/min/max`, and a mergeable t-digest as a binary column.
+2. **Build trigger is the certification signal, not a timer.** Build a bucket
+   only from a bin dedup has certified clean and invalidate it when that bin
+   re-enters the dirty queue. `dedup_window_clean` and `dirty_bin_*` already
+   track precisely this — and E now depends on the same signal, so a bug in it
+   is already load-bearing and already tested.
+3. **Routing predicate** — the part §5a says gets missed: route only if every
+   GROUP BY key AND **every filtered column** is a dimension, every aggregate is
+   decomposable, and the range covers whole buckets. Land this WITH the table,
+   not before.
+4. **Grain cascade** by re-aggregating 1m -> 1h -> 1d; the merge is associative
+   so there is no second pipeline. Planner picks the coarsest grain <= the
+   requested bucket width.
+5. **`rollup_hit` / `rollup_miss{reason}`** from the first commit. Without the
+   miss-reason breakdown there is no feedback loop telling us which dimension to
+   add next.
+
+Dimension budget: rows per bucket is roughly the product of the dimensions'
+distinct counts, and at 1m grain that product must stay in the low thousands.
+Start with `resource___service___name`, `kind`, `status_code`.
+
+### F. Coalesce the Golden Signals — blocked on a monoscope capability
+
+Traffic, P95 and Error Rate are three separate full scans of identical rows on
+every Overview load, differing only in aggregate. Because the wide-scan gate is
+process-wide, removing two of three also shortens the queue for every other
+tenant — so this is worth more than a 3x on one dashboard.
+
+It cannot be done in `_overview.yaml` as it stands. Both existing sharing
+mechanisms are the wrong shape:
+
+* `constants` expand via `constantToSQLList` to a VALUE LIST — `('a','b')` for
+  `IN` clauses — not a reusable subquery or CTE.
+* `Widget.queries :: Maybe [Query]` combines several queries INTO one widget; it
+  does not let three widgets share one result.
+
+So F needs a monoscope feature: a widget that declares its data comes from
+another widget's already-executed result. Smallest version —
+
+1. add `source :: Maybe Text` to `Pkg.Components.Widget`, naming a sibling
+   widget's `id`;
+2. in `Pages.Dashboards`, execute source widgets first, then hand each dependent
+   widget the cached result instead of issuing its own query;
+3. in `_overview.yaml`, add one hidden `sql:` widget computing per bucket:
+   `count(*)`, `count(*) FILTER (WHERE status_code='ERROR' OR …>=500)`,
+   `percentile_agg(duration)` — the exact shape §4 of the 2026-07-16 plan
+   specifies — and point the three tiles at it via `source:`.
+
+The three tiles keep their current appearance, which is why this is a data-flow
+change and not a product decision. It is a monoscope change end to end; nothing
+in TimeFusion blocks it.
+
