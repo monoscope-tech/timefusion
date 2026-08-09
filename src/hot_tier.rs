@@ -1448,6 +1448,36 @@ mod tests {
         assert_eq!(capped.stats().files, 0);
     }
 
+    /// The safety property behind raising `d_hot_tier_retention_hours` to 72:
+    /// the DISK CAP, not the hour count, is the real window. Prod 2026-08-09
+    /// sat at 79.6 GB of a 128 GB cap because 24h bound first, leaving a
+    /// quarter of the disk unused while every window that left the tier cost
+    /// 17-31 s instead of 0.3-1.0 s. Raising retention is only safe because GC
+    /// still bounds bytes oldest-first, which is what this pins.
+    #[test]
+    fn a_long_retention_is_still_bounded_by_the_disk_cap_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 10_000_000i64;
+        // A retention window so wide nothing can age out of it.
+        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(365 * 24 * 3600)), limits(u64::MAX));
+        for (id, end) in [(1i64, now - 3000), (2, now - 2000), (3, now - 1000)] {
+            tier.demote("p1", "t", Bucket { bucket_id: id, batches: &[batch(8)], min_ts: end - 10, max_ts: end, covers_window: true });
+        }
+        tier.gc(now);
+        assert_eq!(tier.stats().files, 3, "nothing ages out under a wide window — the hour count alone would keep everything");
+
+        // Same wide window, but a cap that admits roughly one file: age keeps
+        // all three, so the cap must be what evicts, and it must take the
+        // OLDEST first.
+        let one_file_bytes = tier.stats().bytes / 3;
+        let capped = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(365 * 24 * 3600)), limits(one_file_bytes));
+        capped.gc(now);
+        let kept: Vec<i64> = capped.buckets_in_range("p1", "t", None).iter().map(|m| m.bucket_id).collect();
+        assert!(capped.stats().bytes <= one_file_bytes, "the cap binds regardless of retention: {} bytes over {one_file_bytes}", capped.stats().bytes);
+        assert!(!kept.contains(&1), "the OLDEST file must go first, so a longer window degrades to fewer hours, never to unbounded disk: kept {kept:?}");
+        assert!(kept.contains(&3), "and the newest survives — the hours nearest now are the ones dashboards ask for");
+    }
+
     /// A disabled tier is still responsible for its own directory: `open`
     /// sweeps whatever a previously-enabled run left, or the files leak
     /// forever, unbounded and invisible.

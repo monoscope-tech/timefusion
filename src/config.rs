@@ -619,7 +619,26 @@ const_default!(d_retention_mins: u64 = 70);
 // `skip_for_lookback`'s 2x-retention ceiling made anything past 12h skip the
 // tier entirely. Disk must scale with it (6h held ~24GB => 24h ~ 96GB) or
 // oldest-first GC silently shrinks the effective window back down.
-const_default!(d_hot_tier_retention_hours: u64 = 24);
+//
+// 72h since 2026-08-09, and the "disk must scale with it" caveat above is
+// exactly the point rather than an objection. Prod profiling found the 1h/3d
+// cliff to be a plan-shape flip: `HotLegPooledExec` serves every 1h query in
+// 0.3-1.0 s, and the moment a window leaves the tier the same query costs
+// 17-31 s. Meanwhile the tier sat at 79.6 GB of its 128 GB cap — a quarter of
+// the disk bought and unused, because an hour count, not the disk, was the
+// binding constraint.
+//
+// Raising it is SELF-LIMITING, which is what makes this safe: `HotTier::gc`
+// already unlinks by age "then oldest-first until under the disk cap", so the
+// cap simply binds first and the tier holds as many hours as the disk affords
+// (~40h at the measured 79.6 GB/24h) instead of stopping short of it. Heap is
+// bounded independently by `leg_budget_bytes`, and depth by
+// `skip_for_lookback`, so neither scales with this number.
+//
+// Raise `d_hot_tier_max_disk_gb` to convert disk into coverage: a full 72h
+// needs ~240 GB, which the 128 GB cap does not have today. That is a capacity
+// decision, not a code one, and until it is made the cap is the real window.
+const_default!(d_hot_tier_retention_hours: u64 = 72);
 const_default!(d_hot_tier_max_disk_gb: u64 = 128);
 // 1GB: at 512MB the leg-budget walk stopped mid-window on wide 24h scans and
 // pushed the older half to R2 — the exact latency the tier exists to remove.
