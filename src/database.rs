@@ -670,8 +670,7 @@ fn build_optimize_session_state_with_batch(
 /// `uncapped_partitions` lifts `MAINTENANCE_MAX_PARTITIONS`. Only sound for a
 /// session whose caller runs ONE rewrite at a time — see `repair_session_state`.
 fn build_optimize_session_state_tuned(
-    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>,
-    uncapped_partitions: bool,
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>, uncapped_partitions: bool,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
