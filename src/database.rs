@@ -8983,20 +8983,34 @@ impl Database {
                     let probe = format!(
                         "SELECT min(\"{col}\") AS lo, max(\"{col}\") AS hi, sum(CASE WHEN \"{col}\" IS NULL THEN 1 ELSE 0 END) AS nulls FROM {bin_table}"
                     );
-                    match (want > 1).then_some(()).and(bin_time_range(&ctx, &probe).await) {
-                        Some((lo, hi)) if hi > lo => {
+                    // The bounds come back as the column's raw i64 (micros), but
+                    // the column is `Timestamp(Microsecond, Some("UTC"))` — and
+                    // DataFusion will not coerce a bare integer to a timestamp,
+                    // so an untyped literal fails the whole bin in `type_coercion`
+                    // before it reads a row (prod 2026-08-09). `{:?}` on the
+                    // Arrow type is exactly `arrow_cast`'s type syntax. No type
+                    // in hand means no honest literal, so decline slicing rather
+                    // than emit a predicate that cannot plan.
+                    let cast_ty = ctx
+                        .table_provider(bin_table.as_str())
+                        .await
+                        .ok()
+                        .and_then(|p| p.schema().field_with_name(&col).ok().map(|f| format!("{:?}", f.data_type())));
+                    match (want > 1).then_some(()).and(cast_ty).zip(bin_time_range(&ctx, &probe).await) {
+                        Some((ty, (lo, hi))) if hi > lo => {
                             let mut bounds = repair_slice_bounds(lo, hi, want);
                             if lead.is_some_and(|c| c.descending) {
                                 bounds.reverse();
                             }
+                            let lit = |v: i64| format!("arrow_cast({v}, '{ty}')");
                             bounds
                                 .into_iter()
                                 .map(|(start, end)| match end {
                                     // Half-open on the high side; the final
                                     // ascending slice is unbounded so `hi` itself
                                     // is never dropped.
-                                    Some(e) => format!(" WHERE \"{col}\" >= {start} AND \"{col}\" < {e}"),
-                                    None => format!(" WHERE \"{col}\" >= {start}"),
+                                    Some(e) => format!(" WHERE \"{col}\" >= {} AND \"{col}\" < {}", lit(start), lit(e)),
+                                    None => format!(" WHERE \"{col}\" >= {}", lit(start)),
                                 })
                                 .collect()
                         }
@@ -16059,6 +16073,45 @@ mod tests {
     /// Slice bounds must TILE `[lo, hi]` — no gaps (a gap drops rows) and no
     /// overlaps (an overlap duplicates them, and puts two versions of one key in
     /// different files where keep-greatest can no longer see them together).
+    /// A slice bound is the column's raw i64 micros, but the column is
+    /// `Timestamp(Microsecond, Some("UTC"))`. DataFusion does NOT coerce a bare
+    /// integer to a timestamp, so the untyped predicate failed the whole bin in
+    /// `type_coercion` before reading a row — the sliced repair ran, logged
+    /// `slices=5`, and died in 2 ms (prod 2026-08-09). The literal must carry the
+    /// column's type, and `{:?}` on the Arrow type is `arrow_cast`'s syntax.
+    #[tokio::test]
+    async fn repair_slice_predicate_plans_against_a_tz_aware_timestamp() {
+        use datafusion::{datasource::MemTable, prelude::SessionContext};
+        let ty = arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new("timestamp", ty.clone(), false)]));
+        let ctx = SessionContext::new();
+        ctx.register_table("bin", Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("memtable")))
+            .expect("register");
+
+        // The type string the fix derives from the provider's schema.
+        let rendered = format!("{ty:?}");
+        assert_eq!(rendered, r#"Timestamp(Microsecond, Some("UTC"))"#, "arrow_cast parses this exact syntax");
+
+        // `ctx.sql()` only builds the unanalyzed plan — coercion runs on the way
+        // to a physical plan, which is where `execute_stream` takes it, so the
+        // check has to go that far or it proves nothing.
+        let plan = |sql: String| {
+            let ctx = ctx.clone();
+            async move { ctx.sql(&sql).await.expect("parses").create_physical_plan().await }
+        };
+
+        // The typed literal plans...
+        plan(format!("SELECT * FROM bin WHERE \"timestamp\" >= arrow_cast(1753833600000000, '{rendered}')"))
+            .await
+            .expect("typed literal must plan against a tz-aware timestamp");
+
+        // ...and the bare integer that shipped is exactly what did not.
+        let Err(err) = plan("SELECT * FROM bin WHERE \"timestamp\" >= 1753833600000000".into()).await else {
+            panic!("a bare integer bound must NOT silently coerce");
+        };
+        assert!(format!("{err}").contains("type_coercion"), "expected the prod failure mode, got: {err}");
+    }
+
     #[test]
     fn repair_slices_tile_the_range_without_gaps_or_overlaps() {
         for (lo, hi, n) in [(0i64, 100i64, 4usize), (-50, 50, 3), (1_700_000_000_000_000, 1_700_000_086_400_000, 8), (0, 1, 4), (5, 5, 4)] {
