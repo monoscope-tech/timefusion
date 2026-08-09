@@ -664,13 +664,15 @@ fn build_optimize_session_state(
 fn build_optimize_session_state_with_batch(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>,
 ) -> datafusion::execution::session_state::SessionState {
-    build_optimize_session_state_tuned(target_partitions, runtime_env, batch_override, false)
+    build_optimize_session_state_tuned(target_partitions, runtime_env, batch_override, None)
 }
 
-/// `uncapped_partitions` lifts `MAINTENANCE_MAX_PARTITIONS`. Only sound for a
-/// session whose caller runs ONE rewrite at a time — see `repair_session_state`.
+/// `repair_partitions` lifts `MAINTENANCE_MAX_PARTITIONS` and pins the sort's
+/// parallelism to the given value. Only sound for a session whose caller runs
+/// ONE rewrite at a time — see `repair_session_state`, which picks the value
+/// from [`REPAIR_SORT_PARTITION_LADDER`].
 fn build_optimize_session_state_tuned(
-    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>, uncapped_partitions: bool,
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>, repair_partitions: Option<usize>,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
@@ -681,11 +683,11 @@ fn build_optimize_session_state_tuned(
     // indivisible admission unit, and small-cgroup pools must be able to admit
     // one before spilling can engage.
     let batch_size = batch_override.unwrap_or_else(|| crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size()));
-    let mut cfg = match uncapped_partitions {
-        false => maintenance_session_config(SessionConfig::new(), batch_size, target_partitions),
-        true => maintenance_session_config(SessionConfig::new(), batch_size, usize::MAX).with_target_partitions(REPAIR_SORT_PARTITIONS),
+    let mut cfg = match repair_partitions {
+        None => maintenance_session_config(SessionConfig::new(), batch_size, target_partitions),
+        Some(n) => maintenance_session_config(SessionConfig::new(), batch_size, usize::MAX).with_target_partitions(n),
     };
-    if uncapped_partitions {
+    if repair_partitions.is_some() {
         let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", &REPAIR_SORT_RESERVATION_BYTES.to_string());
     }
     // `runtime_env` is the dedicated bounded maintenance pool (see
@@ -1838,8 +1840,9 @@ pub struct Database {
     /// `dirty_dedup_bins_enqueue_seal_and_requeue`).
     maintenance_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
     light_optimize_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
-    /// Repair-only session: same pool, smaller batches. See `repair_session_state`.
-    repair_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
+    /// Repair-only sessions: same pool, smaller batches, keyed by the sort
+    /// parallelism they pin. See `repair_session_state`.
+    repair_session_states: Arc<dashmap::DashMap<usize, datafusion::execution::session_state::SessionState>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
     unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
@@ -2002,6 +2005,10 @@ pub struct Database {
     /// pass, and starves every candidate behind it — see
     /// `REPAIR_QUARANTINE_AFTER`.
     repair_failures: Arc<dashmap::DashMap<String, u32>>,
+    /// Index into [`REPAIR_SORT_PARTITION_LADDER`] for a repair candidate that
+    /// has exhausted the pool at a higher parallelism. Cleared on success, so a
+    /// file only carries a degraded setting while it needs one.
+    repair_degradation: Arc<dashmap::DashMap<String, usize>>,
     /// Caps concurrent HEAVY maintenance rewrites — and ONLY those: dedup
     /// dirty-bin staging (`stage_dedup_chunk`), full optimize (Z-order /
     /// consolidate), nightly light-consolidate (`optimize_table_light_inner`)
@@ -2456,7 +2463,7 @@ impl Database {
             flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
             light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
-            repair_session_state: Arc::new(std::sync::OnceLock::new()),
+            repair_session_states: Arc::new(dashmap::DashMap::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
@@ -2489,6 +2496,7 @@ impl Database {
             repair_verified_sorted: Arc::new(dashmap::DashSet::new()),
             repair_verified_lock: Arc::new(std::sync::Mutex::new(())),
             repair_failures: Arc::new(dashmap::DashMap::new()),
+            repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
@@ -4771,10 +4779,15 @@ impl Database {
     /// indivisible admission unit, and small pools must be able to admit one
     /// before spilling can engage"). Trading scan throughput for an allocation
     /// that fits is the right trade on a rewrite that otherwise never lands.
-    fn repair_session_state(&self) -> datafusion::execution::session_state::SessionState {
-        self.repair_session_state
-            .get_or_init(|| {
-                build_optimize_session_state_tuned(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env(), Some("256"), true)
+    /// `partitions` comes from [`REPAIR_SORT_PARTITION_LADDER`]: a bin that
+    /// exhausted the pool is retried with fewer, because the unspillable
+    /// `SortPreservingMergeExec` is per-partition. Cached per parallelism —
+    /// there are three of them and repair runs one bin at a time.
+    fn repair_session_state(&self, partitions: usize) -> datafusion::execution::session_state::SessionState {
+        self.repair_session_states
+            .entry(partitions)
+            .or_insert_with(|| {
+                build_optimize_session_state_tuned(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env(), Some("256"), Some(partitions))
             })
             .clone()
     }
@@ -8977,9 +8990,13 @@ impl Database {
             // The light session state forces non-view Parquet types: Variant
             // columns are Struct{Binary, Binary} on disk and a view-typed read
             // blows the rewrite up mid-scan with "Expected Binary, got BinaryView".
+            // A bin that already exhausted the pool retries with fewer sort
+            // partitions — the unspillable merge exec is per-partition, so this
+            // is the one dial that changes whether the same file can fit.
+            let repair_level = files.first().and_then(|f| self.repair_degradation.get(f).map(|v| *v)).unwrap_or(0);
             let ctx = datafusion::prelude::SessionContext::new_with_state(match pass {
                 TailPass::Pack => self.light_optimize_session_state(),
-                TailPass::Repair => self.repair_session_state(),
+                TailPass::Repair => self.repair_session_state(REPAIR_SORT_PARTITION_LADDER[repair_level.min(REPAIR_SORT_PARTITION_LADDER.len() - 1)]),
             });
             // Unique per staging: the cached session state's clone SHARES its
             // catalog, so a fixed name collides across the k concurrent
@@ -9174,10 +9191,15 @@ impl Database {
             // and zero quarantines while shipbubble's file was never reached.
             // A deterministic failure has to be worth the whole threshold or the
             // mechanism cannot fire at the rate passes actually run.
-            let deterministic = e.to_string().contains("Resources exhausted");
+            let exhausted = e.to_string().contains("Resources exhausted");
             if pass == TailPass::Repair {
+                let level = files.first().and_then(|f| self.repair_degradation.get(f).map(|v| *v)).unwrap_or(0);
+                let (retry_at, step) = repair_failure_action(exhausted, level);
+                let deterministic = exhausted && retry_at.is_none();
                 for path in &files {
-                    let step = if deterministic { REPAIR_QUARANTINE_AFTER } else { 1 };
+                    if retry_at.is_some() {
+                        self.repair_degradation.insert(path.clone(), level + 1);
+                    }
                     let hits = *self.repair_failures.entry(path.clone()).and_modify(|n| *n += step).or_insert(step);
                     if hits >= REPAIR_QUARANTINE_AFTER && hits - step < REPAIR_QUARANTINE_AFTER {
                         warn!(
@@ -9189,6 +9211,9 @@ impl Database {
                             event = "footer_repair_quarantined",
                             "repair candidate failed {hits}x consecutively — parking it so other candidates can be reached; it needs the off-box `timefusion optimize --recompress` or a chunked rewrite"
                         );
+                    }
+                    if let Some(partitions) = retry_at {
+                        info!(table_name, project_id, path, partitions, event = "footer_repair_parallelism_degraded", "pool exhausted — retrying this bin at {partitions} sort partitions before believing it");
                     }
                 }
             }
@@ -9235,6 +9260,7 @@ impl Database {
         if pass == TailPass::Repair {
             for path in &files {
                 self.repair_failures.remove(path);
+                self.repair_degradation.remove(path);
             }
         }
         Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, dedup: None }))
@@ -11779,6 +11805,50 @@ pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) ->
 /// *consistently* impossible file is parked.
 const REPAIR_QUARANTINE_AFTER: u32 = 3;
 
+/// Sort parallelism a repair bin is retried at, in order, before its pool
+/// exhaustion is believed.
+///
+/// `REPAIR_SORT_PARTITIONS` (16) is the fast setting, and the quarantine rule
+/// below used to treat one `Resources exhausted` at that setting as proof the
+/// file is impossible: "the working set of a whole-file sort is a function of
+/// the file's size and the pool's, so it recurs on every attempt". That premise
+/// is incomplete. The working set is *also* a function of parallelism, and
+/// parallelism is ours to choose — there is one `ExternalSorterMerge` PER
+/// PARTITION and it cannot spill, so 16 partitions means 16 unspillable merges
+/// competing for the same pool. A single-partition sort has no merge exec at
+/// all and spills within its fair share; `sort_flush_group` already made
+/// exactly this trade (2026-08-03) for exactly this reason.
+///
+/// So an exhaustion at 16 says nothing about 1. Prod 2026-08-09 quarantined
+/// five files this way — monoscope-self `date=2026-08-01` (which alone breaks
+/// every >8-day dashboard for that tenant with `mode=full` dedup), plus
+/// 98fdd4f3 `07-08`, 6297304f `07-08`, edb04135 `07-04` and be87ebc1 `07-02` —
+/// each after ONE failure, having never been tried at a parallelism that fits.
+///
+/// Descending, and the last entry is the floor: exhaustion THERE is believed,
+/// because there is nothing cheaper left to try.
+const REPAIR_SORT_PARTITION_LADDER: [usize; 3] = [REPAIR_SORT_PARTITIONS, 4, 1];
+
+/// What a failed repair staging costs the candidate: the parallelism to retry
+/// at next (`None` = nothing cheaper left) and the strike step to charge.
+///
+/// Split out from the failure arm so the escalation rule is testable without a
+/// pool to exhaust. A pool exhaustion is only "deterministic" once it happens
+/// at the bottom of [`REPAIR_SORT_PARTITION_LADDER`]; above the bottom it buys
+/// a retry at lower parallelism and charges a single strike, so a file that
+/// keeps failing for a genuinely unrelated reason still parks after
+/// [`REPAIR_QUARANTINE_AFTER`].
+fn repair_failure_action(exhausted: bool, level: usize) -> (Option<usize>, u32) {
+    let next = level + 1;
+    match (exhausted, REPAIR_SORT_PARTITION_LADDER.get(next)) {
+        // Room left on the ladder: retry cheaper, charge one strike.
+        (true, Some(&partitions)) => (Some(partitions), 1),
+        // Bottom of the ladder, or a non-pool failure: existing semantics.
+        (true, None) => (None, REPAIR_QUARANTINE_AFTER),
+        (false, _) => (None, 1),
+    }
+}
+
 /// travel together through planning, admission and binning.
 struct HotBinPolicy<'a> {
     /// SEALED dates (yesterday backwards) scanned for footer repair only.
@@ -11941,6 +12011,39 @@ mod repair_order_tests {
     /// one on 2026-05-30 breaks only queries reaching back 70+ days. Prod
     /// 2026-08-09: a 30-minute pass served 2026-05-30, 05-31, 06-09 and 07-10
     /// and never reached the 07-30 file two tenants were blocked on.
+    /// Prod 2026-08-09 quarantined monoscope-self's `date=2026-08-01` file after
+    /// ONE `Resources exhausted` at 16 sort partitions, which alone forces
+    /// `mode=full` dedup and breaks every >8-day dashboard for that tenant. The
+    /// exhaustion was never retried at a parallelism that could fit.
+    #[test]
+    fn a_pool_exhaustion_walks_down_the_parallelism_ladder_before_it_is_believed() {
+        // Top of the ladder: buy a retry at lower parallelism, charge ONE strike
+        // (not the whole threshold) so this alone cannot park the file.
+        assert_eq!(super::repair_failure_action(true, 0), (Some(4), 1));
+        assert_eq!(super::repair_failure_action(true, 1), (Some(1), 1));
+
+        // Bottom of the ladder: nothing cheaper left, so the exhaustion IS
+        // deterministic and keeps the original whole-threshold semantics.
+        let (next, step) = super::repair_failure_action(true, 2);
+        assert_eq!(next, None, "single-partition sort is the floor");
+        assert_eq!(step, super::REPAIR_QUARANTINE_AFTER, "believed at the floor: park it");
+
+        // A non-pool failure is transient and keeps the 3-strike rule at every level.
+        for level in 0..super::REPAIR_SORT_PARTITION_LADDER.len() {
+            assert_eq!(super::repair_failure_action(false, level), (None, 1), "transient failures never escalate or park early");
+        }
+    }
+
+    /// The ladder must end at 1: a single-partition sort is the only setting
+    /// with no `SortPreservingMergeExec` at all, and that exec cannot spill.
+    #[test]
+    fn the_parallelism_ladder_descends_to_a_single_partition() {
+        let ladder = super::REPAIR_SORT_PARTITION_LADDER;
+        assert_eq!(*ladder.last().unwrap(), 1, "the floor must have no merge exec");
+        assert_eq!(ladder[0], super::REPAIR_SORT_PARTITIONS, "the ladder starts at the fast setting");
+        assert!(ladder.windows(2).all(|w| w[0] > w[1]), "strictly descending: {ladder:?}");
+    }
+
     #[test]
     fn repair_bin_date_extracts_the_partition_and_orders_recent_first() {
         let bin = |d: &str| vec![format!("project_id=abc/date={d}/part-00000-x.zstd.parquet")];
@@ -11967,7 +12070,7 @@ mod repair_batch_tests {
         use datafusion::execution::runtime_env::RuntimeEnv;
         let batch = |state: &datafusion::execution::session_state::SessionState| state.config().options().execution.batch_size;
         let pack = super::build_optimize_session_state(0, std::sync::Arc::new(RuntimeEnv::default()));
-        let repair = super::build_optimize_session_state_tuned(0, std::sync::Arc::new(RuntimeEnv::default()), Some("256"), true);
+        let repair = super::build_optimize_session_state_tuned(0, std::sync::Arc::new(RuntimeEnv::default()), Some("256"), Some(super::REPAIR_SORT_PARTITIONS));
         assert_eq!(batch(&repair), 256, "repair shrinks the sort's indivisible admission unit");
         // Repair runs ONE bin at a time, so the many-concurrent-sorters premise
         // behind `MAINTENANCE_MAX_PARTITIONS` does not apply to it. Paying the
@@ -14793,7 +14896,7 @@ mod tests {
     #[test]
     fn repair_session_reserves_merge_memory_up_front() {
         let env = Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default());
-        let repair = build_optimize_session_state_tuned(0, Arc::clone(&env), Some("256"), true);
+        let repair = build_optimize_session_state_tuned(0, Arc::clone(&env), Some("256"), Some(REPAIR_SORT_PARTITIONS));
         let exec = &repair.config().options().execution;
         assert_eq!(exec.sort_spill_reservation_bytes, REPAIR_SORT_RESERVATION_BYTES);
         assert_eq!(exec.target_partitions, REPAIR_SORT_PARTITIONS, "repair runs one bin at a time, so it is not capped at 2");
@@ -14807,7 +14910,7 @@ mod tests {
 
         // Ordinary maintenance is untouched: it runs many concurrent bins, where
         // a large per-partition reservation is what exhausts the bounded pool.
-        let plain = build_optimize_session_state_tuned(0, env, None, false);
+        let plain = build_optimize_session_state_tuned(0, env, None, None);
         assert_eq!(plain.config().options().execution.sort_spill_reservation_bytes, 33_554_432);
     }
 
