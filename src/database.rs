@@ -1974,6 +1974,8 @@ pub struct Database {
     /// admission by tag alone would rewrite a healthy 716 MB file for nothing.
     /// One footer read per file per process, then it is excluded.
     repair_verified_sorted: Arc<dashmap::DashSet<String>>,
+    /// Serializes appends to the persisted verified-sorted list.
+    repair_verified_lock: Arc<std::sync::Mutex<()>>,
     /// Consecutive staging failures per repair candidate. A file whose rewrite
     /// cannot fit the resources available fails, is re-selected identically next
     /// pass, and starves every candidate behind it — see
@@ -2448,6 +2450,7 @@ impl Database {
             dedup_dirty_bins,
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             repair_verified_sorted: Arc::new(dashmap::DashSet::new()),
+            repair_verified_lock: Arc::new(std::sync::Mutex::new(())),
             repair_failures: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
@@ -2740,6 +2743,11 @@ impl Database {
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
         let db = Arc::new(self.background_clone());
         let cancel = self.maintenance_shutdown.clone();
+
+        // Before any repair pass runs: re-adopt the footers already probed as
+        // sorted in earlier processes, so this one does not spend its pass
+        // re-clearing them. See `load_verified_sorted`.
+        db.load_verified_sorted();
 
         // Always-on pressure sampling. `scan_pressure_permits` samples lazily
         // (on gated decode polls), so a climb driven by anything OTHER than a
@@ -9356,6 +9364,66 @@ impl Database {
     /// crash-mid-PUT window uncovered (a partial object under a name nobody
     /// ever learned) — VACUUM's job, as before. The window this closes is the
     /// long one: staging → wave commit, which spans the whole wave.
+    /// Where the verified-sorted paths are remembered ACROSS restarts.
+    fn repair_verified_path(&self) -> PathBuf {
+        let wal_dir = self.config.core.wal_dir();
+        wal_dir.parent().map(|p| p.to_path_buf()).unwrap_or(wal_dir).join("repair_verified_sorted.txt")
+    }
+
+    /// Remember footers already probed as sorted, so a restart does not re-probe
+    /// them.
+    ///
+    /// Sound because a Delta object path is IMMUTABLE: a rewrite always produces
+    /// a new path, so "this object carries a `sorting_columns` footer" is a
+    /// permanent fact about it, not a cache of mutable state. A stale entry for a
+    /// tombstoned path is harmless — admission simply never sees that path again.
+    ///
+    /// This is what lets repair make progress under a restarting process. In
+    /// memory only, the set resets on every boot, so each pass re-probes
+    /// thousands of correctly-sorted files before it can reach a poisoned one:
+    /// prod 2026-08-09 logged **626 `footer_repair_suspect_cleared` in 11
+    /// minutes** while restarts came every ~20, and shipbubble's blocking file
+    /// was never reached in six hours. Best-effort throughout — a write failure
+    /// costs re-probing, never correctness.
+    fn persist_verified_sorted(&self, paths: &[String]) {
+        use std::io::Write;
+        let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file_path = self.repair_verified_path();
+        let write = (|| -> std::io::Result<()> {
+            if let Some(dir) = file_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&file_path)?;
+            for path in paths {
+                writeln!(file, "{path}")?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = write {
+            warn!("verified-sorted append failed ({:?}): {} — repair will re-probe these footers after a restart", file_path, e);
+        }
+    }
+
+    /// Load the persisted verified-sorted paths at boot, compacting the file if
+    /// it has grown past [`REPAIR_VERIFIED_PERSIST_CAP`]. Newest entries win: the
+    /// tail of the file is the most recently probed.
+    fn load_verified_sorted(&self) {
+        let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file_path = self.repair_verified_path();
+        let Ok(contents) = std::fs::read_to_string(&file_path) else { return };
+        let all: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+        let kept = &all[all.len().saturating_sub(REPAIR_VERIFIED_PERSIST_CAP)..];
+        for path in kept {
+            self.repair_verified_sorted.insert((*path).to_string());
+        }
+        if all.len() > kept.len()
+            && let Err(e) = std::fs::write(&file_path, kept.iter().map(|p| format!("{p}\n")).collect::<String>())
+        {
+            warn!("verified-sorted compaction failed ({:?}): {e}", file_path);
+        }
+        info!(loaded = kept.len(), dropped = all.len() - kept.len(), event = "footer_repair_verified_loaded");
+    }
+
     fn staged_intent_path(&self) -> PathBuf {
         let wal_dir = self.config.core.wal_dir();
         wal_dir.parent().map(|p| p.to_path_buf()).unwrap_or(wal_dir).join("staged_intent.jsonl")
@@ -9718,6 +9786,7 @@ impl Database {
         for path in files {
             self.repair_verified_sorted.insert(path.clone());
         }
+        self.persist_verified_sorted(files);
         info!(files = files.len(), event = "footer_repair_suspect_cleared");
         true
     }
@@ -11132,6 +11201,11 @@ fn host_mem_available_bytes() -> Option<u64> {
 const REPAIR_RESELECT_ROUNDS: usize = 64;
 
 const REPAIR_VERIFY_CONCURRENCY: usize = 16;
+
+/// How many verified-sorted paths survive a restart. One path is ~150 bytes, so
+/// 200k is ~30 MB on disk and bounds boot-time load. Newest wins, because the
+/// walk is newest-first and the recent tail is what the next pass will re-probe.
+const REPAIR_VERIFIED_PERSIST_CAP: usize = 200_000;
 
 const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
 
@@ -15786,6 +15860,34 @@ mod tests {
     /// re-sorts a converged file). Prod reached 55% of active files unsorted
     /// this way. Ingest keeps the fallback — its rows exist nowhere else.
     ///
+    /// A footer probed as sorted must survive a RESTART.
+    ///
+    /// The set was in-process only, so every boot re-probed thousands of
+    /// correctly-sorted files before the walk could reach a poisoned one: prod
+    /// 2026-08-09 logged 626 `footer_repair_suspect_cleared` in 11 minutes while
+    /// restarts came every ~20, and shipbubble's blocking file was never reached
+    /// in six hours. Sound to persist because a Delta object path is immutable.
+    #[tokio::test]
+    async fn a_verified_sorted_footer_survives_a_restart() -> Result<()> {
+        let cfg = create_test_config("verified-sorted-persist");
+        let db = Database::with_config(cfg.clone()).await?;
+        let paths: Vec<String> = (0..3).map(|i| format!("timefusion/t/project_id=p/date=2026-07-30/part-{i}.parquet")).collect();
+        db.persist_verified_sorted(&paths);
+
+        // A fresh Database over the SAME data dir is the restart.
+        let restarted = Database::with_config(cfg).await?;
+        assert!(restarted.repair_verified_sorted.is_empty(), "nothing is adopted until the load runs");
+        restarted.load_verified_sorted();
+        for path in &paths {
+            assert!(restarted.repair_verified_sorted.contains(path), "re-adopted after restart: {path}");
+        }
+
+        // Loading twice must not duplicate or drop anything.
+        restarted.load_verified_sorted();
+        assert_eq!(restarted.repair_verified_sorted.len(), paths.len(), "idempotent");
+        Ok(())
+    }
+
     /// Degradation is forced here by an unmergeable schema (`id` Utf8 vs Int64),
     /// which is one of the several ways `sort_batches_by_schema` gives up — so
     /// the guard is exercised on the in-process path, not just on escalation.
