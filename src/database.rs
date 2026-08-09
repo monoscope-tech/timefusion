@@ -8926,15 +8926,33 @@ impl Database {
             warn!("Light optimize staging failed for project={} table={}: {}", project_id, table_name, e);
             // Count it against the candidate so a deterministically-impossible
             // file stops being re-offered and the queue behind it drains.
+            //
+            // A pool exhaustion counts for the WHOLE threshold, because it is not
+            // a coin flip: the working set of a whole-file sort is a function of
+            // the file's size and the pool's, so it recurs on every attempt. The
+            // 3-strike rule exists for genuinely transient failures (a lost OCC
+            // race, a file rewritten underneath us, a restart mid-stage) and
+            // those keep it.
+            //
+            // Measured 2026-08-09: with one repair pass per process (the budget
+            // is per-table and a pass legitimately runs for hours, so the hourly
+            // cron stands down behind the guard), a 3-strike counter that also
+            // resets on restart NEVER reached 3 — 2 h 13 m produced one failure
+            // and zero quarantines while shipbubble's file was never reached.
+            // A deterministic failure has to be worth the whole threshold or the
+            // mechanism cannot fire at the rate passes actually run.
+            let deterministic = e.to_string().contains("Resources exhausted");
             if pass == TailPass::Repair {
                 for path in &files {
-                    let hits = *self.repair_failures.entry(path.clone()).and_modify(|n| *n += 1).or_insert(1);
-                    if hits == REPAIR_QUARANTINE_AFTER {
+                    let step = if deterministic { REPAIR_QUARANTINE_AFTER } else { 1 };
+                    let hits = *self.repair_failures.entry(path.clone()).and_modify(|n| *n += step).or_insert(step);
+                    if hits >= REPAIR_QUARANTINE_AFTER && hits - step < REPAIR_QUARANTINE_AFTER {
                         warn!(
                             table_name,
                             project_id,
                             path,
                             failures = hits,
+                            deterministic,
                             event = "footer_repair_quarantined",
                             "repair candidate failed {hits}x consecutively — parking it so other candidates can be reached; it needs the off-box `timefusion optimize --recompress` or a chunked rewrite"
                         );
@@ -14962,6 +14980,14 @@ mod tests {
         assert!(!admits(&sealed, 900, false, true), "parked once it has failed REPAIR_QUARANTINE_AFTER times");
         // Parking is per FILE, not per project or date — its neighbours stay eligible.
         assert!(admits(&p("date=2026-08-05/other-"), 900, false, true), "a different file on the same sealed date is unaffected");
+        // A DETERMINISTIC failure (pool exhaustion) is worth the whole threshold:
+        // the working set of a whole-file sort is a function of file size vs
+        // pool, so it recurs every attempt. Measured 2026-08-09: at one repair
+        // pass per process a 3-strike counter never reached 3, so the mechanism
+        // could not fire at all.
+        failures.clear();
+        failures.insert(sealed.clone(), super::REPAIR_QUARANTINE_AFTER);
+        assert!(!admits(&sealed, 900, false, true), "one deterministic failure parks it — a 3-strike rule never fires at the observed pass rate");
         failures.clear(); // the assertions below share these paths
 
         // SEALED, in the lookback window — repair only.
