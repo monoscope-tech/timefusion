@@ -56,9 +56,14 @@ point-lookup vs unbounded aggregate**, not narrow vs wide.
 - Maintenance is healthy again post-`79bb75a`: `dirty_bin_queue_depth` 1264 ->
   256 within the session, `light_optimize_projects_completed` 164/177,
   `light_optimize_failed_total` 1. RSS 21.6 GB of 120 GB, no OOM kills.
-- `dedup_timed_out_total` = 11 since the 16:41 restart. Not yet explained, and
-  the one live maintenance signal still pointing at dedup — worth a look before
-  assuming dedup is entirely healthy.
+- Dedup is healthy, and `dedup_timed_out_total` does NOT say otherwise. That
+  counter is incremented on the SUCCESS arm — `Ok(()) if t0.elapsed() >
+  DEDUP_WARN` (90s) — so it counts passes that were slow and *finished*, not
+  passes that timed out. The real timeout counter is
+  `dedup_bin_stage_timeouts_total` against a 3600s per-bin deadline, and prod
+  reads **0**, with `dedup_failed_total` **0** and 33 bins committed. The name
+  cost me a wrong conclusion within an hour of reading it; rename it
+  (`dedup_passes_over_warn_total`) or nothing will stop it doing that again.
 - Do NOT benchmark this with unbounded `count(*)` over wide windows on prod: it
   is what pushed the instance into dropped connections and a
   `exit 137: unhealthy container` on 2026-08-09. Use `EXPLAIN` for mode and
