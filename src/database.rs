@@ -2446,7 +2446,10 @@ impl Database {
         let maint_rewrite_permits = cfg.derived.rewrite_permits().max(1);
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
-        let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1);
+        // In UNITS, not polls: one reader slot is `DECODE_UNITS_PER_READER`
+        // units and a worst-case batch claims all of them, so the heap ceiling
+        // is identical to the poll-counting version. See `decode_units`.
+        let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1) * DECODE_UNITS_PER_READER as usize;
         let flush_sort_permits = flush_sort_permits(cfg.maintenance.flush_sort_pool_bytes());
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
@@ -12011,6 +12014,38 @@ mod repair_order_tests {
     /// one on 2026-05-30 breaks only queries reaching back 70+ days. Prod
     /// 2026-08-09: a 30-minute pass served 2026-05-30, 05-31, 06-09 and 07-10
     /// and never reached the 07-30 file two tenants were blocked on.
+    /// The gate bounds decode HEAP; it used to bound POLLS, which reserved the
+    /// 145 MB worst case for every batch. Measured on prod 2026-08-09 the real
+    /// dashboard batches were 0.19-0.23 MB, so ~99% of the budget went unused
+    /// while polls queued. Charging for produced heap must NOT move the ceiling.
+    #[test]
+    fn a_decode_claim_is_proportional_to_heap_and_never_exceeds_one_reader_slot() {
+        let k = super::DECODE_UNITS_PER_READER;
+        let nominal = super::NOMINAL_DECODE_BATCH_BYTES;
+
+        // THE INVARIANT: a worst-case batch still claims a whole slot, so N
+        // concurrent worst-case decodes are still capped at N readers.
+        assert_eq!(super::decode_units(nominal), k, "a full-size batch must still cost a full slot");
+        assert_eq!(super::decode_units(nominal * 4), k, "an oversized batch is clamped, never exceeding one slot");
+
+        // Unknown size (a stream's first poll) is charged conservatively — the
+        // pre-split behaviour — so nothing regresses before we have evidence.
+        assert_eq!(super::decode_units(0), k, "unknown batch size claims a whole slot");
+
+        // The actual prod-measured batch size: 1 unit of 16, i.e. 16x the
+        // concurrency at the same ceiling.
+        assert_eq!(super::decode_units(210 * 1024), 1, "a 0.21 MB prod batch costs one unit, not a whole slot");
+
+        // Monotonic, and never zero (zero would break progress guarantees).
+        let mut prev = 0;
+        for mb in [0.2_f64, 1.0, 10.0, 50.0, 100.0, 145.0] {
+            let u = super::decode_units((mb * 1024.0 * 1024.0) as u64);
+            assert!(u >= 1 && u <= k, "{mb} MB -> {u} units, out of range 1..={k}");
+            assert!(u >= prev, "claim must not decrease as batches grow: {mb} MB -> {u} after {prev}");
+            prev = u;
+        }
+    }
+
     /// Prod 2026-08-09 quarantined monoscope-self's `date=2026-08-01` file after
     /// ONE `Resources exhausted` at 16 sort partitions, which alone forces
     /// `mode=full` dedup and breaks every >8-day dashboard for that tenant. The
@@ -12969,7 +13004,7 @@ impl ProjectRoutingTable {
             self.database.heavy_scan_sem.clone(),
             Some(self.database.scan_metrics.clone()),
             bypass_cache,
-            mem.timefusion_max_concurrent_scan_readers as u32,
+            mem.timefusion_max_concurrent_scan_readers.max(1) as u32 * DECODE_UNITS_PER_READER,
         ))
     }
 
@@ -13342,6 +13377,46 @@ fn scan_pressure_permits(total: u32) -> u32 {
     pressure_permit_claim(USAGE_PCT.load(Relaxed), total)
 }
 
+/// Sub-divisions of one reader slot in the wide-scan gate.
+///
+/// The gate bounds Parquet DECODE HEAP, which is untracked by the DataFusion
+/// memory pool and is what OOM-restarted prod from a single 7-day dashboard
+/// (2026-07-20). It did that by counting POLLS: one permit per `poll_next`,
+/// `timefusion_max_concurrent_scan_readers` (16) of them. A poll is a terrible
+/// proxy for heap, because the permit is sized for the worst-case batch
+/// ([`NOMINAL_DECODE_BATCH_BYTES`], 145 MB, measured 2026-07-27) while real
+/// dashboard batches are three orders of magnitude smaller — measured on prod
+/// 2026-08-09 across the profiled scans, **0.19-0.23 MB per decoded batch**.
+/// So ~99% of the decode budget sat unused while polls queued behind it.
+///
+/// Splitting each reader slot into `K` units and charging a poll for the heap
+/// it ACTUALLY produces keeps the ceiling exactly where it was — a full-size
+/// batch still claims all `K` units, so at most
+/// `timefusion_max_concurrent_scan_readers` worst-case decodes run at once —
+/// while a 0.2 MB batch claims 1 unit instead of 16. This is why the fix is
+/// NOT to raise `timefusion_max_concurrent_scan_readers`: that would raise the
+/// heap ceiling, which is the one thing the guard exists to hold down.
+const DECODE_UNITS_PER_READER: u32 = 16;
+
+/// The worst-case decoded batch one reader slot is sized for. 8192-row decode
+/// batches of wide otel rows measured up to 145 MB (2026-07-27) — the number
+/// the poll-counting gate was implicitly built around.
+const NOMINAL_DECODE_BATCH_BYTES: u64 = 145 * 1024 * 1024;
+
+/// Units a poll must claim to cover `last_batch_bytes` of decoded Arrow.
+///
+/// `0` means "not yet known" (a stream's first poll) and claims a whole reader
+/// slot, i.e. exactly the pre-split behaviour; the claim adapts down once the
+/// stream has shown what its batches actually weigh. Never exceeds one slot, so
+/// the heap ceiling is unchanged, and never zero, so progress is guaranteed.
+fn decode_units(last_batch_bytes: u64) -> u32 {
+    let k = u64::from(DECODE_UNITS_PER_READER);
+    match last_batch_bytes {
+        0 => DECODE_UNITS_PER_READER,
+        b => (b.saturating_mul(k).div_ceil(NOMINAL_DECODE_BATCH_BYTES)).clamp(1, k) as u32,
+    }
+}
+
 /// Tier math for `scan_pressure_permits`, separated for testability.
 fn pressure_permit_claim(usage_pct: u64, total: u32) -> u32 {
     match usage_pct {
@@ -13421,7 +13496,10 @@ impl ExecutionPlan for GatedScanExec {
         // release so other partitions/queries can proceed — see type docs.
         // The permit window is also exactly the decode window, which is what
         // makes this the honest place to measure decode heap.
-        let gated = futures::stream::unfold(inner, move |mut inner| {
+        // `last_bytes` is this stream's most recent decoded batch size: the
+        // claim adapts to what this scan actually produces instead of every
+        // poll reserving the 145 MB worst case.
+        let gated = futures::stream::unfold((inner, 0u64), move |(mut inner, last_bytes)| {
             let sem = sem.clone();
             let metrics = metrics.clone();
             async move {
@@ -13429,11 +13507,13 @@ impl ExecutionPlan for GatedScanExec {
                 // shrinking effective decode concurrency (see
                 // `scan_pressure_permits`). `acquire_many` never exceeds the
                 // pool size, so progress is guaranteed.
-                let want = scan_pressure_permits(pool_size);
+                // Pressure valve wins when it is engaged (it claims a quarter
+                // or all of the pool); otherwise the heap-proportional claim does.
+                let want = scan_pressure_permits(pool_size).max(decode_units(last_bytes)).min(pool_size);
                 let _permit = sem.acquire_many_owned(want).await.ok()?;
                 if let Some(m) = &metrics {
                     m.decode_begin();
-                    if want > 1 {
+                    if want > DECODE_UNITS_PER_READER {
                         m.decode_pressure_throttled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -13444,11 +13524,12 @@ impl ExecutionPlan for GatedScanExec {
                     true => crate::object_store_cache::scan_bypass_scope(true, futures::StreamExt::next(&mut inner)).await,
                     false => futures::StreamExt::next(&mut inner).await,
                 };
+                let produced = next.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |b: &RecordBatch| b.get_array_memory_size() as u64);
                 if let Some(m) = &metrics {
                     // Size the decoded Arrow, not the compressed parquet.
-                    m.decode_end(next.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |b: &RecordBatch| b.get_array_memory_size() as u64));
+                    m.decode_end(produced);
                 }
-                next.map(|item| (item, inner))
+                next.map(|item| (item, (inner, produced)))
             }
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, gated)))
