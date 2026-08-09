@@ -1368,3 +1368,49 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     assert!(m.entries.values().all(|e| e.covered_files.iter().all(|u| live.contains(u))), "no entry may cover a dead file");
     Ok(())
 }
+
+/// The safety precondition for dropping the read-side `DedupExec` on a swept
+/// partition — the change that would reclaim the `id` projection (43% of a
+/// file's bytes) for charts and `count(*)`. See
+/// `docs/plans/2026-08-09-per-date-dedup.md`.
+///
+/// `dedup_skip_allowed` refuses outright when a table sets `version_append`,
+/// on the belief that merge-on-read leaves superseded versions a skip would
+/// serve. Inspection says otherwise — the sweep calls `dedup_batches` with the
+/// schema tiebreak (keep-greatest), and `filter_tombstones` runs OUTSIDE
+/// `match dedup_on` so deletes never depend on dedup. This asserts it by
+/// EXECUTION, because inspection cannot rule out an ordering interaction and
+/// serving a superseded row is silent corruption.
+///
+/// Deliberately reads PHYSICAL rows (Delta log stats), never a routed query:
+/// the read-side dedup would mask exactly the property under test.
+#[serial]
+#[tokio::test]
+async fn a_swept_mor_partition_holds_one_winning_row_per_key() -> Result<()> {
+    let cfg = TestConfigBuilder::new("swept_mor_one_winner").with_buffer_mode(BufferMode::Enabled).build();
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    // Yesterday noon UTC: a sealed prior-day partition the sweep will rewrite.
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    // Two versions of ONE key, in separate flushes so they land in separate
+    // files — the shape merge-on-read produces for an UPDATE.
+    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-sweep: the two versions are two physical rows, which is what a skip would wrongly serve");
+
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    // THE claim: after the sweep a certified partition holds exactly one row
+    // per key. If this ever fails, the `version_append` bail is load-bearing
+    // and the per-date dedup skip must NOT be built on top of it.
+    assert_eq!(
+        delta_physical_row_count(&table_ref).await?,
+        1,
+        "a swept merge-on-read partition must hold ONE physical row per key — otherwise skipping DedupExec would serve a superseded version"
+    );
+    Ok(())
+}

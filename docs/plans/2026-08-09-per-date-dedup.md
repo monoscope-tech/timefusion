@@ -76,12 +76,21 @@ read for every chart and every `count(*)` over sealed dates.
    version; a deleted row survives only as its winning tombstone, which the
    filter removes. **The bail is over-conservative and the lever is real.**
 
-   **Still required before shipping: an EXECUTION test, not inspection.**
-   Inspection establishes plausibility; it cannot rule out an ordering or
-   edge-case interaction. Prove it with
-   `buffer_consistency_test::test_{update,delete}::immediate` plus a new case
-   that certifies a partition, skips dedup, and asserts the UPDATED value (not
-   the superseded one) is returned and the DELETED row is absent.
+   **VERIFIED BY EXECUTION** (2026-08-09):
+   `dedup_compaction_test::a_swept_mor_partition_holds_one_winning_row_per_key`
+   writes two versions of one key into separate files on a `version_append`
+   table, runs the production sweep entry point
+   (`dedup_today_partitions`), and asserts the partition collapses to ONE
+   physical row — read from Delta log stats, never through a routed query,
+   because the read-side dedup would mask the property under test.
+
+   So the precondition is established: a swept partition holds one row per key
+   and it is the winner. The `version_append` bail can be lifted, and the test
+   is the guard that stops it silently regressing.
+
+   Still to do when building the skip: assert the surviving row is the UPDATED
+   value (not merely that one row survives), and that a MOR-deleted row is
+   absent end-to-end through the scan with the skip active.
 2. The skip is decided AFTER the projection is built and requires
    `output_projection.is_none()` — but augmenting the projection is what sets
    it. The decision must be hoisted ABOVE projection computation.
