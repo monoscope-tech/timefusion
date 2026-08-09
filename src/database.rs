@@ -16224,6 +16224,38 @@ mod tests {
         assert!(format!("{err}").contains("type_coercion"), "expected the prod failure mode, got: {err}");
     }
 
+    /// The quantile probe must actually PLAN and return monotone cuts. It falls
+    /// back to the uniform split on any error, silently — so if
+    /// `approx_percentile_cont` over a cast timestamp does not plan in this
+    /// DataFusion version, slicing quietly reverts to the behaviour that pinned
+    /// 22 GB and nothing looks wrong.
+    #[tokio::test]
+    async fn repair_slice_cuts_are_monotone_and_row_balanced_under_skew() {
+        use datafusion::{datasource::MemTable, prelude::SessionContext};
+        // 1000 rows crammed into the last 1% of the span — the shape that defeats
+        // an even TIME split.
+        let ts: Vec<i64> = (0..1000).map(|i| 990_000 + i * 10).chain(std::iter::once(0)).collect();
+        let ty = arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()));
+        let arr = arrow::array::TimestampMicrosecondArray::from(ts).with_timezone("UTC");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new("timestamp", ty, false)]));
+        let batch = arrow::array::RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).expect("batch");
+        let ctx = SessionContext::new();
+        ctx.register_table("bin", Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("memtable"))).expect("register");
+
+        let cuts = super::repair_slice_cuts(&ctx, "bin", "timestamp", 4).await;
+        assert_eq!(cuts.len(), 3, "4 slices need 3 interior cuts; empty means the probe did not plan");
+        assert!(cuts.windows(2).all(|w| w[0] < w[1]), "cuts must be strictly increasing to tile: {cuts:?}");
+
+        // The whole point: cuts follow the ROWS into the dense tail, not the span.
+        // An even TIME split would have put its first cut near 250_000.
+        assert!(cuts[0] > 500_000, "cuts must track row density, not the time span: {cuts:?}");
+
+        let bounds = super::repair_bounds_from_cuts(0, 999_990, &cuts);
+        assert_eq!(bounds.len(), 4);
+        assert_eq!(bounds[0].0, 0);
+        assert!(bounds.last().expect("non-empty").1.is_none());
+    }
+
     /// Quantile cuts must tile exactly like the uniform split — a gap drops rows
     /// and an overlap duplicates them, putting two versions of one key in
     /// different files where keep-greatest can no longer see them together.
