@@ -13037,9 +13037,19 @@ impl ProjectRoutingTable {
         if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept {
             return false;
         }
-        if crate::schema_loader::get_schema(&self.table_name).is_some_and(|s| s.version_append) {
-            return false;
-        }
+        // `version_append` (merge-on-read) is NOT a reason to refuse. It looks
+        // like one — MOR appends a new version per UPDATE, so a skip would serve
+        // the superseded row — but that is only true BEFORE the sweep. On a
+        // partition the sweep certified duplicate-free with a still-matching
+        // fingerprint there is exactly one row per key, and it is the winner:
+        //
+        //  * the sweep collapses versions keep-greatest, calling
+        //    `mem_buffer::dedup_batches(.., schema.dedup_tiebreak, None)`;
+        //  * `filter_tombstones` runs OUTSIDE `match dedup_on`, so a deleted row
+        //    is removed whether or not DedupExec ran — a skip cannot resurrect it.
+        //
+        // Asserted by execution, not inspection, in
+        // `dedup_compaction_test::a_swept_mor_partition_holds_one_winning_row_per_key`.
         let Some(window) = window else { return false };
         self.database.dedup_window_clean(table, project_id, &self.table_name, window)
     }
@@ -13692,12 +13702,35 @@ impl TableProvider for ProjectRoutingTable {
         // cols) on the common tables. `tombstone_keep` is the requested width when
         // the marker was projected in purely for the filter (it then occupies one
         // trailing column that the post-filter projection removes).
+        // Decide the dedup skip BEFORE the projection is built, not after.
+        //
+        // The skip existed already but was evaluated below, gated on
+        // `output_projection.is_none()` — and augmenting the projection with the
+        // dedup keys is exactly what makes `output_projection` `Some`. So for
+        // every query that did not already select `id` (every chart, every
+        // `count(*)`) the skip could never fire, and even when it did the scan
+        // had already been widened. That inverted the point of it: `id` is 43%
+        // of an otel file's bytes and is read purely to feed a `DedupExec` this
+        // path then removes.
+        //
+        // Deciding here lets a certified window skip BOTH the dedup and the
+        // widening. `try_fast_resolve` keeps it cheap — a miss simply declines,
+        // because the skip is an optimisation and never a correctness input.
+        let pre_skip_dedup = !dedup_keys.is_empty()
+            && self
+                .database
+                .try_fast_resolve(&project_id, &self.table_name)
+                .and_then(|t| t.try_read().ok().map(|table| self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys)))
+                .unwrap_or(false);
         let (scan_projection, output_projection, tombstone_keep): (Option<Vec<usize>>, Option<Vec<usize>>, Option<usize>) = match projection {
             Some(p) if !dedup_keys.is_empty() || tombstone.is_some() => {
                 let full_schema = self.schema();
-                let missing: Vec<usize> = dedup_keys
-                    .iter()
-                    .chain(dedup_tiebreak.iter())
+                // A granted skip removes the DedupExec, so its key columns are
+                // dead weight; the tombstone marker still rides in because
+                // `filter_tombstones` runs regardless.
+                let augment: Vec<&String> = if pre_skip_dedup { Vec::new() } else { dedup_keys.iter().chain(dedup_tiebreak.iter()).collect() };
+                let missing: Vec<usize> = augment
+                    .into_iter()
                     .chain(tombstone.iter())
                     .filter_map(|k| full_schema.index_of(k).ok())
                     .filter(|i| !p.contains(i))
@@ -13854,7 +13887,12 @@ impl TableProvider for ProjectRoutingTable {
             let table = delta_table.read().await;
             // Same guard for the dedup gate and the scan: the fingerprint
             // verdict applies to exactly the snapshot being read.
-            let skip_dedup = output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            // `pre_skip_dedup` already decided this above the projection; re-check
+            // against the RESOLVED table so the fingerprint verdict applies to the
+            // exact snapshot being read, and keep the `output_projection` guard —
+            // when the skip was granted no augmentation happened, so it is None.
+            let skip_dedup =
+                pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }
@@ -13959,7 +13997,12 @@ impl TableProvider for ProjectRoutingTable {
             let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
             let table = delta_table.read().await;
             // Same guard for the dedup gate and the scan (see branch above).
-            let skip_dedup = output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            // `pre_skip_dedup` already decided this above the projection; re-check
+            // against the RESOLVED table so the fingerprint verdict applies to the
+            // exact snapshot being read, and keep the `output_projection` guard —
+            // when the skip was granted no augmentation happened, so it is None.
+            let skip_dedup =
+                pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }

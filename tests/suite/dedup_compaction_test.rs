@@ -1414,3 +1414,53 @@ async fn a_swept_mor_partition_holds_one_winning_row_per_key() -> Result<()> {
     );
     Ok(())
 }
+
+/// End-to-end guard for the read-side dedup skip on a merge-on-read table:
+/// a certified partition must return the UPDATED value, never the superseded
+/// one. See `docs/plans/2026-08-09-per-date-dedup.md`.
+///
+/// The skip removes `DedupExec` and (now) the dedup-key projection with it —
+/// `id` alone is 43% of an otel file's bytes. Its whole safety rests on the
+/// sweep having collapsed each key to its winner, so this asserts the winner is
+/// what a query actually gets, through the routed scan rather than the log.
+///
+/// `timefusion_read_dedup_skip_swept` is off by default, so this is the only
+/// place the path runs until an operator opts in.
+#[serial]
+#[tokio::test]
+async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("dedup_skip_mor_winner").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    // Through the routed scan, which is where a wrong skip would show up.
+    let sql = format!(
+        "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+         AND timestamp >= {ts} AND timestamp <= {ts}",
+        ts = format_args!("to_timestamp_micros({ts})")
+    );
+    let batches = db.query_delta_only(&sql).await?;
+    // Cast rather than assume the physical string type (otel columns are
+    // Utf8View on this path).
+    let rows: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = datafusion::arrow::compute::kernels::cast::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8).expect("cast to Utf8");
+            let col = col.as_string::<i32>();
+            (0..b.num_rows()).map(|i| col.value(i).to_string()).collect::<Vec<_>>()
+        })
+        .collect();
+
+    assert_eq!(rows.len(), 1, "exactly one row survives the sweep, so the skip must return one: {rows:?}");
+    assert_eq!(rows[0], "updated", "the skip must return the WINNING version, never the superseded one");
+    Ok(())
+}
