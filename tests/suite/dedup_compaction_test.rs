@@ -1464,3 +1464,53 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     assert_eq!(rows[0], "updated", "the skip must return the WINNING version, never the superseded one");
     Ok(())
 }
+
+/// COUNT parity — the precondition `timefusion_read_dedup_skip_swept`'s own doc
+/// names ("off by default until COUNT parity is validated on prod-shaped
+/// data"). The skip removes `DedupExec` and its key projection, so if the
+/// certification is ever wrong a `count(*)` silently over-counts on every
+/// dashboard. This runs the SAME data both ways and demands identical answers.
+///
+/// Prod-shaped means what actually produces duplicates here: many keys, each
+/// written twice across separate flushes so the copies land in different Delta
+/// files (flush-time dedup is per-bucket and cannot see across files), plus
+/// unique keys that must not be collapsed.
+#[serial]
+#[tokio::test]
+async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
+    const DUPLICATED: usize = 250;
+    const UNIQUE: usize = 120;
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    // One dataset, two engines: skip disabled (the authority) and enabled.
+    let run = |skip: bool, tag: &'static str| async move {
+        let mut cfg = (*TestConfigBuilder::new(tag).with_buffer_mode(BufferMode::Enabled).build()).clone();
+        cfg.maintenance.timefusion_read_dedup_skip_swept = skip;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+        let batch = |lo: usize, hi: usize| -> Result<_> {
+            json_to_batch((lo..hi).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect())
+        };
+        // Two flushes covering the same keys -> cross-file duplicates.
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(0, DUPLICATED)?], true, None).await?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(0, DUPLICATED)?], true, None).await?;
+        // ...plus keys written once, which must survive intact.
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(DUPLICATED, DUPLICATED + UNIQUE)?], true, None).await?;
+
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+        let sql = format!("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}'");
+        let batches = db.query_delta_only(&sql).await?;
+        let n = batches.iter().map(|b| b.column(0).as_primitive::<Int64Type>().value(0)).sum::<i64>();
+        anyhow::Ok(n)
+    };
+
+    let authoritative = run(false, "count_parity_dedup_on").await?;
+    let skipped = run(true, "count_parity_skip_on").await?;
+
+    assert_eq!(authoritative, (DUPLICATED + UNIQUE) as i64, "the control itself must be right: every key counted exactly once");
+    assert_eq!(skipped, authoritative, "the dedup skip must not change COUNT — a mismatch here is silent over-counting on every dashboard");
+    Ok(())
+}

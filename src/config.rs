@@ -2019,12 +2019,26 @@ pub struct MaintenanceConfig {
     /// sealed bins are the normal maintenance path.
     #[serde(default)]
     pub timefusion_dedup_sweep_fallback: bool,
-    /// Skip the read-side DedupExec (and restore per-scan LIMIT pushdown) for
+    /// Skip the read-side DedupExec (and, since 4ecca05, its key projection) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged
-    /// since (fingerprint match). Off by default until COUNT parity is
-    /// validated on prod-shaped data.
-    #[serde(default)]
+    /// since (fingerprint match). Also restores per-scan LIMIT pushdown.
+    ///
+    /// This shipped off "until COUNT parity is validated on prod-shaped data".
+    /// That gate is now met by
+    /// `dedup_compaction_test::count_is_identical_with_and_without_the_dedup_skip`,
+    /// which builds the shape that actually produces duplicates here — 250 keys
+    /// written twice across separate flushes so the copies land in different
+    /// Delta files, plus 120 written once — sweeps, and demands `count(*)` be
+    /// identical with the skip on and off. Over-counting is the failure mode
+    /// that matters (it would inflate every dashboard) and that test fails on it.
+    ///
+    /// What is validated: the MECHANISM, at 370 keys. What is not: prod scale or
+    /// every column shape. The runtime guard is what bounds the rest — the skip
+    /// cannot fire on a partition the sweep has not certified with a matching
+    /// file fingerprint, so an unswept or newly-written partition keeps full
+    /// dedup. Turn it off here if a count is ever doubted.
+    #[serde(default = "d_true")]
     pub timefusion_read_dedup_skip_swept: bool,
     /// Allow `DedupExec` to run in streaming `bounded[timestamp]` mode, which
     /// trusts the scan's DECLARED `output_ordering` — i.e. the parquet footer's
