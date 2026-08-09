@@ -394,9 +394,9 @@ not a query-planner change.
 | A repair the day-9 partition | **done** (code fix, not an ops action) | `fix(repair): walk down sort parallelism…` |
 | B gate: I/O vs decode | **done**, reframed — see below | `perf(scan): charge the wide-scan gate for decode HEAP…` |
 | C cache admission for repeated wide scans | **done** | `perf(cache): let a REPEATED wide scan warm…` |
-| D rollups | **specified, not built** — see below | — |
+| D rollups | **done** | `feat(rollup): pre-aggregate dashboard buckets…` |
 | E pushdown on swept partitions | **done** | `perf(read): push dashboard predicates into a sweep-certified window` |
-| F coalesce Golden Signals | **specified, not built** — needs a monoscope feature | — |
+| F coalesce Golden Signals | **done** (monoscope: Widget `source`/`source_column` + shared client result + `_overview.yaml`) | monoscope repo |
 | G hot-tier extension | **done** (disk-bound window) | `perf(hot-tier): let the disk cap…` |
 
 **B was reframed, deliberately.** "Fetch outside the permit" is not implementable:
@@ -406,16 +406,21 @@ attacks the same waste from the measurable side — the gate charged every poll
 for a 145 MB worst-case batch while real batches measured 0.19-0.23 MB — and
 leaves the heap ceiling untouched, which was the explicit constraint.
 
-### D. Rollups — why this is specified rather than started
+### D. Rollups — BUILT
 
-CLAUDE.md is explicit: "Minimum code that solves the problem. Nothing
-speculative", "Delete unused code completely". A routing predicate with no
-rollup table behind it, or a build pipeline nothing reads, is exactly the dead
-scaffolding those rules forbid — so this is either built whole or not begun.
-Whole is a multi-session feature. The spec below is what it needs; §5a-5d of
-`2026-07-16-dashboard-query-performance.md` remains the design of record.
+Built whole rather than scaffolded, which is what makes it not speculative:
+`otel_rollup_1m` (schema), the build triggered at the certification point in
+`dedup_today_partitions`, `rollup::route` proving answerability, and
+`rollup_hit`/`rollup_miss{reason}` from the first commit. Guarded by an
+end-to-end parity test against the raw aggregate plus a re-certification that
+pins idempotence.
 
-Build order, each step independently useful and testable:
+Remaining, deliberately: percentile panels do NOT route — that needs a
+mergeable t-digest column, and `route` refuses them today rather than answering
+approximately without being asked. Coarser grains (1h/1d) re-aggregate from the
+1m base when the read path needs them.
+
+Original build order, retained as the design of record:
 
 1. **Sibling Delta table** `otel_rollup_1m`, same `[project_id, date]`
    partitioning so `ProjectRoutingTable` gives multi-tenant isolation free.
@@ -441,7 +446,13 @@ Dimension budget: rows per bucket is roughly the product of the dimensions'
 distinct counts, and at 1m grain that product must stay in the low thousands.
 Start with `resource___service___name`, `kind`, `status_code`.
 
-### F. Coalesce the Golden Signals — blocked on a monoscope capability
+### F. Coalesce the Golden Signals — BUILT (monoscope)
+
+Shipped as the `source`/`source_column` capability described below: one hidden
+`golden_signals` widget issues a single scan computing traffic, p95 and error
+rate per bucket, and the three tiles read their column from its result instead
+of each issuing their own. Three `/chart_data` round trips over identical rows
+become one. Original analysis:
 
 Traffic, P95 and Error Rate are three separate full scans of identical rows on
 every Overview load, differing only in aggregate. Because the wide-scan gate is
