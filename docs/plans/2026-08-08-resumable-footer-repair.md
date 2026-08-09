@@ -260,3 +260,74 @@ session memory notes referenced in each line.
    `count(*)`.
 6. **39 files / 55.2 GB exceed even the budget-derived repair reach** and need
    `optimize --recompress`.
+
+
+---
+
+# Addendum: slicing the rewrite unit (2026-08-09)
+
+**Why this is now the blocking item.** Measured on prod 2026-08-09:
+
+| | |
+|---|---|
+| rewrite of shipbubble's `date=2026-07-30` file (1,088,634,971 B) | **~40 min** |
+| process lifetime under the current deploy rate | **18-21 min** |
+
+A 40-minute unit cannot complete in 20-minute windows, and a stage killed
+part-way resumes nothing (resume commits a COMPLETED stage; it does not
+continue a partial one). Every scheduling lever has been tried and none of
+them close that gap: own cron, budget decoupled from cadence, bounded pool
+share, startup pass, shortest-job-first, newest-first, a 64-deep suspect walk,
+and finally serialising repair to one bin (`330afa8`). The unit itself has to
+shrink.
+
+## Design
+
+Replace the original file with **(sorted time-slice) + (unsorted remainder)**
+in one atomic commit, and let the next tick take the remainder. Converges in
+ceil(size / slice) ticks, each of which fits a short process life.
+
+In `stage_hot_bin`, when `pass == TailPass::Repair` and the bin's `bytes_in`
+exceeds a slice target, run TWO read/write segments instead of one:
+
+```sql
+-- segment A: sorted, tagged as a sorted run
+SELECT * FROM <bin> WHERE "timestamp" <  TIMESTAMP '<cut>' ORDER BY <sort cols>
+-- segment B: the remainder, written as-is, NOT tagged
+SELECT * FROM <bin> WHERE "timestamp" >= TIMESTAMP '<cut>' OR "timestamp" IS NULL
+```
+
+`cut` comes from the targets' own stats: `min + (max - min) * (slice_target /
+bytes_in)`. Skew makes slices uneven, which costs an extra tick and nothing
+else.
+
+Both segments feed the existing writer loop; only the `sorted` flag and the
+`SORTED_RUN_TAG` differ per segment. Commit is unchanged — one Remove of the
+original, N Adds.
+
+## The invariant that makes it safe
+
+The two predicates **partition** the rows: a row with a non-null timestamp
+satisfies exactly one, and a null-timestamp row satisfies only B. So
+
+    sum(output numRecords) == sum(input numRecords)
+
+must hold exactly. **Assert it before returning the bin and fail the bin if it
+does not.** That single check catches both directions — a gap (rows lost) and
+an overlap (rows duplicated) — and turns any predicate mistake into a refused
+commit rather than data loss. Staged parquet is invisible to readers until the
+commit, so a refused bin costs one tick and some orphan parquet for vacuum.
+
+## Tests
+
+- unit: predicate pair over a fixture with rows either side of the cut, exactly
+  on it, and with a NULL timestamp — assert the partition is exact
+- unit: a deliberately overlapping cut must fail the row-count guard
+- e2e: a large footer-less file converges to fully-sorted over N ticks with the
+  partition's row count unchanged at every intermediate step
+
+## Note
+
+Do this on a quiet tree. `stage_hot_bin` was edited by several concurrent
+commits on 2026-08-08/09 and is the most delicate function in the maintenance
+path.
