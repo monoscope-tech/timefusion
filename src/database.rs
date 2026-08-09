@@ -1936,6 +1936,11 @@ pub struct Database {
     /// admission by tag alone would rewrite a healthy 716 MB file for nothing.
     /// One footer read per file per process, then it is excluded.
     repair_verified_sorted: Arc<dashmap::DashSet<String>>,
+    /// Consecutive staging failures per repair candidate. A file whose rewrite
+    /// cannot fit the resources available fails, is re-selected identically next
+    /// pass, and starves every candidate behind it — see
+    /// `REPAIR_QUARANTINE_AFTER`.
+    repair_failures: Arc<dashmap::DashMap<String, u32>>,
     /// Caps concurrent HEAVY maintenance rewrites — and ONLY those: dedup
     /// dirty-bin staging (`stage_dedup_chunk`), full optimize (Z-order /
     /// consolidate), nightly light-consolidate (`optimize_table_light_inner`)
@@ -2405,6 +2410,7 @@ impl Database {
             dedup_dirty_bins,
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             repair_verified_sorted: Arc::new(dashmap::DashSet::new()),
+            repair_failures: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
@@ -8424,6 +8430,7 @@ impl Database {
             },
             pass,
             verified_sorted: &self.repair_verified_sorted,
+            failures: &self.repair_failures,
         }
     }
 
@@ -8865,6 +8872,23 @@ impl Database {
         if let Err(e) = staged {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
             warn!("Light optimize staging failed for project={} table={}: {}", project_id, table_name, e);
+            // Count it against the candidate so a deterministically-impossible
+            // file stops being re-offered and the queue behind it drains.
+            if pass == TailPass::Repair {
+                for path in &files {
+                    let hits = *self.repair_failures.entry(path.clone()).and_modify(|n| *n += 1).or_insert(1);
+                    if hits == REPAIR_QUARANTINE_AFTER {
+                        warn!(
+                            table_name,
+                            project_id,
+                            path,
+                            failures = hits,
+                            event = "footer_repair_quarantined",
+                            "repair candidate failed {hits}x consecutively — parking it so other candidates can be reached; it needs the off-box `timefusion optimize --recompress` or a chunked rewrite"
+                        );
+                    }
+                }
+            }
             return Err(e);
         }
         if adds.is_empty() {
@@ -8903,6 +8927,13 @@ impl Database {
             permit_wait_ms,
             event = "wave_bin_staged"
         );
+        // Consecutive, not cumulative: a bin that staged is not a poison pill,
+        // whatever transient failures preceded it.
+        if pass == TailPass::Repair {
+            for path in &files {
+                self.repair_failures.remove(path);
+            }
+        }
         Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, dedup: None }))
     }
 
@@ -11108,7 +11139,14 @@ fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], siz
     // `verified_sorted` makes that one ranged read per file per process, not per
     // tick — and `repair_bin_already_sorted` populates it precisely so a
     // tag-less-but-sorted file stops being offered.
-    repairable && size <= policy.repair_max_bytes && !policy.verified_sorted.contains(path) && repair_markers.iter().any(|m| path.contains(m.as_str()))
+    // A quarantined candidate is skipped so the queue behind it can drain — a
+    // file that cannot be rewritten with the resources available would otherwise
+    // be re-selected every pass forever (see `REPAIR_QUARANTINE_AFTER`).
+    repairable
+        && size <= policy.repair_max_bytes
+        && !policy.verified_sorted.contains(path)
+        && policy.failures.get(path).map_or(0, |n| *n.value()) < REPAIR_QUARANTINE_AFTER
+        && repair_markers.iter().any(|m| path.contains(m.as_str()))
 }
 
 /// Pool bytes one escalated flush sort needs to finish without being refused.
@@ -11192,6 +11230,27 @@ pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) ->
 }
 
 /// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
+/// Consecutive staging failures after which a repair candidate stops being
+/// offered for the rest of the process.
+///
+/// A repair bin is one whole-file sort, and if its working set does not fit the
+/// resources available it fails EVERY time — the failure is deterministic, not
+/// transient. Without a quarantine that file is re-selected identically on every
+/// pass and consumes the wave, so the candidates queued behind it are never
+/// reached at all.
+///
+/// Prod 2026-08-09 measured exactly that: `__HIVE_DEFAULT_PARTITION__` owns a
+/// ~1.16 GB footer-less file whose sort cannot fit the shared light pool. It was
+/// re-staged at 00:10, 00:30 and 02:34 and failed each time, while shipbubble's
+/// own blocking file was NEVER staged once in six hours — its 14/30-day queries
+/// stayed broken behind a poison pill belonging to a different tenant.
+///
+/// Three attempts, not one: staging also fails for genuinely transient reasons
+/// (a lost OCC race, a concurrent rewrite, a restart mid-stage), and those must
+/// not cost a file its eligibility. A success clears the count, so only a
+/// *consistently* impossible file is parked.
+const REPAIR_QUARANTINE_AFTER: u32 = 3;
+
 /// travel together through planning, admission and binning.
 struct HotBinPolicy<'a> {
     /// SEALED dates (yesterday backwards) scanned for footer repair only.
@@ -11208,6 +11267,8 @@ struct HotBinPolicy<'a> {
     pass: TailPass,
     /// Suspects a footer read already cleared — see `repair_verified_sorted`.
     verified_sorted: &'a dashmap::DashSet<String>,
+    /// Consecutive staging failures per candidate — see `REPAIR_QUARANTINE_AFTER`.
+    failures: &'a dashmap::DashMap<String, u32>,
 }
 
 /// The hot tail runs two jobs that were one, and the merge is what broke both.
@@ -14809,6 +14870,7 @@ mod tests {
         let repair: Vec<String> = vec!["date=2026-08-05/".into()];
         let p = |d: &str| format!("timefusion/otel_logs_and_spans/project_id=abc/{d}part-x.parquet");
         let cleared: dashmap::DashSet<String> = dashmap::DashSet::new();
+        let failures: dashmap::DashMap<String, u32> = dashmap::DashMap::new();
         let policy = |repair_dates: &'static [String]| super::HotBinPolicy {
             repair_dates,
             target_size: TARGET,
@@ -14817,6 +14879,7 @@ mod tests {
             repair_max_bytes: REPAIR_MAX,
             pass: TailPass::Pack,
             verified_sorted: &cleared,
+            failures: &failures,
         };
         let with_repair = super::HotBinPolicy { repair_dates: &repair, ..policy(&[]) };
         let admits = |path: &str, size, sorted, repairable| super::hot_bin_admits(path, today, &repair, size, sorted, repairable, &with_repair);
@@ -14825,6 +14888,22 @@ mod tests {
         assert!(admits(&p(today), 10, false, true), "small file today packs");
         assert!(!admits(&p(today), 900, true, true), "converged sorted run today is done");
         assert!(admits(&p(today), 900, false, true), "converged UNSORTED today is a repair candidate");
+
+        // A candidate that keeps failing to stage is PARKED, so the queue behind
+        // it drains. Prod 2026-08-09: `__HIVE_DEFAULT_PARTITION__`'s ~1.16 GB
+        // file failed the pool on every pass and shipbubble's own blocking file
+        // was never staged once in six hours.
+        let sealed = p("date=2026-08-05/");
+        assert!(admits(&sealed, 900, false, true), "sealed unsorted file is repair work");
+        for n in 1..super::REPAIR_QUARANTINE_AFTER {
+            failures.insert(sealed.clone(), n);
+            assert!(admits(&sealed, 900, false, true), "still eligible after {n} failure(s) — transient failures must not cost eligibility");
+        }
+        failures.insert(sealed.clone(), super::REPAIR_QUARANTINE_AFTER);
+        assert!(!admits(&sealed, 900, false, true), "parked once it has failed REPAIR_QUARANTINE_AFTER times");
+        // Parking is per FILE, not per project or date — its neighbours stay eligible.
+        assert!(admits(&p("date=2026-08-05/other-"), 900, false, true), "a different file on the same sealed date is unaffected");
+        failures.clear(); // the assertions below share these paths
 
         // SEALED, in the lookback window — repair only.
         let sealed = "date=2026-08-05/";
