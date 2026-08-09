@@ -8562,14 +8562,27 @@ impl Database {
         // which is worse: packing is continuous and latency-critical, repair is
         // a finite background backlog.
         //
-        // Half the pool, so packing always keeps the majority. On prod that is
-        // k=5 (22.5 GB light share / 4 GB per sort, under a 12-core bound), so
-        // repair takes 2 and packing keeps 3 — enough to drain a finite backlog
-        // without ever being able to block the continuous job.
+        // ONE repair rewrite at a time, so the bin that is blocking a tenant
+        // gets the whole machine rather than a share of it.
+        //
+        // A repair bin is CPU-bound — prod 2026-08-09 measured the pass at
+        // ~1350% CPU spread across several concurrent bins — and it must finish
+        // inside a single process lifetime, because a stage killed part-way
+        // resumes nothing. That lifetime is set by the deploy rate, not by us:
+        // on 2026-08-09 it was 18-21 minutes against a rewrite that needs ~40.
+        // Splitting the cores N ways multiplies the wall clock of EVERY bin by
+        // N and makes all of them miss the window; running them one at a time
+        // means the first one — shortest-job-first, so the tenant closest to
+        // being unblocked — actually lands.
+        //
+        // Throughput is unchanged in aggregate (the work is CPU-bound, so N
+        // bins at 1/N speed take the same total time); what changes is that
+        // completions arrive serially instead of all-or-nothing at the end.
+        // Packing is untouched and keeps the whole pool minus this one slot.
         let k = self.config.derived.light_optimize_k(project_ids.len());
         let concurrency = match pass {
             TailPass::Pack => k,
-            TailPass::Repair => (k / 2).max(1),
+            TailPass::Repair => 1,
         };
         // Bound total rounds so a large backlog can't wedge the tick even if the
         // wall-clock budget is raised.
