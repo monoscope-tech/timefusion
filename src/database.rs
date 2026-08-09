@@ -12117,6 +12117,16 @@ where
                 }
             }
         }
+        // Did the round SURVIVE to its commit, and with how many bins? Prod
+        // 2026-08-09: 6 `staged_intent_resumed` and 4 `wave_commit_enter` with
+        // ZERO overlap — recovered rewrites, complete and row-exact on S3, that
+        // never reach a commit. The path between the two is unconditional, so
+        // this line bisects the only two remaining stories: `staged=0` means the
+        // outcome was not `Staged` after all, and a resume that logged but did
+        // not arrive here means the round's future was dropped (cancelled)
+        // before `collect()` returned. Generic over `T`, so it counts bins
+        // rather than naming them — `wave_commit_enter` supplies the wave_ids.
+        info!(round, staged = staged.len(), pending = pending.len(), failed, event = "round_staged");
         // A wave normally commits ONCE, which is what made wave commits ~40x
         // rarer than the per-bin commits they replaced (2026-07-29: ~130 commits
         // a tick drove OCC ladders to attempt 9-20). That batching is right for
