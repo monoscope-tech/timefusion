@@ -8634,6 +8634,45 @@ impl Database {
         // this tick and drops out of the round-robin.
         let plan: tokio::sync::Mutex<HashMap<String, Vec<String>>> = tokio::sync::Mutex::new(planned.into_iter().collect());
 
+        // COMMIT RECOVERED REWRITES FIRST, outside the round.
+        //
+        // A resumed bin is already staged and already verified row-exact — it
+        // needs nothing but a commit. Committing it inside the round means
+        // waiting for every sibling to finish staging, because
+        // `round_robin_bins` awaits the whole round's
+        // `buffer_unordered(..).collect()` before it commits anything; even
+        // `commit_each_bin` only splits what that collect produced.
+        //
+        // Prod 2026-08-09 measured the consequence: 6 `staged_intent_resumed`
+        // against ZERO matching `wave_commit_enter`, the resumes landing at
+        // 13:46:55 with no `round_staged` after them at all. Process lifetime
+        // under deploy churn is shorter than a round of minutes-long bins, so
+        // the recovered rewrite died with the round every single pass —
+        // resume kept finding the same finished work and the round kept losing
+        // it. shipbubble's `date=2026-07-30` sat that way for days with a
+        // complete, sorted, row-exact replacement already on S3.
+        let resumed: Vec<(String, StagedBin)> = {
+            let plan_guard = plan.lock().await;
+            let mut found = Vec::new();
+            for (project_id, files) in plan_guard.iter() {
+                if let Some(bin) = self.resumable_staged_bin(table_ref, table_name, project_id, files).await {
+                    found.push((project_id.clone(), bin));
+                }
+            }
+            found
+        };
+        for (project_id, bin) in resumed {
+            // Drop it from the plan: its inputs are about to stop being live, so
+            // re-staging them this tick would rewrite files the commit removed.
+            plan.lock().await.remove(&project_id);
+            let markers: Vec<String> = match pass {
+                TailPass::Pack => vec![format!("date={today_str}/")],
+                TailPass::Repair => policy.repair_dates.iter().map(|d| format!("date={d}/")).collect(),
+            };
+            let failed = self.commit_wave(table_ref, table_name, &markers, false, vec![bin], 0).await.failed.len();
+            info!(table_name, project_id, failed, event = "resumed_bin_committed_early");
+        }
+
         // A repair wave takes ONE rewrite slot, never the pool.
         //
         // `stage_hot_bin` acquires `light_rewrite_sem`, and BOTH passes share it.
