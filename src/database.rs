@@ -11058,10 +11058,8 @@ async fn repair_slice_cuts(ctx: &datafusion::prelude::SessionContext, bin_table:
     if slices <= 1 {
         return Vec::new();
     }
-    let exprs = (1..slices)
-        .map(|i| format!("approx_percentile_cont(arrow_cast(\"{col}\", 'Int64'), {})", i as f64 / slices as f64))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let exprs =
+        (1..slices).map(|i| format!("approx_percentile_cont(arrow_cast(\"{col}\", 'Int64'), {})", i as f64 / slices as f64)).collect::<Vec<_>>().join(", ");
     let Ok(df) = ctx.sql(&format!("SELECT {exprs} FROM {bin_table}")).await else {
         return Vec::new();
     };
