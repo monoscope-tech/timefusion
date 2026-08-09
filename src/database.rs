@@ -4445,16 +4445,34 @@ impl Database {
     fn build_spill_runtime_env(&self, pool_size: usize, spill_subdir: &str) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         use datafusion::execution::{
             disk_manager::{DiskManagerBuilder, DiskManagerMode},
-            memory_pool::FairSpillPool,
+            memory_pool::{FairSpillPool, TrackConsumersPool},
             runtime_env::RuntimeEnvBuilder,
         };
         let spill_dir = self.config.core.timefusion_data_dir.join(spill_subdir);
         let _ = std::fs::create_dir_all(&spill_dir);
         reap_orphaned_spill_dirs(&spill_dir);
         let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
+        // TrackConsumersPool so an exhausted MAINTENANCE pool names its holders,
+        // exactly as `shared_runtime_env` already does for the query pool.
+        //
+        // Without it the error names only the victim, which is never the culprit:
+        // prod 2026-08-09 00:13 reported `Failed to allocate additional 2.5 MB for
+        // SortPreservingMergeExec[0] with 4.9 MB already allocated - 1188.5 KB
+        // remain available for the total memory pool: fair(pool_size: 22.5 GB)`.
+        // A consumer asking for 2.5 MB is the thing that got starved, and the
+        // 22.5 GB was held by something the message would not name. One shared
+        // light pool serves every hot-tail pass across ALL tables and projects,
+        // so the holder can be another table entirely — that same night an
+        // `otel_metrics` packing bin was misread as the `otel_logs_and_spans`
+        // footer repair failing, and the wrong subsystem was blamed for hours.
+        //
+        // The query pool learned this on 2026-08-03 ("with a bare Greedy pool the
+        // holder was unattributable"); the maintenance pool never did.
+        let top = std::num::NonZeroUsize::new(5).expect("5 is non-zero");
+        let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), top));
         Arc::new(
             RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
+                .with_memory_pool(pool)
                 .with_disk_manager_builder(disk)
                 .build()
                 .expect("build maintenance runtime env"),
@@ -13874,6 +13892,32 @@ mod writer_properties_tests {
         );
         assert_eq!(p.statistics_enabled(&ColumnPath::from("timestamp")), EnabledStatistics::Page);
         assert_eq!(p.statistics_enabled(&ColumnPath::from("body")), EnabledStatistics::Chunk);
+    }
+
+    /// An exhausted MAINTENANCE pool must name its holders, not just its victim.
+    ///
+    /// Prod 2026-08-09 00:13 reported only `Failed to allocate additional 2.5 MB
+    /// for SortPreservingMergeExec[0] ... 1188.5 KB remain available for the
+    /// total memory pool: fair(pool_size: 22.5 GB)`. The consumer asking for
+    /// 2.5 MB is the starved one; the 22.5 GB was held by something the message
+    /// never named, and hours went into guessing which pass it was. This pins
+    /// the DataFusion contract the fix depends on — a bare pool would report the
+    /// reservation and the total and stop there.
+    #[test]
+    fn an_exhausted_maintenance_pool_names_the_consumers_holding_it() {
+        use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer, MemoryPool, TrackConsumersPool};
+        let top = std::num::NonZeroUsize::new(5).expect("5 is non-zero");
+        let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(FairSpillPool::new(4 * 1024 * 1024), top));
+
+        // A fat holder takes most of the pool, then a small consumer is starved
+        // — exactly the shape of the prod failure.
+        let hog = MemoryConsumer::new("TheBinThatAteThePool").register(&pool);
+        hog.grow(3 * 1024 * 1024);
+        let starved = MemoryConsumer::new("SortPreservingMergeExec").register(&pool);
+        let error = starved.try_grow(3 * 1024 * 1024).expect_err("pool is too small for both");
+
+        let text = error.to_string();
+        assert!(text.contains("TheBinThatAteThePool"), "the HOLDER must be named, that is the whole point: {text}");
     }
 
     // Option A: only declare the parquet SortingColumn footer when the writer
