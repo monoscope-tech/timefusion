@@ -664,6 +664,15 @@ fn build_optimize_session_state(
 fn build_optimize_session_state_with_batch(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>,
 ) -> datafusion::execution::session_state::SessionState {
+    build_optimize_session_state_tuned(target_partitions, runtime_env, batch_override, false)
+}
+
+/// `uncapped_partitions` lifts `MAINTENANCE_MAX_PARTITIONS`. Only sound for a
+/// session whose caller runs ONE rewrite at a time — see `repair_session_state`.
+fn build_optimize_session_state_tuned(
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>,
+    uncapped_partitions: bool,
+) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
     // wide — 8192-row decode batches measured up to 145MB (2026-07-27). Quartering
@@ -673,7 +682,10 @@ fn build_optimize_session_state_with_batch(
     // indivisible admission unit, and small-cgroup pools must be able to admit
     // one before spilling can engage.
     let batch_size = batch_override.unwrap_or_else(|| crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size()));
-    let cfg = maintenance_session_config(SessionConfig::new(), batch_size, target_partitions);
+    let cfg = match uncapped_partitions {
+        false => maintenance_session_config(SessionConfig::new(), batch_size, target_partitions),
+        true => maintenance_session_config(SessionConfig::new(), batch_size, usize::MAX).with_target_partitions(REPAIR_SORT_PARTITIONS),
+    };
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
     // OOM-killing the process, but are isolated from query pressure and can spill.
@@ -687,6 +699,23 @@ fn build_optimize_session_state_with_batch(
 /// 4.8 GB pool). Legacy and high-file-count partitions still blew the reservation
 /// at 4 partitions, hence 2.
 const MAINTENANCE_MAX_PARTITIONS: usize = 2;
+
+/// Parallelism for the REPAIR sort specifically, which `MAINTENANCE_MAX_PARTITIONS`
+/// otherwise pins at 2.
+///
+/// That cap exists because MANY concurrent sorters exhaust the bounded pool
+/// (prod 2026-07-12: ~46 sorters x 64 MB against a 4.8 GB pool). Repair runs
+/// exactly ONE bin at a time, so the premise does not hold for it — and paying
+/// the cap anyway is what made a ~1 GiB rewrite take ~40 minutes on a 48-core
+/// box while using two threads.
+///
+/// That 40 minutes is the whole reason shipbubble's blocking file could not be
+/// repaired: prod process lifetime under the 2026-08-09 deploy rate was 18-21
+/// minutes, and a stage killed part-way resumes nothing. 16 partitions is
+/// ~512 MB of up-front sort reservation (16 x `sort_spill_reservation_bytes`)
+/// against a 22.5 GB light pool — a rounding error there, and the difference
+/// between a unit that fits its window and one that never lands.
+const REPAIR_SORT_PARTITIONS: usize = 16;
 
 /// How long after boot the one-shot footer repair waits. Long enough for WAL
 /// replay and snapshot load to finish, short enough that a process which only
@@ -4691,7 +4720,7 @@ impl Database {
     fn repair_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.repair_session_state
             .get_or_init(|| {
-                build_optimize_session_state_with_batch(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env(), Some("256"))
+                build_optimize_session_state_tuned(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env(), Some("256"), true)
             })
             .clone()
     }
@@ -11429,11 +11458,18 @@ mod repair_batch_tests {
         use datafusion::execution::runtime_env::RuntimeEnv;
         let batch = |state: &datafusion::execution::session_state::SessionState| state.config().options().execution.batch_size;
         let pack = super::build_optimize_session_state(0, std::sync::Arc::new(RuntimeEnv::default()));
-        let repair = super::build_optimize_session_state_with_batch(0, std::sync::Arc::new(RuntimeEnv::default()), Some("256"));
+        let repair = super::build_optimize_session_state_tuned(0, std::sync::Arc::new(RuntimeEnv::default()), Some("256"), true);
         assert_eq!(batch(&repair), 256, "repair shrinks the sort's indivisible admission unit");
+        // Repair runs ONE bin at a time, so the many-concurrent-sorters premise
+        // behind `MAINTENANCE_MAX_PARTITIONS` does not apply to it. Paying the
+        // cap anyway sorted ~1 GiB with two threads on a 48-core box — ~40
+        // minutes, against an 18-21 minute process lifetime.
+        assert_eq!(repair.config().options().execution.target_partitions, super::REPAIR_SORT_PARTITIONS, "repair sorts wide");
+        assert!(
+            repair.config().options().execution.target_partitions > pack.config().options().execution.target_partitions,
+            "packing keeps the cap because it runs many bins at once"
+        );
         assert!(batch(&repair) < batch(&pack), "packing keeps the wider batch: {} vs {}", batch(&pack), batch(&repair));
-        // The override must not disturb the shared parallelism cap.
-        assert_eq!(repair.config().options().execution.target_partitions, pack.config().options().execution.target_partitions);
     }
 }
 
