@@ -248,6 +248,87 @@ Use:
 
 **Verify:** 3-day throughput and percentile panels read rollup records only and meet the 3-second cold / 1-second warm targets.
 
+#### 5a. Routing: how this survives "users filter by any combination of fields"
+
+The schema has ~100 flattened columns. No rollup answers their cross-product,
+and pretending otherwise is how rollups end up serving 20% of traffic. Rollups
+answer a KNOWN set; the engineering is a rule that PROVES a query is answerable
+plus a fallback that is fast when it is not.
+
+Route to the rollup only if all four hold:
+
+1. every GROUP BY key is a rollup dimension;
+2. **every FILTERED column is a rollup dimension** — the one that gets missed.
+   A filter on a non-dimension cannot be applied after aggregation: those rows
+   are already summed together and cannot be subtracted back out. Filter
+   columns constrain the design exactly as hard as group-by columns;
+3. every aggregate is decomposable — `count`/`sum`/`min`/`max` merge, `avg` is
+   sum/count; exact `count(distinct)` and exact percentiles do NOT;
+4. the range covers whole buckets, or 5c splits it.
+
+Anything failing falls through to raw, silently, with a counter (5d).
+
+Dimension candidates from this schema, all low cardinality:
+`resource___service___name`, `kind`, `status_code`, `level`,
+`attributes___http___request___method`,
+`attributes___http___response___status_code`, and
+`attributes___url___path` ONLY if templated — raw paths carrying IDs explode
+the key space. Excluded by nature: `context___trace_id`, `id`,
+`attributes___user___id`, `body`. Those are point lookups or free text, and the
+`LIMIT` path already serves them at 30 days in ~1.1s (2026-08-09).
+
+Cardinality is a budget, not a preference: rows per bucket is roughly the
+product of the dimensions' distinct counts. At 1-minute grain that product must
+stay in the low thousands or the rollup is a slightly smaller copy of the table.
+
+Percentiles need a **mergeable sketch** (t-digest / DDSketch) stored per bucket
+as a binary column, not a scalar — sketches merge associatively, so quantiles
+survive both re-aggregation across buckets and collapse across dimensions, at
+bounded error. Exact quantiles stay a raw-scan query.
+
+#### 5b. Correctness under MOR — the part a generic rollup design gets wrong
+
+A bucket's contents CHANGE after the fact here. Enrichment appends new row
+versions (merge-on-read) and dedup keep-greatest decides the winner, so a
+rollup computed over a bucket that is later deduped is simply wrong.
+
+So the build trigger is not a timer, it is the existing certification signal:
+**build a rollup bucket only from a bin dedup has certified clean, and
+invalidate it when that bin re-enters the dirty queue.** The `dirty_bin_*`
+machinery already tracks precisely this, which makes the rollup table another
+consumer of a signal we maintain rather than new bookkeeping to keep in sync.
+
+Store it as a sibling Delta table with the same `[project_id, date]`
+partitioning, so `ProjectRoutingTable` gives multi-tenant isolation for free.
+
+#### 5c. Hybrid ranges and grain cascade
+
+A 30-day query is 29 sealed days from the rollup plus today's partial from raw
++ MemBuffer — structurally the union already used between MemBuffer and Delta.
+
+Build ONE base grain (1m) and derive coarser grains by re-aggregating
+(1m -> 1h -> 1d); the merge is associative, so this needs no second pipeline.
+The planner picks the coarsest grain <= the requested bucket width.
+
+#### 5d. Instrument BEFORE choosing dimensions
+
+Log every dashboard aggregate's group-by set, filter set and range for a week,
+and derive the dimension set from that. Counters: `rollup_hit`, and
+`rollup_miss` bucketed by REASON (unknown dimension / non-decomposable
+aggregate / partial bucket). Without the miss-reason breakdown there is no
+feedback loop telling us which dimension to add next.
+
+#### 5e. What this does NOT fix
+
+Arbitrary-combination queries always fall back to raw, so rollups do not remove
+the need for a fast scan path — they remove the DASHBOARD's traffic from it.
+The measured cliff is ~700-900 mostly-cold object opens for a 7-day aggregate
+(2026-08-09), and no rollup helps the exploratory query that misses. Parity is
+two-track: rollups here, and `2026-07-31-local-hot-tier.md` for the scan path.
+Worth stating plainly — ClickHouse's edge on arbitrary filters is not
+materialized views either; it is fast columnar scan with sparse indexes and
+projections.
+
 ### 6. Make latency breakdown an explicit drill-down or rollup
 
 **Outcome:** prevent the root-to-child span self-join from blocking dashboard first paint.
