@@ -8590,8 +8590,22 @@ impl Database {
         // which is worse: packing is continuous and latency-critical, repair is
         // a finite background backlog.
         //
-        // ONE repair rewrite at a time, so the bin that is blocking a tenant
-        // gets the whole machine rather than a share of it.
+        // Half the pool for repair, so several projects progress at once.
+        //
+        // This was ONE at a time (330afa8), on the theory that the blocking bin
+        // needed the whole machine. That theory was wrong twice over. The sort
+        // was never CPU-starved by its neighbours — it was pinned to 2
+        // partitions by `MAINTENANCE_MAX_PARTITIONS` (fixed in 4d63bb1), which
+        // is what actually made a ~1 GiB rewrite take ~40 minutes. And
+        // serialising ten projects behind one slot means a tenant late in the
+        // order waits for every bin ahead of it: prod 2026-08-09 managed FOUR
+        // bins in a 30-minute uninterrupted window — dates 2026-05-30, 05-31,
+        // 06-09, 07-10 — and never reached the tenant whose queries were down.
+        //
+        // With 16 partitions per sort, two concurrent bins are 32 reservations
+        // against a 22.5 GB pool, and repair's 256-row batches keep each merge's
+        // ask near 8 MB. Parallel progress is affordable; making a blocked
+        // tenant queue behind nine others is not.
         //
         // A repair bin is CPU-bound — prod 2026-08-09 measured the pass at
         // ~1350% CPU spread across several concurrent bins — and it must finish
@@ -8610,7 +8624,7 @@ impl Database {
         let k = self.config.derived.light_optimize_k(project_ids.len());
         let concurrency = match pass {
             TailPass::Pack => k,
-            TailPass::Repair => 1,
+            TailPass::Repair => (k / 2).max(1),
         };
         // Bound total rounds so a large backlog can't wedge the tick even if the
         // wall-clock budget is raised.
