@@ -8845,7 +8845,20 @@ impl Database {
             table_name,
         );
         if targets.len() != files.len() {
-            debug!(table_name, project_id, mapped = targets.len(), selected = files.len(), event = "light_optimize_bin_vanished");
+            // WARN, not debug: prod runs RUST_LOG=info, so at debug this exit is
+            // INVISIBLE — a bin that is selected every pass and silently
+            // abandoned every pass looks identical to one that was never
+            // selected. That cost a night on 2026-08-09, where shipbubble's
+            // blocking file logged 13 selections, 13 staging starts and only 11
+            // `wave_bin_staged`, with nothing at all explaining the other two.
+            warn!(
+                table_name,
+                project_id,
+                mapped = targets.len(),
+                selected = files.len(),
+                missing = ?files.iter().filter(|f| !targets.iter().any(|t| &&t.path == f)).collect::<Vec<_>>(),
+                event = "light_optimize_bin_vanished"
+            );
             return Ok(BinOutcome::Retry);
         }
         // The wave engine's OWN permit — NEVER maintenance_rewrite_sem. That
@@ -8962,6 +8975,10 @@ impl Database {
             drop(stream);
             let _ = ctx.deregister_table(&bin_table);
             if rows_staged == 0 {
+                // The other silent exit. A bin whose scan yields no rows returns
+                // Ok and stages nothing, which is indistinguishable in the logs
+                // from success — see the `bin_vanished` note above.
+                warn!(table_name, project_id, files = files.len(), event = "light_optimize_bin_no_rows");
                 return Ok(());
             }
             adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
