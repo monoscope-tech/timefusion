@@ -8934,7 +8934,55 @@ impl Database {
             // footer declaration is then honest by construction.
             let order_by = schema_order_by_clause(schema);
             let sorted = !order_by.is_empty();
-            let read = ctx.sql(&format!("SELECT * FROM {bin_table}{order_by}")).await;
+            // SLICE a repair rewrite by event time, so no single sort has to fit
+            // the whole file. See `REPAIR_SLICE_TARGET_BYTES` for why no
+            // partition count can do this instead.
+            //
+            // The slices are emitted in the output's OWN sort direction and
+            // appended to one writer, so the concatenation is globally sorted
+            // and every footer stays honest — the same property the
+            // `max_file_bytes` cut below already relies on.
+            //
+            // Declined (single whole-file sort, i.e. today's behaviour) unless
+            // every precondition holds: this is a repair, the table sorts on a
+            // leading timestamp, and the bin has a usable non-null range. A
+            // NULL timestamp would sort outside every slice and silently drop
+            // rows, so its presence declines slicing outright rather than being
+            // handled — and `rows_staged` is verified against the input count
+            // before anything commits regardless.
+            let lead = schema.sorting_columns.first();
+            let slice_col = lead.filter(|_| pass == TailPass::Repair && sorted).map(|c| c.name.clone());
+            let slices: Vec<String> = match slice_col {
+                None => Vec::new(),
+                Some(col) => {
+                    let want = (bytes_in / REPAIR_SLICE_TARGET_BYTES).max(0) as usize + 1;
+                    let probe = format!(
+                        "SELECT min(\"{col}\") AS lo, max(\"{col}\") AS hi, sum(CASE WHEN \"{col}\" IS NULL THEN 1 ELSE 0 END) AS nulls FROM {bin_table}"
+                    );
+                    match (want > 1).then_some(()).and(bin_time_range(&ctx, &probe).await) {
+                        Some((lo, hi)) if hi > lo => {
+                            let mut bounds = repair_slice_bounds(lo, hi, want);
+                            if lead.is_some_and(|c| c.descending) {
+                                bounds.reverse();
+                            }
+                            bounds
+                                .into_iter()
+                                .map(|(start, end)| match end {
+                                    // Half-open on the high side; the final
+                                    // ascending slice is unbounded so `hi` itself
+                                    // is never dropped.
+                                    Some(e) => format!(" WHERE \"{col}\" >= {start} AND \"{col}\" < {e}"),
+                                    None => format!(" WHERE \"{col}\" >= {start}"),
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    }
+                }
+            };
+            if !slices.is_empty() {
+                info!(table_name, project_id, bytes_in, slices = slices.len(), event = "repair_bin_sliced");
+            }
             // Intermediate tier: this output is rewritten tonight by
             // consolidate/recompress, so it isn't worth max compression.
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
@@ -8942,10 +8990,6 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
                 .with_writer_properties(writer_properties);
             let target_schema = writer.arrow_schema();
-            let mut stream = match read {
-                Ok(df) => df.execute_stream().await,
-                Err(e) => Err(e),
-            }?;
             let mut rows_staged = 0usize;
             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
             let tag_sorted = |mut add: deltalake::kernel::Add| {
@@ -8956,23 +9000,28 @@ impl Database {
                 }
                 Action::Add(add)
             };
-            while let Some(batch) = stream.next().await {
-                let batch = cast_variant_columns_to_binary(batch?)?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                rows_staged += batch.num_rows();
-                let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
-                writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
-                // Cut the file at the ceiling instead of buffering the whole bin
-                // into one Add. The cut is on a contiguous slice of the sorted
-                // stream, so each piece keeps an honest footer and the pieces
-                // stay event-time disjoint.
-                if writer.buffer_len() >= max_file_bytes {
-                    adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
+            // One pass when not sliced; otherwise one pass per slice, in sort
+            // order, all feeding the SAME writer.
+            let passes: Vec<String> = if slices.is_empty() { vec![String::new()] } else { slices };
+            for predicate in &passes {
+                let mut stream = ctx.sql(&format!("SELECT * FROM {bin_table}{predicate}{order_by}")).await?.execute_stream().await?;
+                while let Some(batch) = stream.next().await {
+                    let batch = cast_variant_columns_to_binary(batch?)?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    rows_staged += batch.num_rows();
+                    let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
+                    writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
+                    // Cut the file at the ceiling instead of buffering the whole bin
+                    // into one Add. The cut is on a contiguous slice of the sorted
+                    // stream, so each piece keeps an honest footer and the pieces
+                    // stay event-time disjoint.
+                    if writer.buffer_len() >= max_file_bytes {
+                        adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
+                    }
                 }
             }
-            drop(stream);
             let _ = ctx.deregister_table(&bin_table);
             if rows_staged == 0 {
                 // The other silent exit. A bin whose scan yields no rows returns
@@ -8980,6 +9029,26 @@ impl Database {
                 // from success — see the `bin_vanished` note above.
                 warn!(table_name, project_id, files = files.len(), event = "light_optimize_bin_no_rows");
                 return Ok(());
+            }
+            // A sliced rewrite must reproduce EVERY input row. Slicing is the one
+            // thing here that could silently drop rows (a value outside every
+            // range), so the count is checked before anything is committed and a
+            // mismatch aborts the bin — the inputs stay live and the staged
+            // parquet is cleaned up, exactly as any other staging failure.
+            // A deletion vector makes the SCAN return fewer rows than
+            // `numRecords`, so the count is only comparable when no input
+            // carries one — otherwise the guard would abort perfectly good
+            // repairs. Declining to check is safe; falsely aborting is not.
+            if passes.len() > 1 && targets.iter().all(|a| a.deletion_vector.is_none()) {
+                let expected: usize = targets
+                    .iter()
+                    .filter_map(|a| a.stats.as_deref())
+                    .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter_map(|v| v.get("numRecords").and_then(serde_json::Value::as_u64))
+                    .sum::<u64>() as usize;
+                if expected > 0 && rows_staged != expected {
+                    anyhow::bail!("sliced repair staged {rows_staged} rows but the inputs hold {expected} — refusing to commit a lossy rewrite");
+                }
             }
             adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
             Ok(())
@@ -10858,6 +10927,72 @@ fn stats_columns_for(schema: &crate::schema_loader::TableSchema) -> String {
 /// SQL `ORDER BY` clause (leading space, quoted identifiers) matching the
 /// schema's sort order, for rewrite paths that stream through a `SELECT` rather
 /// than delta-rs optimize (recompress). Empty when no sort order is declared.
+/// Input bytes one repair slice may cover. A whole-file sort of a ~1 GiB input
+/// does not fit the light pool at ANY partition count — measured prod
+/// 2026-08-09: at 2 partitions the sorter alone peaks 22.3 GB, and at 16 the
+/// sixteen `ExternalSorterMerge` operators (which CANNOT spill, one per
+/// partition) hold ~16 GB on top of an 18.3 GB sorter. Both blow a 22.5 GB
+/// pool, so only a smaller UNIT can work.
+///
+/// 256 MB of input is ~4.4 GB of Arrow at prod's ~17x zstd ratio — comfortably
+/// inside the pool with the merges included, and short enough that a slice
+/// survives the gap between deploys.
+const REPAIR_SLICE_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+
+/// Run the min/max/null probe for slice planning. `None` declines slicing —
+/// on any error, a non-i64 sort column, or a single NULL, because a NULL would
+/// fall outside every range and be dropped.
+///
+/// The probe is an aggregate with no ORDER BY, so it costs a scan and no sort
+/// memory. Slicing then costs one scan per slice; for a repair that otherwise
+/// never completes at all, re-reading is the cheap side of the trade.
+async fn bin_time_range(ctx: &datafusion::prelude::SessionContext, probe: &str) -> Option<(i64, i64)> {
+    use datafusion::arrow::array::Array;
+    let batches = ctx.sql(probe).await.ok()?.collect().await.ok()?;
+    let batch = batches.into_iter().find(|b| b.num_rows() > 0)?;
+    // Timestamps arrive as Timestamp(µs); `as_primitive` over the concrete type
+    // keeps this honest rather than casting blindly.
+    let int_at = |i: usize| -> Option<i64> {
+        let col = batch.column(i);
+        if col.is_null(0) {
+            return None;
+        }
+        arrow::compute::kernels::cast::cast(col, &arrow_schema::DataType::Int64)
+            .ok()
+            .map(|c| arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(&c).value(0))
+    };
+    let (lo, hi) = (int_at(0)?, int_at(1)?);
+    // Any NULL in the sort column declines slicing outright.
+    match int_at(2) {
+        Some(0) | None => Some((lo, hi)),
+        Some(_) => None,
+    }
+}
+
+/// Split `[lo, hi]` into `slices` half-open ranges, last one inclusive of `hi`.
+/// Returns `(lo, hi_exclusive_or_none)` pairs in ASCENDING order.
+///
+/// Slicing a repair rewrite by TIME (never by row count) is what keeps the
+/// output honest: the slices are processed in the output's own sort direction
+/// and appended to one writer, so the concatenation stays globally sorted and
+/// every file's `sorting_columns` footer remains true. Row-count slices would
+/// produce overlapping files, and two versions of one key could then land in
+/// different files where keep-greatest can no longer see them together.
+fn repair_slice_bounds(lo: i64, hi: i64, slices: usize) -> Vec<(i64, Option<i64>)> {
+    if slices <= 1 || hi <= lo {
+        return vec![(lo, None)];
+    }
+    let span = (hi - lo) as i128;
+    (0..slices)
+        .map(|i| {
+            let start = lo + (span * i as i128 / slices as i128) as i64;
+            let end = (i + 1 < slices).then(|| lo + (span * (i + 1) as i128 / slices as i128) as i64);
+            (start, end)
+        })
+        // A degenerate span can produce empty ranges; they simply select nothing.
+        .collect()
+}
+
 fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String {
     if schema.sorting_columns.is_empty() {
         return String::new();
@@ -15871,6 +16006,30 @@ mod tests {
     /// re-sorts a converged file). Prod reached 55% of active files unsorted
     /// this way. Ingest keeps the fallback — its rows exist nowhere else.
     ///
+    /// Slice bounds must TILE `[lo, hi]` — no gaps (a gap drops rows) and no
+    /// overlaps (an overlap duplicates them, and puts two versions of one key in
+    /// different files where keep-greatest can no longer see them together).
+    #[test]
+    fn repair_slices_tile_the_range_without_gaps_or_overlaps() {
+        for (lo, hi, n) in [(0i64, 100i64, 4usize), (-50, 50, 3), (1_700_000_000_000_000, 1_700_000_086_400_000, 8), (0, 1, 4), (5, 5, 4)] {
+            let bounds = super::repair_slice_bounds(lo, hi, n);
+            assert_eq!(bounds[0].0, lo, "first slice starts at lo");
+            assert!(bounds.last().expect("non-empty").1.is_none(), "the last slice is unbounded so hi itself is never dropped");
+            for pair in bounds.windows(2) {
+                let (prev, next) = (pair[0], pair[1]);
+                assert_eq!(prev.1.expect("only the last is open"), next.0, "slice {prev:?} must abut {next:?} exactly");
+            }
+            // Every value in [lo, hi] lands in exactly one half-open slice.
+            for v in [lo, hi, lo + (hi - lo) / 2] {
+                let hits = bounds.iter().filter(|(a, b)| v >= *a && b.is_none_or(|e| v < e)).count();
+                assert_eq!(hits, 1, "value {v} must fall in exactly one slice of {bounds:?}");
+            }
+        }
+        // Degenerate inputs decline slicing rather than producing nonsense.
+        assert_eq!(super::repair_slice_bounds(10, 5, 4), vec![(10, None)], "hi <= lo is a single unbounded pass");
+        assert_eq!(super::repair_slice_bounds(0, 100, 1), vec![(0, None)], "one slice is the un-sliced path");
+    }
+
     /// A footer probed as sorted must survive a RESTART.
     ///
     /// The set was in-process only, so every boot re-probed thousands of
