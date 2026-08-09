@@ -8640,7 +8640,18 @@ impl Database {
                     if files.is_empty() {
                         return (project_id, Ok(BinOutcome::Converged));
                     }
-                    info!(table_name, project_id, date = %today, selected_files = files.len(), round, event = "light_optimize_tail_selected");
+                    // Log WHICH file, not just how many. A repair bin is one
+                    // file, and every question worth asking about a stalled
+                    // repair — is the blocking file being selected at all, is it
+                    // selected and failing, or is the pass spending itself
+                    // elsewhere — needs the path. Inferring it from counters and
+                    // checkpoints cost most of a night on 2026-08-09 and every
+                    // inference was one indirection too far from the answer.
+                    let selected = match pass {
+                        TailPass::Repair => files.first().map(String::as_str).unwrap_or(""),
+                        TailPass::Pack => "",
+                    };
+                    info!(table_name, project_id, date = %today, selected_files = files.len(), selected, round, event = "light_optimize_tail_selected");
                     // Admission picked this file off the ABSENT sort tag, which
                     // is only a suspicion (see `repair_verified_sorted`). Read
                     // the footer before spending minutes rewriting it: one
