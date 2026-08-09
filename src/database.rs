@@ -9208,6 +9208,22 @@ impl Database {
         use deltalake::kernel::{Action, transaction::TableReference};
         debug_assert!(bins.iter().all(|b| b.data_change() == data_change), "a wave must not mix data-preserving and row-dropping units");
         let engine = if data_change { "dedup" } else { "light optimize" };
+        // Which bins actually REACH a commit. `staged_intent_resumed` proves a
+        // recovered rewrite was handed back (prod 2026-08-09: wave 980e1400
+        // resumed 6x across restarts, complete and row-exact on S3), but nothing
+        // downstream says whether it reached commit_wave, and the mode stayed
+        // `full-set`. Four hypotheses died for want of exactly this line —
+        // budget discard, dedup contention, flush yield, probe fallback — each
+        // refuted by a counter that was already zero. Name the waves on the way
+        // in, so the next pass says where the bin went instead of what it wasn't.
+        info!(
+            table_name,
+            engine,
+            round,
+            bins = bins.len(),
+            wave_ids = ?bins.iter().map(|b| b.wave_id.as_str()).collect::<Vec<_>>(),
+            event = "wave_commit_enter"
+        );
         let mut bins = bins;
         let mut failed: Vec<StagedBin> = Vec::new();
         // Bins already CONFIRMED landed by an earlier attempt of this wave (see
