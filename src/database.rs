@@ -4470,13 +4470,7 @@ impl Database {
         // holder was unattributable"); the maintenance pool never did.
         let top = std::num::NonZeroUsize::new(5).expect("5 is non-zero");
         let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), top));
-        Arc::new(
-            RuntimeEnvBuilder::new()
-                .with_memory_pool(pool)
-                .with_disk_manager_builder(disk)
-                .build()
-                .expect("build maintenance runtime env"),
-        )
+        Arc::new(RuntimeEnvBuilder::new().with_memory_pool(pool).with_disk_manager_builder(disk).build().expect("build maintenance runtime env"))
     }
 
     /// Light-optimize slice of the maintenance budget: one per-sort budget
