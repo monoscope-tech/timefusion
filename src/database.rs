@@ -16085,8 +16085,7 @@ mod tests {
         let ty = arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()));
         let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new("timestamp", ty.clone(), false)]));
         let ctx = SessionContext::new();
-        ctx.register_table("bin", Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("memtable")))
-            .expect("register");
+        ctx.register_table("bin", Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("memtable"))).expect("register");
 
         // The type string the fix derives from the provider's schema.
         let rendered = format!("{ty:?}");
