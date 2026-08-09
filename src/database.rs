@@ -10972,17 +10972,33 @@ fn stats_columns_for(schema: &crate::schema_loader::TableSchema) -> String {
 /// SQL `ORDER BY` clause (leading space, quoted identifiers) matching the
 /// schema's sort order, for rewrite paths that stream through a `SELECT` rather
 /// than delta-rs optimize (recompress). Empty when no sort order is declared.
-/// Input bytes one repair slice may cover. A whole-file sort of a ~1 GiB input
-/// does not fit the light pool at ANY partition count — measured prod
-/// 2026-08-09: at 2 partitions the sorter alone peaks 22.3 GB, and at 16 the
-/// sixteen `ExternalSorterMerge` operators (which CANNOT spill, one per
-/// partition) hold ~16 GB on top of an 18.3 GB sorter. Both blow a 22.5 GB
-/// pool, so only a smaller UNIT can work.
+/// Input bytes one repair slice may cover — sized to sort IN MEMORY, never spill.
 ///
-/// 256 MB of input is ~4.4 GB of Arrow at prod's ~17x zstd ratio — comfortably
-/// inside the pool with the merges included, and short enough that a slice
-/// survives the gap between deploys.
-const REPAIR_SLICE_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+/// A whole-file sort of a ~1 GiB input does not fit the light pool at ANY
+/// partition count (prod 2026-08-09: 22.3 GB sorter peak at 2 partitions; at 16,
+/// sixteen `ExternalSorterMerge` operators that CANNOT spill hold ~16 GB on top
+/// of an 18.3 GB sorter). So the unit has to shrink — but HOW FAR matters more
+/// than the fact of shrinking, because throughput falls off a cliff at the spill
+/// boundary. Measured from `wave_bin_staged` (bytes_in / staging_ms) over three
+/// hours of real bins:
+///
+/// | bin | throughput |
+/// |---|---|
+/// | 55-78 MB | **2.4-5.6 MB/s** — sorts in memory |
+/// | 380 MB | 0.90 MB/s |
+/// | 1038 MB | 0.22 MB/s |
+/// | 412 MB | 0.09 MB/s |
+///
+/// A 25-60x collapse, and it is spill I/O, not CPU. 256 MB still spilled: it is
+/// ~4.4 GB of Arrow at prod's ~17x zstd ratio, well past what the sort keeps
+/// resident. 64 MB is ~1.1 GB of Arrow — comfortably in-memory inside the
+/// 22.5 GB pool — which takes a 1 GiB file from ~77 minutes to a few, and is
+/// what makes a repair finish inside the gap between deploys.
+///
+/// The cost is one scan per slice, so more slices means more re-reading. That
+/// trade is still overwhelmingly favourable: re-reading is linear, spilling is
+/// the cliff above.
+const REPAIR_SLICE_TARGET_BYTES: i64 = 64 * 1024 * 1024;
 
 /// Run the min/max/null probe for slice planning. `None` declines slicing —
 /// on any error, a non-i64 sort column, or a single NULL, because a NULL would
@@ -16141,6 +16157,32 @@ mod tests {
     /// re-sorts a converged file). Prod reached 55% of active files unsorted
     /// this way. Ingest keeps the fallback — its rows exist nowhere else.
     ///
+    /// The slice target must keep a sort IN MEMORY, because throughput falls off
+    /// a cliff at the spill boundary — measured on prod 2026-08-09 from real
+    /// bins: 55-78 MB ran at 2.4-5.6 MB/s, while 380 MB / 1038 MB / 412 MB ran
+    /// at 0.90 / 0.22 / 0.09 MB/s. A 256 MB target still spilled (~4.4 GB of
+    /// Arrow at the ~17x zstd ratio) and took 77 minutes on a 1 GiB file.
+    #[test]
+    fn a_repair_slice_is_sized_to_sort_without_spilling() {
+        const MB: i64 = 1024 * 1024;
+        // Prod's measured compression ratio: file bytes -> in-memory Arrow.
+        const ZSTD_RATIO: i64 = 17;
+        // Bound through the real slice planner rather than the bare constant, so
+        // this exercises the code the repair actually runs.
+        let per_slice = |input: i64| {
+            let want = (input / super::REPAIR_SLICE_TARGET_BYTES).max(0) as usize + 1;
+            let bounds = super::repair_slice_bounds(0, input, want);
+            (want, input / bounds.len() as i64)
+        };
+        // shipbubble's 1.04 GiB blocker: many slices, each resident when decoded.
+        let (slices, bytes_each) = per_slice(1_088_634_971);
+        assert!(slices >= 16, "the 1.04 GiB blocker needs many small slices, got {slices}");
+        assert!(bytes_each * ZSTD_RATIO < 2 * 1024 * MB, "each slice must stay ~1 GB of Arrow so it sorts resident, got {} bytes", bytes_each * ZSTD_RATIO);
+        assert!(bytes_each <= 78 * MB, "each slice must sit in the band measured at 2.4-5.6 MB/s, got {bytes_each} bytes");
+        // A small file is still sorted whole — slicing costs a scan per slice.
+        assert_eq!(per_slice(30 * MB).0, 1, "a 30 MB file is not worth slicing");
+    }
+
     /// Slice bounds must TILE `[lo, hi]` — no gaps (a gap drops rows) and no
     /// overlaps (an overlap duplicates them, and puts two versions of one key in
     /// different files where keep-greatest can no longer see them together).
