@@ -57,13 +57,31 @@ read for every chart and every `count(*)` over sealed dates.
 
 `dedup_skip_allowed` already exists for this but is blocked by three things:
 
-1. A blanket `version_append` bail. **This is the correctness-critical claim to
-   verify first** — `filter_tombstones` is applied unconditionally and
-   independently of `dedup_on`, and the sweep collapses versions with
-   keep-greatest, so a partition certified with ZERO duplicate keys arguably
-   needs no dedup even under MOR. UNVERIFIED. Prove or disprove it with
+1. A blanket `version_append` bail (`dedup_skip_allowed`, database.rs ~13040).
+
+   **Both halves of the safety argument are now VERIFIED BY INSPECTION**
+   (2026-08-09), which is what this section previously flagged as unknown:
+
+   - **Tombstones do not depend on dedup.** `filter_tombstones` is applied to
+     the post-dedup plan unconditionally — the `match &tombstone` sits *outside*
+     and *after* the `match dedup_on`, so it runs whether or not `DedupExec`
+     did. Skipping dedup therefore cannot resurrect a deleted row.
+   - **The sweep really does collapse MOR versions.** The sweep calls
+     `mem_buffer::dedup_batches(.., schema.dedup_tiebreak, None)`
+     (database.rs:7505), and that function is keep-greatest by the tiebreak —
+     its own comment: *"the greatest value wins, ties → last"*.
+
+   So on a partition the sweep certified duplicate-free with a still-matching
+   file fingerprint, there is exactly ONE row per key and it is the winning
+   version; a deleted row survives only as its winning tombstone, which the
+   filter removes. **The bail is over-conservative and the lever is real.**
+
+   **Still required before shipping: an EXECUTION test, not inspection.**
+   Inspection establishes plausibility; it cannot rule out an ordering or
+   edge-case interaction. Prove it with
    `buffer_consistency_test::test_{update,delete}::immediate` plus a new case
-   before relying on it.
+   that certifies a partition, skips dedup, and asserts the UPDATED value (not
+   the superseded one) is returned and the DELETED row is absent.
 2. The skip is decided AFTER the projection is built and requires
    `output_projection.is_none()` — but augmenting the projection is what sets
    it. The decision must be hoisted ABOVE projection computation.
