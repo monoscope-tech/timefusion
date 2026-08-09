@@ -13729,12 +13729,8 @@ impl TableProvider for ProjectRoutingTable {
                 // dead weight; the tombstone marker still rides in because
                 // `filter_tombstones` runs regardless.
                 let augment: Vec<&String> = if pre_skip_dedup { Vec::new() } else { dedup_keys.iter().chain(dedup_tiebreak.iter()).collect() };
-                let missing: Vec<usize> = augment
-                    .into_iter()
-                    .chain(tombstone.iter())
-                    .filter_map(|k| full_schema.index_of(k).ok())
-                    .filter(|i| !p.contains(i))
-                    .collect();
+                let missing: Vec<usize> =
+                    augment.into_iter().chain(tombstone.iter()).filter_map(|k| full_schema.index_of(k).ok()).filter(|i| !p.contains(i)).collect();
                 if missing.is_empty() {
                     (Some(p.clone()), None, None)
                 } else {
@@ -13891,8 +13887,7 @@ impl TableProvider for ProjectRoutingTable {
             // against the RESOLVED table so the fingerprint verdict applies to the
             // exact snapshot being read, and keep the `output_projection` guard —
             // when the skip was granted no augmentation happened, so it is None.
-            let skip_dedup =
-                pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            let skip_dedup = pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }
@@ -14001,8 +13996,7 @@ impl TableProvider for ProjectRoutingTable {
             // against the RESOLVED table so the fingerprint verdict applies to the
             // exact snapshot being read, and keep the `output_projection` guard —
             // when the skip was granted no augmentation happened, so it is None.
-            let skip_dedup =
-                pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            let skip_dedup = pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }
