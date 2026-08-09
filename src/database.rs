@@ -703,10 +703,7 @@ const MAINTENANCE_MAX_PARTITIONS: usize = 2;
 /// poison is. Empty string sorts last, which is the right default for a path
 /// that carries no date.
 fn repair_bin_date(files: &[String]) -> &str {
-    files
-        .first()
-        .and_then(|p| p.split('/').find_map(|seg| seg.strip_prefix("date=")))
-        .unwrap_or("")
+    files.first().and_then(|p| p.split('/').find_map(|seg| seg.strip_prefix("date="))).unwrap_or("")
 }
 
 /// Parallelism for the REPAIR sort specifically, which `MAINTENANCE_MAX_PARTITIONS`
@@ -11606,11 +11603,8 @@ mod repair_order_tests {
         assert_eq!(super::repair_bin_date(&[]), "", "no file sorts last");
         assert_eq!(super::repair_bin_date(&["no-date-here.parquet".to_string()]), "", "no date sorts last");
 
-        let mut planned: Vec<(String, Vec<String>)> = vec![
-            ("old".into(), bin("2026-05-30")),
-            ("blocking".into(), bin("2026-07-30")),
-            ("older".into(), bin("2026-06-09")),
-        ];
+        let mut planned: Vec<(String, Vec<String>)> =
+            vec![("old".into(), bin("2026-05-30")), ("blocking".into(), bin("2026-07-30")), ("older".into(), bin("2026-06-09"))];
         planned.sort_by(|a, b| super::repair_bin_date(&b.1).cmp(super::repair_bin_date(&a.1)));
         assert_eq!(planned.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["blocking", "older", "old"]);
     }
