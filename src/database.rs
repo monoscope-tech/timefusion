@@ -681,10 +681,13 @@ fn build_optimize_session_state_tuned(
     // indivisible admission unit, and small-cgroup pools must be able to admit
     // one before spilling can engage.
     let batch_size = batch_override.unwrap_or_else(|| crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size()));
-    let cfg = match uncapped_partitions {
+    let mut cfg = match uncapped_partitions {
         false => maintenance_session_config(SessionConfig::new(), batch_size, target_partitions),
         true => maintenance_session_config(SessionConfig::new(), batch_size, usize::MAX).with_target_partitions(REPAIR_SORT_PARTITIONS),
     };
+    if uncapped_partitions {
+        let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", &REPAIR_SORT_RESERVATION_BYTES.to_string());
+    }
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
     // OOM-killing the process, but are isolated from query pressure and can spill.
@@ -722,6 +725,27 @@ fn repair_bin_date(files: &[String]) -> &str {
 /// against a 22.5 GB light pool — a rounding error there, and the difference
 /// between a unit that fits its window and one that never lands.
 const REPAIR_SORT_PARTITIONS: usize = 16;
+
+/// Up-front merge reservation for the repair sort, per partition.
+///
+/// The note above accounted for partitions scaling the *reservation* and called
+/// 512 MB a rounding error. It missed that partitions also scale the **merge**,
+/// and the merge is the half that cannot spill. Measured on the file this was
+/// all built for (shipbubble `date=2026-07-30`, prod 2026-08-09):
+///
+/// ```text
+/// ExternalSorter[0]      consumed 9.4 GB, peak 18.9 GB  (can spill: true)
+/// ExternalSorterMerge[0] consumed 9.5 GB                (can spill: FALSE)
+/// -> failed to allocate 64.3 MB; 25.3 MB remained of a 22.5 GB pool
+/// ```
+///
+/// At 32 MB the sorter is free to grow to 18.9 GB before spilling, and the merge
+/// then has nowhere to live. Reserving the merge's share up-front instead makes
+/// the sorter spill early: the reservation is what DataFusion carves out *before*
+/// the sort begins, so it converts an unspillable 9.5 GB tail into spill IO.
+/// 256 MB x 16 partitions = 4 GB against a 22.5 GB pool, and the sort it has to
+/// survive missed by 25.3 MB.
+const REPAIR_SORT_RESERVATION_BYTES: usize = 256 * 1024 * 1024;
 
 /// How long after boot the one-shot footer repair waits. Long enough for WAL
 /// replay and snapshot load to finish, short enough that a process which only
@@ -14529,6 +14553,32 @@ mod tests {
         // ...and it can never exceed the default it replaces, whatever the
         // target — a huge target must not silently restore 1M-row row groups.
         assert_eq!(super::row_group_row_count(otel, usize::MAX / 2), PARQUET_DEFAULT);
+    }
+
+    /// The repair sort runs 16 partitions, so its unspillable merge is 8x the
+    /// 2-partition maintenance default. Reserving that share up-front is what
+    /// forces the sorter to spill instead of consuming the pool and stranding
+    /// the merge — the exact failure that quarantined shipbubble's blocking file
+    /// (9.4 GB sorter + 9.5 GB merge, short by 25.3 MB, prod 2026-08-09).
+    #[test]
+    fn repair_session_reserves_merge_memory_up_front() {
+        let env = Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default());
+        let repair = build_optimize_session_state_tuned(0, Arc::clone(&env), Some("256"), true);
+        let exec = &repair.config().options().execution;
+        assert_eq!(exec.sort_spill_reservation_bytes, REPAIR_SORT_RESERVATION_BYTES);
+        assert_eq!(exec.target_partitions, REPAIR_SORT_PARTITIONS, "repair runs one bin at a time, so it is not capped at 2");
+
+        // The reservation must scale WITH the partition count, or raising
+        // partitions silently re-inflates the unspillable merge share.
+        assert!(
+            exec.sort_spill_reservation_bytes * exec.target_partitions >= 4 * 1024 * 1024 * 1024,
+            "16 partitions need >=4 GB reserved; measured merge was 9.5 GB"
+        );
+
+        // Ordinary maintenance is untouched: it runs many concurrent bins, where
+        // a large per-partition reservation is what exhausts the bounded pool.
+        let plain = build_optimize_session_state_tuned(0, env, None, false);
+        assert_eq!(plain.config().options().execution.sort_spill_reservation_bytes, 33_554_432);
     }
 
     #[test]
