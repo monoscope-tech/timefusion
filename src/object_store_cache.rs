@@ -750,6 +750,11 @@ pub fn scan_bypass_scope<F: std::future::Future>(bypass: bool, fut: F) -> impl s
     SCAN_BYPASS.scope(bypass, fut)
 }
 
+/// Cap on [`FoyerObjectStoreCache::repeat_sighting`]'s key set. ~100k keys of
+/// path-length strings is a few MB — small against a 4 GB L1, and large enough
+/// that a whole dashboard's working set fits without a reset mid-refresh.
+const BYPASS_SEEN_MAX: usize = 100_000;
+
 pub fn bypass_active() -> bool {
     SCAN_BYPASS.try_with(|b| *b).unwrap_or(false)
 }
@@ -833,6 +838,9 @@ pub struct FoyerObjectStoreCache {
     refreshing: Arc<DashSet<String>>,
     main_fetch_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
+    /// Keys a bypassed (wide) scan has asked to admit once already. See
+    /// [`Self::repeat_sighting`].
+    bypass_seen: Arc<DashSet<String>>,
 }
 
 impl FoyerObjectStoreCache {
@@ -846,6 +854,7 @@ impl FoyerObjectStoreCache {
             config: shared_cache.config.clone(),
             refreshing: Arc::new(DashSet::new()),
             main_fetch_locks: Arc::new(DashMap::new()),
+            bypass_seen: Arc::new(DashSet::new()),
             background_tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
@@ -1484,11 +1493,37 @@ impl FoyerObjectStoreCache {
     /// suppress all of them in one place. `l1_max_entry_bytes = 0` (metadata
     /// entries) keeps the default L1+disk placement.
     fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
-        if bypass_active() {
+        if bypass_active() && !self.repeat_sighting(&key) {
             crate::metrics::record_cache_insert_bypassed();
             return;
         }
         insert_main(cache, key, value, l1_max_entry_bytes);
+    }
+
+    /// Has a bypassed scan already tried to admit `key` once?
+    ///
+    /// The bypass exists so a ONE-OFF wide scan cannot evict the hot set on its
+    /// way through — a real concern with L2 full (118.5 of 120 GB, 12.3k
+    /// evictions, prod 2026-08-09). But a dashboard panel is the opposite of a
+    /// one-off: it is the most repeated query in the system, and under a blanket
+    /// bypass it can never warm its own working set. Measured on prod, the same
+    /// 3d panel ran 24.4 s cold and plateaued at ~11-15 s warm purely on the
+    /// caches the bypass does NOT touch (parquet metadata, provider) — the data
+    /// blocks never stuck.
+    ///
+    /// First sighting records and still declines; the second admits. So an
+    /// ad-hoc scan that touches a key once pays nothing, and a panel that
+    /// refreshes converges. `DashSet` insert returns false when already present,
+    /// which is exactly the second-sighting test.
+    ///
+    /// Bounded by clearing wholesale at [`BYPASS_SEEN_MAX`] rather than tracking
+    /// per-entry recency: this is a hint, and a rare full reset costs one extra
+    /// cold pass, not correctness.
+    fn repeat_sighting(&self, key: &str) -> bool {
+        if self.bypass_seen.len() >= BYPASS_SEEN_MAX {
+            self.bypass_seen.clear();
+        }
+        !self.bypass_seen.insert(key.to_string())
     }
 
     /// Cache a fetched byte range under `key`, stamped with the file's identity
@@ -3075,6 +3110,30 @@ mod tests {
         assert!(cache.cache.contains(cold.as_ref()));
         assert!(!bypass_active(), "the scope must not leak past its future");
 
+        cache.shutdown().await?;
+        Ok(())
+    }
+
+    /// A wide scan is bypassed so a ONE-OFF cannot evict the hot set, but a
+    /// dashboard panel is the most REPEATED query in the system and under a
+    /// blanket bypass could never warm its own working set: measured on prod
+    /// 2026-08-09 the same 3d panel went 24.4 s cold -> ~11-15 s warm purely on
+    /// the metadata/provider caches the bypass does not touch, while its data
+    /// blocks never stuck. Second sighting admits.
+    #[tokio::test]
+    async fn a_repeated_bypassed_scan_warms_on_the_second_sighting() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let cache = FoyerObjectStoreCache::new(inner.clone(), FoyerCacheConfig::test_config("bypass_repeat")).await?;
+        let cold = Path::from("tbl/date=2020-01-01/cold.parquet");
+        inner.put(&cold, PutPayload::from_static(b"cold-bytes")).await?;
+
+        scan_bypass_scope(true, async { cache.get(&cold).await.unwrap().bytes().await.unwrap() }).await;
+        assert!(!cache.cache.contains(cold.as_ref()), "first sighting still declines — a one-off scan pays nothing");
+
+        scan_bypass_scope(true, async { cache.get(&cold).await.unwrap().bytes().await.unwrap() }).await;
+        assert!(cache.cache.contains(cold.as_ref()), "second sighting admits, so a refreshing panel converges");
+
+        assert!(!bypass_active(), "the scope must not leak past its future");
         cache.shutdown().await?;
         Ok(())
     }
