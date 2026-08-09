@@ -10954,10 +10954,27 @@ fn host_mem_available_bytes() -> Option<u64> {
 /// are metadata-cache-backed ranged reads, not rewrites, so this is bounded by
 /// object-store round trips rather than memory.
 /// How many times one repair tick may re-select after clearing false suspects.
-/// Bounded so a project whose sealed dates are ENTIRELY well-formed cannot spin
-/// the planner for the whole budget; `repair_verified_sorted` persists for the
-/// process, so the next tick resumes where this one stopped.
-const REPAIR_RESELECT_ROUNDS: usize = 12;
+///
+/// Must exceed a project's run of false suspects, or the tick cannot REACH its
+/// real work. Every day's flush output lands untagged — the tag is written by
+/// optimize, not flush — so each sealed day contributes a fresh batch of
+/// suspects NEWER than any old poisoned file, and newest-first walks them
+/// first. Prod 2026-08-09: shipbubble had 16 suspects on 2026-08-08 plus 2 on
+/// 08-01 sitting in front of the single 1,088,634,971-byte file on 07-30 that
+/// was blocking its 14- and 30-day queries. At 12 the tick cleared 12 and
+/// stopped one short, every tick, forever.
+///
+/// 64 is cheap: a round is one snapshot walk plus up to
+/// `REPAIR_VERIFY_CONCURRENCY` ranged footer reads against the cache the scan
+/// warms — tens of seconds in total against a 144-minute budget — and the loop
+/// exits the moment a round clears nothing, so a well-formed project still
+/// stops immediately rather than spinning.
+///
+/// NOTE `repair_verified_sorted` is in-process only, so a restart resets the
+/// walk to the newest candidate. Under frequent deploys that is what makes the
+/// cap load-bearing rather than a mere optimisation; persisting it is the
+/// durable fix (see docs/plans/2026-08-08-resumable-footer-repair.md).
+const REPAIR_RESELECT_ROUNDS: usize = 64;
 
 const REPAIR_VERIFY_CONCURRENCY: usize = 16;
 
