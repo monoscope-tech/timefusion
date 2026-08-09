@@ -1489,9 +1489,8 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
         let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
-        let batch = |lo: usize, hi: usize| -> Result<_> {
-            json_to_batch((lo..hi).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect())
-        };
+        let batch =
+            |lo: usize, hi: usize| -> Result<_> { json_to_batch((lo..hi).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect()) };
         // Two flushes covering the same keys -> cross-file duplicates.
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(0, DUPLICATED)?], true, None).await?;
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(0, DUPLICATED)?], true, None).await?;
