@@ -699,6 +699,16 @@ fn build_optimize_session_state_tuned(
 /// at 4 partitions, hence 2.
 const MAINTENANCE_MAX_PARTITIONS: usize = 2;
 
+/// The `date=` partition a repair bin sits in, for ordering by how recent its
+/// poison is. Empty string sorts last, which is the right default for a path
+/// that carries no date.
+fn repair_bin_date(files: &[String]) -> &str {
+    files
+        .first()
+        .and_then(|p| p.split('/').find_map(|seg| seg.strip_prefix("date=")))
+        .unwrap_or("")
+}
+
 /// Parallelism for the REPAIR sort specifically, which `MAINTENANCE_MAX_PARTITIONS`
 /// otherwise pins at 2.
 ///
@@ -8514,6 +8524,24 @@ impl Database {
             }
             planned = next;
         }
+        // Serve the most RECENT poison first, across projects.
+        //
+        // By this point the suspects are gone and every remaining bin is real
+        // work, so its date is known — and that date is the only thing that
+        // says how much damage the file is doing. One footer-less file voids
+        // the scan ordering for EVERY query window that reaches it, so a file
+        // on 2026-07-30 breaks 14- and 30-day queries while one on 2026-05-30
+        // breaks only queries reaching back 70+ days, which almost nobody runs.
+        //
+        // Ordering by candidate COUNT (shortest-job-first, which is right for
+        // finishing projects) ignores that entirely. Prod 2026-08-09, measured
+        // with the `selected=` log: a 30-minute uninterrupted pass served
+        // 2026-05-30, 05-31, 06-09 and 07-10 — every one of them older, and
+        // less user-visible, than the 2026-07-30 file that was the reason two
+        // tenants could not query 14 or 30 days.
+        if policy.pass == TailPass::Repair {
+            planned.sort_by(|a, b| repair_bin_date(&b.1).cmp(repair_bin_date(&a.1)));
+        }
         Ok(planned)
     }
 
@@ -11485,6 +11513,32 @@ fn staged_chunks<T>(staged: Vec<T>, per_bin: bool) -> Vec<Vec<T>> {
             true => vec![],
             false => vec![staged],
         },
+    }
+}
+
+#[cfg(test)]
+mod repair_order_tests {
+    /// Across projects, repair serves the most RECENT poison first.
+    ///
+    /// One footer-less file voids scan ordering for every query window that
+    /// reaches it, so a file on 2026-07-30 breaks 14- and 30-day queries while
+    /// one on 2026-05-30 breaks only queries reaching back 70+ days. Prod
+    /// 2026-08-09: a 30-minute pass served 2026-05-30, 05-31, 06-09 and 07-10
+    /// and never reached the 07-30 file two tenants were blocked on.
+    #[test]
+    fn repair_bin_date_extracts_the_partition_and_orders_recent_first() {
+        let bin = |d: &str| vec![format!("project_id=abc/date={d}/part-00000-x.zstd.parquet")];
+        assert_eq!(super::repair_bin_date(&bin("2026-07-30")), "2026-07-30");
+        assert_eq!(super::repair_bin_date(&[]), "", "no file sorts last");
+        assert_eq!(super::repair_bin_date(&["no-date-here.parquet".to_string()]), "", "no date sorts last");
+
+        let mut planned: Vec<(String, Vec<String>)> = vec![
+            ("old".into(), bin("2026-05-30")),
+            ("blocking".into(), bin("2026-07-30")),
+            ("older".into(), bin("2026-06-09")),
+        ];
+        planned.sort_by(|a, b| super::repair_bin_date(&b.1).cmp(super::repair_bin_date(&a.1)));
+        assert_eq!(planned.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["blocking", "older", "old"]);
     }
 }
 
