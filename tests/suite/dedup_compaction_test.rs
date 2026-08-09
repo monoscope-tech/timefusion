@@ -1465,6 +1465,97 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     Ok(())
 }
 
+/// A predicate on a version-MUTABLE column, pushed into the Delta leg because
+/// the window is sweep-certified. This is the half of the swept-partition work
+/// that reclaims ROWS rather than the key projection: prod 2026-08-09 measured
+/// monoscope-self decoding 15.97 M rows to keep 35.89 K (445x) because
+/// `version_mutable_columns` withheld every dashboard predicate and only
+/// `timestamp >=` ever reached Parquet.
+///
+/// It is also the change most able to corrupt a read. Pushing such a predicate
+/// BELOW the dedup normally drops the newer version of a key and leaves
+/// keep-greatest serving the superseded one — `WHERE status_code = 'OK'`
+/// matching a row already updated to 'ERROR' (2026-08-02,
+/// `integration::test_update_operations`). The claim is that a certified
+/// partition has no superseded version to serve, so this asserts BOTH
+/// directions: the new value is found, and the old value is NOT.
+#[serial]
+#[tokio::test]
+async fn a_pushed_mutable_predicate_on_a_swept_partition_cannot_match_the_superseded_row() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("swept_pushdown_mutable").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    // `name` is version-mutable, so this predicate is exactly the one that may
+    // now reach the Parquet scan on a certified window.
+    let count_where = |val: &str| {
+        let sql = format!(
+            "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+             AND timestamp >= to_timestamp_micros({ts}) AND timestamp <= to_timestamp_micros({ts}) \
+             AND name = '{val}'"
+        );
+        let db = Arc::clone(&db);
+        async move { db.query_delta_only(&sql).await.map(|bs| bs.iter().map(|b| b.num_rows()).sum::<usize>()) }
+    };
+
+    assert_eq!(count_where("updated").await?, 1, "the winning version must still be found through a pushed predicate");
+    assert_eq!(
+        count_where("original").await?,
+        0,
+        "the SUPERSEDED value must match nothing — if it matches, the pushdown resurrected a stale version below the dedup"
+    );
+    Ok(())
+}
+
+/// The guard on the test above: an UNCERTIFIED window must NOT get the
+/// pushdown, and must still answer correctly.
+///
+/// Same two versions, but no sweep — so `dedup_skip_allowed` refuses, the
+/// mutable predicate is re-stripped by `leg_safe`, `DedupExec` runs, and the
+/// FilterExec above it rejects the stale match. If the pushdown ever escapes
+/// its certification gate this is the test that catches it, because here the
+/// superseded row really is still on disk.
+#[serial]
+#[tokio::test]
+async fn an_uncertified_window_still_hides_the_superseded_row_from_a_mutable_predicate() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("uncertified_no_pushdown").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true; // enabled, but the window is not certified
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
+
+    // Deliberately NO `dedup_today_partitions`: both physical versions remain.
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "precondition: the superseded row is physically present, so a leaked pushdown could match it");
+
+    let count_where = |val: &str| {
+        let sql = format!(
+            "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+             AND timestamp >= to_timestamp_micros({ts}) AND timestamp <= to_timestamp_micros({ts}) \
+             AND name = '{val}'"
+        );
+        let db = Arc::clone(&db);
+        async move { db.query_delta_only(&sql).await.map(|bs| bs.iter().map(|b| b.num_rows()).sum::<usize>()) }
+    };
+
+    assert_eq!(count_where("original").await?, 0, "uncertified: the superseded version must stay invisible — a match here means the pushdown escaped its gate");
+    assert_eq!(count_where("updated").await?, 1, "uncertified: the winner is still returned");
+    Ok(())
+}
+
 /// COUNT parity — the precondition `timefusion_read_dedup_skip_swept`'s own doc
 /// names ("off by default until COUNT parity is validated on prod-shaped
 /// data"). The skip removes `DedupExec` and its key projection, so if the

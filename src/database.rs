@@ -13656,9 +13656,19 @@ impl TableProvider for ProjectRoutingTable {
             .map(|f| {
                 if Self::references_tombstone(&self.table_name, f)
                     || (!variant_cols.is_empty() && f.column_refs().iter().any(|c| variant_cols.contains(&c.name)))
-                    || mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
                 {
                     TableProviderFilterPushDown::Unsupported
+                } else if mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name))) {
+                    // `Inexact`, not `Unsupported`: DataFusion keeps its own
+                    // FilterExec above the scan either way, but `Unsupported`
+                    // also withholds the predicate from `scan()`, and `scan()`
+                    // is the only place that knows whether this window is
+                    // sweep-certified. `scan()` re-strips it for every path that
+                    // is not (see `leg_safe`), so this widens what `scan()` can
+                    // SEE without widening what any leg is given. NEVER `Exact`:
+                    // the above-dedup FilterExec is what makes a stale-version
+                    // match impossible, and `Exact` would delete it.
+                    TableProviderFilterPushDown::Inexact
                 } else if Self::is_exact_pushdown_filter(f) {
                     TableProviderFilterPushDown::Exact
                 } else {
@@ -14102,6 +14112,25 @@ impl TableProvider for ProjectRoutingTable {
             let skip_dedup = pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
+                // The window is sweep-certified: exactly one row per key, and it
+                // is the winner. The reason a version-mutable predicate may not
+                // reach a leg — that it drops the NEWER version and leaves
+                // keep-greatest serving a stale one — has no instance here,
+                // because there is no superseded version to serve. This is the
+                // same argument `dedup_skip_allowed` makes to delete DedupExec
+                // entirely; a scan that needs no dedup needs no protection from
+                // pruning below it.
+                //
+                // This is the half that matters for dashboards. Skipping dedup
+                // reclaims the key projection; pushing `kind = 'server'` down
+                // reclaims the ROWS, and prod 2026-08-09 measured monoscope-self
+                // decoding 15.97 M rows to keep 35.89 K of them (445x) because
+                // only `timestamp >=` ever reached Parquet.
+                //
+                // Delta-only by construction: `dedup_skip_allowed` is never
+                // granted while the MemBuffer leg is in play, and MemBuffer is
+                // exactly where uncertified versions live.
+                delta_only_filters.extend(unstripped_filters.iter().filter(|f| !leg_safe(f) && !Self::references_tombstone(&self.table_name, f)).cloned());
             }
             // Restoring the pushed limit is only sound when nothing above the
             // scan drops rows — the tombstone filter does, regardless of dedup.
