@@ -20,6 +20,7 @@ pub mod logical_count_index;
 pub mod mem_buffer;
 pub mod metrics;
 pub mod object_store_cache;
+pub mod rollup;
 pub mod optimizers;
 pub mod pgwire_early_bind;
 pub mod pgwire_handlers;

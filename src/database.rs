@@ -7644,6 +7644,37 @@ impl Database {
     /// Takes the SAME `table` guard the caller will scan/sum from, so the
     /// fingerprint verdict and the data read share one snapshot (no
     /// check-then-use window; 2026-07-05 review hardening).
+    /// Recompute one certified partition's rollup buckets.
+    ///
+    /// Best-effort by design: a failure here must never fail the dedup sweep
+    /// that certified the partition, because the sweep's own result (a
+    /// duplicate-free partition) is correct and useful without the rollup. A
+    /// missing bucket costs a raw scan — the same thing every query did before
+    /// this table existed — so `route` simply finds nothing to serve.
+    async fn rebuild_rollup_partition(&self, project_id: &str, date: &str) {
+        let sql = crate::rollup::build_partition_sql(project_id, date);
+        let rows = match self.query_delta_only(&sql).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(project_id, date, "rollup build: aggregate failed, leaving the window to raw scans: {e}");
+                return;
+            }
+        };
+        let batches = match crate::rollup::to_rollup_batches(project_id, date, &rows) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => return,
+            Err(e) => {
+                warn!(project_id, date, "rollup build: shaping failed: {e}");
+                return;
+            }
+        };
+        let written: usize = batches.iter().map(|b| b.num_rows()).sum();
+        match self.insert_records_batch(project_id, crate::rollup::ROLLUP_TABLE, batches, true, None).await {
+            Ok(_) => info!(project_id, date, rows = written, event = "rollup_partition_built"),
+            Err(e) => warn!(project_id, date, "rollup build: write failed: {e}"),
+        }
+    }
+
     pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> bool {
         let Some(dates) = window_dates(lo, hi) else { return false };
         dates.into_iter().all(|date| {
@@ -7921,6 +7952,17 @@ impl Database {
                         let fp_post = partition_file_fp(post.clone());
                         if d == 0 && complete && !post.is_empty() && partition_file_fp(pre) == fp_post {
                             self.dedup_clean_fp.insert(fp_key, fp_post);
+                            // Rollup buckets are built HERE and nowhere else: a
+                            // bucket computed over a bin that is later deduped is
+                            // simply wrong, so the build trigger is the
+                            // certification signal rather than a timer. The
+                            // rewrite is idempotent (`rollup::bucket_id` is
+                            // deterministic in bucket+dimensions), so re-running
+                            // it for an already-built partition replaces its rows
+                            // instead of doubling every measure.
+                            if table_name == crate::rollup::SOURCE_TABLE {
+                                self.rebuild_rollup_partition(pid, &date.to_string()).await;
+                            }
                         } else {
                             self.dedup_clean_fp.remove(&fp_key);
                         }

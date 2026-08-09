@@ -1556,6 +1556,69 @@ async fn an_uncertified_window_still_hides_the_superseded_row_from_a_mutable_pre
     Ok(())
 }
 
+/// End-to-end for the dashboard rollup: certifying a partition must build its
+/// buckets, and those buckets must agree with the raw aggregate EXACTLY.
+///
+/// A rollup that disagrees is worse than no rollup — it returns a wrong number
+/// silently, on the panel people trust most. So this compares the stored
+/// measures against the same aggregate computed from raw spans, rather than
+/// asserting the rollup merely exists.
+///
+/// It also pins idempotence: the build is triggered by certification, and a
+/// partition can be certified more than once, so a second build must REPLACE
+/// its rows rather than double every count.
+#[serial]
+#[tokio::test]
+async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggregate() -> Result<()> {
+    let cfg = TestConfigBuilder::new("rollup_build_parity").with_buffer_mode(BufferMode::Enabled).build();
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+    let ts = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    // Several spans inside one minute bucket, plus one in the next.
+    for (i, offset) in [0i64, 1_000_000, 2_000_000, 60_000_000].iter().enumerate() {
+        let batch = json_to_batch(vec![test_span_ts(&format!("span_{i}"), "op", &project_id, ts + offset)])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    }
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    let total_from_rollup = |db: Arc<Database>, project_id: String| async move {
+        let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_rollup_1m WHERE project_id = '{project_id}'");
+        let batches = db.query_delta_only(&sql).await?;
+        let v = batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .filter_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|c| c.value(0)))
+            .next()
+            .unwrap_or(0);
+        anyhow::Ok(v)
+    };
+
+    let raw_total = {
+        let sql = format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project_id}'");
+        let batches = db.query_delta_only(&sql).await?;
+        batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .filter_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|c| c.value(0)))
+            .next()
+            .unwrap_or(0)
+    };
+
+    let rolled = total_from_rollup(Arc::clone(&db), project_id.clone()).await?;
+    assert_eq!(rolled, raw_total, "rollup request_count must sum to the raw row count, or every Traffic panel is silently wrong");
+    assert!(raw_total > 0, "precondition: the fixture actually wrote rows");
+
+    // Certify again: the build must replace, not append.
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    let after_rebuild = total_from_rollup(Arc::clone(&db), project_id.clone()).await?;
+    assert_eq!(after_rebuild, raw_total, "a second certification must REPLACE the buckets, not double every measure");
+    Ok(())
+}
+
 /// COUNT parity — the precondition `timefusion_read_dedup_skip_swept`'s own doc
 /// names ("off by default until COUNT parity is validated on prod-shaped
 /// data"). The skip removes `DedupExec` and its key projection, so if the

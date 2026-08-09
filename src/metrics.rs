@@ -105,6 +105,8 @@ counter_registry! {
     cache_confirm_attempts     => "timefusion.cache.confirm_attempts": "Files probed by the pre-drain cache confirm on the flush path (Influx oracle ordering). Files captured during upload cost only this probe",
     cache_confirm_warmed       => "timefusion.cache.confirm_warmed": "Files the pre-drain confirm had to fetch because write-capture skipped them. Sustained ~= confirm_attempts means the write-capture caps are too tight — every flush output is being re-read from S3",
     cache_confirm_timeouts     => "timefusion.cache.confirm_timeouts": "Pre-drain cache confirms that hit their bound and gave up. Best-effort — the commit and the drain proceed; the next query on those files just pays an S3 round-trip",
+    rollup_hits                => "timefusion.rollup.hits": "Dashboard aggregates served from the pre-aggregated rollup instead of raw spans",
+    rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
     cache_insert_bypassed      => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
     hot_tier_demote_skipped    => "timefusion.hot_tier.demote_skipped": "Flush groups NOT demoted to the local hot tier because a demotion was already running (the bound that keeps drained batches from piling up off-ledger). Purely a latency miss — those windows are served from Delta. WARN if sustained: the local IPC write is falling behind the flush rate",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
@@ -404,6 +406,21 @@ sum_recorders! {
 /// One commit-path operation abandoned by its bound. `op` is a fixed set of
 /// static labels (bounded cardinality by construction — never a table or
 /// project id, which belong on the accompanying warn's span attributes).
+/// One dashboard aggregate answered from the rollup.
+pub fn record_rollup_hit() {
+    if let Some(m) = METRICS.get() {
+        m.rollup_hits.add(1, &[]);
+    }
+}
+
+/// One dashboard aggregate that fell through to a raw scan. `reason` is a
+/// `MissReason::label` — a closed, bounded set, never a table or project id.
+pub fn record_rollup_miss(reason: &'static str) {
+    if let Some(m) = METRICS.get() {
+        m.rollup_misses.add(1, &[KeyValue::new("reason", reason)]);
+    }
+}
+
 pub fn record_commit_timeout(op: &'static str) {
     if let Some(m) = METRICS.get() {
         m.commit_lock_timeouts.add(1, &[KeyValue::new("op", op)]);

@@ -1,0 +1,51 @@
+table_name: otel_rollup_1m
+# Same [project_id, date] partitioning as the table it summarizes, so
+# `ProjectRoutingTable` gives multi-tenant isolation and date pruning for free.
+partitions:
+  - project_id
+  - date
+# A bucket is uniquely identified by its time and its dimension tuple. Rebuilds
+# replace a bucket rather than appending a second copy of it, so the rewrite is
+# idempotent and a re-certified bin can simply be rebuilt.
+dedup_keys:
+  - timestamp
+  - id
+dedup_tiebreak: updated_at
+tombstone_column: deleted
+# NOT version_append. Rollup rows are never enriched in place — a bucket is
+# rebuilt wholesale from its source partition — so there are no superseded
+# versions to resolve at read time, and the read path pays no dedup ordering.
+version_append: false
+sorting_columns:
+  - name: timestamp
+    descending: true
+    nulls_first: true
+z_order_columns: []
+fields:
+  - { name: project_id, data_type: Utf8, nullable: true }
+  # Bucket START, at the grain named by the table (1 minute).
+  - { name: timestamp, data_type: 'Timestamp(Microsecond, Some("UTC"))', nullable: false }
+  - { name: date, data_type: Date32, nullable: false }
+  # Deterministic hash of (bucket, dimension tuple) — see `rollup::bucket_id`.
+  # Deterministic on purpose: a rebuild of the same bucket must collide with the
+  # row it replaces, which is what makes the rewrite idempotent.
+  - { name: id, data_type: Utf8, nullable: false }
+  - { name: updated_at, data_type: 'Timestamp(Microsecond, Some("UTC"))', nullable: false }
+  - { name: deleted, data_type: Boolean, nullable: true }
+  # DIMENSIONS. Every one must be low-cardinality: rows per bucket is roughly the
+  # product of their distinct counts, and at 1m grain that product has to stay in
+  # the low thousands or this table is a slightly smaller copy of the source.
+  # A filter on any column NOT listed here disqualifies the query from routing
+  # (see `rollup::route`), because a filter cannot be applied after aggregation.
+  - { name: resource___service___name, data_type: Utf8, nullable: true }
+  - { name: kind, data_type: Utf8, nullable: true }
+  - { name: status_code, data_type: Utf8, nullable: true }
+  # DECOMPOSABLE measures only. count/sum/min/max re-aggregate across buckets and
+  # across collapsed dimensions; avg is sum/count. Exact percentiles and exact
+  # count(distinct) do NOT, and `rollup::route` refuses them rather than
+  # answering them approximately without being asked.
+  - { name: request_count, data_type: Int64, nullable: false }
+  - { name: error_count, data_type: Int64, nullable: false }
+  - { name: duration_sum, data_type: Int64, nullable: true }
+  - { name: duration_min, data_type: Int64, nullable: true }
+  - { name: duration_max, data_type: Int64, nullable: true }
