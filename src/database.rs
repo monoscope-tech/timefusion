@@ -8998,7 +8998,14 @@ impl Database {
                         .and_then(|p| p.schema().field_with_name(&col).ok().map(|f| format!("{:?}", f.data_type())));
                     match (want > 1).then_some(()).and(cast_ty).zip(bin_time_range(&ctx, &probe).await) {
                         Some((ty, (lo, hi))) if hi > lo => {
-                            let mut bounds = repair_slice_bounds(lo, hi, want);
+                            // Equal-ROW cuts where they can be had; the equal-TIME
+                            // split only bounds memory when rows are spread evenly,
+                            // and on the file this exists for they are not.
+                            let cuts = repair_slice_cuts(&ctx, bin_table.as_str(), &col, want).await;
+                            let mut bounds = match cuts.is_empty() {
+                                false => repair_bounds_from_cuts(lo, hi, &cuts),
+                                true => repair_slice_bounds(lo, hi, want),
+                            };
                             if lead.is_some_and(|c| c.descending) {
                                 bounds.reverse();
                             }
@@ -11029,6 +11036,72 @@ fn repair_slice_bounds(lo: i64, hi: i64, slices: usize) -> Vec<(i64, Option<i64>
         })
         // A degenerate span can produce empty ranges; they simply select nothing.
         .collect()
+}
+
+/// Interior cut points placed at equal-ROW quantiles of the sort column.
+///
+/// `repair_slice_bounds` cuts the time span into equal parts, which bounds
+/// memory only if rows are spread evenly across it. They are not: shipbubble's
+/// `date=2026-07-30` sliced 5 ways and one slice still held the whole file —
+/// `ExternalSorter` peaked at 22.0 GB with its merge pinning another 11.3 GB, so
+/// a single bin owned 22.2 GB of the 22.5 GB pool and starved three other
+/// tenants' repairs into quarantine (prod 2026-08-09).
+///
+/// Quantiles keep every property the time split has — the cuts are still
+/// contiguous ranges in the column's own order, so the concatenation stays
+/// globally sorted and each footer stays honest — while making the ROW count per
+/// slice flat regardless of how the timestamps clump. Approximate is fine: the
+/// cuts only need to be monotone to tile correctly, and the row-count guard
+/// still verifies the rewrite before anything commits.
+async fn repair_slice_cuts(ctx: &datafusion::prelude::SessionContext, bin_table: &str, col: &str, slices: usize) -> Vec<i64> {
+    use datafusion::arrow::array::Array;
+    if slices <= 1 {
+        return Vec::new();
+    }
+    let exprs = (1..slices)
+        .map(|i| format!("approx_percentile_cont(arrow_cast(\"{col}\", 'Int64'), {})", i as f64 / slices as f64))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Ok(df) = ctx.sql(&format!("SELECT {exprs} FROM {bin_table}")).await else {
+        return Vec::new();
+    };
+    let Ok(batches) = df.collect().await else {
+        return Vec::new();
+    };
+    let Some(batch) = batches.into_iter().find(|b| b.num_rows() > 0) else {
+        return Vec::new();
+    };
+    let mut cuts: Vec<i64> = (0..batch.num_columns())
+        .filter_map(|i| {
+            let c = batch.column(i);
+            (!c.is_null(0))
+                .then(|| arrow::compute::kernels::cast::cast(c, &arrow_schema::DataType::Int64).ok())
+                .flatten()
+                .map(|c| arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(&c).value(0))
+        })
+        .collect();
+    // Heavy ties collapse neighbouring quantiles onto one value. Deduping just
+    // yields fewer, larger slices — an overlap would duplicate rows, so it is
+    // the one outcome that must not survive.
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
+}
+
+/// Turn interior cut points into the same half-open, ascending tiling
+/// `repair_slice_bounds` produces: `[lo, c1), [c1, c2), ... [cn, +inf)`.
+fn repair_bounds_from_cuts(lo: i64, hi: i64, cuts: &[i64]) -> Vec<(i64, Option<i64>)> {
+    // Deduped here rather than trusting the caller: repeated cuts are empty
+    // ranges, which cost a full scan each and select nothing.
+    let mut interior: Vec<i64> = cuts.iter().copied().filter(|&c| c > lo && c <= hi).collect();
+    interior.sort_unstable();
+    interior.dedup();
+    if interior.is_empty() {
+        return vec![(lo, None)];
+    }
+    let starts = std::iter::once(lo).chain(interior.iter().copied());
+    let ends = interior.iter().copied().map(Some).chain(std::iter::once(None));
+    starts.zip(ends).collect()
 }
 
 fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String {
@@ -16109,6 +16182,39 @@ mod tests {
             panic!("a bare integer bound must NOT silently coerce");
         };
         assert!(format!("{err}").contains("type_coercion"), "expected the prod failure mode, got: {err}");
+    }
+
+    /// Quantile cuts must tile exactly like the uniform split — a gap drops rows
+    /// and an overlap duplicates them, putting two versions of one key in
+    /// different files where keep-greatest can no longer see them together.
+    #[test]
+    fn repair_cut_bounds_tile_the_range_and_survive_skew() {
+        let tiles = |bounds: &[(i64, Option<i64>)], lo: i64, hi: i64| {
+            assert_eq!(bounds[0].0, lo, "first slice starts at lo");
+            assert!(bounds.last().expect("non-empty").1.is_none(), "last slice is open so hi is never dropped");
+            for w in bounds.windows(2) {
+                assert_eq!(w[0].1.expect("only the last is open"), w[1].0, "{:?} must abut {:?}", w[0], w[1]);
+            }
+            for v in [lo, lo + 1, (lo + hi) / 2, hi - 1, hi] {
+                let hits = bounds.iter().filter(|(s, e)| v >= *s && e.is_none_or(|e| v < e)).count();
+                assert_eq!(hits, 1, "value {v} must fall in exactly one slice of {bounds:?}");
+            }
+        };
+
+        // Skewed cuts — the whole point: they may bunch anywhere in the range.
+        let bounds = super::repair_bounds_from_cuts(0, 1000, &[997, 998, 999]);
+        assert_eq!(bounds.len(), 4);
+        tiles(&bounds, 0, 1000);
+
+        // Ties collapse to FEWER slices, never to an overlap.
+        assert_eq!(super::repair_bounds_from_cuts(0, 100, &[50, 50, 50]), vec![(0, Some(50)), (50, None)]);
+
+        // Cuts outside (lo, hi] are ignored; all-degenerate falls back to one pass.
+        assert_eq!(super::repair_bounds_from_cuts(10, 20, &[5, 10, 99]), vec![(10, None)]);
+        assert_eq!(super::repair_bounds_from_cuts(0, 100, &[]), vec![(0, None)]);
+
+        // A cut exactly at hi is legal: it opens a final slice holding only hi.
+        tiles(&super::repair_bounds_from_cuts(0, 100, &[100]), 0, 100);
     }
 
     #[test]
