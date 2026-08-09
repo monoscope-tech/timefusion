@@ -1,5 +1,69 @@
 # Dashboard query performance improvement plan
 
+## Latest context (2026-08-09) — re-measured, and the diagnosis has CHANGED
+
+**The dedup explanation for wide-query cost is dead.** It was true when this
+plan and `tf_wide_query_cost_is_the_dedup_key` were written: one footer-less
+file voided a scan's ordering, `DedupExec` fell back to `full-set`, buffered
+everything and hit the 2 GiB per-query cap. Footer repair fixed that
+(2026-08-09 — slicing `556f82f`, and `79bb75a`, which stopped every recovered
+rewrite being discarded before commit). Measured after, on prod:
+
+```
+EXPLAIN count(*)  3d / 7d / 14d  ->  DedupExec mode=bounded[timestamp]   (all three)
+```
+
+Bounded at every width. So **dedup is no longer the bottleneck for aggregates**
+and the per-date dedup split this plan's successors assumed is NOT the next
+move. Do not start there.
+
+**What the cost actually is now — a cliff between 3 and 7 days** (talstack
+`6297304f`, prod, 2026-08-09):
+
+| window | wall | rows |
+|---|---|---|
+| 1d | 2564 ms | 630,384 |
+| 3d | 7209 ms | 7,890,807 |
+| 7d | **>100 s (timed out)** | — |
+
+3d costs ~1.1M rows/s. Linear extrapolation puts 7d near 18 s; it exceeds 100 s.
+The non-linearity is not dedup (bounded), not ordering (repaired), and not row
+count — it is **files opened**. The table is 2403 active files / 986.8 GB, 27%
+of them under 32 MB, with 98-140 files on each of the busiest dates, so a 7-day
+aggregate opens ~700-900 objects, most of them cold in Foyer.
+
+Point queries are already fine at any width — shipbubble 30d `LIMIT` is 1120 ms
+and talstack 851 ms, both from timeouts earlier the same day. **The split is
+point-lookup vs unbounded aggregate**, not narrow vs wide.
+
+### What to tackle next, in order
+
+1. **§5 rollups (below) — the real parity move.** ClickHouse and Influx win
+   these workloads by not touching raw rows at all. Every dashboard range >= 3
+   days should read a rollup; that removes the 700-900 file opens rather than
+   making them faster. This plan already specifies it.
+2. **Cold-file open cost** — `2026-07-31-local-hot-tier.md` and the Foyer work
+   attack the same number from the other side, and help ad-hoc queries that no
+   rollup can anticipate. Second because it improves a constant, where rollups
+   remove the work.
+3. **NOT the dedup key.** Retired by measurement above.
+
+### Adjacent facts worth carrying
+
+- `write-throughput-and-backlog` §G ("file-count explosion, 52.9k files, the
+  steady-state limiter") is RESOLVED: 2403 files today. That plan's remaining
+  value is historical.
+- Maintenance is healthy again post-`79bb75a`: `dirty_bin_queue_depth` 1264 ->
+  256 within the session, `light_optimize_projects_completed` 164/177,
+  `light_optimize_failed_total` 1. RSS 21.6 GB of 120 GB, no OOM kills.
+- `dedup_timed_out_total` = 11 since the 16:41 restart. Not yet explained, and
+  the one live maintenance signal still pointing at dedup — worth a look before
+  assuming dedup is entirely healthy.
+- Do NOT benchmark this with unbounded `count(*)` over wide windows on prod: it
+  is what pushed the instance into dropped connections and a
+  `exit 137: unhealthy container` on 2026-08-09. Use `EXPLAIN` for mode and
+  narrow windows for cost.
+
 ## Goal
 
 Make the common Overview/Service dashboard workloads responsive for high-volume projects without increasing write-path pressure:
