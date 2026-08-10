@@ -322,8 +322,11 @@ impl ExecutionPlan for OrderingProbeExec {
 fn leading_bound(input: &Arc<dyn ExecutionPlan>, in_schema: &SchemaRef) -> Option<Bound> {
     let se = input.properties().output_ordering()?.iter().next()?;
     let col = sort_col(se)?;
-    matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))
-        .then(|| Bound { idx: col.index(), desc: se.options.descending, last: None })
+    matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..)).then(|| Bound {
+        idx: col.index(),
+        desc: se.options.descending,
+        last: None,
+    })
 }
 
 /// Rows observed out of the order their scan declared. See `Bound::advance`.

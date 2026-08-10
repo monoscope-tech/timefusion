@@ -14146,14 +14146,8 @@ impl TableProvider for ProjectRoutingTable {
         // Identity travels WITH the plan, so the flatten cannot desynchronise it
         // from the sortability it implies (see `wrap_result`).
         use crate::read_dedup::LegKind;
-        let legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> = [
-            mem_plan.map(|p| (p, LegKind::Mem)),
-            hot_plan.map(|p| (p, LegKind::Hot)),
-            Some((delta_plan, LegKind::Delta)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> =
+            [mem_plan.map(|p| (p, LegKind::Mem)), hot_plan.map(|p| (p, LegKind::Hot)), Some((delta_plan, LegKind::Delta))].into_iter().flatten().collect();
         wrap_result(legs)
     }
 
