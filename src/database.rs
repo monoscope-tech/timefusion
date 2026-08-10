@@ -2961,6 +2961,21 @@ impl Database {
         // re-clearing them. See `load_verified_sorted`.
         db.load_verified_sorted();
 
+        // Re-adopt rollup coverage from the rollup tables themselves. Spawned,
+        // not awaited: it reads object storage, and a slow probe must not delay
+        // every other scheduler behind it. Until it lands, reads simply miss and
+        // fall back to raw scans — the same thing they did before rollups.
+        {
+            let db = db.clone();
+            tokio::spawn(async move {
+                for source in crate::schema_loader::registry().list_tables() {
+                    if let Err(error) = db.recover_rollup_coverage(&source).await {
+                        warn!(source, %error, "rollup coverage recovery failed; those partitions stay on raw scans");
+                    }
+                }
+            });
+        }
+
         // Always-on pressure sampling. `scan_pressure_permits` samples lazily
         // (on gated decode polls), so a climb driven by anything OTHER than a
         // wide scan — flush sorts, replay, maintenance — reached the OOM kill
@@ -3145,6 +3160,27 @@ impl Database {
                         // for custom-storage ones (they are separate Delta logs).
                         let key = if project_id.is_empty() { table_name.clone() } else { format!("{project_id}:{table_name}") };
                         db.run_dedup_for_table(&table, &table_name, &key, &Self::table_label(&project_id, &table_name)).await;
+                    }
+                }
+            }
+        });
+
+        // Rollup backfill — build sealed past days the dedup sweep never reaches.
+        // Deliberately does NOT take `maintenance_job_sem`: that is held for the
+        // whole dedup and optimize passes, which run for hours under backlog, and
+        // a backfill that can only run when they are idle is a backfill that
+        // never runs. `spawn_cron_job` already skips overlapping ticks.
+        spawn_cron_job("Rollup backfill", &self.config.maintenance.timefusion_rollup_backfill_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
+                    for source in crate::schema_loader::registry().list_tables() {
+                        match db.rollup_backfill_tick(&source).await {
+                            Ok(0) => {}
+                            Ok(built) => info!(source, built, "rollup backfill built sealed partitions"),
+                            Err(error) => warn!(source, %error, "rollup backfill tick failed"),
+                        }
                     }
                 }
             }
@@ -8009,7 +8045,7 @@ impl Database {
             let coverage_key = (project_id.to_string(), source.to_string(), target.clone(), date.to_string());
             self.rollup_coverage.remove(&coverage_key);
             let rows = self.query_delta_only(&crate::rollup::build_partition_sql(spec, source, project_id, date)?).await?;
-            let generation = uuid::Uuid::new_v4().to_string();
+            let generation = crate::rollup::generation_id(spec, source, project_id, date, source_fp);
             let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
             let row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();
             self.replace_rollup_partition(project_id, &target, date, batches).await?;
@@ -8023,6 +8059,215 @@ impl Database {
         }
         self.clear_rollup_backoff(project_id, source, date);
         Ok(())
+    }
+
+    /// Live source fingerprints for every `(project_id, date)` partition, in ONE
+    /// walk of the table's file list.
+    ///
+    /// `rollup_source_fingerprint` walks every live file in the whole table to
+    /// answer for a single date. Recovery needs one answer per date per project,
+    /// and the read path needs one per date in the window, so calling it per
+    /// date is quadratic in the file count for no reason.
+    fn partition_fingerprints(table: &DeltaTable) -> Result<HashMap<(String, String), u64>> {
+        let mut by_partition: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for uri in table.get_file_uris()? {
+            let segment = |prefix: &str| uri.split('/').find_map(|part| part.strip_prefix(prefix).map(str::to_string));
+            // Custom-project tables carry no `project_id=` segment; the sweep
+            // groups those under "default", so match it exactly.
+            let (Some(date), project) = (segment("date="), segment("project_id=").unwrap_or_else(|| "default".to_string())) else { continue };
+            by_partition.entry((project, date)).or_default().push(uri);
+        }
+        Ok(by_partition.into_iter().map(|(key, files)| (key, partition_file_fp(files))).collect())
+    }
+
+    /// Re-adopt rollup coverage that previous processes durably wrote.
+    ///
+    /// `rollup_coverage` is an in-memory map, so before this every restart lost
+    /// it — and because reads filter on `rollup_generation`, the rollup rows
+    /// already sitting on S3 became unreadable even though they were correct.
+    /// Prod restarts on every deploy, so multi-day windows could never stay
+    /// covered long enough to matter.
+    ///
+    /// There is no sidecar file: the rollup table IS the record. Each stored
+    /// `(date, generation)` is re-proved against the generation the CURRENT
+    /// source partition would produce, so a source that moved since the build
+    /// simply fails to match and the partition is left uncovered. That is the
+    /// safe direction — an unproved claim costs a raw scan, whereas trusting one
+    /// would make the rewrite read zero rows and report zero.
+    pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
+        let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
+        if !self.config.maintenance.timefusion_rollup_enabled {
+            return Ok(0);
+        }
+        let fingerprints = {
+            let table = self.resolve_table("default", source).await?;
+            let table = table.read().await;
+            Self::partition_fingerprints(&table)?
+        };
+        let mut recovered = 0;
+        for spec in &schema.rollups {
+            let target = spec.table_name(source);
+            // One grouped probe over the whole rollup table. It is small by
+            // construction (one row per bucket per dimension tuple), so this is
+            // cheap next to the raw scans it saves.
+            let sql = format!("SELECT project_id, date::TEXT AS d, rollup_generation, COUNT(*)::BIGINT AS n FROM {target} GROUP BY 1, 2, 3");
+            let Ok(batches) = self.query_delta_only(&sql).await else { continue };
+            for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+                for row in 0..batch.num_rows() {
+                    let value = |index: usize| crate::test_utils::test_helpers::array_get_str(batch.column(index).as_ref(), row);
+                    let (project_id, date, generation) = (value(0), value(1), value(2));
+                    let Some(rows) = arrow::array::AsArray::as_primitive_opt::<arrow::datatypes::Int64Type>(batch.column(3).as_ref()).map(|c| c.value(row))
+                    else {
+                        continue;
+                    };
+                    let Some(&source_fp) = fingerprints.get(&(project_id.clone(), date.clone())) else { continue };
+                    if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
+                        continue;
+                    }
+                    let epoch = self.rollup_source_epochs.get(&(project_id.clone(), source.to_string(), date.clone())).map_or(0, |entry| *entry.value());
+                    self.rollup_coverage.insert(
+                        (project_id, source.to_string(), target.clone(), date),
+                        RollupCoverage { source_fp, source_epoch: epoch, generation, rows: rows as u64 },
+                    );
+                    recovered += 1;
+                }
+            }
+        }
+        info!(source, recovered, event = "rollup_coverage_recovered");
+        Ok(recovered)
+    }
+
+    /// Apply the certification rule to one finished dedup pass and record the
+    /// verdict, returning the clean fingerprint when the partition is proved
+    /// duplicate-free.
+    ///
+    /// THE rule, in one place. A 0-drop pass over a file set that is still the
+    /// live set proves the partition duplicate-free; `complete` is required
+    /// because `Ok(0)` with skipped unsealed or over-budget chunks proves
+    /// nothing; any concurrent commit changes the set and must not certify.
+    /// Both the sweep and the backfill go through here — a rollup built on a
+    /// partition certified by a laxer rule is silently wrong, so the two must
+    /// not be able to drift.
+    async fn record_certification(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, pre: &[String],
+        (dropped, complete): (u64, bool),
+    ) -> Result<Option<u64>> {
+        let key = (project_id.to_string(), table_name.to_string(), date.to_string());
+        let post = {
+            let table = table_ref.read().await;
+            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()
+        };
+        let fp_post = partition_file_fp(post.clone());
+        if dropped == 0 && complete && !post.is_empty() && partition_file_fp(pre.to_vec()) == fp_post {
+            self.dedup_clean_fp.insert(key, fp_post);
+            return Ok(Some(fp_post));
+        }
+        self.dedup_clean_fp.remove(&key);
+        Ok(None)
+    }
+
+    /// Dedup one partition and certify it if the pass proves it clean.
+    ///
+    /// The sweep never reaches past its lookback, so a sealed day has never been
+    /// certified and the backfill has to do it before it may roll the day up.
+    async fn certify_partition(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
+    ) -> Result<Option<u64>> {
+        let pre = {
+            let table = table_ref.read().await;
+            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()
+        };
+        // Already proved clean and untouched since — no need to re-probe.
+        let key = (project_id.to_string(), table_name.to_string(), date.to_string());
+        let fp_pre = partition_file_fp(pre.clone());
+        if !pre.is_empty() && self.dedup_clean_fp.get(&key).map(|entry| *entry.value()) == Some(fp_pre) {
+            return Ok(Some(fp_pre));
+        }
+        let outcome = self.dedup_partition(table_ref, table_name, project_id, date).await?;
+        self.record_certification(table_ref, table_name, project_id, date, &pre, outcome).await
+    }
+
+    /// Build rollups for sealed past days, newest-first, until the unit budget
+    /// is spent.
+    ///
+    /// Certification only ever reaches today plus the dedup lookback, so
+    /// everything older is invisible to `dedup_today_partitions` and stays
+    /// uncovered forever. Routing needs a contiguous certified prefix from the
+    /// START of the window, so one uncovered old day disqualifies the entire
+    /// query — which is why 7d and 30d windows never routed while 24h did.
+    ///
+    /// Newest-first for the same reason the dedup drain is: recent days are what
+    /// dashboards actually read, and an oldest-first pass spends a whole process
+    /// lifetime on data nobody queries.
+    pub async fn rollup_backfill_tick(&self, source: &str) -> Result<usize> {
+        let horizon = self.config.maintenance.timefusion_rollup_backfill_days;
+        if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
+            return Ok(0);
+        }
+        let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
+        let table_ref = self.resolve_table("default", source).await?;
+        let fingerprints = {
+            let table = table_ref.read().await;
+            Self::partition_fingerprints(&table)?
+        };
+
+        let today = Utc::now().date_naive();
+        // Skip today and the dedup lookback: those are the sweep's job, and
+        // today's fingerprint moves on every flush anyway.
+        let sealed_from = self.config.maintenance.timefusion_dedup_lookback_days as i64 + 1;
+        let mut candidates: Vec<(String, chrono::NaiveDate)> = (sealed_from..=sealed_from + horizon as i64)
+            .map(|back| today - chrono::Duration::days(back))
+            .flat_map(|date| {
+                let date_key = date.to_string();
+                fingerprints.keys().filter(move |(_, d)| *d == date_key).map(move |(project, _)| (project.clone(), date)).collect::<Vec<_>>()
+            })
+            .filter(|(project, date)| {
+                self.config.maintenance.rollup_build_enabled_for(project)
+                    && self.rollup_retry_allowed(project, source, &date.to_string())
+                    && fingerprints
+                        .get(&(project.clone(), date.to_string()))
+                        .is_some_and(|fp| !self.rollup_coverage_current(project, source, &date.to_string(), *fp))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
+        let started = std::time::Instant::now();
+        let mut built = 0;
+        for (project_id, date) in candidates {
+            // The FIRST unit always runs: a day-sized aggregate is indivisible,
+            // so checking the budget before it would let a slow day produce
+            // nothing on every tick, forever.
+            if built > 0 && (built >= self.config.maintenance.timefusion_rollup_backfill_units_per_tick || started.elapsed() >= budget) {
+                break;
+            }
+            if self.maintenance_shutdown.is_cancelled() || !self.dedup_flush_healthy() {
+                break;
+            }
+            let date_key = date.to_string();
+            // A rollup over a partition that still holds duplicates is simply
+            // wrong, so certify first — the sweep never reaches this far back.
+            match self.certify_partition(&table_ref, source, &project_id, date).await {
+                Ok(Some(clean_fp)) => {
+                    if let Err(error) = self.rebuild_rollup_partition(source, &project_id, &date_key, clean_fp).await {
+                        self.record_rollup_failure(&project_id, source, &date_key);
+                        warn!(project_id, date = %date, source, %error, "rollup backfill build failed");
+                        continue;
+                    }
+                    built += 1;
+                }
+                Ok(None) => debug!(project_id, date = %date, source, "rollup backfill: partition not certifiable yet"),
+                Err(error) => {
+                    self.record_rollup_failure(&project_id, source, &date_key);
+                    warn!(project_id, date = %date, source, %error, "rollup backfill certification failed");
+                }
+            }
+        }
+        if built > 0 {
+            info!(source, built, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
+        }
+        let _ = schema;
+        Ok(built)
     }
 
     pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> bool {
@@ -8303,16 +8548,8 @@ impl Database {
                         // Any concurrent commit (flush/compaction) changes
                         // the set → don't mark; a >0 pass marks nothing (the
                         // NEXT 0-drop pass confirms the rewrite held).
-                        let pre = cur_files;
-                        let post = {
-                            let table = table_ref.read().await;
-                            Self::partition_files_by_pid(&table, &date_marker)?.remove(pid).unwrap_or_default()
-                        };
-                        // `complete` is required: Ok(0) with skipped unsealed/
-                        // over-budget dup chunks must NOT certify the partition.
-                        let fp_post = partition_file_fp(post.clone());
-                        if d == 0 && complete && !post.is_empty() && partition_file_fp(pre) == fp_post {
-                            self.dedup_clean_fp.insert(fp_key, fp_post);
+                        let certified = self.record_certification(table_ref, table_name, pid, date, &cur_files, (d, complete)).await?;
+                        if let Some(fp_post) = certified {
                             // Rollup buckets are built HERE and nowhere else: a
                             // bucket computed over a bin that is later deduped is
                             // simply wrong, so the build trigger is the
@@ -8331,8 +8568,6 @@ impl Database {
                                 self.record_rollup_failure(pid, table_name, &date.to_string());
                                 warn!(project_id = pid, date = %date, table_name, %error, "rollup build failed; leaving the partition on raw scans");
                             }
-                        } else {
-                            self.dedup_clean_fp.remove(&fp_key);
                         }
                     }
                     Err(e) => {
@@ -9167,12 +9402,12 @@ impl Database {
         };
         // Bound total rounds so a large backlog can't wedge the tick even if the
         // wall-clock budget is raised.
-        const MAX_WAVES: usize = 12;
+        let max_waves = max_waves(pass);
         let deadline = std::time::Instant::now() + budget;
         let order_index: HashMap<String, usize> = project_ids.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect();
         let failed = round_robin_bins(
             project_ids,
-            MAX_WAVES,
+            max_waves,
             concurrency,
             deadline,
             |round, remaining| {
@@ -9291,7 +9526,7 @@ impl Database {
                     // project per pass — and none at all when no further round
                     // can run (round cap / deadline), which would walk the
                     // snapshot only to discard the result.
-                    if round + 1 < MAX_WAVES && std::time::Instant::now() < deadline {
+                    if round + 1 < max_waves && std::time::Instant::now() < deadline {
                         let next = {
                             let table = table_ref.read().await;
                             Self::select_all_hot_bins(&table, schema, today_str, policy).unwrap_or_default()
@@ -11988,6 +12223,36 @@ fn host_mem_available_bytes() -> Option<u64> {
 /// cap load-bearing rather than a mere optimisation; persisting it is the
 /// durable fix (see docs/plans/2026-08-08-resumable-footer-repair.md).
 const REPAIR_RESELECT_ROUNDS: usize = 64;
+
+/// Wave cap for one tail pass. A wave serves each project at most one bin, so
+/// this is also the per-project file ceiling for the whole pass.
+///
+/// Packing keeps 12: its bins are minutes apart on TODAY's partition, it runs
+/// every few minutes, and a pack tick that never ends holds the light pool
+/// against the next flush.
+///
+/// Repair must NOT: its cap and its budget were describing different passes.
+/// `TIMEFUSION_FOOTER_REPAIR_BUDGET_SECS` is 8640s (2h24m) precisely so one pass
+/// can chew through a backlog, but 12 waves cap that pass at 12 files per
+/// project no matter how much of the budget is left — so a project with a large
+/// backlog converges at 12 files per PASS, i.e. per hour.
+///
+/// Measured, prod 2026-08-10: the whale (87576849) holds **663 footer-less files
+/// across 07-13 and 07-20..08-01** (486 GB). At 12 files/pass that is 56
+/// uninterrupted hourly passes — and process lifetime under deploy churn was
+/// 18-21 minutes on 2026-08-09, so in practice it never converges at all. One
+/// footer-less file voids the declared ordering for EVERY query window reaching
+/// its date, so the tenant stays on `full-set` dedup the entire time.
+///
+/// The deadline and the memory brake are the real bounds and both are already
+/// enforced every round inside `round_robin_bins`, so this only has to stop a
+/// runaway loop, not ration the budget.
+const fn max_waves(pass: TailPass) -> usize {
+    match pass {
+        TailPass::Pack => 12,
+        TailPass::Repair => 512,
+    }
+}
 
 const REPAIR_VERIFY_CONCURRENCY: usize = 16;
 
@@ -16621,6 +16886,24 @@ mod tests {
         }
         assert!(cols.len() < schema.fields.len(), "must be a strict subset of the schema, got {} of {}", cols.len(), schema.fields.len());
         assert_eq!(cols.len(), cols.iter().collect::<std::collections::HashSet<_>>().len(), "no duplicates");
+    }
+
+    /// A repair pass must be bounded by its BUDGET, not by a wave count.
+    ///
+    /// Prod 2026-08-10: the whale held 663 footer-less files. A wave serves one
+    /// bin per project, so the old flat `MAX_WAVES = 12` capped a pass at 12
+    /// files per project however much of the 2h24m budget remained — 56 hourly
+    /// passes to converge, against an 18-21 minute process lifetime under deploy
+    /// churn. Packing keeps 12 (short cron, holds the light pool against flush).
+    #[test]
+    fn repair_waves_are_bounded_by_budget_not_by_the_pack_cap() {
+        assert_eq!(super::max_waves(super::TailPass::Pack), 12, "packing's short-cron cap must not change");
+        // The whale's worst single date (07-24) holds 120 poisoned files; one
+        // pass must be able to clear a date rather than 12 files of it.
+        assert!(
+            super::max_waves(super::TailPass::Repair) >= 120,
+            "a repair pass capped below a single date's backlog can never clear that date, whatever its budget"
+        );
     }
 
     /// Fairness guard for prod 2026-07-29: the old per-project drain gave the

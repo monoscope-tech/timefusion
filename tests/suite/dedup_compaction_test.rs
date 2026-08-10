@@ -1753,6 +1753,71 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     Ok(())
 }
 
+/// A multi-day window can only route if the OLD days are covered, and the dedup
+/// sweep never reaches past its lookback — so before the backfill a 7d or 30d
+/// query could never route no matter how long the process ran, while a 24h one
+/// could. That asymmetry is the whole reason the expensive queries stayed slow.
+///
+/// Also pins that coverage survives a restart. `rollup_generation` used to be a
+/// random UUID held only in memory, so a deploy made the rollup rows already on
+/// S3 permanently unreadable — and prod redeploys constantly.
+#[serial]
+#[tokio::test]
+async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("rollup_backfill").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    cfg.maintenance.timefusion_rollup_backfill_days = 7;
+    let cfg = Arc::new(cfg);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let day = |back: i64| (today - chrono::Duration::days(back)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let row = |id: &str, ts: i64| -> Result<_> {
+        json_to_batch(vec![serde_json::json!({
+            "timestamp": ts, "id": id, "name": "op", "project_id": project_id, "hashes": [], "summary": ["backfill fixture"],
+            "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string(),
+            "duration": 100, "kind": "server", "status_code": "OK", "resource___service___name": "cart",
+        })])
+    };
+    // D-5 and D-4 are sealed and far outside the dedup lookback (default 1).
+    for back in [5i64, 4] {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("d{back}"), day(back))?], true, None).await?;
+    }
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    let covered = |db: Arc<Database>| {
+        let project_id = project_id.clone();
+        async move {
+            anyhow::Ok(
+            db.query_delta_only(&format!(
+                "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"
+            ))
+            .await?
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0)))
+            .next()
+            .unwrap_or(0),
+            )
+        }
+    };
+    assert_eq!(covered(Arc::clone(&db)).await?, 0, "the sweep must NOT reach sealed days — that gap is what the backfill exists to close");
+
+    let built = db.rollup_backfill_tick("otel_logs_and_spans").await?;
+    assert_eq!(built, 2, "the backfill must certify and build both sealed days");
+    assert_eq!(covered(Arc::clone(&db)).await?, 2, "both sealed spans must be rolled up");
+
+    // Restart over the SAME config (same storage prefix): a fresh Database has
+    // an empty coverage map, and must re-adopt it from the rollup table itself.
+    let restarted = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let recovered = restarted.recover_rollup_coverage("otel_logs_and_spans").await?;
+    assert!(recovered >= 2, "coverage must be re-provable from the rollup table after a restart, got {recovered}");
+    Ok(())
+}
+
 /// COUNT parity — the precondition `timefusion_read_dedup_skip_swept`'s own doc
 /// names ("off by default until COUNT parity is validated on prod-shaped
 /// data"). The skip removes `DedupExec` and its key projection, so if the

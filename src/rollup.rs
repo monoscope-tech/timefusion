@@ -58,6 +58,27 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Deterministic identity for one built partition.
+///
+/// It was a random UUID, which made the rollup rows on S3 unreadable after a
+/// restart: reads filter on the generation and the only copy of it lived in a
+/// DashMap. Deriving it from the inputs makes the rollup TABLE the durable
+/// record — coverage can be recovered by reading back what is stored and
+/// checking it still matches — and makes a rebuild over an unchanged source
+/// produce byte-identical `id`s, so a replace is idempotent per row rather than
+/// only per partition.
+///
+/// The spec participates because adding a measure without bumping the table
+/// name would otherwise serve rows built under the old spec as if current.
+pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, source_fp: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = fnv::FnvHasher::default();
+    source_fp.hash(&mut hasher);
+    format!("{spec:?}").hash(&mut hasher);
+    (source, project_id, date).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// SQL that builds one source `(project_id, date)` partition.
 ///
 /// Aggregate filters belong on each aggregate rather than in the row `WHERE`

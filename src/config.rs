@@ -890,6 +890,8 @@ const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
 const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
+const_default!(d_rollup_backfill_schedule: String = "0 */10 * * * *");
+const_default!(d_rollup_backfill_units: usize = 4);
 const_default!(d_footer_repair_schedule: String = "0 30 * * * *");
 const_default!(d_footer_repair_budget_secs: u64 = 8640);
 const_default!(d_repair_lookback_days: u64 = 31);
@@ -2067,6 +2069,23 @@ pub struct MaintenanceConfig {
     /// Optional comma-separated read canary projects.
     #[serde(default)]
     pub timefusion_rollup_read_projects: Option<String>,
+    /// Sealed days back the backfill will build rollups for. 0 disables it.
+    ///
+    /// Without a backfill the ONLY covered dates are today and the dedup
+    /// lookback, and routing needs a contiguous certified prefix from the start
+    /// of the window — so a 7d or 30d query, the only kind expensive enough to
+    /// be worth accelerating, can never route no matter how long the process
+    /// runs. Conservative by default: the first pass certifies each sealed day,
+    /// which is real work on a busy table.
+    #[serde(default)]
+    pub timefusion_rollup_backfill_days: u16,
+    #[serde(default = "d_rollup_backfill_schedule")]
+    pub timefusion_rollup_backfill_schedule: String,
+    /// Units attempted per tick AFTER the first. The first always runs to
+    /// completion: a day-sized aggregate cannot be split, so a budget check
+    /// before it would make a slow day produce NOTHING, forever.
+    #[serde(default = "d_rollup_backfill_units")]
+    pub timefusion_rollup_backfill_units_per_tick: usize,
     /// Skip the read-side DedupExec (and, since 4ecca05, its key projection) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged
