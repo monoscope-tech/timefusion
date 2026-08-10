@@ -23,6 +23,10 @@ pub enum WalError {
     InvalidOperation(u8),
     #[error("Unsupported WAL version: {version} (expected {expected})")]
     UnsupportedVersion { version: u8, expected: u8 },
+    /// The WAL lock was never released. Fatal on purpose: a process that cannot
+    /// own the WAL must exit rather than linger half-started.
+    #[error("{0}")]
+    LockContention(String),
     #[error("Bincode decode error: {0}")]
     BincodeDecode(#[from] bincode::error::DecodeError),
     #[error("Bincode encode error: {0}")]
@@ -43,6 +47,17 @@ pub enum WalError {
 /// snapshots). Skipped by WAL GC.
 pub const META_DIR: &str = ".timefusion_meta";
 const TAKEOVER_REQUEST_FILE: &str = "takeover.request";
+
+/// How long a contender waits for the WAL lock before exiting non-zero. Far
+/// beyond any real handoff (seconds), so only a predecessor that will NEVER
+/// release trips it.
+const LOCK_WAIT_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// How long the holder tolerates an outstanding takeover request before shutting
+/// down even though it never reached handoff readiness. The graceful path is the
+/// same one SIGTERM takes, and it is lossless — a measured `docker stop` of a
+/// wedged instance drained in 23s.
+pub const TAKEOVER_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// `<data_dir>/.timefusion_meta/<file>`.
 pub fn meta_path(data_dir: &Path, file: &str) -> PathBuf {
@@ -1373,7 +1388,18 @@ impl WalDirLock {
                     // contender to touch WAL state before acquiring the lock.
                     if waits.is_multiple_of(400) {
                         let request = meta_dir.join(TAKEOVER_REQUEST_FILE);
-                        let _ = std::fs::write(&request, format!("pid={} requested_at_micros={}\n", std::process::id(), chrono::Utc::now().timestamp_micros()));
+                        // Written ONCE and never refreshed: the predecessor
+                        // escalates on how long the request has been
+                        // outstanding, and rewriting it every 10s reset that
+                        // age to zero on every poll, so the escalation could
+                        // never fire and an orphaned predecessor held the lock
+                        // forever (2026-08-10: 47 minutes, six live containers).
+                        if !request.is_file() {
+                            let _ = std::fs::write(
+                                &request,
+                                format!("pid={} requested_at_micros={}\n", std::process::id(), chrono::Utc::now().timestamp_micros()),
+                            );
+                        }
                         let secs = waits / 40;
                         if waits >= 2_400 {
                             error!(
@@ -1383,6 +1409,21 @@ impl WalDirLock {
                         } else {
                             warn!("WAL dir {:?} is locked by another TimeFusion process; waiting for it to exit before recovery", path);
                         }
+                    }
+                    // Never spinning forever is the point. A predecessor that
+                    // will never release — an orphaned container swarm has lost
+                    // track of, so it is never sent SIGTERM — used to leave this
+                    // process alive and half-started indefinitely, and every
+                    // redeploy stacked another one onto the box until it ran out
+                    // of memory. Exiting non-zero instead turns a silent
+                    // permanent wedge into an ordinary crash-loop the
+                    // orchestrator backs off and an operator can see.
+                    if waits >= LOCK_WAIT_GIVE_UP.as_millis() as u64 / 25 {
+                        return Err(WalError::LockContention(format!(
+                            "WAL dir {path:?} still locked after {}s; giving up so this process restarts instead of \
+                             occupying memory forever (look for an orphaned TimeFusion container holding the lock)",
+                            LOCK_WAIT_GIVE_UP.as_secs()
+                        )));
                     }
                     waits += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1395,6 +1436,20 @@ impl WalDirLock {
 
 pub fn takeover_requested(wal_dir: &std::path::Path) -> bool {
     wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE).is_file()
+}
+
+/// How long a takeover request has been outstanding, or `None` when none is.
+///
+/// The predecessor escalates on this: a request it keeps ignoring because it
+/// never reaches handoff readiness is exactly the wedge this bounds.
+pub fn takeover_request_age(wal_dir: &std::path::Path) -> Option<std::time::Duration> {
+    let path = wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE);
+    let requested_at = std::fs::read_to_string(&path)
+        .ok()?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("requested_at_micros=")?.parse::<i64>().ok())?;
+    let elapsed = crate::clock::now_micros().saturating_sub(requested_at).max(0);
+    Some(std::time::Duration::from_micros(elapsed as u64))
 }
 
 pub fn clear_takeover_request(wal_dir: &std::path::Path) {
@@ -2254,6 +2309,41 @@ mod tests {
         // Dropping the guard releases the lock (mirrors kernel release on exit).
         drop(guard);
         assert!(other.try_lock_exclusive().unwrap(), "lock must be acquirable after the holder drops");
+    }
+
+    /// The predecessor escalates on how long a takeover request has gone
+    /// unanswered, so the request's timestamp must be the FIRST ask. The
+    /// contender re-wrote it on every 10s poll, which reset the age to zero
+    /// forever — the escalation could never fire, and an orphaned predecessor
+    /// (never sent SIGTERM, so never shut down) held the WAL lock indefinitely
+    /// while replacements stacked up on the box.
+    #[tokio::test]
+    async fn a_takeover_request_keeps_its_original_timestamp_while_the_contender_polls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_path_buf();
+        let _owner = WalDirLock::acquire(&path).await.unwrap();
+        let contender_path = path.clone();
+        let contender = tokio::spawn(async move { WalDirLock::acquire(&contender_path).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !takeover_requested(&path) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("contender must request a takeover");
+        let first = std::fs::read_to_string(path.join(".timefusion_meta").join(TAKEOVER_REQUEST_FILE)).unwrap();
+
+        // Poll well past the contender's ~10s rewrite interval.
+        tokio::time::sleep(std::time::Duration::from_millis(11_000)).await;
+        let later = std::fs::read_to_string(path.join(".timefusion_meta").join(TAKEOVER_REQUEST_FILE)).unwrap();
+        assert_eq!(first, later, "the request must not be refreshed, or its age can never reach the escalation threshold");
+        assert!(
+            takeover_request_age(&path).is_some_and(|age| age >= std::time::Duration::from_secs(10)),
+            "the age must grow with wall clock: {:?}",
+            takeover_request_age(&path)
+        );
+        contender.abort();
     }
 
     #[tokio::test]

@@ -524,7 +524,26 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let takeover_signal = async {
         loop {
             tokio::time::sleep(Duration::from_millis(25)).await;
-            if buffered_layer.is_deploy_handoff_ready() && timefusion::wal::takeover_requested(&cfg.core.wal_dir()) {
+            let wal_dir = cfg.core.wal_dir();
+            if !timefusion::wal::takeover_requested(&wal_dir) {
+                continue;
+            }
+            if buffered_layer.is_deploy_handoff_ready() {
+                break;
+            }
+            // Escalation. Handoff readiness is the FAST path, not the only one:
+            // an instance the orchestrator has lost track of is never sent
+            // SIGTERM, so if readiness is the sole authority it holds the WAL
+            // lock forever and every replacement starves behind it — measured
+            // 2026-08-10 at 47 minutes with six live containers stacking up on
+            // one box. A request nobody has satisfied for this long means the
+            // predecessor is that instance, so take the ordinary graceful path
+            // anyway; it fences writes and flushes exactly like SIGTERM does.
+            if timefusion::wal::takeover_request_age(&wal_dir).is_some_and(|age| age >= timefusion::wal::TAKEOVER_ESCALATE_AFTER) {
+                warn!(
+                    "WAL takeover requested {}s ago and this instance never reached handoff readiness; shutting down anyway so the replacement can start",
+                    timefusion::wal::TAKEOVER_ESCALATE_AFTER.as_secs()
+                );
                 break;
             }
         }
