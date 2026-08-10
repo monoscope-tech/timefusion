@@ -1395,10 +1395,8 @@ impl WalDirLock {
                         // never fire and an orphaned predecessor held the lock
                         // forever (2026-08-10: 47 minutes, six live containers).
                         if !request.is_file() {
-                            let _ = std::fs::write(
-                                &request,
-                                format!("pid={} requested_at_micros={}\n", std::process::id(), chrono::Utc::now().timestamp_micros()),
-                            );
+                            let _ =
+                                std::fs::write(&request, format!("pid={} requested_at_micros={}\n", std::process::id(), chrono::Utc::now().timestamp_micros()));
                         }
                         let secs = waits / 40;
                         if waits >= 2_400 {
@@ -1444,10 +1442,8 @@ pub fn takeover_requested(wal_dir: &std::path::Path) -> bool {
 /// never reaches handoff readiness is exactly the wedge this bounds.
 pub fn takeover_request_age(wal_dir: &std::path::Path) -> Option<std::time::Duration> {
     let path = wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE);
-    let requested_at = std::fs::read_to_string(&path)
-        .ok()?
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("requested_at_micros=")?.parse::<i64>().ok())?;
+    let requested_at =
+        std::fs::read_to_string(&path).ok()?.split_whitespace().find_map(|field| field.strip_prefix("requested_at_micros=")?.parse::<i64>().ok())?;
     let elapsed = crate::clock::now_micros().saturating_sub(requested_at).max(0);
     Some(std::time::Duration::from_micros(elapsed as u64))
 }
