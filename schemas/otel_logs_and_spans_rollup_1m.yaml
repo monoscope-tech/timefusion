@@ -1,4 +1,4 @@
-table_name: otel_rollup_1m
+table_name: otel_logs_and_spans_rollup_1m
 # Same [project_id, date] partitioning as the table it summarizes, so
 # `ProjectRoutingTable` gives multi-tenant isolation and date pruning for free.
 partitions:

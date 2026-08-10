@@ -1586,7 +1586,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
     let total_from_rollup = |db: Arc<Database>, project_id: String| async move {
-        let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_rollup_1m WHERE project_id = '{project_id}'");
+        let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_1m WHERE project_id = '{project_id}'");
         let batches = db.query_delta_only(&sql).await?;
         let v = batches
             .iter()

@@ -409,7 +409,7 @@ leaves the heap ceiling untouched, which was the explicit constraint.
 ### D. Rollups — BUILT
 
 Built whole rather than scaffolded, which is what makes it not speculative:
-`otel_rollup_1m` (schema), the build triggered at the certification point in
+`otel_logs_and_spans_rollup_1m` (schema), the build triggered at the certification point in
 `dedup_today_partitions`, `rollup::route` proving answerability, and
 `rollup_hit`/`rollup_miss{reason}` from the first commit. Guarded by an
 end-to-end parity test against the raw aggregate plus a re-certification that
@@ -422,7 +422,7 @@ approximately without being asked. Coarser grains (1h/1d) re-aggregate from the
 
 Original build order, retained as the design of record:
 
-1. **Sibling Delta table** `otel_rollup_1m`, same `[project_id, date]`
+1. **Sibling Delta table** `otel_logs_and_spans_rollup_1m`, same `[project_id, date]`
    partitioning so `ProjectRoutingTable` gives multi-tenant isolation free.
    Columns: `bucket`, the dimension set, `request_count`, `error_count`,
    `duration_sum/min/max`, and a mergeable t-digest as a binary column.

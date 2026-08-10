@@ -22,11 +22,25 @@
 
 use crate::metrics;
 
-/// The table [`build_partition`] writes and [`route`] reads.
-pub const ROLLUP_TABLE: &str = "otel_rollup_1m";
-
-/// The source table it summarizes.
+/// The source table this rollup summarizes. Spans only — `otel_metrics` has
+/// none of these columns and would need its own rollup, dimension set and
+/// decomposability argument.
 pub const SOURCE_TABLE: &str = "otel_logs_and_spans";
+
+/// The table [`build_partition`] writes and [`route`] reads.
+///
+/// NAMING RULE, pinned by `rollup_table_is_named_after_its_source`:
+/// `{SOURCE_TABLE}_rollup_{grain}`. This was `otel_rollup_1m`, which reads like
+/// a rollup of all OTel data when it is a rollup of ONE table — every dimension
+/// and measure here is span-shaped (`kind`, `status_code`, `duration`, and an
+/// error predicate on HTTP status). A second rollup over a different source
+/// must carry its own source's name for the same reason.
+pub const ROLLUP_TABLE: &str = "otel_logs_and_spans_rollup_1m";
+
+/// The grain suffix in [`ROLLUP_TABLE`], kept beside [`GRAIN_MICROS`] so a
+/// change to one that is not mirrored in the other fails the naming test
+/// rather than shipping a table whose name lies about its resolution.
+pub const GRAIN_SUFFIX: &str = "1m";
 
 /// Base grain, in microseconds. Coarser grains are derived by re-aggregating
 /// this one (1m -> 1h -> 1d): the merge is associative, so there is no second
@@ -276,6 +290,22 @@ mod tests {
     /// The dashboard's Traffic panel: count by hour, filtered to server spans.
     /// This is the shape the whole table exists for, so if it stops routing the
     /// rollup is worthless.
+    /// A rollup's name must say WHAT it rolls up. `otel_rollup_1m` did not: it
+    /// reads like a rollup of all OTel data while summarizing exactly one
+    /// table, and every dimension and measure in it is span-shaped. Adding a
+    /// second rollup over a different source under a vague name is the failure
+    /// this pins.
+    #[test]
+    fn rollup_table_is_named_after_its_source() {
+        assert_eq!(ROLLUP_TABLE, format!("{SOURCE_TABLE}_rollup_{GRAIN_SUFFIX}"), "a rollup table must be named {{source}}_rollup_{{grain}}");
+        // And the grain in the NAME must be the grain it actually stores.
+        assert_eq!(GRAIN_MICROS, 60 * 1_000_000, "GRAIN_SUFFIX says 1m; keep it and GRAIN_MICROS in step");
+        // The schema registry must agree, or the build writes to a table the
+        // reader never looks for.
+        let schema = crate::schema_loader::get_schema(ROLLUP_TABLE).expect("rollup schema must be registered under its own name");
+        assert_eq!(schema.table_name, ROLLUP_TABLE);
+    }
+
     #[test]
     fn the_traffic_panel_routes() {
         let (g, f, a) = (s(&[]), s(&["kind"]), s(&["count"]));
