@@ -134,9 +134,17 @@ impl RollupSpec {
             // A base bucket must fall entirely inside one of ours, or its state
             // would have to be split across two output buckets — which no
             // aggregate state can do.
-            anyhow::ensure!(coarse > fine && coarse % fine == 0, "rollup {target}: grain must be a whole multiple of `{base}`'s ({} vs {})", self.grain, base_spec.grain);
+            anyhow::ensure!(
+                coarse > fine && coarse % fine == 0,
+                "rollup {target}: grain must be a whole multiple of `{base}`'s ({} vs {})",
+                self.grain,
+                base_spec.grain
+            );
             for dimension in &self.dimensions {
-                anyhow::ensure!(base_spec.dimensions.contains(dimension), "rollup {target}: dimension `{dimension}` is absent from `{base}`, so it cannot be derived from it");
+                anyhow::ensure!(
+                    base_spec.dimensions.contains(dimension),
+                    "rollup {target}: dimension `{dimension}` is absent from `{base}`, so it cannot be derived from it"
+                );
             }
             for measure in &self.measures {
                 let base_measure = base_spec
@@ -777,7 +785,8 @@ mod tests {
             grain: "1m".into(),
             name: Some("digest_test".into()),
             dimensions: vec!["kind".into()],
-            measures: vec![RollupMeasure { name: "digest".into(), agg: "tdigest".into(), column: Some("duration".into()), filter: None }], derive_from: None,
+            measures: vec![RollupMeasure { name: "digest".into(), agg: "tdigest".into(), column: Some("duration".into()), filter: None }],
+            derive_from: None,
         };
 
         let rollup = spec.synthesize(source).expect("valid rollup");
@@ -792,7 +801,8 @@ mod tests {
             grain: "1m".into(),
             name: None,
             dimensions: vec![],
-            measures: vec![RollupMeasure { name: "bad".into(), agg: "median".into(), column: Some("duration".into()), filter: None }], derive_from: None,
+            measures: vec![RollupMeasure { name: "bad".into(), agg: "median".into(), column: Some("duration".into()), filter: None }],
+            derive_from: None,
         };
 
         assert!(spec.validate(source).unwrap_err().to_string().contains("unsupported aggregate"));

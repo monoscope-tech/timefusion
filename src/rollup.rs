@@ -1166,10 +1166,8 @@ mod tests {
     #[tokio::test]
     async fn avg_unions_as_separate_sum_and_count_states() {
         let state = session().await;
-        let route = route_for(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"))
-            .await
-            .expect("match")
-            .expect("route");
+        let route =
+            route_for(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await.expect("match").expect("route");
         let generated = hybrid_sql(&route, WIDE_HORIZON);
         // The query's own output name is `avg(otel_logs_and_spans.duration)`, so
         // only the union body can be checked for a leg-level average.
