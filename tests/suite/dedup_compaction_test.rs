@@ -1660,8 +1660,14 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // Yesterday, spread over several 1m buckets and starting mid-bucket so the
     // left fringe is non-empty too.
     for (i, offset) in [17i64, 61_000_000, 130_000_000, 610_000_000].iter().enumerate() {
-        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("y{i}"), "cart", 100 + i as i64 * 10, yesterday_noon + offset)?], true, None)
-            .await?;
+        db.insert_records_batch(
+            &project_id,
+            "otel_logs_and_spans",
+            vec![row(&format!("y{i}"), "cart", 100 + i as i64 * 10, yesterday_noon + offset)?],
+            true,
+            None,
+        )
+        .await?;
     }
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
@@ -1670,8 +1676,14 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // Written AFTER certification: today has no coverage, so these are reachable
     // only through the raw leg.
     for (i, offset) in [5_000_000i64, 3_600_000_000].iter().enumerate() {
-        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("t{i}"), "checkout", 500 + i as i64 * 10, midnight + offset)?], true, None)
-            .await?;
+        db.insert_records_batch(
+            &project_id,
+            "otel_logs_and_spans",
+            vec![row(&format!("t{i}"), "checkout", 500 + i as i64 * 10, midnight + offset)?],
+            true,
+            None,
+        )
+        .await?;
     }
 
     // Unaligned on both ends, exactly like a dashboard's `now`-relative window.
@@ -1729,12 +1741,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let misses = || timefusion::metrics::maintenance_stats().rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
     let (before, misses_before) = (hits(), misses());
     let hybrid = rows_of(ctx.sql(&query).await?.collect().await?);
-    assert_eq!(
-        hits(),
-        before + 1,
-        "the query must be served from the rollup as a hybrid union, not a raw scan (misses +{})",
-        misses() - misses_before
-    );
+    assert_eq!(hits(), before + 1, "the query must be served from the rollup as a hybrid union, not a raw scan (misses +{})", misses() - misses_before);
 
     // `query_delta_only` bypasses both the rollup and the buffer, so it is the
     // authority: every fixture row was written straight to Delta.

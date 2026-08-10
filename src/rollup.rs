@@ -257,9 +257,9 @@ impl Merge {
             // The CAST is on the dividend, not the result: both states are
             // Int64, so dividing first truncates and the outer type only widens
             // an already-wrong value.
-            (Self::Avg, [sum, count]) => format!(
-                "CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END"
-            ),
+            (Self::Avg, [sum, count]) => {
+                format!("CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END")
+            }
             (Self::TDigest, [digest]) => format!("tdigest_merge({digest})"),
             // `arity()` is the single source of truth for how many states each
             // variant is built with, so this is unreachable by construction.
@@ -770,9 +770,8 @@ pub(crate) async fn match_aggregate(
 /// them in once a spec has won.
 #[allow(clippy::too_many_arguments)]
 async fn route_with_spec(
-    spec: &RollupSpec, source: &str, table_name: &str, predicates: &[datafusion::logical_expr::Expr],
-    aggregate: &datafusion::logical_expr::Aggregate, output_names: Option<&Vec<String>>,
-    session: &datafusion::execution::context::SessionState,
+    spec: &RollupSpec, source: &str, table_name: &str, predicates: &[datafusion::logical_expr::Expr], aggregate: &datafusion::logical_expr::Aggregate,
+    output_names: Option<&Vec<String>>, session: &datafusion::execution::context::SessionState,
 ) -> Result<RoutedRollup, MissReason> {
     use datafusion::logical_expr::{Expr, Operator, utils::split_conjunction};
 
@@ -855,15 +854,10 @@ async fn route_with_spec(
     for (index, expression) in aggregate.aggr_expr.iter().enumerate() {
         let output_index = aggregate.group_expr.len() + index;
         let (expression, alias) = match expression {
-            Expr::Alias(alias) => {
-                (alias.expr.as_ref(), output_names.and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| alias.name.clone()))
-            }
+            Expr::Alias(alias) => (alias.expr.as_ref(), output_names.and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| alias.name.clone())),
             expression => (
                 expression,
-                output_names
-                    .and_then(|names| names.get(output_index))
-                    .cloned()
-                    .unwrap_or_else(|| aggregate.schema.field(output_index).name().to_string()),
+                output_names.and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| aggregate.schema.field(output_index).name().to_string()),
             ),
         };
         let Expr::AggregateFunction(function) = unaliased(expression) else { return Err(MissReason::NonDecomposableAggregate) };
