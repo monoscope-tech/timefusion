@@ -305,7 +305,8 @@ mod tests {
     fn the_rollup_table_is_generated_from_the_source_tables_config() {
         let src = crate::schema_loader::get_schema(SOURCE_TABLE).expect("source schema");
         let spec = src.rollups.first().expect("otel_logs_and_spans must declare a rollup");
-        let generated = crate::schema_loader::get_schema(&spec.table_name(SOURCE_TABLE)).expect("the rollup table must be registered without a hand-written yaml");
+        let generated =
+            crate::schema_loader::get_schema(&spec.table_name(SOURCE_TABLE)).expect("the rollup table must be registered without a hand-written yaml");
 
         let has = |n: &str| generated.fields.iter().any(|f| f.name == n);
         for d in &spec.dimensions {
@@ -319,7 +320,12 @@ mod tests {
         let src_ty = |n: &str| src.fields.iter().find(|f| f.name == n).map(|f| f.data_type.clone());
         for m in spec.measures.iter().filter(|m| m.agg != "count") {
             let col = m.column.as_deref().expect("non-count measure declares a column");
-            assert_eq!(generated.fields.iter().find(|f| f.name == m.name).map(|f| f.data_type.clone()), src_ty(col), "measure `{}` must keep the source column's type", m.name);
+            assert_eq!(
+                generated.fields.iter().find(|f| f.name == m.name).map(|f| f.data_type.clone()),
+                src_ty(col),
+                "measure `{}` must keep the source column's type",
+                m.name
+            );
         }
         // Partitioning is inherited, so multi-tenant routing and date pruning
         // work on the rollup exactly as on the source.

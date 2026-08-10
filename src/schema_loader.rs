@@ -83,7 +83,12 @@ impl RollupSpec {
     /// Int64 (count) or the source column's type (sum/min/max).
     pub fn synthesize(&self, source: &TableSchema) -> anyhow::Result<TableSchema> {
         let src_field = |n: &str| {
-            source.fields.iter().find(|f| f.name == n).cloned().ok_or_else(|| anyhow::anyhow!("rollup {}: unknown column `{n}`", self.table_name(&source.table_name)))
+            source
+                .fields
+                .iter()
+                .find(|f| f.name == n)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("rollup {}: unknown column `{n}`", self.table_name(&source.table_name)))
         };
         let plain = |name: &str, data_type: &str, nullable: bool| FieldDef {
             name: name.to_string(),
