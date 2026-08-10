@@ -388,7 +388,7 @@ fields:
     nullable: true
 
 # Continuous-aggregate rollups derived from this table. The rollup's own table
-# (`otel_logs_and_spans_rollup_1m`) is SYNTHESIZED from this spec plus the field
+# (`otel_logs_and_spans_rollup_dashboard_1m_v2`) is SYNTHESIZED from this spec plus the field
 # definitions below, so a measure's type cannot drift from the column it
 # aggregates and adding a rollup needs no second schema file.
 #
@@ -399,10 +399,20 @@ fields:
 # filter cannot be applied after aggregation.
 rollups:
   - grain: 1m
+    name: dashboard_1m_v2
     dimensions: [resource___service___name, kind, status_code]
     measures:
       - { name: request_count, agg: count }
+      - { name: duration_count, agg: count, column: duration }
       - { name: error_count, agg: count, filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500" }
       - { name: duration_sum, agg: sum, column: duration }
       - { name: duration_min, agg: min, column: duration }
       - { name: duration_max, agg: max, column: duration }
+      - { name: server_request_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+      - { name: server_duration_count, agg: count, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+      - { name: server_duration_sum, agg: sum, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+      - { name: server_duration_min, agg: min, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+      - { name: server_duration_max, agg: max, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+      - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span'" }
+      - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
+      - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }

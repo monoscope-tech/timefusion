@@ -145,6 +145,41 @@ impl QueryPlanner for DmlQueryPlanner {
         if let Some(exec) = crate::count_pushdown::try_count_pushdown(logical_plan, &self.database).await? {
             return Ok(exec);
         }
+        match self.database.rollup_sql(logical_plan, session_state).await {
+            Ok(Some((sql, grain, outer_projection, ticket))) => {
+                let rewritten = async {
+                    let plan = session_state.create_logical_plan(&sql).await?;
+                    let plan = match outer_projection {
+                        Some(projection) => {
+                            LogicalPlan::Projection(datafusion::logical_expr::logical_plan::Projection::try_new(projection.expr, Arc::new(plan))?)
+                        }
+                        None => plan,
+                    };
+                    session_state.optimize(&plan)
+                }
+                .await;
+                match rewritten {
+                    Ok(rewritten) if rewritten.schema() == logical_plan.schema() => match self.planner.create_physical_plan(&rewritten, session_state).await {
+                        Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
+                            crate::metrics::record_rollup_hit("full", &grain);
+                            return Ok(exec);
+                        }
+                        Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::IncompleteCoverage.label()),
+                        Err(error) => {
+                            debug!(%error, "rollup physical planning failed; using raw plan");
+                            crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
+                        }
+                    },
+                    Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch.label()),
+                    Err(error) => {
+                        debug!(%error, "rollup SQL planning failed; using raw plan");
+                        crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => crate::metrics::record_rollup_miss(reason.label()),
+        }
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
                 let span = tracing::Span::current();
@@ -577,6 +612,7 @@ impl ExecutionPlan for DmlExec {
 
         let future = async move {
             let DmlExec { op_type, table_name, project_id, predicate, assignments, source, database, buffered_layer, session, .. } = this;
+            database.invalidate_rollup_source(&project_id, &table_name);
             let result = match op_type {
                 DmlOperation::Update => {
                     perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, source, session, &span)

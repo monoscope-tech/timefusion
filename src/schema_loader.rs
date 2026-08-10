@@ -85,7 +85,67 @@ impl RollupSpec {
             "d" => 86_400 * 1_000_000,
             _ => return None,
         };
-        (n > 0).then(|| n * mult)
+        (n > 0).then(|| n.checked_mul(mult)).flatten()
+    }
+
+    fn validate(&self, source: &TableSchema) -> anyhow::Result<()> {
+        const IDENTITY_FIELDS: [&str; 7] = ["project_id", "timestamp", "date", "id", "updated_at", "deleted", "rollup_generation"];
+        let field = |name: &str| source.fields.iter().find(|f| f.name == name);
+        let is_ident = |name: &str| {
+            let mut chars = name.chars();
+            matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_')) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+
+        anyhow::ensure!(self.grain_micros().is_some(), "rollup {}: invalid grain `{}`", self.table_name(&source.table_name), self.grain);
+        anyhow::ensure!(self.name.as_deref().is_none_or(is_ident), "rollup {}: name must be an SQL identifier", self.table_name(&source.table_name));
+        let mut names = HashSet::new();
+        for dimension in &self.dimensions {
+            anyhow::ensure!(field(dimension).is_some(), "rollup {}: unknown dimension `{dimension}`", self.table_name(&source.table_name));
+            anyhow::ensure!(names.insert(dimension), "rollup {}: duplicate dimension `{dimension}`", self.table_name(&source.table_name));
+            anyhow::ensure!(
+                !IDENTITY_FIELDS.contains(&dimension.as_str()),
+                "rollup {}: dimension `{dimension}` collides with an identity field",
+                self.table_name(&source.table_name)
+            );
+        }
+        anyhow::ensure!(!self.measures.is_empty(), "rollup {}: needs at least one measure", self.table_name(&source.table_name));
+        for measure in &self.measures {
+            anyhow::ensure!(is_ident(&measure.name), "rollup {}: measure `{}` must be an SQL identifier", self.table_name(&source.table_name), measure.name);
+            anyhow::ensure!(names.insert(&measure.name), "rollup {}: duplicate or colliding measure `{}`", self.table_name(&source.table_name), measure.name);
+            anyhow::ensure!(
+                matches!(measure.agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest"),
+                "rollup {}: unsupported aggregate `{}`",
+                self.table_name(&source.table_name),
+                measure.agg
+            );
+            match (&measure.agg[..], measure.column.as_deref()) {
+                ("count", None) => {}
+                ("count", Some(column)) | ("sum" | "min" | "max", Some(column)) => {
+                    anyhow::ensure!(field(column).is_some(), "rollup {}: unknown column `{column}`", self.table_name(&source.table_name));
+                }
+                ("tdigest", Some(column)) => {
+                    let Some(data_type) = field(column).map(|f| f.data_type.as_str()) else {
+                        anyhow::bail!("rollup {}: unknown column `{column}`", self.table_name(&source.table_name))
+                    };
+                    anyhow::ensure!(
+                        matches!(data_type, "Int32" | "Int64" | "UInt32" | "UInt64" | "Float64"),
+                        "rollup {}: tdigest column `{column}` must be numeric",
+                        self.table_name(&source.table_name)
+                    );
+                }
+                (_, None) => {
+                    anyhow::bail!("rollup {}: `{}` measure `{}` needs a source column", self.table_name(&source.table_name), measure.agg, measure.name)
+                }
+                (aggregate, Some(_)) => anyhow::bail!("rollup {}: unsupported aggregate `{aggregate}`", self.table_name(&source.table_name)),
+            }
+            anyhow::ensure!(
+                measure.filter.as_deref().is_none_or(|f| !f.trim().is_empty()),
+                "rollup {}: measure `{}` has an empty filter",
+                self.table_name(&source.table_name),
+                measure.name
+            );
+        }
+        Ok(())
     }
 
     /// The rollup's `TableSchema`, derived from the source so column types
@@ -116,6 +176,7 @@ impl RollupSpec {
             plain("id", "Utf8", false),
             plain("updated_at", "Timestamp(Microsecond, Some(\"UTC\"))", false),
             plain("deleted", "Boolean", true),
+            plain("rollup_generation", "Utf8", false),
         ];
         for d in &self.dimensions {
             let f = src_field(d)?;
@@ -126,6 +187,7 @@ impl RollupSpec {
         for m in &self.measures {
             let ty = match (m.agg.as_str(), &m.column) {
                 ("count", _) => "Int64".to_string(),
+                ("tdigest", Some(_)) => "Binary".to_string(),
                 (_, Some(c)) => src_field(c)?.data_type,
                 (a, None) => anyhow::bail!("rollup {}: `{a}` measure `{}` needs a source column", self.table_name(&source.table_name), m.name),
             };
@@ -441,6 +503,7 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "Int32" => ArrowDataType::Int32,
         "Int64" => ArrowDataType::Int64,
         "Float64" => ArrowDataType::Float64,
+        "Binary" => ArrowDataType::Binary,
         "UInt32" => ArrowDataType::UInt32,
         "UInt64" => ArrowDataType::UInt64,
         "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8View, true))),
@@ -479,6 +542,7 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
         "Int32" | "UInt32" => DeltaDataType::Primitive(Integer),
         "Int64" | "UInt64" => DeltaDataType::Primitive(Long),
         "Float64" => DeltaDataType::Primitive(Double),
+        "Binary" => DeltaDataType::Primitive(Binary),
         "List(Utf8)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(String), true))),
         "List(Int64)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(Long), true))),
         "List(Float64)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(Double), true))),
@@ -504,6 +568,7 @@ impl SchemaRegistry {
                 let content = file.contents_utf8().expect("Schema file should be UTF-8");
                 let schema: TableSchema = serde_yaml::from_str(content).unwrap_or_else(|e| panic!("Failed to parse schema {:?}: {}", file.path(), e));
                 schema.validate().unwrap_or_else(|e| panic!("Invalid schema {:?}: {}", file.path(), e));
+                schema.rollups.iter().try_for_each(|rollup| rollup.validate(&schema)).unwrap_or_else(|e| panic!("Invalid rollup on {:?}: {}", file.path(), e));
                 (schema.table_name.clone(), schema)
             })
             .collect();
@@ -659,6 +724,34 @@ mod tests {
 
     fn parse_schema(extra: &str, fields: &str) -> TableSchema {
         serde_yaml::from_str(&format!("{BASE_YAML}{extra}{fields}")).expect("yaml parses")
+    }
+
+    #[test]
+    fn synthesized_rollup_stores_a_generation_and_tdigest() {
+        let source = get_schema("otel_logs_and_spans").expect("source schema");
+        let spec = RollupSpec {
+            grain: "1m".into(),
+            name: Some("digest_test".into()),
+            dimensions: vec!["kind".into()],
+            measures: vec![RollupMeasure { name: "digest".into(), agg: "tdigest".into(), column: Some("duration".into()), filter: None }],
+        };
+
+        let rollup = spec.synthesize(source).expect("valid rollup");
+        assert_eq!(rollup.field_def("rollup_generation"), Some((ArrowDataType::Utf8View, false)));
+        assert_eq!(rollup.field_def("digest"), Some((ArrowDataType::Binary, true)));
+    }
+
+    #[test]
+    fn invalid_rollup_aggregate_fails_validation() {
+        let source = get_schema("otel_logs_and_spans").expect("source schema");
+        let spec = RollupSpec {
+            grain: "1m".into(),
+            name: None,
+            dimensions: vec![],
+            measures: vec![RollupMeasure { name: "bad".into(), agg: "median".into(), column: Some("duration".into()), filter: None }],
+        };
+
+        assert!(spec.validate(source).unwrap_err().to_string().contains("unsupported aggregate"));
     }
 
     // Regression: parquet `SortingColumn.column_idx` must index the non-partition

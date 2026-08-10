@@ -593,6 +593,7 @@ const_default!(d_grpc_port: u16 = 50051);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
 const_default!(d_pgwire_user: String = "postgres");
+const_default!(d_pgwire_max_statement_secs: u64 = 60);
 // 60s (was 300s): a shorter flush interval bounds how much un-flushed WAL a
 // restart must replay — startup/redeploy downtime is dominated by WAL replay
 // (95.6s for 46,692 entries at 300s on 2026-07-13), and it scales ~linearly
@@ -1245,6 +1246,15 @@ impl AwsConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OtelScanGuard {
+    #[default]
+    Off,
+    Observe,
+    Enforce,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
     #[serde(default = "d_data_dir")]
@@ -1263,6 +1273,10 @@ pub struct CoreConfig {
     pub pgwire_user: String,
     #[serde(default)]
     pub pgwire_password: Option<String>,
+    #[serde(default = "d_pgwire_max_statement_secs")]
+    pub timefusion_pgwire_max_statement_secs: u64,
+    #[serde(default)]
+    pub timefusion_otel_scan_guard: OtelScanGuard,
     #[serde(default = "d_grpc_port")]
     pub grpc_port: u16,
     #[serde(default)]
@@ -2038,6 +2052,21 @@ pub struct MaintenanceConfig {
     /// sealed bins are the normal maintenance path.
     #[serde(default)]
     pub timefusion_dedup_sweep_fallback: bool,
+    /// Master kill switch for rollup builds and reads.
+    #[serde(default)]
+    pub timefusion_rollup_enabled: bool,
+    /// Read-side rollup routing gate. Builds can run while this stays off.
+    #[serde(default)]
+    pub timefusion_rollup_read_enabled: bool,
+    /// Allow raw fringes and a live raw tail around certified rollup windows.
+    #[serde(default)]
+    pub timefusion_rollup_realtime_tail: bool,
+    /// Optional comma-separated build canary projects.
+    #[serde(default)]
+    pub timefusion_rollup_build_projects: Option<String>,
+    /// Optional comma-separated read canary projects.
+    #[serde(default)]
+    pub timefusion_rollup_read_projects: Option<String>,
     /// Skip the read-side DedupExec (and, since 4ecca05, its key projection) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged
@@ -2162,6 +2191,18 @@ pub struct MaintenanceConfig {
 }
 
 impl MaintenanceConfig {
+    fn selected(project_id: &str, projects: Option<&str>) -> bool {
+        projects.is_none_or(|projects| projects.trim().is_empty() || projects.split(',').map(str::trim).any(|project| project == project_id))
+    }
+
+    pub fn rollup_build_enabled_for(&self, project_id: &str) -> bool {
+        self.timefusion_rollup_enabled && Self::selected(project_id, self.timefusion_rollup_build_projects.as_deref())
+    }
+
+    pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {
+        self.timefusion_rollup_enabled && self.timefusion_rollup_read_enabled && Self::selected(project_id, self.timefusion_rollup_read_projects.as_deref())
+    }
+
     /// Flush escalation-sort pool in bytes. Floored so a misconfigured 0 can't
     /// build a zero-sized pool that fails every sort.
     pub fn flush_sort_pool_bytes(&self) -> usize {
@@ -2304,6 +2345,22 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollup_gates_default_off_and_respect_canary_projects() {
+        let mut config = AppConfig::default().maintenance;
+        assert!(!config.rollup_build_enabled_for("project-a"));
+        assert!(!config.rollup_read_enabled_for("project-a"));
+
+        config.timefusion_rollup_enabled = true;
+        config.timefusion_rollup_build_projects = Some("project-a, project-b".into());
+        config.timefusion_rollup_read_enabled = true;
+        config.timefusion_rollup_read_projects = Some("project-b".into());
+        assert!(config.rollup_build_enabled_for("project-a"));
+        assert!(!config.rollup_read_enabled_for("project-a"));
+        assert!(config.rollup_read_enabled_for("project-b"));
+        assert!(!config.rollup_build_enabled_for("project-c"));
+    }
 
     /// The tree budgets 100% of whatever limit it is given — correct for a
     /// dedicated box, and the reason prod OOM-looped on 2026-07-31: a 120 GiB TF

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use arrow_schema::SchemaRef;
@@ -186,6 +191,8 @@ pub struct ScanMetrics {
     pub provider_build_total: std::sync::atomic::AtomicU64,
     pub provider_scan_us_total: std::sync::atomic::AtomicU64,
     pub provider_scan_total: std::sync::atomic::AtomicU64,
+    pub bounded_otel_scan_candidates: std::sync::atomic::AtomicU64,
+    pub bounded_otel_scan_rejections: std::sync::atomic::AtomicU64,
     pub mem_plan_us_total: std::sync::atomic::AtomicU64,
     pub mem_plan_total: std::sync::atomic::AtomicU64,
     pub hot_plan_us_total: std::sync::atomic::AtomicU64,
@@ -312,6 +319,20 @@ pub type CustomProjectTables = Arc<RwLock<HashMap<(String, String), Arc<RwLock<D
 type ZOrderFilesets = Arc<RwLock<HashMap<String, HashMap<chrono::NaiveDate, std::collections::HashSet<String>>>>>;
 /// Per-(project_id, table_name) DML serialization mutexes — see `Database::dml_lock`.
 type DmlLocks = Arc<dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+
+type RollupSourceKey = (String, String, String);
+type RollupCoverageKey = (String, String, String, String);
+
+#[derive(Debug, Clone)]
+struct RollupCoverage {
+    source_fp: u64,
+    source_epoch: u64,
+    generation: String,
+    rows: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RollupReadTicket(Vec<(RollupCoverageKey, u64, u64, String)>);
 /// Per-physical-table count of flush/ingest committers QUEUED on the commit lock
 /// — see `Database::flush_waiters` and the priority check in `commit_wave`.
 type FlushWaiterCounts = Arc<dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicUsize>>>;
@@ -1973,6 +1994,12 @@ pub struct Database {
     /// Any commit touching the partition changes its file set → mismatch →
     /// dedup stays on until the next clean sweep pass.
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), u64>>,
+    /// Monotonic invalidation epoch for each source `(project, table, date)`.
+    rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
+    /// Certified rollup generations keyed by `(project, source, target, date)`.
+    rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
+    /// Bounded exponential retry state for failed source-partition rollup builds.
+    rollup_backoff: Arc<dashmap::DashMap<RollupCoverageKey, (u32, std::time::Instant)>>,
     /// Exact merge-on-read count partitions. Query threads use only the
     /// process-local front; disk loads and Delta builds are single-flight and
     /// bounded in the background so a cold cache cannot amplify query load.
@@ -2093,6 +2120,8 @@ pub struct Database {
     /// Per-clone override for `query_delta_only`: hides the shared layer so
     /// scans bypass the in-memory buffer.
     bypass_buffer: bool,
+    /// Internal aggregate builds must never read the rollup they are rebuilding.
+    bypass_rollup: bool,
     /// Late-binding shared cells like `buffered_layer`: attached by `with_*`
     /// builders after boot has already cloned Database into sessions/planners,
     /// so a plain Option would leave those clones silently service-less.
@@ -2488,6 +2517,9 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
+            rollup_source_epochs: Arc::new(dashmap::DashMap::new()),
+            rollup_coverage: Arc::new(dashmap::DashMap::new()),
+            rollup_backoff: Arc::new(dashmap::DashMap::new()),
             logical_count_cache,
             logical_count_building: Arc::new(dashmap::DashSet::new()),
             // A build retains one winner per logical key. Serial construction
@@ -2511,6 +2543,7 @@ impl Database {
             snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
             bypass_buffer: false,
+            bypass_rollup: false,
             tantivy_search: Arc::new(std::sync::OnceLock::new()),
             tantivy_indexer: Arc::new(std::sync::OnceLock::new()),
             dml_coalescer: Arc::new(std::sync::OnceLock::new()),
@@ -2769,10 +2802,65 @@ impl Database {
         Ok(built)
     }
 
+    pub(crate) async fn rollup_sql(
+        &self, logical_plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
+    ) -> std::result::Result<Option<(String, String, Option<datafusion::logical_expr::logical_plan::Projection>, RollupReadTicket)>, crate::rollup::MissReason>
+    {
+        if self.bypass_rollup {
+            return Ok(None);
+        }
+        let Some(route) = crate::rollup::match_aggregate(logical_plan, session).await? else { return Ok(None) };
+        if !self.config.maintenance.rollup_read_enabled_for(&route.project_id) {
+            return Ok(None);
+        }
+        if route.lo.rem_euclid(route.grain) != 0 || route.hi.rem_euclid(route.grain) != 0 {
+            return Err(crate::rollup::MissReason::PartialBucket);
+        }
+        let end = route.hi.checked_sub(1).ok_or(crate::rollup::MissReason::UnboundedTime)?;
+        let dates = window_dates(route.lo, end).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
+        let mut generations = Vec::with_capacity(dates.len());
+        let mut ticket = Vec::with_capacity(dates.len());
+        for date in dates {
+            let date = date.to_string();
+            let key = (route.project_id.clone(), route.source.clone(), route.target.clone(), date.clone());
+            let Some(coverage) = self.rollup_coverage.get(&key) else { return Err(crate::rollup::MissReason::IncompleteCoverage) };
+            let source_fp =
+                self.rollup_source_fingerprint(&route.project_id, &route.source, &date).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
+            let source_epoch = self.rollup_source_epochs.get(&(route.project_id.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
+            if coverage.source_fp != source_fp || coverage.source_epoch != source_epoch {
+                return Err(crate::rollup::MissReason::IncompleteCoverage);
+            }
+            debug!(project_id = %route.project_id, source = %route.source, target = %route.target, date, rows = coverage.rows, "rollup coverage selected");
+            generations.push((date.clone(), coverage.generation.clone()));
+            ticket.push((key, source_fp, source_epoch, coverage.generation.clone()));
+        }
+        Ok(Some((route.sql(&generations), format!("{}us", route.grain), route.outer_projection, RollupReadTicket(ticket))))
+    }
+
+    pub(crate) async fn rollup_ticket_current(&self, ticket: &RollupReadTicket) -> bool {
+        for ((project_id, source, target, date), source_fp, source_epoch, generation) in &ticket.0 {
+            if self
+                .rollup_coverage
+                .get(&(project_id.clone(), source.clone(), target.clone(), date.clone()))
+                .is_none_or(|coverage| coverage.source_fp != *source_fp || coverage.source_epoch != *source_epoch || coverage.generation != *generation)
+            {
+                return false;
+            }
+            if self.rollup_source_epochs.get(&(project_id.clone(), source.clone(), date.clone())).map_or(0, |epoch| *epoch.value()) != *source_epoch {
+                return false;
+            }
+            if self.rollup_source_fingerprint(project_id, source, date).await.map_or(true, |fingerprint| fingerprint != *source_fp) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Query Delta tables directly, bypassing the in-memory buffer (for testing).
     pub async fn query_delta_only(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let mut db_clone = self.clone();
         db_clone.bypass_buffer = true;
+        db_clone.bypass_rollup = true;
         let db_arc = Arc::new(db_clone);
         let mut ctx = Arc::clone(&db_arc).create_session_context();
         datafusion_functions_json::register_all(&mut ctx)?;
@@ -3366,9 +3454,9 @@ impl Database {
             // binding): sessions are created during boot before the layer
             // exists.
             .with_query_planner(Arc::new(DmlQueryPlanner::new(self.clone())))
-            // PG parity: resolve `'<path>'::jsonpath` casts to Utf8 so the path
-            // literal reaches jsonb_path_exists as text (covers simple + extended).
-            .with_type_planner(Arc::new(crate::functions::JsonPathTypePlanner))
+            // PostgreSQL custom casts, including jsonpath and regproc, become
+            // text consistently for simple and extended protocol queries.
+            .with_type_planner(Arc::new(crate::functions::PostgresTypePlanner))
             .build();
 
         SessionContext::new_with_state(session_state)
@@ -3384,7 +3472,7 @@ impl Database {
         Ok(())
     }
 
-    /// Register routing + stats + pg_settings tables. Depends on `self.buffered_layer`
+    /// Register routing, stats, and PostgreSQL catalog tables. Depends on `self.buffered_layer`
     /// being set (stats table holds an Arc to it).
     pub fn setup_session_tables(&self, ctx: &mut SessionContext) -> DFResult<()> {
         use crate::schema_loader::registry;
@@ -3450,7 +3538,7 @@ impl Database {
             ),
         )?;
 
-        self.register_pg_settings_table(ctx)?;
+        crate::pg_compat::setup_catalog(ctx, &self.config.core.pgwire_user, self.config.core.timefusion_pgwire_max_statement_secs)?;
         Ok(())
     }
 
@@ -3459,37 +3547,6 @@ impl Database {
     pub fn setup_session_context(&self, ctx: &mut SessionContext) -> DFResult<()> {
         self.setup_session_tables(ctx)?;
         self.setup_session_udfs(ctx)
-    }
-
-    /// Register PostgreSQL settings table for compatibility
-    pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
-        use datafusion::arrow::{
-            array::StringViewArray,
-            datatypes::{DataType, Field, Schema},
-            record_batch::RecordBatch,
-        };
-
-        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8View, false), Field::new("setting", DataType::Utf8View, false)]));
-
-        let names: Vec<&str> = vec![
-            "TimeZone",
-            "client_encoding",
-            "datestyle",
-            "client_min_messages",
-            "lc_monetary",
-            "lc_numeric",
-            "lc_time",
-            "standard_conforming_strings",
-            "application_name",
-            "search_path",
-        ];
-
-        let settings: Vec<&str> = vec!["UTC", "UTF8", "ISO, MDY", "notice", "C", "C", "C", "on", "TimeFusion", "public"];
-
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringViewArray::from(names)), Arc::new(StringViewArray::from(settings))])?;
-
-        ctx.register_batch("pg_settings", batch)?;
-        Ok(())
     }
 
     /// Register set_config UDF for PostgreSQL compatibility
@@ -5063,6 +5120,10 @@ impl Database {
 
         // Use provided table_name or default to otel_logs_and_spans
         let table_name = if table_name.is_empty() { "otel_logs_and_spans".to_string() } else { table_name.to_string() };
+
+        if watermark.is_none() {
+            self.invalidate_rollup_batches(&project_id, &table_name, &batches);
+        }
 
         // Stamp the schema's TF-owned version column. This is the single funnel
         // every *inbound* write passes through — pgwire INSERT (`write_all`),
@@ -7642,6 +7703,106 @@ impl Database {
         Ok(m)
     }
 
+    async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str) -> Result<u64> {
+        let table = self.resolve_table(project_id, source).await?;
+        let table = table.read().await;
+        let mut files = Self::partition_files_by_pid(&table, &format!("date={date}"))?;
+        Ok(partition_file_fp(files.remove(project_id).or_else(|| files.remove("default")).unwrap_or_default()))
+    }
+
+    fn invalidate_rollup_partition(&self, project_id: &str, source: &str, date: &str) {
+        let source_key = (project_id.to_string(), source.to_string(), date.to_string());
+        self.rollup_source_epochs.entry(source_key).and_modify(|epoch| *epoch = epoch.saturating_add(1)).or_insert(1);
+        if let Some(schema) = get_schema(source) {
+            for spec in &schema.rollups {
+                let key = (project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string());
+                self.rollup_coverage.remove(&key);
+                self.rollup_backoff.remove(&key);
+            }
+        }
+    }
+
+    fn rollup_retry_allowed(&self, project_id: &str, source: &str, date: &str) -> bool {
+        get_schema(source).is_none_or(|schema| {
+            schema.rollups.iter().all(|spec| {
+                self.rollup_backoff
+                    .get(&(project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string()))
+                    .is_none_or(|entry| std::time::Instant::now() >= entry.value().1)
+            })
+        })
+    }
+
+    fn record_rollup_failure(&self, project_id: &str, source: &str, date: &str) {
+        const MAX_ROLLUP_RETRIES: usize = 4096;
+        let Some(schema) = get_schema(source) else { return };
+        for spec in &schema.rollups {
+            let key = (project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string());
+            let attempts = self.rollup_backoff.get(&key).map_or(0, |entry| entry.value().0);
+            if attempts > 0 || self.rollup_backoff.len() < MAX_ROLLUP_RETRIES {
+                let attempts = attempts.saturating_add(1);
+                let delay = std::time::Duration::from_secs((600_u64 << attempts.saturating_sub(1).min(7)).min(21_600));
+                self.rollup_backoff.insert(key, (attempts, std::time::Instant::now() + delay));
+            }
+        }
+    }
+
+    fn clear_rollup_backoff(&self, project_id: &str, source: &str, date: &str) {
+        if let Some(schema) = get_schema(source) {
+            for spec in &schema.rollups {
+                self.rollup_backoff.remove(&(project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string()));
+            }
+        }
+    }
+
+    fn rollup_coverage_current(&self, project_id: &str, source: &str, date: &str, source_fp: u64) -> bool {
+        let epoch = self.rollup_source_epochs.get(&(project_id.to_string(), source.to_string(), date.to_string())).map_or(0, |entry| *entry.value());
+        get_schema(source).is_some_and(|schema| {
+            schema.rollups.iter().all(|spec| {
+                self.rollup_coverage
+                    .get(&(project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string()))
+                    .is_some_and(|coverage| coverage.source_fp == source_fp && coverage.source_epoch == epoch)
+            })
+        })
+    }
+
+    pub(crate) fn invalidate_rollup_source(&self, project_id: &str, source: &str) {
+        if !get_schema(source).is_some_and(|schema| !schema.rollups.is_empty()) {
+            return;
+        }
+        let keys: Vec<_> =
+            self.rollup_source_epochs.iter().filter(|entry| entry.key().0 == project_id && entry.key().1 == source).map(|entry| entry.key().clone()).collect();
+        for key in keys {
+            self.rollup_source_epochs.entry(key).and_modify(|epoch| *epoch = epoch.saturating_add(1));
+        }
+        self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source);
+        self.rollup_backoff.retain(|(project, table, _, _), _| project != project_id || table != source);
+    }
+
+    fn invalidate_rollup_batches(&self, project_id: &str, source: &str, batches: &[RecordBatch]) {
+        if !get_schema(source).is_some_and(|schema| !schema.rollups.is_empty()) {
+            return;
+        }
+        let dates = batches
+            .iter()
+            .map(|batch| {
+                batch.column_by_name("timestamp").and_then(|column| column.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>()).map(
+                    |timestamps| {
+                        timestamps
+                            .iter()
+                            .flatten()
+                            .filter_map(chrono::DateTime::<chrono::Utc>::from_timestamp_micros)
+                            .map(|timestamp| timestamp.date_naive().to_string())
+                            .collect::<HashSet<_>>()
+                    },
+                )
+            })
+            .collect::<Option<Vec<_>>>();
+        match dates {
+            Some(dates) => dates.into_iter().flatten().for_each(|date| self.invalidate_rollup_partition(project_id, source, &date)),
+            None => self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source),
+        }
+    }
+
     /// True iff every (project, date) partition overlapping `window` carries
     /// a clean fingerprint matching its CURRENT live file set (0-drop sweep
     /// pass, unchanged since). Shared by the read-side DedupExec skip and the
@@ -7658,32 +7819,114 @@ impl Database {
     /// this table existed — so `route` simply finds nothing to serve.
     /// Rebuilds EVERY rollup declared on `source`, so adding one is a schema
     /// change and nothing here needs editing.
-    async fn rebuild_rollup_partition(&self, source: &str, project_id: &str, date: &str) {
-        let Some(schema) = get_schema(source) else { return };
-        for spec in &schema.rollups {
-            let target = spec.table_name(source);
-            let sql = crate::rollup::build_partition_sql(spec, source, project_id, date);
-            let rows = match self.query_delta_only(&sql).await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    warn!(project_id, date, target, "rollup build: aggregate failed, leaving the window to raw scans: {e}");
-                    continue;
-                }
-            };
-            let batches = match crate::rollup::to_rollup_batches(spec, source, project_id, date, &rows) {
-                Ok(b) if !b.is_empty() => b,
-                Ok(_) => continue,
-                Err(e) => {
-                    warn!(project_id, date, target, "rollup build: shaping failed: {e}");
-                    continue;
-                }
-            };
-            let written: usize = batches.iter().map(|b| b.num_rows()).sum();
-            match self.insert_records_batch(project_id, &target, batches, true, None).await {
-                Ok(_) => info!(project_id, date, target, rows = written, event = "rollup_partition_built"),
-                Err(e) => warn!(project_id, date, target, "rollup build: write failed: {e}"),
+    async fn replace_rollup_partition(&self, project_id: &str, target: &str, date: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        use deltalake::{
+            kernel::{Action, transaction::TableReference},
+            protocol::{DeltaOperation, SaveMode},
+            writer::DeltaWriter,
+        };
+
+        let table_ref = self.get_or_create_table(project_id, target).await?;
+        let schema = get_schema(target).ok_or_else(|| anyhow::anyhow!("rollup target `{target}` is not registered"))?;
+        let (batches, sorted) = self.sort_flush_group(schema, batches, UnsortedFallback::Forbid).await?;
+        let staging_table = table_ref.read().await.clone();
+        let stage_store = staging_table.log_store().object_store(None);
+        let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
+            .map_err(|error| anyhow::anyhow!("rollup writer: {error}"))?
+            .with_writer_properties(self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted));
+        let target_schema = writer.arrow_schema();
+        let mut staged = Vec::new();
+        for batch in batches {
+            let batch = batch?;
+            writer.write(deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?).await?;
+            if writer.buffer_len() >= self.config.maintenance.timefusion_writer_max_file_bytes {
+                staged.extend(writer.flush().await?.into_iter().map(Action::Add));
             }
         }
+        staged.extend(writer.flush().await?.into_iter().map(Action::Add));
+
+        let commit_lock = self.commit_lock(project_id, target).await;
+        for attempt in 0..5 {
+            let commit_guard = commit_lock.lock().await;
+            let _ = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
+            let mut table = table_ref.read().await.clone();
+            let target_paths: std::collections::HashSet<_> =
+                dedup_partition_paths(table.snapshot()?.log_data().iter().map(|add| add.path().to_string()), project_id, date).into_iter().collect();
+            let targets: Vec<_> = table.snapshot()?.log_data().iter().filter(|add| target_paths.contains(add.path().as_ref())).collect();
+            if targets.is_empty() && staged.is_empty() {
+                return Ok(());
+            }
+            let removes = targets.into_iter().map(|add| Action::Remove(add.remove_action(true)));
+            let adds = staged.clone().into_iter().map(|action| match action {
+                Action::Add(mut add) => {
+                    add.data_change = true;
+                    Action::Add(add)
+                }
+                action => action,
+            });
+            let actions = removes.chain(adds).collect();
+            let pre_uris = table.get_file_uris()?.collect::<std::collections::HashSet<_>>();
+            let snapshot = table.snapshot()?;
+            let result =
+                deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                    .with_actions(actions)
+                    .build(
+                        Some(snapshot as &dyn TableReference),
+                        table.log_store(),
+                        DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(schema.partitions.clone()), predicate: None },
+                    )
+                    .await;
+            match result {
+                Ok(finalized) => {
+                    table.state = Some(finalized.snapshot());
+                    drop(commit_guard);
+                    let no_dirty: &[(String, i64)] = &[];
+                    self.record_committed_write(&table_ref, &[(project_id, no_dirty)], target, table, &pre_uris, false).await;
+                    return Ok(());
+                }
+                Err(error) if is_occ_conflict_err(&error.to_string()) && attempt < 4 => {
+                    drop(commit_guard);
+                    tokio::time::sleep(occ_backoff(attempt)).await;
+                }
+                Err(error) => {
+                    drop(commit_guard);
+                    Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
+                    return Err(anyhow::anyhow!("rollup partition replace failed: {error}"));
+                }
+            }
+        }
+        Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
+        anyhow::bail!("rollup partition replace exhausted retries")
+    }
+
+    async fn rebuild_rollup_partition(&self, source: &str, project_id: &str, date: &str, source_fp: u64) -> Result<()> {
+        if !self.config.maintenance.rollup_build_enabled_for(project_id) {
+            return Ok(());
+        }
+        let Some(schema) = get_schema(source) else { return Ok(()) };
+        let source_key = (project_id.to_string(), source.to_string(), date.to_string());
+        let source_epoch = self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
+        let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
+
+        for spec in &schema.rollups {
+            let target = spec.table_name(source);
+            let coverage_key = (project_id.to_string(), source.to_string(), target.clone(), date.to_string());
+            self.rollup_coverage.remove(&coverage_key);
+            let rows = self.query_delta_only(&crate::rollup::build_partition_sql(spec, source, project_id, date)?).await?;
+            let generation = uuid::Uuid::new_v4().to_string();
+            let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
+            let row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+            self.replace_rollup_partition(project_id, &target, date, batches).await?;
+            if self.rollup_source_fingerprint(project_id, source, date).await? != source_fp
+                || self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value()) != source_epoch
+            {
+                anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
+            }
+            self.rollup_coverage.insert(coverage_key, RollupCoverage { source_fp, source_epoch, generation, rows: row_count });
+            info!(project_id, date, target, rows = row_count, event = "rollup_partition_built");
+        }
+        self.clear_rollup_backoff(project_id, source, date);
+        Ok(())
     }
 
     pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> bool {
@@ -7898,7 +8141,8 @@ impl Database {
         let dates: Vec<chrono::NaiveDate> = (0..=lookback).rev().map(|d| today - chrono::Duration::days(d)).collect();
 
         let pre_version = table_ref.read().await.version().unwrap_or(0);
-        if self.last_dedup_versions.read().await.get(dedup_key).copied() == Some(pre_version) {
+        let needs_rollup_retry = self.config.maintenance.timefusion_rollup_enabled && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
+        if !needs_rollup_retry && self.last_dedup_versions.read().await.get(dedup_key).copied() == Some(pre_version) {
             debug!("dedup sweep: table={} version={} unchanged — skipping", table_name, pre_version);
             return Ok(());
         }
@@ -7931,7 +8175,17 @@ impl Database {
                 // lookback days, and today between flushes).
                 let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
                 let cur_files = files_by_pid.get(pid).cloned().unwrap_or_default();
-                if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|e| *e.value()) == Some(partition_file_fp(cur_files.clone())) {
+                let current_fp = partition_file_fp(cur_files.clone());
+                if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| *entry.value()) == Some(current_fp) {
+                    if self.config.maintenance.rollup_build_enabled_for(pid)
+                        && self.rollup_retry_allowed(pid, table_name, &date.to_string())
+                        && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
+                        && !self.rollup_coverage_current(pid, table_name, &date.to_string(), current_fp)
+                        && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), current_fp).await
+                    {
+                        self.record_rollup_failure(pid, table_name, &date.to_string());
+                        warn!(project_id = pid, date = %date, table_name, %error, "rollup retry failed; leaving the partition on raw scans");
+                    }
                     continue;
                 }
                 let backoff_key = format!("{dedup_key}:{pid}:{date}");
@@ -7974,8 +8228,12 @@ impl Database {
                             // Any table that DECLARES rollups gets them rebuilt
                             // at its certification point — no table name is
                             // special-cased here any more.
-                            if get_schema(table_name).is_some_and(|s| !s.rollups.is_empty()) {
-                                self.rebuild_rollup_partition(table_name, pid, &date.to_string()).await;
+                            if get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
+                                && self.rollup_retry_allowed(pid, table_name, &date.to_string())
+                                && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), fp_post).await
+                            {
+                                self.record_rollup_failure(pid, table_name, &date.to_string());
+                                warn!(project_id = pid, date = %date, table_name, %error, "rollup build failed; leaving the partition on raw scans");
                             }
                         } else {
                             self.dedup_clean_fp.remove(&fp_key);
@@ -8474,7 +8732,8 @@ impl Database {
                 error!("Dirty-bin dedup failed for {label}: {e}");
             }
         }
-        if self.config.maintenance.timefusion_dedup_sweep_fallback {
+        let certify_rollups = self.config.maintenance.timefusion_rollup_enabled && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
+        if self.config.maintenance.timefusion_dedup_sweep_fallback || certify_rollups {
             let t0 = std::time::Instant::now();
             match self.dedup_today_partitions(table, table_name, dedup_key).await {
                 Ok(()) if t0.elapsed() > DEDUP_WARN => {
@@ -12603,6 +12862,34 @@ impl ProjectRoutingTable {
         filters.iter().find_map(crate::optimizers::extract_project_id_from_expr)
     }
 
+    fn bounded_otel_scan_reason(&self, filters: &[Expr], limit: Option<usize>) -> Option<&'static str> {
+        let mut conjuncts = Vec::new();
+        fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+            if let Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) = expr {
+                collect_conjuncts(left, out);
+                collect_conjuncts(right, out);
+            } else {
+                out.push(expr);
+            }
+        }
+        for filter in filters {
+            collect_conjuncts(filter, &mut conjuncts);
+        }
+        let lower_timestamp_bound =
+            self.extract_time_range_from_filters(&conjuncts.into_iter().cloned().collect::<Vec<_>>()).is_some_and(|(lower, _)| lower != i64::MIN);
+        Self::raw_otel_scan_reason(&self.table_name, filters, limit, lower_timestamp_bound)
+    }
+
+    fn raw_otel_scan_reason(table_name: &str, filters: &[Expr], limit: Option<usize>, lower_timestamp_bound: bool) -> Option<&'static str> {
+        if !matches!(table_name, "otel_logs_and_spans" | "otel_metrics") {
+            return None;
+        }
+        if !filters.iter().any(|filter| crate::optimizers::extract_project_id_from_expr(filter).is_some()) {
+            return Some("missing exact project_id filter");
+        }
+        (limit.is_none() && !lower_timestamp_bound).then_some("missing timestamp lower bound or scan limit")
+    }
+
     /// pgwire-INSERT fast path. Skips `DataSinkExec` + `ValuesExec` entirely:
     /// caller (the plan_cache hook) has already materialized the incoming
     /// VALUES into a RecordBatch from substituted literals, so we just run
@@ -13763,6 +14050,20 @@ impl TableProvider for ProjectRoutingTable {
         let span = tracing::Span::current();
         let scan_start = std::time::Instant::now();
         let scan_metrics = self.database.scan_metrics.clone();
+
+        if let Some(reason) = self.bounded_otel_scan_reason(filters, limit) {
+            match self.database.config.core.timefusion_otel_scan_guard {
+                config::OtelScanGuard::Off => {}
+                config::OtelScanGuard::Observe => {
+                    scan_metrics.bounded_otel_scan_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(event = "otel_scan_guard_candidate", table.name = %self.table_name, reason, "raw OTel scan would be rejected");
+                }
+                config::OtelScanGuard::Enforce => {
+                    scan_metrics.bounded_otel_scan_rejections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(DataFusionError::Plan("raw OTel queries require project_id = <value> and a timestamp lower bound or LIMIT".to_string()));
+                }
+            }
+        }
 
         // Apply our custom optimizations to the filters
         // Second line of defence behind `supports_filters_pushdown`: neither a
@@ -18795,6 +19096,28 @@ mod tests {
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1);
         Ok(())
+    }
+
+    #[test]
+    fn bounded_otel_scan_requires_a_project_and_bound() {
+        let project = col("project_id").eq(lit("project"));
+        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", &[], None, false), Some("missing exact project_id filter"));
+        assert_eq!(
+            ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", std::slice::from_ref(&project), None, false),
+            Some("missing timestamp lower bound or scan limit")
+        );
+        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", std::slice::from_ref(&project), Some(1), false), None);
+        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", std::slice::from_ref(&project), None, true), None);
+        assert_eq!(
+            ProjectRoutingTable::raw_otel_scan_reason(
+                "otel_logs_and_spans",
+                &[col("project_id").eq(lit("one")).or(col("project_id").eq(lit("two")))],
+                None,
+                true,
+            ),
+            Some("missing exact project_id filter")
+        );
+        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("timefusion_stats", &[], None, false), None);
     }
 }
 

@@ -1,479 +1,679 @@
-//! Dashboard rollups: a pre-aggregated sibling of `otel_logs_and_spans`.
+//! Schema-driven dashboard rollups.
 //!
-//! Wide dashboard panels do not fail because the engine is slow, they fail
-//! because they read raw rows at all. Measured on prod 2026-08-09, a 7-day
-//! Overview panel decoded 15.97 M rows across 105 objects to return 35.89 K —
-//! and at 14 days the same shape hit the 2 GiB dedup cap and errored. Reading a
-//! 1-minute rollup instead turns that into a few hundred KB, which is the only
-//! change here that removes the work rather than making it cheaper.
-//!
-//! Two halves, and the second is the one that gets skipped:
-//!
-//! * [`build_partition`] computes buckets from a source partition;
-//! * [`route`] PROVES a query is answerable from them, and refuses otherwise.
-//!
-//! Correctness under merge-on-read is why the build trigger is not a timer. A
-//! bucket's contents change after the fact — enrichment appends new versions and
-//! keep-greatest decides the winner — so a rollup computed over a bin that is
-//! later deduped is simply wrong. Buckets are therefore built ONLY from a
-//! partition the sweep has certified clean, the same signal
-//! `dedup_skip_allowed` uses, and a bin re-entering the dirty queue invalidates
-//! them.
+//! A rollup is built only after its source partition is duplicate-free. This
+//! module owns the deterministic aggregate SQL and the conversion from its
+//! output to the generated target schema. Read routing lives here as well, but
+//! is deliberately conservative: an unsupported query must use raw data.
 
-use crate::{metrics, schema_loader::RollupSpec};
+use crate::schema_loader::RollupSpec;
 
-/// The source table this rollup summarizes. Spans only — `otel_metrics` has
-/// none of these columns and would need its own rollup, dimension set and
-/// decomposability argument.
-pub const SOURCE_TABLE: &str = "otel_logs_and_spans";
-
-/// The table [`build_partition`] writes and [`route`] reads.
-///
-/// NAMING RULE, pinned by `rollup_table_is_named_after_its_source`:
-/// `{SOURCE_TABLE}_rollup_{grain}`. This was `otel_rollup_1m`, which reads like
-/// a rollup of all OTel data when it is a rollup of ONE table — every dimension
-/// and measure here is span-shaped (`kind`, `status_code`, `duration`, and an
-/// error predicate on HTTP status). A second rollup over a different source
-/// must carry its own source's name for the same reason.
-pub const ROLLUP_TABLE: &str = "otel_logs_and_spans_rollup_1m";
-
-/// The grain suffix in [`ROLLUP_TABLE`], kept beside [`GRAIN_MICROS`] so a
-/// change to one that is not mirrored in the other fails the naming test
-/// rather than shipping a table whose name lies about its resolution.
-pub const GRAIN_SUFFIX: &str = "1m";
-
-/// Base grain, in microseconds. Coarser grains are derived by re-aggregating
-/// this one (1m -> 1h -> 1d): the merge is associative, so there is no second
-/// pipeline and no second correctness argument.
-pub const GRAIN_MICROS: i64 = 60 * 1_000_000;
-
-/// Columns a query may GROUP BY or FILTER on and still be answerable.
-///
-/// Filter columns constrain the design exactly as hard as group-by columns, and
-/// that is the part a rollup design usually gets wrong: rows for a
-/// non-dimension are already summed together and cannot be subtracted back out,
-/// so a filter on one cannot be applied after aggregation. Both sets are
-/// checked against this list.
-pub const DIMENSIONS: [&str; 3] = ["resource___service___name", "kind", "status_code"];
-
-/// Aggregates that survive re-aggregation across buckets and across collapsed
-/// dimensions. `avg` is admissible as `sum/count` and is expanded by the
-/// planner before it reaches here.
-pub const DECOMPOSABLE: [&str; 4] = ["count", "sum", "min", "max"];
-
-/// Why a query could not be served from the rollup.
-///
-/// Carried rather than collapsed to a bool because without the reason there is
-/// no feedback loop telling us which dimension to add next — a rollup that
-/// silently serves 20% of traffic looks identical to one that serves 90%.
+/// Why a query cannot use a rollup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissReason {
-    /// A GROUP BY key that is not a dimension.
+    UnsupportedShape,
+    MissingProject,
+    UnboundedTime,
     UnknownGroupBy,
-    /// A FILTER on a column that is not a dimension — the one that gets missed.
     UnknownFilter,
-    /// `count(distinct)`, an exact percentile: cannot be re-aggregated.
+    MissingMeasure,
     NonDecomposableAggregate,
-    /// The requested bucket width is finer than [`GRAIN_MICROS`], or the range
-    /// does not cover whole buckets.
     PartialBucket,
+    IncompleteCoverage,
+    RewriteSchemaMismatch,
 }
 
 impl MissReason {
-    /// Stable label for the `rollup_miss` counter.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::UnsupportedShape => "unsupported_shape",
+            Self::MissingProject => "missing_project",
+            Self::UnboundedTime => "unbounded_time",
             Self::UnknownGroupBy => "unknown_group_by",
             Self::UnknownFilter => "unknown_filter",
-            Self::NonDecomposableAggregate => "non_decomposable_aggregate",
-            Self::PartialBucket => "partial_bucket",
+            Self::MissingMeasure => "missing_measure",
+            Self::NonDecomposableAggregate => "non_decomposable",
+            Self::PartialBucket => "unaligned_range",
+            Self::IncompleteCoverage => "incomplete_coverage",
+            Self::RewriteSchemaMismatch => "rewrite_schema_mismatch",
         }
     }
 }
 
-/// What a query asks for, reduced to the four things routing depends on.
-#[derive(Debug, Clone)]
-pub struct Ask<'a> {
-    pub group_by: &'a [String],
-    pub filtered: &'a [String],
-    pub aggregates: &'a [String],
-    /// Requested bucket width in micros, if the query buckets by time at all.
-    pub bucket_micros: Option<i64>,
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Decide whether `ask` can be answered from the rollup, and record the verdict.
+/// SQL that builds one source `(project_id, date)` partition.
 ///
-/// All four conditions must hold; any failure falls through to the raw scan,
-/// which is always correct and merely slower. Silent fallthrough is deliberate —
-/// a query that cannot route must still return the right answer — but it is
-/// never UNRECORDED, which is what makes the dimension set improvable.
-pub fn route(spec: &RollupSpec, ask: &Ask<'_>) -> Result<(), MissReason> {
-    let grain_micros = spec.grain_micros().unwrap_or(GRAIN_MICROS);
-    let known = |c: &String| spec.dimensions.iter().any(|d| d == c);
-    let reason = if !ask.group_by.iter().all(known) {
-        Some(MissReason::UnknownGroupBy)
-    } else if !ask.filtered.iter().all(known) {
-        Some(MissReason::UnknownFilter)
-    } else if !ask.aggregates.iter().all(|a| DECOMPOSABLE.contains(&a.as_str())) {
-        Some(MissReason::NonDecomposableAggregate)
-    } else if ask.bucket_micros.is_none_or(|w| w < grain_micros || w % grain_micros != 0) {
-        // Finer than the grain cannot be reconstructed, and a width that is not
-        // a whole multiple would split a stored bucket across two output rows.
-        Some(MissReason::PartialBucket)
-    } else {
-        None
-    };
-    match reason {
-        Some(r) => {
-            metrics::record_rollup_miss(r.label());
-            Err(r)
-        }
-        None => {
-            metrics::record_rollup_hit();
-            Ok(())
-        }
-    }
-}
-
-/// Bucket start containing `ts`, floored to the base grain.
-///
-/// Floor, not truncate-toward-zero: pre-epoch timestamps are not expected here,
-/// but a bucket that jumps forward for negative input would silently misplace
-/// rows rather than fail, and that is the class of bug this table cannot afford.
-pub const fn bucket_start(ts_micros: i64) -> i64 {
-    ts_micros.div_euclid(GRAIN_MICROS) * GRAIN_MICROS
-}
-
-/// Stable identity for one rollup row.
-///
-/// Deterministic in (bucket, dimensions) so rebuilding a partition produces the
-/// SAME id and replaces the previous row through the table's dedup keys, rather
-/// than doubling every measure. That property is what lets a re-certified bin be
-/// rebuilt without a delete pass.
-pub fn bucket_id(bucket_micros: i64, dims: &[Option<&str>]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bucket_micros.hash(&mut h);
-    // Hash the arity too: ["a", None] and ["a"] must not collide.
-    dims.len().hash(&mut h);
-    for d in dims {
-        d.hash(&mut h);
-    }
-    format!("{bucket_micros}-{:016x}", h.finish())
-}
-
-/// The SQL that computes one partition's buckets from the source table.
-///
-/// Expressed as SQL rather than hand-rolled Arrow because the engine already
-/// does this well and the aggregate list is the part that must stay obviously
-/// aligned with [`DIMENSIONS`] and the schema's measure columns.
-///
-/// `date` is the partition being rebuilt; the caller is responsible for having
-/// certified it clean first (see the module docs).
-pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, date: &str) -> String {
-    let grain = spec.grain_micros().unwrap_or(GRAIN_MICROS);
-    let dims = spec.dimensions.join(", ");
-    // Measures come from the spec in declaration order, which is the same order
-    // `synthesize` appended them to the schema — that alignment is what lets
-    // `to_rollup_batches` map column i of the aggregate onto measure i.
+/// Aggregate filters belong on each aggregate rather than in the row `WHERE`
+/// clause. Moving them would make unrelated measures observe the wrong rows.
+pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, date: &str) -> anyhow::Result<String> {
+    let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
+    let dimensions = spec.dimensions.join(", ");
     let measures = spec
         .measures
         .iter()
-        .map(|m| {
-            let inner = match (m.agg.as_str(), m.column.as_deref()) {
-                ("count", _) => "COUNT(*)".to_string(),
-                (a, Some(c)) => format!("{}({c})", a.to_uppercase()),
-                (a, None) => format!("{}(1)", a.to_uppercase()),
+        .map(|measure| {
+            let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
+                ("count", None) => "COUNT(*)".to_string(),
+                ("count", Some(column)) => format!("COUNT({column})"),
+                ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+                (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
+                (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
             };
-            match &m.filter {
-                Some(f) => format!("{inner} FILTER (WHERE {f}) AS {}", m.name),
-                None => format!("{inner} AS {}", m.name),
-            }
+            Ok(match &measure.filter {
+                Some(filter) => format!("{expression} FILTER (WHERE {filter}) AS {}", measure.name),
+                None => format!("{expression} AS {}", measure.name),
+            })
         })
-        .collect::<Vec<_>>()
+        .collect::<anyhow::Result<Vec<_>>>()?
         .join(", ");
-    format!(
-        "SELECT \
-           to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp, \
-           {dims}, {measures} \
-         FROM {source} \
-         WHERE project_id = '{project_id}' AND date = '{date}' \
-         GROUP BY 1, {dims}"
-    )
+    let select_dimensions = (!dimensions.is_empty()).then(|| format!(", {dimensions}")).unwrap_or_default();
+    let group_by = std::iter::once("1".to_string()).chain((2..).take(spec.dimensions.len()).map(|index| index.to_string())).collect::<Vec<_>>().join(", ");
+
+    Ok(format!(
+        "SELECT to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp{select_dimensions}, {measures} \
+         FROM {source} WHERE project_id = {} AND date = {} GROUP BY {group_by}",
+        sql_literal(project_id),
+        sql_literal(date),
+    ))
 }
 
-/// Shape [`build_partition_sql`]'s output into rows of the rollup schema.
+fn generated_bucket_id(bucket: i64, grain: i64, generation: &str, dimensions: &[datafusion::scalar::ScalarValue]) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (bucket, grain, generation).hash(&mut hasher);
+    dimensions.len().hash(&mut hasher);
+    for dimension in dimensions {
+        format!("{dimension:?}").hash(&mut hasher);
+    }
+    format!("{bucket}-{:016x}", hasher.finish())
+}
+
+/// Convert aggregate batches into rows for the generated rollup schema.
 ///
-/// The aggregate produces `timestamp`, the dimensions, then the measures; this
-/// adds the identity columns the table needs — a deterministic `id` (so a
-/// rebuild replaces rather than doubles), the partition `date`, and the
-/// `updated_at`/`deleted` pair every table here carries.
+/// The aggregate output contains `timestamp`, then configured dimensions and
+/// configured measures. All remaining target fields are internal identity or
+/// partition fields. The conversion deliberately copies each configured Arrow
+/// array and casts it only at the generated target boundary, so binary digest
+/// state and non-string dimensions retain their types.
 pub fn to_rollup_batches(
-    spec: &RollupSpec, source: &str, project_id: &str, date: &str, aggregated: &[arrow::record_batch::RecordBatch],
+    spec: &RollupSpec, source: &str, project_id: &str, date: &str, generation: &str, aggregated: &[arrow::record_batch::RecordBatch],
 ) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
-    use arrow::array::{Array, ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::{
+        array::{Array, ArrayRef, BooleanArray, Date32Array, StringArray, TimestampMicrosecondArray},
+        compute::kernels::cast::cast,
+        datatypes::DataType,
+    };
     use std::sync::Arc;
 
     let target = spec.table_name(source);
     let schema = crate::schema_loader::get_schema(&target).ok_or_else(|| anyhow::anyhow!("{target} schema missing"))?.schema_ref();
-    // Days since epoch; the partition column is what routes reads to this date.
-    let date_days =
-        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| anyhow::anyhow!("invalid Unix epoch date"))?;
+    let date_days = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.signed_duration_since(epoch).num_days();
+    let date_days = i32::try_from(date_days).map_err(|_| anyhow::anyhow!("rollup date `{date}` is outside Date32"))?;
+    let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let now = crate::clock::now_micros();
 
-    let text = |b: &arrow::record_batch::RecordBatch, name: &str| -> Option<Vec<Option<String>>> {
-        let idx = b.schema().index_of(name).ok()?;
-        let col = arrow::compute::kernels::cast::cast(b.column(idx), &arrow::datatypes::DataType::Utf8).ok()?;
-        let col = col.as_any().downcast_ref::<StringArray>()?.clone();
-        Some((0..col.len()).map(|i| col.is_valid(i).then(|| col.value(i).to_string())).collect())
-    };
-    let ints = |b: &arrow::record_batch::RecordBatch, name: &str| -> Vec<Option<i64>> {
-        b.schema()
-            .index_of(name)
-            .ok()
-            .and_then(|i| arrow::compute::kernels::cast::cast(b.column(i), &arrow::datatypes::DataType::Int64).ok())
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>().cloned())
-            .map_or_else(|| vec![None; b.num_rows()], |c| (0..c.len()).map(|i| c.is_valid(i).then(|| c.value(i))).collect())
-    };
+    aggregated
+        .iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .map(|batch| {
+            let rows = batch.num_rows();
+            let timestamp = batch.column_by_name("timestamp").ok_or_else(|| anyhow::anyhow!("rollup aggregate is missing timestamp"))?;
+            let timestamp = cast(timestamp, &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())))?;
+            let timestamp = timestamp
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| anyhow::anyhow!("rollup aggregate timestamp cannot cast to microseconds"))?;
+            let timestamps = (0..rows)
+                .map(|row| (!timestamp.is_null(row)).then(|| timestamp.value(row)).ok_or_else(|| anyhow::anyhow!("rollup aggregate timestamp is null")))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let dimension_columns = spec
+                .dimensions
+                .iter()
+                .map(|name| batch.column_by_name(name).ok_or_else(|| anyhow::anyhow!("rollup aggregate is missing dimension `{name}`")))
+                .collect::<anyhow::Result<Vec<&ArrayRef>>>()?;
+            let ids = (0..rows)
+                .map(|row| {
+                    let values = dimension_columns
+                        .iter()
+                        .map(|column| datafusion::scalar::ScalarValue::try_from_array(column, row))
+                        .collect::<datafusion::common::Result<Vec<_>>>()?;
+                    Ok(generated_bucket_id(timestamps[row], grain, generation, &values))
+                })
+                .collect::<datafusion::common::Result<Vec<_>>>()?;
 
-    let mut out = Vec::new();
-    for b in aggregated.iter().filter(|b| b.num_rows() > 0) {
-        let n = b.num_rows();
-        let ts: Vec<i64> = b
-            .schema()
-            .index_of("timestamp")
-            .ok()
-            .and_then(|i| {
-                arrow::compute::kernels::cast::cast(
-                    b.column(i),
-                    &arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-                )
-                .ok()
-            })
-            .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>().cloned())
-            .map_or_else(|| vec![0; n], |c| (0..c.len()).map(|i| c.value(i)).collect());
-        let dims: Vec<Vec<Option<String>>> = spec.dimensions.iter().map(|d| text(b, d).unwrap_or_else(|| vec![None; n])).collect();
-        let ids: Vec<String> = (0..n)
-            .map(|r| {
-                let row: Vec<Option<&str>> = dims.iter().map(|d| d[r].as_deref()).collect();
-                bucket_id(ts[r], &row)
-            })
-            .collect();
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| -> anyhow::Result<ArrayRef> {
+                    let array: ArrayRef = match field.name().as_str() {
+                        "project_id" => Arc::new(StringArray::from(vec![Some(project_id); rows])),
+                        "timestamp" => Arc::new(TimestampMicrosecondArray::from(timestamps.clone()).with_timezone("UTC")),
+                        "date" => Arc::new(Date32Array::from(vec![date_days; rows])),
+                        "id" => Arc::new(StringArray::from(ids.clone())),
+                        "updated_at" => Arc::new(TimestampMicrosecondArray::from(vec![now; rows]).with_timezone("UTC")),
+                        "deleted" => Arc::new(BooleanArray::from(vec![Some(false); rows])),
+                        "rollup_generation" => Arc::new(StringArray::from(vec![Some(generation); rows])),
+                        name if spec.dimensions.iter().any(|dimension| dimension == name) || spec.measures.iter().any(|measure| measure.name == name) => {
+                            batch.column_by_name(name).cloned().ok_or_else(|| anyhow::anyhow!("rollup aggregate is missing `{name}`"))?
+                        }
+                        name => anyhow::bail!("generated rollup schema has unsupported field `{name}`"),
+                    };
+                    Ok(if array.data_type() == field.data_type() { array } else { cast(&array, field.data_type())? })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), columns)?)
+        })
+        .collect()
+}
 
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-        for f in schema.fields() {
-            let col: ArrayRef = match f.name().as_str() {
-                "project_id" => Arc::new(StringArray::from(vec![Some(project_id); n])),
-                "timestamp" => Arc::new(TimestampMicrosecondArray::from(ts.clone()).with_timezone("UTC")),
-                "date" => Arc::new(Date32Array::from(vec![date_days; n])),
-                "id" => Arc::new(StringArray::from(ids.clone())),
-                "updated_at" => Arc::new(TimestampMicrosecondArray::from(vec![now; n]).with_timezone("UTC")),
-                "deleted" => Arc::new(BooleanArray::from(vec![Some(false); n])),
-                name if DIMENSIONS.contains(&name) => {
-                    let i = DIMENSIONS.iter().position(|d| *d == name).unwrap();
-                    Arc::new(StringArray::from(dims[i].clone()))
-                }
-                // Counts are never null — an absent count is a zero bucket, not
-                // an unknown one — while the duration measures are genuinely
-                // absent when every row in the bucket had a null duration.
-                name @ ("request_count" | "error_count") => Arc::new(Int64Array::from(ints(b, name).into_iter().map(|v| v.unwrap_or(0)).collect::<Vec<_>>())),
-                name => Arc::new(Int64Array::from(ints(b, name))),
-            };
-            // Build in the natural Arrow type, then cast to whatever the loaded
-            // schema actually uses — string columns materialize as `Utf8View`
-            // here, and hand-matching each field's type would drift the moment
-            // the schema changes.
-            cols.push(match col.data_type() == f.data_type() {
-                true => col,
-                false => arrow::compute::kernels::cast::cast(&col, f.data_type())?,
-            });
-        }
-        out.push(arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), cols)?);
+#[derive(Debug)]
+pub(crate) struct RoutedRollup {
+    pub source: String,
+    pub project_id: String,
+    pub lo: i64,
+    pub hi: i64,
+    pub grain: i64,
+    pub target: String,
+    pub outer_projection: Option<datafusion::logical_expr::logical_plan::Projection>,
+    row_filters: Vec<String>,
+    select: String,
+    group_by: String,
+}
+
+impl RoutedRollup {
+    pub fn sql(&self, generations: &[(String, String)]) -> String {
+        let generations = generations
+            .iter()
+            .map(|(date, generation)| format!("(date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation)))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let group_by = (!self.group_by.is_empty()).then(|| format!(" GROUP BY {}", self.group_by));
+        let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
+        format!(
+            "SELECT {} FROM {} WHERE project_id = {} AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}) AND ({}){}{}",
+            self.select,
+            self.target,
+            sql_literal(&self.project_id),
+            self.lo,
+            self.hi,
+            generations,
+            row_filters,
+            group_by.unwrap_or_default(),
+        )
     }
-    Ok(out)
+}
+
+fn unaliased(expr: &datafusion::logical_expr::Expr) -> &datafusion::logical_expr::Expr {
+    match expr {
+        datafusion::logical_expr::Expr::Alias(alias) => unaliased(&alias.expr),
+        datafusion::logical_expr::Expr::Cast(cast) => unaliased(&cast.expr),
+        expr => expr,
+    }
+}
+
+fn column_name(expr: &datafusion::logical_expr::Expr) -> Option<&str> {
+    match unaliased(expr) {
+        datafusion::logical_expr::Expr::Column(column) => Some(&column.name),
+        _ => None,
+    }
+}
+
+fn string_literal(expr: &datafusion::logical_expr::Expr) -> Option<&str> {
+    match unaliased(expr) {
+        datafusion::logical_expr::Expr::Literal(
+            datafusion::scalar::ScalarValue::Utf8(Some(value)) | datafusion::scalar::ScalarValue::Utf8View(Some(value)),
+            _,
+        ) => Some(value),
+        _ => None,
+    }
+}
+
+fn timestamp_literal(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
+    match unaliased(expr) {
+        datafusion::logical_expr::Expr::Literal(
+            datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(value), _) | datafusion::scalar::ScalarValue::Int64(Some(value)),
+            _,
+        ) => Some(*value),
+        _ => None,
+    }
+}
+
+fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, dimensions: &[String]) -> Option<String> {
+    use datafusion::{
+        logical_expr::{Expr, Operator},
+        scalar::ScalarValue,
+    };
+
+    let literal = |value: &ScalarValue| match value {
+        ScalarValue::Utf8(Some(value)) | ScalarValue::Utf8View(Some(value)) => Some(sql_literal(value)),
+        ScalarValue::Boolean(Some(value)) => Some(value.to_string()),
+        ScalarValue::Int8(Some(value)) => Some(value.to_string()),
+        ScalarValue::Int16(Some(value)) => Some(value.to_string()),
+        ScalarValue::Int32(Some(value)) => Some(value.to_string()),
+        ScalarValue::Int64(Some(value)) => Some(value.to_string()),
+        ScalarValue::UInt8(Some(value)) => Some(value.to_string()),
+        ScalarValue::UInt16(Some(value)) => Some(value.to_string()),
+        ScalarValue::UInt32(Some(value)) => Some(value.to_string()),
+        ScalarValue::UInt64(Some(value)) => Some(value.to_string()),
+        ScalarValue::Float32(Some(value)) => Some(value.to_string()),
+        ScalarValue::Float64(Some(value)) => Some(value.to_string()),
+        ScalarValue::Null => Some("NULL".to_string()),
+        _ => None,
+    };
+    let operator = |operator| match operator {
+        Operator::Eq => Some("="),
+        Operator::NotEq => Some("<>"),
+        Operator::Lt => Some("<"),
+        Operator::LtEq => Some("<="),
+        Operator::Gt => Some(">"),
+        Operator::GtEq => Some(">="),
+        Operator::And => Some("AND"),
+        Operator::Or => Some("OR"),
+        _ => None,
+    };
+    match unaliased(expr) {
+        Expr::Column(column) if dimensions.iter().any(|dimension| dimension == &column.name) => Some(column.name.clone()),
+        Expr::Literal(value, _) => literal(value),
+        Expr::BinaryExpr(binary) => {
+            Some(format!("{} {} {}", dimension_filter_sql(&binary.left, dimensions)?, operator(binary.op)?, dimension_filter_sql(&binary.right, dimensions)?))
+        }
+        Expr::IsNull(expr) => Some(format!("{} IS NULL", dimension_filter_sql(expr, dimensions)?)),
+        Expr::IsNotNull(expr) => Some(format!("{} IS NOT NULL", dimension_filter_sql(expr, dimensions)?)),
+        _ => None,
+    }
+}
+
+fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
+    use datafusion::logical_expr::{Expr, Operator};
+    match unaliased(expr) {
+        Expr::Column(column) => column.name.clone(),
+        Expr::Literal(value, _) => format!("{value:?}"),
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            let mut terms = Vec::new();
+            fn collect(expr: &Expr, operator: Operator, terms: &mut Vec<String>) {
+                match unaliased(expr) {
+                    Expr::BinaryExpr(binary) if binary.op == operator => {
+                        collect(&binary.left, operator, terms);
+                        collect(&binary.right, operator, terms);
+                    }
+                    expr => terms.push(canonical(expr)),
+                }
+            }
+            collect(expr, binary.op, &mut terms);
+            terms.sort();
+            format!(
+                "({})",
+                terms.join(match binary.op {
+                    Operator::And => " AND ",
+                    _ => " OR ",
+                })
+            )
+        }
+        Expr::BinaryExpr(binary) => format!("({} {:?} {})", canonical(&binary.left), binary.op, canonical(&binary.right)),
+        Expr::IsNotNull(expr) => format!("{} IS NOT NULL", canonical(expr)),
+        Expr::ScalarFunction(function) => format!("{}({})", function.name(), function.args.iter().map(canonical).collect::<Vec<_>>().join(",")),
+        expr => format!("{expr:?}"),
+    }
+}
+
+fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logical_expr::Expr>) -> String {
+    let mut expressions = expressions.into_iter().map(canonical).collect::<Vec<_>>();
+    expressions.sort();
+    expressions.join(" AND ")
+}
+
+fn parse_bucket_micros(value: &str) -> Option<i64> {
+    let mut parts = value.split_whitespace();
+    let value = parts.next()?.parse::<i64>().ok()?;
+    let unit = parts.next()?.trim_end_matches('s');
+    let unit = match unit {
+        "second" | "sec" => 1_000_000,
+        "minute" | "min" => 60_000_000,
+        "hour" | "hr" => 3_600_000_000,
+        "day" => 86_400_000_000,
+        _ => return None,
+    };
+    value.checked_mul(unit)
+}
+
+fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mut Vec<datafusion::logical_expr::Expr>) -> Option<String> {
+    use datafusion::logical_expr::LogicalPlan;
+    match plan {
+        LogicalPlan::Projection(projection) => source_and_filters(&projection.input, filters),
+        LogicalPlan::Filter(filter) => {
+            filters.push(filter.predicate.clone());
+            source_and_filters(&filter.input, filters)
+        }
+        LogicalPlan::TableScan(scan) => {
+            filters.extend(scan.filters.clone());
+            Some(scan.table_name.table().to_string())
+        }
+        _ => None,
+    }
+}
+
+async fn measure_filters<'a>(
+    session: &datafusion::execution::context::SessionState, source: &str, spec: &'a RollupSpec,
+) -> Result<Vec<(&'a crate::schema_loader::RollupMeasure, String)>, MissReason> {
+    let mut filters = Vec::with_capacity(spec.measures.len());
+    for measure in &spec.measures {
+        let filter = match &measure.filter {
+            None => String::new(),
+            Some(filter) => {
+                let plan = session.create_logical_plan(&format!("SELECT * FROM {source} WHERE {filter}")).await.map_err(|_| MissReason::UnknownFilter)?;
+                let mut filters = Vec::new();
+                source_and_filters(&plan, &mut filters).ok_or(MissReason::UnknownFilter)?;
+                canonical_and(&filters)
+            }
+        };
+        filters.push((measure, filter));
+    }
+    Ok(filters)
+}
+
+/// Match a direct aggregate over one declared source table and construct its
+/// re-aggregation request. It deliberately rejects a shape it cannot prove.
+pub(crate) async fn match_aggregate(
+    plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
+) -> Result<Option<RoutedRollup>, MissReason> {
+    use datafusion::logical_expr::{Expr, LogicalPlan, Operator, utils::split_conjunction};
+
+    let (aggregate, output_names, outer_projection) = match plan {
+        LogicalPlan::Aggregate(aggregate) => (aggregate, None, None),
+        LogicalPlan::Projection(projection) => {
+            let LogicalPlan::Aggregate(aggregate) = projection.input.as_ref() else { return Ok(None) };
+            if projection.expr.iter().all(|expr| matches!(unaliased(expr), Expr::Column(_))) {
+                (aggregate, Some(projection.schema.fields().iter().map(|field| field.name().to_string()).collect::<Vec<_>>()), None)
+            } else {
+                (aggregate, None, Some(projection.clone()))
+            }
+        }
+        _ => return Ok(None),
+    };
+    let mut predicates = Vec::new();
+    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(None) };
+    let Some(schema) = crate::schema_loader::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(None) };
+    let spec = schema.rollups.first().ok_or(MissReason::UnsupportedShape)?;
+    let mut project_id = None;
+    let (mut lo, mut hi) = (None, None);
+    let (mut row_filters, mut residual) = (Vec::new(), Vec::new());
+    for term in predicates.iter().flat_map(split_conjunction) {
+        match term {
+            Expr::Between(between) if !between.negated && column_name(&between.expr) == Some("timestamp") => {
+                let (Some(lower), Some(upper)) = (timestamp_literal(&between.low), timestamp_literal(&between.high)) else {
+                    return Err(MissReason::UnboundedTime);
+                };
+                lo = Some(lo.map_or(lower, |current: i64| current.max(lower)));
+                hi = Some(
+                    hi.map_or_else(|| upper.checked_add(1), |current: i64| upper.checked_add(1).map(|upper| current.min(upper)))
+                        .ok_or(MissReason::UnboundedTime)?,
+                );
+            }
+            Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq) && column_name(&binary.left) == Some("project_id") => {
+                project_id = string_literal(&binary.right).map(str::to_string)
+            }
+            Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq) && column_name(&binary.right) == Some("project_id") => {
+                project_id = string_literal(&binary.left).map(str::to_string)
+            }
+            Expr::BinaryExpr(binary) if column_name(&binary.left) == Some("timestamp") => {
+                let Some(value) = timestamp_literal(&binary.right) else { return Err(MissReason::UnboundedTime) };
+                match binary.op {
+                    Operator::GtEq => lo = Some(lo.map_or(value, |current: i64| current.max(value))),
+                    Operator::Gt => {
+                        lo = Some(lo.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.max(value.saturating_add(1))))
+                    }
+                    Operator::Lt => hi = Some(hi.map_or(value, |current: i64| current.min(value))),
+                    Operator::LtEq => {
+                        hi = Some(hi.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.min(value.saturating_add(1))))
+                    }
+                    _ => residual.push(term.clone()),
+                }
+            }
+            term => match dimension_filter_sql(term, &spec.dimensions) {
+                Some(filter) => row_filters.push(filter),
+                None => residual.push(term.clone()),
+            },
+        }
+    }
+    let project_id = project_id.ok_or(MissReason::MissingProject)?;
+    let (lo, hi) = lo.zip(hi).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
+    let grain = spec.grain_micros().ok_or(MissReason::UnsupportedShape)?;
+    let configured_filters = measure_filters(session, &source, spec).await?;
+    let residual_filter = canonical_and(&residual);
+
+    let mut select = Vec::new();
+    let mut group_by = Vec::new();
+    for (index, expression) in aggregate.group_expr.iter().enumerate() {
+        let alias = output_names.as_ref().and_then(|names| names.get(index)).map_or_else(|| aggregate.schema.field(index).name(), String::as_str);
+        match unaliased(expression) {
+            Expr::Column(column) if spec.dimensions.iter().any(|dimension| dimension == &column.name) => {
+                select.push(format!("{} AS \"{}\"", column.name, alias.replace('"', "\"\"")))
+            }
+            Expr::ScalarFunction(function)
+                if function.name().eq_ignore_ascii_case("time_bucket") && function.args.len() == 2 && column_name(&function.args[1]) == Some("timestamp") =>
+            {
+                let interval = string_literal(&function.args[0]).ok_or(MissReason::UnsupportedShape)?;
+                let width = parse_bucket_micros(interval).ok_or(MissReason::UnsupportedShape)?;
+                if width < grain || width % grain != 0 {
+                    return Err(MissReason::PartialBucket);
+                }
+                select.push(format!("time_bucket({}, timestamp) AS \"{}\"", sql_literal(interval), alias.replace('"', "\"\"")));
+            }
+            Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
+            _ => return Err(MissReason::UnsupportedShape),
+        }
+        group_by.push((index + 1).to_string());
+    }
+
+    for (index, expression) in aggregate.aggr_expr.iter().enumerate() {
+        let output_index = aggregate.group_expr.len() + index;
+        let (expression, alias) = match expression {
+            Expr::Alias(alias) => {
+                (alias.expr.as_ref(), output_names.as_ref().and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| alias.name.clone()))
+            }
+            expression => (
+                expression,
+                output_names
+                    .as_ref()
+                    .and_then(|names| names.get(output_index))
+                    .cloned()
+                    .unwrap_or_else(|| aggregate.schema.field(output_index).name().to_string()),
+            ),
+        };
+        let Expr::AggregateFunction(function) = unaliased(expression) else { return Err(MissReason::NonDecomposableAggregate) };
+        if function.params.distinct || !function.params.order_by.is_empty() {
+            return Err(MissReason::NonDecomposableAggregate);
+        }
+        let local_filter = canonical_and(function.params.filter.iter().map(|filter| filter.as_ref()));
+        let mut filters = [residual_filter.as_str(), local_filter.as_str()].into_iter().filter(|filter| !filter.is_empty()).collect::<Vec<_>>();
+        filters.sort();
+        let filter = filters.join(" AND ");
+        let name = function.func.name().to_ascii_lowercase();
+        let column = function.params.args.first().and_then(column_name).map(str::to_string);
+        let measure = |aggregate: &str, column: Option<&str>| {
+            configured_filters
+                .iter()
+                .find(|(measure, measure_filter)| measure.agg == aggregate && measure.column.as_deref() == column && *measure_filter == filter)
+                .map(|(measure, _)| measure.name.as_str())
+        };
+        let state = match name.as_str() {
+            "count" => measure("count", column.as_deref()).map(|measure| format!("COALESCE(SUM({measure}), 0)")),
+            "sum" => measure("sum", column.as_deref()).map(|measure| format!("SUM({measure})")),
+            "min" => measure("min", column.as_deref()).map(|measure| format!("MIN({measure})")),
+            "max" => measure("max", column.as_deref()).map(|measure| format!("MAX({measure})")),
+            "avg" => {
+                let sum = measure("sum", column.as_deref());
+                let count = measure("count", column.as_deref());
+                sum.zip(count)
+                    .map(|(sum, count)| format!("CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE SUM({sum}) / SUM({count}) END"))
+            }
+            "percentile_agg" => measure("tdigest", column.as_deref()).map(|measure| format!("tdigest_merge({measure})")),
+            _ => return Err(MissReason::NonDecomposableAggregate),
+        }
+        .ok_or(MissReason::MissingMeasure)?;
+        select.push(format!("{state} AS \"{}\"", alias.replace('"', "\"\"")));
+    }
+
+    Ok(Some(RoutedRollup {
+        source,
+        project_id,
+        lo,
+        hi,
+        grain,
+        target: spec.table_name(&schema.table_name),
+        outer_projection,
+        row_filters,
+        select: select.join(", "),
+        group_by: group_by.join(", "),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-
-    /// The rollup must be DEFINED BY CONFIG, not by code. This is the property
-    /// that makes it a continuous-aggregate feature rather than one hardcoded
-    /// table: the schema registry has to contain a rollup table synthesized
-    /// from the source's `rollups:` block, with the dimensions and measures
-    /// that block declares and types taken from the source's own columns.
-    #[test]
-    fn the_rollup_table_is_generated_from_the_source_tables_config() {
-        let src = crate::schema_loader::get_schema(SOURCE_TABLE).expect("source schema");
-        let spec = src.rollups.first().expect("otel_logs_and_spans must declare a rollup");
-        let generated =
-            crate::schema_loader::get_schema(&spec.table_name(SOURCE_TABLE)).expect("the rollup table must be registered without a hand-written yaml");
-
-        let has = |n: &str| generated.fields.iter().any(|f| f.name == n);
-        for d in &spec.dimensions {
-            assert!(has(d), "declared dimension `{d}` missing from the generated table");
-        }
-        for m in &spec.measures {
-            assert!(has(&m.name), "declared measure `{}` missing from the generated table", m.name);
-        }
-        // Types are DERIVED from the source, which is the anti-drift property:
-        // a sum over an i64 column cannot silently become a string.
-        let src_ty = |n: &str| src.fields.iter().find(|f| f.name == n).map(|f| f.data_type.clone());
-        for m in spec.measures.iter().filter(|m| m.agg != "count") {
-            let col = m.column.as_deref().expect("non-count measure declares a column");
-            assert_eq!(
-                generated.fields.iter().find(|f| f.name == m.name).map(|f| f.data_type.clone()),
-                src_ty(col),
-                "measure `{}` must keep the source column's type",
-                m.name
-            );
-        }
-        // Partitioning is inherited, so multi-tenant routing and date pruning
-        // work on the rollup exactly as on the source.
-        assert_eq!(generated.partitions, src.partitions);
-        // And a rollup is never version_append: buckets are rebuilt wholesale.
-        assert!(!generated.version_append);
-    }
-
-    /// Two rollups at the same grain: what happens, and what to do about it.
-    ///
-    /// Same grain + SAME dimensions is the same GROUP BY, so the answer is to
-    /// add the measure to the existing rollup — a second table would duplicate
-    /// every identity and dimension column. Same grain + DIFFERENT dimensions
-    /// is a genuinely different table, and `name:` is how you distinguish it.
-    /// Both used to produce one misleading "collides with a declared schema
-    /// file" panic.
-    #[test]
-    fn a_second_rollup_at_the_same_grain_needs_a_name_only_when_it_groups_differently() {
-        use crate::schema_loader::{RollupMeasure, RollupSpec};
-        let spec = |name: Option<&str>, dims: &[&str]| RollupSpec {
-            grain: "1m".into(),
-            name: name.map(str::to_string),
-            dimensions: dims.iter().map(|d| d.to_string()).collect(),
-            measures: vec![RollupMeasure { name: "n".into(), agg: "count".into(), column: None, filter: None }],
-        };
-        // Bare grain collides...
-        assert_eq!(spec(None, &["kind"]).table_name(SOURCE_TABLE), spec(None, &["status_code"]).table_name(SOURCE_TABLE));
-        // ...and `name:` is what separates them.
-        assert_ne!(spec(Some("by_kind"), &["kind"]).table_name(SOURCE_TABLE), spec(None, &["status_code"]).table_name(SOURCE_TABLE));
-        assert_eq!(spec(Some("by_kind"), &["kind"]).table_name(SOURCE_TABLE), "otel_logs_and_spans_rollup_by_kind");
-        // A named rollup still synthesizes a valid table.
-        let src = crate::schema_loader::get_schema(SOURCE_TABLE).expect("source schema");
-        let generated = spec(Some("by_kind"), &["kind"]).synthesize(src).expect("named rollup must synthesize");
-        assert_eq!(generated.table_name, "otel_logs_and_spans_rollup_by_kind");
-        assert!(generated.fields.iter().any(|f| f.name == "kind"));
-    }
-
-    /// The spec as DECLARED on the source table — tests exercise the real
-    /// configuration rather than a fixture that could drift from it.
-    fn declared_spec() -> crate::schema_loader::RollupSpec {
-        crate::schema_loader::get_schema(SOURCE_TABLE).expect("source schema").rollups.first().expect("a declared rollup").clone()
-    }
-
     use super::*;
+    use arrow::{
+        array::{Array, BinaryArray, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray},
+        datatypes::{DataType, Field, Schema, TimeUnit},
+        record_batch::RecordBatch,
+    };
+    use std::sync::Arc;
 
-    fn ask<'a>(group_by: &'a [String], filtered: &'a [String], aggregates: &'a [String], bucket: Option<i64>) -> Ask<'a> {
-        Ask { group_by, filtered, aggregates, bucket_micros: bucket }
-    }
-    fn s(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
+    const SOURCE: &str = "otel_logs_and_spans";
 
-    /// The dashboard's Traffic panel: count by hour, filtered to server spans.
-    /// This is the shape the whole table exists for, so if it stops routing the
-    /// rollup is worthless.
-    /// A rollup's name must say WHAT it rolls up. `otel_rollup_1m` did not: it
-    /// reads like a rollup of all OTel data while summarizing exactly one
-    /// table, and every dimension and measure in it is span-shaped. Adding a
-    /// second rollup over a different source under a vague name is the failure
-    /// this pins.
-    #[test]
-    fn rollup_table_is_named_after_its_source() {
-        assert_eq!(ROLLUP_TABLE, format!("{SOURCE_TABLE}_rollup_{GRAIN_SUFFIX}"), "a rollup table must be named {{source}}_rollup_{{grain}}");
-        // And the grain in the NAME must be the grain it actually stores.
-        assert_eq!(GRAIN_MICROS, 60 * 1_000_000, "GRAIN_SUFFIX says 1m; keep it and GRAIN_MICROS in step");
-        // The schema registry must agree, or the build writes to a table the
-        // reader never looks for.
-        let schema = crate::schema_loader::get_schema(ROLLUP_TABLE).expect("rollup schema must be registered under its own name");
-        assert_eq!(schema.table_name, ROLLUP_TABLE);
+    fn spec() -> RollupSpec {
+        crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
     }
 
     #[test]
-    fn the_traffic_panel_routes() {
-        let (g, f, a) = (s(&[]), s(&["kind"]), s(&["count"]));
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(3_600_000_000))), Ok(()));
-    }
-
-    /// A filter on a NON-dimension must refuse, even though every GROUP BY key
-    /// is fine. Those rows are already summed together and cannot be subtracted
-    /// back out, so serving this from the rollup would silently over-count.
-    #[test]
-    fn a_filter_on_a_non_dimension_refuses_even_when_the_group_by_is_clean() {
-        let (g, f, a) = (s(&["kind"]), s(&["attributes___url___path"]), s(&["count"]));
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::UnknownFilter));
+    fn declared_rollup_is_generated_with_its_configured_fields() {
+        let source = crate::schema_loader::get_schema(SOURCE).expect("source schema");
+        let spec = spec();
+        let target = crate::schema_loader::get_schema(&spec.table_name(SOURCE)).expect("generated rollup schema");
+        for name in spec.dimensions.iter().chain(spec.measures.iter().map(|measure| &measure.name)) {
+            assert!(target.fields.iter().any(|field| field.name == *name), "missing configured rollup field `{name}`");
+        }
+        assert!(target.fields.iter().any(|field| field.name == "rollup_generation"));
+        assert_eq!(target.partitions, source.partitions);
+        assert!(!target.version_append);
     }
 
     #[test]
-    fn a_non_dimension_group_by_refuses() {
-        let (g, f, a) = (s(&["name"]), s(&[]), s(&["count"]));
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::UnknownGroupBy));
+    fn build_sql_uses_exact_count_and_tdigest_states() {
+        let sql = build_partition_sql(&spec(), SOURCE, "pro'ject", "2026-08-01").expect("valid SQL");
+        assert!(sql.contains("COUNT(duration) AS duration_count"));
+        assert!(sql.contains("percentile_agg(CAST(duration AS DOUBLE))"));
+        assert!(sql.contains("project_id = 'pro''ject'"));
+        assert!(sql.contains("GROUP BY 1, 2, 3, 4"));
     }
 
-    /// Exact percentiles do not re-aggregate. Answering them from stored
-    /// min/max/sum would be a different, wrong number returned silently.
-    #[test]
-    fn a_non_decomposable_aggregate_refuses() {
-        let (g, f, a) = (s(&[]), s(&[]), s(&["approx_percentile"]));
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::NonDecomposableAggregate));
+    #[tokio::test]
+    async fn matcher_rewrites_a_certifiable_count_aggregate() {
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
+        let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(SOURCE).expect("source schema").schema_ref(), vec![vec![]])
+            .expect("empty source table");
+        ctx.register_table(SOURCE, Arc::new(table)).expect("register source");
+        let state = ctx.state();
+        let plan = state
+            .create_logical_plan(
+                "SELECT COUNT(*) FROM otel_logs_and_spans \
+                 WHERE project_id = 'project' \
+                   AND timestamp >= to_timestamp_micros(60000000) \
+                   AND timestamp < to_timestamp_micros(120000000)",
+            )
+            .await
+            .expect("parse count");
+        let plan = state.optimize(&plan).expect("optimize count");
+        let route = match_aggregate(&plan, &state).await.expect("match count").expect("declared rollup route");
+        assert_eq!(route.target, "otel_logs_and_spans_rollup_dashboard_1m_v2");
+        assert_eq!(route.project_id, "project");
+        assert!(route.sql(&[("1970-01-01".into(), "generation".into())]).contains("COALESCE(SUM(request_count), 0)"));
     }
 
-    /// Finer than the grain cannot be reconstructed, and a width that is not a
-    /// whole multiple would split a stored bucket across two output rows.
-    #[test]
-    fn a_bucket_finer_than_the_grain_or_not_a_multiple_of_it_refuses() {
-        let (g, f, a) = (s(&[]), s(&[]), s(&["count"]));
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(30_000_000))), Err(MissReason::PartialBucket), "30s is finer than the 1m grain");
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(90_000_000))), Err(MissReason::PartialBucket), "90s is not a whole number of buckets");
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, None)), Err(MissReason::PartialBucket), "an unbucketed aggregate has no whole-bucket guarantee");
-        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Ok(()), "the grain itself routes");
-    }
-
-    /// Rebuilding a partition must REPLACE its rows, not double every measure.
-    /// The id is the only thing that makes the rewrite idempotent.
-    #[test]
-    fn a_rebuilt_bucket_keeps_its_identity_and_distinct_dimensions_do_not_collide() {
-        let b = bucket_start(1_786_000_123_456_789);
-        assert_eq!(
-            bucket_id(b, &[Some("api"), Some("server")]),
-            bucket_id(b, &[Some("api"), Some("server")]),
-            "a rebuild must collide with the row it replaces"
+    #[tokio::test]
+    async fn matcher_preserves_a_scalar_outer_projection() {
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
+        for table_name in [SOURCE, "otel_logs_and_spans_rollup_dashboard_1m_v2"] {
+            let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
+                .expect("empty table");
+            ctx.register_table(table_name, Arc::new(table)).expect("register table");
+        }
+        let state = ctx.state();
+        let plan = state
+            .create_logical_plan(
+                "SELECT COUNT(*) + 1 AS total FROM otel_logs_and_spans \
+                 WHERE project_id = 'project' \
+                   AND timestamp >= to_timestamp_micros(60000000) \
+                   AND timestamp < to_timestamp_micros(120000000)",
+            )
+            .await
+            .expect("parse count");
+        let plan = state.optimize(&plan).expect("optimize count");
+        let route = match_aggregate(&plan, &state).await.expect("match count").expect("declared rollup route");
+        let rewritten = state.create_logical_plan(&route.sql(&[("1970-01-01".into(), "generation".into())])).await.expect("parse rollup query");
+        let projection = route.outer_projection.expect("scalar projection");
+        let rewritten = datafusion::logical_expr::LogicalPlan::Projection(
+            datafusion::logical_expr::logical_plan::Projection::try_new(projection.expr, Arc::new(rewritten)).expect("reapply projection"),
         );
-        assert_ne!(bucket_id(b, &[Some("api"), Some("server")]), bucket_id(b, &[Some("api"), Some("client")]), "different dimensions are different rows");
-        assert_ne!(bucket_id(b, &[Some("api"), None]), bucket_id(b, &[Some("api")]), "arity must be part of the identity");
-        assert_ne!(bucket_id(b, &[Some("api")]), bucket_id(b + GRAIN_MICROS, &[Some("api")]), "different buckets are different rows");
+        assert_eq!(rewritten.schema(), plan.schema());
+    }
+
+    #[tokio::test]
+    async fn matcher_applies_dimension_predicates_to_the_rollup_scan() {
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
+        let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(SOURCE).expect("source schema").schema_ref(), vec![vec![]])
+            .expect("empty source table");
+        ctx.register_table(SOURCE, Arc::new(table)).expect("register source");
+        let state = ctx.state();
+        let plan = state
+            .create_logical_plan(
+                "SELECT COUNT(*) FROM otel_logs_and_spans \
+                 WHERE project_id = 'project' AND kind = 'server' \
+                   AND timestamp >= to_timestamp_micros(60000000) \
+                   AND timestamp < to_timestamp_micros(120000000)",
+            )
+            .await
+            .expect("parse count");
+        let route = match_aggregate(&state.optimize(&plan).expect("optimize count"), &state).await.expect("match count").expect("declared rollup route");
+        assert!(route.sql(&[("1970-01-01".into(), "generation".into())]).contains("AND (kind = 'server')"));
     }
 
     #[test]
-    fn a_bucket_start_floors_and_is_stable_within_the_grain() {
-        assert_eq!(bucket_start(GRAIN_MICROS), GRAIN_MICROS);
-        assert_eq!(bucket_start(GRAIN_MICROS + 1), GRAIN_MICROS);
-        assert_eq!(bucket_start(GRAIN_MICROS * 2 - 1), GRAIN_MICROS);
-        // Floor, not truncate-toward-zero: a negative input must not jump into
-        // the following bucket and silently misplace its rows.
-        assert_eq!(bucket_start(-1), -GRAIN_MICROS);
-    }
-
-    /// The build must aggregate exactly the measures the schema stores, and
-    /// group by exactly the dimensions routing promises. A drift between these
-    /// two lists is a wrong answer, not a compile error.
-    #[test]
-    fn the_build_sql_covers_every_dimension_and_every_stored_measure() {
-        let sql = build_partition_sql(&declared_spec(), SOURCE_TABLE, "proj", "2026-08-01");
-        for d in DIMENSIONS {
-            assert!(sql.contains(d), "dimension {d} missing from the build");
-        }
-        for m in ["request_count", "error_count", "duration_sum", "duration_min", "duration_max"] {
-            assert!(sql.contains(m), "measure {m} missing from the build");
-        }
-        assert!(sql.contains("project_id = 'proj'") && sql.contains("date = '2026-08-01'"), "the build must be scoped to one certified partition");
+    fn shaped_batches_preserve_binary_measure_and_generation() {
+        let spec = spec();
+        let mut fields = vec![Arc::new(Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false))];
+        fields.extend(spec.dimensions.iter().map(|name| Arc::new(Field::new(name, DataType::Utf8, true))));
+        fields.extend(spec.measures.iter().map(|measure| {
+            Arc::new(Field::new(&measure.name, if measure.agg == "tdigest" { DataType::Binary } else { DataType::Int64 }, measure.agg != "count"))
+        }));
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![1_000_000]).with_timezone("UTC"))];
+        columns.extend(spec.dimensions.iter().map(|_| Arc::new(StringArray::from(vec![Some("value")])) as arrow::array::ArrayRef));
+        columns.extend(spec.measures.iter().map(|measure| {
+            if measure.agg == "tdigest" {
+                Arc::new(BinaryArray::from(vec![Some(&[1_u8, 2, 3][..])])) as arrow::array::ArrayRef
+            } else {
+                Arc::new(Int64Array::from(vec![Some(1)])) as arrow::array::ArrayRef
+            }
+        }));
+        let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("aggregate batch");
+        let output = to_rollup_batches(&spec, SOURCE, "project", "1970-01-01", "generation-a", &[input.clone()]).expect("shape rollup");
+        let other = to_rollup_batches(&spec, SOURCE, "project", "1970-01-01", "generation-b", &[input]).expect("shape rollup");
+        let batch = output.first().expect("one output batch");
+        let generation = batch.column_by_name("rollup_generation").expect("generation").as_any().downcast_ref::<StringViewArray>().expect("utf8 generation");
+        assert_eq!(generation.value(0), "generation-a");
+        let digest = batch.column_by_name("server_duration_digest").expect("digest");
+        assert_eq!(digest.data_type(), &DataType::Binary);
+        assert_eq!(digest.as_any().downcast_ref::<BinaryArray>().expect("binary digest").value(0), &[1, 2, 3]);
+        assert_ne!(
+            batch.column_by_name("id").expect("id").as_any().downcast_ref::<StringViewArray>().expect("utf8 id").value(0),
+            other[0].column_by_name("id").expect("id").as_any().downcast_ref::<StringViewArray>().expect("utf8 id").value(0),
+            "generations must not share a dedup identity"
+        );
     }
 }

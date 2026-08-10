@@ -68,21 +68,17 @@ macro_rules! scalar_udf_boilerplate {
 // Variant-Aware Expression Planner
 // ============================================================================
 
-/// Resolves PG's `jsonpath` type (`'<path>'::jsonpath`) to Utf8 so the literal
-/// flows to `jsonb_path_exists` as text. DataFusion's SqlToRel otherwise rejects
-/// the unknown SQL type at plan time ("Unsupported SQL type jsonpath"), before
-/// the UDF runs. Registered via `with_type_planner`, so it covers both the
-/// simple- and extended-query paths (both route casts through
-/// `convert_data_type_to_field`), unlike a raw-SQL string rewrite.
+/// Resolves PostgreSQL types that DataFusion does not model natively as text.
+/// The planner runs for simple and extended protocol casts alike.
 #[derive(Debug, Default)]
-pub struct JsonPathTypePlanner;
+pub struct PostgresTypePlanner;
 
-impl TypePlanner for JsonPathTypePlanner {
+impl TypePlanner for PostgresTypePlanner {
     fn plan_type_field(&self, sql_type: &SqlDataType) -> datafusion::error::Result<Option<FieldRef>> {
-        // Extend with more arms (or a name→DataType table) when a second PG cast type
-        // appears — `::jsonb`, `::regclass`, `::oid` would all hit the same wall.
         Ok(match sql_type {
-            SqlDataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("jsonpath") => Some(Arc::new(Field::new("", DataType::Utf8, true))),
+            SqlDataType::Custom(name, _) if matches!(name.to_string().to_ascii_lowercase().as_str(), "jsonpath" | "regproc" | "pg_catalog.regproc") => {
+                Some(Arc::new(Field::new("", DataType::Utf8, true)))
+            }
             _ => None,
         })
     }
@@ -456,6 +452,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     ctx.register_udf(create_jsonb_array_elements_udf());
     ctx.register_udf(create_time_bucket_udf());
     ctx.register_udaf(create_percentile_agg_udaf());
+    ctx.register_udaf(create_tdigest_merge_udaf());
 
     // text_match(col, 'query') for tantivy-accelerated full-text search. Naive
     // substring fallback keeps correctness when tantivy is disabled or when
@@ -1100,7 +1097,18 @@ fn create_percentile_agg_udaf() -> AggregateUDF {
         Arc::new(DataType::Binary),
         Volatility::Immutable,
         Arc::new(|_| Ok(Box::<PercentileAccumulator>::default())),
-        Arc::new(vec![DataType::Binary]), // State type should match return type
+        Arc::new(vec![DataType::Binary]),
+    )
+}
+
+fn create_tdigest_merge_udaf() -> AggregateUDF {
+    create_udaf(
+        "tdigest_merge",
+        vec![DataType::Binary],
+        Arc::new(DataType::Binary),
+        Volatility::Immutable,
+        Arc::new(|_| Ok(Box::<TDigestMergeAccumulator>::default())),
+        Arc::new(vec![DataType::Binary]),
     )
 }
 
@@ -1171,6 +1179,15 @@ impl TDigestWrapper {
     }
 }
 
+fn merge_tdigest_batch(digest: &mut TDigestWrapper, arrays: &[ArrayRef]) -> datafusion::error::Result<()> {
+    let Some(array) = arrays.first() else { return Ok(()) };
+    let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("tdigest_merge expects Binary values".to_string()))?;
+    binary.iter().flatten().try_for_each(|bytes| {
+        digest.merge(&TDigestWrapper::from_bytes(bytes)?);
+        Ok(())
+    })
+}
+
 /// Accumulator for percentile_agg that builds a t-digest
 #[derive(Debug, Default)]
 struct PercentileAccumulator {
@@ -1199,12 +1216,34 @@ impl Accumulator for PercentileAccumulator {
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
-        let Some(array) = states.first() else { return Ok(()) };
-        let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("Expected binary array for merge".to_string()))?;
-        binary.iter().flatten().try_for_each(|bytes| {
-            self.digest.merge(&TDigestWrapper::from_bytes(bytes)?);
-            Ok(())
-        })
+        merge_tdigest_batch(&mut self.digest, states)
+    }
+}
+
+#[derive(Debug, Default)]
+struct TDigestMergeAccumulator {
+    digest: TDigestWrapper,
+}
+
+impl Accumulator for TDigestMergeAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::error::Result<()> {
+        merge_tdigest_batch(&mut self.digest, values)
+    }
+
+    fn evaluate(&mut self) -> datafusion::error::Result<ScalarValue> {
+        Ok(ScalarValue::Binary(Some(self.digest.to_bytes()?)))
+    }
+
+    fn size(&self) -> usize {
+        self.digest.size()
+    }
+
+    fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
+        self.evaluate().map(|value| vec![value])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
+        merge_tdigest_batch(&mut self.digest, states)
     }
 }
 
@@ -1522,6 +1561,27 @@ mod tests {
 
         assert!(left.to_bytes().unwrap().len() < 10_000);
         assert!((left.to_digest().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0);
+    }
+
+    #[tokio::test]
+    async fn tdigest_merge_merges_serialized_percentile_states() {
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        register_custom_functions(&mut ctx).expect("functions register");
+        let batches = ctx
+            .sql(
+                "SELECT approx_percentile(0.95, tdigest_merge(digest)) FROM (\
+                   SELECT percentile_agg(value) AS digest FROM (VALUES (1.0), (2.0), (3.0)) AS low(value) \
+                   UNION ALL \
+                   SELECT percentile_agg(value) AS digest FROM (VALUES (100.0), (101.0), (102.0)) AS high(value)\
+                 )",
+            )
+            .await
+            .expect("plan tdigest merge")
+            .collect()
+            .await
+            .expect("run tdigest merge");
+        let values = batches[0].column(0).as_any().downcast_ref::<Float64Array>().expect("percentile output");
+        assert!(values.value(0) > 90.0);
     }
 
     #[test]

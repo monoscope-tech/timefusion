@@ -406,10 +406,10 @@ sum_recorders! {
 /// One commit-path operation abandoned by its bound. `op` is a fixed set of
 /// static labels (bounded cardinality by construction — never a table or
 /// project id, which belong on the accompanying warn's span attributes).
-/// One dashboard aggregate answered from the rollup.
-pub fn record_rollup_hit() {
+/// One dashboard aggregate answered from a configured rollup.
+pub fn record_rollup_hit(mode: &'static str, grain: &str) {
     if let Some(m) = METRICS.get() {
-        m.rollup_hits.add(1, &[]);
+        m.rollup_hits.add(1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string())]);
     }
 }
 
