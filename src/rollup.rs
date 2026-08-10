@@ -18,7 +18,16 @@ pub enum MissReason {
     MissingMeasure,
     NonDecomposableAggregate,
     PartialBucket,
+    /// No rollup was ever built for a date in the window.
+    NotBuilt,
+    /// A rollup exists for the date but the source has moved under it.
+    StaleCoverage,
+    /// Coverage cannot be established at all: buffered rows, or a window whose
+    /// dates cannot be enumerated.
     IncompleteCoverage,
+    /// The certified interior is too small a slice of the window to be worth the
+    /// union's second scan.
+    TinyInterior,
     RewriteSchemaMismatch,
 }
 
@@ -32,8 +41,14 @@ impl MissReason {
             Self::UnknownFilter => "unknown_filter",
             Self::MissingMeasure => "missing_measure",
             Self::NonDecomposableAggregate => "non_decomposable",
-            Self::PartialBucket => "unaligned_range",
+            // Names the ONLY thing this reason still means: a `time_bucket`
+            // width that is not a multiple of the grain. The window's own
+            // alignment stopped mattering once raw fringes were added.
+            Self::PartialBucket => "unaligned_bucket_width",
+            Self::NotBuilt => "not_built",
+            Self::StaleCoverage => "stale_coverage",
             Self::IncompleteCoverage => "incomplete_coverage",
+            Self::TinyInterior => "tiny_interior",
             Self::RewriteSchemaMismatch => "rewrite_schema_mismatch",
         }
     }
@@ -198,6 +213,103 @@ impl PlanWrapper {
     }
 }
 
+/// How a measure's per-leg partial states combine into the query's answer.
+///
+/// The same combinator serves both shapes: over measure columns when the rollup
+/// answers alone, and over the union's state aliases when a raw leg is present.
+/// That is only sound because every variant is associative over a *partition* of
+/// the row set — which is exactly what [`interior`] guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Merge {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+    TDigest,
+}
+
+impl Merge {
+    /// State columns consumed, in order. `Avg` is the only multi-state merge: an
+    /// average is not a state, so the legs must carry sum and count apart or the
+    /// union would average two averages.
+    const fn arity(self) -> usize {
+        if matches!(self, Self::Avg) { 2 } else { 1 }
+    }
+
+    /// The associative operator that folds one state column across legs.
+    const fn partial_op(self) -> &'static str {
+        match self {
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+            Self::TDigest => "tdigest_merge",
+            _ => "SUM",
+        }
+    }
+
+    /// Combine `states` into the query's output value.
+    fn sql(self, states: &[String]) -> String {
+        match (self, states) {
+            (Self::Count, [count]) => format!("COALESCE(SUM({count}), 0)"),
+            (Self::Sum, [sum]) => format!("SUM({sum})"),
+            (Self::Min, [min]) => format!("MIN({min})"),
+            (Self::Max, [max]) => format!("MAX({max})"),
+            // The CAST is on the dividend, not the result: both states are
+            // Int64, so dividing first truncates and the outer type only widens
+            // an already-wrong value.
+            (Self::Avg, [sum, count]) => format!(
+                "CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END"
+            ),
+            (Self::TDigest, [digest]) => format!("tdigest_merge({digest})"),
+            // `arity()` is the single source of truth for how many states each
+            // variant is built with, so this is unreachable by construction.
+            _ => unreachable!("merge {self:?} built with {} states", states.len()),
+        }
+    }
+}
+
+/// One output aggregate, resolved against the declared rollup.
+#[derive(Debug)]
+struct RoutedMeasure {
+    alias: String,
+    merge: Merge,
+    /// Rollup-table measure columns, one per state, in `merge` order.
+    measures: Vec<String>,
+    /// Raw-leg aggregate SQL, one per state, in `merge` order. Rendered from the
+    /// measure's declared filter text rather than by unparsing the query's
+    /// `Expr` — the matcher has already proven the two are canonically equal.
+    raw: Vec<String>,
+}
+
+/// The union pays a second scan, a second aggregation and a union barrier, so a
+/// sliver of certified interior is strictly worse than the raw plan it replaces.
+const MIN_INTERIOR_FRACTION: i64 = 5;
+const MIN_INTERIOR_BUCKETS: i64 = 2;
+
+const fn floor_grain(value: i64, grain: i64) -> i64 {
+    value - value.rem_euclid(grain)
+}
+
+const fn ceil_grain(value: i64, grain: i64) -> i64 {
+    let remainder = value.rem_euclid(grain);
+    if remainder == 0 { value } else { value + (grain - remainder) }
+}
+
+/// The grain-aligned `[a, b)` the rollup leg may own inside `[lo, hi)`, or
+/// `None` when the raw plan should be left alone.
+///
+/// `horizon` is the exclusive bound of the certified, buffer-free prefix. Both
+/// endpoints are snapped to a grain boundary because a rollup row is indivisible:
+/// half of one cannot be given to a fringe. That alignment is the invariant the
+/// whole rewrite rests on — with `a` or `b` off-grain the legs either double
+/// count a bucket or drop one, and no aggregate can detect it afterwards.
+pub(crate) fn interior(lo: i64, hi: i64, grain: i64, horizon: i64) -> Option<(i64, i64)> {
+    let (start, end) = (ceil_grain(lo, grain), floor_grain(hi.min(horizon), grain));
+    debug_assert!(start.rem_euclid(grain) == 0 && end.rem_euclid(grain) == 0, "interior endpoints must be grain-aligned");
+    let width = end.checked_sub(start).filter(|width| *width > 0)?;
+    (width >= MIN_INTERIOR_BUCKETS.saturating_mul(grain) && width >= hi.saturating_sub(lo) / MIN_INTERIOR_FRACTION).then_some((start, end))
+}
+
 #[derive(Debug)]
 pub(crate) struct RoutedRollup {
     pub source: String,
@@ -214,29 +326,111 @@ pub(crate) struct RoutedRollup {
     /// Sort/Limit peeled off the query root, outermost first.
     pub wrappers: Vec<PlanWrapper>,
     row_filters: Vec<String>,
-    select: String,
-    group_by: String,
+    /// `(expression, output alias)`. Every expression is valid, and means the
+    /// same thing, on BOTH tables — which is what lets the union share them.
+    groups: Vec<(String, String)>,
+    measures: Vec<RoutedMeasure>,
 }
 
 impl RoutedRollup {
-    pub fn sql(&self, generations: &[(String, String)]) -> String {
-        let generations = generations
+    /// A half-open range predicate. Only `>=`/`<` are ever emitted: an inclusive
+    /// bound on either side of a shared boundary double counts a whole bucket.
+    fn range_sql(&(start, end): &(i64, i64)) -> String {
+        format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))")
+    }
+
+    fn quoted(alias: &str) -> String {
+        format!("\"{}\"", alias.replace('"', "\"\""))
+    }
+
+    /// `GROUP BY 1, 2, …`, positional so it stays valid whether the select list
+    /// carries synthetic leg aliases or the query's own names. Empty for an
+    /// ungrouped aggregate.
+    fn group_by(&self) -> String {
+        if self.groups.is_empty() {
+            return String::new();
+        }
+        format!(" GROUP BY {}", (1..=self.groups.len()).map(|index| index.to_string()).collect::<Vec<_>>().join(", "))
+    }
+
+    /// One partial-aggregate SELECT over `ranges`, with synthetic column names.
+    ///
+    /// The aliases are synthetic (`__g0`, `__s1_0`) rather than the query's, so a
+    /// dashboard alias like `c` or `time` can never collide with a state column.
+    fn leg(&self, table: &str, ranges: &[(i64, i64)], extra: &str) -> String {
+        let select = self
+            .groups
             .iter()
-            .map(|(date, generation)| format!("(date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation)))
+            .enumerate()
+            .map(|(index, (expression, _))| format!("{expression} AS __g{index}"))
+            .chain(self.measures.iter().enumerate().flat_map(|(index, measure)| {
+                let states = if table == self.target {
+                    measure.measures.iter().map(|column| format!("{}({column})", measure.merge.partial_op())).collect::<Vec<_>>()
+                } else {
+                    measure.raw.clone()
+                };
+                states.into_iter().enumerate().map(move |(state, sql)| format!("{sql} AS __s{index}_{state}"))
+            }))
             .collect::<Vec<_>>()
-            .join(" OR ");
-        let group_by = (!self.group_by.is_empty()).then(|| format!(" GROUP BY {}", self.group_by));
+            .join(", ");
+        let ranges = ranges.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR ");
         let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
+        let group_by = self.group_by();
+        format!("SELECT {select} FROM {table} WHERE project_id = {} AND ({ranges}){extra}{row_filters}{group_by}", sql_literal(&self.project_id))
+    }
+
+    /// The rewrite. `interior` is the grain-aligned `[a, b)` the rollup leg owns;
+    /// the raw leg owns exactly `[lo, a)` and `[b, hi)`, so the three are a
+    /// partition of `[lo, hi)` — no gap, no overlap.
+    ///
+    /// When the interior is the whole window this collapses to a single
+    /// statement against the rollup table, which is both cheaper and the shape
+    /// the aligned fast path has always emitted.
+    pub fn sql(&self, generations: &[(String, String)], interior: (i64, i64)) -> String {
+        let generations = format!(
+            " AND ({})",
+            generations
+                .iter()
+                .map(|(date, generation)| format!("(date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation)))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let fringes: Vec<(i64, i64)> = [(self.lo, interior.0), (interior.1, self.hi)].into_iter().filter(|(start, end)| start < end).collect();
+        if fringes.is_empty() {
+            // Single leg: the rollup rows ARE the partial states, so the merge
+            // applies directly to the measure columns.
+            let select = self
+                .groups
+                .iter()
+                .map(|(expression, alias)| format!("{expression} AS {}", Self::quoted(alias)))
+                .chain(self.measures.iter().map(|measure| format!("{} AS {}", measure.merge.sql(&measure.measures), Self::quoted(&measure.alias))))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
+            let group_by = self.group_by();
+            return format!(
+                "SELECT {select} FROM {} WHERE project_id = {} AND ({}){generations}{row_filters}{group_by}",
+                self.target,
+                sql_literal(&self.project_id),
+                Self::range_sql(&interior),
+            );
+        }
+        let outer = self
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, (_, alias))| format!("__g{index} AS {}", Self::quoted(alias)))
+            .chain(self.measures.iter().enumerate().map(|(index, measure)| {
+                let states = (0..measure.merge.arity()).map(|state| format!("__s{index}_{state}")).collect::<Vec<_>>();
+                format!("{} AS {}", measure.merge.sql(&states), Self::quoted(&measure.alias))
+            }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let group_by = self.group_by();
         format!(
-            "SELECT {} FROM {} WHERE project_id = {} AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}) AND ({}){}{}",
-            self.select,
-            self.target,
-            sql_literal(&self.project_id),
-            self.lo,
-            self.hi,
-            generations,
-            row_filters,
-            group_by.unwrap_or_default(),
+            "SELECT {outer} FROM ({} UNION ALL {}) AS rollup_union{group_by}",
+            self.leg(&self.target, std::slice::from_ref(&interior), &generations),
+            self.leg(&self.source, &fringes, ""),
         )
     }
 }
@@ -330,6 +524,15 @@ fn dimension_filter_sql(expr: &datafusion::logical_expr::Expr, dimensions: &[Str
         }
         Expr::IsNull(expr) => Some(format!("{} IS NULL", dimension_filter_sql(expr, dimensions)?)),
         Expr::IsNotNull(expr) => Some(format!("{} IS NOT NULL", dimension_filter_sql(expr, dimensions)?)),
+        // `metric_name IN (…)` is how every metrics panel selects its series;
+        // without this the whole otel_metrics dashboard is one residual filter
+        // away from never routing.
+        Expr::InList(list) => Some(format!(
+            "{} {}IN ({})",
+            dimension_filter_sql(&list.expr, dimensions)?,
+            if list.negated { "NOT " } else { "" },
+            list.list.iter().map(|item| dimension_filter_sql(item, dimensions)).collect::<Option<Vec<_>>>()?.join(", ")
+        )),
         _ => None,
     }
 }
@@ -494,7 +697,7 @@ fn decline(plan: &datafusion::logical_expr::LogicalPlan) -> Result<Option<Routed
 pub(crate) async fn match_aggregate(
     plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
 ) -> Result<Option<RoutedRollup>, MissReason> {
-    use datafusion::logical_expr::{Expr, LogicalPlan, Operator, utils::split_conjunction};
+    use datafusion::logical_expr::{Expr, LogicalPlan};
 
     // Every real dashboard query ends in `ORDER BY … DESC`, often with a LIMIT,
     // so the optimized root is `Sort(Projection(Aggregate))`. Peel those and
@@ -526,7 +729,45 @@ pub(crate) async fn match_aggregate(
     let mut predicates = Vec::new();
     let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(None) };
     let Some(schema) = crate::schema_loader::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(None) };
-    let spec = schema.rollups.first().ok_or(MissReason::UnsupportedShape)?;
+
+    // Try every declared rollup, coarsest grain first: a coarser grain reads
+    // strictly fewer rows for the same answer. Ties break toward the narrower
+    // dimension set, which is the smaller table. A spec that cannot serve this
+    // query — wrong grain, missing dimension, missing measure — declines and the
+    // next one is tried, so adding a spec can only ever widen what routes.
+    let mut candidates: Vec<&RollupSpec> = schema.rollups.iter().collect();
+    candidates.sort_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), spec.dimensions.len()));
+    let mut first_miss = None;
+    for spec in candidates {
+        match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, output_names.as_ref(), session).await {
+            Ok(mut route) => {
+                route.outer_projection =
+                    outer_projection.map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>()).transpose()?;
+                route.having = having.map(unqualified).transpose()?;
+                route.wrappers = wrappers;
+                return Ok(Some(route));
+            }
+            // Report the FIRST spec's reason: it is the one the operator most
+            // likely intended to serve this query, so it is the actionable gap.
+            Err(reason) => first_miss = first_miss.or(Some(reason)),
+        }
+    }
+    Err(first_miss.unwrap_or(MissReason::UnsupportedShape))
+}
+
+/// Resolve one query against one declared rollup spec.
+///
+/// Returns a route with `outer_projection`, `having` and `wrappers` left empty —
+/// those are properties of the query root, not of the spec, and the caller fills
+/// them in once a spec has won.
+#[allow(clippy::too_many_arguments)]
+async fn route_with_spec(
+    spec: &RollupSpec, source: &str, table_name: &str, predicates: &[datafusion::logical_expr::Expr],
+    aggregate: &datafusion::logical_expr::Aggregate, output_names: Option<&Vec<String>>,
+    session: &datafusion::execution::context::SessionState,
+) -> Result<RoutedRollup, MissReason> {
+    use datafusion::logical_expr::{Expr, Operator, utils::split_conjunction};
+
     let mut project_id = None;
     let (mut lo, mut hi) = (None, None);
     let mut row_filters = Vec::new();
@@ -575,42 +816,43 @@ pub(crate) async fn match_aggregate(
     let project_id = project_id.ok_or(MissReason::MissingProject)?;
     let (lo, hi) = lo.zip(hi).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
     let grain = spec.grain_micros().ok_or(MissReason::UnsupportedShape)?;
-    let configured_filters = measure_filters(session, &source, spec).await?;
+    let configured_filters = measure_filters(session, source, spec).await?;
 
-    let mut select = Vec::new();
-    let mut group_by = Vec::new();
+    let mut groups = Vec::new();
     for (index, expression) in aggregate.group_expr.iter().enumerate() {
-        let alias = output_names.as_ref().and_then(|names| names.get(index)).map_or_else(|| aggregate.schema.field(index).name(), String::as_str);
-        match unaliased(expression) {
-            Expr::Column(column) if spec.dimensions.iter().any(|dimension| dimension == &column.name) => {
-                select.push(format!("{} AS \"{}\"", column.name, alias.replace('"', "\"\"")))
-            }
+        let alias = output_names.and_then(|names| names.get(index)).map_or_else(|| aggregate.schema.field(index).name(), String::as_str);
+        let expression = match unaliased(expression) {
+            Expr::Column(column) if spec.dimensions.iter().any(|dimension| dimension == &column.name) => column.name.clone(),
             Expr::ScalarFunction(function)
                 if function.name().eq_ignore_ascii_case("time_bucket") && function.args.len() == 2 && column_name(&function.args[1]) == Some("timestamp") =>
             {
                 let interval = string_literal(&function.args[0]).ok_or(MissReason::UnsupportedShape)?;
                 let width = parse_bucket_micros(interval).ok_or(MissReason::UnsupportedShape)?;
+                // A width that is not a whole number of grains would make one
+                // rollup row straddle two output buckets, and no state can be
+                // split across them. Raw fringes do not change this: the
+                // interior is still answered by whole rollup rows.
                 if width < grain || width % grain != 0 {
                     return Err(MissReason::PartialBucket);
                 }
-                select.push(format!("time_bucket({}, timestamp) AS \"{}\"", sql_literal(interval), alias.replace('"', "\"\"")));
+                format!("time_bucket({}, timestamp)", sql_literal(interval))
             }
             Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
             _ => return Err(MissReason::UnsupportedShape),
-        }
-        group_by.push((index + 1).to_string());
+        };
+        groups.push((expression, alias.to_string()));
     }
 
+    let mut measures = Vec::new();
     for (index, expression) in aggregate.aggr_expr.iter().enumerate() {
         let output_index = aggregate.group_expr.len() + index;
         let (expression, alias) = match expression {
             Expr::Alias(alias) => {
-                (alias.expr.as_ref(), output_names.as_ref().and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| alias.name.clone()))
+                (alias.expr.as_ref(), output_names.and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| alias.name.clone()))
             }
             expression => (
                 expression,
                 output_names
-                    .as_ref()
                     .and_then(|names| names.get(output_index))
                     .cloned()
                     .unwrap_or_else(|| aggregate.schema.field(output_index).name().to_string()),
@@ -627,46 +869,56 @@ pub(crate) async fn match_aggregate(
             configured_filters
                 .iter()
                 .find(|(measure, measure_filter)| measure.agg == aggregate && measure.column.as_deref() == column && *measure_filter == filter)
-                .map(|(measure, _)| measure.name.as_str())
+                .map(|(measure, _)| *measure)
         };
-        let state = match name.as_str() {
-            "count" => measure("count", column.as_deref()).map(|measure| format!("COALESCE(SUM({measure}), 0)")),
-            "sum" => measure("sum", column.as_deref()).map(|measure| format!("SUM({measure})")),
-            "min" => measure("min", column.as_deref()).map(|measure| format!("MIN({measure})")),
-            "max" => measure("max", column.as_deref()).map(|measure| format!("MAX({measure})")),
-            "avg" => {
-                let sum = measure("sum", column.as_deref());
-                let count = measure("count", column.as_deref());
-                // The CAST is on the dividend, not the result: both measures are
-                // Int64, so dividing first truncates and the outer type only
-                // widens an already-wrong value.
-                sum.zip(count).map(|(sum, count)| {
-                    format!(
-                        "CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END"
-                    )
-                })
-            }
-            "percentile_agg" => measure("tdigest", column.as_deref()).map(|measure| format!("tdigest_merge({measure})")),
+        // The raw leg reproduces the measure's DECLARED filter text verbatim.
+        // The matcher has already proven the query's aggregate filter
+        // canonicalizes to the same predicate, so this is exact — and it avoids
+        // unparsing an optimized `Expr` back into SQL.
+        let raw = |expression: String, declared: Option<&String>| match declared {
+            Some(filter) => format!("{expression} FILTER (WHERE {filter})"),
+            None => expression,
+        };
+        let (merge, resolved) = match name.as_str() {
+            "count" => (Merge::Count, measure("count", column.as_deref()).map(|m| vec![m])),
+            "sum" => (Merge::Sum, measure("sum", column.as_deref()).map(|m| vec![m])),
+            "min" => (Merge::Min, measure("min", column.as_deref()).map(|m| vec![m])),
+            "max" => (Merge::Max, measure("max", column.as_deref()).map(|m| vec![m])),
+            "avg" => (Merge::Avg, measure("sum", column.as_deref()).zip(measure("count", column.as_deref())).map(|(sum, count)| vec![sum, count])),
+            "percentile_agg" => (Merge::TDigest, measure("tdigest", column.as_deref()).map(|m| vec![m])),
             _ => return Err(MissReason::NonDecomposableAggregate),
-        }
-        .ok_or(MissReason::MissingMeasure)?;
-        select.push(format!("{state} AS \"{}\"", alias.replace('"', "\"\"")));
+        };
+        let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
+        debug_assert_eq!(resolved.len(), merge.arity(), "{merge:?} resolved the wrong number of measures");
+        let raw = resolved
+            .iter()
+            .map(|measure| {
+                let aggregate = measure.agg.to_uppercase();
+                let expression = match (merge, measure.column.as_deref()) {
+                    (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+                    (_, None) => "COUNT(*)".to_string(),
+                    (_, Some(column)) => format!("{aggregate}({column})"),
+                };
+                raw(expression, measure.filter.as_ref())
+            })
+            .collect();
+        measures.push(RoutedMeasure { alias, merge, measures: resolved.iter().map(|measure| measure.name.clone()).collect(), raw });
     }
 
-    Ok(Some(RoutedRollup {
-        source,
+    Ok(RoutedRollup {
+        source: source.to_string(),
         project_id,
         lo,
         hi,
         grain,
-        target: spec.table_name(&schema.table_name),
-        outer_projection: outer_projection.map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>()).transpose()?,
-        having: having.map(unqualified).transpose()?,
-        wrappers,
+        target: spec.table_name(table_name),
+        outer_projection: None,
+        having: None,
+        wrappers: Vec::new(),
         row_filters,
-        select: select.join(", "),
-        group_by: group_by.join(", "),
-    }))
+        groups,
+        measures,
+    })
 }
 
 #[cfg(test)]
@@ -709,6 +961,11 @@ mod tests {
 
     const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v2";
     const WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(120000000)";
+    /// Ten grains wide. The hybrid tests need a window that can still hold a
+    /// worthwhile interior after `MIN_INTERIOR_BUCKETS`/`MIN_INTERIOR_FRACTION`
+    /// take their cut — `WINDOW` is one grain, so it can never union.
+    const WIDE_WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(660000000)";
+    const WIDE_HORIZON: i64 = 540_000_000;
 
     /// Register the source AND its generated rollup so a route can be planned
     /// back into a real logical plan.
@@ -731,8 +988,16 @@ mod tests {
         match_aggregate(&optimized(state, sql).await, state).await
     }
 
+    /// The rewrite when the rollup owns the whole window — the single-leg shape.
     fn generated_sql(route: &RoutedRollup) -> String {
-        route.sql(&[("1970-01-01".into(), "generation".into())])
+        route.sql(&[("1970-01-01".into(), "generation".into())], (route.lo, route.hi))
+    }
+
+    /// The rewrite when only part of the window is certified, so raw fringes and
+    /// a live tail are unioned in.
+    fn hybrid_sql(route: &RoutedRollup, horizon: i64) -> String {
+        let interior = interior(route.lo, route.hi, route.grain, horizon).expect("a routable interior");
+        route.sql(&[("1970-01-01".into(), "generation".into())], interior)
     }
 
     #[tokio::test]
@@ -769,6 +1034,176 @@ mod tests {
             .expect("match count")
             .expect("declared rollup route");
         assert!(generated_sql(&route).contains("AND (kind = 'server')"));
+    }
+
+    /// The three ranges must PARTITION `[lo, hi)`: a gap drops rows, an overlap
+    /// counts them twice, and no downstream aggregate can detect either. Both
+    /// interior endpoints must also be grain-aligned, because a rollup row is
+    /// indivisible — half of one cannot be handed to a fringe.
+    #[test]
+    fn the_interior_and_its_fringes_partition_the_window() {
+        let grain = 60_000_000;
+        for lo in [0_i64, 1, 59_999_999, 60_000_000, 137_000_017] {
+            for width in [grain, grain * 3, grain * 40, grain * 40 + 7] {
+                for horizon_offset in [0_i64, 1, grain, grain * 7, width] {
+                    let hi = lo + width;
+                    let horizon = lo + horizon_offset;
+                    let Some((start, end)) = interior(lo, hi, grain, horizon) else { continue };
+                    assert_eq!(start.rem_euclid(grain), 0, "interior start {start} must be grain-aligned");
+                    assert_eq!(end.rem_euclid(grain), 0, "interior end {end} must be grain-aligned");
+                    assert!(lo <= start && start < end && end <= hi, "interior ({start},{end}) must sit inside [{lo},{hi})");
+                    assert!(end <= horizon, "interior must not reach past the certified horizon {horizon}");
+                    // Contiguity: fringe, interior, fringe, back to back.
+                    let covered = (start - lo) + (end - start) + (hi - end);
+                    assert_eq!(covered, hi - lo, "the three ranges must cover [{lo},{hi}) exactly once");
+                }
+            }
+        }
+    }
+
+    /// The shape production actually sends: microsecond-precision bounds ending
+    /// at wall-clock `now`. Before raw fringes this was refused outright, which
+    /// is why the feature never served a single query.
+    #[tokio::test]
+    async fn an_unaligned_live_window_emits_a_raw_fringe_and_a_live_tail() {
+        let state = session().await;
+        let (lo, hi) = (60_000_017_i64, 660_000_042_i64);
+        let sql = format!(
+            "SELECT resource___service___name, COUNT(*) AS c FROM {SOURCE} \
+             WHERE project_id = 'project' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1"
+        );
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let horizon = 540_000_000;
+        let generated = hybrid_sql(&route, horizon);
+        assert!(generated.contains("UNION ALL"), "an uncertified tail must union a raw leg: {generated}");
+        // The rollup leg owns exactly [ceil_g(lo), floor_g(horizon)); the raw leg
+        // owns the two fringes. Shared endpoints appear once as `<` and once as
+        // `>=`, never as an inclusive bound on both sides.
+        assert!(generated.contains(&format!("timestamp >= to_timestamp_micros(120000000) AND timestamp < to_timestamp_micros({horizon})")));
+        assert!(generated.contains(&format!("timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros(120000000)")));
+        assert!(generated.contains(&format!("timestamp >= to_timestamp_micros({horizon}) AND timestamp < to_timestamp_micros({hi})")));
+        assert!(!generated.contains("<="), "an inclusive bound at a shared boundary double counts a bucket: {generated}");
+        assert!(generated.contains(TARGET) && generated.contains(&format!("FROM {SOURCE}")), "both legs must be present: {generated}");
+    }
+
+    /// An average is not a mergeable state. If the legs carried `avg` each, the
+    /// union would average two averages and silently weight a 3-row minute the
+    /// same as a 3-million-row one.
+    #[tokio::test]
+    async fn avg_unions_as_separate_sum_and_count_states() {
+        let state = session().await;
+        let route = route_for(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WIDE_WINDOW}"))
+            .await
+            .expect("match")
+            .expect("route");
+        let generated = hybrid_sql(&route, WIDE_HORIZON);
+        // The query's own output name is `avg(otel_logs_and_spans.duration)`, so
+        // only the union body can be checked for a leg-level average.
+        let legs = generated.split_once("FROM (").expect("union body").1;
+        assert!(!legs.contains("avg("), "no leg may compute an average: {legs}");
+        assert!(generated.contains("SUM(duration_sum) AS __s0_0") && generated.contains("SUM(duration_count) AS __s0_1"), "rollup leg states: {generated}");
+        assert!(generated.contains("SUM(duration) AS __s0_0") && generated.contains("COUNT(duration) AS __s0_1"), "raw leg states: {generated}");
+        assert!(generated.contains("CAST(SUM(__s0_0) AS DOUBLE) / CAST(SUM(__s0_1) AS DOUBLE)"), "the merge must divide in floating point: {generated}");
+    }
+
+    /// The raw leg must apply the SAME predicate the stored measure was built
+    /// with, or the two legs answer different questions and the union is a
+    /// plausible-looking wrong number.
+    #[tokio::test]
+    async fn the_raw_leg_reproduces_the_measure_filter_verbatim() {
+        let state = session().await;
+        let filter = "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'";
+        let sql = format!(
+            "SELECT approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE)) FILTER (WHERE {filter})) AS p95 \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WIDE_WINDOW}"
+        );
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let generated = hybrid_sql(&route, WIDE_HORIZON);
+        assert!(
+            generated.contains(&format!("percentile_agg(CAST(duration AS DOUBLE)) FILTER (WHERE {filter})")),
+            "raw leg must carry the declared filter: {generated}"
+        );
+        assert!(generated.contains("tdigest_merge(server_duration_digest) AS __s0_0"), "rollup leg merges stored digest state: {generated}");
+        assert!(generated.contains("tdigest_merge(__s0_0)"), "the outer merge folds both legs' digests: {generated}");
+    }
+
+    /// The union widens nullability and re-types every state column, so the
+    /// acceptance gate in `dml.rs` is doing more work here than on the single-leg
+    /// path. This is also what catches a `Binary` state unifying to `BinaryView`,
+    /// which `tdigest_merge` cannot downcast.
+    #[tokio::test]
+    async fn the_union_rewrite_matches_the_original_schema() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('10 minutes', timestamp) AS bucket, resource___service___name, COUNT(*) AS c, avg(duration) AS mean, \
+                    min(duration) AS lo, max(duration) AS hi \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WIDE_WINDOW} GROUP BY 1, 2 ORDER BY 1 DESC LIMIT 10"
+        );
+        let original = optimized(&state, &sql).await;
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let generated = hybrid_sql(&route, WIDE_HORIZON);
+        assert!(generated.contains("UNION ALL"), "precondition: this is the union path");
+        let plan = state.create_logical_plan(&generated).await.expect("parse union rewrite");
+        let rewrapped = PlanWrapper::rewrap(route.wrappers, plan);
+        rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// The metrics dashboard's shape: `AVG(value)` and a percentile, grouped by
+    /// `metric_name`, selected with `metric_name IN (…)`. The `IN` is the part
+    /// that used to fall through to `unknown_filter` and disqualify the panel.
+    #[tokio::test]
+    async fn a_metrics_panel_routes_with_an_in_filter_and_a_digest() {
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
+        for table_name in ["otel_metrics", "otel_metrics_rollup_metrics_1m_v1"] {
+            let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
+                .expect("empty table");
+            ctx.register_table(table_name, Arc::new(table)).expect("register table");
+        }
+        let state = ctx.state();
+        let sql = format!(
+            "SELECT time_bucket('1 minute', timestamp) AS bucket, metric_name, AVG(value) AS mean, \
+                    approx_percentile(0.95, percentile_agg(CAST(value AS DOUBLE))) AS p95 \
+             FROM otel_metrics \
+             WHERE project_id = 'project' \
+               AND metric_name IN ('system.cpu.load_average.1m', 'system.cpu.load_average.5m', 'redis.memory.used', 'redis.memory.rss') \
+               AND {WIDE_WINDOW} \
+             GROUP BY 1, 2 ORDER BY 1 DESC"
+        );
+        let original = optimized(&state, &sql).await;
+        let route = match_aggregate(&original, &state).await.expect("match").expect("route");
+        assert_eq!(route.target, "otel_metrics_rollup_metrics_1m_v1");
+        let generated = hybrid_sql(&route, WIDE_HORIZON);
+        // DataFusion inlines a short `IN` to `OR`s, so this list is deliberately
+        // long enough to survive as an `InList` and exercise that branch.
+        assert_eq!(
+            generated.matches("metric_name IN ('system.cpu.load_average.1m', 'system.cpu.load_average.5m', 'redis.memory.used', 'redis.memory.rss')").count(),
+            2,
+            "the IN filter must be pushed into BOTH legs, not left residual: {generated}"
+        );
+        assert!(generated.contains("tdigest_merge(value_digest)") && generated.contains("percentile_agg(CAST(value AS DOUBLE))"), "{generated}");
+        // `approx_percentile(…)` is a scalar over the aggregate, so the query's
+        // own projection is re-applied above the rewrite — exactly as `dml.rs`
+        // does — and only then must the schemas agree.
+        let plan = state.create_logical_plan(&generated).await.expect("parse metrics rewrite");
+        let plan = datafusion::logical_expr::LogicalPlan::Projection(
+            datafusion::logical_expr::logical_plan::Projection::try_new(route.outer_projection.expect("scalar projection"), Arc::new(plan))
+                .expect("reapply projection"),
+        );
+        let rewrapped = PlanWrapper::rewrap(route.wrappers, plan);
+        rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// A sliver of certified interior is strictly worse than the raw plan: the
+    /// fringes still scan nearly the whole window, and the rollup leg plus the
+    /// union barrier are pure overhead on top.
+    #[test]
+    fn a_sliver_of_certified_interior_declines_the_union() {
+        let grain = 60_000_000;
+        let (lo, hi) = (0, grain * 100);
+        assert_eq!(interior(lo, hi, grain, grain * 3), None, "3 of 100 buckets is not worth a second scan");
+        assert_eq!(interior(lo, hi, grain, grain), None, "one bucket is below the floor even when it is the whole horizon");
+        assert!(interior(lo, hi, grain, grain * 40).is_some(), "40 of 100 buckets is worth it");
     }
 
     /// A dimension-grouped query is the shape every dashboard panel sends. The

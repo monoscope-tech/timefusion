@@ -103,3 +103,31 @@ fields:
   # via `migrate-columns`). See otel_logs_and_spans.yaml for why order matters.
   - { name: updated_at, data_type: 'Timestamp(Microsecond, Some("UTC"))', nullable: true }
   - { name: deleted, data_type: Boolean, nullable: true }
+
+# Continuous-aggregate rollups. See otel_logs_and_spans.yaml for the mechanics.
+#
+# Dimensions are `metric_name` plus the emitting service, because that is what
+# every metrics panel groups and filters by. `series_id` is deliberately absent:
+# it is per-timeseries and would make the rollup a copy of the source. A panel
+# whose series is an EXPRESSION (`COALESCE(resource___service___name,
+# resource___container___name, 'unknown')`) still cannot route — the matcher only
+# accepts a plain dimension column — but its `metric_name` filter can, so the
+# scan it falls back to is already pruned.
+#
+# The grain is 1m because every metrics widget bins at `1 minute`; a coarser
+# grain could not answer them at all.
+rollups:
+  - grain: 1m
+    name: metrics_1m_v1
+    dimensions: [metric_name, resource___service___name]
+    measures:
+      - { name: point_count, agg: count }
+      # `value_count` pairs with `value_sum` to answer AVG(value): an average is
+      # not decomposable, so the matcher rebuilds it from the two.
+      - { name: value_count, agg: count, column: value }
+      - { name: value_sum, agg: sum, column: value }
+      - { name: value_min, agg: min, column: value }
+      - { name: value_max, agg: max, column: value }
+      # Percentiles over a metric are a routine ask ("p95 CPU"), and a t-digest
+      # is the only percentile state that re-aggregates across buckets.
+      - { name: value_digest, agg: tdigest, column: value }

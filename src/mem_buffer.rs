@@ -1439,6 +1439,39 @@ impl MemBuffer {
         table.buckets.iter().any(|b| b.value().row_count.load(Ordering::Relaxed) > 0 && bucket_overlaps_range(b.value(), &range))
     }
 
+    /// Lower bound on the timestamp of any row still buffered for
+    /// `(project, table)` that could fall in `[lo, hi]`, or `None` when nothing
+    /// is buffered there.
+    ///
+    /// The bound is the minimum of the bucket's KEY-derived start and its
+    /// published `min_timestamp`. The key is fixed when the bucket is created
+    /// and is a lower bound on every row the bucket can ever hold, whereas
+    /// `min_timestamp` is stored *after* `row_count` — so a reader can observe a
+    /// non-empty bucket whose min has not dropped yet. Taking only the latter
+    /// would hand back a horizon that is too NEW, and every row below it would
+    /// be served from a rollup that does not contain it. Taking both is free and
+    /// also absorbs `compute_bucket_id`'s truncating division on negative
+    /// timestamps, where `key * duration` sits above the rows it holds.
+    ///
+    /// Scoped to `[lo, hi]` on purpose: one late straggler outside the query's
+    /// window must not collapse the certified horizon for every other query.
+    pub fn min_buffered_micros(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> Option<i64> {
+        let table = self.get_table(project_id, table_name)?;
+        let range = (Some(lo), Some(hi));
+        table
+            .buckets
+            .iter()
+            .filter(|b| b.value().row_count.load(Ordering::Relaxed) > 0 && bucket_overlaps_range(b.value(), &range))
+            .map(|b| {
+                let start = b.key().saturating_mul(bucket_duration_micros());
+                match b.value().min_timestamp.load(Ordering::Relaxed) {
+                    i64::MAX => start,
+                    min => start.min(min),
+                }
+            })
+            .min()
+    }
+
     /// Atomic MemBuffer query with text-match prefilter. For each bucket:
     ///   - Snapshot batches + run text_match search → ID set (under the
     ///     same `batches` lock).
@@ -4140,6 +4173,30 @@ mod tests {
 
         let stats = buffer.get_stats();
         assert_eq!(stats.total_buckets, 2, "Should have 2 separate buckets");
+    }
+
+    /// The rollup read path splits a window at the oldest buffered row:
+    /// everything below is served from Delta, everything above is read raw. A
+    /// horizon that is too NEW silently drops rows, so the bound must never sit
+    /// above a buffered row's own timestamp.
+    #[test]
+    fn min_buffered_micros_never_exceeds_the_oldest_buffered_row() {
+        let buffer = MemBuffer::new();
+        let (early, late) = (BUCKET_DURATION_MICROS + 7, BUCKET_DURATION_MICROS * 4 + 11);
+        buffer.insert("p", "t", create_test_batch(late), late).unwrap();
+        buffer.insert("p", "t", create_test_batch(early), early).unwrap();
+
+        let horizon = buffer.min_buffered_micros("p", "t", 0, late).expect("rows are buffered in range");
+        assert!(horizon <= early, "horizon {horizon} must not exceed the oldest buffered row {early}");
+        assert_eq!(horizon, BUCKET_DURATION_MICROS, "the bound is the bucket start, which is what a rollup grain aligns against");
+
+        // Scoped to the range: a window above `early` must not be dragged down
+        // by it, or one straggler collapses the horizon for every query.
+        let above = buffer.min_buffered_micros("p", "t", late, late).expect("the late bucket overlaps");
+        assert!(above > early, "a window that excludes the early row must not report it: {above}");
+
+        assert_eq!(buffer.min_buffered_micros("p", "t", late * 10, late * 20), None, "no overlapping bucket");
+        assert_eq!(buffer.min_buffered_micros("p", "absent", 0, late), None, "unknown table");
     }
 
     #[test]

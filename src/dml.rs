@@ -146,7 +146,7 @@ impl QueryPlanner for DmlQueryPlanner {
             return Ok(exec);
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
-            Ok(Some(crate::database::RollupRewrite { sql, grain, outer_projection, having, wrappers, ticket })) => {
+            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, outer_projection, having, wrappers, ticket })) => {
                 let rewritten = async {
                     let plan = session_state.create_logical_plan(&sql).await?;
                     // HAVING first: it sits directly above the aggregate and
@@ -170,20 +170,26 @@ impl QueryPlanner for DmlQueryPlanner {
                     // are unqualified where the original aggregate keeps the
                     // source qualifier, and a derived `==` on DFSchema compares
                     // qualifiers — which rejected every grouped query.
-                    Ok(rewritten) if rewritten.schema().has_equivalent_names_and_types(logical_plan.schema()).is_ok() => {
-                        match self.planner.create_physical_plan(&rewritten, session_state).await {
+                    Ok(rewritten) => match rewritten.schema().has_equivalent_names_and_types(logical_plan.schema()) {
+                        Ok(()) => match self.planner.create_physical_plan(&rewritten, session_state).await {
                             Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
-                                crate::metrics::record_rollup_hit("full", &grain);
+                                crate::metrics::record_rollup_hit(mode, &grain);
                                 return Ok(exec);
                             }
-                            Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::IncompleteCoverage.label()),
+                            Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::StaleCoverage.label()),
                             Err(error) => {
                                 debug!(%error, "rollup physical planning failed; using raw plan");
                                 crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
                             }
+                        },
+                        // The mismatch names the offending field and both types.
+                        // Discarding it leaves `rewrite_schema_mismatch` with no
+                        // way to tell WHICH column drifted.
+                        Err(error) => {
+                            debug!(%error, "rollup rewrite does not match the query schema; using raw plan");
+                            crate::metrics::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch.label());
                         }
-                    }
-                    Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch.label()),
+                    },
                     Err(error) => {
                         debug!(%error, "rollup SQL planning failed; using raw plan");
                         crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
