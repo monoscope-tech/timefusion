@@ -333,6 +333,18 @@ struct RollupCoverage {
 
 #[derive(Debug)]
 pub(crate) struct RollupReadTicket(Vec<(RollupCoverageKey, u64, u64, String)>);
+
+/// A matched query's rollup substitute: the SQL to plan, the plan nodes peeled
+/// off the original root that must be re-applied above it, and the coverage
+/// ticket to re-check before the substitute is used.
+#[derive(Debug)]
+pub(crate) struct RollupRewrite {
+    pub sql: String,
+    pub grain: String,
+    pub outer_projection: Option<datafusion::logical_expr::logical_plan::Projection>,
+    pub wrappers: Vec<crate::rollup::PlanWrapper>,
+    pub ticket: RollupReadTicket,
+}
 /// Per-physical-table count of flush/ingest committers QUEUED on the commit lock
 /// — see `Database::flush_waiters` and the priority check in `commit_wave`.
 type FlushWaiterCounts = Arc<dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicUsize>>>;
@@ -2804,9 +2816,11 @@ impl Database {
 
     pub(crate) async fn rollup_sql(
         &self, logical_plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
-    ) -> std::result::Result<Option<(String, String, Option<datafusion::logical_expr::logical_plan::Projection>, RollupReadTicket)>, crate::rollup::MissReason>
-    {
-        if self.bypass_rollup {
+    ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
+        // Both switches are project-independent, so they are checked BEFORE the
+        // matcher: `match_aggregate` plans one statement per filtered measure,
+        // and with the feature off that cost must not be paid at all.
+        if self.bypass_rollup || !self.config.maintenance.timefusion_rollup_enabled || !self.config.maintenance.timefusion_rollup_read_enabled {
             return Ok(None);
         }
         let Some(route) = crate::rollup::match_aggregate(logical_plan, session).await? else { return Ok(None) };
@@ -2817,6 +2831,12 @@ impl Database {
             return Err(crate::rollup::MissReason::PartialBucket);
         }
         let end = route.hi.checked_sub(1).ok_or(crate::rollup::MissReason::UnboundedTime)?;
+        // A rollup partition is built from Delta files only (`query_delta_only`),
+        // so any row still in the MemBuffer is absent from it. Serving such a
+        // window would silently drop the most recent minutes.
+        if self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&route.project_id, &route.source, route.lo, end)) {
+            return Err(crate::rollup::MissReason::IncompleteCoverage);
+        }
         let dates = window_dates(route.lo, end).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
         let mut generations = Vec::with_capacity(dates.len());
         let mut ticket = Vec::with_capacity(dates.len());
@@ -2834,7 +2854,13 @@ impl Database {
             generations.push((date.clone(), coverage.generation.clone()));
             ticket.push((key, source_fp, source_epoch, coverage.generation.clone()));
         }
-        Ok(Some((route.sql(&generations), format!("{}us", route.grain), route.outer_projection, RollupReadTicket(ticket))))
+        Ok(Some(RollupRewrite {
+            sql: route.sql(&generations),
+            grain: format!("{}us", route.grain),
+            outer_projection: route.outer_projection,
+            wrappers: route.wrappers,
+            ticket: RollupReadTicket(ticket),
+        }))
     }
 
     pub(crate) async fn rollup_ticket_current(&self, ticket: &RollupReadTicket) -> bool {
@@ -7778,8 +7804,11 @@ impl Database {
         self.rollup_backoff.retain(|(project, table, _, _), _| project != project_id || table != source);
     }
 
+    /// Walks the whole timestamp column, so it is gated on the master switch as
+    /// well as the schema: with rollups off this runs on every inbound write for
+    /// nothing, at one `String` allocation per row.
     fn invalidate_rollup_batches(&self, project_id: &str, source: &str, batches: &[RecordBatch]) {
-        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
+        if !self.config.maintenance.timefusion_rollup_enabled || get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return;
         }
         let dates = batches
@@ -7888,10 +7917,27 @@ impl Database {
                     drop(commit_guard);
                     tokio::time::sleep(occ_backoff(attempt)).await;
                 }
+                // Non-OCC error: delta-rs also returns Err when a post-commit
+                // hook or snapshot refresh fails AFTER N.json is durably
+                // written. Deleting the staged parquet then leaves the newest
+                // version pointing at objects that no longer exist (the
+                // 2026-07-09 dangling-Add incident), so probe before cleaning up
+                // — exactly what the staged flush path does.
                 Err(error) => {
                     drop(commit_guard);
-                    Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
-                    return Err(anyhow::anyhow!("rollup partition replace failed: {error}"));
+                    match self.probe_commit_landed_bounded(&table_ref, &staged).await {
+                        CommitProbe::Landed => {
+                            warn!(project_id, target, date, %error, "rollup partition replace reported an error but LANDED");
+                            return Ok(());
+                        }
+                        CommitProbe::NotLanded => {
+                            Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
+                            return Err(anyhow::anyhow!("rollup partition replace failed: {error}"));
+                        }
+                        CommitProbe::Inconclusive => {
+                            return Err(anyhow::anyhow!("rollup partition replace failed (landing unconfirmed, staged parquet kept): {error}"));
+                        }
+                    }
                 }
             }
         }
@@ -12875,9 +12921,19 @@ impl ProjectRoutingTable {
         for filter in filters {
             collect_conjuncts(filter, &mut conjuncts);
         }
-        let lower_timestamp_bound =
-            self.extract_time_range_from_filters(&conjuncts.into_iter().cloned().collect::<Vec<_>>()).is_some_and(|(lower, _)| lower != i64::MIN);
-        Self::raw_otel_scan_reason(&self.table_name, filters, limit, lower_timestamp_bound)
+        let bounded = conjuncts.iter().any(|expr| Self::is_bounding_predicate(expr))
+            || self.extract_time_range_from_filters(&conjuncts.into_iter().cloned().collect::<Vec<_>>()).is_some_and(|(lower, _)| lower != i64::MIN);
+        Self::raw_otel_scan_reason(&self.table_name, filters, limit, bounded)
+    }
+
+    /// Predicates that bound a scan but that `extract_time_range_from_filters`
+    /// does not decompose: `date = '…'` restricts it to one partition, and
+    /// `BETWEEN` is a timestamp range it does not see. Both are shapes
+    /// `rollup::match_aggregate` accepts, so the guard must accept them too —
+    /// otherwise enforce mode rejects TimeFusion's own rollup build query.
+    fn is_bounding_predicate(expr: &Expr) -> bool {
+        matches!(expr, Expr::Between(between) if !between.negated && matches!(between.expr.as_ref(), Expr::Column(c) if c.name == "timestamp"))
+            || matches!(expr, Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, .. }) if matches!(left.as_ref(), Expr::Column(c) if c.name == "date"))
     }
 
     fn raw_otel_scan_reason(table_name: &str, filters: &[Expr], limit: Option<usize>, lower_timestamp_bound: bool) -> Option<&'static str> {
@@ -14051,7 +14107,11 @@ impl TableProvider for ProjectRoutingTable {
         let scan_start = std::time::Instant::now();
         let scan_metrics = self.database.scan_metrics.clone();
 
-        if let Some(reason) = self.bounded_otel_scan_reason(filters, limit) {
+        // Internal Delta-only reads (rollup builds, maintenance) are not the
+        // unbounded client scans this guard exists to reject.
+        if !self.database.bypass_rollup
+            && let Some(reason) = self.bounded_otel_scan_reason(filters, limit)
+        {
             match self.database.config.core.timefusion_otel_scan_guard {
                 config::OtelScanGuard::Off => {}
                 config::OtelScanGuard::Observe => {
@@ -19096,6 +19156,19 @@ mod tests {
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1);
         Ok(())
+    }
+
+    /// `date = '…'` and `BETWEEN` bound a scan but are invisible to
+    /// `extract_time_range_from_filters`. Enforce mode used to reject both —
+    /// including the rollup builder's own `project_id = … AND date = …`
+    /// aggregate, which has no timestamp predicate and no LIMIT.
+    #[test]
+    fn a_date_partition_or_between_predicate_counts_as_bounded() {
+        assert!(ProjectRoutingTable::is_bounding_predicate(&col("date").eq(lit("2026-08-10"))));
+        assert!(ProjectRoutingTable::is_bounding_predicate(&col("timestamp").between(lit(1_i64), lit(2_i64))));
+        assert!(!ProjectRoutingTable::is_bounding_predicate(&col("timestamp").not_between(lit(1_i64), lit(2_i64))));
+        assert!(!ProjectRoutingTable::is_bounding_predicate(&col("name").between(lit(1_i64), lit(2_i64))));
+        assert!(!ProjectRoutingTable::is_bounding_predicate(&col("project_id").eq(lit("project"))));
     }
 
     #[test]

@@ -3413,6 +3413,10 @@ impl BufferedWriteLayer {
         self.mem_buffer.get_bucket_ranges(project_id, table_name)
     }
 
+    pub fn has_rows_in_range(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> bool {
+        self.mem_buffer.has_rows_in_range(project_id, table_name, lo, hi)
+    }
+
     /// Upper bound on row timestamps Delta can hold for this table — see
     /// `delta_flushed_watermark`. Queries bounded strictly above this can
     /// skip the Delta scan.

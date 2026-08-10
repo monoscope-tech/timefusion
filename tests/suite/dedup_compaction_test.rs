@@ -1570,7 +1570,7 @@ async fn an_uncertified_window_still_hides_the_superseded_row_from_a_mutable_pre
 #[serial]
 #[tokio::test]
 async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggregate() -> Result<()> {
-    let cfg = TestConfigBuilder::new("rollup_build_parity").with_buffer_mode(BufferMode::Enabled).build();
+    let cfg = TestConfigBuilder::new("rollup_build_parity").with_buffer_mode(BufferMode::Enabled).with_rollups().build();
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let day = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
@@ -1586,7 +1586,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
     let total_from_rollup = |db: Arc<Database>, project_id: String| async move {
-        let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_1m WHERE project_id = '{project_id}'");
+        let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'");
         let batches = db.query_delta_only(&sql).await?;
         let v = batches
             .iter()

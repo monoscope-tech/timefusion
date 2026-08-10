@@ -146,7 +146,7 @@ impl QueryPlanner for DmlQueryPlanner {
             return Ok(exec);
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
-            Ok(Some((sql, grain, outer_projection, ticket))) => {
+            Ok(Some(crate::database::RollupRewrite { sql, grain, outer_projection, wrappers, ticket })) => {
                 let rewritten = async {
                     let plan = session_state.create_logical_plan(&sql).await?;
                     let plan = match outer_projection {
@@ -155,21 +155,27 @@ impl QueryPlanner for DmlQueryPlanner {
                         }
                         None => plan,
                     };
-                    session_state.optimize(&plan)
+                    session_state.optimize(&crate::rollup::PlanWrapper::rewrap(wrappers, plan))
                 }
                 .await;
                 match rewritten {
-                    Ok(rewritten) if rewritten.schema() == logical_plan.schema() => match self.planner.create_physical_plan(&rewritten, session_state).await {
-                        Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
-                            crate::metrics::record_rollup_hit("full", &grain);
-                            return Ok(exec);
+                    // Names, order and types must match; the rollup SQL's aliases
+                    // are unqualified where the original aggregate keeps the
+                    // source qualifier, and a derived `==` on DFSchema compares
+                    // qualifiers — which rejected every grouped query.
+                    Ok(rewritten) if rewritten.schema().has_equivalent_names_and_types(logical_plan.schema()).is_ok() => {
+                        match self.planner.create_physical_plan(&rewritten, session_state).await {
+                            Ok(exec) if self.database.rollup_ticket_current(&ticket).await => {
+                                crate::metrics::record_rollup_hit("full", &grain);
+                                return Ok(exec);
+                            }
+                            Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::IncompleteCoverage.label()),
+                            Err(error) => {
+                                debug!(%error, "rollup physical planning failed; using raw plan");
+                                crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
+                            }
                         }
-                        Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::IncompleteCoverage.label()),
-                        Err(error) => {
-                            debug!(%error, "rollup physical planning failed; using raw plan");
-                            crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
-                        }
-                    },
+                    }
                     Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch.label()),
                     Err(error) => {
                         debug!(%error, "rollup SQL planning failed; using raw plan");

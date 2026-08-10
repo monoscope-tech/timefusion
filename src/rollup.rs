@@ -68,7 +68,7 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
         })
         .collect::<anyhow::Result<Vec<_>>>()?
         .join(", ");
-    let select_dimensions = (!dimensions.is_empty()).then(|| format!(", {dimensions}")).unwrap_or_default();
+    let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = std::iter::once("1".to_string()).chain((2..).take(spec.dimensions.len()).map(|index| index.to_string())).collect::<Vec<_>>().join(", ");
 
     Ok(format!(
@@ -170,6 +170,34 @@ pub fn to_rollup_batches(
         .collect()
 }
 
+/// A plan node peeled off the query root so the rewrite can be re-wrapped in it.
+#[derive(Debug, Clone)]
+pub(crate) enum PlanWrapper {
+    Sort(Vec<datafusion::logical_expr::SortExpr>, Option<usize>),
+    Limit(Option<Box<datafusion::logical_expr::Expr>>, Option<Box<datafusion::logical_expr::Expr>>),
+}
+
+impl PlanWrapper {
+    /// Peel one wrapper off the root, returning it and the plan beneath.
+    fn peel(plan: &datafusion::logical_expr::LogicalPlan) -> Option<(Self, &datafusion::logical_expr::LogicalPlan)> {
+        use datafusion::logical_expr::LogicalPlan;
+        match plan {
+            LogicalPlan::Sort(sort) => Some((Self::Sort(sort.expr.clone(), sort.fetch), &sort.input)),
+            LogicalPlan::Limit(limit) => Some((Self::Limit(limit.skip.clone(), limit.fetch.clone()), &limit.input)),
+            _ => None,
+        }
+    }
+
+    /// Re-apply `wrappers` (outermost first, as peeled) above `plan`.
+    pub fn rewrap(wrappers: Vec<Self>, plan: datafusion::logical_expr::LogicalPlan) -> datafusion::logical_expr::LogicalPlan {
+        use datafusion::logical_expr::{LogicalPlan, logical_plan};
+        wrappers.into_iter().rev().fold(plan, |input, wrapper| match wrapper {
+            Self::Sort(expr, fetch) => LogicalPlan::Sort(logical_plan::Sort { expr, input: std::sync::Arc::new(input), fetch }),
+            Self::Limit(skip, fetch) => LogicalPlan::Limit(logical_plan::Limit { skip, fetch, input: std::sync::Arc::new(input) }),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RoutedRollup {
     pub source: String,
@@ -179,6 +207,8 @@ pub(crate) struct RoutedRollup {
     pub grain: i64,
     pub target: String,
     pub outer_projection: Option<datafusion::logical_expr::logical_plan::Projection>,
+    /// Sort/Limit peeled off the query root, outermost first.
+    pub wrappers: Vec<PlanWrapper>,
     row_filters: Vec<String>,
     select: String,
     group_by: String,
@@ -230,6 +260,19 @@ fn string_literal(expr: &datafusion::logical_expr::Expr) -> Option<&str> {
         ) => Some(value),
         _ => None,
     }
+}
+
+/// The literal that `column = '…'` compares against, in either operand order.
+///
+/// `None` for any other shape — including `project_id = other_column`, which
+/// must stay a predicate the matcher cannot honour rather than being consumed.
+fn eq_literal<'a>(expr: &'a datafusion::logical_expr::Expr, column: &str) -> Option<&'a str> {
+    use datafusion::logical_expr::{Expr, Operator};
+    let Expr::BinaryExpr(binary) = unaliased(expr) else { return None };
+    (binary.op == Operator::Eq)
+        .then_some([(&binary.left, &binary.right), (&binary.right, &binary.left)])?
+        .into_iter()
+        .find_map(|(name, value)| (column_name(name) == Some(column)).then(|| string_literal(value)).flatten())
 }
 
 fn timestamp_literal(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
@@ -343,7 +386,12 @@ fn parse_bucket_micros(value: &str) -> Option<i64> {
 fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mut Vec<datafusion::logical_expr::Expr>) -> Option<String> {
     use datafusion::logical_expr::LogicalPlan;
     match plan {
-        LogicalPlan::Projection(projection) => source_and_filters(&projection.input, filters),
+        // Only a rename-free projection may be walked through. `hash AS name`
+        // would otherwise make the matcher read a declared dimension off the
+        // wrong source column and answer with the wrong values.
+        LogicalPlan::Projection(projection) if projection.expr.iter().all(|expr| matches!(expr, datafusion::logical_expr::Expr::Column(_))) => {
+            source_and_filters(&projection.input, filters)
+        }
         LogicalPlan::Filter(filter) => {
             filters.push(filter.predicate.clone());
             source_and_filters(&filter.input, filters)
@@ -363,11 +411,16 @@ async fn measure_filters<'a>(
     for measure in &spec.measures {
         let filter = match &measure.filter {
             None => String::new(),
+            // Canonicalized through the SAME pipeline the query side went
+            // through — optimized (so literals carry the coerced type) and split
+            // into conjuncts — or the two strings can never be equal and every
+            // filtered measure is dead weight.
             Some(filter) => {
                 let plan = session.create_logical_plan(&format!("SELECT * FROM {source} WHERE {filter}")).await.map_err(|_| MissReason::UnknownFilter)?;
+                let plan = session.optimize(&plan).map_err(|_| MissReason::UnknownFilter)?;
                 let mut filters = Vec::new();
                 source_and_filters(&plan, &mut filters).ok_or(MissReason::UnknownFilter)?;
-                canonical_and(&filters)
+                canonical_and(filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction))
             }
         };
         filters.push((measure, filter));
@@ -381,6 +434,17 @@ pub(crate) async fn match_aggregate(
     plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
 ) -> Result<Option<RoutedRollup>, MissReason> {
     use datafusion::logical_expr::{Expr, LogicalPlan, Operator, utils::split_conjunction};
+
+    // Every real dashboard query ends in `ORDER BY … DESC`, often with a LIMIT,
+    // so the optimized root is `Sort(Projection(Aggregate))`. Peel those and
+    // hand them back for the caller to re-apply above the rewrite — matching
+    // only a bare aggregate root would leave the feature inert in production.
+    let mut wrappers = Vec::new();
+    let mut plan = plan;
+    while let Some((wrapper, input)) = PlanWrapper::peel(plan) {
+        wrappers.push(wrapper);
+        plan = input;
+    }
 
     let (aggregate, output_names, outer_projection) = match plan {
         LogicalPlan::Aggregate(aggregate) => (aggregate, None, None),
@@ -400,7 +464,7 @@ pub(crate) async fn match_aggregate(
     let spec = schema.rollups.first().ok_or(MissReason::UnsupportedShape)?;
     let mut project_id = None;
     let (mut lo, mut hi) = (None, None);
-    let (mut row_filters, mut residual) = (Vec::new(), Vec::new());
+    let mut row_filters = Vec::new();
     for term in predicates.iter().flat_map(split_conjunction) {
         match term {
             Expr::Between(between) if !between.negated && column_name(&between.expr) == Some("timestamp") => {
@@ -413,12 +477,6 @@ pub(crate) async fn match_aggregate(
                         .ok_or(MissReason::UnboundedTime)?,
                 );
             }
-            Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq) && column_name(&binary.left) == Some("project_id") => {
-                project_id = string_literal(&binary.right).map(str::to_string)
-            }
-            Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq) && column_name(&binary.right) == Some("project_id") => {
-                project_id = string_literal(&binary.left).map(str::to_string)
-            }
             Expr::BinaryExpr(binary) if column_name(&binary.left) == Some("timestamp") => {
                 let Some(value) = timestamp_literal(&binary.right) else { return Err(MissReason::UnboundedTime) };
                 match binary.op {
@@ -430,12 +488,22 @@ pub(crate) async fn match_aggregate(
                     Operator::LtEq => {
                         hi = Some(hi.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.min(value.saturating_add(1))))
                     }
-                    _ => residual.push(term.clone()),
+                    _ => return Err(MissReason::UnknownFilter),
                 }
             }
-            term => match dimension_filter_sql(term, &spec.dimensions) {
-                Some(filter) => row_filters.push(filter),
-                None => residual.push(term.clone()),
+            // A predicate we can push into the rollup scan is a dimension filter;
+            // one we cannot may NOT be answered by picking a measure that was
+            // pre-filtered the same way. The measure carries the right value, but
+            // the raw query also *eliminates* the groups and buckets where
+            // nothing matched, and re-aggregating the rollup resurrects them as
+            // 0/NULL rows. (`count(*) FILTER (WHERE …)` is unaffected — an
+            // aggregate filter changes values, never which groups exist.)
+            term => match (eq_literal(term, "project_id"), dimension_filter_sql(term, &spec.dimensions)) {
+                // Two different literals cannot both hold; never keep the last.
+                (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
+                (Some(value), _) => project_id = Some(value.to_string()),
+                (None, Some(filter)) => row_filters.push(filter),
+                (None, None) => return Err(MissReason::UnknownFilter),
             },
         }
     }
@@ -443,7 +511,6 @@ pub(crate) async fn match_aggregate(
     let (lo, hi) = lo.zip(hi).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
     let grain = spec.grain_micros().ok_or(MissReason::UnsupportedShape)?;
     let configured_filters = measure_filters(session, &source, spec).await?;
-    let residual_filter = canonical_and(&residual);
 
     let mut select = Vec::new();
     let mut group_by = Vec::new();
@@ -488,10 +555,7 @@ pub(crate) async fn match_aggregate(
         if function.params.distinct || !function.params.order_by.is_empty() {
             return Err(MissReason::NonDecomposableAggregate);
         }
-        let local_filter = canonical_and(function.params.filter.iter().map(|filter| filter.as_ref()));
-        let mut filters = [residual_filter.as_str(), local_filter.as_str()].into_iter().filter(|filter| !filter.is_empty()).collect::<Vec<_>>();
-        filters.sort();
-        let filter = filters.join(" AND ");
+        let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())));
         let name = function.func.name().to_ascii_lowercase();
         let column = function.params.args.first().and_then(column_name).map(str::to_string);
         let measure = |aggregate: &str, column: Option<&str>| {
@@ -508,8 +572,14 @@ pub(crate) async fn match_aggregate(
             "avg" => {
                 let sum = measure("sum", column.as_deref());
                 let count = measure("count", column.as_deref());
-                sum.zip(count)
-                    .map(|(sum, count)| format!("CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE SUM({sum}) / SUM({count}) END"))
+                // The CAST is on the dividend, not the result: both measures are
+                // Int64, so dividing first truncates and the outer type only
+                // widens an already-wrong value.
+                sum.zip(count).map(|(sum, count)| {
+                    format!(
+                        "CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END"
+                    )
+                })
             }
             "percentile_agg" => measure("tdigest", column.as_deref()).map(|measure| format!("tdigest_merge({measure})")),
             _ => return Err(MissReason::NonDecomposableAggregate),
@@ -526,6 +596,7 @@ pub(crate) async fn match_aggregate(
         grain,
         target: spec.table_name(&schema.table_name),
         outer_projection,
+        wrappers,
         row_filters,
         select: select.join(", "),
         group_by: group_by.join(", "),
@@ -570,52 +641,53 @@ mod tests {
         assert!(sql.contains("GROUP BY 1, 2, 3, 4"));
     }
 
-    #[tokio::test]
-    async fn matcher_rewrites_a_certifiable_count_aggregate() {
-        let mut ctx = datafusion::prelude::SessionContext::new();
-        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
-        let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(SOURCE).expect("source schema").schema_ref(), vec![vec![]])
-            .expect("empty source table");
-        ctx.register_table(SOURCE, Arc::new(table)).expect("register source");
-        let state = ctx.state();
-        let plan = state
-            .create_logical_plan(
-                "SELECT COUNT(*) FROM otel_logs_and_spans \
-                 WHERE project_id = 'project' \
-                   AND timestamp >= to_timestamp_micros(60000000) \
-                   AND timestamp < to_timestamp_micros(120000000)",
-            )
-            .await
-            .expect("parse count");
-        let plan = state.optimize(&plan).expect("optimize count");
-        let route = match_aggregate(&plan, &state).await.expect("match count").expect("declared rollup route");
-        assert_eq!(route.target, "otel_logs_and_spans_rollup_dashboard_1m_v2");
-        assert_eq!(route.project_id, "project");
-        assert!(route.sql(&[("1970-01-01".into(), "generation".into())]).contains("COALESCE(SUM(request_count), 0)"));
-    }
+    const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v2";
+    const WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(120000000)";
 
-    #[tokio::test]
-    async fn matcher_preserves_a_scalar_outer_projection() {
+    /// Register the source AND its generated rollup so a route can be planned
+    /// back into a real logical plan.
+    async fn session() -> datafusion::execution::context::SessionState {
         let mut ctx = datafusion::prelude::SessionContext::new();
         crate::functions::register_custom_functions(&mut ctx).expect("functions register");
-        for table_name in [SOURCE, "otel_logs_and_spans_rollup_dashboard_1m_v2"] {
+        for table_name in [SOURCE, TARGET] {
             let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
                 .expect("empty table");
             ctx.register_table(table_name, Arc::new(table)).expect("register table");
         }
-        let state = ctx.state();
-        let plan = state
-            .create_logical_plan(
-                "SELECT COUNT(*) + 1 AS total FROM otel_logs_and_spans \
-                 WHERE project_id = 'project' \
-                   AND timestamp >= to_timestamp_micros(60000000) \
-                   AND timestamp < to_timestamp_micros(120000000)",
-            )
+        ctx.state()
+    }
+
+    async fn optimized(state: &datafusion::execution::context::SessionState, sql: &str) -> datafusion::logical_expr::LogicalPlan {
+        state.optimize(&state.create_logical_plan(sql).await.expect("parse")).expect("optimize")
+    }
+
+    async fn route_for(state: &datafusion::execution::context::SessionState, sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
+        match_aggregate(&optimized(state, sql).await, state).await
+    }
+
+    fn generated_sql(route: &RoutedRollup) -> String {
+        route.sql(&[("1970-01-01".into(), "generation".into())])
+    }
+
+    #[tokio::test]
+    async fn matcher_rewrites_a_certifiable_count_aggregate() {
+        let state = session().await;
+        let route = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"))
             .await
-            .expect("parse count");
-        let plan = state.optimize(&plan).expect("optimize count");
-        let route = match_aggregate(&plan, &state).await.expect("match count").expect("declared rollup route");
-        let rewritten = state.create_logical_plan(&route.sql(&[("1970-01-01".into(), "generation".into())])).await.expect("parse rollup query");
+            .expect("match count")
+            .expect("declared rollup route");
+        assert_eq!(route.target, TARGET);
+        assert_eq!(route.project_id, "project");
+        assert!(generated_sql(&route).contains("COALESCE(SUM(request_count), 0)"));
+    }
+
+    #[tokio::test]
+    async fn matcher_preserves_a_scalar_outer_projection() {
+        let state = session().await;
+        let sql = format!("SELECT COUNT(*) + 1 AS total FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}");
+        let plan = optimized(&state, &sql).await;
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let rewritten = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
         let projection = route.outer_projection.expect("scalar projection");
         let rewritten = datafusion::logical_expr::LogicalPlan::Projection(
             datafusion::logical_expr::logical_plan::Projection::try_new(projection.expr, Arc::new(rewritten)).expect("reapply projection"),
@@ -625,23 +697,82 @@ mod tests {
 
     #[tokio::test]
     async fn matcher_applies_dimension_predicates_to_the_rollup_scan() {
-        let mut ctx = datafusion::prelude::SessionContext::new();
-        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
-        let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(SOURCE).expect("source schema").schema_ref(), vec![vec![]])
-            .expect("empty source table");
-        ctx.register_table(SOURCE, Arc::new(table)).expect("register source");
-        let state = ctx.state();
-        let plan = state
-            .create_logical_plan(
-                "SELECT COUNT(*) FROM otel_logs_and_spans \
-                 WHERE project_id = 'project' AND kind = 'server' \
-                   AND timestamp >= to_timestamp_micros(60000000) \
-                   AND timestamp < to_timestamp_micros(120000000)",
-            )
+        let state = session().await;
+        let route = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND kind = 'server' AND {WINDOW}"))
             .await
-            .expect("parse count");
-        let route = match_aggregate(&state.optimize(&plan).expect("optimize count"), &state).await.expect("match count").expect("declared rollup route");
-        assert!(route.sql(&[("1970-01-01".into(), "generation".into())]).contains("AND (kind = 'server')"));
+            .expect("match count")
+            .expect("declared rollup route");
+        assert!(generated_sql(&route).contains("AND (kind = 'server')"));
+    }
+
+    /// A dimension-grouped query is the shape every dashboard panel sends. The
+    /// rewrite's aliases are unqualified while the source aggregate keeps the
+    /// table qualifier, so a derived `==` on DFSchema rejected all of them —
+    /// the feature was inert for exactly the queries it was built for.
+    #[tokio::test]
+    async fn a_grouped_rewrite_matches_the_original_schema_despite_qualifiers() {
+        let state = session().await;
+        let sql = format!("SELECT resource___service___name, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
+        let original = optimized(&state, &sql).await;
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let rewritten = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
+        assert_ne!(rewritten.schema(), original.schema(), "precondition: the qualifiers really do differ");
+        rewritten.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// `ORDER BY ... DESC` is on every real dashboard query, so a matcher that
+    /// only accepts a bare aggregate root never fires in production.
+    #[tokio::test]
+    async fn an_order_by_above_the_aggregate_is_peeled_and_reapplied() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT resource___service___name, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1 ORDER BY 1 DESC LIMIT 10"
+        );
+        let original = optimized(&state, &sql).await;
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        assert!(!route.wrappers.is_empty(), "Sort/Limit must be peeled, not rejected");
+        let plan = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
+        let rewrapped = PlanWrapper::rewrap(route.wrappers, plan);
+        // The optimizer folds the LIMIT into the Sort's `fetch`, so one Sort is
+        // the whole peeled prefix — the ordering must be back on top of the
+        // rewrite, or a routed dashboard query returns rows in rollup order.
+        let datafusion::logical_expr::LogicalPlan::Sort(sort) = &rewrapped else { panic!("the peeled ORDER BY must be back on top: {rewrapped:?}") };
+        assert_eq!(sort.fetch, Some(10), "the LIMIT folded into the Sort must survive too");
+        rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// An `avg` over two Int64 measures divides as integers; the CASE's DOUBLE
+    /// only widens an already-truncated value, so the schema gate cannot see it.
+    #[tokio::test]
+    async fn avg_casts_before_dividing_so_it_does_not_truncate() {
+        let state = session().await;
+        let route =
+            route_for(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await.expect("match").expect("route");
+        let sql = generated_sql(&route);
+        assert!(sql.contains("CAST(SUM(duration_sum) AS DOUBLE) / CAST(SUM(duration_count) AS DOUBLE)"), "avg must divide in floating point: {sql}");
+    }
+
+    /// A `WHERE` predicate that only *selects* a pre-filtered measure is not
+    /// applied by the rewrite, so groups and buckets the raw query eliminates
+    /// come back as 0/NULL rows. Refuse the route instead.
+    #[tokio::test]
+    async fn a_residual_row_filter_refuses_the_route_rather_than_inventing_zero_rows() {
+        let state = session().await;
+        // `name` is not a declared dimension, so it cannot be pushed into the
+        // rollup scan — it can only pick a pre-filtered measure.
+        let reason = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND name = 'monoscope.http' AND {WINDOW}"))
+            .await
+            .expect_err("a residual filter must not route");
+        assert_eq!(reason, MissReason::UnknownFilter);
+    }
+
+    /// `project_id = <column>` used to be consumed and dropped, so the rollup
+    /// answered without a predicate the raw query enforces.
+    #[tokio::test]
+    async fn a_non_literal_project_id_predicate_is_not_silently_dropped() {
+        let state = session().await;
+        let route = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = name AND project_id = 'project' AND {WINDOW}")).await;
+        assert!(matches!(route, Err(MissReason::UnknownFilter) | Ok(None)), "must not route while ignoring `project_id = name`: {route:?}");
     }
 
     #[test]
@@ -662,7 +793,7 @@ mod tests {
             }
         }));
         let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("aggregate batch");
-        let output = to_rollup_batches(&spec, SOURCE, "project", "1970-01-01", "generation-a", &[input.clone()]).expect("shape rollup");
+        let output = to_rollup_batches(&spec, SOURCE, "project", "1970-01-01", "generation-a", std::slice::from_ref(&input)).expect("shape rollup");
         let other = to_rollup_batches(&spec, SOURCE, "project", "1970-01-01", "generation-b", &[input]).expect("shape rollup");
         let batch = output.first().expect("one output batch");
         let generation = batch.column_by_name("rollup_generation").expect("generation").as_any().downcast_ref::<StringViewArray>().expect("utf8 generation");

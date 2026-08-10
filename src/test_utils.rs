@@ -27,11 +27,12 @@ pub mod test_helpers {
     pub struct TestConfigBuilder {
         test_name: String,
         buffer_mode: BufferMode,
+        rollups: bool,
     }
 
     impl TestConfigBuilder {
         pub fn new(test_name: &str) -> Self {
-            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled }
+            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled, rollups: false }
         }
 
         pub fn with_buffer_mode(mut self, mode: BufferMode) -> Self {
@@ -39,10 +40,18 @@ pub mod test_helpers {
             self
         }
 
+        /// Turn on the default-off rollup build and read gates.
+        pub fn with_rollups(mut self) -> Self {
+            self.rollups = true;
+            self
+        }
+
         pub fn build(self) -> Arc<AppConfig> {
             let id = format!("{}-{}", self.test_name, &uuid::Uuid::new_v4().to_string()[..8]);
             let mut cfg = minio_base_config(&id, &format!("/tmp/timefusion-{id}"));
             cfg.buffer.timefusion_flush_immediately = self.buffer_mode == BufferMode::FlushImmediately;
+            cfg.maintenance.timefusion_rollup_enabled = self.rollups;
+            cfg.maintenance.timefusion_rollup_read_enabled = self.rollups;
             Arc::new(cfg)
         }
     }

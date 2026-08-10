@@ -210,6 +210,20 @@ fn client_statement_timeout(client: &(impl ClientInfo + ?Sized)) -> Option<std::
     client.metadata().get("statement_timeout_ms").and_then(|value| value.parse::<u64>().ok()).map(std::time::Duration::from_millis)
 }
 
+/// Writes are exempt from the statement timeout.
+///
+/// `run_with_statement_timeout` enforces by DROPPING the in-flight future, and
+/// the DML path runs its WAL append and Delta commit *inside* that future — so
+/// cancelling a slow bulk INSERT or a MOR UPDATE reports failure to the client
+/// for a write that is already partly durable, and it reappears on the next WAL
+/// replay. PostgreSQL's `statement_timeout` aborts a statement transactionally;
+/// dropping a future cannot, so the deadline only covers read-only statements.
+/// `classify_query` errs toward matching DML, which errs toward no timeout.
+fn statement_timeout_applies(query: &str) -> bool {
+    let (kind, _) = classify_query(query);
+    !matches!(kind, "DML" | "DDL")
+}
+
 async fn run_with_statement_timeout<T>(
     timeout: Option<std::time::Duration>, query: impl std::future::Future<Output = PgWireResult<T>>,
 ) -> PgWireResult<(T, Option<tokio::time::Instant>)> {
@@ -854,7 +868,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
-        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs);
+        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs).filter(|_| statement_timeout_applies(query));
         let result =
             run_with_statement_timeout(timeout, <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span))
                 .await
@@ -935,7 +949,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
-        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs);
+        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs).filter(|_| statement_timeout_applies(query));
         let result = run_with_statement_timeout(
             timeout,
             <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span),
@@ -1006,6 +1020,18 @@ mod tests {
             panic!("expected query response");
         };
         assert!(matches!(response.data_rows.next().await, Some(Err(PgWireError::UserError(_)))));
+    }
+
+    /// The deadline is enforced by dropping the in-flight future, and the DML
+    /// path commits inside it — so a timed-out write is reported as failed while
+    /// already partly durable. Reads only.
+    #[test]
+    fn the_statement_timeout_never_applies_to_a_write() {
+        assert!(super::statement_timeout_applies("SELECT count(*) FROM otel_logs_and_spans"));
+        assert!(super::statement_timeout_applies("SHOW server_version"));
+        assert!(!super::statement_timeout_applies("INSERT INTO otel_logs_and_spans VALUES (1)"));
+        assert!(!super::statement_timeout_applies("UPDATE otel_logs_and_spans SET name = 'x' WHERE id = '1'"));
+        assert!(!super::statement_timeout_applies("DELETE FROM otel_logs_and_spans WHERE id = '1'"));
     }
 
     #[test]

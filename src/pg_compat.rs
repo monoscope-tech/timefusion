@@ -132,7 +132,10 @@ impl PgCompatibilityHook {
             "server_version" => PG_COMPAT_VERSION.to_string(),
             "server_version_num" => PG_COMPAT_VERSION_NUM.to_string(),
             "is_superuser" => "on".to_string(),
-            "search_path" => PG_COMPAT_SCHEMA.to_string(),
+            // `search_path` is deliberately NOT answered here: `SetShowHook`
+            // runs behind this hook and reads the value `SET search_path` wrote
+            // to the client session. A constant here would report `public` back
+            // to every client that had switched schema.
             "statement_timeout" => effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs)
                 .map_or_else(|| "0".to_string(), |timeout| format!("{}ms", timeout.as_millis())),
             _ => return None,
