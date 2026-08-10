@@ -206,7 +206,11 @@ pub(crate) struct RoutedRollup {
     pub hi: i64,
     pub grain: i64,
     pub target: String,
-    pub outer_projection: Option<datafusion::logical_expr::logical_plan::Projection>,
+    /// Projection expressions to re-apply above the rewrite, qualifiers stripped.
+    pub outer_projection: Option<Vec<datafusion::logical_expr::Expr>>,
+    /// A HAVING predicate to re-apply directly above the rewrite, below
+    /// `outer_projection`. It references the aggregate's own output names.
+    pub having: Option<datafusion::logical_expr::Expr>,
     /// Sort/Limit peeled off the query root, outermost first.
     pub wrappers: Vec<PlanWrapper>,
     row_filters: Vec<String>,
@@ -428,6 +432,63 @@ async fn measure_filters<'a>(
     Ok(filters)
 }
 
+/// Strip table qualifiers from every column reference.
+///
+/// A HAVING predicate and an outer projection are lifted off the source plan,
+/// so their group-by columns are qualified `otel_logs_and_spans.kind`. The
+/// rewrite reads from the rollup table, so those would not resolve. Names are
+/// unique in the rewrite's output by construction — each is a SELECT alias.
+fn unqualified(expr: datafusion::logical_expr::Expr) -> Result<datafusion::logical_expr::Expr, MissReason> {
+    use datafusion::{
+        common::tree_node::{Transformed, TreeNode},
+        logical_expr::Expr,
+    };
+    expr.transform(|expr| {
+        Ok(match expr {
+            Expr::Column(column) => Transformed::yes(Expr::Column(datafusion::common::Column::new_unqualified(column.name))),
+            expr => Transformed::no(expr),
+        })
+    })
+    .map(|transformed| transformed.data)
+    .map_err(|_| MissReason::UnsupportedShape)
+}
+
+/// An `Aggregate`, or the `Filter(Aggregate)` a HAVING clause plans to.
+fn aggregate_with_having(
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Option<(&datafusion::logical_expr::Aggregate, Option<datafusion::logical_expr::Expr>)> {
+    use datafusion::logical_expr::LogicalPlan;
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => Some((aggregate, None)),
+        LogicalPlan::Filter(filter) => match filter.input.as_ref() {
+            LogicalPlan::Aggregate(aggregate) => Some((aggregate, Some(filter.predicate.clone()))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Decline a plan the matcher cannot rewrite.
+///
+/// `Ok(None)` means "not our business" and stays uncounted — otherwise every
+/// ordinary SELECT would land in `rollup_miss`. But when the plan *is* an
+/// aggregate over a rollup-declaring source, the decline is a real shape gap
+/// and must be visible: an operator who enables read routing and sees zero
+/// hits AND zero misses cannot tell the gate from the matcher.
+fn decline(plan: &datafusion::logical_expr::LogicalPlan) -> Result<Option<RoutedRollup>, MissReason> {
+    use datafusion::logical_expr::LogicalPlan;
+    fn aggregate_source(plan: &LogicalPlan) -> Option<String> {
+        match plan {
+            LogicalPlan::Aggregate(aggregate) => source_and_filters(&aggregate.input, &mut Vec::new()),
+            plan => plan.inputs().into_iter().find_map(aggregate_source),
+        }
+    }
+    match aggregate_source(plan) {
+        Some(source) if crate::schema_loader::get_schema(&source).is_some_and(|schema| !schema.rollups.is_empty()) => Err(MissReason::UnsupportedShape),
+        _ => Ok(None),
+    }
+}
+
 /// Match a direct aggregate over one declared source table and construct its
 /// re-aggregation request. It deliberately rejects a shape it cannot prove.
 pub(crate) async fn match_aggregate(
@@ -446,17 +507,21 @@ pub(crate) async fn match_aggregate(
         plan = input;
     }
 
-    let (aggregate, output_names, outer_projection) = match plan {
-        LogicalPlan::Aggregate(aggregate) => (aggregate, None, None),
-        LogicalPlan::Projection(projection) => {
-            let LogicalPlan::Aggregate(aggregate) = projection.input.as_ref() else { return Ok(None) };
-            if projection.expr.iter().all(|expr| matches!(unaliased(expr), Expr::Column(_))) {
-                (aggregate, Some(projection.schema.fields().iter().map(|field| field.name().to_string()).collect::<Vec<_>>()), None)
+    let (aggregate, having, output_names, outer_projection) = match aggregate_with_having(plan) {
+        Some((aggregate, having)) => (aggregate, having, None, None),
+        None => {
+            let LogicalPlan::Projection(projection) = plan else { return decline(plan) };
+            let Some((aggregate, having)) = aggregate_with_having(&projection.input) else { return decline(plan) };
+            // A HAVING between the two breaks the positional projection-to-
+            // aggregate name mapping, so keep the aggregate's own schema names
+            // — the filter references those — and re-apply the projection above
+            // the rewrite rather than absorbing it into the SELECT aliases.
+            if having.is_none() && projection.expr.iter().all(|expr| matches!(unaliased(expr), Expr::Column(_))) {
+                (aggregate, None, Some(projection.schema.fields().iter().map(|field| field.name().to_string()).collect::<Vec<_>>()), None)
             } else {
-                (aggregate, None, Some(projection.clone()))
+                (aggregate, having, None, Some(projection.clone()))
             }
         }
-        _ => return Ok(None),
     };
     let mut predicates = Vec::new();
     let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(None) };
@@ -595,7 +660,8 @@ pub(crate) async fn match_aggregate(
         hi,
         grain,
         target: spec.table_name(&schema.table_name),
-        outer_projection,
+        outer_projection: outer_projection.map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>()).transpose()?,
+        having: having.map(unqualified).transpose()?,
         wrappers,
         row_filters,
         select: select.join(", "),
@@ -690,7 +756,7 @@ mod tests {
         let rewritten = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
         let projection = route.outer_projection.expect("scalar projection");
         let rewritten = datafusion::logical_expr::LogicalPlan::Projection(
-            datafusion::logical_expr::logical_plan::Projection::try_new(projection.expr, Arc::new(rewritten)).expect("reapply projection"),
+            datafusion::logical_expr::logical_plan::Projection::try_new(projection, Arc::new(rewritten)).expect("reapply projection"),
         );
         assert_eq!(rewritten.schema(), plan.schema());
     }
@@ -739,6 +805,44 @@ mod tests {
         let datafusion::logical_expr::LogicalPlan::Sort(sort) = &rewrapped else { panic!("the peeled ORDER BY must be back on top: {rewrapped:?}") };
         assert_eq!(sort.fetch, Some(10), "the LIMIT folded into the Sort must survive too");
         rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// `HAVING` plans to a `Filter` between the aggregate and the projection,
+    /// which used to abort routing. It must be re-applied above the rewrite —
+    /// dropping it would return the rows the query asked to exclude.
+    #[tokio::test]
+    async fn a_having_clause_is_reapplied_above_the_rewrite() {
+        let state = session().await;
+        let sql = format!("SELECT kind, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1 HAVING COUNT(*) > 0");
+        let original = optimized(&state, &sql).await;
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let having = route.having.clone().expect("the HAVING predicate must be carried, not dropped");
+        let plan = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
+        let filtered =
+            datafusion::logical_expr::LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(having, Arc::new(plan)).expect("reapply having"));
+        let rebuilt = match route.outer_projection {
+            Some(projection) => datafusion::logical_expr::LogicalPlan::Projection(
+                datafusion::logical_expr::logical_plan::Projection::try_new(projection, Arc::new(filtered)).expect("reapply projection"),
+            ),
+            None => filtered,
+        };
+        rebuilt.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// A shape gap over a rollup-declaring source must reach `rollup_miss`;
+    /// a plan that simply is not our business must stay uncounted, or every
+    /// ordinary SELECT would pollute the counter.
+    #[tokio::test]
+    async fn an_unsupported_shape_is_counted_but_an_unrelated_query_is_not() {
+        let state = session().await;
+        let union = format!(
+            "SELECT kind, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1 \
+             UNION ALL SELECT kind, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'other' AND {WINDOW} GROUP BY 1"
+        );
+        let unsupported = route_for(&state, &union).await;
+        assert_eq!(unsupported.err(), Some(MissReason::UnsupportedShape), "a rollup source we cannot rewrite must be visible");
+        let unrelated = route_for(&state, &format!("SELECT kind FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await;
+        assert!(matches!(unrelated, Ok(None)), "a non-aggregate query must not be counted as a miss: {unrelated:?}");
     }
 
     /// An `avg` over two Int64 measures divides as integers; the CASE's DOUBLE

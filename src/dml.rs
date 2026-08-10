@@ -146,13 +146,20 @@ impl QueryPlanner for DmlQueryPlanner {
             return Ok(exec);
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
-            Ok(Some(crate::database::RollupRewrite { sql, grain, outer_projection, wrappers, ticket })) => {
+            Ok(Some(crate::database::RollupRewrite { sql, grain, outer_projection, having, wrappers, ticket })) => {
                 let rewritten = async {
                     let plan = session_state.create_logical_plan(&sql).await?;
+                    // HAVING first: it sits directly above the aggregate and
+                    // references its output names. A predicate naming a
+                    // *qualified* group-by column will not resolve against the
+                    // rollup's unqualified output — that errors here and is
+                    // recorded as a miss, which is the safe direction.
+                    let plan = match having {
+                        Some(predicate) => LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(predicate, Arc::new(plan))?),
+                        None => plan,
+                    };
                     let plan = match outer_projection {
-                        Some(projection) => {
-                            LogicalPlan::Projection(datafusion::logical_expr::logical_plan::Projection::try_new(projection.expr, Arc::new(plan))?)
-                        }
+                        Some(expr) => LogicalPlan::Projection(datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan))?),
                         None => plan,
                     };
                     session_state.optimize(&crate::rollup::PlanWrapper::rewrap(wrappers, plan))

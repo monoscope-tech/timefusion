@@ -341,7 +341,8 @@ pub(crate) struct RollupReadTicket(Vec<(RollupCoverageKey, u64, u64, String)>);
 pub(crate) struct RollupRewrite {
     pub sql: String,
     pub grain: String,
-    pub outer_projection: Option<datafusion::logical_expr::logical_plan::Projection>,
+    pub outer_projection: Option<Vec<datafusion::logical_expr::Expr>>,
+    pub having: Option<datafusion::logical_expr::Expr>,
     pub wrappers: Vec<crate::rollup::PlanWrapper>,
     pub ticket: RollupReadTicket,
 }
@@ -2858,6 +2859,7 @@ impl Database {
             sql: route.sql(&generations),
             grain: format!("{}us", route.grain),
             outer_projection: route.outer_projection,
+            having: route.having,
             wrappers: route.wrappers,
             ticket: RollupReadTicket(ticket),
         }))
