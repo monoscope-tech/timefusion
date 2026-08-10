@@ -285,6 +285,12 @@ impl StatsTableProvider {
         // footer repair; see read_dedup::Bound::advance.
         let read_dedup = rows![@atomic "read_dedup";
             "ordering_violations_total" => crate::read_dedup::ORDERING_VIOLATIONS,
+            // Per-leg attribution, populated only while
+            // TIMEFUSION_ORDERING_PROBE=true. All zero with a nonzero total
+            // just means the probe is off — not that no leg is at fault.
+            "ordering_violations_mem" => crate::read_dedup::ORDERING_VIOLATIONS_MEM,
+            "ordering_violations_hot" => crate::read_dedup::ORDERING_VIOLATIONS_HOT,
+            "ordering_violations_delta" => crate::read_dedup::ORDERING_VIOLATIONS_DELTA,
         ];
 
         let m = crate::metrics::maintenance_stats();

@@ -13779,7 +13779,19 @@ impl TableProvider for ProjectRoutingTable {
 
         let scan_state = parking_lot::Mutex::new(ScanShape::default());
         // Legs of the mem ∪ hot ∪ delta union, in recency order.
-        let wrap_result = |legs: Vec<Arc<dyn ExecutionPlan>>, leg_sortable: Vec<bool>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        // (plan, leg) pairs rather than a plan vec plus a parallel sortable
+        // mask: the mask has to stay index-aligned with a list built by
+        // flattening three Options, and `LegKind::sortable()` derives the same
+        // bit from the identity that can't drift out of step with it.
+        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, crate::read_dedup::LegKind)>| -> DFResult<Arc<dyn ExecutionPlan>> {
+            let leg_sortable: Vec<bool> = legs.iter().map(|(_, k)| k.sortable()).collect();
+            let legs: Vec<Arc<dyn ExecutionPlan>> = legs
+                .into_iter()
+                .map(|(plan, kind)| match crate::read_dedup::ordering_probe_enabled() {
+                    true => Arc::new(crate::read_dedup::OrderingProbeExec::new(plan, kind)) as Arc<dyn ExecutionPlan>,
+                    false => plan,
+                })
+                .collect();
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
@@ -13913,7 +13925,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![plan], vec![false]);
+            return wrap_result(vec![(plan, crate::read_dedup::LegKind::Delta)]);
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -14022,7 +14034,7 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
-            return wrap_result(vec![plan], vec![false]);
+            return wrap_result(vec![(plan, crate::read_dedup::LegKind::Delta)]);
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
@@ -14039,7 +14051,7 @@ impl TableProvider for ProjectRoutingTable {
         if let Some(mem_plan) = mem_plan.clone().filter(|_| skip_delta) {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(vec![mem_plan], vec![true]);
+            return wrap_result(vec![(mem_plan, crate::read_dedup::LegKind::Mem)]);
         }
 
         // Build Delta filters with per-bucket exclusion.
@@ -14131,10 +14143,18 @@ impl TableProvider for ProjectRoutingTable {
                 Some(Arc::new(crate::hot_tier::HotLegPooledExec::new(exec, hot_bytes)) as Arc<dyn ExecutionPlan>)
             }
         };
-        // Sortable mask tracks the flatten: in-memory legs true, Delta false.
-        let leg_sortable: Vec<bool> = [mem_plan.as_ref().map(|_| true), hot_plan.as_ref().map(|_| true), Some(false)].into_iter().flatten().collect();
-        let legs: Vec<Arc<dyn ExecutionPlan>> = [mem_plan, hot_plan, Some(delta_plan)].into_iter().flatten().collect();
-        wrap_result(legs, leg_sortable)
+        // Identity travels WITH the plan, so the flatten cannot desynchronise it
+        // from the sortability it implies (see `wrap_result`).
+        use crate::read_dedup::LegKind;
+        let legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> = [
+            mem_plan.map(|p| (p, LegKind::Mem)),
+            hot_plan.map(|p| (p, LegKind::Hot)),
+            Some((delta_plan, LegKind::Delta)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        wrap_result(legs)
     }
 
     fn statistics(&self) -> Option<Statistics> {

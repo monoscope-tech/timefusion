@@ -151,6 +151,21 @@ impl Bound {
     /// Move to row value `t`, returning true when doing so *closed* a previous
     /// run (state built for the old run may then be dropped). A run opens on the
     /// first row ever, or on a value strictly past `last` in the sort direction.
+    /// `advance`'s comparison, attributed to a leg instead of the global
+    /// counter. Kept beside it deliberately: two copies of this predicate that
+    /// could disagree is exactly how a diagnostic ends up exonerating the
+    /// guilty party.
+    fn advance_counting(&mut self, t: i64, leg: LegKind) {
+        if let Some(l) = self.last
+            && if self.desc { t > l } else { t < l }
+        {
+            leg.counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.last.is_none_or(|l| if self.desc { t < l } else { t > l }) {
+            self.last = Some(t);
+        }
+    }
+
     fn advance(&mut self, t: i64) -> bool {
         // A value moving AGAINST the declared direction proves this scan's
         // advertised ordering is false — a parquet footer's `sorting_columns` is
@@ -165,6 +180,150 @@ impl Bound {
         }
         self.last.is_none_or(|l| if self.desc { t < l } else { t > l }) && self.last.replace(t).is_some()
     }
+}
+
+/// Which union leg a row came from. Also carries the sortability the plan
+/// builder needs, so the two can no longer drift apart in parallel vectors —
+/// the Delta leg is the one that must never be sorted at read time (an UPDATE
+/// writes a row's ORIGINAL timestamp into a NEW file, so its files overlap and
+/// the blocking sort that "fixes" that exhausted the query pool, prod
+/// 2026-08-02).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegKind {
+    Mem,
+    Hot,
+    Delta,
+}
+
+impl LegKind {
+    pub fn sortable(self) -> bool {
+        !matches!(self, LegKind::Delta)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LegKind::Mem => "mem",
+            LegKind::Hot => "hot",
+            LegKind::Delta => "delta",
+        }
+    }
+
+    fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
+        match self {
+            LegKind::Mem => &ORDERING_VIOLATIONS_MEM,
+            LegKind::Hot => &ORDERING_VIOLATIONS_HOT,
+            LegKind::Delta => &ORDERING_VIOLATIONS_DELTA,
+        }
+    }
+}
+
+pub(crate) static ORDERING_VIOLATIONS_MEM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static ORDERING_VIOLATIONS_HOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static ORDERING_VIOLATIONS_DELTA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn ordering_violations_by_leg() -> [(&'static str, u64); 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (LegKind::Mem.label(), ORDERING_VIOLATIONS_MEM.load(Relaxed)),
+        (LegKind::Hot.label(), ORDERING_VIOLATIONS_HOT.load(Relaxed)),
+        (LegKind::Delta.label(), ORDERING_VIOLATIONS_DELTA.load(Relaxed)),
+    ]
+}
+
+/// Diagnostic wrapper that answers "which leg's declared ordering is false?".
+///
+/// `ORDERING_VIOLATIONS` is counted inside `DedupExec`, which is single-partition
+/// and sits above the mem ∪ hot ∪ delta union — so by the time a violation is
+/// seen the row's leg is gone, and the plan algebra alone cannot say which leg
+/// lied (I tried; every leg looks honest on paper because a leg that declares
+/// nothing stops the union from declaring either). This checks each leg against
+/// its OWN declared ordering, so a nonzero counter names the culprit directly.
+///
+/// OFF by default (`TIMEFUSION_ORDERING_PROBE`): it costs one i64 compare per
+/// row per leg, which is the same order as the bound check it duplicates. Turn
+/// it on when `ordering_violations_total` is nonzero and you need attribution.
+pub struct OrderingProbeExec {
+    inner: Arc<dyn ExecutionPlan>,
+    leg: LegKind,
+}
+
+impl OrderingProbeExec {
+    pub fn new(inner: Arc<dyn ExecutionPlan>, leg: LegKind) -> Self {
+        Self { inner, leg }
+    }
+}
+
+impl std::fmt::Debug for OrderingProbeExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "OrderingProbeExec: leg={}", self.leg.label())
+    }
+}
+
+impl DisplayAs for OrderingProbeExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "OrderingProbeExec: leg={}", self.leg.label())
+    }
+}
+
+impl ExecutionPlan for OrderingProbeExec {
+    fn name(&self) -> &'static str {
+        "OrderingProbeExec"
+    }
+
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(self: Arc<Self>, mut children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(children.swap_remove(0), self.leg)))
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<datafusion::common::Statistics>> {
+        self.inner.partition_statistics(partition)
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        use futures::StreamExt;
+        let stream = self.inner.execute(partition, context)?;
+        let schema = stream.schema();
+        // The leg's OWN claim — not the union's. `None` means this leg declares
+        // nothing, and a leg that promises nothing cannot break a promise.
+        let Some(mut bound) = detect_bound(&self.inner, &[], &schema, true).or_else(|| leading_bound(&self.inner, &schema)) else {
+            return Ok(stream);
+        };
+        let leg = self.leg;
+        let out = stream.map(move |batch| {
+            let batch = batch?;
+            if let Some(col) = batch.column(bound.idx).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>() {
+                for i in 0..col.len() {
+                    if col.is_valid(i) {
+                        bound.advance_counting(col.value(i), leg);
+                    }
+                }
+            } else if let Some(col) = batch.column(bound.idx).as_any().downcast_ref::<arrow::array::Int64Array>() {
+                for i in 0..col.len() {
+                    if col.is_valid(i) {
+                        bound.advance_counting(col.value(i), leg);
+                    }
+                }
+            }
+            Ok(batch)
+        });
+        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, out)))
+    }
+}
+
+/// The leg's leading sort column as a `Bound`, ignoring whether it is a dedup
+/// key — the probe cares only about "did this leg honour what it declared".
+fn leading_bound(input: &Arc<dyn ExecutionPlan>, in_schema: &SchemaRef) -> Option<Bound> {
+    let se = input.properties().output_ordering()?.iter().next()?;
+    let col = sort_col(se)?;
+    matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))
+        .then(|| Bound { idx: col.index(), desc: se.options.descending, last: None })
 }
 
 /// Rows observed out of the order their scan declared. See `Bound::advance`.
@@ -208,6 +367,16 @@ fn sort_col(se: &datafusion::physical_expr::PhysicalSortExpr) -> Option<&datafus
 /// A "top 100" log-explorer query would scan the whole window. Reach for it only
 /// if a bounded scan is proven to be serving wrong rows again.
 static BOUNDED_DEDUP_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+static ORDERING_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Per-leg ordering attribution (`OrderingProbeExec`). OFF unless
+/// `TIMEFUSION_ORDERING_PROBE=true`: it costs an i64 compare per row per leg,
+/// and it answers a question you only ask when `ordering_violations_total` is
+/// already nonzero.
+pub fn ordering_probe_enabled() -> bool {
+    *ORDERING_PROBE.get_or_init(|| std::env::var("TIMEFUSION_ORDERING_PROBE").is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1"))
+}
 
 pub fn bounded_dedup_enabled() -> bool {
     *BOUNDED_DEDUP_ENABLED.get_or_init(|| true)
@@ -1451,5 +1620,125 @@ mod tests {
         assert_eq!(g.best.len(), 2, "only the open run's keys are held");
         assert_eq!(g.batches.len(), 1, "only the open run's batches are held");
         assert!(d.seen.is_empty(), "seen only holds overflow-flushed keys");
+    }
+}
+
+#[cfg(test)]
+mod ordering_probe_tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::TimestampMicrosecondArray,
+        datatypes::{DataType, Field, Schema, TimeUnit},
+        record_batch::RecordBatch,
+    };
+    use datafusion::{
+        physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column},
+        physical_plan::{
+            ExecutionPlan, Partitioning, PlanProperties,
+            execution_plan::{Boundedness, EmissionType},
+        },
+        prelude::SessionContext,
+    };
+    use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+    use futures::StreamExt;
+
+    use super::{LegKind, OrderingProbeExec, ordering_violations_by_leg};
+
+    /// A leg whose declared ordering is a LIE: it claims timestamp DESC and
+    /// then hands back ascending rows. This is the shape the probe exists to
+    /// catch — `DedupExec` counts the violation globally, but it sits above the
+    /// union and cannot say WHICH leg produced it.
+    fn lying_desc_leg(values: Vec<i64>) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(TimestampMicrosecondArray::from(values))]).unwrap();
+        let src = MemorySourceConfig::try_new(&[vec![batch]], schema.clone(), None).unwrap();
+        let exec = Arc::new(DataSourceExec::new(Arc::new(src))) as Arc<dyn ExecutionPlan>;
+        // Declare DESC regardless of the data — exactly what a stale/false
+        // parquet footer does to a Delta scan.
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(Column::new("timestamp", 0))).desc()]).unwrap();
+        let props = PlanProperties::new(
+            EquivalenceProperties::new_with_orderings(schema, [ordering]),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Arc::new(LyingOrder { inner: exec, props: Arc::new(props) })
+    }
+
+    #[derive(Debug)]
+    struct LyingOrder {
+        inner: Arc<dyn ExecutionPlan>,
+        props: Arc<PlanProperties>,
+    }
+    impl datafusion::physical_plan::DisplayAs for LyingOrder {
+        fn fmt_as(&self, _t: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "LyingOrder")
+        }
+    }
+    impl ExecutionPlan for LyingOrder {
+        fn name(&self) -> &'static str {
+            "LyingOrder"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.props
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self, p: usize, c: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::common::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+            self.inner.execute(p, c)
+        }
+    }
+
+    async fn drain(plan: Arc<dyn ExecutionPlan>) {
+        let ctx = SessionContext::new();
+        let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
+        while let Some(b) = s.next().await {
+            b.unwrap();
+        }
+    }
+
+    /// The probe must name the leg that lied, and leave the innocent legs at
+    /// zero — a diagnostic that blames everyone is no better than the global
+    /// counter it is meant to disambiguate.
+    #[tokio::test]
+    async fn the_probe_names_the_leg_whose_declared_order_is_false() {
+        let before = ordering_violations_by_leg();
+        // Ascending rows behind a DESC claim: every step after the first is a violation.
+        drain(Arc::new(OrderingProbeExec::new(lying_desc_leg(vec![1, 2, 3, 4]), LegKind::Delta))).await;
+        let after = ordering_violations_by_leg();
+        let delta = |k: &str| {
+            let g = |v: &[(&'static str, u64); 3]| v.iter().find(|(n, _)| *n == k).unwrap().1;
+            g(&after) - g(&before)
+        };
+        assert!(delta("delta") >= 3, "the lying delta leg must be attributed, got {}", delta("delta"));
+        assert_eq!(delta("mem"), 0, "an innocent leg must not be blamed");
+        assert_eq!(delta("hot"), 0, "an innocent leg must not be blamed");
+    }
+
+    /// A leg that honours its claim must be silent, or the counter is noise.
+    #[tokio::test]
+    async fn an_honest_leg_reports_nothing() {
+        let before = ordering_violations_by_leg();
+        drain(Arc::new(OrderingProbeExec::new(lying_desc_leg(vec![9, 8, 7, 6]), LegKind::Mem))).await;
+        let after = ordering_violations_by_leg();
+        let g = |v: &[(&'static str, u64); 3]| v.iter().find(|(n, _)| *n == "mem").unwrap().1;
+        assert_eq!(g(&after) - g(&before), 0, "descending rows honour a DESC claim — nothing to report");
+    }
+
+    /// `LegKind::sortable()` is what replaced the parallel `leg_sortable` mask.
+    /// The Delta leg must never be sortable: an UPDATE writes a row's ORIGINAL
+    /// timestamp into a NEW file, so its files overlap, and the blocking sort
+    /// that "fixes" that exhausted the query pool (prod 2026-08-02).
+    #[test]
+    fn only_the_in_memory_legs_are_sortable() {
+        assert!(LegKind::Mem.sortable() && LegKind::Hot.sortable());
+        assert!(!LegKind::Delta.sortable(), "sorting the Delta leg at read time is the 2026-08-02 pool exhaustion");
     }
 }
