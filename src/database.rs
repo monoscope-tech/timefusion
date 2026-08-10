@@ -2201,26 +2201,42 @@ impl Database {
 
     /// WriterProperties for the DML rewrite paths (`dml::perform_delta_{merge_update,
     /// update,delete}`, used by monoscope's `UPDATE`/`DELETE`/`UPDATE ... FROM` +
-    /// the dml_coalescer). Standard zstd tier; `declare_sorted=false` because these
-    /// rewrite/reorder matched rows (no global sort). Without passing this, delta-rs's
-    /// Merge/Update/Delete builders fall back to their SNAPPY default, leaving
-    /// `.snappy.parquet` files that inflate storage/scan bytes and force the daily
-    /// recompress to rewrite them to zstd.
-    pub(crate) fn dml_writer_properties(&self, table_name: &str) -> WriterProperties {
+    /// the dml_coalescer). Without passing this, delta-rs's Merge/Update/Delete
+    /// builders fall back to their SNAPPY default, leaving `.snappy.parquet`
+    /// files that inflate storage/scan bytes and force the daily recompress to
+    /// rewrite them to zstd.
+    ///
+    /// `sorted` MUST describe what the caller's plan actually does, because the
+    /// footer is believed, not verified:
+    ///
+    /// * **`true` — the DV-merge path only.** `perform_delta_merge_update` sets
+    ///   `MergeDvUpdate::append_sort_by` (fork rev 94f9cfe4), so its appended
+    ///   rows really are written in the schema's sort order. Before that sort
+    ///   existed the appended file carried the join's row order, and ONE such
+    ///   file disabled the reader's all-or-nothing footer ordering for the whole
+    ///   partition — how a continuously-enriched table lost its top-N pushdown
+    ///   permanently (prod 2026-08-01: a 1-row DML file among 24 sorted ones).
+    ///   Load-bearing pair: if that sort is ever removed, this must go back to
+    ///   `false`.
+    /// * **`false` — `UpdateBuilder` / `DeleteBuilder`.** Their plan is
+    ///   scan -> filter -> project -> `write_execution_plan`, with no sort
+    ///   anywhere, and the writer coalesces the stream into files by
+    ///   `target_file_size` — so the output is in SCAN order. Declaring the
+    ///   schema's sort order over it is a footer that LIES, which is strictly
+    ///   worse than declaring nothing: a missing footer only costs the ordering
+    ///   claim, while a false one makes `DedupExec`'s bounded mode advance its
+    ///   bound over rows that are not ordered (`read_dedup::Bound::advance`
+    ///   counts each violation).
+    ///
+    /// Today the prod tables reach the sorted path only because
+    /// `otel_logs_and_spans` / `otel_metrics` / `mor_versioned` set
+    /// `version_append`, which routes UPDATE/DELETE to `perform_version_append`
+    /// instead. That is an accident of configuration, not a guarantee: MOR has
+    /// been switched off on otel before (2026-08-02), and a single flag flip
+    /// would have pointed the busiest table in the system at the lying branch.
+    pub(crate) fn dml_writer_properties(&self, table_name: &str, sorted: bool) -> WriterProperties {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // `declare_sorted=true` is HONEST here only because the DV-merge path
-        // now sorts its appended rows by these same keys before writing
-        // (`MergeDvUpdate::append_sort_by`, fork rev 94f9cfe4). Before that the
-        // appended file carried the join's row order and had to declare
-        // nothing — and ONE such file disabled the reader's all-or-nothing
-        // footer ordering for the whole partition, which is how a
-        // continuously-enriched table lost its top-N pushdown permanently
-        // (measured prod 2026-08-01: a 1-row DML file among 24 sorted ones).
-        //
-        // Load-bearing pair: if the sort is ever removed from the append path,
-        // this must go back to `false` or the footer starts lying and the
-        // reader will merge on an order the file does not have.
-        self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, true)
+        self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted)
     }
 
     /// Updates a DeltaTable and handles errors consistently
@@ -16576,6 +16592,39 @@ mod tests {
         assert!(guard.try_lock().is_err(), "a second repair pass must stand down while one holds the guard");
         drop(held);
         assert!(guard.try_lock().is_ok(), "the guard must release when the pass finishes, or repair stops forever");
+    }
+
+    /// The DML footer declaration must track the path that actually sorts.
+    ///
+    /// `dml_writer_properties` used to pass `declare_sorted=true`
+    /// unconditionally, but only `perform_delta_merge_update` sorts (it sets
+    /// `MergeDvUpdate::append_sort_by`). `UpdateBuilder`/`DeleteBuilder` are
+    /// scan -> filter -> project -> write with no sort at all, so their files
+    /// carried a footer claiming the schema's order over rows in SCAN order.
+    ///
+    /// A LYING footer is worse than a missing one: a missing footer only costs
+    /// the ordering claim, while a false one makes `DedupExec`'s bounded mode
+    /// advance its bound over unordered rows (every such row is counted by
+    /// `read_dedup::Bound::advance`). Prod reached the sorted path only because
+    /// the busy tables set `version_append` and route elsewhere — an accident
+    /// of config that a single flag flip would have undone.
+    #[tokio::test]
+    async fn dml_declares_a_sorted_footer_only_on_the_path_that_sorts() -> Result<()> {
+        let db = Database::with_config(create_test_config("dml-footer-honesty")).await?;
+        let schema = get_schema("otel_logs_and_spans").expect("registered");
+        assert!(!schema.sorting_columns.is_empty(), "fixture needs a table with sort keys or this asserts nothing");
+
+        // The merge/DV path sorts its appended rows, so it may declare them.
+        let sorted = db.dml_writer_properties("otel_logs_and_spans", true);
+        assert!(sorted.sorting_columns().is_some_and(|c| !c.is_empty()), "the DV-merge path sorts (append_sort_by) and must declare its footer");
+
+        // Update/Delete do not sort. Their footer must claim nothing.
+        let unsorted = db.dml_writer_properties("otel_logs_and_spans", false);
+        assert!(
+            unsorted.sorting_columns().is_none_or(|c| c.is_empty()),
+            "UpdateBuilder/DeleteBuilder write in SCAN order — declaring the schema's sort order is a footer that lies"
+        );
+        Ok(())
     }
 
     async fn setup_test_database() -> Result<(Database, SessionContext, String)> {

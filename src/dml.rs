@@ -1042,7 +1042,7 @@ pub async fn perform_delta_update(
     let span = tracing::Span::current();
     // Clone captures per attempt: the operation may rerun after an OCC conflict.
     // zstd tier for the rewrite: without it the UpdateBuilder writes SNAPPY.
-    let writer_properties = database.dml_writer_properties(table_name);
+    let writer_properties = database.dml_writer_properties(table_name, false);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
     perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
@@ -1082,7 +1082,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 
     let span = tracing::Span::current();
     // zstd tier for the rewrite: without it the DeleteBuilder writes SNAPPY.
-    let writer_properties = database.dml_writer_properties(table_name);
+    let writer_properties = database.dml_writer_properties(table_name, false);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
     perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, session) = (predicate.clone(), session.clone());
@@ -1292,7 +1292,7 @@ pub async fn perform_delta_merge_update(
         .collect::<Result<Vec<_>>>()?;
 
     // Our zstd tier for the rewrite: without it the MergeBuilder writes SNAPPY.
-    let writer_properties = database.dml_writer_properties(table_name);
+    let writer_properties = database.dml_writer_properties(table_name, true);
     let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
 
     perform_delta_operation(database, table_name, project_id, |delta_table| {
