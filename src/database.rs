@@ -9207,8 +9207,8 @@ impl Database {
     /// 8640s budget untouched. Raising the wave cap did nothing, because the
     /// pass was ending on an EMPTY PLAN, not on waves or time.
     async fn reselect_until_real_work(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, today_str: &str,
-        policy: &HotBinPolicy<'_>, mut planned: Vec<(String, Vec<String>)>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
+        mut planned: Vec<(String, Vec<String>)>,
     ) -> Result<Vec<(String, Vec<String>)>> {
         for _ in 0..REPAIR_RESELECT_ROUNDS {
             let before = planned.len();
