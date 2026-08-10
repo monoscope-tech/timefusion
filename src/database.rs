@@ -4790,7 +4790,12 @@ impl Database {
         self.repair_session_states
             .entry(partitions)
             .or_insert_with(|| {
-                build_optimize_session_state_tuned(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env(), Some("256"), Some(partitions))
+                build_optimize_session_state_tuned(
+                    self.config.memory.timefusion_query_partitions,
+                    self.light_optimize_runtime_env(),
+                    Some("256"),
+                    Some(partitions),
+                )
             })
             .clone()
     }
@@ -9258,7 +9263,14 @@ impl Database {
                         );
                     }
                     if let Some(partitions) = retry_at {
-                        info!(table_name, project_id, path, partitions, event = "footer_repair_parallelism_degraded", "pool exhausted — retrying this bin at {partitions} sort partitions before believing it");
+                        info!(
+                            table_name,
+                            project_id,
+                            path,
+                            partitions,
+                            event = "footer_repair_parallelism_degraded",
+                            "pool exhausted — retrying this bin at {partitions} sort partitions before believing it"
+                        );
                     }
                 }
             }

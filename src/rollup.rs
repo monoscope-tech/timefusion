@@ -178,13 +178,16 @@ pub fn build_partition_sql(project_id: &str, date: &str) -> String {
 /// adds the identity columns the table needs — a deterministic `id` (so a
 /// rebuild replaces rather than doubles), the partition `date`, and the
 /// `updated_at`/`deleted` pair every table here carries.
-pub fn to_rollup_batches(project_id: &str, date: &str, aggregated: &[arrow::record_batch::RecordBatch]) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
+pub fn to_rollup_batches(
+    project_id: &str, date: &str, aggregated: &[arrow::record_batch::RecordBatch],
+) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
     use arrow::array::{Array, ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use std::sync::Arc;
 
     let schema = crate::schema_loader::get_schema(ROLLUP_TABLE).ok_or_else(|| anyhow::anyhow!("{ROLLUP_TABLE} schema missing"))?.schema_ref();
     // Days since epoch; the partition column is what routes reads to this date.
-    let date_days = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
+    let date_days =
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
     let now = crate::clock::now_micros();
 
     let text = |b: &arrow::record_batch::RecordBatch, name: &str| -> Option<Vec<Option<String>>> {
@@ -209,7 +212,13 @@ pub fn to_rollup_batches(project_id: &str, date: &str, aggregated: &[arrow::reco
             .schema()
             .index_of("timestamp")
             .ok()
-            .and_then(|i| arrow::compute::kernels::cast::cast(b.column(i), &arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))).ok())
+            .and_then(|i| {
+                arrow::compute::kernels::cast::cast(
+                    b.column(i),
+                    &arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                )
+                .ok()
+            })
             .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>().cloned())
             .map_or_else(|| vec![0; n], |c| (0..c.len()).map(|i| c.value(i)).collect());
         let dims: Vec<Vec<Option<String>>> = DIMENSIONS.iter().map(|d| text(b, d).unwrap_or_else(|| vec![None; n])).collect();
@@ -312,7 +321,11 @@ mod tests {
     #[test]
     fn a_rebuilt_bucket_keeps_its_identity_and_distinct_dimensions_do_not_collide() {
         let b = bucket_start(1_786_000_123_456_789);
-        assert_eq!(bucket_id(b, &[Some("api"), Some("server")]), bucket_id(b, &[Some("api"), Some("server")]), "a rebuild must collide with the row it replaces");
+        assert_eq!(
+            bucket_id(b, &[Some("api"), Some("server")]),
+            bucket_id(b, &[Some("api"), Some("server")]),
+            "a rebuild must collide with the row it replaces"
+        );
         assert_ne!(bucket_id(b, &[Some("api"), Some("server")]), bucket_id(b, &[Some("api"), Some("client")]), "different dimensions are different rows");
         assert_ne!(bucket_id(b, &[Some("api"), None]), bucket_id(b, &[Some("api")]), "arity must be part of the identity");
         assert_ne!(bucket_id(b, &[Some("api")]), bucket_id(b + GRAIN_MICROS, &[Some("api")]), "different buckets are different rows");
