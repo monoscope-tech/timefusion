@@ -45,6 +45,17 @@ pub struct RollupSpec {
     /// out — which is the part a rollup design usually gets wrong.
     pub dimensions: Vec<String>,
     pub measures: Vec<RollupMeasure>,
+    /// Build this rollup from ANOTHER rollup on the same source rather than from
+    /// raw rows, naming that spec's `name`.
+    ///
+    /// A coarse tier is what makes a 30-day window cheap, but computing it from
+    /// raw means a second full scan of every partition — on the big table that
+    /// doubles the cost of every certification. Re-aggregating the fine tier
+    /// instead reads a table that is already orders of magnitude smaller, and it
+    /// is exact: every measure here is associative, so folding 1m states into 1h
+    /// states gives the same answer as folding raw rows straight to 1h.
+    #[serde(default)]
+    pub derive_from: Option<String>,
 }
 
 /// One stored measure. Only DECOMPOSABLE aggregates are expressible: count/sum/
@@ -109,6 +120,39 @@ impl RollupSpec {
             );
         }
         anyhow::ensure!(!self.measures.is_empty(), "rollup {}: needs at least one measure", self.table_name(&source.table_name));
+        if let Some(base) = &self.derive_from {
+            let target = self.table_name(&source.table_name);
+            let base_spec = source
+                .rollups
+                .iter()
+                .find(|spec| spec.name.as_deref() == Some(base.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("rollup {target}: `derive_from: {base}` names no rollup on this table"))?;
+            anyhow::ensure!(base_spec.derive_from.is_none(), "rollup {target}: `derive_from` may not chain — `{base}` is itself derived");
+            let (Some(fine), Some(coarse)) = (base_spec.grain_micros(), self.grain_micros()) else {
+                anyhow::bail!("rollup {target}: cannot compare grains with `{base}`")
+            };
+            // A base bucket must fall entirely inside one of ours, or its state
+            // would have to be split across two output buckets — which no
+            // aggregate state can do.
+            anyhow::ensure!(coarse > fine && coarse % fine == 0, "rollup {target}: grain must be a whole multiple of `{base}`'s ({} vs {})", self.grain, base_spec.grain);
+            for dimension in &self.dimensions {
+                anyhow::ensure!(base_spec.dimensions.contains(dimension), "rollup {target}: dimension `{dimension}` is absent from `{base}`, so it cannot be derived from it");
+            }
+            for measure in &self.measures {
+                let base_measure = base_spec
+                    .measures
+                    .iter()
+                    .find(|candidate| candidate.name == measure.name)
+                    .ok_or_else(|| anyhow::anyhow!("rollup {target}: measure `{}` is absent from `{base}`", measure.name))?;
+                // Re-aggregating states only works if both sides mean the same
+                // thing; a `sum` folded out of a `min` is silently wrong.
+                anyhow::ensure!(
+                    base_measure.agg == measure.agg && base_measure.column == measure.column && base_measure.filter == measure.filter,
+                    "rollup {target}: measure `{}` must match `{base}`'s definition exactly to be derived from it",
+                    measure.name
+                );
+            }
+        }
         for measure in &self.measures {
             anyhow::ensure!(is_ident(&measure.name), "rollup {}: measure `{}` must be an SQL identifier", self.table_name(&source.table_name), measure.name);
             anyhow::ensure!(names.insert(&measure.name), "rollup {}: duplicate or colliding measure `{}`", self.table_name(&source.table_name), measure.name);
@@ -733,7 +777,7 @@ mod tests {
             grain: "1m".into(),
             name: Some("digest_test".into()),
             dimensions: vec!["kind".into()],
-            measures: vec![RollupMeasure { name: "digest".into(), agg: "tdigest".into(), column: Some("duration".into()), filter: None }],
+            measures: vec![RollupMeasure { name: "digest".into(), agg: "tdigest".into(), column: Some("duration".into()), filter: None }], derive_from: None,
         };
 
         let rollup = spec.synthesize(source).expect("valid rollup");
@@ -748,7 +792,7 @@ mod tests {
             grain: "1m".into(),
             name: None,
             dimensions: vec![],
-            measures: vec![RollupMeasure { name: "bad".into(), agg: "median".into(), column: Some("duration".into()), filter: None }],
+            measures: vec![RollupMeasure { name: "bad".into(), agg: "median".into(), column: Some("duration".into()), filter: None }], derive_from: None,
         };
 
         assert!(spec.validate(source).unwrap_err().to_string().contains("unsupported aggregate"));

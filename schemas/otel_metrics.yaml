@@ -131,3 +131,20 @@ rollups:
       # Percentiles over a metric are a routine ask ("p95 CPU"), and a t-digest
       # is the only percentile state that re-aggregates across buckets.
       - { name: value_digest, agg: tdigest, column: value }
+  # Coarse tier for wide windows. 1m over 30 days is ~6.6M rows per project here;
+  # at 1h it is ~110k, and the matcher picks the coarsest grain that divides the
+  # requested bucket width, so a 30-day chart reads this and a 1-minute chart
+  # still reads the tier above. Derived from that tier rather than from raw, so
+  # it costs a scan of 220k rollup rows instead of a second pass over 1.8M
+  # points — every measure here is associative, so the answer is identical.
+  - grain: 1h
+    name: metrics_1h_v1
+    derive_from: metrics_1m_v1
+    dimensions: [metric_name, resource___service___name]
+    measures:
+      - { name: point_count, agg: count }
+      - { name: value_count, agg: count, column: value }
+      - { name: value_sum, agg: sum, column: value }
+      - { name: value_min, agg: min, column: value }
+      - { name: value_max, agg: max, column: value }
+      - { name: value_digest, agg: tdigest, column: value }

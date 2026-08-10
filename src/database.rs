@@ -8040,11 +8040,20 @@ impl Database {
         let source_epoch = self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
         let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
 
-        for spec in &schema.rollups {
+        // Base specs first: a derived tier re-aggregates the finer one's rows, so
+        // it must not run before that tier has been replaced for this partition.
+        let mut specs: Vec<&crate::schema_loader::RollupSpec> = schema.rollups.iter().collect();
+        specs.sort_by_key(|spec| spec.derive_from.is_some());
+        for spec in specs {
             let target = spec.table_name(source);
             let coverage_key = (project_id.to_string(), source.to_string(), target.clone(), date.to_string());
             self.rollup_coverage.remove(&coverage_key);
-            let rows = self.query_delta_only(&crate::rollup::build_partition_sql(spec, source, project_id, date)?).await?;
+            let from = spec
+                .derive_from
+                .as_ref()
+                .and_then(|base| schema.rollups.iter().find(|candidate| candidate.name.as_deref() == Some(base.as_str())))
+                .map_or_else(|| source.to_string(), |base| base.table_name(source));
+            let rows = self.query_delta_only(&crate::rollup::build_partition_sql_from(spec, source, &from, project_id, date)?).await?;
             let generation = crate::rollup::generation_id(spec, source, project_id, date, source_fp);
             let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
             let row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();

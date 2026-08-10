@@ -84,12 +84,33 @@ pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &s
 /// Aggregate filters belong on each aggregate rather than in the row `WHERE`
 /// clause. Moving them would make unrelated measures observe the wrong rows.
 pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, date: &str) -> anyhow::Result<String> {
+    build_partition_sql_from(spec, source, source, project_id, date)
+}
+
+/// `build_partition_sql`, but reading `from` instead of the raw source.
+///
+/// When `from` is a finer rollup the measures are re-aggregated as STATES —
+/// `SUM` of counts and sums, `MIN`/`MAX` of extrema, `tdigest_merge` of digests —
+/// and each measure's declared `filter` is deliberately NOT re-applied: the base
+/// row already had it applied when it was built, and the filter's columns do not
+/// even exist on the base table.
+pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, project_id: &str, date: &str) -> anyhow::Result<String> {
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
+    let derived = from != source;
     let dimensions = spec.dimensions.join(", ");
     let measures = spec
         .measures
         .iter()
         .map(|measure| {
+            if derived {
+                let merge = match measure.agg.as_str() {
+                    "min" => "MIN",
+                    "max" => "MAX",
+                    "tdigest" => "tdigest_merge",
+                    _ => "SUM",
+                };
+                return Ok(format!("{merge}({}) AS {}", measure.name, measure.name));
+            }
             let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
                 ("count", None) => "COUNT(*)".to_string(),
                 ("count", Some(column)) => format!("COUNT({column})"),
@@ -104,6 +125,7 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
         })
         .collect::<anyhow::Result<Vec<_>>>()?
         .join(", ");
+    let source = from;
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = std::iter::once("1".to_string()).chain((2..).take(spec.dimensions.len()).map(|index| index.to_string())).collect::<Vec<_>>().join(", ");
 
@@ -494,12 +516,30 @@ fn eq_literal<'a>(expr: &'a datafusion::logical_expr::Expr, column: &str) -> Opt
         .find_map(|(name, value)| (column_name(name) == Some(column)).then(|| string_literal(value)).flatten())
 }
 
+/// A timestamp bound in microseconds, whatever precision the literal carries.
+///
+/// `now()` const-folds to a NANOSECOND literal, so accepting only microseconds
+/// silently refused every `timestamp < now()` window — which is most ad-hoc
+/// queries, and was measured missing in production while the identical window
+/// written with explicit literals routed.
+///
+/// Sub-microsecond bounds convert by rounding UP, which is exact rather than
+/// merely close: the column is microsecond-typed, so a row at `t` µs satisfies
+/// `t*1000 >= lo_ns` exactly when `t >= ceil(lo_ns/1000)`, and `t*1000 < hi_ns`
+/// exactly when `t < ceil(hi_ns/1000)`. The same ceiling therefore serves both
+/// ends; flooring either one would shift the window by up to a microsecond and
+/// silently include or drop rows.
 fn timestamp_literal(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
+    use datafusion::scalar::ScalarValue;
+    let ceil_div = |value: i64, per_micro: i64| value.checked_add(per_micro - 1).map(|v| v.div_euclid(per_micro));
     match unaliased(expr) {
-        datafusion::logical_expr::Expr::Literal(
-            datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(value), _) | datafusion::scalar::ScalarValue::Int64(Some(value)),
-            _,
-        ) => Some(*value),
+        datafusion::logical_expr::Expr::Literal(value, _) => match value {
+            ScalarValue::TimestampMicrosecond(Some(value), _) | ScalarValue::Int64(Some(value)) => Some(*value),
+            ScalarValue::TimestampNanosecond(Some(value), _) => ceil_div(*value, 1_000),
+            ScalarValue::TimestampMillisecond(Some(value), _) => value.checked_mul(1_000),
+            ScalarValue::TimestampSecond(Some(value), _) => value.checked_mul(1_000_000),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -844,6 +884,14 @@ async fn route_with_spec(
     let project_id = project_id.ok_or(MissReason::MissingProject)?;
     let (lo, hi) = lo.zip(hi).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
     let grain = spec.grain_micros().ok_or(MissReason::UnsupportedShape)?;
+    // A grain too coarse for the window can never yield a usable interior — the
+    // aligned span inside it is empty or below the cost floor. Rejecting it here
+    // rather than at interior() matters because specs are tried coarsest-first:
+    // otherwise a 1h tier would shadow the 1m tier that CAN serve a 10-minute
+    // window, and the query would miss entirely instead of routing.
+    if hi.saturating_sub(lo) < grain.saturating_mul(MIN_INTERIOR_BUCKETS) {
+        return Err(MissReason::TinyInterior);
+    }
     let configured_filters = measure_filters(session, source, spec).await?;
 
     let mut groups = Vec::new();
@@ -983,11 +1031,10 @@ mod tests {
     }
 
     const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v2";
-    const WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(120000000)";
-    /// Ten grains wide. The hybrid tests need a window that can still hold a
-    /// worthwhile interior after `MIN_INTERIOR_BUCKETS`/`MIN_INTERIOR_FRACTION`
-    /// take their cut — `WINDOW` is one grain, so it can never union.
-    const WIDE_WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(660000000)";
+    /// Ten grains wide. A window narrower than `MIN_INTERIOR_BUCKETS` grains can
+    /// never route — the aligned interior would be at most one bucket — so a
+    /// one-minute fixture would exercise the rejection path, not the matcher.
+    const WINDOW: &str = "timestamp >= to_timestamp_micros(60000000) AND timestamp < to_timestamp_micros(660000000)";
     const WIDE_HORIZON: i64 = 540_000_000;
 
     /// Register the source AND its generated rollup so a route can be planned
@@ -995,10 +1042,14 @@ mod tests {
     async fn session() -> datafusion::execution::context::SessionState {
         let mut ctx = datafusion::prelude::SessionContext::new();
         crate::functions::register_custom_functions(&mut ctx).expect("functions register");
-        for table_name in [SOURCE, TARGET] {
-            let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
+        // Every declared tier, not just the fine one: specs are tried
+        // coarsest-first, so a session missing the coarse table could not plan a
+        // rewrite the matcher legitimately chose.
+        let targets = crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.iter().map(|spec| spec.table_name(SOURCE)).collect::<Vec<_>>();
+        for table_name in std::iter::once(SOURCE.to_string()).chain(targets) {
+            let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(&table_name).expect("schema").schema_ref(), vec![vec![]])
                 .expect("empty table");
-            ctx.register_table(table_name, Arc::new(table)).expect("register table");
+            ctx.register_table(table_name.as_str(), Arc::new(table)).expect("register table");
         }
         ctx.state()
     }
@@ -1115,7 +1166,7 @@ mod tests {
     #[tokio::test]
     async fn avg_unions_as_separate_sum_and_count_states() {
         let state = session().await;
-        let route = route_for(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WIDE_WINDOW}"))
+        let route = route_for(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"))
             .await
             .expect("match")
             .expect("route");
@@ -1138,7 +1189,7 @@ mod tests {
         let filter = "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'";
         let sql = format!(
             "SELECT approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE)) FILTER (WHERE {filter})) AS p95 \
-             FROM {SOURCE} WHERE project_id = 'project' AND {WIDE_WINDOW}"
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"
         );
         let route = route_for(&state, &sql).await.expect("match").expect("route");
         let generated = hybrid_sql(&route, WIDE_HORIZON);
@@ -1160,7 +1211,7 @@ mod tests {
         let sql = format!(
             "SELECT time_bucket('10 minutes', timestamp) AS bucket, resource___service___name, COUNT(*) AS c, avg(duration) AS mean, \
                     min(duration) AS lo, max(duration) AS hi \
-             FROM {SOURCE} WHERE project_id = 'project' AND {WIDE_WINDOW} GROUP BY 1, 2 ORDER BY 1 DESC LIMIT 10"
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2 ORDER BY 1 DESC LIMIT 10"
         );
         let original = optimized(&state, &sql).await;
         let route = route_for(&state, &sql).await.expect("match").expect("route");
@@ -1190,7 +1241,7 @@ mod tests {
              FROM otel_metrics \
              WHERE project_id = 'project' \
                AND metric_name IN ('system.cpu.load_average.1m', 'system.cpu.load_average.5m', 'redis.memory.used', 'redis.memory.rss') \
-               AND {WIDE_WINDOW} \
+               AND {WINDOW} \
              GROUP BY 1, 2 ORDER BY 1 DESC"
         );
         let original = optimized(&state, &sql).await;
@@ -1215,6 +1266,50 @@ mod tests {
         );
         let rewrapped = PlanWrapper::rewrap(route.wrappers, plan);
         rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// `now()` folds to a NANOSECOND literal, so a microsecond-only matcher
+    /// refused every `timestamp < now()` window. Measured in production: the
+    /// same window written with explicit literals routed, with `now()` it missed.
+    #[test]
+    fn a_timestamp_bound_is_read_at_any_precision() {
+        use datafusion::{logical_expr::Expr, scalar::ScalarValue};
+        let literal = |value: ScalarValue| Expr::Literal(value, None);
+        assert_eq!(timestamp_literal(&literal(ScalarValue::TimestampMicrosecond(Some(1_500), None))), Some(1_500));
+        assert_eq!(timestamp_literal(&literal(ScalarValue::TimestampMillisecond(Some(2), None))), Some(2_000));
+        assert_eq!(timestamp_literal(&literal(ScalarValue::TimestampSecond(Some(3), None))), Some(3_000_000));
+        // Rounds UP, which is exact against a microsecond column: a row at 2µs
+        // satisfies `ts >= 1500ns`, a row at 1µs does not.
+        assert_eq!(timestamp_literal(&literal(ScalarValue::TimestampNanosecond(Some(1_500), None))), Some(2));
+        assert_eq!(timestamp_literal(&literal(ScalarValue::TimestampNanosecond(Some(2_000), None))), Some(2));
+        assert_eq!(timestamp_literal(&literal(ScalarValue::Utf8(Some("nope".into())))), None);
+    }
+
+    /// Coarsest-first selection must still respect the window. A 1h tier reads
+    /// 60x fewer rows for a 30-day chart, but it cannot answer a 10-minute one —
+    /// and because it is tried FIRST, letting it match would shadow the 1m tier
+    /// and turn a query that used to route into a miss.
+    #[tokio::test]
+    async fn grain_selection_prefers_the_coarsest_tier_the_window_can_use() {
+        let state = session().await;
+        let wide = format!(
+            "SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' \
+               AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(864000000000) \
+             GROUP BY time_bucket('1 hours', timestamp)"
+        );
+        assert_eq!(
+            route_for(&state, &wide).await.expect("match").expect("route").target,
+            "otel_logs_and_spans_rollup_dashboard_1h_v1",
+            "a 10-day window bucketed hourly must use the coarse tier"
+        );
+
+        // Ten minutes: the 1h tier cannot cover it, so the 1m tier must win.
+        let narrow = format!(
+            "SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' \
+               AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(600000000) \
+             GROUP BY time_bucket('5 minutes', timestamp)"
+        );
+        assert_eq!(route_for(&state, &narrow).await.expect("match").expect("route").target, TARGET, "a 10-minute window must fall back to the fine tier");
     }
 
     /// A sliver of certified interior is strictly worse than the raw plan: the

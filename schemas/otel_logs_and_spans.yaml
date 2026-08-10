@@ -339,6 +339,14 @@ fields:
   - name: resource___service___namespace
     data_type: Utf8
     nullable: true
+  # The dimension monoscope's app-wide environment selector (prod/staging/…) scopes by.
+  # Deliberately NOT a sorting column: the sort key list is load-bearing for the TopK
+  # pushdown described at the top of this file, and environment is low cardinality, so it
+  # prunes badly by sort order and well by row-group statistics, which it gets for free.
+  # Additive and nullable, so existing tables evolve into it via SchemaMode::Merge.
+  - name: resource___deployment___environment___name
+    data_type: Utf8
+    nullable: true
   - name: resource___telemetry___sdk___language
     data_type: Utf8
     nullable: true
@@ -416,3 +424,28 @@ rollups:
       - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span'" }
       - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
       - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+  # Coarse tier for wide windows. The matcher picks the coarsest grain that
+  # divides the requested bucket width, so a 30-day chart (1d/6h buckets)
+  # reads this and a 5-minute chart still reads the 1m tier. Derived from
+  # that tier, so it re-aggregates its rows instead of scanning the raw
+  # partition a second time — on this table that is the difference between
+  # a few hundred thousand rows and hundreds of millions.
+  - grain: 1h
+    name: dashboard_1h_v1
+    derive_from: dashboard_1m_v2
+    dimensions: [resource___service___name, kind, status_code]
+    measures:
+         - { name: request_count, agg: count }
+         - { name: duration_count, agg: count, column: duration }
+         - { name: error_count, agg: count, filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500" }
+         - { name: duration_sum, agg: sum, column: duration }
+         - { name: duration_min, agg: min, column: duration }
+         - { name: duration_max, agg: max, column: duration }
+         - { name: server_request_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+         - { name: server_duration_count, agg: count, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+         - { name: server_duration_sum, agg: sum, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+         - { name: server_duration_min, agg: min, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+         - { name: server_duration_max, agg: max, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+         - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span'" }
+         - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
+         - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
