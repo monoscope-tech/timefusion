@@ -21,7 +21,6 @@ pub mod mem_buffer;
 pub mod metrics;
 pub mod object_store_cache;
 pub mod optimizers;
-pub mod pg_compat;
 pub mod pgwire_early_bind;
 pub mod pgwire_handlers;
 pub mod plan_cache;
