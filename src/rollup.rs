@@ -334,6 +334,35 @@ mod tests {
         assert!(!generated.version_append);
     }
 
+    /// Two rollups at the same grain: what happens, and what to do about it.
+    ///
+    /// Same grain + SAME dimensions is the same GROUP BY, so the answer is to
+    /// add the measure to the existing rollup — a second table would duplicate
+    /// every identity and dimension column. Same grain + DIFFERENT dimensions
+    /// is a genuinely different table, and `name:` is how you distinguish it.
+    /// Both used to produce one misleading "collides with a declared schema
+    /// file" panic.
+    #[test]
+    fn a_second_rollup_at_the_same_grain_needs_a_name_only_when_it_groups_differently() {
+        use crate::schema_loader::{RollupMeasure, RollupSpec};
+        let spec = |name: Option<&str>, dims: &[&str]| RollupSpec {
+            grain: "1m".into(),
+            name: name.map(str::to_string),
+            dimensions: dims.iter().map(|d| d.to_string()).collect(),
+            measures: vec![RollupMeasure { name: "n".into(), agg: "count".into(), column: None, filter: None }],
+        };
+        // Bare grain collides...
+        assert_eq!(spec(None, &["kind"]).table_name(SOURCE_TABLE), spec(None, &["status_code"]).table_name(SOURCE_TABLE));
+        // ...and `name:` is what separates them.
+        assert_ne!(spec(Some("by_kind"), &["kind"]).table_name(SOURCE_TABLE), spec(None, &["status_code"]).table_name(SOURCE_TABLE));
+        assert_eq!(spec(Some("by_kind"), &["kind"]).table_name(SOURCE_TABLE), "otel_logs_and_spans_rollup_by_kind");
+        // A named rollup still synthesizes a valid table.
+        let src = crate::schema_loader::get_schema(SOURCE_TABLE).expect("source schema");
+        let generated = spec(Some("by_kind"), &["kind"]).synthesize(src).expect("named rollup must synthesize");
+        assert_eq!(generated.table_name, "otel_logs_and_spans_rollup_by_kind");
+        assert!(generated.fields.iter().any(|f| f.name == "kind"));
+    }
+
     /// The spec as DECLARED on the source table — tests exercise the real
     /// configuration rather than a fixture that could drift from it.
     fn declared_spec() -> crate::schema_loader::RollupSpec {

@@ -25,9 +25,20 @@ use serde::{Deserialize, Serialize};
 /// computed over a bin that is later deduped is simply wrong.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RollupSpec {
-    /// Bucket width, e.g. `1m`, `1h`, `1d`. Also the table-name suffix, so the
-    /// name can never disagree with the resolution.
+    /// Bucket width, e.g. `1m`, `1h`, `1d`. The default table-name suffix, so
+    /// the name cannot disagree with the resolution.
     pub grain: String,
+    /// Distinguishing suffix, for a SECOND rollup at the same grain.
+    ///
+    /// Needed only when two rollups share a grain but group differently:
+    /// different dimensions mean a different GROUP BY, hence a different row
+    /// set, hence a genuinely different table. If instead you want another
+    /// MEASURE at a grain you already roll up, add it to that rollup's
+    /// `measures:` — same grain and same dimensions produce the identical row
+    /// set, so a second table would duplicate every identity and dimension
+    /// column and force a query wanting both measures to read two tables.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Columns a query may GROUP BY **or FILTER on** and still be answerable.
     /// Filters constrain the design exactly as hard as group-bys — rows for a
     /// non-dimension are already summed together and cannot be subtracted back
@@ -56,9 +67,9 @@ pub struct RollupMeasure {
 }
 
 impl RollupSpec {
-    /// `{source}_rollup_{grain}` — see `rollup_table_is_named_after_its_source`.
+    /// `{source}_rollup_{name|grain}` — see `rollup_table_is_named_after_its_source`.
     pub fn table_name(&self, source: &str) -> String {
-        format!("{source}_rollup_{}", self.grain)
+        format!("{source}_rollup_{}", self.name.as_deref().unwrap_or(&self.grain))
     }
 
     /// Grain in microseconds, parsed from the suffix. `None` for an
@@ -499,6 +510,28 @@ impl SchemaRegistry {
         // Synthesize a table for every declared rollup. Generated rather than
         // hand-written so a rollup column's type cannot drift from the source
         // column it aggregates, and so adding one is a config change.
+        // Two rollups generating one name is a config error, and WHICH error it
+        // is depends on whether they group the same way — so say so, rather
+        // than making the operator infer it from a name collision.
+        for src in schemas.values() {
+            for (i, a) in src.rollups.iter().enumerate() {
+                if let Some(b) = src.rollups[i + 1..].iter().find(|b| b.table_name(&src.table_name) == a.table_name(&src.table_name)) {
+                    let name = a.table_name(&src.table_name);
+                    assert!(
+                        a.dimensions != b.dimensions,
+                        "{}: two rollups both generate `{name}` with the SAME dimensions. Same grain + same dimensions is the same GROUP BY, so \
+                         add the extra measures to the existing rollup instead of declaring a second one — a second table would duplicate every \
+                         identity and dimension column and make a query wanting both measures read two tables.",
+                        src.table_name
+                    );
+                    panic!(
+                        "{}: two rollups both generate `{name}` but group differently ({:?} vs {:?}). Different dimensions ARE different tables; \
+                         give one of them a `name:` to distinguish it.",
+                        src.table_name, a.dimensions, b.dimensions
+                    );
+                }
+            }
+        }
         let synthesized: Vec<TableSchema> = schemas
             .values()
             .flat_map(|src| src.rollups.iter().map(move |spec| (src, spec)))
@@ -509,10 +542,12 @@ impl SchemaRegistry {
             })
             .collect();
         for r in synthesized {
-            if let Some(prev) = schemas.insert(r.table_name.clone(), r) {
-                // A hand-written file colliding with a generated name would
-                // silently win or lose depending on iteration order.
-                panic!("rollup table `{}` collides with a declared schema file", prev.table_name);
+            let name = r.table_name.clone();
+            if schemas.insert(name.clone(), r).is_some() {
+                // A hand-written file under a generated name would silently win
+                // or lose depending on iteration order. (Same-source rollup
+                // collisions are already reported above, with a better message.)
+                panic!("rollup table `{name}` collides with a hand-written schema file of the same name");
             }
         }
         Self { schemas }
