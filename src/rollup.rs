@@ -623,7 +623,15 @@ async fn measure_filters<'a>(
             // into conjuncts — or the two strings can never be equal and every
             // filtered measure is dead weight.
             Some(filter) => {
-                let plan = session.create_logical_plan(&format!("SELECT * FROM {source} WHERE {filter}")).await.map_err(|_| MissReason::UnknownFilter)?;
+                // `SELECT timestamp`, never `SELECT *`: on a real session `*`
+                // expands to every column, and the Variant rewriter wraps the
+                // Variant ones in `variant_to_json(…)`. That projection is not
+                // rename-free, so `source_and_filters` refuses to walk it and
+                // EVERY filtered measure — hence every spec declaring one —
+                // failed to resolve. Unit tests could not see it: a bare
+                // `MemTable` session has no Variant rewriter registered.
+                let plan =
+                    session.create_logical_plan(&format!("SELECT timestamp FROM {source} WHERE {filter}")).await.map_err(|_| MissReason::UnknownFilter)?;
                 let plan = session.optimize(&plan).map_err(|_| MissReason::UnknownFilter)?;
                 let mut filters = Vec::new();
                 source_and_filters(&plan, &mut filters).ok_or(MissReason::UnknownFilter)?;

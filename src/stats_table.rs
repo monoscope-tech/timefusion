@@ -327,6 +327,9 @@ impl StatsTableProvider {
             "mor_delta_leg_sorts_total" => m.mor_delta_leg_sorts,
             "flush_sort_unsorted_fallbacks_total" => m.flush_sort_unsorted_fallbacks,
             "light_optimize_ticks_degraded_total" => m.light_optimize_ticks_degraded,
+            "rollup_hits_full_total" => m.rollup_hits_full,
+            "rollup_hits_hybrid_total" => m.rollup_hits_hybrid,
+            "rollup_misses_total" => m.rollup_misses_total,
             "dirty_bin_queue_depth" => m.dirty_bin_queue_depth,
             "dirty_bin_enqueued_total" => m.dirty_bin_enqueued,
             "dirty_bin_eligible_total" => m.dirty_bin_eligible,
@@ -621,6 +624,11 @@ mod tests {
             ("maintenance", "dedup_timed_out_total"),
             ("maintenance", "light_optimize_timed_out_total"),
             ("maintenance", "cron_long_running_total"),
+            // The rollout signal: hits vs misses is the only way to tell read
+            // routing is firing, and this key list is hand-maintained.
+            ("maintenance", "rollup_hits_full_total"),
+            ("maintenance", "rollup_hits_hybrid_total"),
+            ("maintenance", "rollup_misses_total"),
             ("parquet", "metadata_cache_hits"),
             ("parquet", "bytes_read"),
             ("scan", "provider_build_us_avg"),

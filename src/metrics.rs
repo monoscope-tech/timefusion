@@ -408,6 +408,8 @@ sum_recorders! {
 /// project id, which belong on the accompanying warn's span attributes).
 /// One dashboard aggregate answered from a configured rollup.
 pub fn record_rollup_hit(mode: &'static str, grain: &str) {
+    let stats = maintenance_stats();
+    if mode == "hybrid" { &stats.rollup_hits_hybrid } else { &stats.rollup_hits_full }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = METRICS.get() {
         m.rollup_hits.add(1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string())]);
     }
@@ -416,6 +418,7 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
 /// One dashboard aggregate that fell through to a raw scan. `reason` is a
 /// `MissReason::label` — a closed, bounded set, never a table or project id.
 pub fn record_rollup_miss(reason: &'static str) {
+    maintenance_stats().rollup_misses_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = METRICS.get() {
         m.rollup_misses.add(1, &[KeyValue::new("reason", reason)]);
     }
@@ -529,6 +532,17 @@ atomic_stats! {
     /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
     /// outrunning flush often enough that compaction is running at the floor.
     light_optimize_ticks_degraded,
+    /// Dashboard aggregates served from a rollup, split by how much of the
+    /// window the rollup owned. The OTel counters carry the same numbers but
+    /// cannot be read back in-process, and these two are the only signal that
+    /// says whether read routing is actually firing — `rollup_hits_hybrid`
+    /// specifically is the one that proves the raw-fringe union works, since a
+    /// full-window hit needs no union at all.
+    rollup_hits_full,
+    rollup_hits_hybrid,
+    /// Aggregates that fell through to a raw scan. Unlabelled here; the reason
+    /// breakdown lives on the OTel counter.
+    rollup_misses_total,
     dirty_bin_queue_depth,
     dirty_bin_enqueued,
     dirty_bin_eligible,

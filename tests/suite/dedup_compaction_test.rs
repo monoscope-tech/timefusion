@@ -13,7 +13,7 @@ use datafusion::arrow::{
 use serial_test::serial;
 use timefusion::{
     database::Database,
-    test_utils::test_helpers::{BufferMode, TestConfigBuilder, delta_physical_row_count, json_to_batch, test_span_ts},
+    test_utils::test_helpers::{BufferMode, TestConfigBuilder, array_get_str, delta_physical_row_count, json_to_batch, test_span_ts},
 };
 
 #[serial]
@@ -1616,6 +1616,133 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
     let after_rebuild = total_from_rollup(Arc::clone(&db), project_id.clone()).await?;
     assert_eq!(after_rebuild, raw_total, "a second certification must REPLACE the buckets, not double every measure");
+    Ok(())
+}
+
+/// The rollup must answer a window it only PARTLY covers, by unioning its
+/// certified interior with raw fringes, and the answer must equal the raw one.
+///
+/// This is the shape production actually sends: microsecond-precision bounds
+/// running up to now. Before the union it was refused outright, so the feature
+/// never served a single query. A hybrid that merely *runs* is worthless — the
+/// failure mode is a plausible wrong number — so this asserts row-for-row
+/// equality against the same aggregate computed from raw spans, AND asserts the
+/// query really routed. Without the second assertion the test passes vacuously,
+/// because a miss also returns the right answer.
+///
+/// The fixture makes coverage partial deterministically, with no dependence on
+/// flush timing: yesterday is certified, today is written afterwards and never
+/// certified. So the interior ends at midnight and today's rows can only be
+/// reached through the raw leg.
+#[serial]
+#[tokio::test]
+async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("rollup_hybrid").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    // Varied duration/service so avg/min/max and the group set are all
+    // non-trivial, and one service that appears ONLY in the raw tail — the case
+    // a naive merge drops.
+    let row = |id: &str, service: &str, duration: i64, ts: i64| -> Result<_> {
+        json_to_batch(vec![serde_json::json!({
+            "timestamp": ts, "id": id, "name": "op", "project_id": project_id, "hashes": [], "summary": ["rollup hybrid fixture"],
+            "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string(),
+            "duration": duration, "kind": "server", "status_code": "OK",
+            "resource___service___name": service,
+        })])
+    };
+    // Yesterday, spread over several 1m buckets and starting mid-bucket so the
+    // left fringe is non-empty too.
+    for (i, offset) in [17i64, 61_000_000, 130_000_000, 610_000_000].iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("y{i}"), "cart", 100 + i as i64 * 10, yesterday_noon + offset)?], true, None)
+            .await?;
+    }
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    // Written AFTER certification: today has no coverage, so these are reachable
+    // only through the raw leg.
+    for (i, offset) in [5_000_000i64, 3_600_000_000].iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("t{i}"), "checkout", 500 + i as i64 * 10, midnight + offset)?], true, None)
+            .await?;
+    }
+
+    // Unaligned on both ends, exactly like a dashboard's `now`-relative window.
+    let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
+    let query = format!(
+        "SELECT resource___service___name AS svc, COUNT(*) AS c, avg(duration) AS mean, min(duration) AS lo, max(duration) AS hi \
+         FROM otel_logs_and_spans \
+         WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) \
+         GROUP BY 1 ORDER BY 1"
+    );
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+
+    // Precondition: certification really did build yesterday's buckets. Without
+    // this the routing assertion below cannot distinguish "the rewrite is broken"
+    // from "there was nothing to rewrite to".
+    let built: i64 = db
+        .query_delta_only(&format!(
+            "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"
+        ))
+        .await?
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0)))
+        .next()
+        .unwrap_or(0);
+    assert_eq!(built, 4, "certification must have rolled up all four of yesterday's spans");
+
+    let rows_of = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
+        batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .map(|r| {
+                        (
+                            array_get_str(b.column(0).as_ref(), r),
+                            b.column(1).as_primitive::<Int64Type>().value(r),
+                            b.column(2).as_primitive::<datafusion::arrow::datatypes::Float64Type>().value(r),
+                            b.column(3).as_primitive::<Int64Type>().value(r),
+                            b.column(4).as_primitive::<Int64Type>().value(r),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // The routing decision is only observable through this counter. `EXPLAIN`
+    // cannot see it: the substitution happens in `DmlQueryPlanner`, and EXPLAIN
+    // renders its inner plan with the DEFAULT planner, so an explained query
+    // always shows the raw scan even when the real one routes.
+    let hits = || timefusion::metrics::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
+    let misses = || timefusion::metrics::maintenance_stats().rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
+    let (before, misses_before) = (hits(), misses());
+    let hybrid = rows_of(ctx.sql(&query).await?.collect().await?);
+    assert_eq!(
+        hits(),
+        before + 1,
+        "the query must be served from the rollup as a hybrid union, not a raw scan (misses +{})",
+        misses() - misses_before
+    );
+
+    // `query_delta_only` bypasses both the rollup and the buffer, so it is the
+    // authority: every fixture row was written straight to Delta.
+    let raw = rows_of(db.query_delta_only(&query).await?);
+
+    assert_eq!(hybrid, raw, "the hybrid rewrite must equal the raw aggregate exactly");
+    assert_eq!(hybrid.len(), 2, "both services must survive, including the one that exists only in the raw tail: {hybrid:?}");
+    assert_eq!(hybrid.iter().map(|row| row.1).sum::<i64>(), 6, "every fixture row must be counted exactly once: {hybrid:?}");
     Ok(())
 }
 
