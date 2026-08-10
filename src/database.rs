@@ -8170,9 +8170,7 @@ impl Database {
     ///
     /// The sweep never reaches past its lookback, so a sealed day has never been
     /// certified and the backfill has to do it before it may roll the day up.
-    async fn certify_partition(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
-    ) -> Result<Option<u64>> {
+    async fn certify_partition(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate) -> Result<Option<u64>> {
         let pre = {
             let table = table_ref.read().await;
             Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()

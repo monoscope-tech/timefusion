@@ -1792,15 +1792,15 @@ async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Re
         let project_id = project_id.clone();
         async move {
             anyhow::Ok(
-            db.query_delta_only(&format!(
-                "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"
-            ))
-            .await?
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0)))
-            .next()
-            .unwrap_or(0),
+                db.query_delta_only(&format!(
+                    "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"
+                ))
+                .await?
+                .iter()
+                .filter(|b| b.num_rows() > 0)
+                .filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0)))
+                .next()
+                .unwrap_or(0),
             )
         }
     };
