@@ -21,6 +21,7 @@ mod kill_recovery;
 mod listen_backlog_test;
 mod membuffer_concurrency_bench;
 mod merge_date_prune_test;
+mod pg_client_compat;
 mod pgwire_dml_tag_test;
 mod plan_cache_shape_repro;
 mod proptest_invariants;

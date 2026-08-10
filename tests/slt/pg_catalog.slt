@@ -1,0 +1,96 @@
+# PostgreSQL catalog and identity compatibility.
+
+query T
+SELECT current_database()
+----
+postgres
+
+query T
+SELECT session_user, current_schema()
+----
+postgres public
+
+query T
+SELECT CURRENT_USER AS current_user, SESSION_USER AS session_user, USER AS user_name
+----
+postgres postgres postgres
+
+query T
+SELECT version() LIKE 'PostgreSQL 16.6 (TimeFusion %'
+----
+true
+
+query T
+SELECT current_setting('server_version'), current_setting('server_version_num')
+----
+16.6 160006
+
+query T
+SELECT current_setting('unknown_setting', true) IS NULL
+----
+true
+
+query T
+SELECT COUNT(*) FROM information_schema.columns
+WHERE table_schema = 'pg_catalog' AND table_name = 'pg_settings'
+----
+17
+
+query T
+SELECT setting FROM pg_catalog.pg_settings
+WHERE name = 'standard_conforming_strings'
+----
+on
+
+query T
+SELECT datname FROM pg_catalog.pg_database WHERE datname = 'postgres'
+----
+postgres
+
+query T
+SELECT rolname FROM pg_catalog.pg_roles WHERE rolname = 'postgres'
+----
+postgres
+
+query T
+SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'public'
+----
+public
+
+query T
+SELECT relname FROM pg_catalog.pg_class WHERE relname = 'otel_logs_and_spans'
+----
+otel_logs_and_spans
+
+query T
+SELECT tablename FROM pg_catalog.pg_tables WHERE tablename = 'otel_logs_and_spans'
+----
+otel_logs_and_spans
+
+query T
+SELECT attname FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+WHERE c.relname = 'otel_logs_and_spans' AND attname = 'project_id'
+----
+project_id
+
+query T
+SELECT format_type(23, NULL)
+----
+integer
+
+query T
+SELECT 'pg_catalog.array_in'::regproc
+----
+pg_catalog.array_in
+
+query T
+SELECT relname FROM pg_catalog.pg_class
+WHERE oid = 'pg_catalog.pg_class'::regclass
+----
+pg_class
+
+query I
+SELECT array_upper(ARRAY['a', 'b', 'c']::text[], 1)
+----
+3

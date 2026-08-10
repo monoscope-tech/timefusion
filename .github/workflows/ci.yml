@@ -176,6 +176,34 @@ jobs:
       - name: Test
         run: cargo nextest run --profile ci --locked --partition hash:${{ matrix.shard }}/2
 
+      # libpq 18 sends a protocol-3.2 probe during startup. Exercise the real
+      # client and its catalog meta-commands rather than only replaying SQL.
+      - name: PostgreSQL 18 client smoke
+        if: matrix.shard == 1
+        run: |
+          set -euo pipefail
+          data_dir=$(mktemp -d)
+          log="$RUNNER_TEMP/timefusion-pg-client.log"
+          TIMEFUSION_DATA_DIR="$data_dir" TIMEFUSION_ALLOW_INSECURE_AUTH=true PGWIRE_PASSWORD=postgres \
+            cargo run --locked --quiet --bin timefusion >"$log" 2>&1 &
+          pid=$!
+          cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$data_dir"; }
+          trap cleanup EXIT
+          ready=false
+          for _ in {1..60}; do
+            if docker run --rm --network host -e PGPASSWORD=postgres postgres:18.4 \
+              psql "postgresql://postgres@127.0.0.1:$PGWIRE_PORT/postgres" -Atqc 'SELECT 1' >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          "$ready" || { cat "$log"; exit 1; }
+          for command in '\dt' '\d otel_logs_and_spans' '\l' '\du' '\dn'; do
+            docker run --rm --network host -e PGPASSWORD=postgres postgres:18.4 \
+              psql "postgresql://postgres@127.0.0.1:$PGWIRE_PORT/postgres" -v ON_ERROR_STOP=1 -c "$command"
+          done
+
   # E2E suite: full pgwire → BufferedWriteLayer → WAL → Delta path against a
   # per-test MinIO via testcontainers. Runs in its own job so failures are
   # attributable and the suite can be made a required check independently.

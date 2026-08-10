@@ -477,6 +477,7 @@ mod sqllogictest_tests {
         json_functions,
         merge_on_read,
         partition_pruning_test,
+        pg_catalog,
         percentile_functions,
         variant_column,
         variant_functions,

@@ -3538,6 +3538,7 @@ impl Database {
             ),
         )?;
 
+        crate::pg_compat::setup_catalog(ctx, &self.config.core.pgwire_user, self.config.core.timefusion_pgwire_max_statement_secs)?;
         Ok(())
     }
 

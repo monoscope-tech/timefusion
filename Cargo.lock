@@ -405,7 +405,7 @@ dependencies = [
 [[package]]
 name = "arrow-pg"
 version = "0.14.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=timefusion-df54#3a6d58b18f9d3919dea1cc7692550a65fe83635c"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=timefusion-df54#51a90197941210b58cb0bbbaf2819065b0c04eb4"
 dependencies = [
  "arrow-schema",
  "bytes",
@@ -2733,7 +2733,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pg-catalog"
 version = "0.17.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=timefusion-df54#3a6d58b18f9d3919dea1cc7692550a65fe83635c"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=timefusion-df54#51a90197941210b58cb0bbbaf2819065b0c04eb4"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -2853,7 +2853,7 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.17.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=timefusion-df54#3a6d58b18f9d3919dea1cc7692550a65fe83635c"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=timefusion-df54#51a90197941210b58cb0bbbaf2819065b0c04eb4"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -4357,7 +4357,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -5806,8 +5806,6 @@ dependencies = [
 [[package]]
 name = "pgwire"
 version = "0.40.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdc5af11aa35ec1e23f56699dfd96f70f02822bdac5bddeabfb53795af4cc477"
 dependencies = [
  "async-trait",
  "base64",
@@ -6337,7 +6335,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.36",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6375,7 +6373,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]

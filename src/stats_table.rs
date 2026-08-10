@@ -426,6 +426,8 @@ impl StatsTableProvider {
                     "provider_build_total" => provider_builds,
                     "provider_scan_us_avg" => avg(m.provider_scan_us_total.load(Relaxed), provider_scans),
                     "provider_scan_total" => provider_scans,
+                    "bounded_otel_scan_candidates" => m.bounded_otel_scan_candidates.load(Relaxed),
+                    "bounded_otel_scan_rejections" => m.bounded_otel_scan_rejections.load(Relaxed),
                     "mem_plan_us_avg" => avg(m.mem_plan_us_total.load(Relaxed), mem_plans),
                     "mem_plan_total" => mem_plans,
                     "hot_plan_us_avg" => avg(m.hot_plan_us_total.load(Relaxed), hot_plans),

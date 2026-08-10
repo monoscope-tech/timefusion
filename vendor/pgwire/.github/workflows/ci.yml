@@ -1,0 +1,95 @@
+name: CI
+on:
+  schedule: [{cron: "30 13 * * *"}]
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  format:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+        components: rustfmt
+        override: true
+    - run: cargo fmt -- --check
+
+  lint:
+    name: Clippy lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        components: clippy
+        override: true
+    - name: Lint default
+      run: cargo clippy --features pg-type-postgis -- -D warnings
+    - name: Lint minimal
+      run: cargo clippy --no-default-features -- -D warnings
+    - name: Lint server-api without tls
+      run: cargo clippy --no-default-features --features server-api -- -D warnings
+    - name: Lint ring
+      run: cargo clippy --no-default-features --features server-api-ring -- -D warnings
+    - name: Lint client api
+      run: cargo clippy --features client-api-aws-lc-rs -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        rust: [stable, nightly]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: ${{ matrix.rust }}
+        override: true
+    - name: Build and run tests on default feature set
+      if: runner.os != 'Windows'
+      run: cargo test --features pg-type-postgis
+    - name: Run tests on minimal feature set
+      run: cargo test --no-default-features
+    - name: Run tests without tls
+      run: cargo test --no-default-features --features server-api
+    - name: Run tests on additional ring feature set
+      run: cargo test --no-default-features --features server-api-ring
+    - name: Run tests for client api
+      if: runner.os != 'Windows'
+      run: cargo test --features client-api-aws-lc-rs
+    - name: Run check sqlite example
+      run: cargo check --all-targets --features _sqlite,_bundled
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test]
+    steps:
+    - uses: actions/checkout@v6
+    - uses: DeterminateSystems/nix-installer-action@main
+    - uses: DeterminateSystems/magic-nix-cache-action@main
+    - uses: nicknovitski/nix-develop@v1
+    - run: ./tests-integration/test.sh
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: "1.89"
+        override: true
+    - run: cargo build --features pg-type-postgis
+    - run: cargo build --no-default-features
+    - run: cargo build --no-default-features --features server-api
+    - run: cargo build --no-default-features --features server-api-ring

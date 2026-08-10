@@ -226,14 +226,15 @@ debug = 0
 strip = "none"
 
 [patch.crates-io]
+# libpq 18 requires a ProtocolVersionNegotiation response that reports every
+# unsupported `_pq_.*` startup option, even when protocol 3.2 itself matches.
+pgwire = { path = "vendor/pgwire" }
 # datafusion-postgres ecosystem on our fork's DataFusion 54 branch
-# (apitoolkit/datafusion-postgres @ timefusion-df54, off v0.16.0). Carries two
-# fixes: arrow-pg decodes UUID/JSON/JSONB bind params by raw bytes (pgwire's
-# FromSql<String> rejects those OIDs, breaking any client sending a UUID), and
-# `ordered_param_types` sorts placeholders by numeric suffix (lexicographic put
-# `$10` before `$2`, mistyping params in >9-placeholder statements). Patching
-# datafusion-postgres alone pulls its sibling arrow-pg/datafusion-pg-catalog
-# from the same git workspace, so those need no separate patch.
+# (apitoolkit/datafusion-postgres @ timefusion-df54, off v0.16.0). Includes
+# bind-parameter, cursor, catalog, and PostgreSQL-client compatibility fixes.
+# Patching datafusion-postgres alone pulls its sibling
+# arrow-pg/datafusion-pg-catalog from the same git workspace, so those need no
+# separate patch.
 datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", branch = "timefusion-df54" }
 # datafusion-sql on our fork (tonyalaribe/datafusion @ timefusion-update-from-54,
 # off tag 54.0.0): removes the SQL planner's defensive

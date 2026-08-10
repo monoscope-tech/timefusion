@@ -8,11 +8,11 @@ use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion_postgres::{
     DfSessionService,
-    hooks::{QueryHook, set_show::SetShowHook, transactions::TransactionStatementHook},
+    hooks::{QueryHook, cursor::CursorStatementHook, set_show::SetShowHook, transactions::TransactionStatementHook},
     pgwire::{
         api::{
             ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers,
-            auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler, cleartext::CleartextPasswordAuthStartupHandler},
+            auth::{AuthSource, LoginInfo, Password, StartupHandler, cleartext::CleartextPasswordAuthStartupHandler},
             portal::Portal,
             query::{ExtendedQueryHandler, SimpleQueryHandler},
             results::{DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag},
@@ -23,12 +23,16 @@ use datafusion_postgres::{
         messages::PgWireBackendMessage,
     },
 };
-use futures::{Sink, TryStreamExt, stream};
+use futures::{Sink, StreamExt, TryStreamExt, stream};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use tracing::{Instrument, error, field::Empty, info, instrument};
 
-use crate::{database::Database, plan_cache::PlanCacheHook};
+use crate::{
+    database::Database,
+    pg_compat::{DEFAULT_MAX_STATEMENT_SECS, PgCompatibilityHook, TimeFusionServerParameterProvider, effective_statement_timeout, statement_timeout_error},
+    plan_cache::PlanCacheHook,
+};
 
 /// Auth configuration for PgWire server
 #[derive(Debug, Clone)]
@@ -93,17 +97,23 @@ pub struct LoggingHandlerFactory {
     plan_cache: Arc<PlanCacheHook>,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
     db: Option<Arc<Database>>,
+    max_statement_secs: u64,
 }
 
 impl LoggingHandlerFactory {
     pub fn new(session_context: Arc<SessionContext>, auth_config: AuthConfig) -> Self {
         let plan_cache = Arc::new(PlanCacheHook::default());
         crate::plan_cache::set_global(plan_cache.clone());
-        Self { session_context, auth_config, plan_cache, scan_metrics: None, db: None }
+        Self { session_context, auth_config, plan_cache, scan_metrics: None, db: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
         self.scan_metrics = Some(m);
+        self
+    }
+
+    pub fn with_max_statement_secs(mut self, max_statement_secs: u64) -> Self {
+        self.max_statement_secs = max_statement_secs;
         self
     }
 
@@ -119,7 +129,13 @@ impl LoggingHandlerFactory {
     /// produces. Sharing the single `plan_cache` Arc is what makes the LRU
     /// global rather than per-connection.
     fn hooks(&self) -> Vec<Arc<dyn QueryHook>> {
-        vec![self.plan_cache.clone() as Arc<dyn QueryHook>, Arc::new(SetShowHook), Arc::new(TransactionStatementHook)]
+        vec![
+            Arc::new(CursorStatementHook),
+            Arc::new(PgCompatibilityHook::new(self.max_statement_secs)),
+            self.plan_cache.clone() as Arc<dyn QueryHook>,
+            Arc::new(SetShowHook),
+            Arc::new(TransactionStatementHook),
+        ]
     }
 
     pub fn plan_cache(&self) -> Arc<PlanCacheHook> {
@@ -129,18 +145,18 @@ impl LoggingHandlerFactory {
 
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        let h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
+        let h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()).with_max_statement_secs(self.max_statement_secs);
         let h = self.scan_metrics.iter().fold(h, |h, m| h.with_scan_metrics(m.clone()));
         Arc::new(self.db.iter().fold(h, |h, db| h.with_database(db.clone())))
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        let h = LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
+        let h = LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()).with_max_statement_secs(self.max_statement_secs);
         Arc::new(self.scan_metrics.iter().fold(h, |h, m| h.with_scan_metrics(m.clone())))
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(CleartextPasswordAuthStartupHandler::new(ConfigAuthSource::new(self.auth_config.clone()), DefaultServerParameterProvider::default()))
+        Arc::new(CleartextPasswordAuthStartupHandler::new(ConfigAuthSource::new(self.auth_config.clone()), TimeFusionServerParameterProvider::default()))
     }
 
     fn error_handler(&self) -> Arc<impl ErrorHandler> {
@@ -190,16 +206,60 @@ async fn giant_stmt_permit(len: usize) -> Option<tokio::sync::SemaphorePermit<'s
     Some(permit)
 }
 
+fn client_statement_timeout(client: &(impl ClientInfo + ?Sized)) -> Option<std::time::Duration> {
+    client.metadata().get("statement_timeout_ms").and_then(|value| value.parse::<u64>().ok()).map(std::time::Duration::from_millis)
+}
+
+async fn run_with_statement_timeout<T>(
+    timeout: Option<std::time::Duration>, query: impl std::future::Future<Output = PgWireResult<T>>,
+) -> PgWireResult<(T, Option<tokio::time::Instant>)> {
+    let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let result = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, query).await.map_err(|_| statement_timeout_error())?,
+        None => query.await,
+    }?;
+    Ok((result, deadline))
+}
+
+fn with_response_deadline(response: Response, deadline: Option<tokio::time::Instant>) -> Response {
+    match (response, deadline) {
+        (Response::Query(QueryResponse { command_tag, row_schema, data_rows, .. }), Some(deadline)) => {
+            let data_rows = stream::unfold(Some(data_rows), move |rows| async move {
+                let mut rows = rows?;
+                match tokio::time::timeout_at(deadline, rows.next()).await {
+                    Ok(Some(row)) => Some((row, Some(rows))),
+                    Ok(None) => None,
+                    Err(_) => Some((Err(statement_timeout_error()), None)),
+                }
+            });
+            let mut response = QueryResponse::new(row_schema, data_rows);
+            response.set_command_tag(&command_tag);
+            Response::Query(response)
+        }
+        (response, _) => response,
+    }
+}
+
+fn with_response_deadlines(responses: Vec<Response>, deadline: Option<tokio::time::Instant>) -> Vec<Response> {
+    responses.into_iter().map(|response| with_response_deadline(response, deadline)).collect()
+}
+
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
     inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
     db: Option<Arc<Database>>,
+    max_statement_secs: u64,
 }
 
 impl LoggingSimpleQueryHandler {
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
-        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None, db: None }
+        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None, db: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS }
+    }
+
+    pub fn with_max_statement_secs(mut self, max_statement_secs: u64) -> Self {
+        self.max_statement_secs = max_statement_secs;
+        self
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
@@ -794,7 +854,11 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
-        let result = <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await;
+        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs);
+        let result =
+            run_with_statement_timeout(timeout, <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span))
+                .await
+                .map(|(responses, deadline)| with_response_deadlines(responses, deadline));
         record_statement_latency(self.scan_metrics.as_deref(), query, "simple", t0.elapsed().as_micros() as u64, result.is_ok());
         result
     }
@@ -804,16 +868,22 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
 pub struct LoggingExtendedQueryHandler {
     inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+    max_statement_secs: u64,
 }
 
 impl LoggingExtendedQueryHandler {
+    pub fn with_max_statement_secs(mut self, max_statement_secs: u64) -> Self {
+        self.max_statement_secs = max_statement_secs;
+        self
+    }
+
     pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
         self.scan_metrics = Some(m);
         self
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
-        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None }
+        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS }
     }
 }
 
@@ -865,7 +935,13 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
-        let result = <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span).await;
+        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs);
+        let result = run_with_statement_timeout(
+            timeout,
+            <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span),
+        )
+        .await
+        .map(|(response, deadline)| with_response_deadline(response, deadline));
         record_statement_latency(self.scan_metrics.as_deref(), query, "extended", t0.elapsed().as_micros() as u64, result.is_ok());
         result
     }
@@ -874,7 +950,8 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
 fn handler_factory(
     session_context: Arc<SessionContext>, auth_config: AuthConfig, scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>,
 ) -> Arc<LoggingHandlerFactory> {
-    let factory = LoggingHandlerFactory::new(session_context, auth_config);
+    let max_statement_secs = db.as_ref().map_or(DEFAULT_MAX_STATEMENT_SECS, |db| db.config().core.timefusion_pgwire_max_statement_secs);
+    let factory = LoggingHandlerFactory::new(session_context, auth_config).with_max_statement_secs(max_statement_secs);
     let factory = scan_metrics.into_iter().fold(factory, LoggingHandlerFactory::with_scan_metrics);
     Arc::new(db.into_iter().fold(factory, LoggingHandlerFactory::with_database))
 }
@@ -906,8 +983,30 @@ pub async fn serve_with_listener(
 mod tests {
     use super::{
         parse_delta_actions, parse_delta_history, parse_delta_recovery_audit, parse_flush, parse_handoff, parse_optimize, parse_vacuum, query_dimensions,
-        query_fingerprint, query_template, rewrite_pg_synonyms,
+        query_fingerprint, query_template, rewrite_pg_synonyms, with_response_deadline,
     };
+    use datafusion_postgres::pgwire::{
+        api::results::{QueryResponse, Response},
+        error::PgWireError,
+        messages::data::DataRow,
+    };
+    use futures::StreamExt;
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn query_stream_observes_the_server_deadline() {
+        let response = Response::Query(QueryResponse::new(
+            Arc::new(vec![]),
+            futures::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err::<DataRow, _>(crate::pg_compat::statement_timeout_error())
+            }),
+        ));
+        let Response::Query(mut response) = with_response_deadline(response, Some(tokio::time::Instant::now() + Duration::from_millis(1))) else {
+            panic!("expected query response");
+        };
+        assert!(matches!(response.data_rows.next().await, Some(Err(PgWireError::UserError(_)))));
+    }
 
     #[test]
     fn optimize_parses_table_and_date() {
