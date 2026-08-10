@@ -7765,7 +7765,7 @@ impl Database {
     }
 
     pub(crate) fn invalidate_rollup_source(&self, project_id: &str, source: &str) {
-        if !get_schema(source).is_some_and(|schema| !schema.rollups.is_empty()) {
+        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return;
         }
         let keys: Vec<_> =
@@ -7778,7 +7778,7 @@ impl Database {
     }
 
     fn invalidate_rollup_batches(&self, project_id: &str, source: &str, batches: &[RecordBatch]) {
-        if !get_schema(source).is_some_and(|schema| !schema.rollups.is_empty()) {
+        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return;
         }
         let dates = batches
