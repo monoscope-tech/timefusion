@@ -1019,6 +1019,14 @@ mod tests {
         assert!(target.fields.iter().any(|field| field.name == "rollup_generation"));
         assert_eq!(target.partitions, source.partitions);
         assert!(!target.version_append);
+        // A rollup must declare NO dedup keys. `replace_rollup_partition` removes
+        // every existing file in the partition in the same commit that adds the
+        // new ones, so duplicates are impossible — and declaring keys made every
+        // read plan a `DedupExec` over them, which the rewrite's
+        // dimensions-and-measures projection does not carry. In production that
+        // turned every routed query into "DedupExec key `id` not in input
+        // schema" and then a failed raw fallback.
+        assert!(target.dedup_keys.is_empty(), "a rollup must not require read-time dedup: {:?}", target.dedup_keys);
     }
 
     #[test]

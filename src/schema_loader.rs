@@ -255,11 +255,21 @@ impl RollupSpec {
             z_order_columns: vec![],
             fields,
             time_column: Some("timestamp".into()),
-            // A bucket is identified by time + dimension tuple, hashed into
-            // `id`. A rebuild REPLACES its bucket rather than appending a
-            // second copy, which is what makes the build idempotent.
-            dedup_keys: vec!["timestamp".into(), "id".into()],
-            dedup_tiebreak: Some("updated_at".into()),
+            // NO read-time dedup. A bucket is identified by time + dimension
+            // tuple hashed into `id`, but duplicates are impossible by
+            // construction: `replace_rollup_partition` commits Remove actions
+            // for every existing file in the (project, date) partition together
+            // with the new ones, so a partition only ever holds one build, and
+            // reads additionally pin `rollup_generation`.
+            //
+            // Declaring keys here made every read of a rollup plan a `DedupExec`
+            // over them — and the rewrite projects only dimensions and measures,
+            // so planning died with "DedupExec key `id` not in input schema" and
+            // every routed query fell back to a raw scan that then failed. Unit
+            // tests could not see it: they register the rollup as a `MemTable`,
+            // which has no dedup layer at all.
+            dedup_keys: vec![],
+            dedup_tiebreak: None,
             tombstone_column: Some("deleted".into()),
             // Never version_append: buckets are rebuilt wholesale, so there are
             // no superseded versions and the read path pays no dedup ordering.
