@@ -386,3 +386,23 @@ fields:
   - name: deleted
     data_type: Boolean
     nullable: true
+
+# Continuous-aggregate rollups derived from this table. The rollup's own table
+# (`otel_logs_and_spans_rollup_1m`) is SYNTHESIZED from this spec plus the field
+# definitions below, so a measure's type cannot drift from the column it
+# aggregates and adding a rollup needs no second schema file.
+#
+# Every dimension must be low-cardinality: rows per bucket is roughly the
+# product of their distinct counts, and at 1m grain that product has to stay in
+# the low thousands or the rollup is a slightly smaller copy of this table.
+# A filter on any column NOT listed disqualifies a query from routing, because a
+# filter cannot be applied after aggregation.
+rollups:
+  - grain: 1m
+    dimensions: [resource___service___name, kind, status_code]
+    measures:
+      - { name: request_count, agg: count }
+      - { name: error_count, agg: count, filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500" }
+      - { name: duration_sum, agg: sum, column: duration }
+      - { name: duration_min, agg: min, column: duration }
+      - { name: duration_max, agg: max, column: duration }

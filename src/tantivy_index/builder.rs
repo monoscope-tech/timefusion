@@ -308,6 +308,7 @@ mod tests {
             bloom_filter: false,
         };
         TableSchema {
+            rollups: vec![],
             table_name: "logs".into(),
             partitions: vec![],
             sorting_columns: vec![],

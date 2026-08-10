@@ -11,9 +11,145 @@ use deltalake::{
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 
+/// One continuous-aggregate rollup, declared on the SOURCE table.
+///
+/// TimescaleDB's continuous aggregates in TF's shape: you declare the grain,
+/// the dimensions and the measures, and the rollup table is SYNTHESIZED from
+/// this plus the source schema (`RollupSpec::synthesize`). Nothing is
+/// hand-written, so a rollup column's type cannot drift from the source column
+/// it aggregates, and adding a rollup is a config change rather than a new
+/// YAML file plus a hardcoded constant.
+///
+/// The refresh policy is TF's own and is better than a timer: the build fires
+/// at the point a partition is CERTIFIED duplicate-free, because a bucket
+/// computed over a bin that is later deduped is simply wrong.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RollupSpec {
+    /// Bucket width, e.g. `1m`, `1h`, `1d`. Also the table-name suffix, so the
+    /// name can never disagree with the resolution.
+    pub grain: String,
+    /// Columns a query may GROUP BY **or FILTER on** and still be answerable.
+    /// Filters constrain the design exactly as hard as group-bys — rows for a
+    /// non-dimension are already summed together and cannot be subtracted back
+    /// out — which is the part a rollup design usually gets wrong.
+    pub dimensions: Vec<String>,
+    pub measures: Vec<RollupMeasure>,
+}
+
+/// One stored measure. Only DECOMPOSABLE aggregates are expressible: count/sum/
+/// min/max re-aggregate across buckets and across collapsed dimensions. `avg`
+/// is admissible as sum/count and is expanded before it gets here; exact
+/// percentiles and exact count(distinct) are not, and are refused rather than
+/// answered approximately without being asked.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RollupMeasure {
+    /// Column name in the rollup table.
+    pub name: String,
+    /// `count` | `sum` | `min` | `max`.
+    pub agg: String,
+    /// Source column to aggregate. Omitted for `count`.
+    #[serde(default)]
+    pub column: Option<String>,
+    /// Optional `FILTER (WHERE …)` predicate, for things like an error count.
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+impl RollupSpec {
+    /// `{source}_rollup_{grain}` — see `rollup_table_is_named_after_its_source`.
+    pub fn table_name(&self, source: &str) -> String {
+        format!("{source}_rollup_{}", self.grain)
+    }
+
+    /// Grain in microseconds, parsed from the suffix. `None` for an
+    /// unparseable grain, which `validate` rejects at load rather than at the
+    /// first build.
+    pub fn grain_micros(&self) -> Option<i64> {
+        let (n, unit) = self.grain.split_at(self.grain.len().checked_sub(1)?);
+        let n: i64 = n.parse().ok()?;
+        let mult = match unit {
+            "s" => 1_000_000,
+            "m" => 60 * 1_000_000,
+            "h" => 3_600 * 1_000_000,
+            "d" => 86_400 * 1_000_000,
+            _ => return None,
+        };
+        (n > 0).then(|| n * mult)
+    }
+
+    /// The rollup's `TableSchema`, derived from the source so column types
+    /// cannot drift. Identity columns mirror what every table here carries;
+    /// dimensions keep the source's own type and nullability; measures are
+    /// Int64 (count) or the source column's type (sum/min/max).
+    pub fn synthesize(&self, source: &TableSchema) -> anyhow::Result<TableSchema> {
+        let src_field = |n: &str| {
+            source.fields.iter().find(|f| f.name == n).cloned().ok_or_else(|| anyhow::anyhow!("rollup {}: unknown column `{n}`", self.table_name(&source.table_name)))
+        };
+        let plain = |name: &str, data_type: &str, nullable: bool| FieldDef {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable,
+            tantivy: None,
+            dictionary: None,
+            bloom_filter: false,
+        };
+        let mut fields = vec![
+            plain("project_id", "Utf8", true),
+            plain("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", false),
+            plain("date", "Date32", false),
+            plain("id", "Utf8", false),
+            plain("updated_at", "Timestamp(Microsecond, Some(\"UTC\"))", false),
+            plain("deleted", "Boolean", true),
+        ];
+        for d in &self.dimensions {
+            let f = src_field(d)?;
+            // Always nullable in the rollup: GROUP BY emits a NULL group for
+            // rows missing the dimension, even when the source column is not.
+            fields.push(FieldDef { nullable: true, ..f });
+        }
+        for m in &self.measures {
+            let ty = match (m.agg.as_str(), &m.column) {
+                ("count", _) => "Int64".to_string(),
+                (_, Some(c)) => src_field(c)?.data_type,
+                (a, None) => anyhow::bail!("rollup {}: `{a}` measure `{}` needs a source column", self.table_name(&source.table_name), m.name),
+            };
+            // A measure over an empty group is NULL, and count is never NULL.
+            fields.push(plain(&m.name, &ty, m.agg != "count"));
+        }
+        Ok(TableSchema {
+            table_name: self.table_name(&source.table_name),
+            // Same partitioning as the source, so ProjectRoutingTable gives
+            // multi-tenant isolation and date pruning for free.
+            partitions: source.partitions.clone(),
+            sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: true, nulls_first: true }],
+            z_order_columns: vec![],
+            fields,
+            time_column: Some("timestamp".into()),
+            // A bucket is identified by time + dimension tuple, hashed into
+            // `id`. A rebuild REPLACES its bucket rather than appending a
+            // second copy, which is what makes the build idempotent.
+            dedup_keys: vec!["timestamp".into(), "id".into()],
+            dedup_tiebreak: Some("updated_at".into()),
+            tombstone_column: Some("deleted".into()),
+            // Never version_append: buckets are rebuilt wholesale, so there are
+            // no superseded versions and the read path pays no dedup ordering.
+            version_append: false,
+            // A rollup of a rollup is a real design (1m -> 1h -> 1d) but it is
+            // not this change: declaring it here would recurse at load.
+            rollups: vec![],
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
     pub table_name: String,
+    /// Continuous-aggregate rollups derived FROM this table. Declared here
+    /// rather than as separate schema files so a rollup cannot drift from its
+    /// source; the rollup's own `TableSchema` is synthesized at load
+    /// (`RollupSpec::synthesize`) and registered under `{table}_rollup_{grain}`.
+    #[serde(default)]
+    pub rollups: Vec<RollupSpec>,
     pub partitions: Vec<String>,
     pub sorting_columns: Vec<SortingColumnDef>,
     pub z_order_columns: Vec<String>,
@@ -345,7 +481,7 @@ pub struct SchemaRegistry {
 
 impl SchemaRegistry {
     fn new() -> Self {
-        let schemas = SCHEMAS_DIR
+        let mut schemas: HashMap<String, TableSchema> = SCHEMAS_DIR
             .files()
             .filter(|f| f.path().extension().and_then(|s| s.to_str()) == Some("yaml"))
             .map(|file| {
@@ -355,6 +491,25 @@ impl SchemaRegistry {
                 (schema.table_name.clone(), schema)
             })
             .collect();
+        // Synthesize a table for every declared rollup. Generated rather than
+        // hand-written so a rollup column's type cannot drift from the source
+        // column it aggregates, and so adding one is a config change.
+        let synthesized: Vec<TableSchema> = schemas
+            .values()
+            .flat_map(|src| src.rollups.iter().map(move |spec| (src, spec)))
+            .map(|(src, spec)| {
+                let rollup = spec.synthesize(src).unwrap_or_else(|e| panic!("Invalid rollup on {}: {e}", src.table_name));
+                rollup.validate().unwrap_or_else(|e| panic!("Invalid synthesized rollup {}: {e}", rollup.table_name));
+                rollup
+            })
+            .collect();
+        for r in synthesized {
+            if let Some(prev) = schemas.insert(r.table_name.clone(), r) {
+                // A hand-written file colliding with a generated name would
+                // silently win or lose depending on iteration order.
+                panic!("rollup table `{}` collides with a declared schema file", prev.table_name);
+            }
+        }
         Self { schemas }
     }
 

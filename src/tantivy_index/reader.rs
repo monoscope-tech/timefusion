@@ -225,6 +225,7 @@ mod tests {
     /// silently dropped the matching rows.
     fn ngram_index() -> Index {
         let table = TableSchema {
+            rollups: vec![],
             table_name: "t".into(),
             partitions: vec![],
             sorting_columns: vec![],

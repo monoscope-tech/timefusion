@@ -29,6 +29,7 @@ fn level_error_node() -> timefusion::tantivy_index::udf::PredNode {
 #[allow(dead_code)]
 fn schema_with(level_indexed: bool) -> TableSchema {
     TableSchema {
+        rollups: vec![],
         table_name: "logs".into(),
         partitions: vec![],
         sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],

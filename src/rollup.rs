@@ -20,7 +20,7 @@
 //! `dedup_skip_allowed` uses, and a bin re-entering the dirty queue invalidates
 //! them.
 
-use crate::metrics;
+use crate::{metrics, schema_loader::RollupSpec};
 
 /// The source table this rollup summarizes. Spans only — `otel_metrics` has
 /// none of these columns and would need its own rollup, dimension set and
@@ -107,15 +107,16 @@ pub struct Ask<'a> {
 /// which is always correct and merely slower. Silent fallthrough is deliberate —
 /// a query that cannot route must still return the right answer — but it is
 /// never UNRECORDED, which is what makes the dimension set improvable.
-pub fn route(ask: &Ask<'_>) -> Result<(), MissReason> {
-    let known = |c: &String| DIMENSIONS.contains(&c.as_str());
+pub fn route(spec: &RollupSpec, ask: &Ask<'_>) -> Result<(), MissReason> {
+    let grain_micros = spec.grain_micros().unwrap_or(GRAIN_MICROS);
+    let known = |c: &String| spec.dimensions.iter().any(|d| d == c);
     let reason = if !ask.group_by.iter().all(known) {
         Some(MissReason::UnknownGroupBy)
     } else if !ask.filtered.iter().all(known) {
         Some(MissReason::UnknownFilter)
     } else if !ask.aggregates.iter().all(|a| DECOMPOSABLE.contains(&a.as_str())) {
         Some(MissReason::NonDecomposableAggregate)
-    } else if ask.bucket_micros.is_none_or(|w| w < GRAIN_MICROS || w % GRAIN_MICROS != 0) {
+    } else if ask.bucket_micros.is_none_or(|w| w < grain_micros || w % grain_micros != 0) {
         // Finer than the grain cannot be reconstructed, and a width that is not
         // a whole multiple would split a stored bucket across two output rows.
         Some(MissReason::PartialBucket)
@@ -169,18 +170,33 @@ pub fn bucket_id(bucket_micros: i64, dims: &[Option<&str>]) -> String {
 ///
 /// `date` is the partition being rebuilt; the caller is responsible for having
 /// certified it clean first (see the module docs).
-pub fn build_partition_sql(project_id: &str, date: &str) -> String {
-    let dims = DIMENSIONS.join(", ");
+pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, date: &str) -> String {
+    let grain = spec.grain_micros().unwrap_or(GRAIN_MICROS);
+    let dims = spec.dimensions.join(", ");
+    // Measures come from the spec in declaration order, which is the same order
+    // `synthesize` appended them to the schema — that alignment is what lets
+    // `to_rollup_batches` map column i of the aggregate onto measure i.
+    let measures = spec
+        .measures
+        .iter()
+        .map(|m| {
+            let inner = match (m.agg.as_str(), m.column.as_deref()) {
+                ("count", _) => "COUNT(*)".to_string(),
+                (a, Some(c)) => format!("{}({c})", a.to_uppercase()),
+                (a, None) => format!("{}(1)", a.to_uppercase()),
+            };
+            match &m.filter {
+                Some(f) => format!("{inner} FILTER (WHERE {f}) AS {}", m.name),
+                None => format!("{inner} AS {}", m.name),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "SELECT \
-           to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {GRAIN_MICROS}) AS BIGINT) * {GRAIN_MICROS}) AS timestamp, \
-           {dims}, \
-           COUNT(*) AS request_count, \
-           COUNT(*) FILTER (WHERE status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500) AS error_count, \
-           SUM(duration) AS duration_sum, \
-           MIN(duration) AS duration_min, \
-           MAX(duration) AS duration_max \
-         FROM {SOURCE_TABLE} \
+           to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp, \
+           {dims}, {measures} \
+         FROM {source} \
          WHERE project_id = '{project_id}' AND date = '{date}' \
          GROUP BY 1, {dims}"
     )
@@ -193,12 +209,13 @@ pub fn build_partition_sql(project_id: &str, date: &str) -> String {
 /// rebuild replaces rather than doubles), the partition `date`, and the
 /// `updated_at`/`deleted` pair every table here carries.
 pub fn to_rollup_batches(
-    project_id: &str, date: &str, aggregated: &[arrow::record_batch::RecordBatch],
+    spec: &RollupSpec, source: &str, project_id: &str, date: &str, aggregated: &[arrow::record_batch::RecordBatch],
 ) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
     use arrow::array::{Array, ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use std::sync::Arc;
 
-    let schema = crate::schema_loader::get_schema(ROLLUP_TABLE).ok_or_else(|| anyhow::anyhow!("{ROLLUP_TABLE} schema missing"))?.schema_ref();
+    let target = spec.table_name(source);
+    let schema = crate::schema_loader::get_schema(&target).ok_or_else(|| anyhow::anyhow!("{target} schema missing"))?.schema_ref();
     // Days since epoch; the partition column is what routes reads to this date.
     let date_days =
         chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
@@ -235,7 +252,7 @@ pub fn to_rollup_batches(
             })
             .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>().cloned())
             .map_or_else(|| vec![0; n], |c| (0..c.len()).map(|i| c.value(i)).collect());
-        let dims: Vec<Vec<Option<String>>> = DIMENSIONS.iter().map(|d| text(b, d).unwrap_or_else(|| vec![None; n])).collect();
+        let dims: Vec<Vec<Option<String>>> = spec.dimensions.iter().map(|d| text(b, d).unwrap_or_else(|| vec![None; n])).collect();
         let ids: Vec<String> = (0..n)
             .map(|r| {
                 let row: Vec<Option<&str>> = dims.iter().map(|d| d[r].as_deref()).collect();
@@ -278,6 +295,45 @@ pub fn to_rollup_batches(
 
 #[cfg(test)]
 mod tests {
+
+    /// The rollup must be DEFINED BY CONFIG, not by code. This is the property
+    /// that makes it a continuous-aggregate feature rather than one hardcoded
+    /// table: the schema registry has to contain a rollup table synthesized
+    /// from the source's `rollups:` block, with the dimensions and measures
+    /// that block declares and types taken from the source's own columns.
+    #[test]
+    fn the_rollup_table_is_generated_from_the_source_tables_config() {
+        let src = crate::schema_loader::get_schema(SOURCE_TABLE).expect("source schema");
+        let spec = src.rollups.first().expect("otel_logs_and_spans must declare a rollup");
+        let generated = crate::schema_loader::get_schema(&spec.table_name(SOURCE_TABLE)).expect("the rollup table must be registered without a hand-written yaml");
+
+        let has = |n: &str| generated.fields.iter().any(|f| f.name == n);
+        for d in &spec.dimensions {
+            assert!(has(d), "declared dimension `{d}` missing from the generated table");
+        }
+        for m in &spec.measures {
+            assert!(has(&m.name), "declared measure `{}` missing from the generated table", m.name);
+        }
+        // Types are DERIVED from the source, which is the anti-drift property:
+        // a sum over an i64 column cannot silently become a string.
+        let src_ty = |n: &str| src.fields.iter().find(|f| f.name == n).map(|f| f.data_type.clone());
+        for m in spec.measures.iter().filter(|m| m.agg != "count") {
+            let col = m.column.as_deref().expect("non-count measure declares a column");
+            assert_eq!(generated.fields.iter().find(|f| f.name == m.name).map(|f| f.data_type.clone()), src_ty(col), "measure `{}` must keep the source column's type", m.name);
+        }
+        // Partitioning is inherited, so multi-tenant routing and date pruning
+        // work on the rollup exactly as on the source.
+        assert_eq!(generated.partitions, src.partitions);
+        // And a rollup is never version_append: buckets are rebuilt wholesale.
+        assert!(!generated.version_append);
+    }
+
+    /// The spec as DECLARED on the source table — tests exercise the real
+    /// configuration rather than a fixture that could drift from it.
+    fn declared_spec() -> crate::schema_loader::RollupSpec {
+        crate::schema_loader::get_schema(SOURCE_TABLE).expect("source schema").rollups.first().expect("a declared rollup").clone()
+    }
+
     use super::*;
 
     fn ask<'a>(group_by: &'a [String], filtered: &'a [String], aggregates: &'a [String], bucket: Option<i64>) -> Ask<'a> {
@@ -309,7 +365,7 @@ mod tests {
     #[test]
     fn the_traffic_panel_routes() {
         let (g, f, a) = (s(&[]), s(&["kind"]), s(&["count"]));
-        assert_eq!(route(&ask(&g, &f, &a, Some(3_600_000_000))), Ok(()));
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(3_600_000_000))), Ok(()));
     }
 
     /// A filter on a NON-dimension must refuse, even though every GROUP BY key
@@ -318,13 +374,13 @@ mod tests {
     #[test]
     fn a_filter_on_a_non_dimension_refuses_even_when_the_group_by_is_clean() {
         let (g, f, a) = (s(&["kind"]), s(&["attributes___url___path"]), s(&["count"]));
-        assert_eq!(route(&ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::UnknownFilter));
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::UnknownFilter));
     }
 
     #[test]
     fn a_non_dimension_group_by_refuses() {
         let (g, f, a) = (s(&["name"]), s(&[]), s(&["count"]));
-        assert_eq!(route(&ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::UnknownGroupBy));
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::UnknownGroupBy));
     }
 
     /// Exact percentiles do not re-aggregate. Answering them from stored
@@ -332,7 +388,7 @@ mod tests {
     #[test]
     fn a_non_decomposable_aggregate_refuses() {
         let (g, f, a) = (s(&[]), s(&[]), s(&["approx_percentile"]));
-        assert_eq!(route(&ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::NonDecomposableAggregate));
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Err(MissReason::NonDecomposableAggregate));
     }
 
     /// Finer than the grain cannot be reconstructed, and a width that is not a
@@ -340,10 +396,10 @@ mod tests {
     #[test]
     fn a_bucket_finer_than_the_grain_or_not_a_multiple_of_it_refuses() {
         let (g, f, a) = (s(&[]), s(&[]), s(&["count"]));
-        assert_eq!(route(&ask(&g, &f, &a, Some(30_000_000))), Err(MissReason::PartialBucket), "30s is finer than the 1m grain");
-        assert_eq!(route(&ask(&g, &f, &a, Some(90_000_000))), Err(MissReason::PartialBucket), "90s is not a whole number of buckets");
-        assert_eq!(route(&ask(&g, &f, &a, None)), Err(MissReason::PartialBucket), "an unbucketed aggregate has no whole-bucket guarantee");
-        assert_eq!(route(&ask(&g, &f, &a, Some(GRAIN_MICROS))), Ok(()), "the grain itself routes");
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(30_000_000))), Err(MissReason::PartialBucket), "30s is finer than the 1m grain");
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(90_000_000))), Err(MissReason::PartialBucket), "90s is not a whole number of buckets");
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, None)), Err(MissReason::PartialBucket), "an unbucketed aggregate has no whole-bucket guarantee");
+        assert_eq!(route(&declared_spec(), &ask(&g, &f, &a, Some(GRAIN_MICROS))), Ok(()), "the grain itself routes");
     }
 
     /// Rebuilding a partition must REPLACE its rows, not double every measure.
@@ -376,7 +432,7 @@ mod tests {
     /// two lists is a wrong answer, not a compile error.
     #[test]
     fn the_build_sql_covers_every_dimension_and_every_stored_measure() {
-        let sql = build_partition_sql("proj", "2026-08-01");
+        let sql = build_partition_sql(&declared_spec(), SOURCE_TABLE, "proj", "2026-08-01");
         for d in DIMENSIONS {
             assert!(sql.contains(d), "dimension {d} missing from the build");
         }

@@ -56,6 +56,7 @@ fn variant(name: &str, flatten: &str) -> FieldDef {
 
 fn small_table() -> TableSchema {
     TableSchema {
+        rollups: vec![],
         table_name: "t".into(),
         partitions: vec![],
         sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],

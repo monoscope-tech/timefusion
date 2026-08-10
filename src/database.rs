@@ -7656,27 +7656,33 @@ impl Database {
     /// duplicate-free partition) is correct and useful without the rollup. A
     /// missing bucket costs a raw scan — the same thing every query did before
     /// this table existed — so `route` simply finds nothing to serve.
-    async fn rebuild_rollup_partition(&self, project_id: &str, date: &str) {
-        let sql = crate::rollup::build_partition_sql(project_id, date);
-        let rows = match self.query_delta_only(&sql).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                warn!(project_id, date, "rollup build: aggregate failed, leaving the window to raw scans: {e}");
-                return;
+    /// Rebuilds EVERY rollup declared on `source`, so adding one is a schema
+    /// change and nothing here needs editing.
+    async fn rebuild_rollup_partition(&self, source: &str, project_id: &str, date: &str) {
+        let Some(schema) = get_schema(source) else { return };
+        for spec in &schema.rollups {
+            let target = spec.table_name(source);
+            let sql = crate::rollup::build_partition_sql(spec, source, project_id, date);
+            let rows = match self.query_delta_only(&sql).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!(project_id, date, target, "rollup build: aggregate failed, leaving the window to raw scans: {e}");
+                    continue;
+                }
+            };
+            let batches = match crate::rollup::to_rollup_batches(spec, source, project_id, date, &rows) {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(project_id, date, target, "rollup build: shaping failed: {e}");
+                    continue;
+                }
+            };
+            let written: usize = batches.iter().map(|b| b.num_rows()).sum();
+            match self.insert_records_batch(project_id, &target, batches, true, None).await {
+                Ok(_) => info!(project_id, date, target, rows = written, event = "rollup_partition_built"),
+                Err(e) => warn!(project_id, date, target, "rollup build: write failed: {e}"),
             }
-        };
-        let batches = match crate::rollup::to_rollup_batches(project_id, date, &rows) {
-            Ok(b) if !b.is_empty() => b,
-            Ok(_) => return,
-            Err(e) => {
-                warn!(project_id, date, "rollup build: shaping failed: {e}");
-                return;
-            }
-        };
-        let written: usize = batches.iter().map(|b| b.num_rows()).sum();
-        match self.insert_records_batch(project_id, crate::rollup::ROLLUP_TABLE, batches, true, None).await {
-            Ok(_) => info!(project_id, date, rows = written, event = "rollup_partition_built"),
-            Err(e) => warn!(project_id, date, "rollup build: write failed: {e}"),
         }
     }
 
@@ -7965,8 +7971,11 @@ impl Database {
                             // deterministic in bucket+dimensions), so re-running
                             // it for an already-built partition replaces its rows
                             // instead of doubling every measure.
-                            if table_name == crate::rollup::SOURCE_TABLE {
-                                self.rebuild_rollup_partition(pid, &date.to_string()).await;
+                            // Any table that DECLARES rollups gets them rebuilt
+                            // at its certification point — no table name is
+                            // special-cased here any more.
+                            if get_schema(table_name).is_some_and(|s| !s.rollups.is_empty()) {
+                                self.rebuild_rollup_partition(table_name, pid, &date.to_string()).await;
                             }
                         } else {
                             self.dedup_clean_fp.remove(&fp_key);
@@ -14443,6 +14452,7 @@ mod writer_properties_tests {
 
     fn schema_with(fields: Vec<FieldDef>, sort: Vec<&str>) -> TableSchema {
         TableSchema {
+            rollups: vec![],
             table_name: "t".into(),
             partitions: vec![],
             sorting_columns: sort.into_iter().map(|n| SortingColumnDef { name: n.into(), descending: false, nulls_first: false }).collect(),

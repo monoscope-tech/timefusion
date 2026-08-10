@@ -26,6 +26,7 @@ use timefusion::{
 
 fn table() -> TableSchema {
     TableSchema {
+        rollups: vec![],
         table_name: "logs".into(),
         partitions: vec![],
         sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
