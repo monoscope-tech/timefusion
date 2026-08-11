@@ -374,6 +374,8 @@ pub(crate) struct RollupRewrite {
     pub outer_projection: Option<Vec<datafusion::logical_expr::Expr>>,
     pub having: Option<datafusion::logical_expr::Expr>,
     pub wrappers: Vec<crate::rollup::PlanWrapper>,
+    /// Sort/Limit that sat BELOW the query's outer projection; re-applied there.
+    pub inner_wrappers: Vec<crate::rollup::PlanWrapper>,
     pub ticket: RollupReadTicket,
 }
 /// Per-physical-table count of flush/ingest committers QUEUED on the commit lock
@@ -3001,6 +3003,7 @@ impl Database {
             outer_projection: route.outer_projection,
             having: route.having,
             wrappers: route.wrappers,
+            inner_wrappers: route.inner_wrappers,
             ticket: RollupReadTicket(ticket),
         }))
     }

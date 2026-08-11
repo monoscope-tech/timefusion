@@ -366,8 +366,14 @@ pub(crate) struct RoutedRollup {
     /// A HAVING predicate to re-apply directly above the rewrite, below
     /// `outer_projection`. It references the aggregate's own output names.
     pub having: Option<datafusion::logical_expr::Expr>,
-    /// Sort/Limit peeled off the query root, outermost first.
+    /// Sort/Limit peeled off the query root, outermost first — re-applied ABOVE
+    /// `outer_projection`.
     pub wrappers: Vec<PlanWrapper>,
+    /// Sort/Limit peeled from BELOW the outer projection, where `ORDER BY <an
+    /// aggregate> LIMIT n` puts them. Re-applied under the projection, which is
+    /// where they were: hoisting them above it would sort and truncate a
+    /// different set of columns.
+    pub inner_wrappers: Vec<PlanWrapper>,
     row_filters: Vec<String>,
     /// `(expression, output alias)`. Every expression is valid, and means the
     /// same thing, on BOTH tables — which is what lets the union share them.
@@ -814,6 +820,7 @@ pub(crate) async fn match_aggregates(
     // hand them back for the caller to re-apply above the rewrite — matching
     // only a bare aggregate root would leave the feature inert in production.
     let mut wrappers = Vec::new();
+    let mut inner_wrappers = Vec::new();
     let mut plan = plan;
     while let Some((wrapper, input)) = PlanWrapper::peel(plan) {
         wrappers.push(wrapper);
@@ -824,7 +831,18 @@ pub(crate) async fn match_aggregates(
         Some((aggregate, having)) => (aggregate, having, None, None),
         None => {
             let LogicalPlan::Projection(projection) = plan else { return decline(plan).map(Vec::from_iter) };
-            let Some((aggregate, having)) = aggregate_with_having(&projection.input) else { return decline(plan).map(Vec::from_iter) };
+            // `ORDER BY <an aggregate> LIMIT n` puts the Sort BELOW the outer
+            // projection, because the sort key has to still exist when the sort
+            // runs and is dropped afterwards. Root-only peeling therefore hit
+            // `Projection(Limit(Sort(Aggregate)))` and declined the single most
+            // common dashboard shape there is. These wrappers are re-applied
+            // UNDER the projection, which is where they were.
+            let mut inner = &*projection.input;
+            while let Some((wrapper, input)) = PlanWrapper::peel(inner) {
+                inner_wrappers.push(wrapper);
+                inner = input;
+            }
+            let Some((aggregate, having)) = aggregate_with_having(inner) else { return decline(plan).map(Vec::from_iter) };
             // The output names are absorbed into the rewrite's SELECT aliases
             // POSITIONALLY, so that is only valid when the projection passes
             // every aggregate output through in order. Two things break it:
@@ -868,6 +886,7 @@ pub(crate) async fn match_aggregates(
                     outer_projection.clone().map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>()).transpose()?;
                 route.having = having.clone().map(unqualified).transpose()?;
                 route.wrappers = wrappers.clone();
+                route.inner_wrappers = inner_wrappers.clone();
                 routes.push(route);
             }
             // Report the FIRST spec's reason: it is the one the operator most
@@ -1046,6 +1065,7 @@ async fn route_with_spec(
         outer_projection: None,
         having: None,
         wrappers: Vec::new(),
+        inner_wrappers: Vec::new(),
         row_filters,
         groups,
         measures,
@@ -1395,6 +1415,38 @@ mod tests {
         let generated = generated_sql(&route);
         assert!(!generated.contains("timestamp) AS \"c\""), "the bucket must not be aliased with a measure's name: {generated}");
         let plan = state.create_logical_plan(&generated).await.expect("parse rewrite");
+        let plan = match route.outer_projection {
+            Some(expr) => datafusion::logical_expr::LogicalPlan::Projection(
+                datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan)).expect("reapply projection"),
+            ),
+            None => plan,
+        };
+        PlanWrapper::rewrap(route.wrappers, plan).schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// `ORDER BY <an aggregate> LIMIT n` puts the Sort BELOW the outer
+    /// projection — the sort key must still exist when the sort runs, and is
+    /// dropped after — so the optimized root is
+    /// `Projection(Limit(Sort(Aggregate)))`. Peeling only at the root declined
+    /// it, and prod's `rollup_declined_shape` log showed this exact plan for the
+    /// most common dashboard query there is.
+    #[tokio::test]
+    async fn a_sort_below_the_outer_projection_is_peeled_and_reapplied_there() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT COUNT(*) AS c, avg(duration)::BIGINT AS m FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} \
+             GROUP BY time_bucket('1 hours', timestamp) ORDER BY 1 DESC LIMIT 2"
+        );
+        let original = optimized(&state, &sql).await;
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        // WHERE the optimizer puts the Sort depends on the session's analyzer
+        // rules — a pgwire session nests it under the projection, a bare one
+        // does not — so the invariant is that it is peeled from wherever it is
+        // and the plan reassembles, not which of the two lists it lands in.
+        assert!(!route.wrappers.is_empty() || !route.inner_wrappers.is_empty(), "the Sort/Limit must be peeled from somewhere, not declined");
+
+        let plan = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rewrite");
+        let plan = PlanWrapper::rewrap(route.inner_wrappers, plan);
         let plan = match route.outer_projection {
             Some(expr) => datafusion::logical_expr::LogicalPlan::Projection(
                 datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan)).expect("reapply projection"),

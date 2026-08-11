@@ -146,7 +146,7 @@ impl QueryPlanner for DmlQueryPlanner {
             return Ok(exec);
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
-            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, outer_projection, having, wrappers, ticket })) => {
+            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, outer_projection, having, wrappers, inner_wrappers, ticket })) => {
                 let rewritten = async {
                     let plan = session_state.create_logical_plan(&sql).await?;
                     // HAVING first: it sits directly above the aggregate and
@@ -158,6 +158,10 @@ impl QueryPlanner for DmlQueryPlanner {
                         Some(predicate) => LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(predicate, Arc::new(plan))?),
                         None => plan,
                     };
+                    // Order matters: these sat UNDER the projection in the
+                    // original plan, so re-applying them above it would sort and
+                    // truncate a different set of columns.
+                    let plan = crate::rollup::PlanWrapper::rewrap(inner_wrappers, plan);
                     let plan = match outer_projection {
                         Some(expr) => LogicalPlan::Projection(datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan))?),
                         None => plan,
