@@ -184,3 +184,75 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
 
     Ok(())
 }
+
+/// A repair pass must not end because ONE of a project's candidates turned out
+/// to be fine.
+///
+/// Admission offers every un-verified sealed file as a suspect — the
+/// `delta-rs.optimize.sort_by` tag lies, so only the footer decides — which
+/// means a project's next candidate is usually a correctly-sorted file rather
+/// than poison. Clearing it leaves that project with no bin, and without a
+/// RE-SELECT it drops out of the wave engine's `pending` set for the whole
+/// PASS rather than the wave.
+///
+/// Prod 2026-08-10, project 87576849 (663 footer-less files interleaved with
+/// ~450 sorted ones): every repair pass ended in ~14s having repaired ~1 file,
+/// with `planned=6 completed=6 brakes=0` and its 8640s budget untouched — the
+/// pass was ending on an EMPTY PLAN, not on waves or time. Fixed in d50cedc by
+/// sharing `reselect_until_real_work` between both call sites.
+///
+/// SCOPE: this pins the walk — one pass clears EVERY sorted suspect in the
+/// partition, not one per pass. It does not isolate the per-wave re-plan call
+/// site specifically, because manufacturing a genuinely footer-less file needs
+/// a hand-written parquet (the flush path escalates to a pooled sort rather
+/// than skipping, so `with_sort_skip_bytes(0)` no longer produces one).
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyhow::Result<()> {
+    let sec = 1_000_000i64;
+    // Yesterday: repair only scans SEALED dates (today belongs to packing).
+    let yesterday = FROZEN_START_MICROS - 24 * 3600 * sec;
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(60))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_optimize_sort_by()
+        // Converged, so nothing but repair would ever look at these files.
+        .with_light_optimize_target(1024)
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+
+    // Four separate flushes -> four untagged suspects in one sealed partition.
+    const SUSPECTS: usize = 4;
+    for b in 0..SUSPECTS as i64 {
+        for i in 0..3i64 {
+            insert_at(&client, &format!("s-{b}-{i}"), yesterday + (b * 300 + i * 20) * sec).await?;
+        }
+        env.force_flush().await?;
+        clock::set_micros(FROZEN_START_MICROS);
+    }
+
+    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let before = {
+        let t = table_ref.read().await;
+        t.snapshot()?.log_data().iter().count()
+    };
+    assert!(before >= SUSPECTS, "fixture must produce at least {SUSPECTS} suspects, got {before}");
+
+    env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair).await?;
+
+    // The verified-sorted set is what admission consults, and it is persisted —
+    // so it is also the thing a pass that gave up early leaves half-written.
+    let verified = std::fs::read_to_string(env.data_dir.join("repair_verified_sorted.txt")).unwrap_or_default();
+    let cleared = verified.lines().filter(|l| !l.trim().is_empty()).count();
+    assert!(
+        cleared >= before,
+        "one pass must walk PAST each cleared suspect to the next: cleared {cleared} of {before}. \
+         Stopping at the first is how a 663-file backlog moved ~1 file per pass. file={verified:?}"
+    );
+
+    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(count, (SUSPECTS as i64) * 3, "verification must not touch data");
+
+    Ok(())
+}

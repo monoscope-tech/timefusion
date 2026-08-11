@@ -332,6 +332,13 @@ impl E2eEnv {
         E2eEnvBuilder::default()
     }
 
+    /// Flush sort budget for the NEXT `restart()`. Toggling it mid-test is the
+    /// only way to build the shape footer repair actually walks in prod: ONE
+    /// partition holding both poisoned and correctly-sorted-but-untagged files.
+    pub fn set_sort_skip_bytes(&mut self, bytes: usize) {
+        self.builder.sort_skip_bytes = Some(bytes);
+    }
+
     fn bootstrapped(&self) -> &Bootstrapped {
         self.bootstrapped.as_ref().expect("E2eEnv was already shut down via restart()")
     }

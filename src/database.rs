@@ -262,6 +262,7 @@ impl ScanMetrics {
     /// bound at all), while `pre_skip` true with no skip means a leg refused one that was —
     /// overwhelmingly a MemBuffer leg, which cannot skip. The two have different fixes and the
     /// aggregate hides which one you have.
+    #[allow(clippy::too_many_arguments)] // one flag per counter; a struct would just rename them
     pub fn record_scan(
         &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool, pre_skip: bool,
     ) {
@@ -2234,6 +2235,14 @@ pub struct Database {
     /// this so an overloaded box degrades to "every project within k ticks"
     /// instead of forever re-serving the same debt-ordered prefix.
     light_optimize_cursor: Arc<std::sync::atomic::AtomicUsize>,
+    /// Repair bins currently sorting. Packing shares the light pool with them
+    /// and is sized as if every sort fitted `PER_SORT_BUDGET_BYTES` (4 GiB); a
+    /// whale footer-repair sort measured **14.4 GB** of the 15.4 GB pool
+    /// (`ExternalSorter` 7.4 GB + its unspillable `ExternalSorterMerge` 7.0 GB,
+    /// prod 2026-08-11 09:15). Three concurrent packing bins then held ~0.9 GB
+    /// and the next 162.8 MB ask died with 139.1 MB left — killing the repair
+    /// bin, not the packing one. See `light_optimize_brake`.
+    repair_bins_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Database {
@@ -2624,6 +2633,7 @@ impl Database {
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            repair_bins_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
 
@@ -8801,7 +8811,9 @@ impl Database {
         // that never crosses a wave boundary, so the wave-level brake could
         // not stop it — prod 2026-07-30 04:31 OOM-killed at 112GB anon with
         // memory_brakes_total=0 while a drain pass rode RSS up unbraked.
-        !self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) && self.light_optimize_brake().is_none()
+        // `Repair` only to opt out of the packing-specific light-pool guard: the
+        // dedup drain runs on the HEAVY pool, so a repair sort is not its rival.
+        !self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) && self.light_optimize_brake(TailPass::Repair).is_none()
     }
 
     /// Order one drain pass and split off the work it will not do.
@@ -9606,7 +9618,7 @@ impl Database {
                 let resume = remaining.first().and_then(|p| order_index.get(p).copied()).unwrap_or(0);
                 self.light_optimize_cursor.store(resume, Relaxed);
             },
-            || self.light_optimize_brake(),
+            || self.light_optimize_brake(pass),
             // Repair commits per bin: its bins are few and minutes long, so a
             // restart mid-wave must not discard the ones already finished.
             pass == TailPass::Repair,
@@ -9683,6 +9695,10 @@ impl Database {
                         // error path) accounts for it.
                         return (project_id, Ok(BinOutcome::Converged));
                     }
+                    // Publish the sort while it runs so the packing pass can see
+                    // it and stand down (see `light_optimize_brake`). The guard
+                    // decrements on every exit path including the timeout.
+                    let _in_flight = (pass == TailPass::Repair).then(|| InFlightGuard::enter(&self.repair_bins_in_flight));
                     let staged = match tokio::time::timeout(left, self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, pass)).await {
                         Ok(staged) => staged,
                         Err(_) => Err(anyhow::anyhow!("hot bin staging exceeded the {left:?} left in the tick budget")),
@@ -10759,8 +10775,17 @@ impl Database {
     /// bounded by the tick deadline — a full stop there starves compaction
     /// indefinitely, which degrades reads and merges. Memory near the cgroup
     /// limit is an imminent OOM: hard STOP.
-    fn light_optimize_brake(&self) -> Option<Brake> {
+    fn light_optimize_brake(&self, pass: TailPass) -> Option<Brake> {
         use std::sync::atomic::Ordering::Relaxed;
+        // A repair sort takes the light pool almost whole (see
+        // `repair_bins_in_flight`), so packing's k — derived from a 4 GiB
+        // `PER_SORT_BUDGET_BYTES` that the repair sort exceeds 3.6x — is a
+        // fiction while one is running. Degrade, don't Stop: packing keeps a
+        // service floor of one bin, because starving it is how partitions grow
+        // to 50-65 files and poison the very footers repair is here to fix.
+        if pass == TailPass::Pack && self.repair_bins_in_flight.load(Relaxed) > 0 {
+            return Some(Brake::Degrade("repair_holds_light_pool"));
+        }
         if let Some(stale_buckets) = self.buffered_layer().map(|layer| layer.stale_unflushed_bucket_count()).filter(|count| *count > 0) {
             info!(stale_buckets, event = "light_optimize_flush_debt_yield");
             crate::metrics::maintenance_stats().light_optimize_flush_debt_yields.fetch_add(1, Relaxed);
@@ -12865,18 +12890,6 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     files
 }
 
-/// One commit per bin, or one for the whole wave. See the call site: batching is
-/// a throughput optimisation for packing and a durability liability for repair.
-fn staged_chunks<T>(staged: Vec<T>, per_bin: bool) -> Vec<Vec<T>> {
-    match per_bin {
-        true => staged.into_iter().map(|bin| vec![bin]).collect(),
-        false => match staged.is_empty() {
-            true => vec![],
-            false => vec![staged],
-        },
-    }
-}
-
 #[cfg(test)]
 mod repair_order_tests {
     /// Across projects, repair serves the most RECENT poison first.
@@ -12992,26 +13005,6 @@ mod repair_batch_tests {
     }
 }
 
-#[cfg(test)]
-mod staged_chunk_tests {
-    /// Repair commits per bin; packing commits once per wave.
-    ///
-    /// Wave batching is why wave commits are ~40x rarer than the per-bin
-    /// commits they replaced (2026-07-29: ~130 commits a tick drove OCC ladders
-    /// to attempt 9-20). Right for packing — many quick bins. Wrong for repair —
-    /// few bins, minutes each — where it holds every finished rewrite hostage to
-    /// the slowest one, so a deploy or a healthcheck restart discards the whole
-    /// wave instead of just the bin in flight. Prod 2026-08-08 lost entire
-    /// passes that way twice in one morning.
-    #[test]
-    fn repair_commits_each_bin_separately_so_a_restart_loses_only_one() {
-        assert_eq!(super::staged_chunks(vec!["a", "b", "c"], true), vec![vec!["a"], vec!["b"], vec!["c"]], "repair: one commit per bin");
-        assert_eq!(super::staged_chunks(vec!["a", "b", "c"], false), vec![vec!["a", "b", "c"]], "packing: one commit per wave");
-        // An empty wave must not produce a commit call in either mode.
-        assert!(super::staged_chunks(Vec::<&str>::new(), false).is_empty());
-        assert!(super::staged_chunks(Vec::<&str>::new(), true).is_empty());
-    }
-}
 
 /// Split staged bins into (committable, stale) against the live file set of the
 /// refreshed snapshot. One conflicting file used to fail one commit of one bin;
@@ -13072,6 +13065,23 @@ enum BinOutcome<T> {
     /// Selection went stale (concurrent rewrite); keep the project pending so
     /// the next round's re-plan serves it a fresh bin.
     Retry,
+}
+
+/// Decrement-on-drop counter, so a bin that times out or panics still clears
+/// its slot — a leaked count would degrade packing for the process's lifetime.
+struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> InFlightGuard<'a> {
+    fn enter(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A wave-boundary safety brake. Two levels: `Degrade` keeps a SERVICE FLOOR
@@ -13142,27 +13152,38 @@ where
         // Deferred projects stay `pending`, so the next round's boundary check
         // truncates the tick and rotates the cursor exactly as a brake there
         // would have.
-        let outcomes: Vec<(String, Result<BinOutcome<T>>)> = futures::stream::iter(std::mem::take(&mut pending))
-            .map(|project_id| {
-                let (op, deferred) = (&op, matches!(should_pause(), Some(Brake::Stop(_))));
-                async move {
-                    match deferred {
-                        true => (project_id, Ok(BinOutcome::Retry)),
-                        false => op(project_id, round).await,
+        let mut outcomes = std::pin::pin!(
+            futures::stream::iter(std::mem::take(&mut pending))
+                .map(|project_id| {
+                    let (op, deferred) = (&op, matches!(should_pause(), Some(Brake::Stop(_))));
+                    async move {
+                        match deferred {
+                            true => (project_id, Ok(BinOutcome::Retry)),
+                            false => op(project_id, round).await,
+                        }
                     }
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+                })
+                .buffer_unordered(concurrency)
+        );
         // Carry forward projects that still have work; converged or failed
         // projects drop out for the rest of the tick.
-        let mut staged = Vec::with_capacity(outcomes.len());
-        for (project_id, outcome) in outcomes {
+        let (mut staged, mut staged_seen) = (Vec::new(), 0usize);
+        while let Some((project_id, outcome)) = outcomes.next().await {
             match outcome {
                 Ok(BinOutcome::Staged(bin)) => {
-                    staged.push(bin);
+                    staged_seen += 1;
                     pending.push(project_id);
+                    // Per-bin commits must also be per-bin in TIME. Collecting
+                    // the round first made a finished bin wait on its slowest
+                    // sibling, and a repair round's siblings are minutes apart —
+                    // so a restart mid-round threw away rewrites that were
+                    // already complete on S3. Prod 2026-08-10/11: EVERY tier
+                    // drop arrived via `staged_intent_resumed` on a LATER pass,
+                    // never from a bin that staged and committed in one.
+                    match commit_each_bin {
+                        true => failed += commit_wave(vec![bin], round).await,
+                        false => staged.push(bin),
+                    }
                 }
                 Ok(BinOutcome::Retry) => pending.push(project_id),
                 Ok(BinOutcome::Converged) => {}
@@ -13186,23 +13207,15 @@ where
         // this line bisects the only two remaining stories: `staged=0` means the
         // outcome was not `Staged` after all, and a resume that logged but did
         // not arrive here means the round's future was dropped (cancelled)
-        // before `collect()` returned. Generic over `T`, so it counts bins
+        // before the stream drained. Generic over `T`, so it counts bins
         // rather than naming them — `wave_commit_enter` supplies the wave_ids.
-        info!(round, staged = staged.len(), pending = pending.len(), failed, event = "round_staged");
-        // A wave normally commits ONCE, which is what made wave commits ~40x
+        info!(round, staged = staged_seen, pending = pending.len(), failed, event = "round_staged");
+        // Packing commits ONCE per wave, which is what made wave commits ~40x
         // rarer than the per-bin commits they replaced (2026-07-29: ~130 commits
-        // a tick drove OCC ladders to attempt 9-20). That batching is right for
-        // packing, whose bins are many and quick.
-        //
-        // Repair is the opposite shape and the batching hurts it twice over:
-        // its bins are FEW and each is minutes long, so per-bin commits cost a
-        // handful of extra commits per tick rather than a hundred; and holding
-        // every finished bin hostage until the slowest one lands means a restart
-        // — a deploy, or the healthcheck replacing the task — throws away every
-        // completed rewrite in the wave, not just the one in flight. Prod
-        // 2026-08-08 lost whole passes that way twice in one morning.
-        for chunk in staged_chunks(staged, commit_each_bin) {
-            failed += commit_wave(chunk, round).await;
+        // a tick drove OCC ladders to attempt 9-20). Right for packing, whose
+        // bins are many and quick; repair committed each bin as it arrived above.
+        if !staged.is_empty() {
+            failed += commit_wave(staged, round).await;
         }
     }
     failed
@@ -17182,6 +17195,99 @@ mod tests {
             ],
             "expected round-robin, got a per-project drain"
         );
+    }
+
+    /// A repair bin that times out or panics must still clear its slot: a leaked
+    /// count degrades packing to concurrency 1 for the rest of the process.
+    #[test]
+    fn an_in_flight_repair_slot_clears_even_when_the_bin_unwinds() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let counter = AtomicUsize::new(0);
+        {
+            let _guard = super::InFlightGuard::enter(&counter);
+            assert_eq!(counter.load(Relaxed), 1, "packing must be able to SEE the sort while it runs");
+        }
+        assert_eq!(counter.load(Relaxed), 0);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = super::InFlightGuard::enter(&counter);
+            panic!("bin exploded");
+        });
+        assert_eq!(counter.load(Relaxed), 0, "a panicking bin left the slot held");
+    }
+
+    /// Repair bins are minutes apart, so a round that collected every outcome
+    /// before committing held finished rewrites hostage to the slowest sibling
+    /// — and a restart mid-round (deploy, or the ~2-hourly healthcheck kill)
+    /// discarded them all. Prod 2026-08-10/11: every whale tier drop arrived via
+    /// `staged_intent_resumed` on a LATER pass, never from a bin that staged and
+    /// committed in one.
+    ///
+    /// The slow bin only finishes once the fast bin's commit has RUN, so a
+    /// collect-then-commit implementation cannot finish this test at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_repair_bin_commits_without_waiting_for_its_slow_sibling() {
+        let (committed, gate) = (std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new())), std::sync::Arc::new(tokio::sync::Notify::new()));
+        let (seen, release) = (committed.clone(), gate.clone());
+        let run = super::round_robin_bins(
+            vec!["fast".into(), "slow".into()],
+            1,
+            2,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            |_, _| {},
+            || None,
+            true,
+            |project_id, _round| {
+                let gate = gate.clone();
+                async move {
+                    if project_id == "slow" {
+                        gate.notified().await;
+                    }
+                    (project_id.clone(), Ok(super::BinOutcome::Staged(project_id)))
+                }
+            },
+            |bins: Vec<String>, _round| {
+                let (seen, release) = (seen.clone(), release.clone());
+                async move {
+                    seen.lock().unwrap().push(bins);
+                    release.notify_one();
+                    0
+                }
+            },
+        );
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(10), run).await.expect("a finished bin must commit while its sibling is still staging");
+        assert_eq!(failed, 0);
+        assert_eq!(*committed.lock().unwrap(), vec![vec!["fast".to_string()], vec!["slow".to_string()]], "one commit per bin, in completion order");
+    }
+
+    /// The other half of the trade: packing bins are many and quick, and one
+    /// commit per bin drove OCC ladders to attempt 9-20 (2026-07-29). Packing
+    /// must still land the whole wave in a single call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn packing_still_commits_the_whole_wave_in_one_call() {
+        let committed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let seen = committed.clone();
+        let failed = super::round_robin_bins(
+            vec!["a".into(), "b".into(), "c".into()],
+            1,
+            3,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            |_, _| {},
+            || None,
+            false,
+            |project_id, _round| async move { (project_id.clone(), Ok(super::BinOutcome::Staged(project_id))) },
+            |bins: Vec<String>, _round| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(bins);
+                    0
+                }
+            },
+        )
+        .await;
+        assert_eq!(failed, 0);
+        let committed = committed.lock().unwrap();
+        assert_eq!(committed.len(), 1, "packing commits ONCE per wave, got {} calls", committed.len());
+        assert_eq!(committed[0].len(), 3, "all three bins in the one commit");
     }
 
     /// A dedup-raced bin (`Retry`) must NOT silence the project for the tick:
