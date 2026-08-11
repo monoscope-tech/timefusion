@@ -256,3 +256,58 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
 
     Ok(())
 }
+
+/// Two tables must not repair at the same time.
+///
+/// `round_robin_bins` serialises repair WITHIN a table (concurrency
+/// `(k/2).max(1)` = 1), and `REPAIR_SORT_PARTITIONS` is justified by "repair
+/// runs exactly ONE bin at a time" — but the light pool is shared by every
+/// table, so that was only ever true per table. Prod 2026-08-11 11:30:
+/// `otel_metrics` and `otel_logs_and_spans` repaired concurrently and the pool
+/// held two sorts (`ExternalSorter#36474` at 13.6 GB plus a second merge at
+/// 1245 MB), killing a 981 MB bin with 2.1 MB left of a 15.4 GB pool.
+///
+/// The loser must SKIP its tick, not queue: a repair pass owns a 144-minute
+/// budget, so blocking would stall the other table for hours.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool() -> anyhow::Result<()> {
+    let sec = 1_000_000i64;
+    let yesterday = FROZEN_START_MICROS - 24 * 3600 * sec;
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(60))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_optimize_sort_by()
+        .with_light_optimize_target(1024)
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+    for b in 0..4i64 {
+        for i in 0..3i64 {
+            insert_at(&client, &format!("x-{b}-{i}"), yesterday + (b * 300 + i * 20) * sec).await?;
+        }
+        env.force_flush().await?;
+        clock::set_micros(FROZEN_START_MICROS);
+    }
+
+    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let before = timefusion::metrics::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Same table twice is the same contention the two tables have: one
+    // process-wide permit, two concurrent passes.
+    let (a, b) = tokio::join!(
+        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair),
+        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair),
+    );
+    a?;
+    b?;
+    let yielded = timefusion::metrics::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert_eq!(yielded, 1, "exactly one of two overlapping repair passes must yield the permit, got {yielded}");
+
+    // And the permit must be RELEASED: a later pass still runs.
+    env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair).await?;
+    let after = timefusion::metrics::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert_eq!(after, 1, "the permit leaked — a pass that ran alone still yielded");
+
+    Ok(())
+}

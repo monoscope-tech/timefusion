@@ -546,6 +546,15 @@ atomic_stats! {
     /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
     /// outrunning flush often enough that compaction is running at the floor.
     light_optimize_ticks_degraded,
+    /// Repair ticks skipped because ANOTHER table's repair pass already held the
+    /// process-wide permit. The light pool is shared across tables while the
+    /// wave engine's concurrency cap is per-table, so before this guard two
+    /// repair sorts could co-exist and starve each other (prod 2026-08-11 11:30,
+    /// `otel_metrics` vs `otel_logs_and_spans`, a 981 MB bin lost with 2.1 MB
+    /// left of 15.4 GB). Chronic nonzero = repair is contended, not broken; a
+    /// permanently-zero repair backlog on one table while this climbs means the
+    /// other table is monopolising the permit.
+    repair_ticks_yielded,
     /// Dashboard aggregates served from a rollup, split by how much of the
     /// window the rollup owned. The OTel counters carry the same numbers but
     /// cannot be read back in-process, and these two are the only signal that

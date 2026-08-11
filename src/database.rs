@@ -2245,6 +2245,16 @@ pub struct Database {
     /// and the next 162.8 MB ask died with 139.1 MB left — killing the repair
     /// bin, not the packing one. See `light_optimize_brake`.
     repair_bins_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// One repair pass at a time, PROCESS-WIDE.
+    ///
+    /// `round_robin_bins` already serialises repair within a table (concurrency
+    /// `(k/2).max(1)` = 1), and `REPAIR_SORT_PARTITIONS` is justified by "repair
+    /// runs exactly ONE bin at a time" — but that was only ever true per TABLE,
+    /// while the light pool is shared by every table. Prod 2026-08-11 11:30:
+    /// `otel_metrics` and `otel_logs_and_spans` repaired concurrently and the
+    /// pool held TWO sorts (`ExternalSorter#36474` 13.6 GB + a second merge
+    /// `#61345` at 1245 MB), killing a 981 MB bin with 2.1 MB left of 15.4 GB.
+    repair_pass_permit: Arc<tokio::sync::Semaphore>,
 }
 
 impl Database {
@@ -2636,6 +2646,7 @@ impl Database {
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_bins_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
 
@@ -9498,6 +9509,23 @@ impl Database {
         // makes the whole pass unreachable from the virtual-time e2e harness —
         // which is why this path had no end-to-end coverage and shipped writing
         // every output unsorted. In production the clock IS the wall clock.
+        // Take the process-wide repair permit FIRST — before planning, not just
+        // before staging. Two tables' repair passes otherwise duplicate the
+        // suspect walk and then both stage into one shared light pool. Held for
+        // the pass and released on every exit path; `try_acquire` rather than
+        // `acquire` so the loser SKIPS its tick instead of queueing behind a
+        // 144-minute budget. See `repair_pass_permit`.
+        let _repair_permit = match pass {
+            TailPass::Pack => None,
+            TailPass::Repair => match Arc::clone(&self.repair_pass_permit).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    crate::metrics::maintenance_stats().repair_ticks_yielded.fetch_add(1, Relaxed);
+                    info!(table_name, event = "repair_pass_yielded_to_another_table");
+                    return Ok(());
+                }
+            },
+        };
         let today = chrono::DateTime::from_timestamp_micros(crate::clock::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let today_str = today.to_string();
         let repair_dates = self.repair_dates(today, pass);
