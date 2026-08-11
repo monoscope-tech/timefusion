@@ -13005,7 +13005,6 @@ mod repair_batch_tests {
     }
 }
 
-
 /// Split staged bins into (committable, stale) against the live file set of the
 /// refreshed snapshot. One conflicting file used to fail one commit of one bin;
 /// with a batched wave commit, dropping only the stale bin's actions keeps the
@@ -17254,7 +17253,8 @@ mod tests {
                 }
             },
         );
-        let failed = tokio::time::timeout(std::time::Duration::from_secs(10), run).await.expect("a finished bin must commit while its sibling is still staging");
+        let failed =
+            tokio::time::timeout(std::time::Duration::from_secs(10), run).await.expect("a finished bin must commit while its sibling is still staging");
         assert_eq!(failed, 0);
         assert_eq!(*committed.lock().unwrap(), vec![vec!["fast".to_string()], vec!["slow".to_string()]], "one commit per bin, in completion order");
     }
