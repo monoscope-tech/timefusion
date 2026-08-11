@@ -1,6 +1,8 @@
 # Making dedup certification survive — measure before you build
 
-**Status:** **Phase 0 is built and shipped** (`feat(stats): split the dedup-skip denial by
+**Status:** **Phase 0 and Phase 1 are built.** Phase 1 is shipped dark behind
+`timefusion_dedup_certification_persist` (default off) and must not be enabled until Phase 0
+has been read — see "Turning it on". Phase 0 itself is shipped (`feat(stats): split the dedup-skip denial by
 cause…`). Nothing to write until it has been read — see "Reading Phase 0" below. Nobody
 should write Phase 1 code until Phase 0 returns a number.
 
@@ -198,7 +200,54 @@ dates and `never_certified` to dominate for sealed ones — i.e. the win is avai
 historical windows, which are the least latency-sensitive queries we serve. If that is what
 comes back, the correct decision is to stop.
 
-## Phase 1 — options, only if Phase 0 justifies it
+## Phase 1 — BUILT, and OFF
+
+Both levers are implemented and shipped dark. Neither changes behaviour until
+`timefusion_dedup_certification_persist` is turned on, except the sweep fix, which is
+unconditional because it is a correctness-shaped bug rather than an optimisation.
+
+**The sweep fix (finding 3) is on.** `dedup_today_partitions` no longer records the table
+version after a pass that dropped rows, so the confirming 0-drop pass runs off the back of the
+rewrite instead of waiting for an unrelated commit. Covered by
+`a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit`. **Read Phase 0 again
+after this has been live for a day before judging persistence** — it may move
+`never_certified` on its own, and if it does, the persistence layer below is solving a problem
+that no longer exists at the measured size.
+
+**Persistence is built as option A, adapted, and defaults OFF.** `src/certification_store.rs`
+snapshots `dedup_clean_fp` to the data dir at the end of each sweep and reloads it at boot.
+
+*Deviation from the A3 recommendation above, deliberately.* A3 proposed object-store markers
+with a lazy read on first miss. The lazy read is the problem: `dedup_window_clean` is
+synchronous and sits on the scan planning path, so a first-miss GET would put object-store
+latency in front of the 99.5% of scans that are *not* certified — paying on the common path to
+speed up the rare one. Making it async instead would push that await onto every scan. So this
+persists to `timefusion_data_dir` (a persistent volume; the same place
+`dirty_bin_queue` already keeps cross-restart state, and the same tmp+rename helper), which is
+a local file read at boot and no IO at all on the read path.
+
+What that gives up is sharing between replicas. TF runs one instance per box, and a
+certification is about a partition's file list — so a marker written by another replica would
+be valid, just unavailable. If TF ever runs multi-replica AND Phase 0 says the prize is large,
+promote the store to option A3's object-store keys; the seam is `certification_store::{load,
+store}` and nothing else has to change.
+
+**The safety property that makes this cheap:** loading cannot widen certification. A reloaded
+entry passes the same `partition_file_fp` equality check against the live file list as an
+in-memory one, so a stale, truncated, or corrupted file costs a skip and can never grant a
+wrong one. That is why this is a snapshot-and-reload rather than a transaction.
+
+Covered by `a_certification_survives_a_restart_and_still_grants_the_skip` — which fails with
+the flag off, so it is testing persistence and not something incidental.
+
+### Turning it on
+
+Read the Phase 0 rows first. If `dedup_denied_fp_moved` dominates, **leave it off** and close
+this out: partitions are being written to continuously and no store recovers that. Only if
+`never_certified` still dominates *after* the sweep fix has been live for a day is there
+anything for persistence to recover.
+
+## Phase 1 — the options as originally written
 
 ### A. Persist the fingerprint
 
@@ -263,8 +312,17 @@ The complement to A, not an alternative. Without A there is nothing to warm from
     building a scan, so it exercises neither `DedupExec` nor the skip. Count the rows a
     projection returns instead;
   - **a commit between the two sweeps** — see finding (3) above.
-- Add a restart test: certify, drop and rebuild the `Database`, and assert the skip still
-  fires. That is the whole point of Phase 1 and nothing currently covers it.
+- The restart test now exists: `a_certification_survives_a_restart_and_still_grants_the_skip`
+  certifies, drops the `Database`, rebuilds it over the same data dir and asserts the skip
+  still fires. It fails with `timefusion_dedup_certification_persist` off, which is what makes
+  it a test of persistence rather than of something incidental.
+- `count_pushdown_declines_where_tombstones_are_possible` used to assert `DedupExec` survived.
+  It held only while the partition happened never to be certified; once it is, the read-side
+  skip legitimately removes `DedupExec` and the tombstone filter — which sits outside dedup —
+  still gives the right answer. It now asserts a real scan survives, which is what
+  "count_pushdown declined" actually means. Worth knowing about, because anything that raises
+  the certification rate will trip assertions written against the operator rather than the
+  answer.
 
 ## Files
 

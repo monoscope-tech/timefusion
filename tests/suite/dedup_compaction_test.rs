@@ -1954,6 +1954,53 @@ async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Re
     Ok(())
 }
 
+/// A certification must survive the process (`timefusion_dedup_certification_persist`).
+///
+/// This is the whole point of persisting them: `dedup_clean_fp` is process-local
+/// and TF deploys several times a day, so the read-side skip spends much of its
+/// life starting from cold. Nothing covered a restart before, which is exactly
+/// how the cache could stay useless without any test noticing.
+#[serial]
+#[tokio::test]
+async fn a_certification_survives_a_restart_and_still_grants_the_skip() -> Result<()> {
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let cfg = {
+        let mut cfg = (*TestConfigBuilder::new("cert_restart").with_buffer_mode(BufferMode::Enabled).build()).clone();
+        cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+        cfg.maintenance.timefusion_dedup_certification_persist = true;
+        Arc::new(cfg)
+    };
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let sql = format!(
+        "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+         AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({})",
+        ts - 1,
+        ts + 1_000
+    );
+
+    {
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        let batch = json_to_batch((0..40).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect())?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        assert_eq!(db.scan_metrics.cert_granted_total.load(std::sync::atomic::Ordering::Relaxed), 1, "the sweep must certify before a restart can carry it");
+    }
+
+    // A brand-new Database over the same data dir — a deploy, in miniature. Its
+    // `dedup_clean_fp` starts empty and is filled only from what was persisted.
+    let db = Arc::new(Database::with_config(cfg).await?);
+    db.query_delta_only(&sql).await?; // warm `try_fast_resolve`; cold it declines as Unresolved
+    let before = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed);
+    db.query_delta_only(&sql).await?;
+    assert_eq!(
+        db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed) - before,
+        1,
+        "the reloaded certification must grant the skip; a fresh process swept nothing"
+    );
+    Ok(())
+}
+
 /// A partition that HAD duplicates must still end up certified, without waiting
 /// for an unrelated commit to come along.
 ///

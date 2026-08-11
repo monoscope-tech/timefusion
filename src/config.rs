@@ -2107,6 +2107,25 @@ pub struct MaintenanceConfig {
     /// dedup. Turn it off here if a count is ever doubted.
     #[serde(default = "d_true")]
     pub timefusion_read_dedup_skip_swept: bool,
+    /// Persist sweep certifications to the data dir and reload them at boot, so
+    /// the read-side dedup skip does not restart from cold on every deploy.
+    ///
+    /// `dedup_clean_fp` is process-local and TF deploys several times a day,
+    /// which is the leading suspect for the skip firing on only 0.2–0.5% of
+    /// Delta-reading scans. Persistence is the lever for that — but the size of
+    /// the prize is unmeasured, which is why this is OFF.
+    ///
+    /// **Turn it on only after reading Phase 0**
+    /// (`docs/plans/2026-08-11-certification-survival.md`): if the denials are
+    /// mostly `dedup_denied_fp_moved`, partitions are being written to
+    /// continuously and no amount of persistence recovers them, so this earns
+    /// nothing and should stay off.
+    ///
+    /// It cannot widen certification. A reloaded entry passes through the same
+    /// fingerprint-equality check against the live file list as an in-memory one,
+    /// so a stale record costs a skip rather than granting a wrong one.
+    #[serde(default)]
+    pub timefusion_dedup_certification_persist: bool,
     /// Allow `DedupExec` to run in streaming `bounded[timestamp]` mode, which
     /// trusts the scan's DECLARED `output_ordering` — i.e. the parquet footer's
     /// `sorting_columns`. A footer that lies makes one "run" span many

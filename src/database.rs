@@ -2653,6 +2653,23 @@ impl Database {
             dedup_dirty_bins.insert((bin.project_id, bin.table_name, bin.date, bin.bin), ());
         }
         crate::metrics::maintenance_stats().dirty_bin_queue_depth.store(dedup_dirty_bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        // Reload sweep certifications so the read-side dedup skip does not start
+        // from cold after every deploy. Loading cannot grant a skip on its own:
+        // `dedup_window_clean` still checks each entry's fingerprint against the
+        // live file list, so a record that has gone stale simply fails there.
+        let dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>> = Arc::new(dashmap::DashMap::new());
+        if cfg.maintenance.timefusion_dedup_certification_persist {
+            let now = std::time::Instant::now();
+            for entry in crate::certification_store::load(&cfg.core.timefusion_data_dir) {
+                // Rebuild the monotonic instant from the stored wall-clock age, so
+                // dwell keeps measuring the certification's real lifetime instead
+                // of restarting at this boot. A clock that moved backwards (or an
+                // entry from the future) falls back to "granted now".
+                let since = crate::certification_store::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
+                dedup_clean_fp.insert((entry.project_id, entry.table_name, entry.date), Certification { fp: entry.fp, since });
+            }
+            info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
+        }
         let aws_endpoint = &cfg.aws.aws_s3_endpoint;
         let aws_url = Url::parse(aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
@@ -2735,7 +2752,7 @@ impl Database {
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
-            dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
+            dedup_clean_fp,
             rollup_source_epochs: Arc::new(dashmap::DashMap::new()),
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_backoff: Arc::new(dashmap::DashMap::new()),
@@ -9009,10 +9026,45 @@ impl Database {
             let post_version = table_ref.read().await.version().unwrap_or(pre_version);
             self.last_dedup_versions.write().await.insert(dedup_key.to_string(), post_version);
         }
+        if any_ok {
+            self.persist_certifications();
+        }
         if total_dropped > 0 {
             info!("dedup sweep: table={} key={} total_dropped={}", table_name, dedup_key, total_dropped);
         }
         Ok(())
+    }
+
+    /// Snapshot `dedup_clean_fp` to the data dir. Called at the end of a sweep
+    /// rather than per certification: one write per tick instead of one per
+    /// partition, and the snapshot picks up invalidations in the same pass.
+    ///
+    /// Best-effort by design — this is a cache, and a lost write costs a cold
+    /// start, never a wrong answer.
+    fn persist_certifications(&self) {
+        if !self.config.maintenance.timefusion_dedup_certification_persist {
+            return;
+        }
+        let now_ms = crate::certification_store::now_unix_ms();
+        let mut entries: Vec<_> = self
+            .dedup_clean_fp
+            .iter()
+            .map(|entry| {
+                let ((project_id, table_name, date), cert) = (entry.key().clone(), *entry.value());
+                crate::certification_store::StoredCertification {
+                    project_id,
+                    table_name,
+                    date,
+                    fp: cert.fp,
+                    granted_unix_ms: now_ms.saturating_sub(cert.since.elapsed().as_millis() as u64),
+                }
+            })
+            .collect();
+        // Newest first, so the cap drops the oldest — which is also the likeliest
+        // to have been invalidated by a write already.
+        entries.sort_by(|a, b| b.granted_unix_ms.cmp(&a.granted_unix_ms));
+        entries.truncate(crate::certification_store::PERSIST_CAP);
+        crate::certification_store::store(&self.config.core.timefusion_data_dir, &entries);
     }
 
     fn persist_dirty_bins(&self) {
