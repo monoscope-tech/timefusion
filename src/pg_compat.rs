@@ -334,10 +334,8 @@ impl PgShowAllSettingsFunction {
     }
 
     fn batch(&self) -> DFResult<RecordBatch> {
-        let rows: Vec<(&str, String)> = COMPATIBILITY_SETTING_NAMES
-            .iter()
-            .filter_map(|name| compatibility_setting(name, self.max_statement_secs).map(|value| (*name, value)))
-            .collect();
+        let rows: Vec<(&str, String)> =
+            COMPATIBILITY_SETTING_NAMES.iter().filter_map(|name| compatibility_setting(name, self.max_statement_secs).map(|value| (*name, value))).collect();
         let strings = |values: Vec<Option<String>>| Arc::new(StringArray::from(values)) as ArrayRef;
         let settings: Vec<Option<String>> = rows.iter().map(|(_, value)| Some(value.clone())).collect();
         let nulls = || vec![None; rows.len()];
