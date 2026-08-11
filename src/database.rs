@@ -9244,6 +9244,44 @@ impl Database {
     /// takes. Split out of [`Self::optimize_table_light`] so a test can
     /// reproduce the EXACT bin the next real pass will select — resume is keyed
     /// on input-set equality, so a hand-picked file list would prove nothing.
+    /// Drop verified-sorted suspects and RE-SELECT until what is left is real
+    /// repair work (or the walk is exhausted).
+    ///
+    /// Load-bearing at BOTH call sites, and it was missing from the second one.
+    /// Admission offers every un-verified sealed file as a suspect — the
+    /// `delta-rs.optimize.sort_by` tag lies, so only the footer decides — which
+    /// means a project's selected bin is usually a correctly sorted file rather
+    /// than poison. Verify it, and that project has no bin left; without a
+    /// re-select it drops out of the wave engine's `pending` set and is done for
+    /// the WHOLE pass, not just the wave.
+    ///
+    /// Prod 2026-08-10, project 87576849 (663 footer-less files interleaved with
+    /// ~450 correctly sorted ones): every repair pass ended in ~14s having
+    /// repaired ~1 file, with `planned=6 completed=6 bins=6 brakes=0` and its
+    /// 8640s budget untouched. Raising the wave cap did nothing, because the
+    /// pass was ending on an EMPTY PLAN, not on waves or time.
+    async fn reselect_until_real_work(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
+        mut planned: Vec<(String, Vec<String>)>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        for _ in 0..REPAIR_RESELECT_ROUNDS {
+            let before = planned.len();
+            planned = self.drop_verified_sorted_bins(table_ref, table_name, policy.pass, planned).await;
+            if policy.pass != TailPass::Repair || planned.len() == before {
+                break;
+            }
+            let next = {
+                let table = table_ref.read().await;
+                Self::select_all_hot_bins(&table, schema, today_str, policy)?
+            };
+            if next.is_empty() {
+                break;
+            }
+            planned = next;
+        }
+        Ok(planned)
+    }
+
     async fn plan_tail_pass(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today_str: &str, policy: &HotBinPolicy<'_>,
     ) -> Result<Vec<(String, Vec<String>)>> {
@@ -9277,21 +9315,7 @@ impl Database {
         // makes every re-plan skip what was just checked, so a tick walks a
         // project's candidates until it finds real work or runs out — within one
         // tick instead of one per tick.
-        for _ in 0..REPAIR_RESELECT_ROUNDS {
-            let before = planned.len();
-            planned = self.drop_verified_sorted_bins(table_ref, table_name, policy.pass, planned).await;
-            if policy.pass != TailPass::Repair || planned.len() == before {
-                break;
-            }
-            let next = {
-                let table = table_ref.read().await;
-                Self::select_all_hot_bins(&table, schema, today_str, policy)?
-            };
-            if next.is_empty() {
-                break;
-            }
-            planned = next;
-        }
+        let mut planned = self.reselect_until_real_work(table_ref, table_name, schema, today_str, policy, planned).await?;
         // Serve the most RECENT poison first, across projects.
         //
         // By this point the suspects are gone and every remaining bin is real
@@ -9597,7 +9621,7 @@ impl Database {
                         // round re-selected unverified suspects and fell back to
                         // one clear per round, leaving the measured rate at
                         // 1.24/min with zero rewrites either way.
-                        let next = self.drop_verified_sorted_bins(table_ref, table_name, pass, next).await;
+                        let next = self.reselect_until_real_work(table_ref, table_name, schema, today_str, policy, next).await.unwrap_or_default();
                         *plan.lock().await = next.into_iter().collect();
                     }
                     failed
