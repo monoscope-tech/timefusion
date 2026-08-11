@@ -7987,6 +7987,35 @@ impl Database {
         })
     }
 
+    /// Invalidate only the partitions a DML statement can have changed.
+    ///
+    /// The source-wide wipe below is correct but catastrophic under continuous
+    /// enrichment. Measured in production 2026-08-11: monoscope issues ~400
+    /// scoped `UPDATE otel_logs_and_spans SET hashes = …` per 10 minutes for one
+    /// project, and each one dropped EVERY date's coverage for the table — a
+    /// blanket wipe roughly every 1.5 seconds. Nine days of built rollups could
+    /// never survive to serve a single read, while `otel_metrics`, which takes
+    /// no DML at all, routed a 4-day window in 1s. Same code, same recovery; the
+    /// only difference was write traffic.
+    ///
+    /// Narrowing is safe because invalidation is a fast path, not the
+    /// correctness boundary: coverage is re-proved against the partition's DATA
+    /// fingerprint when a plan is built AND again on the ticket before that plan
+    /// is used. It still falls back to the wipe whenever the predicate does not
+    /// confine the statement to a date range, or when the statement assigns
+    /// `timestamp` and could therefore move a row into another partition.
+    pub(crate) fn invalidate_rollup_dml(
+        &self, project_id: &str, source: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
+    ) {
+        let moves_rows = assignments.iter().any(|(column, _)| column == "timestamp");
+        let dates =
+            (!moves_rows).then(|| predicate.and_then(crate::rollup::timestamp_window)).flatten().and_then(|(lo, hi)| window_dates(lo, hi.checked_sub(1)?));
+        match dates {
+            Some(dates) => dates.iter().for_each(|date| self.invalidate_rollup_partition(project_id, source, &date.to_string())),
+            None => self.invalidate_rollup_source(project_id, source),
+        }
+    }
+
     pub(crate) fn invalidate_rollup_source(&self, project_id: &str, source: &str) {
         if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return;

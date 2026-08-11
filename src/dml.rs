@@ -156,20 +156,25 @@ pub(crate) fn requalified(plan: LogicalPlan, target: &datafusion::common::DFSche
 /// and kept declining production shapes that had one layer more.
 pub(crate) fn substitute(plan: &LogicalPlan, matched: &LogicalPlan, replacement: LogicalPlan) -> Result<LogicalPlan> {
     use datafusion::common::tree_node::TreeNodeRecursion;
-    let mut replacement = Some(replacement);
+    // EVERY occurrence, not just the first: an inlined CTE referenced twice
+    // plans to two identical aggregates, and replacing one would leave the other
+    // scanning raw — the same answer at half the saving.
+    let mut replaced = 0usize;
     let rewritten = plan
         .clone()
-        .transform_down(|node| match replacement.take_if(|_| &node == matched) {
-            // `Jump` skips the replaced subtree; siblings are still visited, but
-            // the `Option` is spent, so exactly one node is ever swapped.
-            Some(replacement) => Ok(Transformed::new(replacement, true, TreeNodeRecursion::Jump)),
-            None => Ok(Transformed::no(node)),
+        .transform_down(|node| {
+            if &node != matched {
+                return Ok(Transformed::no(node));
+            }
+            replaced += 1;
+            // `Jump` skips the subtree just inserted; siblings are still visited.
+            Ok(Transformed::new(replacement.clone(), true, TreeNodeRecursion::Jump))
         })?
         .data;
     // A target that is not in the plan would leave it untouched — a correct RAW
     // answer reported as a rollup hit, which is the one failure the counters
     // cannot show. Fail instead; the caller records it as a miss.
-    if replacement.is_some() {
+    if replaced == 0 {
         return Err(DataFusionError::Internal("rollup substitution target is not in the plan".into()));
     }
     // Parent nodes cache their `DFSchema`. Rebuilding bottom-up both refreshes
@@ -670,7 +675,7 @@ impl ExecutionPlan for DmlExec {
 
         let future = async move {
             let DmlExec { op_type, table_name, project_id, predicate, assignments, source, database, buffered_layer, session, .. } = this;
-            database.invalidate_rollup_source(&project_id, &table_name);
+            database.invalidate_rollup_dml(&project_id, &table_name, predicate.as_ref(), &assignments);
             let result = match op_type {
                 DmlOperation::Update => {
                     perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, source, session, &span)

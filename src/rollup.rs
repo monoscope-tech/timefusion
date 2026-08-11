@@ -785,6 +785,61 @@ pub(crate) async fn match_aggregates(
     Err(reason)
 }
 
+/// Narrow `[lo, hi)` by one conjunct that bounds `timestamp`.
+///
+/// `Ok(false)` means the term says nothing about `timestamp` and is the
+/// caller's to interpret; `Err` means it bounds `timestamp` in a way we cannot
+/// read, which must never be silently ignored — a dropped bound widens the
+/// window and would serve rows the query excluded.
+fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>, hi: &mut Option<i64>) -> Result<bool, MissReason> {
+    use datafusion::logical_expr::{Expr, Operator};
+    match term {
+        Expr::Between(between) if !between.negated && column_name(&between.expr) == Some("timestamp") => {
+            let (Some(lower), Some(upper)) = (timestamp_literal(&between.low), timestamp_literal(&between.high)) else {
+                return Err(MissReason::UnboundedTime);
+            };
+            *lo = Some(lo.map_or(lower, |current: i64| current.max(lower)));
+            *hi = Some(
+                hi.map_or_else(|| upper.checked_add(1), |current: i64| upper.checked_add(1).map(|upper| current.min(upper)))
+                    .ok_or(MissReason::UnboundedTime)?,
+            );
+        }
+        Expr::BinaryExpr(binary) if column_name(&binary.left) == Some("timestamp") => {
+            let Some(value) = timestamp_literal(&binary.right) else { return Err(MissReason::UnboundedTime) };
+            match binary.op {
+                Operator::GtEq => *lo = Some(lo.map_or(value, |current: i64| current.max(value))),
+                Operator::Gt => {
+                    *lo = Some(lo.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.max(value.saturating_add(1))))
+                }
+                Operator::Lt => *hi = Some(hi.map_or(value, |current: i64| current.min(value))),
+                Operator::LtEq => {
+                    *hi = Some(hi.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.min(value.saturating_add(1))))
+                }
+                _ => return Err(MissReason::UnknownFilter),
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The half-open `[lo, hi)` microsecond window `predicate` confines `timestamp`
+/// to, or `None` when it does not bound it on both sides.
+///
+/// Only conjuncts narrow: `split_conjunction` hands an `OR` back whole, so a
+/// disjunction contributes no bound and the window stays open — which is the
+/// safe direction for every caller.
+pub(crate) fn timestamp_window(predicate: &datafusion::logical_expr::Expr) -> Option<(i64, i64)> {
+    let (mut lo, mut hi) = (None, None);
+    for term in datafusion::logical_expr::utils::split_conjunction(predicate) {
+        // An unreadable bound is not "no bound": treat it as unbounded.
+        if narrow_timestamp(term, &mut lo, &mut hi).is_err() {
+            return None;
+        }
+    }
+    lo.zip(hi).filter(|(lo, hi)| lo < hi)
+}
+
 /// Resolve one query against one declared rollup spec.
 ///
 /// Every output is aliased with the aggregate's OWN field name, never a name
@@ -794,51 +849,28 @@ async fn route_with_spec(
     spec: &RollupSpec, source: &str, table_name: &str, predicates: &[datafusion::logical_expr::Expr], aggregate: &datafusion::logical_expr::Aggregate,
     session: &datafusion::execution::context::SessionState,
 ) -> Result<RoutedRollup, MissReason> {
-    use datafusion::logical_expr::{Expr, Operator, utils::split_conjunction};
+    use datafusion::logical_expr::{Expr, utils::split_conjunction};
 
     let mut project_id = None;
     let (mut lo, mut hi) = (None, None);
     let mut row_filters = Vec::new();
     for term in predicates.iter().flat_map(split_conjunction) {
-        match term {
-            Expr::Between(between) if !between.negated && column_name(&between.expr) == Some("timestamp") => {
-                let (Some(lower), Some(upper)) = (timestamp_literal(&between.low), timestamp_literal(&between.high)) else {
-                    return Err(MissReason::UnboundedTime);
-                };
-                lo = Some(lo.map_or(lower, |current: i64| current.max(lower)));
-                hi = Some(
-                    hi.map_or_else(|| upper.checked_add(1), |current: i64| upper.checked_add(1).map(|upper| current.min(upper)))
-                        .ok_or(MissReason::UnboundedTime)?,
-                );
-            }
-            Expr::BinaryExpr(binary) if column_name(&binary.left) == Some("timestamp") => {
-                let Some(value) = timestamp_literal(&binary.right) else { return Err(MissReason::UnboundedTime) };
-                match binary.op {
-                    Operator::GtEq => lo = Some(lo.map_or(value, |current: i64| current.max(value))),
-                    Operator::Gt => {
-                        lo = Some(lo.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.max(value.saturating_add(1))))
-                    }
-                    Operator::Lt => hi = Some(hi.map_or(value, |current: i64| current.min(value))),
-                    Operator::LtEq => {
-                        hi = Some(hi.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.min(value.saturating_add(1))))
-                    }
-                    _ => return Err(MissReason::UnknownFilter),
-                }
-            }
-            // A predicate we can push into the rollup scan is a dimension filter;
-            // one we cannot may NOT be answered by picking a measure that was
-            // pre-filtered the same way. The measure carries the right value, but
-            // the raw query also *eliminates* the groups and buckets where
-            // nothing matched, and re-aggregating the rollup resurrects them as
-            // 0/NULL rows. (`count(*) FILTER (WHERE …)` is unaffected — an
-            // aggregate filter changes values, never which groups exist.)
-            term => match (eq_literal(term, "project_id"), dimension_filter_sql(term, &spec.dimensions)) {
-                // Two different literals cannot both hold; never keep the last.
-                (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
-                (Some(value), _) => project_id = Some(value.to_string()),
-                (None, Some(filter)) => row_filters.push(filter),
-                (None, None) => return Err(MissReason::UnknownFilter),
-            },
+        if narrow_timestamp(term, &mut lo, &mut hi)? {
+            continue;
+        }
+        // A predicate we can push into the rollup scan is a dimension filter;
+        // one we cannot may NOT be answered by picking a measure that was
+        // pre-filtered the same way. The measure carries the right value, but
+        // the raw query also *eliminates* the groups and buckets where nothing
+        // matched, and re-aggregating the rollup resurrects them as 0/NULL rows.
+        // (`count(*) FILTER (WHERE …)` is unaffected — an aggregate filter
+        // changes values, never which groups exist.)
+        match (eq_literal(term, "project_id"), dimension_filter_sql(term, &spec.dimensions)) {
+            // Two different literals cannot both hold; never keep the last.
+            (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
+            (Some(value), _) => project_id = Some(value.to_string()),
+            (None, Some(filter)) => row_filters.push(filter),
+            (None, None) => return Err(MissReason::UnknownFilter),
         }
     }
     let project_id = project_id.ok_or(MissReason::MissingProject)?;
@@ -1387,6 +1419,53 @@ mod tests {
         let rewrite = crate::dml::requalified(rewrite, route.matched.schema()).expect("requalify");
         let rebuilt = crate::dml::substitute(&original, &route.matched, rewrite).expect("substitute");
         rebuilt.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+    }
+
+    /// What `timestamp_window` refuses matters more than what it reads: it
+    /// decides how much rollup coverage a DML statement destroys, and a window
+    /// narrower than the statement's true reach would leave coverage standing
+    /// for a partition that changed.
+    #[tokio::test]
+    async fn a_timestamp_window_is_read_only_from_conjuncts_that_bound_both_ends() {
+        async fn predicate(state: &datafusion::execution::context::SessionState, sql: &str) -> Option<(i64, i64)> {
+            let plan = optimized(state, &format!("SELECT id FROM {SOURCE} WHERE {sql}")).await;
+            let mut filters = Vec::new();
+            source_and_filters(&plan, &mut filters).expect("source");
+            filters.into_iter().reduce(datafusion::logical_expr::and).and_then(|filter| timestamp_window(&filter))
+        }
+        let state = session().await;
+        let predicate = |sql: &'static str| predicate(&state, sql);
+        assert_eq!(
+            predicate("project_id = 'p' AND timestamp >= to_timestamp_micros(100) AND timestamp < to_timestamp_micros(500)").await,
+            Some((100, 500)),
+            "a half-open conjunction is the shape enrichment sends"
+        );
+        // Inclusive upper: the exclusive bound is one microsecond past it, or a
+        // row exactly on the boundary sits outside the invalidated dates.
+        assert_eq!(predicate("project_id = 'p' AND timestamp BETWEEN to_timestamp_micros(100) AND to_timestamp_micros(499)").await, Some((100, 500)));
+        // One-sided, and disjunctions, leave the window open — the caller must
+        // fall back to invalidating everything.
+        assert_eq!(predicate("project_id = 'p' AND timestamp >= to_timestamp_micros(100)").await, None, "an open-ended range must not narrow anything");
+        assert_eq!(
+            predicate("project_id = 'p' AND (timestamp < to_timestamp_micros(100) OR timestamp >= to_timestamp_micros(500))").await,
+            None,
+            "a disjunction reaches outside any single range"
+        );
+    }
+
+    /// An aggregate inside a CTE is reachable now, because the matcher searches
+    /// the tree instead of peeling the root — monoscope's percentile panel wraps
+    /// its aggregate in exactly this shape, and no amount of root-peeling could
+    /// ever have seen it.
+    #[tokio::test]
+    async fn an_aggregate_inside_a_cte_is_reachable() {
+        let state = session().await;
+        let sql = format!(
+            "WITH bucketed AS (SELECT time_bucket('1 hours', timestamp) AS t, avg(duration) AS mean \
+                               FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1) \
+             SELECT t, mean FROM bucketed ORDER BY 1 DESC"
+        );
+        assert_substitutes(&state, &sql, None).await;
     }
 
     /// `ORDER BY ... DESC` is on every real dashboard query, so a matcher that

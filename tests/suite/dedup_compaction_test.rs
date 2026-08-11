@@ -1846,6 +1846,27 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let routed = counts(ctx.sql(&shaped).await?.collect().await?);
     assert_eq!(hits(), before + 1, "the shape that defeated every peeling matcher must route (misses +{})", misses() - misses_before);
     assert_eq!(routed, counts(db.query_delta_only(&shaped).await?), "the substituted plan must equal the raw answer exactly");
+
+    // An UPDATE scoped to TODAY must not invalidate YESTERDAY's coverage.
+    //
+    // Regression, prod 2026-08-11: every DML wiped coverage for the whole
+    // (project, table) — all dates, both tiers. monoscope issues ~400 scoped
+    // enrichment UPDATEs per 10 minutes, so nine days of built rollups could
+    // never survive to serve one read, and `otel_logs_and_spans` reported
+    // `not_built` for every date while `otel_metrics` — which takes no DML —
+    // routed the same shape in 1s.
+    ctx.sql(&format!(
+        "UPDATE otel_logs_and_spans SET name = 'enriched' WHERE project_id = '{project_id}' \
+         AND timestamp >= to_timestamp_micros({midnight}) AND timestamp < to_timestamp_micros({})",
+        midnight + 7_200_000_000i64
+    ))
+    .await?
+    .collect()
+    .await?;
+    let before = hits();
+    let after_update = rows_of(ctx.sql(&query).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "a DML confined to today must leave yesterday's coverage intact (misses +{})", misses() - misses_before);
+    assert_eq!(after_update.iter().map(|row| row.1).sum::<i64>(), 6, "the enrichment must not change the counted rows: {after_update:?}");
     Ok(())
 }
 
