@@ -689,7 +689,20 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
     use datafusion::logical_expr::{Expr, Operator};
     match unaliased(expr) {
         Expr::Column(column) => column.name.clone(),
-        Expr::Literal(value, _) => format!("{value:?}"),
+        // The three string scalars collapse to ONE spelling. `{:?}` names the
+        // Rust type, so `Utf8("server")` and `Utf8View("server")` canonicalized
+        // differently and a query's filter could not match the identical
+        // declared one. Prod hit this and no local test could: the plan cache
+        // lifts a literal to `$N` and casts it to the inferred param type, while
+        // the measure probe parses the same literal inline and coerces it its
+        // own way — two spellings of one predicate. A MemTable session and the
+        // integration harness both lack a plan cache, so both agreed.
+        Expr::Literal(value, _) => match value {
+            datafusion::scalar::ScalarValue::Utf8(value)
+            | datafusion::scalar::ScalarValue::Utf8View(value)
+            | datafusion::scalar::ScalarValue::LargeUtf8(value) => format!("Str({value:?})"),
+            value => format!("{value:?}"),
+        },
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
             let mut terms = Vec::new();
             fn collect(expr: &Expr, operator: Operator, terms: &mut Vec<String>) {
@@ -1703,6 +1716,22 @@ mod tests {
         }
         assert!(dirty_ranges(0, 0).is_empty(), "nothing dirty must rebuild nothing");
         assert_eq!(dirty_ranges(0, ALL_HOURS), vec![(0, DAY)], "a fully dirty day must merge to one range");
+    }
+
+    /// A filter's canonical form must not depend on which Rust string scalar the
+    /// planner happened to produce. Prod declined the Golden Signals filter for
+    /// exactly this reason while every local test accepted it.
+    #[test]
+    fn a_string_literal_canonicalizes_the_same_whatever_its_arrow_type() {
+        use datafusion::{logical_expr::Expr, scalar::ScalarValue};
+        let literal = |value: ScalarValue| canonical(&Expr::Literal(value, None));
+        let utf8 = literal(ScalarValue::Utf8(Some("server".into())));
+        assert_eq!(utf8, literal(ScalarValue::Utf8View(Some("server".into()))), "Utf8 and Utf8View must agree");
+        assert_eq!(utf8, literal(ScalarValue::LargeUtf8(Some("server".into()))), "LargeUtf8 must agree too");
+        assert_ne!(utf8, literal(ScalarValue::Utf8(Some("client".into()))), "different values must still differ");
+        // Non-string scalars keep their type, so an integer cannot collide with
+        // a string that merely prints the same.
+        assert_ne!(literal(ScalarValue::Int64(Some(1))), literal(ScalarValue::Utf8(Some("1".into()))));
     }
 
     /// monoscope's Golden Signals panels filter rows with exactly the predicate

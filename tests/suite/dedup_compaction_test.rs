@@ -1901,6 +1901,24 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     assert_eq!(hits(), before + 1, "a DML confined to today must leave yesterday's coverage intact (misses +{})", misses() - misses_before);
     assert_eq!(after_update.iter().map(|row| row.1).sum::<i64>(), 6, "the enrichment must not change the counted rows: {after_update:?}");
 
+    // monoscope's Golden Signals row filter, which is exactly the predicate the
+    // server_* measures declare. Unit tests pass this on a bare MemTable session;
+    // prod declined it, so the canonicalization must be checked through a real
+    // Database session where the analyzer rules actually run.
+    let golden = format!(
+        "SELECT time_bucket('1 hours', timestamp) AS b, COUNT(*) AS c FROM otel_logs_and_spans \
+         WHERE project_id = '{project_id}' AND (kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') \
+           AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1 ORDER BY 2 DESC"
+    );
+    let before = hits();
+    let routed_golden = ctx.sql(&golden).await?.collect().await?;
+    assert_eq!(hits(), before + 1, "the promoted row filter must route (misses +{})", misses() - misses_before);
+    assert_eq!(
+        routed_golden.iter().map(|b| b.num_rows()).sum::<usize>(),
+        db.query_delta_only(&golden).await?.iter().map(|b| b.num_rows()).sum::<usize>(),
+        "the promoted rewrite must return the same buckets as the raw query"
+    );
+
     // The same, with a predicate that says NOTHING about time. On a merge-on-read
     // table the re-appended row invalidates its own date and no other, so
     // precision here does not depend on the predicate's shape — which is the
