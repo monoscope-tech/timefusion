@@ -783,7 +783,19 @@ fn decline(plan: &datafusion::logical_expr::LogicalPlan) -> Result<Option<Routed
         }
     }
     match aggregate_source(plan) {
-        Some(source) if crate::schema_loader::get_schema(&source).is_some_and(|schema| !schema.rollups.is_empty()) => Err(MissReason::UnsupportedShape),
+        Some(source) if crate::schema_loader::get_schema(&source).is_some_and(|schema| !schema.rollups.is_empty()) => {
+            // The plan SHAPE is the whole content of this decline, and it is the
+            // one rollup miss with nothing to look at: prod declines shapes that
+            // match locally, because a pgwire session carries analyzer rules a
+            // bare session does not. Log the shape, not just the verdict.
+            tracing::warn!(
+                event = "rollup_declined_shape",
+                source,
+                plan = %plan.display_indent_schema().to_string().lines().take(6).collect::<Vec<_>>().join(" | "),
+                "aggregate over a rollup source in a shape the matcher does not accept"
+            );
+            Err(MissReason::UnsupportedShape)
+        }
         _ => Ok(None),
     }
 }
