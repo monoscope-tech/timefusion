@@ -1,10 +1,13 @@
 # Making dedup certification survive — measure before you build
 
-**Status:** **Phase 0 and Phase 1 are built.** Phase 1 is shipped dark behind
-`timefusion_dedup_certification_persist` (default off) and must not be enabled until Phase 0
-has been read — see "Turning it on". Phase 0 itself is shipped (`feat(stats): split the dedup-skip denial by
-cause…`). Nothing to write until it has been read — see "Reading Phase 0" below. Nobody
-should write Phase 1 code until Phase 0 returns a number.
+**Status:** **Phase 0 and Phase 1 are both built.** Phase 0's counters are live — see "Reading
+Phase 0". Phase 1 is shipped dark behind `timefusion_dedup_certification_persist` (default
+off) and **must not be enabled until Phase 0 has been read** — see "Turning it on". The
+remaining work is a measurement, not code.
+
+The one change that is unconditionally on is the sweep fix (finding 3 below), because it is a
+bug rather than an optimisation. It may move the numbers on its own, so read Phase 0 after it
+has been live for a day before judging whether persistence is worth enabling at all.
 
 **Owner:** unassigned. Prerequisite reading: `record_certification` and `dedup_window_clean`
 in `src/database.rs`, and `docs/plans/2026-08-09-per-date-dedup.md`.
@@ -109,15 +112,15 @@ Three things surfaced while implementing it. The first two mean the 2026-08-11 n
    rewriting pass is the last thing that moved it. So the confirming pass runs only once some
    *other* commit bumps the table version — and on a quiet table that may be never.
 
-   In production continuous ingest supplies that bump, so this is not a stall; it is a
+   In production continuous ingest supplies that bump, so this was not a stall; it was a
    **systematic delay concentrated exactly on the partitions that had duplicates**, which are
-   the ones the skip is most worth having on. If `never_certified` dominates, check this
-   before building any persistence: scheduling a confirming pass after a rewriting one is a
-   far smaller change than Phase 1 and may recover most of the same ground.
+   the ones the skip is most worth having on. On a quiet table the confirmation may never have
+   arrived at all.
 
-   (This is also why the parity test has to write to a second project between its two sweeps.
-   That is not test scaffolding for its own sake — it is standing in for the ingest that would
-   otherwise never let the partition be certified.)
+   **Fixed** (`fix(dedup): let the confirming sweep pass run…`): the sweep no longer records
+   the table version after a pass that dropped rows, so the confirming pass runs off the back
+   of the rewrite. This is a far smaller change than persistence and may recover much of the
+   same ground — which is why Phase 0 should be re-read after it has been live for a day.
 
 ## Reading Phase 0
 
