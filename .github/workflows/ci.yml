@@ -184,6 +184,12 @@ jobs:
           set -euo pipefail
           data_dir=$(mktemp -d)
           log="$RUNNER_TEMP/timefusion-pg-client.log"
+          # Build BEFORE backgrounding. `cargo run &` compiles inside the
+          # background job while the 60x1s readiness loop below is already
+          # counting, so any run whose build exceeds 60s failed here no matter
+          # what the code did — the step's own log was cargo warnings and
+          # nothing else (CI red on d0d5757, 3ae2142, 03dccf0).
+          cargo build --locked --quiet --bin timefusion
           TIMEFUSION_DATA_DIR="$data_dir" TIMEFUSION_ALLOW_INSECURE_AUTH=true PGWIRE_PASSWORD=postgres \
             cargo run --locked --quiet --bin timefusion >"$log" 2>&1 &
           pid=$!
