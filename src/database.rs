@@ -10805,11 +10805,28 @@ impl Database {
         // A repair sort takes the light pool almost whole (see
         // `repair_bins_in_flight`), so packing's k — derived from a 4 GiB
         // `PER_SORT_BUDGET_BYTES` that the repair sort exceeds 3.6x — is a
-        // fiction while one is running. Degrade, don't Stop: packing keeps a
-        // service floor of one bin, because starving it is how partitions grow
-        // to 50-65 files and poison the very footers repair is here to fix.
+        // fiction while one is running.
+        //
+        // STOP, not Degrade. Degrade was tried first (2026-08-11, same day) to
+        // keep packing's one-bin service floor, on the reasoning that starving
+        // packing grows partitions to 50-65 files. The arithmetic refutes it:
+        // a repair sort measured 12.7-14.4 GB of a 15.4 GB pool, and ONE
+        // packing bin is 1.3-1.5 GB, so the floor does not fit either. Prod
+        // 14:46 with the floor in place:
+        //
+        //   ExternalSorter[0]#187854      6.5 GB, peak 14.3 GB   <- repair
+        //   ExternalSorterMerge[0]#187855 6.2 GB, peak  7.2 GB   <- repair
+        //   ExternalSorterMerge[0]#189072 1515.8 MB              <- packing
+        //   ExternalSorterMerge[1]#189074 1255.7 MB              <- packing
+        //   -> failed to allocate 8.5 MB; 8.3 MB left of 15.4 GB
+        //
+        // A packing bin that dies with `Resources exhausted` compacts nothing
+        // AND takes the repair bin down with it, so the floor bought no
+        // service — it only converted one loser into two. Repair is bounded
+        // (one bin ~13 min, the pass by its tick budget), so packing resumes
+        // between bins rather than being starved indefinitely.
         if pass == TailPass::Pack && self.repair_bins_in_flight.load(Relaxed) > 0 {
-            return Some(Brake::Degrade("repair_holds_light_pool"));
+            return Some(Brake::Stop("repair_holds_light_pool"));
         }
         if let Some(stale_buckets) = self.buffered_layer().map(|layer| layer.stale_unflushed_bucket_count()).filter(|count| *count > 0) {
             info!(stale_buckets, event = "light_optimize_flush_debt_yield");
