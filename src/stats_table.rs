@@ -387,6 +387,7 @@ impl StatsTableProvider {
         let scan = self.scan_metrics.as_ref().map_or_else(Vec::new, |m| {
             let (total, skipped) = (m.scans_total.load(Relaxed), m.scans_skipped_delta.load(Relaxed));
             let (fr_hits, fr_misses) = (m.fast_resolve_hits.load(Relaxed), m.fast_resolve_misses.load(Relaxed));
+            let (dedup_elig, dedup_skipped) = (m.dedup_eligible_scans.load(Relaxed), m.dedup_skipped.load(Relaxed));
             let (pc_hits, pc_misses) = (m.provider_cache_hits.load(Relaxed), m.provider_cache_misses.load(Relaxed));
             let provider_builds = m.provider_build_total.load(Relaxed);
             let provider_scans = m.provider_scan_total.load(Relaxed);
@@ -427,6 +428,11 @@ impl StatsTableProvider {
                     "mem_only" => m.scans_mem_only.load(Relaxed),
                     "delta_only" => m.scans_delta_only.load(Relaxed),
                     "mem_plus_delta" => m.scans_mem_plus_delta.load(Relaxed),
+                    "dedup_eligible" => dedup_elig,
+                    "dedup_skipped" => dedup_skipped,
+                    "dedup_skipped_pct" => pct(dedup_skipped, dedup_elig),
+                    "dedup_denied_uncertified" => m.dedup_denied_uncertified.load(Relaxed),
+                    "dedup_denied_by_leg" => m.dedup_denied_by_leg.load(Relaxed),
                     "fast_resolve_hits" => fr_hits,
                     "fast_resolve_misses" => fr_misses,
                     "fast_resolve_hit_pct" => pct(fr_hits, fr_hits + fr_misses),

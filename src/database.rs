@@ -163,6 +163,11 @@ pub struct ScanMetrics {
     pub scans_mem_only: std::sync::atomic::AtomicU64,
     pub scans_delta_only: std::sync::atomic::AtomicU64,
     pub scans_mem_plus_delta: std::sync::atomic::AtomicU64,
+    /// Swept-partition dedup skip, over scans that read Delta. See `record_scan`.
+    pub dedup_eligible_scans: std::sync::atomic::AtomicU64,
+    pub dedup_skipped: std::sync::atomic::AtomicU64,
+    pub dedup_denied_uncertified: std::sync::atomic::AtomicU64,
+    pub dedup_denied_by_leg: std::sync::atomic::AtomicU64,
     pub fast_resolve_hits: std::sync::atomic::AtomicU64,
     pub fast_resolve_misses: std::sync::atomic::AtomicU64,
     /// Delta TableProvider cache: hit = cached cell at the current snapshot
@@ -251,9 +256,28 @@ impl ScanMetrics {
         self.decode_peak_batch_bytes.fetch_max(bytes, Relaxed);
     }
 
-    pub fn record_scan(&self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>) {
+    /// `dedup_skip` is the outcome of the swept-partition skip, which until now was decided on
+    /// every scan and reported by none of them. Split by WHY it was refused: `pre_skip` false
+    /// means the window was never eligible (unswept partition, moved fingerprint, or no time
+    /// bound at all), while `pre_skip` true with no skip means a leg refused one that was —
+    /// overwhelmingly a MemBuffer leg, which cannot skip. The two have different fixes and the
+    /// aggregate hides which one you have.
+    pub fn record_scan(
+        &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool, pre_skip: bool,
+    ) {
         use std::sync::atomic::Ordering::Relaxed;
         self.scans_total.fetch_add(1, Relaxed);
+        // Counted only where a Delta leg was actually read: the skip's prize is the key columns
+        // it stops decoding out of Parquet, and a mem-only scan has none to decode.
+        if has_delta {
+            self.dedup_eligible_scans.fetch_add(1, Relaxed);
+            match (dedup_skip, pre_skip) {
+                (true, _) => &self.dedup_skipped,
+                (false, true) => &self.dedup_denied_by_leg,
+                (false, false) => &self.dedup_denied_uncertified,
+            }
+            .fetch_add(1, Relaxed);
+        }
         let by_source = match (has_mem, has_delta) {
             (true, false) => Some(&self.scans_mem_only),
             (false, true) => Some(&self.scans_delta_only),
@@ -14921,7 +14945,7 @@ impl TableProvider for ProjectRoutingTable {
                 .collect();
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
-            scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
+            scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit, shape.skip_dedup, pre_skip_dedup);
             let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
             let mut plans = legs;
             // Merge-on-read prerequisite: `DedupExec`'s keep-greatest only engages
