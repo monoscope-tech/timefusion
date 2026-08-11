@@ -2896,6 +2896,15 @@ impl Database {
         // at or above it is read raw.
         let buffered = self.buffered_layer().and_then(|layer| layer.min_buffered_micros(&route.project_id, &route.source, route.lo, end));
         let dates = window_dates(route.lo, end).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
+        // ONE pass over the add actions for the whole window. Asking per date
+        // rebuilds the entire add-actions batch each time, which on a table with
+        // tens of thousands of files is the dominant cost of planning — a 4-day
+        // window paid it four times.
+        let fingerprints = {
+            let table = self.resolve_table(&route.project_id, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
+            let table = table.read().await;
+            Self::partition_fingerprints(&table).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
+        };
         let mut generations = Vec::with_capacity(dates.len());
         let mut ticket = Vec::with_capacity(dates.len());
         // The certified prefix, not the certified SET: a gap in the middle cannot
@@ -2917,8 +2926,11 @@ impl Database {
                 (certified, miss) = (day_start, Some(crate::rollup::MissReason::NotBuilt));
                 break;
             };
-            let source_fp =
-                self.rollup_source_fingerprint(&route.project_id, &route.source, &date).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
+            let source_fp = fingerprints
+                .get(&(route.project_id.clone(), date.clone()))
+                .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
+                .copied()
+                .unwrap_or_default();
             let source_epoch = self.rollup_source_epochs.get(&(route.project_id.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
             if coverage.source_fp != source_fp || coverage.source_epoch != source_epoch {
                 (certified, miss) = (day_start, Some(crate::rollup::MissReason::StaleCoverage));

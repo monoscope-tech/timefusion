@@ -425,6 +425,11 @@ pub fn record_rollup_miss(reason: &'static str) {
         "stale_coverage" => &stats.rollup_miss_stale_coverage,
         "tiny_interior" => &stats.rollup_miss_tiny_interior,
         "unsupported_shape" => &stats.rollup_miss_unsupported,
+        "incomplete_coverage" => &stats.rollup_miss_incomplete_coverage,
+        "unknown_filter" => &stats.rollup_miss_unknown_filter,
+        "missing_measure" => &stats.rollup_miss_missing_measure,
+        "unaligned_bucket_width" => &stats.rollup_miss_unaligned_bucket,
+        "unknown_group_by" => &stats.rollup_miss_unknown_group_by,
         _ => &stats.rollup_miss_other,
     }
     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -562,6 +567,11 @@ atomic_stats! {
     rollup_miss_stale_coverage,
     rollup_miss_tiny_interior,
     rollup_miss_unsupported,
+    rollup_miss_incomplete_coverage,
+    rollup_miss_unknown_filter,
+    rollup_miss_missing_measure,
+    rollup_miss_unaligned_bucket,
+    rollup_miss_unknown_group_by,
     rollup_miss_other,
     dirty_bin_queue_depth,
     dirty_bin_enqueued,
