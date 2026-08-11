@@ -1535,6 +1535,11 @@ fn batch_hours(batch: &RecordBatch) -> Option<HashMap<String, u32>> {
 
 const DAY_MICROS: i64 = 86_400_000_000;
 
+/// The TF-owned stamp a table's writes overwrite, if it declares one.
+fn tiebreak_of(source: &str) -> Option<&'static str> {
+    get_schema(source).and_then(|schema| schema.dedup_tiebreak.as_deref())
+}
+
 /// Microseconds at 00:00:00 UTC on a `YYYY-MM-DD` partition value.
 fn date_start_micros(date: &str) -> Option<i64> {
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros().into()
@@ -3113,7 +3118,7 @@ impl Database {
         let fingerprints = {
             let table = self.resolve_table(&route.project_id, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
             let table = table.read().await;
-            Self::partition_fingerprints(&table).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
+            Self::partition_fingerprints(&table, tiebreak_of(&route.source)).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         let mut generations = Vec::with_capacity(dates.len());
         let mut ticket = Vec::with_capacity(dates.len());
@@ -8102,7 +8107,7 @@ impl Database {
     async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str) -> Result<u64> {
         let table = self.resolve_table(project_id, source).await?;
         let table = table.read().await;
-        let mut fingerprints = Self::partition_fingerprints(&table)?;
+        let mut fingerprints = Self::partition_fingerprints(&table, tiebreak_of(source))?;
         Ok(fingerprints
             .remove(&(project_id.to_string(), date.to_string()))
             .or_else(|| fingerprints.remove(&("default".to_string(), date.to_string())))
@@ -8471,7 +8476,14 @@ impl Database {
     ///
     /// `partition_file_fp` still backs `dedup_clean_fp`, which genuinely does
     /// mean "this exact file set" — the two must not be conflated.
-    fn partition_fingerprints(table: &DeltaTable) -> Result<HashMap<(String, String), u64>> {
+    /// `tiebreak` is the schema's `dedup_tiebreak` — the TF-owned stamp every
+    /// write overwrites. Folding its per-partition MAX into the fingerprint is
+    /// what makes this an identity rather than a statistic: (rows, min_ts,
+    /// max_ts) alone can be preserved by an append paired with a removal, and a
+    /// rollup served across that would be a silently wrong dashboard number.
+    /// The stamp only ever increases, so any append moves it; compaction rewrites
+    /// the same rows and leaves it alone, which is the whole point.
+    fn partition_fingerprints(table: &DeltaTable, tiebreak: Option<&str>) -> Result<HashMap<(String, String), u64>> {
         use std::hash::{Hash, Hasher};
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
@@ -8501,22 +8513,31 @@ impl Database {
             }
         };
         let dates = Some(dates);
-        // (rows, min_ts, max_ts) per partition.
-        let mut by_partition: HashMap<(String, String), (i64, i64, i64)> = HashMap::new();
+        // (rows, min_ts, max_ts, max_stamp) per partition.
+        let mut by_partition: HashMap<(String, String), (i64, i64, i64, i64)> = HashMap::new();
         let min_ts = crate::count_pushdown::ts_micros_column(&actions, "min.timestamp");
         let max_ts = crate::count_pushdown::ts_micros_column(&actions, "max.timestamp");
+        // The stamp is a timestamp on every current schema, but read an integer
+        // one too rather than silently dropping the tightening if that changes.
+        let stamp = tiebreak.map(|tiebreak| format!("max.{tiebreak}")).and_then(|name| {
+            crate::count_pushdown::ts_micros_column(&actions, &name)
+                .or_else(|| actions.column_by_name(&name)?.as_any().downcast_ref::<arrow::array::Int64Array>().cloned())
+        });
         for row in 0..actions.num_rows() {
             let Some(date) = string_at(&dates, row) else { continue };
             // Custom-project tables carry no `project_id` partition; the sweep
             // groups those under "default", so match it exactly.
             let key = (string_at(&projects, row).unwrap_or_else(|| "default".to_string()), date);
-            let entry = by_partition.entry(key).or_insert((0, i64::MAX, i64::MIN));
+            let entry = by_partition.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN));
             entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
             if let Some(lo) = min_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
                 entry.1 = entry.1.min(lo);
             }
             if let Some(hi) = max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
                 entry.2 = entry.2.max(hi);
+            }
+            if let Some(written) = stamp.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
+                entry.3 = entry.3.max(written);
             }
         }
         Ok(by_partition
@@ -8551,7 +8572,7 @@ impl Database {
         let fingerprints = {
             let table = self.resolve_table("default", source).await?;
             let table = table.read().await;
-            Self::partition_fingerprints(&table)?
+            Self::partition_fingerprints(&table, tiebreak_of(source))?
         };
         let mut recovered = 0;
         for spec in &schema.rollups {
@@ -8669,7 +8690,7 @@ impl Database {
         let table_ref = self.resolve_table("default", source).await?;
         let fingerprints = {
             let table = table_ref.read().await;
-            Self::partition_fingerprints(&table)?
+            Self::partition_fingerprints(&table, tiebreak_of(source))?
         };
 
         let today = Utc::now().date_naive();
