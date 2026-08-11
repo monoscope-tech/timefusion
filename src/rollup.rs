@@ -786,11 +786,23 @@ pub(crate) async fn match_aggregates(
         None => {
             let LogicalPlan::Projection(projection) = plan else { return decline(plan).map(Vec::from_iter) };
             let Some((aggregate, having)) = aggregate_with_having(&projection.input) else { return decline(plan).map(Vec::from_iter) };
-            // A HAVING between the two breaks the positional projection-to-
-            // aggregate name mapping, so keep the aggregate's own schema names
-            // — the filter references those — and re-apply the projection above
-            // the rewrite rather than absorbing it into the SELECT aliases.
-            if having.is_none() && projection.expr.iter().all(|expr| matches!(unaliased(expr), Expr::Column(_))) {
+            // The output names are absorbed into the rewrite's SELECT aliases
+            // POSITIONALLY, so that is only valid when the projection passes
+            // every aggregate output through in order. Two things break it:
+            //
+            //  * a HAVING between the two, whose filter references the
+            //    aggregate's own names; and
+            //  * a projection that DROPS an aggregate output — `GROUP BY
+            //    time_bucket(…)` without selecting the bucket leaves a
+            //    3-field aggregate under a 2-field projection, so the group
+            //    column would be aliased with the first MEASURE's name.
+            //
+            // Either way, keep the aggregate's names and re-apply the
+            // projection above the rewrite instead.
+            if having.is_none()
+                && projection.expr.len() == aggregate.schema.fields().len()
+                && projection.expr.iter().all(|expr| matches!(unaliased(expr), Expr::Column(_)))
+            {
                 (aggregate, None, Some(projection.schema.fields().iter().map(|field| field.name().to_string()).collect::<Vec<_>>()), None)
             } else {
                 (aggregate, having, None, Some(projection.clone()))
@@ -1325,6 +1337,32 @@ mod tests {
              GROUP BY time_bucket('5 minutes', timestamp)"
         );
         assert_eq!(route_for(&state, &narrow).await.expect("match").expect("route").target, TARGET, "a 10-minute window must fall back to the fine tier");
+    }
+
+    /// Grouping by a bucket without SELECTing it is an ordinary dashboard shape
+    /// ("count per hour, ordered by count"). The aggregate then has one more
+    /// output than the projection, and mapping names positionally aliased the
+    /// GROUP BY column with the first measure's name — the rewrite named its
+    /// bucket `c` and its count `m`. Seen in production as a miss.
+    #[tokio::test]
+    async fn a_group_key_that_is_not_selected_does_not_steal_a_measure_name() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT COUNT(*) AS c, avg(duration) AS m FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} \
+             GROUP BY time_bucket('1 hours', timestamp) ORDER BY 1 DESC"
+        );
+        let original = optimized(&state, &sql).await;
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let generated = generated_sql(&route);
+        assert!(!generated.contains("timestamp) AS \"c\""), "the bucket must not be aliased with a measure's name: {generated}");
+        let plan = state.create_logical_plan(&generated).await.expect("parse rewrite");
+        let plan = match route.outer_projection {
+            Some(expr) => datafusion::logical_expr::LogicalPlan::Projection(
+                datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan)).expect("reapply projection"),
+            ),
+            None => plan,
+        };
+        PlanWrapper::rewrap(route.wrappers, plan).schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
     }
 
     /// A sliver of certified interior is strictly worse than the raw plan: the
