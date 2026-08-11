@@ -845,7 +845,15 @@ async fn count_pushdown_declines_where_tombstones_are_possible() -> Result<()> {
     // A successful pushdown replaces the whole plan with a one-row in-memory
     // exec; declining leaves the real scan (dedup + tombstone filter) standing.
     let text = rendered(&physical_plan(&db, &sql).await?);
-    assert!(text.contains("DedupExec"), "count_pushdown must decline where tombstones can exist — it answered from add-action stats:\n{text}");
+    // A real scan must survive. NOT "DedupExec must survive": once the sweep
+    // certifies this partition the read-side skip legitimately removes it (there
+    // is one winning row per key by then — see
+    // `a_swept_mor_partition_holds_one_winning_row_per_key`), and asserting the
+    // operator instead of the property made this test pass only for as long as
+    // the partition happened never to be certified.
+    assert!(text.contains("DeltaScanExec"), "count_pushdown must decline where tombstones can exist — it answered from add-action stats:\n{text}");
+    // Whichever way dedup resolves, the tombstone filter is what makes the count
+    // right, and it must be in the plan.
     assert!(text.contains("IS DISTINCT FROM true"), "the tombstone filter must be part of the counted plan:\n{text}");
 
     let mut ctx = Arc::clone(&db).create_session_context();
@@ -1946,6 +1954,47 @@ async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Re
     Ok(())
 }
 
+/// A partition that HAD duplicates must still end up certified, without waiting
+/// for an unrelated commit to come along.
+///
+/// `record_certification` needs a 0-drop pass over an unmoved file set, so the
+/// pass that rewrites certifies nothing and the next one is meant to confirm it.
+/// The sweep's global version guard used to prevent that: it returns immediately
+/// while the table version is unchanged, and the rewriting pass was the last
+/// thing to move it. The confirmation then waited on someone else's write — in
+/// prod, other projects' ingest; on a quiet table, possibly never. That left the
+/// partitions that had duplicates as the ones least likely to be certified,
+/// which is precisely backwards.
+#[serial]
+#[tokio::test]
+async fn a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit() -> Result<()> {
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let mut cfg = (*TestConfigBuilder::new("dedup_confirming_pass").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+    // Rollups bypass the version guard entirely (`needs_rollup_retry`), which
+    // would hide the regression this test exists for.
+    cfg.maintenance.timefusion_rollup_enabled = false;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // The same keys twice, in separate flushes: cross-file duplicates, so the
+    // first sweep pass must rewrite.
+    let batch = || json_to_batch((0..40).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect());
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    let certs = || db.scan_metrics.cert_granted_total.load(std::sync::atomic::Ordering::Relaxed);
+
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    assert_eq!(certs(), 0, "a pass that rewrites must not certify what it just rewrote");
+
+    // No write in between — that is the whole point.
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    assert_eq!(certs(), 1, "the confirming pass must run off the back of the rewrite, not wait for an unrelated commit");
+    Ok(())
+}
+
 /// The denial split that decides whether persisting certifications could ever
 /// pay (`docs/plans/2026-08-11-certification-survival.md`, Phase 0).
 ///
@@ -2051,25 +2100,12 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
 
         let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
         // TWICE. The first pass drops duplicates, and `record_certification`
-        // requires `dropped == 0` over a file set that did not move — a rewriting
-        // pass proves nothing about what it just rewrote. Certification lands on
-        // the next 0-drop pass, and without it the skip below never engages.
+        // requires `dropped == 0` over a file set that did not move — a pass
+        // cannot certify what it just rewrote. The second is the confirming pass,
+        // and without it the skip below never engages. (That the second pass runs
+        // at all, with nothing committed in between, is
+        // `a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit`.)
         db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-        // The first pass REWRITES, and `record_certification` needs a 0-drop pass
-        // over an unmoved file set — a pass cannot certify what it just rewrote.
-        // The confirming pass needs the table version to move first: the sweep's
-        // global guard skips outright while the version is unchanged, so without
-        // this write the partition would never be certified in this process. In
-        // prod another project's ingest supplies that bump continuously; here it
-        // has to be explicit.
-        db.insert_records_batch(
-            &format!("{project_id}_other"),
-            "otel_logs_and_spans",
-            vec![json_to_batch(vec![test_span_ts("other", "n", &format!("{project_id}_other"), ts)])?],
-            true,
-            None,
-        )
-        .await?;
         db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
         // TIME-BOUNDED. Without a window `dedup_skip_allowed` returns `NoWindow`

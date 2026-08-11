@@ -8990,8 +8990,22 @@ impl Database {
         }
         // Only refresh the skip cache when at least one partition ran cleanly,
         // so persistent failures don't silently suppress future sweeps.
+        //
+        // ...and never after a pass that REWROTE. `record_certification` requires
+        // `dropped == 0` over an unmoved file set, so a rewriting pass certifies
+        // nothing by design — the next 0-drop pass is what confirms the rewrite
+        // held. But recording the version here is what stops that pass from ever
+        // running: the guard at the top of this function returns immediately while
+        // the version is unchanged, and the rewrite was the last thing to move it.
+        // The confirming pass then waits on an unrelated commit, which in prod
+        // arrives from other projects' ingest and on a quiet table may not arrive
+        // at all — leaving exactly the partitions that HAD duplicates as the ones
+        // that never get certified.
+        //
+        // Leaving the version unrecorded costs one extra sweep pass over a window
+        // that was just rewritten, and that pass is what earns the certification.
         // TODO: same unbounded-growth caveat as `last_written_versions`.
-        if any_ok {
+        if any_ok && total_dropped == 0 {
             let post_version = table_ref.read().await.version().unwrap_or(pre_version);
             self.last_dedup_versions.write().await.insert(dedup_key.to_string(), post_version);
         }
