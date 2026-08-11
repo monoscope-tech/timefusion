@@ -178,7 +178,7 @@ impl QueryPlanner for DmlQueryPlanner {
                             }
                             Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::StaleCoverage.label()),
                             Err(error) => {
-                                debug!(%error, "rollup physical planning failed; using raw plan");
+                                warn!(%error, event = "rollup_rewrite_failed", stage = "physical", "rollup rewrite could not be planned; using raw plan");
                                 crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
                             }
                         },
@@ -186,12 +186,12 @@ impl QueryPlanner for DmlQueryPlanner {
                         // Discarding it leaves `rewrite_schema_mismatch` with no
                         // way to tell WHICH column drifted.
                         Err(error) => {
-                            debug!(%error, "rollup rewrite does not match the query schema; using raw plan");
+                            warn!(%error, event = "rollup_rewrite_failed", stage = "schema", "rollup rewrite does not match the query schema; using raw plan");
                             crate::metrics::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch.label());
                         }
                     },
                     Err(error) => {
-                        debug!(%error, "rollup SQL planning failed; using raw plan");
+                        warn!(%error, event = "rollup_rewrite_failed", stage = "sql", "rollup rewrite SQL could not be planned; using raw plan");
                         crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
                     }
                 }
