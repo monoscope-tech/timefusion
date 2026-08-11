@@ -448,6 +448,10 @@ pub(crate) struct RoutedRollup {
     /// the rewrite for exactly this node and leaves every node above it alone, so
     /// this is the whole interface between the matcher and the plan.
     pub matched: datafusion::logical_expr::LogicalPlan,
+    /// A `COUNT` over the promoted row filter, carried through the legs but NOT
+    /// selected: it exists only to power the `HAVING` that reproduces group
+    /// elimination. See `promote` in `route_with_spec`.
+    guard: Option<RoutedMeasure>,
     row_filters: Vec<String>,
     /// `(expression, output alias)`. Every expression is valid, and means the
     /// same thing, on BOTH tables — which is what lets the union share them.
@@ -486,7 +490,7 @@ impl RoutedRollup {
             .iter()
             .enumerate()
             .map(|(index, (expression, _))| format!("{expression} AS __g{index}"))
-            .chain(self.measures.iter().enumerate().flat_map(|(index, measure)| {
+            .chain(self.measures.iter().chain(self.guard.iter()).enumerate().flat_map(|(index, measure)| {
                 let states = if table == self.target {
                     measure.measures.iter().map(|column| format!("{}({column})", measure.merge.partial_op())).collect::<Vec<_>>()
                 } else {
@@ -531,8 +535,9 @@ impl RoutedRollup {
                 .join(", ");
             let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
             let group_by = self.group_by();
+            let having = self.guard.as_ref().map_or_else(String::new, |guard| format!(" HAVING {} > 0", guard.merge.sql(&guard.measures)));
             return format!(
-                "SELECT {select} FROM {} WHERE project_id = {} AND ({}){generations}{row_filters}{group_by}",
+                "SELECT {select} FROM {} WHERE project_id = {} AND ({}){generations}{row_filters}{group_by}{having}",
                 self.target,
                 sql_literal(&self.project_id),
                 interiors.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR "),
@@ -550,8 +555,10 @@ impl RoutedRollup {
             .collect::<Vec<_>>()
             .join(", ");
         let group_by = self.group_by();
+        let having =
+            self.guard.as_ref().map_or_else(String::new, |guard| format!(" HAVING {} > 0", guard.merge.sql(&[format!("__s{}_0", self.measures.len())])));
         format!(
-            "SELECT {outer} FROM ({} UNION ALL {}) AS rollup_union{group_by}",
+            "SELECT {outer} FROM ({} UNION ALL {}) AS rollup_union{group_by}{having}",
             self.leg(&self.target, interiors, &generations),
             self.leg(&self.source, &fringes, ""),
         )
@@ -965,6 +972,7 @@ async fn route_with_spec(
     let mut project_id = None;
     let (mut lo, mut hi) = (None, None);
     let mut row_filters = Vec::new();
+    let mut promotable: Vec<&Expr> = Vec::new();
     for term in predicates.iter().flat_map(split_conjunction) {
         if narrow_timestamp(term, &mut lo, &mut hi)? {
             continue;
@@ -981,7 +989,7 @@ async fn route_with_spec(
             (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
             (Some(value), _) => project_id = Some(value.to_string()),
             (None, Some(filter)) => row_filters.push(filter),
-            (None, None) => return Err(MissReason::UnknownFilter),
+            (None, None) => promotable.push(term),
         }
     }
     let project_id = project_id.ok_or(MissReason::MissingProject)?;
@@ -992,10 +1000,48 @@ async fn route_with_spec(
     // rather than at interior() matters because specs are tried coarsest-first:
     // otherwise a 1h tier would shadow the 1m tier that CAN serve a 10-minute
     // window, and the query would miss entirely instead of routing.
-    if hi.saturating_sub(lo) < grain.saturating_mul(MIN_INTERIOR_BUCKETS) {
+    // With nothing to promote, a window too narrow for this grain is the whole
+    // answer and the measure probe below — which plans a statement per filtered
+    // measure — is pure waste. With a residual present, the filter is the
+    // actionable diagnosis and must be reported in preference to the grain, so
+    // the same check runs again once the promotion has been resolved.
+    let too_narrow = hi.saturating_sub(lo) < grain.saturating_mul(MIN_INTERIOR_BUCKETS);
+    if too_narrow && promotable.is_empty() {
         return Err(MissReason::TinyInterior);
     }
     let configured_filters = measure_filters(session, source, spec, &project_id, lo, hi).await?;
+
+    // ROW-FILTER PROMOTION. A residual predicate is normally fatal: the rollup
+    // aggregated over every row, so re-aggregating it resurrects the groups the
+    // raw query eliminated, as 0/NULL rows rather than absent ones.
+    //
+    // But when the residual canonicalizes to exactly a DECLARED measure filter,
+    // the pre-filtered measures already carry the right values, and a `HAVING`
+    // over a count sharing that filter reproduces the elimination exactly — a
+    // bucket where nothing matched has a zero count and is dropped. That makes
+    // every panel using the standard `server` filter routable without changing
+    // what any of them display, which the monoscope-side alternatives could not:
+    // dropping the filter counts every span, and moving it into per-aggregate
+    // FILTER clauses turns absent buckets into zeros.
+    //
+    // The guard must be a `count` with NO column: `count(col)` skips nulls, so a
+    // bucket whose only matching rows had a null column would be dropped where
+    // the raw query kept it.
+    let promoted = (!promotable.is_empty()).then(|| canonical_and(promotable.iter().copied()));
+    let guard = match &promoted {
+        None => None,
+        Some(promoted) => Some(
+            configured_filters
+                .iter()
+                .find(|(measure, filter)| measure.agg == "count" && measure.column.is_none() && filter == promoted)
+                .map(|(measure, _)| *measure)
+                .ok_or(MissReason::UnknownFilter)?,
+        ),
+    };
+
+    if too_narrow {
+        return Err(MissReason::TinyInterior);
+    }
 
     let mut groups = Vec::new();
     for (index, expression) in aggregate.group_expr.iter().enumerate() {
@@ -1029,7 +1075,10 @@ async fn route_with_spec(
         if function.params.distinct || !function.params.order_by.is_empty() {
             return Err(MissReason::NonDecomposableAggregate);
         }
-        let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())));
+        // The promoted conjuncts join the aggregate's own, so a `count(*) FILTER
+        // (WHERE status_code = 'ERROR' …)` under the `server` row filter resolves
+        // to `server_error_count`, which is declared as exactly that conjunction.
+        let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
         let name = function.func.name().to_ascii_lowercase();
         let column = function.params.args.first().and_then(column_name).map(str::to_string);
         let measure = |aggregate: &str, column: Option<&str>| {
@@ -1072,6 +1121,16 @@ async fn route_with_spec(
         measures.push(RoutedMeasure { alias, merge, measures: resolved.iter().map(|measure| measure.name.clone()).collect(), raw });
     }
 
+    let guard = guard.map(|measure| RoutedMeasure {
+        alias: "__guard".to_string(),
+        merge: Merge::Count,
+        measures: vec![measure.name.clone()],
+        raw: vec![match measure.filter.as_ref() {
+            Some(filter) => format!("COUNT(*) FILTER (WHERE {filter})"),
+            None => "COUNT(*)".to_string(),
+        }],
+    });
+
     Ok(RoutedRollup {
         source: source.to_string(),
         project_id,
@@ -1080,6 +1139,7 @@ async fn route_with_spec(
         grain,
         target: spec.table_name(table_name),
         matched: datafusion::logical_expr::LogicalPlan::Aggregate(aggregate.clone()),
+        guard,
         row_filters,
         groups,
         measures,
@@ -1643,6 +1703,54 @@ mod tests {
         }
         assert!(dirty_ranges(0, 0).is_empty(), "nothing dirty must rebuild nothing");
         assert_eq!(dirty_ranges(0, ALL_HOURS), vec![(0, DAY)], "a fully dirty day must merge to one range");
+    }
+
+    /// monoscope's Golden Signals panels filter rows with exactly the predicate
+    /// the `server_*` measures declare, which used to hit the residual-filter
+    /// refusal and made the flagship dashboard unroutable.
+    ///
+    /// The promotion must carry a HAVING: without it a bucket where nothing
+    /// matched comes back as a 0 row instead of being absent, which is a
+    /// different chart.
+    #[tokio::test]
+    async fn a_row_filter_that_matches_a_declared_measure_filter_routes_with_a_having() {
+        let state = session().await;
+        const SERVER: &str = "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http')";
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS bucket, COUNT(*) AS c \
+             FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1 ORDER BY 1 DESC"
+        );
+        let (_, generated) = assert_substitutes(&state, &sql, None).await;
+        assert!(generated.contains("server_request_count"), "the pre-filtered measure must answer it: {generated}");
+        assert!(generated.contains("HAVING"), "group elimination must be reproduced, or empty buckets come back as zeros: {generated}");
+    }
+
+    /// The aggregate's own FILTER and the promoted row filter combine, so the
+    /// error widget resolves to `server_error_count` — declared as exactly that
+    /// conjunction.
+    #[tokio::test]
+    async fn an_aggregate_filter_combines_with_the_promoted_row_filter() {
+        let state = session().await;
+        const SERVER: &str = "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http')";
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS bucket, \
+                    COUNT(*) FILTER (WHERE status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500) AS errors \
+             FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1"
+        );
+        let (_, generated) = assert_substitutes(&state, &sql, None).await;
+        assert!(generated.contains("server_error_count"), "the conjunction must resolve to the declared measure: {generated}");
+    }
+
+    /// A residual filter that matches NOTHING declared must still refuse. The
+    /// promotion widens what routes; it must not widen what is answered wrongly.
+    #[tokio::test]
+    async fn a_residual_filter_with_no_declared_measure_still_refuses() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND status_message = 'nope' \
+             GROUP BY time_bucket('1 hours', timestamp)"
+        );
+        assert_eq!(route_for(&state, &sql).await.err(), Some(MissReason::UnknownFilter), "an unmatched residual must not be promoted");
     }
 
     /// An aggregate inside a CTE is reachable now, because the matcher searches
