@@ -784,9 +784,31 @@ const REPAIR_SORT_PARTITIONS: usize = 16;
 /// then has nowhere to live. Reserving the merge's share up-front instead makes
 /// the sorter spill early: the reservation is what DataFusion carves out *before*
 /// the sort begins, so it converts an unspillable 9.5 GB tail into spill IO.
-/// 256 MB x 16 partitions = 4 GB against a 22.5 GB pool, and the sort it has to
-/// survive missed by 25.3 MB.
-const REPAIR_SORT_RESERVATION_BYTES: usize = 256 * 1024 * 1024;
+/// 256 MB x 16 partitions = 4 GB was calibrated against a **22.5 GB** pool, and
+/// the sort it had to survive missed by 25.3 MB.
+///
+/// Both halves of that have moved. The light pool is **15.4 GB** now, and prod
+/// 2026-08-11 measured the thing this reservation is supposed to cover — the
+/// merge, which CANNOT spill — at **7.7-7.9 GB peak**, i.e. roughly DOUBLE the
+/// 4 GB carve-out. The sorter therefore never spills early enough, grows to
+/// ~14.9 GB, and the merge then has nowhere to live:
+///
+/// ```text
+/// ExternalSorterMerge[0] (can spill: false) consumed 7.7 GB, peak  7.7 GB
+/// ExternalSorter[0]      (can spill: true)  consumed 5.9 GB, peak 14.9 GB
+/// -> Failed to allocate additional 22.2 MB ... 5.1 MB remain available
+///    for the total memory pool: fair(pool_size: 15.4 GB)
+/// ```
+///
+/// 512 MB x 16 = **8 GB reserved**, which covers the measured merge. The sorter
+/// is left ~7 GB and spills earlier — slower, but spill IO is exactly the trade
+/// this constant exists to make, and a bin that spills and COMMITS beats one
+/// that runs 44 minutes and dies.
+///
+/// NOTE the total is `partitions x reservation`. A previous attempt (53f22fd,
+/// reverted) raised this to 512 MB while cutting partitions 16 -> 4, which
+/// HALVED the total to 2 GB and made things worse. Change one at a time.
+const REPAIR_SORT_RESERVATION_BYTES: usize = 512 * 1024 * 1024;
 
 /// How long after boot the one-shot footer repair waits. Long enough for WAL
 /// replay and snapshot load to finish, short enough that a process which only
