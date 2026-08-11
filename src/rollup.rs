@@ -813,10 +813,8 @@ pub(crate) async fn match_aggregates(
     for spec in candidates {
         match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, output_names.as_ref(), session).await {
             Ok(mut route) => {
-                route.outer_projection = outer_projection
-                    .clone()
-                    .map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>())
-                    .transpose()?;
+                route.outer_projection =
+                    outer_projection.clone().map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>()).transpose()?;
                 route.having = having.clone().map(unqualified).transpose()?;
                 route.wrappers = wrappers.clone();
                 routes.push(route);
