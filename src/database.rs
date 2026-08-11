@@ -761,35 +761,11 @@ fn repair_bin_date(files: &[String]) -> &str {
 ///
 /// That 40 minutes is the whole reason shipbubble's blocking file could not be
 /// repaired: prod process lifetime under the 2026-08-09 deploy rate was 18-21
-/// minutes, and a stage killed part-way resumes nothing.
-///
-/// 16 was chosen when the up-front reservation was the only cost worth counting
-/// (~512 MB = 16 x `sort_spill_reservation_bytes`) against a **22.5 GB** light
-/// pool. BOTH of those premises are now false, measured on prod 2026-08-11:
-///
-/// - the light pool is **15.4 GB**, not 22.5 GB; and
-/// - repair does NOT run one bin at a time — `concurrency = (k / 2).max(1)`, and
-///   the failure below shows two bins' merges in the pool together.
-///
-/// The reservation was never the real cost anyway: the MERGE is, and it CANNOT
-/// SPILL, so its footprint scales with fan-in. Whale bin, 44 minutes in:
-///
-/// ```text
-/// ExternalSorter[0]      (can spill: true)   consumed 9.0 GB, peak 15.1 GB
-/// ExternalSorterMerge[0] (can spill: FALSE)  consumed 4.8 GB, peak  7.9 GB
-/// ExternalSorterMerge[0] (can spill: FALSE)  consumed 875 MB
-/// -> Failed to allocate additional 8.2 MB ... 7.0 MB remain available
-///    for the total memory pool: fair(pool_size: 15.4 GB)
-/// ```
-///
-/// 14.7 of 15.4 GB gone, and the bin lost all 44 minutes of work because repair
-/// commits per BIN. A wide sort that reliably dies is worth less than a narrower
-/// one that lands: 4 cuts the non-spillable merge ~4x, to ~1-2 GB, which fits
-/// beside a concurrent bin. It is also the second rung of the existing
-/// `[16, 4, 1]` degradation ladder, i.e. the value this path already falls back
-/// to — except the ladder did not engage on the staging-failure path
-/// (`degraded=0`), so the bin retried wide and failed identically.
-const REPAIR_SORT_PARTITIONS: usize = 4;
+/// minutes, and a stage killed part-way resumes nothing. 16 partitions is
+/// ~512 MB of up-front sort reservation (16 x `sort_spill_reservation_bytes`)
+/// against a 22.5 GB light pool — a rounding error there, and the difference
+/// between a unit that fits its window and one that never lands.
+const REPAIR_SORT_PARTITIONS: usize = 16;
 
 /// Up-front merge reservation for the repair sort, per partition.
 ///
@@ -807,16 +783,10 @@ const REPAIR_SORT_PARTITIONS: usize = 4;
 /// At 32 MB the sorter is free to grow to 18.9 GB before spilling, and the merge
 /// then has nowhere to live. Reserving the merge's share up-front instead makes
 /// the sorter spill early: the reservation is what DataFusion carves out *before*
-/// the sort begins, so it converts an unspillable tail into spill IO.
-///
-/// 256 MB x 16 = 4 GB was sized against a 22.5 GB pool. Prod 2026-08-11 measured
-/// the merge it has to survive at **7.9 GB peak** — so the reservation was
-/// covering barely half of it, and the bin died with 7.0 MB left in a 15.4 GB
-/// pool after 44 minutes of work. Per PARTITION that is ~500 MB of merge, so the
-/// reservation has to be ~512 MB for the up-front carve-out to actually match
-/// what the merge later demands (512 MB x 4 partitions = 2 GB, vs a ~2 GB merge
-/// at 4-way fan-in).
-const REPAIR_SORT_RESERVATION_BYTES: usize = 512 * 1024 * 1024;
+/// the sort begins, so it converts an unspillable 9.5 GB tail into spill IO.
+/// 256 MB x 16 partitions = 4 GB against a 22.5 GB pool, and the sort it has to
+/// survive missed by 25.3 MB.
+const REPAIR_SORT_RESERVATION_BYTES: usize = 256 * 1024 * 1024;
 
 /// How long after boot the one-shot footer repair waits. Long enough for WAL
 /// replay and snapshot load to finish, short enough that a process which only
@@ -12598,7 +12568,7 @@ const REPAIR_QUARANTINE_AFTER: u32 = 3;
 ///
 /// Descending, and the last entry is the floor: exhaustion THERE is believed,
 /// because there is nothing cheaper left to try.
-const REPAIR_SORT_PARTITION_LADDER: [usize; 2] = [REPAIR_SORT_PARTITIONS, 1];
+const REPAIR_SORT_PARTITION_LADDER: [usize; 3] = [REPAIR_SORT_PARTITIONS, 4, 1];
 
 /// What a failed repair staging costs the candidate: the parallelism to retry
 /// at next (`None` = nothing cheaper left) and the strike step to charge.
@@ -12822,13 +12792,12 @@ mod repair_order_tests {
     fn a_pool_exhaustion_walks_down_the_parallelism_ladder_before_it_is_believed() {
         // Top of the ladder: buy a retry at lower parallelism, charge ONE strike
         // (not the whole threshold) so this alone cannot park the file.
-        // The ladder is [REPAIR_SORT_PARTITIONS, 1]; assert against the ladder
-        // itself so a future fan-in change cannot silently break the descent.
-        assert_eq!(super::repair_failure_action(true, 0), (Some(super::REPAIR_SORT_PARTITION_LADDER[1]), 1));
+        assert_eq!(super::repair_failure_action(true, 0), (Some(4), 1));
+        assert_eq!(super::repair_failure_action(true, 1), (Some(1), 1));
 
         // Bottom of the ladder: nothing cheaper left, so the exhaustion IS
         // deterministic and keeps the original whole-threshold semantics.
-        let (next, step) = super::repair_failure_action(true, super::REPAIR_SORT_PARTITION_LADDER.len() - 1);
+        let (next, step) = super::repair_failure_action(true, 2);
         assert_eq!(next, None, "single-partition sort is the floor");
         assert_eq!(step, super::REPAIR_QUARANTINE_AFTER, "believed at the floor: park it");
 
@@ -15835,17 +15804,13 @@ mod tests {
         let repair = build_optimize_session_state_tuned(0, Arc::clone(&env), Some("256"), Some(REPAIR_SORT_PARTITIONS));
         let exec = &repair.config().options().execution;
         assert_eq!(exec.sort_spill_reservation_bytes, REPAIR_SORT_RESERVATION_BYTES);
-        assert_eq!(exec.target_partitions, REPAIR_SORT_PARTITIONS, "repair lifts MAINTENANCE_MAX_PARTITIONS' cap of 2");
+        assert_eq!(exec.target_partitions, REPAIR_SORT_PARTITIONS, "repair runs one bin at a time, so it is not capped at 2");
 
-        // The reservation must cover the UNSPILLABLE merge, which scales with
-        // fan-in at ~500 MB per partition (prod 2026-08-11: 7.9 GB peak at 16).
-        // Assert the invariant, not a constant: any future fan-in change must
-        // keep the up-front carve-out matched to what the merge later demands,
-        // or the bin dies mid-rewrite exactly as it did that night.
+        // The reservation must scale WITH the partition count, or raising
+        // partitions silently re-inflates the unspillable merge share.
         assert!(
-            exec.sort_spill_reservation_bytes >= 500 * 1024 * 1024,
-            "per-partition reservation must cover ~500 MB of merge, got {}",
-            exec.sort_spill_reservation_bytes
+            exec.sort_spill_reservation_bytes * exec.target_partitions >= 4 * 1024 * 1024 * 1024,
+            "16 partitions need >=4 GB reserved; measured merge was 9.5 GB"
         );
 
         // Ordinary maintenance is untouched: it runs many concurrent bins, where
