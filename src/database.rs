@@ -2839,10 +2839,34 @@ impl Database {
         if self.bypass_rollup || !self.config.maintenance.timefusion_rollup_enabled || !self.config.maintenance.timefusion_rollup_read_enabled {
             return Ok(None);
         }
-        let Some(route) = crate::rollup::match_aggregate(logical_plan, session).await? else { return Ok(None) };
-        if !self.config.maintenance.rollup_read_enabled_for(&route.project_id) {
+        let routes = crate::rollup::match_aggregates(logical_plan, session).await?;
+        if routes.is_empty() {
             return Ok(None);
         }
+        if !self.config.maintenance.rollup_read_enabled_for(&routes[0].project_id) {
+            return Ok(None);
+        }
+        // Try every viable tier, best first, and take the first one that is
+        // actually BUILT across the window. The coarsest tier is cheapest to
+        // read but is also the newest and therefore the likeliest to have a hole
+        // at the oldest date; without this fallback a window starting one day
+        // before the coarse tier's coverage missed entirely while the fine tier
+        // sat fully built (measured in production, 08-04 vs 08-05).
+        let mut best_miss = None;
+        for route in routes {
+            match self.rollup_rewrite_for(route, session).await {
+                Ok(Some(rewrite)) => return Ok(Some(rewrite)),
+                Ok(None) => return Ok(None),
+                Err(reason) => best_miss = best_miss.or(Some(reason)),
+            }
+        }
+        Err(best_miss.unwrap_or(crate::rollup::MissReason::NotBuilt))
+    }
+
+    /// Resolve ONE candidate tier against its coverage, or say why it cannot serve.
+    async fn rollup_rewrite_for(
+        &self, route: crate::rollup::RoutedRollup, _session: &datafusion::execution::context::SessionState,
+    ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
         let end = route.hi.checked_sub(1).ok_or(crate::rollup::MissReason::UnboundedTime)?;
         // A rollup partition is built from Delta files only (`query_delta_only`),
         // so any row still in the MemBuffer is absent from it. That is a bound on

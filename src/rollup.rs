@@ -761,11 +761,13 @@ fn decline(plan: &datafusion::logical_expr::LogicalPlan) -> Result<Option<Routed
     }
 }
 
-/// Match a direct aggregate over one declared source table and construct its
-/// re-aggregation request. It deliberately rejects a shape it cannot prove.
-pub(crate) async fn match_aggregate(
+/// Every rollup that could serve this aggregate, best first.
+///
+/// The caller picks: only it knows which tiers are actually BUILT for the dates
+/// in the window, and the best tier on paper is often the one with a hole in it.
+pub(crate) async fn match_aggregates(
     plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
-) -> Result<Option<RoutedRollup>, MissReason> {
+) -> Result<Vec<RoutedRollup>, MissReason> {
     use datafusion::logical_expr::{Expr, LogicalPlan};
 
     // Every real dashboard query ends in `ORDER BY … DESC`, often with a LIMIT,
@@ -782,8 +784,8 @@ pub(crate) async fn match_aggregate(
     let (aggregate, having, output_names, outer_projection) = match aggregate_with_having(plan) {
         Some((aggregate, having)) => (aggregate, having, None, None),
         None => {
-            let LogicalPlan::Projection(projection) = plan else { return decline(plan) };
-            let Some((aggregate, having)) = aggregate_with_having(&projection.input) else { return decline(plan) };
+            let LogicalPlan::Projection(projection) = plan else { return decline(plan).map(Vec::from_iter) };
+            let Some((aggregate, having)) = aggregate_with_having(&projection.input) else { return decline(plan).map(Vec::from_iter) };
             // A HAVING between the two breaks the positional projection-to-
             // aggregate name mapping, so keep the aggregate's own schema names
             // — the filter references those — and re-apply the projection above
@@ -796,8 +798,8 @@ pub(crate) async fn match_aggregate(
         }
     };
     let mut predicates = Vec::new();
-    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(None) };
-    let Some(schema) = crate::schema_loader::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(None) };
+    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(Vec::new()) };
+    let Some(schema) = crate::schema_loader::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
     // Try every declared rollup, coarsest grain first: a coarser grain reads
     // strictly fewer rows for the same answer. Ties break toward the narrower
@@ -807,21 +809,30 @@ pub(crate) async fn match_aggregate(
     let mut candidates: Vec<&RollupSpec> = schema.rollups.iter().collect();
     candidates.sort_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), spec.dimensions.len()));
     let mut first_miss = None;
+    let mut routes = Vec::new();
     for spec in candidates {
         match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, output_names.as_ref(), session).await {
             Ok(mut route) => {
-                route.outer_projection =
-                    outer_projection.map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>()).transpose()?;
-                route.having = having.map(unqualified).transpose()?;
-                route.wrappers = wrappers;
-                return Ok(Some(route));
+                route.outer_projection = outer_projection
+                    .clone()
+                    .map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>())
+                    .transpose()?;
+                route.having = having.clone().map(unqualified).transpose()?;
+                route.wrappers = wrappers.clone();
+                routes.push(route);
             }
             // Report the FIRST spec's reason: it is the one the operator most
             // likely intended to serve this query, so it is the actionable gap.
             Err(reason) => first_miss = first_miss.or(Some(reason)),
         }
     }
-    Err(first_miss.unwrap_or(MissReason::UnsupportedShape))
+    // EVERY viable spec, not just the best one on paper. Coverage is not known
+    // here — it is per (spec, date) and lives in the database — so returning
+    // only the coarsest match would hand back a tier that happens to be
+    // unbuilt for the oldest date in the window and miss, while a finer tier
+    // that IS built sits unused. Measured in production: the 1h tier covered
+    // 08-05.. and the 1m tier 08-04.., and a window starting 08-04 missed.
+    if routes.is_empty() { Err(first_miss.unwrap_or(MissReason::UnsupportedShape)) } else { Ok(routes) }
 }
 
 /// Resolve one query against one declared rollup spec.
@@ -1067,7 +1078,7 @@ mod tests {
     }
 
     async fn route_for(state: &datafusion::execution::context::SessionState, sql: &str) -> Result<Option<RoutedRollup>, MissReason> {
-        match_aggregate(&optimized(state, sql).await, state).await
+        match_aggregates(&optimized(state, sql).await, state).await.map(|routes| routes.into_iter().next())
     }
 
     /// The rewrite when the rollup owns the whole window — the single-leg shape.
@@ -1251,7 +1262,7 @@ mod tests {
              GROUP BY 1, 2 ORDER BY 1 DESC"
         );
         let original = optimized(&state, &sql).await;
-        let route = match_aggregate(&original, &state).await.expect("match").expect("route");
+        let route = match_aggregates(&original, &state).await.expect("match").into_iter().next().expect("route");
         assert_eq!(route.target, "otel_metrics_rollup_metrics_1m_v1");
         let generated = hybrid_sql(&route, WIDE_HORIZON);
         // DataFusion inlines a short `IN` to `OR`s, so this list is deliberately
