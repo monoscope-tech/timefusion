@@ -7839,11 +7839,21 @@ impl Database {
         Ok(m)
     }
 
+    /// The DATA fingerprint of one source partition — the same identity
+    /// `partition_fingerprints` computes, so a build and a later read agree.
+    ///
+    /// Was the partition's file list, which compaction changes without touching
+    /// a row; that made every routed query miss shortly after any Consolidate
+    /// pass. See `partition_fingerprints` for why row count plus timestamp span
+    /// is the right question to ask.
     async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str) -> Result<u64> {
         let table = self.resolve_table(project_id, source).await?;
         let table = table.read().await;
-        let mut files = Self::partition_files_by_pid(&table, &format!("date={date}"))?;
-        Ok(partition_file_fp(files.remove(project_id).or_else(|| files.remove("default")).unwrap_or_default()))
+        let mut fingerprints = Self::partition_fingerprints(&table)?;
+        Ok(fingerprints
+            .remove(&(project_id.to_string(), date.to_string()))
+            .or_else(|| fingerprints.remove(&("default".to_string(), date.to_string())))
+            .unwrap_or_default())
     }
 
     fn invalidate_rollup_partition(&self, project_id: &str, source: &str, date: &str) {
@@ -8055,11 +8065,17 @@ impl Database {
         anyhow::bail!("rollup partition replace exhausted retries")
     }
 
-    async fn rebuild_rollup_partition(&self, source: &str, project_id: &str, date: &str, source_fp: u64) -> Result<()> {
+    /// `certified_fp` proves the partition was swept clean; it is NOT what
+    /// coverage is keyed on. Certification speaks in file identity (that exact
+    /// file set was probed) while coverage speaks in DATA identity, so the build
+    /// recomputes the latter — otherwise every build would store a fingerprint
+    /// the read path could never match.
+    async fn rebuild_rollup_partition(&self, source: &str, project_id: &str, date: &str, _certified_fp: u64) -> Result<()> {
         if !self.config.maintenance.rollup_build_enabled_for(project_id) {
             return Ok(());
         }
         let Some(schema) = get_schema(source) else { return Ok(()) };
+        let source_fp = self.rollup_source_fingerprint(project_id, source, date).await?;
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         let source_epoch = self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
         let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
@@ -8094,23 +8110,80 @@ impl Database {
         Ok(())
     }
 
-    /// Live source fingerprints for every `(project_id, date)` partition, in ONE
-    /// walk of the table's file list.
+    /// Live DATA fingerprints for every `(project_id, date)` partition, in ONE
+    /// pass over the add actions.
     ///
-    /// `rollup_source_fingerprint` walks every live file in the whole table to
-    /// answer for a single date. Recovery needs one answer per date per project,
-    /// and the read path needs one per date in the window, so calling it per
-    /// date is quadratic in the file count for no reason.
+    /// Deliberately NOT a fingerprint of the file list. Rollup coverage asks
+    /// "does this partition still hold the rows the rollup was built from?", and
+    /// the file list answers a different question — it changes whenever
+    /// compaction repacks the partition without touching a single row. Prod ran
+    /// Consolidate 18 times in 40 minutes, so file-identity coverage was
+    /// invalidated continuously and routed queries fell back to raw scans
+    /// forever (2026-08-11).
+    ///
+    /// Row count plus the timestamp span moves on every change that matters and
+    /// on no change that does not: an append raises the count (a merge-on-read
+    /// DELETE is itself an append, so it does too), a physical dedup rewrite
+    /// lowers it, and compaction leaves all three identical.
+    ///
+    /// `partition_file_fp` still backs `dedup_clean_fp`, which genuinely does
+    /// mean "this exact file set" — the two must not be conflated.
     fn partition_fingerprints(table: &DeltaTable) -> Result<HashMap<(String, String), u64>> {
-        let mut by_partition: HashMap<(String, String), Vec<String>> = HashMap::new();
-        for uri in table.get_file_uris()? {
-            let segment = |prefix: &str| uri.split('/').find_map(|part| part.strip_prefix(prefix).map(str::to_string));
-            // Custom-project tables carry no `project_id=` segment; the sweep
+        use std::hash::{Hash, Hasher};
+        let snapshot = table.snapshot()?.snapshot();
+        let actions = snapshot.add_actions_table(true)?;
+        let column = |name: &str| actions.column_by_name(name).cloned();
+        // The flattened add-actions batch exposes partition values as their own
+        // columns, so there is no path to parse. A table without `numRecords`
+        // stats cannot be fingerprinted this way at all; returning empty leaves
+        // every partition uncovered, which costs a raw scan rather than risking
+        // a wrong one.
+        let (Some(records), Some(dates)) = (column("num_records"), column("partition.date")) else { return Ok(HashMap::new()) };
+        let Some(records) = records.as_any().downcast_ref::<arrow::array::Int64Array>() else { return Ok(HashMap::new()) };
+        let projects = column("partition.project_id");
+        // Partition values arrive typed: `date` is a Date32, `project_id` a
+        // string. Rendering the date the same way the partition path spells it
+        // is what lets these keys match the `YYYY-MM-DD` used everywhere else.
+        let string_at = |array: &Option<arrow::array::ArrayRef>, row: usize| -> Option<String> {
+            let array = array.as_ref()?;
+            if !array.is_valid(row) {
+                return None;
+            }
+            match array.data_type() {
+                arrow::datatypes::DataType::Date32 => {
+                    let days = arrow::array::AsArray::as_primitive_opt::<arrow::datatypes::Date32Type>(array.as_ref())?.value(row);
+                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?.checked_add_signed(chrono::Duration::days(days as i64)).map(|date| date.to_string())
+                }
+                _ => Some(crate::test_utils::test_helpers::array_get_str(array.as_ref(), row)),
+            }
+        };
+        let dates = Some(dates);
+        // (rows, min_ts, max_ts) per partition.
+        let mut by_partition: HashMap<(String, String), (i64, i64, i64)> = HashMap::new();
+        let min_ts = crate::count_pushdown::ts_micros_column(&actions, "min.timestamp");
+        let max_ts = crate::count_pushdown::ts_micros_column(&actions, "max.timestamp");
+        for row in 0..actions.num_rows() {
+            let Some(date) = string_at(&dates, row) else { continue };
+            // Custom-project tables carry no `project_id` partition; the sweep
             // groups those under "default", so match it exactly.
-            let (Some(date), project) = (segment("date="), segment("project_id=").unwrap_or_else(|| "default".to_string())) else { continue };
-            by_partition.entry((project, date)).or_default().push(uri);
+            let key = (string_at(&projects, row).unwrap_or_else(|| "default".to_string()), date);
+            let entry = by_partition.entry(key).or_insert((0, i64::MAX, i64::MIN));
+            entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
+            if let Some(lo) = min_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
+                entry.1 = entry.1.min(lo);
+            }
+            if let Some(hi) = max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
+                entry.2 = entry.2.max(hi);
+            }
         }
-        Ok(by_partition.into_iter().map(|(key, files)| (key, partition_file_fp(files))).collect())
+        Ok(by_partition
+            .into_iter()
+            .map(|(key, identity)| {
+                let mut hasher = fnv::FnvHasher::default();
+                identity.hash(&mut hasher);
+                (key, hasher.finish())
+            })
+            .collect())
     }
 
     /// Re-adopt rollup coverage that previous processes durably wrote.
@@ -8552,7 +8625,10 @@ impl Database {
                     if self.config.maintenance.rollup_build_enabled_for(pid)
                         && self.rollup_retry_allowed(pid, table_name, &date.to_string())
                         && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
-                        && !self.rollup_coverage_current(pid, table_name, &date.to_string(), current_fp)
+                        // Coverage is keyed on DATA identity, not on this file
+                        // fingerprint — asking with the wrong one would report
+                        // every partition stale and rebuild it on every tick.
+                        && !self.rollup_coverage_current(pid, table_name, &date.to_string(), self.rollup_source_fingerprint(pid, table_name, &date.to_string()).await.unwrap_or_default())
                         && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), current_fp).await
                     {
                         self.record_rollup_failure(pid, table_name, &date.to_string());
@@ -19685,3 +19761,4 @@ mod footer_repair_schedule_tests {
         assert!(budget > period, "a long run must not be capped by a short cadence");
     }
 }
+

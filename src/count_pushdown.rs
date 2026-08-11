@@ -410,14 +410,19 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
 /// Extract `(min_ts, max_ts, numRecords)` for this project's files from the
 /// flattened add-actions batch and sum the fully-contained ones. `None` on
 /// any missing column/stat, DV presence, or boundary straddle.
+/// A timestamp stats column as microseconds, or `None` when it is absent or not
+/// a timestamp. Shared with the rollup coverage fingerprint, which reads the
+/// same per-file span this pushdown does.
+pub(crate) fn ts_micros_column(b: &RecordBatch, name: &str) -> Option<Int64Array> {
+    use datafusion::arrow::{array::TimestampMicrosecondArray, compute::cast, datatypes::TimeUnit};
+    let c = b.column_by_name(name)?;
+    matches!(c.data_type(), DataType::Timestamp(_, _)).then_some(())?;
+    let c = cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None)).ok()?;
+    Some(c.as_any().downcast_ref::<TimestampMicrosecondArray>()?.reinterpret_cast())
+}
+
 fn sum_from_actions(actions: &RecordBatch, q: &CountQuery) -> Option<u64> {
-    fn ts_micros_col(b: &RecordBatch, name: &str) -> Option<Int64Array> {
-        use datafusion::arrow::{array::TimestampMicrosecondArray, compute::cast, datatypes::TimeUnit};
-        let c = b.column_by_name(name)?;
-        matches!(c.data_type(), DataType::Timestamp(_, _)).then_some(())?;
-        let c = cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None)).ok()?;
-        Some(c.as_any().downcast_ref::<TimestampMicrosecondArray>()?.reinterpret_cast())
-    }
+    let ts_micros_col = ts_micros_column;
     // Deletion vectors make numRecords an over-count — bail if ANY file has
     // one (column families vary by writer; check every dv-prefixed column).
     let any_dv = actions
