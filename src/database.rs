@@ -1487,6 +1487,38 @@ fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
     Some((0..=span).map(|d| lo_d + chrono::Duration::days(d)).collect())
 }
 
+/// The partition dates a write batch's rows land in, or `None` when the batch
+/// does not say.
+///
+/// `None` costs the whole table its rollup coverage, so BOTH readings have to
+/// fail before that happens: `timestamp` at ANY precision — a millisecond
+/// column used to fail a hard downcast to microseconds and take every date's
+/// coverage with it — and then the `date` partition column, which is what Delta
+/// actually partitions on and so names the partition even where it disagrees.
+///
+/// Distinct days are collected BEFORE formatting, so this allocates one
+/// `String` per day rather than per row; it runs on every inbound write.
+fn batch_dates(batch: &RecordBatch) -> Option<HashSet<String>> {
+    use datafusion::arrow::{
+        array::AsArray,
+        compute::cast,
+        datatypes::{DataType, TimeUnit, TimestampMicrosecondType},
+    };
+    const DAY: i64 = 86_400_000_000;
+    let micros = batch.column_by_name("timestamp").and_then(|column| {
+        let wanted = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let column = if column.data_type() == &wanted { column.clone() } else { cast(column, &wanted).ok()? };
+        Some(column.as_primitive_opt::<TimestampMicrosecondType>()?.iter().flatten().map(|micros| micros.div_euclid(DAY)).collect::<HashSet<_>>())
+    });
+    if let Some(days) = micros {
+        return Some(days.into_iter().filter_map(|day| chrono::DateTime::from_timestamp_micros(day * DAY)).map(|day| day.date_naive().to_string()).collect());
+    }
+    // One cast covers Date32, Utf8, Utf8View and LargeUtf8 alike, and only runs
+    // on the path where the timestamp was already unreadable.
+    let text = cast(batch.column_by_name("date")?, &DataType::Utf8).ok()?;
+    Some(text.as_string::<i32>().iter().flatten().map(str::to_string).collect())
+}
+
 /// Microseconds at 00:00:00 UTC on a `YYYY-MM-DD` partition value.
 fn date_start_micros(date: &str) -> Option<i64> {
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros().into()
@@ -8130,32 +8162,35 @@ impl Database {
         self.rollup_backoff.retain(|(project, table, _, _), _| project != project_id || table != source);
     }
 
-    /// Walks the whole timestamp column, so it is gated on the master switch as
-    /// well as the schema: with rollups off this runs on every inbound write for
-    /// nothing, at one `String` allocation per row.
+    /// Walks the batches' dates, so it is gated on the master switch as well as
+    /// the schema: with rollups off this runs on every inbound write for nothing.
     fn invalidate_rollup_batches(&self, project_id: &str, source: &str, batches: &[RecordBatch]) {
         if !self.config.maintenance.timefusion_rollup_enabled || get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return;
         }
-        let dates = batches
-            .iter()
-            .map(|batch| {
-                batch.column_by_name("timestamp").and_then(|column| column.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>()).map(
-                    |timestamps| {
-                        timestamps
-                            .iter()
-                            .flatten()
-                            .filter_map(chrono::DateTime::<chrono::Utc>::from_timestamp_micros)
-                            .map(|timestamp| timestamp.date_naive().to_string())
-                            .collect::<HashSet<_>>()
-                    },
-                )
-            })
-            .collect::<Option<Vec<_>>>();
-        match dates {
-            Some(dates) => dates.into_iter().flatten().for_each(|date| self.invalidate_rollup_partition(project_id, source, &date)),
-            None => self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source),
+        let mut dates = HashSet::new();
+        for batch in batches {
+            let Some(batch_dates) = batch_dates(batch) else {
+                // A batch that cannot say which partitions it touches leaves no
+                // choice but the source-wide wipe — but that wipe is what kept
+                // nine days of rollups from ever surviving a read (prod
+                // 2026-08-11), so it must never happen quietly again. It also
+                // goes through `invalidate_rollup_source`, which bumps the
+                // source epochs and clears the backoff; the bare `retain` this
+                // replaces did neither, so a wipe could leave a date that no
+                // longer had coverage but was still backing off from a retry.
+                warn!(
+                    project_id,
+                    source,
+                    event = "rollup_invalidate_unscoped",
+                    "write batch carries no readable date; invalidating every partition's coverage"
+                );
+                self.invalidate_rollup_source(project_id, source);
+                return;
+            };
+            dates.extend(batch_dates);
         }
+        dates.iter().for_each(|date| self.invalidate_rollup_partition(project_id, source, date));
     }
 
     /// True iff every (project, date) partition overlapping `window` carries
@@ -13150,6 +13185,43 @@ mod repair_order_tests {
             assert!(u >= prev, "claim must not decrease as batches grow: {mb} MB -> {u} after {prev}");
             prev = u;
         }
+    }
+
+    /// `None` here wipes EVERY date's rollup coverage for the table, so the bar
+    /// for reaching it has to be "the batch genuinely cannot say". A hard
+    /// downcast to microseconds meant a millisecond column — or any other
+    /// precision — hit that path silently.
+    #[test]
+    fn a_write_batch_names_its_partitions_at_any_timestamp_precision() {
+        use arrow::{
+            array::{ArrayRef, Date32Array, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray},
+            datatypes::{Field, Schema},
+        };
+        use std::sync::Arc;
+        let day = 86_400_000_000i64;
+        let batch = |name: &str, column: ArrayRef| {
+            RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new(name, column.data_type().clone(), true)])), vec![column]).expect("batch")
+        };
+        let expect = |batch: RecordBatch| {
+            let mut dates = super::batch_dates(&batch).expect("the batch names its partitions").into_iter().collect::<Vec<_>>();
+            dates.sort();
+            dates
+        };
+
+        // Two rows a day apart, written at microsecond and millisecond precision.
+        let micros = TimestampMicrosecondArray::from(vec![0i64, day]).with_timezone("UTC");
+        assert_eq!(expect(batch("timestamp", Arc::new(micros))), ["1970-01-01", "1970-01-02"]);
+        let millis = TimestampMillisecondArray::from(vec![0i64, day / 1_000]).with_timezone("UTC");
+        assert_eq!(expect(batch("timestamp", Arc::new(millis))), ["1970-01-01", "1970-01-02"], "a millisecond column used to wipe the whole table");
+
+        // No timestamp at all: the `date` partition column is what Delta
+        // partitions on, and it answers for both its physical encodings.
+        assert_eq!(expect(batch("date", Arc::new(Date32Array::from(vec![0, 1])))), ["1970-01-01", "1970-01-02"]);
+        assert_eq!(expect(batch("date", Arc::new(StringArray::from(vec!["2026-08-01"])))), ["2026-08-01"]);
+
+        // Only a batch that carries neither may force the source-wide wipe.
+        let opaque = batch("name", Arc::new(StringArray::from(vec!["x"])));
+        assert!(super::batch_dates(&opaque).is_none(), "a batch with no date and no timestamp must still fall back");
     }
 
     /// Prod 2026-08-09 quarantined monoscope-self's `date=2026-08-01` file after
