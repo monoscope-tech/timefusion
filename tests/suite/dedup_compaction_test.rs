@@ -1465,6 +1465,73 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     Ok(())
 }
 
+/// Regression, prod 2026-08-09 → 08-11: every 5-minute service-map rollup failed with
+///
+///     Internal error: DedupExec key `id` not in input schema
+///
+/// from the day `f1f0b90` enabled the swept-partition dedup skip by default.
+///
+/// The shape is the rollup's own: a date whose Delta partition the sweep has CERTIFIED,
+/// plus fresher rows for that date still sitting in the MemBuffer. `pre_skip_dedup` reads
+/// the certified Delta partition and drops the dedup keys from the scan projection — but
+/// the mem ∪ delta union path "never grants `skip_dedup`" (see the exclusion-range comment
+/// in `ProjectRoutingTable::scan`), so a `DedupExec` is still built, over a scan that no
+/// longer carries `id`.
+///
+/// The query must project neither a dedup key nor the tombstone marker, which is what the
+/// dispatcher's `SELECT DISTINCT project_id` does.
+#[serial]
+#[tokio::test]
+async fn a_certified_partition_with_buffered_rows_still_answers_without_the_keys_projected() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("dedup_skip_mem_union").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+    let cfg = Arc::new(cfg);
+    let db0 = Database::with_config(Arc::clone(&cfg)).await?;
+    let layer =
+        Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::bootstrap::delta_write_callback(&db0)));
+    let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+    let ts = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let (lo, hi) = (day.and_hms_opt(0, 0, 0).unwrap().and_utc().to_rfc3339(), day.and_hms_opt(23, 59, 59).unwrap().and_utc().to_rfc3339());
+
+    // Delta leg: committed directly, then swept so the partition is certified.
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("settled", "delta", &project_id, ts)])?], true, None)
+        .await?;
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    // MemBuffer leg: same date, never flushed — this is what makes it a union.
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("buffered", "mem", &project_id, ts + 1)])?], false, None)
+        .await?;
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    // Warm the fast-resolve cache the way a live process is warm: `pre_skip_dedup` reads it,
+    // and a cold cache leaves the skip off — which is why this never reproduced in-harness.
+    let _ = ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?.collect().await?;
+
+    // `name` is neither a dedup key (timestamp, id) nor the tombstone marker.
+    let sql = format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND timestamp >= '{lo}' AND timestamp <= '{hi}'");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+
+    for b in &batches {
+        assert_eq!(b.num_columns(), 1, "only `name` was selected; a dedup key or the tombstone marker leaked through");
+    }
+    let mut rows: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = datafusion::arrow::compute::kernels::cast::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8).expect("cast to Utf8");
+            let col = col.as_string::<i32>();
+            (0..b.num_rows()).map(|i| col.value(i).to_string()).collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec!["delta".to_string(), "mem".to_string()], "both legs must answer");
+    Ok(())
+}
+
 /// A predicate on a version-MUTABLE column, pushed into the Delta leg because
 /// the window is sweep-certified. This is the half of the swept-partition work
 /// that reclaims ROWS rather than the key projection: prod 2026-08-09 measured

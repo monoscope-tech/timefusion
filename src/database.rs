@@ -13961,6 +13961,19 @@ impl ProjectRoutingTable {
     /// column can exist (all-NULL) on a table nothing has ever tombstoned with
     /// no effect on any result. `keep` strips the marker back off when it was
     /// projected in only for this filter.
+    /// Restore a requested column set from an augmented scan, by index into the input.
+    /// Mirrors what `DedupExec`'s `output_projection` does, for the paths that skip it.
+    fn project_indices(plan: Arc<dyn ExecutionPlan>, idxs: &[usize]) -> DFResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_expr::PhysicalExpr;
+        let schema = plan.schema();
+        if idxs.len() == schema.fields().len() && idxs.iter().enumerate().all(|(i, &j)| i == j) {
+            return Ok(plan);
+        }
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            idxs.iter().map(|&i| (Arc::new(PhysicalColumn::new(schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>, schema.field(i).name().clone())).collect();
+        Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+    }
+
     fn filter_tombstones(plan: Arc<dyn ExecutionPlan>, marker: &str, keep: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
         use datafusion::{
             physical_expr::{PhysicalExpr, expressions::binary},
@@ -14827,10 +14840,26 @@ impl TableProvider for ProjectRoutingTable {
         let (scan_projection, output_projection, tombstone_keep): (Option<Vec<usize>>, Option<Vec<usize>>, Option<usize>) = match projection {
             Some(p) if !dedup_keys.is_empty() || tombstone.is_some() => {
                 let full_schema = self.schema();
-                // A granted skip removes the DedupExec, so its key columns are
-                // dead weight; the tombstone marker still rides in because
-                // `filter_tombstones` runs regardless.
-                let augment: Vec<&String> = if pre_skip_dedup { Vec::new() } else { dedup_keys.iter().chain(dedup_tiebreak.iter()).collect() };
+                // The dedup keys ALWAYS ride in, even when `pre_skip_dedup` says the window
+                // is certified and the DedupExec is about to be removed.
+                //
+                // Omitting them here is what took every cross-project scan down from
+                // 2026-08-09 (when `f1f0b90` enabled this skip by default) to 08-11:
+                //
+                //     Internal error: DedupExec key `id` not in input schema
+                //
+                // `pre_skip_dedup` is decided ONCE, above the projection, but the skip it
+                // predicts is granted PER LEG below — and the mem ∪ delta union path never
+                // grants it at all (see the exclusion-range comment further down). So any
+                // query touching the buffer got its keys dropped and a DedupExec built
+                // anyway, over a scan that could not feed it.
+                //
+                // Keeping them costs read bytes on a window that ends up skipping (`id` is
+                // ~43% of an otel file), and the skip still removes the DedupExec itself,
+                // which is the larger win. Buying the bytes back means making one decision
+                // instead of two — resolve the table above the projection and let that
+                // verdict bind every leg — not predicting here what the legs will do.
+                let augment: Vec<&String> = dedup_keys.iter().chain(dedup_tiebreak.iter()).collect();
                 let missing: Vec<usize> =
                     augment.into_iter().chain(tombstone.iter()).filter_map(|k| full_schema.index_of(k).ok()).filter(|i| !p.contains(i)).collect();
                 if missing.is_empty() {
@@ -14969,8 +14998,14 @@ impl TableProvider for ProjectRoutingTable {
                         // Declaring it REQUIRED is what stops EnforceSorting from
                         // deleting the merge above as unused — see the field docs.
                         .requiring(merge_req.clone()),
-                ),
-                false => plan,
+                ) as Arc<dyn ExecutionPlan>,
+                // DedupExec is what restores the requested columns when it runs. Skipped,
+                // that debt is still owed: the scan is carrying augmented key columns the
+                // caller never asked for, and without this they leak into the result.
+                false => match &output_projection {
+                    Some(idxs) => Self::project_indices(plan, idxs)?,
+                    None => plan,
+                },
             };
             match &tombstone {
                 Some(marker) => Self::filter_tombstones(plan, marker, tombstone_keep),
@@ -14991,17 +15026,21 @@ impl TableProvider for ProjectRoutingTable {
             if let Some(f) = tantivy_id_filter.clone() {
                 delta_only_filters.push(f);
             }
-            // Skip is only sound when no output-projection restore is needed
-            // (an augmented projection minus DedupExec would leak key columns).
+            // The augmented key columns a skip leaves behind are projected away by
+            // `project_indices` in the plan builder above, so a restore is no obstacle.
             let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
             let table = delta_table.read().await;
             // Same guard for the dedup gate and the scan: the fingerprint
             // verdict applies to exactly the snapshot being read.
             // `pre_skip_dedup` already decided this above the projection; re-check
             // against the RESOLVED table so the fingerprint verdict applies to the
-            // exact snapshot being read, and keep the `output_projection` guard —
-            // when the skip was granted no augmentation happened, so it is None.
-            let skip_dedup = pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            // exact snapshot being read.
+            // No `output_projection.is_none()` conjunct: it stood in for "the keys are
+            // still in the scan", which is now unconditionally true. It also never meant
+            // what it said — the TOMBSTONE marker alone turns `output_projection` `Some`,
+            // so on any table declaring both (otel_logs_and_spans declares both) it
+            // silently revoked every skip it was supposed to allow.
+            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
                 // The window is sweep-certified: exactly one row per key, and it
@@ -15127,9 +15166,13 @@ impl TableProvider for ProjectRoutingTable {
             // Same guard for the dedup gate and the scan (see branch above).
             // `pre_skip_dedup` already decided this above the projection; re-check
             // against the RESOLVED table so the fingerprint verdict applies to the
-            // exact snapshot being read, and keep the `output_projection` guard —
-            // when the skip was granted no augmentation happened, so it is None.
-            let skip_dedup = pre_skip_dedup && output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            // exact snapshot being read.
+            // No `output_projection.is_none()` conjunct: it stood in for "the keys are
+            // still in the scan", which is now unconditionally true. It also never meant
+            // what it said — the TOMBSTONE marker alone turns `output_projection` `Some`,
+            // so on any table declaring both (otel_logs_and_spans declares both) it
+            // silently revoked every skip it was supposed to allow.
+            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }
