@@ -2112,19 +2112,25 @@ pub struct MaintenanceConfig {
     ///
     /// `dedup_clean_fp` is process-local and TF deploys several times a day,
     /// which is the leading suspect for the skip firing on only 0.2–0.5% of
-    /// Delta-reading scans. Persistence is the lever for that — but the size of
-    /// the prize is unmeasured, which is why this is OFF.
-    ///
-    /// **Turn it on only after reading Phase 0**
-    /// (`docs/plans/2026-08-11-certification-survival.md`): if the denials are
-    /// mostly `dedup_denied_fp_moved`, partitions are being written to
-    /// continuously and no amount of persistence recovers them, so this earns
-    /// nothing and should stay off.
+    /// Delta-reading scans. Persistence is the lever for that.
     ///
     /// It cannot widen certification. A reloaded entry passes through the same
     /// fingerprint-equality check against the live file list as an in-memory one,
-    /// so a stale record costs a skip rather than granting a wrong one.
-    #[serde(default)]
+    /// so a stale, truncated or corrupted store costs a skip rather than granting
+    /// a wrong one. What it DOES do is let the skip actually fire, where before it
+    /// almost never got the chance — so this raises exposure to
+    /// `timefusion_read_dedup_skip_swept`'s certification rule rather than adding
+    /// a new mechanism of its own.
+    ///
+    /// Kill switches, in order of bluntness: set this false to go back to a cold
+    /// cache per process; set `timefusion_read_dedup_skip_swept` false to remove
+    /// the skip entirely. Doubt a `count(*)` and reach for the second one.
+    ///
+    /// Enabling this also makes Phase 0
+    /// (`docs/plans/2026-08-11-certification-survival.md`) measure the end state
+    /// directly — `dedup_denied_never_certified` now reflects what a WARM cache
+    /// leaves on the table, instead of predicting it from a cold one.
+    #[serde(default = "d_true")]
     pub timefusion_dedup_certification_persist: bool,
     /// Allow `DedupExec` to run in streaming `bounded[timestamp]` mode, which
     /// trusts the scan's DECLARED `output_ordering` — i.e. the parquet footer's

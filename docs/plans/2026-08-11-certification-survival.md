@@ -1,13 +1,28 @@
 # Making dedup certification survive — measure before you build
 
-**Status:** **Phase 0 and Phase 1 are both built.** Phase 0's counters are live — see "Reading
-Phase 0". Phase 1 is shipped dark behind `timefusion_dedup_certification_persist` (default
-off) and **must not be enabled until Phase 0 has been read** — see "Turning it on". The
-remaining work is a measurement, not code.
+**Status:** **Phase 0 and Phase 1 are built and both are ON.** The remaining work is to read
+the measurement — see "Reading Phase 0" — but the question it answers has changed shape, for
+the better.
 
-The one change that is unconditionally on is the sweep fix (finding 3 below), because it is a
-bug rather than an optimisation. It may move the numbers on its own, so read Phase 0 after it
-has been live for a day before judging whether persistence is worth enabling at all.
+Persistence was enabled rather than held behind the measurement, deliberately. Phase 0 as
+originally framed was a *prediction*: from a cold cache, estimate what a warm one would
+convert. With `timefusion_dedup_certification_persist` on, the counters measure the end state
+directly — `dedup_skipped` is now what a warm cache actually delivers, and
+`dedup_denied_never_certified` is what it still leaves on the table. That is a strictly better
+experiment than the one this document proposed, and it costs a flag flip to undo.
+
+What enabling changes is **exposure, not mechanism**: it makes the read-side skip fire where
+it previously almost never got the chance. The certification rule it leans on is unchanged and
+already shipped. Kill switches, in order of bluntness:
+
+1. `timefusion_dedup_certification_persist=false` — back to a cold cache per process.
+2. `timefusion_read_dedup_skip_swept=false` — removes the skip entirely.
+
+Doubt a `count(*)` and reach for the second one. Note that the parity test guarding this
+(`count_is_identical_with_and_without_the_dedup_skip`) only began genuinely exercising the
+skip in this batch of work — before that it ran without a time bound and never engaged it.
+
+The sweep fix (finding 3) is also unconditionally on, and may move the numbers on its own.
 
 **Owner:** unassigned. Prerequisite reading: `record_certification` and `dedup_window_clean`
 in `src/database.rs`, and `docs/plans/2026-08-09-per-date-dedup.md`.
@@ -203,11 +218,9 @@ dates and `never_certified` to dominate for sealed ones — i.e. the win is avai
 historical windows, which are the least latency-sensitive queries we serve. If that is what
 comes back, the correct decision is to stop.
 
-## Phase 1 — BUILT, and OFF
+## Phase 1 — BUILT, and ON
 
-Both levers are implemented and shipped dark. Neither changes behaviour until
-`timefusion_dedup_certification_persist` is turned on, except the sweep fix, which is
-unconditional because it is a correctness-shaped bug rather than an optimisation.
+Both levers are implemented and enabled.
 
 **The sweep fix (finding 3) is on.** `dedup_today_partitions` no longer records the table
 version after a pass that dropped rows, so the confirming 0-drop pass runs off the back of the
@@ -217,7 +230,7 @@ after this has been live for a day before judging persistence** — it may move
 `never_certified` on its own, and if it does, the persistence layer below is solving a problem
 that no longer exists at the measured size.
 
-**Persistence is built as option A, adapted, and defaults OFF.** `src/certification_store.rs`
+**Persistence is built as option A, adapted.** `src/certification_store.rs`
 snapshots `dedup_clean_fp` to the data dir at the end of each sweep and reloads it at boot.
 
 *Deviation from the A3 recommendation above, deliberately.* A3 proposed object-store markers
@@ -243,12 +256,15 @@ wrong one. That is why this is a snapshot-and-reload rather than a transaction.
 Covered by `a_certification_survives_a_restart_and_still_grants_the_skip` — which fails with
 the flag off, so it is testing persistence and not something incidental.
 
-### Turning it on
+### Turning it back off
 
-Read the Phase 0 rows first. If `dedup_denied_fp_moved` dominates, **leave it off** and close
-this out: partitions are being written to continuously and no store recovers that. Only if
-`never_certified` still dominates *after* the sweep fix has been live for a day is there
-anything for persistence to recover.
+If `dedup_denied_fp_moved` dominates the reading, persistence is earning little — partitions
+are being written to continuously and no store recovers that. That is a reason to set
+`timefusion_dedup_certification_persist=false` and close this out, not an incident.
+
+If a `count(*)` is ever doubted, go straight to `timefusion_read_dedup_skip_swept=false`:
+that removes the skip itself, which is the thing that could produce a wrong count. Persistence
+only controls how often it gets the opportunity.
 
 ## Phase 1 — the options as originally written
 
