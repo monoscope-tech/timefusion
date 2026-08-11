@@ -786,11 +786,28 @@ fn is_probe_scaffolding(expr: &datafusion::logical_expr::Expr) -> bool {
     !columns.is_empty() && columns.iter().all(|column| matches!(column.name.as_str(), "project_id" | "timestamp"))
 }
 
+/// Canonicalized declared filters, keyed by (source, spec, measure).
+///
+/// The probe below PLANS a statement per filtered measure, and the matcher runs
+/// on every aggregate query — 9 filtered measures across 2 tiers is 18 logical
+/// plans per query, paid even by queries that then decline. The canonical form
+/// depends only on the declared filter text and the schema's coercion rules;
+/// the project and time bounds are injected purely to satisfy the scan
+/// admission guard and stripped straight back out, so the result is the same
+/// for every caller and safe to memoize for the life of the process.
+static MEASURE_FILTERS: std::sync::OnceLock<dashmap::DashMap<(String, String, String), String>> = std::sync::OnceLock::new();
+
 async fn measure_filters<'a>(
     session: &datafusion::execution::context::SessionState, source: &str, spec: &'a RollupSpec, project_id: &str, lo: i64, hi: i64,
 ) -> Result<Vec<(&'a crate::schema_loader::RollupMeasure, String)>, MissReason> {
+    let cache = MEASURE_FILTERS.get_or_init(dashmap::DashMap::new);
     let mut filters = Vec::with_capacity(spec.measures.len());
     for measure in &spec.measures {
+        let key = (source.to_string(), spec.name.clone().unwrap_or_default(), measure.name.clone());
+        if let Some(cached) = cache.get(&key) {
+            filters.push((measure, cached.clone()));
+            continue;
+        }
         let filter = match &measure.filter {
             None => String::new(),
             // Canonicalized through the SAME pipeline the query side went
@@ -826,6 +843,7 @@ async fn measure_filters<'a>(
                 canonical_and(filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).filter(|term| !is_probe_scaffolding(term)))
             }
         };
+        cache.insert(key, filter.clone());
         filters.push((measure, filter));
     }
     Ok(filters)
@@ -1048,7 +1066,26 @@ async fn route_with_spec(
                 .iter()
                 .find(|(measure, filter)| measure.agg == "count" && measure.column.is_none() && filter == promoted)
                 .map(|(measure, _)| *measure)
-                .ok_or(MissReason::UnknownFilter)?,
+                .ok_or_else(|| {
+                    // The two canonical strings are the whole content of this
+                    // decline and there is no way to see them from outside. A
+                    // near-miss between textually identical predicates has now
+                    // cost two deploys to diagnose; print both.
+                    tracing::warn!(
+                        event = "rollup_promotion_unmatched",
+                        source,
+                        spec = spec.name.as_deref().unwrap_or_default(),
+                        promoted = %promoted,
+                        declared = %configured_filters
+                            .iter()
+                            .filter(|(measure, _)| measure.agg == "count" && measure.column.is_none())
+                            .map(|(measure, filter)| format!("{}={filter}", measure.name))
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        "a residual row filter matched no declared count measure"
+                    );
+                    MissReason::UnknownFilter
+                })?,
         ),
     };
 
