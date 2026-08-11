@@ -35,6 +35,19 @@ mod imp {
             warn!("profiling: cannot create {dir:?}: {e} — CPU flamegraphs disabled, heap dumps still land at malloc_conf prof_prefix");
         }
         archive_prekill_dumps(&dir);
+        // The CPU sampler is the one part of boot that can only be removed by a
+        // REBUILD, and it is signal-handler + libunwind code — the classic shape
+        // for a SIGSEGV with no Rust panic. On 2026-08-11 prod crashlooped
+        // (exit 139) with `starting cpu profiler` as the last line of every
+        // attempt, and there was no way to test the hypothesis without shipping
+        // a new image into an outage. Off by env, not by rebuild.
+        //
+        // Heap profiling is unaffected: it is jemalloc's own, configured by the
+        // baked `malloc_conf`, so the dumps that attribute an OOM still land.
+        if std::env::var("TIMEFUSION_CPU_PROFILE").is_ok_and(|v| v.eq_ignore_ascii_case("false") || v == "0") {
+            info!("profiling: jemalloc heap auto-dump only — CPU sampler disabled by TIMEFUSION_CPU_PROFILE → {dir:?}");
+            return;
+        }
         info!("profiling: enabled (jemalloc heap auto-dump + rolling CPU flamegraph) → {dir:?}");
         spawn_cpu_sampler(dir);
     }

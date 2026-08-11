@@ -54,9 +54,17 @@ Reproduce offline: copy that dir, point a local binary at it, run under
 `gdb`/`catchsegv`. No panic text ⇒ unsafe/FFI, so `RUST_BACKTRACE` will not help.
 Two known-good images crashed identically, so it is **state**, not code.
 
-Related hardening regardless of outcome: `walrus-rust`
-`StorageImpl::read` bounds-checks with `debug_assert!`, compiled out in release.
-Make it a real check that returns an error.
+**CORRECTION (16:30):** I listed the `walrus-rust` `StorageImpl::read`
+`debug_assert!` as a missing bounds check. It is not — the line under it is
+`&mmap[offset..offset + dest.len()]`, a Rust slice index, which is bounds-checked
+and PANICS on overrun in release too. The `debug_assert!` only improves the
+message in debug builds. No UB, no fix needed, and it is not a SIGSEGV candidate.
+Truncation behind a live mmap would also give SIGBUS (135), not 139.
+
+That leaves the **CPU profiler** as the only unsafe-adjacent thing at that point
+in boot (signal handlers + libunwind). Gated behind `TIMEFUSION_CPU_PROFILE` as
+of this plan's follow-up, so the hypothesis can be tested by env var instead of
+by shipping an image into an outage.
 
 ### 3. CapRover `serviceUpdateOverride` — one word
 The timefusion app config literally contains `"Order": "start-first"`, which is
@@ -112,8 +120,7 @@ the stand-down are both workarounds for a wrong number.
 - `wave_commit_enter` logs `wave_ids`, not `project_id` — impossible to attribute
   a commit to a tenant. My monitor's `whale_commits` counter could never fire.
 - Repair events omit the date/file being repaired in some paths.
-- The CPU profiler is **ungated** (`profiling.rs::start()` takes no env switch),
-  so it cannot be disabled without a rebuild. Gate it.
+- ~~The CPU profiler is **ungated**~~ — DONE: `TIMEFUSION_CPU_PROFILE`.
 
 ### 9. e2e cannot manufacture a footer-less file
 `with_sort_skip_bytes(0)` no longer produces one — the flush path escalates to a
@@ -150,7 +157,7 @@ checking what produced it.
 
 ## Suggested order
 
-1. Gate the profiler + fix the walrus `debug_assert` (small, unblocks #2)
+1. ~~Gate the profiler~~ DONE (`TIMEFUSION_CPU_PROFILE`); the walrus `debug_assert` item was withdrawn — see the correction in #2
 2. Instrument the health probe (#1) — the outage trigger
 3. CapRover `stop-first` (#3) — needs you, one word
 4. Let 07-31 drain; verify the ladder (#4)
