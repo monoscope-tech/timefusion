@@ -388,6 +388,8 @@ impl StatsTableProvider {
             let (total, skipped) = (m.scans_total.load(Relaxed), m.scans_skipped_delta.load(Relaxed));
             let (fr_hits, fr_misses) = (m.fast_resolve_hits.load(Relaxed), m.fast_resolve_misses.load(Relaxed));
             let (dedup_elig, dedup_skipped) = (m.dedup_eligible_scans.load(Relaxed), m.dedup_skipped.load(Relaxed));
+            let (cert_never, cert_moved) = (m.dedup_denied_never_certified.load(Relaxed), m.dedup_denied_fp_moved.load(Relaxed));
+            let cert_dwells = m.cert_dwell_total.load(Relaxed);
             let (pc_hits, pc_misses) = (m.provider_cache_hits.load(Relaxed), m.provider_cache_misses.load(Relaxed));
             let provider_builds = m.provider_build_total.load(Relaxed);
             let provider_scans = m.provider_scan_total.load(Relaxed);
@@ -433,6 +435,24 @@ impl StatsTableProvider {
                     "dedup_skipped_pct" => pct(dedup_skipped, dedup_elig),
                     "dedup_denied_uncertified" => m.dedup_denied_uncertified.load(Relaxed),
                     "dedup_denied_by_leg" => m.dedup_denied_by_leg.load(Relaxed),
+                    // The certification-survival split. `never_certified` is what a
+                    // persistent/warmed `dedup_clean_fp` could convert; `fp_moved` is
+                    // the irreducible floor (the partition genuinely changed), and
+                    // `no_window`/`unresolved` are denials this feature never owned.
+                    // Read them together with cert_dwell_p50 below — a large
+                    // never_certified share only justifies persistence if the
+                    // certifications it would persist actually live a while.
+                    "dedup_denied_never_certified" => cert_never,
+                    "dedup_denied_fp_moved" => cert_moved,
+                    "dedup_denied_never_certified_pct" => pct(cert_never, cert_never + cert_moved),
+                    "dedup_denied_no_window" => m.dedup_denied_no_window.load(Relaxed),
+                    "dedup_denied_unresolved" => m.dedup_denied_unresolved.load(Relaxed),
+                    "dedup_denied_disabled" => m.dedup_denied_disabled.load(Relaxed),
+                    "cert_granted_total" => m.cert_granted_total.load(Relaxed),
+                    "cert_dwell_total" => cert_dwells,
+                    "cert_dwell_secs_avg" => avg(m.cert_dwell_secs_total.load(Relaxed), cert_dwells),
+                    "cert_dwell_p50_secs" => m.cert_dwell_percentile_secs(0.50),
+                    "cert_dwell_p90_secs" => m.cert_dwell_percentile_secs(0.90),
                     "fast_resolve_hits" => fr_hits,
                     "fast_resolve_misses" => fr_misses,
                     "fast_resolve_hit_pct" => pct(fr_hits, fr_hits + fr_misses),

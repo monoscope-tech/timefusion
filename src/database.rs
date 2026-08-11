@@ -152,6 +152,38 @@ struct ScanShape {
     skip_dedup: bool,
 }
 
+/// Why the swept-partition dedup skip was granted or refused. Decided once per
+/// scan, above the projection.
+///
+/// A single "denied" counter cannot answer the only question worth asking about
+/// this feature (it fires on 0.2–0.5% of Delta-reading scans): would a warm,
+/// persistent `dedup_clean_fp` have converted the denial? `NeverCertified` says
+/// yes — this process simply never swept that partition. `FpMoved` says no — the
+/// partition WAS certified and has been written to since, and no amount of
+/// persistence recovers that. See `docs/plans/2026-08-11-certification-survival.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DedupSkipVerdict {
+    Granted,
+    /// `timefusion_read_dedup_skip_swept` is off, or the table declares no dedup keys.
+    Disabled,
+    /// No usable time bound on the query (no timestamp predicate, or a span so
+    /// wide `window_dates` refuses it), so there is no partition set to certify.
+    NoWindow,
+    /// The table was not already resolved in this process. The skip is an
+    /// optimisation, so it declines rather than pay a resolve to decide.
+    Unresolved,
+    /// Some in-window partition has no `dedup_clean_fp` entry at all.
+    NeverCertified,
+    /// Some in-window partition was certified and has been committed to since.
+    FpMoved,
+}
+
+impl DedupSkipVerdict {
+    pub fn granted(self) -> bool {
+        self == Self::Granted
+    }
+}
+
 /// Counters surfaced via `timefusion_stats` for production debugging. Cheap to
 /// update on the hot path (Relaxed atomics); read via `snapshot()`. Histogram
 /// is fixed-bucket microsecond bins so percentile estimates are O(buckets) to
@@ -166,8 +198,27 @@ pub struct ScanMetrics {
     /// Swept-partition dedup skip, over scans that read Delta. See `record_scan`.
     pub dedup_eligible_scans: std::sync::atomic::AtomicU64,
     pub dedup_skipped: std::sync::atomic::AtomicU64,
+    /// Aggregate of every `pre_skip == false` denial; the sum of the five below.
+    /// Kept so the row keeps meaning what it did when the 0.5% figure was measured.
     pub dedup_denied_uncertified: std::sync::atomic::AtomicU64,
     pub dedup_denied_by_leg: std::sync::atomic::AtomicU64,
+    /// The `dedup_denied_uncertified` split — see `DedupSkipVerdict`. The pair
+    /// that decides the certification-survival question is
+    /// `never_certified` (persistence would recover it) vs `fp_moved` (nothing would).
+    pub dedup_denied_never_certified: std::sync::atomic::AtomicU64,
+    pub dedup_denied_fp_moved: std::sync::atomic::AtomicU64,
+    pub dedup_denied_no_window: std::sync::atomic::AtomicU64,
+    pub dedup_denied_unresolved: std::sync::atomic::AtomicU64,
+    pub dedup_denied_disabled: std::sync::atomic::AtomicU64,
+    /// How long a certification survived, from the sweep that granted it to the
+    /// read that first observed its fingerprint had moved. The other half of the
+    /// Phase 0 answer: persistence only pays if certifications live long enough
+    /// to be worth reloading. Same power-of-two bucketing as the latency
+    /// histograms, in SECONDS.
+    pub cert_granted_total: std::sync::atomic::AtomicU64,
+    pub cert_dwell_total: std::sync::atomic::AtomicU64,
+    pub cert_dwell_secs_total: std::sync::atomic::AtomicU64,
+    pub cert_dwell_buckets: [std::sync::atomic::AtomicU64; 32],
     pub fast_resolve_hits: std::sync::atomic::AtomicU64,
     pub fast_resolve_misses: std::sync::atomic::AtomicU64,
     /// Delta TableProvider cache: hit = cached cell at the current snapshot
@@ -257,14 +308,17 @@ impl ScanMetrics {
     }
 
     /// `dedup_skip` is the outcome of the swept-partition skip, which until now was decided on
-    /// every scan and reported by none of them. Split by WHY it was refused: `pre_skip` false
-    /// means the window was never eligible (unswept partition, moved fingerprint, or no time
-    /// bound at all), while `pre_skip` true with no skip means a leg refused one that was —
-    /// overwhelmingly a MemBuffer leg, which cannot skip. The two have different fixes and the
-    /// aggregate hides which one you have.
+    /// every scan and reported by none of them. Split by WHY it was refused: a non-`Granted`
+    /// `verdict` means the window was never eligible, while `Granted` with no skip means a leg
+    /// refused one that was — overwhelmingly a MemBuffer leg, which cannot skip. The two have
+    /// different fixes and the aggregate hides which one you have.
+    ///
+    /// Measured on prod 2026-08-11, `denied_by_leg` was flat zero: the legs are not what refuse.
+    /// Every denial is a verdict, which is why the verdict — not a bool — is what arrives here.
     #[allow(clippy::too_many_arguments)] // one flag per counter; a struct would just rename them
     pub fn record_scan(
-        &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool, pre_skip: bool,
+        &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool,
+        verdict: DedupSkipVerdict,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
         self.scans_total.fetch_add(1, Relaxed);
@@ -272,12 +326,23 @@ impl ScanMetrics {
         // it stops decoding out of Parquet, and a mem-only scan has none to decode.
         if has_delta {
             self.dedup_eligible_scans.fetch_add(1, Relaxed);
-            match (dedup_skip, pre_skip) {
-                (true, _) => &self.dedup_skipped,
-                (false, true) => &self.dedup_denied_by_leg,
-                (false, false) => &self.dedup_denied_uncertified,
+            if dedup_skip {
+                self.dedup_skipped.fetch_add(1, Relaxed);
+            } else if verdict.granted() {
+                self.dedup_denied_by_leg.fetch_add(1, Relaxed);
+            } else {
+                self.dedup_denied_uncertified.fetch_add(1, Relaxed);
+                match verdict {
+                    DedupSkipVerdict::NeverCertified => &self.dedup_denied_never_certified,
+                    DedupSkipVerdict::FpMoved => &self.dedup_denied_fp_moved,
+                    DedupSkipVerdict::NoWindow => &self.dedup_denied_no_window,
+                    DedupSkipVerdict::Unresolved => &self.dedup_denied_unresolved,
+                    // `Granted` is excluded by the branch above; it shares an arm
+                    // rather than introducing a panic path on the scan hot path.
+                    DedupSkipVerdict::Disabled | DedupSkipVerdict::Granted => &self.dedup_denied_disabled,
+                }
+                .fetch_add(1, Relaxed);
             }
-            .fetch_add(1, Relaxed);
         }
         let by_source = match (has_mem, has_delta) {
             (true, false) => Some(&self.scans_mem_only),
@@ -290,6 +355,27 @@ impl ScanMetrics {
             c.fetch_add(1, Relaxed);
         }
         self.scan_latency_buckets[latency_bucket(duration_us)].fetch_add(1, Relaxed);
+    }
+
+    /// A certification ended: fold how long it survived into the dwell histogram.
+    ///
+    /// The end is almost always OBSERVED rather than caused — a flush moves the
+    /// partition's fingerprint without touching `dedup_clean_fp`, so the entry
+    /// dies silently and the first read to notice is what reports it. That makes
+    /// the recorded dwell an upper bound on the true lifetime, which is the right
+    /// direction: it cannot make persistence look better than it is.
+    pub fn record_cert_dwell(&self, since: std::time::Instant) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let secs = since.elapsed().as_secs();
+        self.cert_dwell_total.fetch_add(1, Relaxed);
+        self.cert_dwell_secs_total.fetch_add(secs, Relaxed);
+        self.cert_dwell_buckets[latency_bucket(secs)].fetch_add(1, Relaxed);
+    }
+
+    /// Coarse dwell percentile, in seconds. Same factor-of-two accuracy as the
+    /// latency histograms it shares bucketing with.
+    pub fn cert_dwell_percentile_secs(&self, p: f64) -> u64 {
+        Self::percentile_from_buckets(&self.cert_dwell_buckets, p)
     }
 
     /// Record a pgwire end-to-end query duration. Cheap on hot path —
@@ -328,6 +414,15 @@ impl ScanMetrics {
             .position(|cum| cum >= target)
             .map_or(1u64 << 32, |i| 1u64 << (i + 1))
     }
+}
+
+/// One partition proved duplicate-free: the file fingerprint it was proved over,
+/// and when. `since` exists purely to measure how long certifications survive —
+/// the evidence that decides whether persisting them could ever pay.
+#[derive(Clone, Copy, Debug)]
+struct Certification {
+    fp: u64,
+    since: std::time::Instant,
 }
 
 /// Power-of-two microsecond bucket index for the 32-bin latency histograms.
@@ -2067,7 +2162,7 @@ pub struct Database {
     /// suppression) can be skipped (`timefusion_read_dedup_skip_swept`).
     /// Any commit touching the partition changes its file set → mismatch →
     /// dedup stays on until the next clean sweep pass.
-    dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), u64>>,
+    dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>>,
     /// Monotonic invalidation epoch for each source `(project, table, date)`.
     rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
     /// Certified rollup generations keyed by `(project, source, target, date)`.
@@ -8376,10 +8471,24 @@ impl Database {
         };
         let fp_post = partition_file_fp(post.clone());
         if dropped == 0 && complete && !post.is_empty() && partition_file_fp(pre.to_vec()) == fp_post {
-            self.dedup_clean_fp.insert(key, fp_post);
+            // Re-certifying at the SAME fingerprint continues the existing
+            // certification rather than starting a new one: the sweep re-proved a
+            // partition nothing had touched. Keeping the original `since` is what
+            // stops a 5-minute sweep cadence from capping every dwell at 5 minutes.
+            let prior = self.dedup_clean_fp.get(&key).map(|e| *e.value()).filter(|prev| prev.fp == fp_post);
+            if let Some(prev) = self.dedup_clean_fp.insert(key, Certification { fp: fp_post, since: prior.map_or_else(std::time::Instant::now, |p| p.since) })
+                && prev.fp != fp_post
+            {
+                self.scan_metrics.record_cert_dwell(prev.since);
+            }
+            if prior.is_none() {
+                self.scan_metrics.cert_granted_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Ok(Some(fp_post));
         }
-        self.dedup_clean_fp.remove(&key);
+        if let Some((_, prev)) = self.dedup_clean_fp.remove(&key) {
+            self.scan_metrics.record_cert_dwell(prev.since);
+        }
         Ok(None)
     }
 
@@ -8395,7 +8504,7 @@ impl Database {
         // Already proved clean and untouched since — no need to re-probe.
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
         let fp_pre = partition_file_fp(pre.clone());
-        if !pre.is_empty() && self.dedup_clean_fp.get(&key).map(|entry| *entry.value()) == Some(fp_pre) {
+        if !pre.is_empty() && self.dedup_clean_fp.get(&key).map(|entry| entry.value().fp) == Some(fp_pre) {
             return Ok(Some(fp_pre));
         }
         let outcome = self.dedup_partition(table_ref, table_name, project_id, date).await?;
@@ -8485,20 +8594,53 @@ impl Database {
         Ok(built)
     }
 
-    pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> bool {
-        let Some(dates) = window_dates(lo, hi) else { return false };
-        dates.into_iter().all(|date| {
-            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &format!("date={date}")) else { return false };
+    /// Is every partition in the window certified duplicate-free, and if not, why not?
+    ///
+    /// **`FpMoved` outranks `NeverCertified`.** A window is only recoverable by a
+    /// persistent certification cache if EVERY denying date is merely uncertified;
+    /// one date that has been written to since its sweep denies the window no matter
+    /// what is stored. Reporting the first denial instead would attribute by date
+    /// order — and since `window_dates` runs oldest-first, and old dates are the ones
+    /// the sweep's lookback never reaches, that would systematically over-report
+    /// `NeverCertified` and bias the decision toward building the persistence layer.
+    ///
+    /// So this short-circuits on `FpMoved` (definitive) but not on `NeverCertified`.
+    /// The extra work is one `partition_files_by_pid` per remaining date, bounded by
+    /// `window_dates`' own 366-day cap.
+    pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> DedupSkipVerdict {
+        let Some(dates) = window_dates(lo, hi) else { return DedupSkipVerdict::NoWindow };
+        let mut verdict = DedupSkipVerdict::Granted;
+        for date in dates {
+            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &format!("date={date}")) else { return DedupSkipVerdict::Unresolved };
             // The sweep keys custom-project tables (no project_id= path
             // segment) under "default"; match its grouping exactly.
             let Some((key_pid, files)) =
                 by_pid.remove(project_id).map(|f| (project_id.to_string(), f)).or_else(|| by_pid.remove("default").map(|f| ("default".to_string(), f)))
             else {
-                return true; // no Delta files for this date → nothing to dedup
+                continue; // no Delta files for this date → nothing to dedup
             };
             let fp_key = (key_pid, table_name.to_string(), date.to_string());
-            self.dedup_clean_fp.get(&fp_key).is_some_and(|fp| *fp.value() == partition_file_fp(files))
-        })
+            // Bound in a `let`, NOT inlined as the match scrutinee: a DashMap `Ref`
+            // temporary in a scrutinee lives until the end of the match, and the
+            // stale arm below removes from the same shard — a self-deadlock.
+            let certified = self.dedup_clean_fp.get(&fp_key).map(|entry| *entry.value());
+            match certified {
+                Some(cert) if cert.fp == partition_file_fp(files) => continue,
+                Some(cert) => {
+                    // Provably stale: this fingerprint can never match again until a
+                    // sweep re-certifies. Drop it so the dwell is recorded exactly
+                    // once rather than on every read that trips over it — but only if
+                    // it is still the value we read, so a sweep that re-certified in
+                    // the gap does not lose its fresh entry.
+                    if self.dedup_clean_fp.remove_if(&fp_key, |_, live| live.fp == cert.fp).is_some() {
+                        self.scan_metrics.record_cert_dwell(cert.since);
+                    }
+                    return DedupSkipVerdict::FpMoved;
+                }
+                None => verdict = DedupSkipVerdict::NeverCertified,
+            }
+        }
+        verdict
     }
 
     fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, Vec<String>)> {
@@ -8732,7 +8874,7 @@ impl Database {
                 let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
                 let cur_files = files_by_pid.get(pid).cloned().unwrap_or_default();
                 let current_fp = partition_file_fp(cur_files.clone());
-                if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| *entry.value()) == Some(current_fp) {
+                if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().fp) == Some(current_fp) {
                     if self.config.maintenance.rollup_build_enabled_for(pid)
                         && self.rollup_retry_allowed(pid, table_name, &date.to_string())
                         && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
@@ -8795,7 +8937,9 @@ impl Database {
                         let attempts = self.dedup_backoff.get(&backoff_key).map_or(0, |e| e.value().0) + 1;
                         let delay = std::time::Duration::from_secs((600u64 << (attempts.min(7) - 1)).min(21_600));
                         self.dedup_backoff.insert(backoff_key, (attempts, std::time::Instant::now() + delay));
-                        self.dedup_clean_fp.remove(&fp_key);
+                        if let Some((_, prev)) = self.dedup_clean_fp.remove(&fp_key) {
+                            self.scan_metrics.record_cert_dwell(prev.since);
+                        }
                         warn!(
                             "dedup sweep: project={} date={} table={} failed (attempt {}, next retry in {}s): {}",
                             pid,
@@ -14199,9 +14343,9 @@ impl ProjectRoutingTable {
     /// pre-update and a DELETE does not delete (caught by
     /// `buffer_consistency_test::test_{update,delete}::immediate` at the
     /// 2026-08-02 flip).
-    fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> bool {
+    fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> DedupSkipVerdict {
         if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept {
-            return false;
+            return DedupSkipVerdict::Disabled;
         }
         // `version_append` (merge-on-read) is NOT a reason to refuse. It looks
         // like one — MOR appends a new version per UPDATE, so a skip would serve
@@ -14216,7 +14360,7 @@ impl ProjectRoutingTable {
         //
         // Asserted by execution, not inspection, in
         // `dedup_compaction_test::a_swept_mor_partition_holds_one_winning_row_per_key`.
-        let Some(window) = window else { return false };
+        let Some(window) = window else { return DedupSkipVerdict::NoWindow };
         self.database.dedup_window_clean(table, project_id, &self.table_name, window)
     }
 
@@ -14956,12 +15100,18 @@ impl TableProvider for ProjectRoutingTable {
         // Deciding here lets a certified window skip BOTH the dedup and the
         // widening. `try_fast_resolve` keeps it cheap — a miss simply declines,
         // because the skip is an optimisation and never a correctness input.
-        let pre_skip_dedup = !dedup_keys.is_empty()
-            && self
+        let skip_verdict = match dedup_keys.is_empty() {
+            true => DedupSkipVerdict::Disabled,
+            false => self
                 .database
                 .try_fast_resolve(&project_id, &self.table_name)
                 .and_then(|t| t.try_read().ok().map(|table| self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys)))
-                .unwrap_or(false);
+                // A resolve miss is its own denial reason, not an uncertified
+                // partition: it says the provider cache was cold, which the
+                // certification-survival question must not be charged for.
+                .unwrap_or(DedupSkipVerdict::Unresolved),
+        };
+        let pre_skip_dedup = skip_verdict.granted();
         let (scan_projection, output_projection, tombstone_keep): (Option<Vec<usize>>, Option<Vec<usize>>, Option<usize>) = match projection {
             Some(p) if !dedup_keys.is_empty() || tombstone.is_some() => {
                 let full_schema = self.schema();
@@ -15034,7 +15184,7 @@ impl TableProvider for ProjectRoutingTable {
                 .collect();
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
-            scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit, shape.skip_dedup, pre_skip_dedup);
+            scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit, shape.skip_dedup, skip_verdict);
             let dedup_on = !dedup_keys.is_empty() && !shape.skip_dedup;
             let mut plans = legs;
             // Merge-on-read prerequisite: `DedupExec`'s keep-greatest only engages
@@ -15165,7 +15315,7 @@ impl TableProvider for ProjectRoutingTable {
             // what it said — the TOMBSTONE marker alone turns `output_projection` `Some`,
             // so on any table declaring both (otel_logs_and_spans declares both) it
             // silently revoked every skip it was supposed to allow.
-            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys).granted();
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
                 // The window is sweep-certified: exactly one row per key, and it
@@ -15194,6 +15344,13 @@ impl TableProvider for ProjectRoutingTable {
             let plan = self
                 .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
                 .await?;
+            // This leg IS the Delta read, and until now it said so to nobody:
+            // `record_scan` gates every dedup counter on `has_delta`, so a
+            // deployment without a buffered layer reported zero eligible scans
+            // however many it served. Prod runs with the buffer, which is why the
+            // 2026-08-11 measurement was unaffected — but `query_delta_only`
+            // (bypass_buffer) takes this path, so tests measured nothing at all.
+            tag_shape(&|s| s.has_delta = true);
             return wrap_result(vec![(plan, crate::read_dedup::LegKind::Delta)]);
         };
 
@@ -15297,7 +15454,7 @@ impl TableProvider for ProjectRoutingTable {
             // what it said — the TOMBSTONE marker alone turns `output_projection` `Some`,
             // so on any table declaring both (otel_logs_and_spans declares both) it
             // silently revoked every skip it was supposed to allow.
-            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys).granted();
             if skip_dedup {
                 tag_shape(&|s| s.skip_dedup = true);
             }

@@ -284,7 +284,7 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
     let total = {
         let table = table_ref.read().await;
         // Gate: duplicates provably absent for the window, in THIS snapshot.
-        if !schema.dedup_keys.is_empty() && !database.dedup_window_clean(&table, &q.project_id, &q.table_name, (q.lo, q.hi)) {
+        if !schema.dedup_keys.is_empty() && !database.dedup_window_clean(&table, &q.project_id, &q.table_name, (q.lo, q.hi)).granted() {
             return Ok(None);
         }
         let Ok(snapshot) = table.snapshot() else { return Ok(None) };

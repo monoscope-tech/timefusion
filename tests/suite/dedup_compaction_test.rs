@@ -1946,6 +1946,77 @@ async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Re
     Ok(())
 }
 
+/// The denial split that decides whether persisting certifications could ever
+/// pay (`docs/plans/2026-08-11-certification-survival.md`, Phase 0).
+///
+/// On prod the skip fires on 0.2–0.5% of Delta-reading scans, and a single
+/// `dedup_denied_uncertified` counter cannot say why. The two causes have
+/// opposite conclusions: `never_certified` is what persisting or warming
+/// `dedup_clean_fp` would recover, `fp_moved` is what nothing recovers — the
+/// partition genuinely changed. This walks ONE partition through all three
+/// states in order, because the counters are only worth reading if each state is
+/// reached deliberately.
+#[serial]
+#[tokio::test]
+async fn a_denied_skip_says_whether_it_was_never_certified_or_written_to_since() -> Result<()> {
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let mut cfg = (*TestConfigBuilder::new("dedup_denial_split").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let write = |lo: usize, hi: usize| {
+        let (db, project_id) = (Arc::clone(&db), project_id.clone());
+        async move {
+            let batch = json_to_batch((lo..hi).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect())?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await
+        }
+    };
+    write(0, 40).await?;
+
+    let sql = format!(
+        "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+         AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({})",
+        ts - 1,
+        ts + 1_000
+    );
+    let m = Arc::clone(&db.scan_metrics);
+    let counts = || {
+        use std::sync::atomic::Ordering::Relaxed;
+        (m.dedup_denied_never_certified.load(Relaxed), m.dedup_denied_fp_moved.load(Relaxed), m.dedup_skipped.load(Relaxed), m.cert_dwell_total.load(Relaxed))
+    };
+    // Warm `try_fast_resolve` first: cold, the skip declines as `Unresolved`
+    // before it ever consults a certification, and every assertion below reads
+    // zero. That the cold query lands in `Unresolved` rather than in the
+    // uncertified bucket is itself part of what makes the split readable.
+    db.query_delta_only(&sql).await?;
+
+    let base = counts();
+    db.query_delta_only(&sql).await?;
+    let never = counts();
+    assert_eq!((never.0 - base.0, never.1 - base.1), (1, 0), "an unswept partition must be denied as never-certified, not as a moved fingerprint");
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    db.query_delta_only(&sql).await?;
+    let certified = counts();
+    assert_eq!(certified.2 - never.2, 1, "a swept partition must actually grant the skip, or the split below measures nothing");
+
+    // A commit into the certified partition moves its fingerprint. This is the
+    // irreducible denial — no persistence layer recovers it.
+    write(40, 80).await?;
+    db.query_delta_only(&sql).await?;
+    let moved = counts();
+    assert_eq!((moved.1 - certified.1, moved.0 - certified.0), (1, 0), "a written-to partition must be denied as fp_moved, not as never-certified");
+    assert_eq!(moved.3 - certified.3, 1, "observing the moved fingerprint must close the certification's dwell");
+
+    // ...and close it exactly once: the stale entry is dropped when observed, so
+    // a second read must not re-report the same certification's lifetime.
+    db.query_delta_only(&sql).await?;
+    assert_eq!(counts().3, moved.3, "dwell must be recorded on the first observation only");
+    Ok(())
+}
+
 /// COUNT parity — the precondition `timefusion_read_dedup_skip_swept`'s own doc
 /// names ("off by default until COUNT parity is validated on prod-shaped
 /// data"). The skip removes `DedupExec` and its key projection, so if the
@@ -1979,18 +2050,59 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(DUPLICATED, DUPLICATED + UNIQUE)?], true, None).await?;
 
         let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        // TWICE. The first pass drops duplicates, and `record_certification`
+        // requires `dropped == 0` over a file set that did not move — a rewriting
+        // pass proves nothing about what it just rewrote. Certification lands on
+        // the next 0-drop pass, and without it the skip below never engages.
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        // The first pass REWRITES, and `record_certification` needs a 0-drop pass
+        // over an unmoved file set — a pass cannot certify what it just rewrote.
+        // The confirming pass needs the table version to move first: the sweep's
+        // global guard skips outright while the version is unchanged, so without
+        // this write the partition would never be certified in this process. In
+        // prod another project's ingest supplies that bump continuously; here it
+        // has to be explicit.
+        db.insert_records_batch(
+            &format!("{project_id}_other"),
+            "otel_logs_and_spans",
+            vec![json_to_batch(vec![test_span_ts("other", "n", &format!("{project_id}_other"), ts)])?],
+            true,
+            None,
+        )
+        .await?;
         db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
-        let sql = format!("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}'");
+        // TIME-BOUNDED. Without a window `dedup_skip_allowed` returns `NoWindow`
+        // and refuses before it ever looks at a certification, so the unbounded
+        // count this test used to run proved nothing about the skip it exists to
+        // gate. The `skips` assertion below is what stops that recurring silently.
+        let (lo, hi) = (ts - 1, ts + (DUPLICATED + UNIQUE) as i64 + 1);
+        // Rows, counted here — NOT `count(*)`. A bare count is answered by
+        // `count_pushdown` from Delta statistics without ever building a scan, so
+        // it exercises neither `DedupExec` nor the skip that removes it. Counting
+        // the rows the scan actually returns is the same assertion about the same
+        // hazard (silent over-counting), through the path that can produce it.
+        let sql = format!(
+            "SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+             AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        );
+        // Warm the fast-resolve cache: `pre_skip_dedup` consults `try_fast_resolve`
+        // and a miss declines outright, so a cold first query never reaches the
+        // skip. Three earlier attempts at a skip test were green against broken
+        // code for exactly this reason.
+        db.query_delta_only(&sql).await?;
+        let before = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed);
         let batches = db.query_delta_only(&sql).await?;
-        let n = batches.iter().map(|b| b.column(0).as_primitive::<Int64Type>().value(0)).sum::<i64>();
-        anyhow::Ok(n)
+        let n = batches.iter().map(|b| b.num_rows()).sum::<usize>() as i64;
+        anyhow::Ok((n, db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed) - before))
     };
 
-    let authoritative = run(false, "count_parity_dedup_on").await?;
-    let skipped = run(true, "count_parity_skip_on").await?;
+    let (authoritative, control_skips) = run(false, "count_parity_dedup_on").await?;
+    let (skipped, skips) = run(true, "count_parity_skip_on").await?;
 
     assert_eq!(authoritative, (DUPLICATED + UNIQUE) as i64, "the control itself must be right: every key counted exactly once");
+    assert_eq!(control_skips, 0, "the control must run with the skip genuinely off");
+    assert!(skips > 0, "the skip never engaged, so this proves nothing about it — check the window and the fast-resolve warm-up");
     assert_eq!(skipped, authoritative, "the dedup skip must not change COUNT — a mismatch here is silent over-counting on every dashboard");
     Ok(())
 }
