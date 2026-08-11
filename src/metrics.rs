@@ -418,7 +418,16 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
 /// One dashboard aggregate that fell through to a raw scan. `reason` is a
 /// `MissReason::label` — a closed, bounded set, never a table or project id.
 pub fn record_rollup_miss(reason: &'static str) {
-    maintenance_stats().rollup_misses_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stats = maintenance_stats();
+    stats.rollup_misses_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match reason {
+        "not_built" => &stats.rollup_miss_not_built,
+        "stale_coverage" => &stats.rollup_miss_stale_coverage,
+        "tiny_interior" => &stats.rollup_miss_tiny_interior,
+        "unsupported_shape" => &stats.rollup_miss_unsupported,
+        _ => &stats.rollup_miss_other,
+    }
+    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = METRICS.get() {
         m.rollup_misses.add(1, &[KeyValue::new("reason", reason)]);
     }
@@ -540,9 +549,20 @@ atomic_stats! {
     /// full-window hit needs no union at all.
     rollup_hits_full,
     rollup_hits_hybrid,
-    /// Aggregates that fell through to a raw scan. Unlabelled here; the reason
-    /// breakdown lives on the OTel counter.
+    /// Aggregates that fell through to a raw scan, plus the breakdown by reason.
+    ///
+    /// The OTel counter carries the same labels but cannot be read back
+    /// in-process, and the reason is the ONLY thing that distinguishes "the
+    /// build never ran" from "it ran and the source moved under it" from "the
+    /// shape is unsupported" — which is the entire diagnosis of a rollout that
+    /// is building rollups but not serving them. Without it the answer is
+    /// guesswork over a 19k-line log.
     rollup_misses_total,
+    rollup_miss_not_built,
+    rollup_miss_stale_coverage,
+    rollup_miss_tiny_interior,
+    rollup_miss_unsupported,
+    rollup_miss_other,
     dirty_bin_queue_depth,
     dirty_bin_enqueued,
     dirty_bin_eligible,
