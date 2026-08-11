@@ -3,14 +3,15 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        array::{Array, BooleanArray, StringBuilder},
-        datatypes::{DataType, Field, Schema},
+        array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StringBuilder},
+        datatypes::{DataType, Field, Schema, SchemaRef},
     },
+    catalog::{MemTable, TableFunctionImpl, TableProvider},
     common::ToDFSchema,
     error::{DataFusionError, Result as DFResult},
     execution::context::SessionContext,
     logical_expr::{
-        ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+        ColumnarValue, Expr, LogicalPlan, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
         create_udf,
     },
     scalar::ScalarValue,
@@ -196,6 +197,7 @@ fn register_identity_udfs(ctx: &SessionContext, role: &str, max_statement_secs: 
         Volatility::Stable,
     ));
     ctx.register_udf(ScalarUDF::from(CurrentSettingUdf::new(max_statement_secs)));
+    ctx.register_udtf("pg_show_all_settings", Arc::new(PgShowAllSettingsFunction { max_statement_secs }));
 }
 
 fn constant_string_udf(name: &str, value: String, volatility: Volatility) -> ScalarUDF {
@@ -265,6 +267,21 @@ impl ScalarUDFImpl for CurrentSettingUdf {
     }
 }
 
+/// Every setting `current_setting()` answers — also the row set of
+/// `pg_show_all_settings()`, so the two can never disagree.
+const COMPATIBILITY_SETTING_NAMES: [&str; 10] = [
+    "server_version",
+    "server_version_num",
+    "search_path",
+    "is_superuser",
+    "standard_conforming_strings",
+    "client_encoding",
+    "timezone",
+    "datestyle",
+    "intervalstyle",
+    "statement_timeout",
+];
+
 fn compatibility_setting(name: &str, max_statement_secs: u64) -> Option<String> {
     Some(match name.to_ascii_lowercase().as_str() {
         "server_version" => PG_COMPAT_VERSION.to_string(),
@@ -278,6 +295,79 @@ fn compatibility_setting(name: &str, max_statement_secs: u64) -> Option<String> 
         "statement_timeout" => (max_statement_secs * 1_000).to_string(),
         _ => return None,
     })
+}
+
+/// `pg_settings` is a view over this set-returning function; pgAdmin calls the
+/// function directly on connect, and the upstream pg_catalog crate only ships
+/// the view — without this, every pgAdmin connection fails at planning.
+#[derive(Debug)]
+struct PgShowAllSettingsFunction {
+    max_statement_secs: u64,
+}
+
+impl PgShowAllSettingsFunction {
+    fn schema() -> SchemaRef {
+        let text = |name: &str| Field::new(name, DataType::Utf8, true);
+        Arc::new(Schema::new(
+            [
+                "name",
+                "setting",
+                "unit",
+                "category",
+                "short_desc",
+                "extra_desc",
+                "context",
+                "vartype",
+                "source",
+                "min_val",
+                "max_val",
+                "enumvals",
+                "boot_val",
+                "reset_val",
+                "sourcefile",
+            ]
+            .map(text)
+            .into_iter()
+            .chain([Field::new("sourceline", DataType::Int32, true), Field::new("pending_restart", DataType::Boolean, true)])
+            .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn batch(&self) -> DFResult<RecordBatch> {
+        let rows: Vec<(&str, String)> = COMPATIBILITY_SETTING_NAMES
+            .iter()
+            .filter_map(|name| compatibility_setting(name, self.max_statement_secs).map(|value| (*name, value)))
+            .collect();
+        let strings = |values: Vec<Option<String>>| Arc::new(StringArray::from(values)) as ArrayRef;
+        let settings: Vec<Option<String>> = rows.iter().map(|(_, value)| Some(value.clone())).collect();
+        let nulls = || vec![None; rows.len()];
+        let columns = vec![
+            strings(rows.iter().map(|(name, _)| Some((*name).to_string())).collect()),
+            strings(settings.clone()),
+            strings(nulls()),
+            strings(nulls()),
+            strings(nulls()),
+            strings(nulls()),
+            strings(vec![Some("user".to_string()); rows.len()]),
+            strings(rows.iter().map(|(_, value)| Some(if matches!(value.as_str(), "on" | "off") { "bool" } else { "string" }.to_string())).collect()),
+            strings(vec![Some("default".to_string()); rows.len()]),
+            strings(nulls()),
+            strings(nulls()),
+            strings(nulls()),
+            strings(settings.clone()),
+            strings(settings),
+            strings(nulls()),
+            Arc::new(Int32Array::from(vec![None::<i32>; rows.len()])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![Some(false); rows.len()])) as ArrayRef,
+        ];
+        RecordBatch::try_new(Self::schema(), columns).map_err(Into::into)
+    }
+}
+
+impl TableFunctionImpl for PgShowAllSettingsFunction {
+    fn call(&self, _args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        Ok(Arc::new(MemTable::try_new(Self::schema(), vec![vec![self.batch()?]])?))
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +396,20 @@ mod tests {
         let parameters = TimeFusionServerParameterProvider::default().server_parameters(&client).unwrap();
         assert_eq!(parameters.get("server_version").map(String::as_str), Some(PG_COMPAT_VERSION));
         assert_eq!(parameters.get("server_version_num").map(String::as_str), Some(PG_COMPAT_VERSION_NUM));
+    }
+
+    /// pgAdmin fails to connect with "table function 'pg_show_all_settings' not
+    /// found" if this regresses; the upstream pg_catalog only ships the view.
+    #[tokio::test]
+    async fn pg_show_all_settings_is_callable_as_a_table_function() {
+        let ctx = SessionContext::new();
+        register_identity_udfs(&ctx, "operator", 60);
+        let batches = ctx.sql("SELECT setting FROM pg_show_all_settings() WHERE name = 'server_version'").await.unwrap().collect().await.unwrap();
+        assert_eq!(batches[0].column(0).as_string::<i32>().value(0), PG_COMPAT_VERSION);
+
+        let all = ctx.sql("SELECT * FROM pg_show_all_settings()").await.unwrap().collect().await.unwrap();
+        assert_eq!(all[0].num_rows(), COMPATIBILITY_SETTING_NAMES.len());
+        assert_eq!(all[0].num_columns(), 17);
     }
 
     #[tokio::test]
