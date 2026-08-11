@@ -563,6 +563,12 @@ atomic_stats! {
     /// full-window hit needs no union at all.
     rollup_hits_full,
     rollup_hits_hybrid,
+    /// Partitions rebuilt from only the hours that changed, vs from scratch.
+    /// The ratio is the whole point of the dirty-hour tracking: a fall to zero
+    /// means something is widening the dirty set to the whole day and every
+    /// enrichment is paying for 24 hours of re-aggregation again.
+    rollup_rebuilds_incremental,
+    rollup_rebuilds_full,
     /// Aggregates that fell through to a raw scan, plus the breakdown by reason.
     ///
     /// The OTel counter carries the same labels but cannot be read back

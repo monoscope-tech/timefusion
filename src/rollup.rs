@@ -94,7 +94,49 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
 /// and each measure's declared `filter` is deliberately NOT re-applied: the base
 /// row already had it applied when it was built, and the filter's columns do not
 /// even exist on the base table.
+/// One bit per hour of a UTC day. `ALL_HOURS` is the conservative value: every
+/// invalidation means it unless the caller can prove a narrower set.
+pub(crate) const ALL_HOURS: u32 = (1 << 24) - 1;
+const HOUR_MICROS: i64 = 3_600_000_000;
+
+/// The `[start, end)` ranges `hours` marks on the day beginning at `day_start`,
+/// with adjacent hours merged so a contiguous span costs one predicate.
+pub(crate) fn dirty_ranges(day_start: i64, hours: u32) -> Vec<(i64, i64)> {
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for hour in 0..24 {
+        if hours & (1 << hour) == 0 {
+            continue;
+        }
+        let (start, end) = (day_start + hour * HOUR_MICROS, day_start + (hour + 1) * HOUR_MICROS);
+        match ranges.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => ranges.push((start, end)),
+        }
+    }
+    ranges
+}
+
+/// True when whole rollup buckets nest inside an hour, which is what lets an
+/// hour be rebuilt without splitting one. A grain that does not divide an hour
+/// would leave a bucket half-rebuilt and half-carried-forward.
+pub(crate) fn grain_fits_hours(spec: &RollupSpec) -> bool {
+    spec.grain_micros().is_some_and(|grain| grain > 0 && HOUR_MICROS % grain == 0)
+}
+
 pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, project_id: &str, date: &str) -> anyhow::Result<String> {
+    build_partition_sql_ranges(spec, source, from, "", project_id, date, &[])
+}
+
+/// The partition's rows, rebuilt over `ranges` only and carried forward from
+/// `target` everywhere else. Empty `ranges` means the whole day, from scratch.
+///
+/// The carried-forward rows are re-emitted verbatim: they were aggregated from
+/// source rows that have not changed since, so re-aggregating them would produce
+/// the same numbers at the cost of scanning the raw partition again — which is
+/// the entire expense this exists to avoid.
+pub(crate) fn build_partition_sql_ranges(
+    spec: &RollupSpec, source: &str, from: &str, target: &str, project_id: &str, date: &str, ranges: &[(i64, i64)],
+) -> anyhow::Result<String> {
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let derived = from != source;
     let dimensions = spec.dimensions.join(", ");
@@ -129,11 +171,26 @@ pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, pro
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = std::iter::once("1".to_string()).chain((2..).take(spec.dimensions.len()).map(|index| index.to_string())).collect::<Vec<_>>().join(", ");
 
-    Ok(format!(
+    let partition = format!("project_id = {} AND date = {}", sql_literal(project_id), sql_literal(date));
+    let rebuilt = format!(
         "SELECT to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp{select_dimensions}, {measures} \
-         FROM {source} WHERE project_id = {} AND date = {} GROUP BY {group_by}",
-        sql_literal(project_id),
-        sql_literal(date),
+         FROM {source} WHERE {partition}"
+    );
+    if ranges.is_empty() {
+        return Ok(format!("{rebuilt} GROUP BY {group_by}"));
+    }
+    // Only `>=`/`<`, and the SAME range list drives both legs — the rebuilt
+    // hours and the carried-forward ones must partition the day exactly, or a
+    // bucket is either counted twice or silently dropped from the rollup.
+    let dirty = ranges
+        .iter()
+        .map(|(start, end)| format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let carried = spec.measures.iter().map(|measure| measure.name.clone()).collect::<Vec<_>>().join(", ");
+    Ok(format!(
+        "{rebuilt} AND ({dirty}) GROUP BY {group_by} \
+         UNION ALL SELECT timestamp{select_dimensions}, {carried} FROM {target} WHERE {partition} AND NOT ({dirty})"
     ))
 }
 
@@ -1451,6 +1508,31 @@ mod tests {
             None,
             "a disjunction reaches outside any single range"
         );
+    }
+
+    /// The rebuilt hours and the carried-forward hours must PARTITION the day:
+    /// a gap silently drops buckets from the rollup, an overlap double-counts
+    /// them, and neither is visible from the read side — the partition still
+    /// looks like a complete day. Same invariant as the read-side fringe split,
+    /// and the same reason it gets a property test rather than an example.
+    #[test]
+    fn rebuilt_and_carried_forward_hours_partition_the_day() {
+        const DAY: i64 = 86_400_000_000;
+        for day_start in [0_i64, 1_754_784_000_000_000, -DAY] {
+            for hours in [1u32, 0b101, 1 << 23, 0xFF_FF00, ALL_HOURS, 0b1010_1010_1010_1010_1010_1010] {
+                let ranges = dirty_ranges(day_start, hours);
+                let covered: i64 = ranges.iter().map(|(start, end)| end - start).sum();
+                assert_eq!(covered, i64::from(hours.count_ones()) * 3_600_000_000, "ranges must cover exactly the marked hours");
+                // Merged, disjoint and ascending — the SQL ORs them, so an
+                // overlap would double-count a bucket.
+                for pair in ranges.windows(2) {
+                    assert!(pair[0].1 < pair[1].0, "ranges must be disjoint and non-adjacent after merging: {ranges:?}");
+                }
+                assert!(ranges.iter().all(|(start, end)| start < end && *start >= day_start && *end <= day_start + DAY), "{ranges:?}");
+            }
+        }
+        assert!(dirty_ranges(0, 0).is_empty(), "nothing dirty must rebuild nothing");
+        assert_eq!(dirty_ranges(0, ALL_HOURS), vec![(0, DAY)], "a fully dirty day must merge to one range");
     }
 
     /// An aggregate inside a CTE is reachable now, because the matcher searches

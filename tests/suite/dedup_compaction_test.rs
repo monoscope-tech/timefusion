@@ -1691,6 +1691,31 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
     let after_rebuild = total_from_rollup(Arc::clone(&db), project_id.clone()).await?;
     assert_eq!(after_rebuild, raw_total, "a second certification must REPLACE the buckets, not double every measure");
+
+    // An INCREMENTAL rebuild must equal a full one. Writing into hour 20 leaves
+    // hour 12's buckets to be carried forward untouched, so if the carry-forward
+    // drops or duplicates them the total moves — which no read-side guard could
+    // catch, because the partition still looks like a complete day.
+    let counters = || {
+        let m = timefusion::metrics::maintenance_stats();
+        (m.rollup_rebuilds_incremental.load(std::sync::atomic::Ordering::Relaxed), m.rollup_rebuilds_full.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    let (incremental_before, full_before) = counters();
+    let late = day.and_hms_opt(20, 30, 0).unwrap().and_utc().timestamp_micros();
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("span_late", "op", &project_id, late)])?], true, None)
+        .await?;
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    let (incremental_after, full_after) = counters();
+    assert!(
+        incremental_after > incremental_before,
+        "the rebuild must have been scoped to the changed hours (incremental {incremental_before}->{incremental_after}, full {full_before}->{full_after})"
+    );
+    assert_eq!(
+        total_from_rollup(Arc::clone(&db), project_id.clone()).await?,
+        raw_total + 1,
+        "an incremental rebuild must carry the untouched hours forward exactly once"
+    );
     Ok(())
 }
 

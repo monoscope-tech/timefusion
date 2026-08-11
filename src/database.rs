@@ -1498,7 +1498,7 @@ fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
 ///
 /// Distinct days are collected BEFORE formatting, so this allocates one
 /// `String` per day rather than per row; it runs on every inbound write.
-fn batch_dates(batch: &RecordBatch) -> Option<HashSet<String>> {
+fn batch_hours(batch: &RecordBatch) -> Option<HashMap<String, u32>> {
     use datafusion::arrow::{
         array::AsArray,
         compute::cast,
@@ -1508,15 +1508,29 @@ fn batch_dates(batch: &RecordBatch) -> Option<HashSet<String>> {
     let micros = batch.column_by_name("timestamp").and_then(|column| {
         let wanted = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         let column = if column.data_type() == &wanted { column.clone() } else { cast(column, &wanted).ok()? };
-        Some(column.as_primitive_opt::<TimestampMicrosecondType>()?.iter().flatten().map(|micros| micros.div_euclid(DAY)).collect::<HashSet<_>>())
+        // Distinct (day, hour) pairs — at most 24 per day however many rows.
+        Some(
+            column
+                .as_primitive_opt::<TimestampMicrosecondType>()?
+                .iter()
+                .flatten()
+                .map(|micros| (micros.div_euclid(DAY), micros.rem_euclid(DAY) / 3_600_000_000))
+                .collect::<HashSet<_>>(),
+        )
     });
-    if let Some(days) = micros {
-        return Some(days.into_iter().filter_map(|day| chrono::DateTime::from_timestamp_micros(day * DAY)).map(|day| day.date_naive().to_string()).collect());
+    if let Some(hours) = micros {
+        return Some(hours.into_iter().fold(HashMap::new(), |mut dates, (day, hour)| {
+            if let Some(day_start) = chrono::DateTime::from_timestamp_micros(day * DAY) {
+                *dates.entry(day_start.date_naive().to_string()).or_default() |= 1 << hour;
+            }
+            dates
+        }));
     }
     // One cast covers Date32, Utf8, Utf8View and LargeUtf8 alike, and only runs
-    // on the path where the timestamp was already unreadable.
+    // on the path where the timestamp was already unreadable. Without a
+    // timestamp there is no hour to name, so the whole day is dirty.
     let text = cast(batch.column_by_name("date")?, &DataType::Utf8).ok()?;
-    Some(text.as_string::<i32>().iter().flatten().map(str::to_string).collect())
+    Some(text.as_string::<i32>().iter().flatten().map(|date| (date.to_string(), crate::rollup::ALL_HOURS)).collect())
 }
 
 /// Microseconds at 00:00:00 UTC on a `YYYY-MM-DD` partition value.
@@ -2199,6 +2213,11 @@ pub struct Database {
     rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
     /// Certified rollup generations keyed by `(project, source, target, date)`.
     rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
+    /// Hours changed since this `(project, source, date)` was last rolled up, as
+    /// a 24-bit mask. PRESENCE is the claim that every change since that build
+    /// was observed; absence means "unknown", which forces a full rebuild. Only
+    /// a successful build inserts one.
+    rollup_dirty: Arc<dashmap::DashMap<(String, String, String), u32>>,
     /// Bounded exponential retry state for failed source-partition rollup builds.
     rollup_backoff: Arc<dashmap::DashMap<RollupCoverageKey, (u32, std::time::Instant)>>,
     /// Exact merge-on-read count partitions. Query threads use only the
@@ -2755,6 +2774,7 @@ impl Database {
             dedup_clean_fp,
             rollup_source_epochs: Arc::new(dashmap::DashMap::new()),
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
+            rollup_dirty: Arc::new(dashmap::DashMap::new()),
             rollup_backoff: Arc::new(dashmap::DashMap::new()),
             logical_count_cache,
             logical_count_building: Arc::new(dashmap::DashSet::new()),
@@ -8076,8 +8096,22 @@ impl Database {
             .unwrap_or_default())
     }
 
+    /// Invalidate a whole date. Every caller that cannot name the hours it
+    /// changed lands here, so the conservative answer is the DEFAULT rather than
+    /// something a future caller has to remember to pass.
     fn invalidate_rollup_partition(&self, project_id: &str, source: &str, date: &str) {
+        self.invalidate_rollup_hours(project_id, source, date, crate::rollup::ALL_HOURS);
+    }
+
+    fn invalidate_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) {
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
+        // Widen the dirty set ONLY where one is already being tracked. An absent
+        // entry means "we have not observed every change since the rollup was
+        // built", and inserting one here would claim otherwise — the difference
+        // between a cheap repair and carrying forward stale buckets.
+        if let Some(mut dirty) = self.rollup_dirty.get_mut(&source_key) {
+            *dirty |= hours;
+        }
         self.rollup_source_epochs.entry(source_key).and_modify(|epoch| *epoch = epoch.saturating_add(1)).or_insert(1);
         if let Some(schema) = get_schema(source) {
             for spec in &schema.rollups {
@@ -8177,6 +8211,10 @@ impl Database {
         }
         self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source);
         self.rollup_backoff.retain(|(project, table, _, _), _| project != project_id || table != source);
+        // A wipe means we no longer know WHAT changed, only that something did.
+        // Dropping the claim is what stops the next repair carrying stale
+        // buckets forward.
+        self.rollup_dirty.retain(|(project, table, _), _| project != project_id || table != source);
     }
 
     /// Walks the batches' dates, so it is gated on the master switch as well as
@@ -8185,9 +8223,9 @@ impl Database {
         if !self.config.maintenance.timefusion_rollup_enabled || get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return;
         }
-        let mut dates = HashSet::new();
+        let mut dates: HashMap<String, u32> = HashMap::new();
         for batch in batches {
-            let Some(batch_dates) = batch_dates(batch) else {
+            let Some(batch_dates) = batch_hours(batch) else {
                 // A batch that cannot say which partitions it touches leaves no
                 // choice but the source-wide wipe — but that wipe is what kept
                 // nine days of rollups from ever surviving a read (prod
@@ -8205,9 +8243,13 @@ impl Database {
                 self.invalidate_rollup_source(project_id, source);
                 return;
             };
-            dates.extend(batch_dates);
+            for (date, hours) in batch_dates {
+                *dates.entry(date).or_default() |= hours;
+            }
         }
-        dates.iter().for_each(|date| self.invalidate_rollup_partition(project_id, source, date));
+        // The hours come from the rows themselves, so an enrichment touching one
+        // hour marks one hour — and the repair rebuilds one hour instead of 24.
+        dates.iter().for_each(|(date, hours)| self.invalidate_rollup_hours(project_id, source, date, *hours));
     }
 
     /// True iff every (project, date) partition overlapping `window` carries
@@ -8338,6 +8380,20 @@ impl Database {
         let source_epoch = self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
         let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
 
+        // Rebuild only the hours that changed, when we can prove which those
+        // are. `rollup_dirty` holds a claim ONLY while every change since the
+        // last successful build was observed; absent, or widened to the whole
+        // day, and this falls back to the full rebuild. Anything else would
+        // carry forward buckets aggregated from source rows that have since
+        // moved — a silently wrong number, which is the one failure mode none of
+        // the read-side guards can catch.
+        let dirty = self.rollup_dirty.get(&source_key).map(|entry| *entry.value()).filter(|hours| *hours != crate::rollup::ALL_HOURS);
+        let day_start = date_start_micros(date);
+        // A build is the only thing that can establish the claim, and a failed
+        // one leaves the partition in an unknown state — so drop it up front and
+        // re-insert only on success.
+        self.rollup_dirty.remove(&source_key);
+
         // Base specs first: a derived tier re-aggregates the finer one's rows, so
         // it must not run before that tier has been replaced for this partition.
         let mut specs: Vec<&crate::schema_loader::RollupSpec> = schema.rollups.iter().collect();
@@ -8351,7 +8407,14 @@ impl Database {
                 .as_ref()
                 .and_then(|base| schema.rollups.iter().find(|candidate| candidate.name.as_deref() == Some(base.as_str())))
                 .map_or_else(|| source.to_string(), |base| base.table_name(source));
-            let rows = self.query_delta_only(&crate::rollup::build_partition_sql_from(spec, source, &from, project_id, date)?).await?;
+            // Whole rollup buckets must nest inside an hour, or one bucket
+            // would be half-rebuilt and half-carried-forward.
+            let ranges = dirty
+                .zip(day_start)
+                .filter(|_| crate::rollup::grain_fits_hours(spec))
+                .map_or_else(Vec::new, |(hours, day_start)| crate::rollup::dirty_ranges(day_start, hours));
+            let incremental = !ranges.is_empty();
+            let rows = self.query_delta_only(&crate::rollup::build_partition_sql_ranges(spec, source, &from, &target, project_id, date, &ranges)?).await?;
             let generation = crate::rollup::generation_id(spec, source, project_id, date, source_fp);
             let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
             let row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();
@@ -8362,9 +8425,18 @@ impl Database {
                 anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
             }
             self.rollup_coverage.insert(coverage_key, RollupCoverage { source_fp, source_epoch, generation, rows: row_count });
-            info!(project_id, date, target, rows = row_count, event = "rollup_partition_built");
+            let counter = if incremental {
+                &crate::metrics::maintenance_stats().rollup_rebuilds_incremental
+            } else {
+                &crate::metrics::maintenance_stats().rollup_rebuilds_full
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(project_id, date, target, rows = row_count, hours_rebuilt = ranges.len(), incremental, event = "rollup_partition_built");
         }
         self.clear_rollup_backoff(project_id, source, date);
+        // Every spec is now current for this source state, so from here on the
+        // dirty set is complete by construction.
+        self.rollup_dirty.insert(source_key, 0);
         Ok(())
     }
 
@@ -13269,7 +13341,7 @@ mod repair_order_tests {
             RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new(name, column.data_type().clone(), true)])), vec![column]).expect("batch")
         };
         let expect = |batch: RecordBatch| {
-            let mut dates = super::batch_dates(&batch).expect("the batch names its partitions").into_iter().collect::<Vec<_>>();
+            let mut dates = super::batch_hours(&batch).expect("the batch names its partitions").into_keys().collect::<Vec<_>>();
             dates.sort();
             dates
         };
@@ -13287,7 +13359,15 @@ mod repair_order_tests {
 
         // Only a batch that carries neither may force the source-wide wipe.
         let opaque = batch("name", Arc::new(StringArray::from(vec!["x"])));
-        assert!(super::batch_dates(&opaque).is_none(), "a batch with no date and no timestamp must still fall back");
+        assert!(super::batch_hours(&opaque).is_none(), "a batch with no date and no timestamp must still fall back");
+
+        // The HOURS are what make a repair cheap: a batch confined to 14:00 must
+        // mark one hour, not the day. A batch with only a `date` cannot name an
+        // hour and must mark all of them.
+        let at = |hours: i64| TimestampMicrosecondArray::from(vec![hours * 3_600_000_000]).with_timezone("UTC");
+        let hours = |batch: RecordBatch| super::batch_hours(&batch).expect("hours").into_values().fold(0u32, |mask, hour| mask | hour);
+        assert_eq!(hours(batch("timestamp", Arc::new(at(14)))), 1 << 14, "one hour of enrichment must mark one hour");
+        assert_eq!(hours(batch("date", Arc::new(Date32Array::from(vec![0])))), crate::rollup::ALL_HOURS, "no timestamp means no hour to name");
     }
 
     /// Prod 2026-08-09 quarantined monoscope-self's `date=2026-08-01` file after

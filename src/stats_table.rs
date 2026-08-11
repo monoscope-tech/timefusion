@@ -329,6 +329,8 @@ impl StatsTableProvider {
             "light_optimize_ticks_degraded_total" => m.light_optimize_ticks_degraded,
             "rollup_hits_full_total" => m.rollup_hits_full,
             "rollup_hits_hybrid_total" => m.rollup_hits_hybrid,
+            "rollup_rebuilds_incremental_total" => m.rollup_rebuilds_incremental,
+            "rollup_rebuilds_full_total" => m.rollup_rebuilds_full,
             "rollup_misses_total" => m.rollup_misses_total,
             "rollup_miss_not_built_total" => m.rollup_miss_not_built,
             "rollup_miss_stale_coverage_total" => m.rollup_miss_stale_coverage,
@@ -664,6 +666,8 @@ mod tests {
             // routing is firing, and this key list is hand-maintained.
             ("maintenance", "rollup_hits_full_total"),
             ("maintenance", "rollup_hits_hybrid_total"),
+            ("maintenance", "rollup_rebuilds_incremental_total"),
+            ("maintenance", "rollup_rebuilds_full_total"),
             ("maintenance", "rollup_misses_total"),
             ("parquet", "metadata_cache_hits"),
             ("parquet", "bytes_read"),
