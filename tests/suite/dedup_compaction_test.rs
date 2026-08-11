@@ -1817,6 +1817,35 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     assert_eq!(hybrid, raw, "the hybrid rewrite must equal the raw aggregate exactly");
     assert_eq!(hybrid.len(), 2, "both services must survive, including the one that exists only in the raw tail: {hybrid:?}");
     assert_eq!(hybrid.iter().map(|row| row.1).sum::<i64>(), 6, "every fixture row must be counted exactly once: {hybrid:?}");
+
+    // The shape prod's `rollup_declined_shape` log printed for months: a CAST
+    // over an aggregate plus `ORDER BY <an aggregate> LIMIT n` optimizes to
+    // `Projection(Sort(Projection(Aggregate)))`. Every peeling matcher declined
+    // it — and no bare-`SessionContext` unit test could reproduce it, because
+    // WHERE the optimizer puts that Sort depends on the session's analyzer
+    // rules. This runs on the real `Database` session, which is the only place
+    // the difference exists. `LIMIT 1` keeps it deterministic: the top bucket
+    // holds 4 rows and the other two hold 1 each.
+    let shaped = format!(
+        "SELECT COUNT(*) AS c, avg(duration)::BIGINT AS m FROM otel_logs_and_spans \
+         WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) \
+         GROUP BY time_bucket('1 hours', timestamp) ORDER BY 1 DESC LIMIT 1"
+    );
+    let counts = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
+        batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .map(|r| (b.column(0).as_primitive::<Int64Type>().value(r), b.column(1).as_primitive::<Int64Type>().value(r)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = hits();
+    let routed = counts(ctx.sql(&shaped).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "the shape that defeated every peeling matcher must route (misses +{})", misses() - misses_before);
+    assert_eq!(routed, counts(db.query_delta_only(&shaped).await?), "the substituted plan must equal the raw answer exactly");
     Ok(())
 }
 

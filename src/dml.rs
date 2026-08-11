@@ -127,6 +127,58 @@ impl DmlQueryPlanner {
     }
 }
 
+/// Give `plan`'s columns the qualifiers `target` carries, field for field.
+///
+/// The rollup SQL produces the right NAMES — its aliases are the aggregate's own
+/// field names — but SELECT aliases are unqualified, while an aggregate's
+/// group-by column keeps its source qualifier. A `Column` reference in an
+/// untouched node above resolves on `(qualifier, name)`, so without this the
+/// substitution would not resolve.
+pub(crate) fn requalified(plan: LogicalPlan, target: &datafusion::common::DFSchemaRef) -> Result<LogicalPlan> {
+    let expr = target
+        .iter()
+        .map(|(qualifier, field)| {
+            let column = Expr::Column(Column::new_unqualified(field.name()));
+            match qualifier {
+                Some(qualifier) => column.alias_qualified(Some(qualifier.clone()), field.name()),
+                None => column,
+            }
+        })
+        .collect();
+    Ok(LogicalPlan::Projection(datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan))?))
+}
+
+/// Swap `replacement` in for the `matched` node, leaving every other node as the
+/// optimizer produced it.
+///
+/// This is the whole reassembly. It replaces peeling the plan apart and
+/// rebuilding it, which could only ever accept a fixed grammar of parent nodes
+/// and kept declining production shapes that had one layer more.
+pub(crate) fn substitute(plan: &LogicalPlan, matched: &LogicalPlan, replacement: LogicalPlan) -> Result<LogicalPlan> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    let mut replacement = Some(replacement);
+    let rewritten = plan
+        .clone()
+        .transform_down(|node| match replacement.take_if(|_| &node == matched) {
+            // `Jump` skips the replaced subtree; siblings are still visited, but
+            // the `Option` is spent, so exactly one node is ever swapped.
+            Some(replacement) => Ok(Transformed::new(replacement, true, TreeNodeRecursion::Jump)),
+            None => Ok(Transformed::no(node)),
+        })?
+        .data;
+    // A target that is not in the plan would leave it untouched — a correct RAW
+    // answer reported as a rollup hit, which is the one failure the counters
+    // cannot show. Fail instead; the caller records it as a miss.
+    if replacement.is_some() {
+        return Err(DataFusionError::Internal("rollup substitution target is not in the plan".into()));
+    }
+    // Parent nodes cache their `DFSchema`. Rebuilding bottom-up both refreshes
+    // those caches and re-resolves every expression against its new input, so a
+    // replacement whose fields do not line up fails HERE — as a recorded miss
+    // and a raw fallback — rather than reaching the physical planner.
+    rewritten.transform_up(|node| node.recompute_schema().map(Transformed::yes)).map(|rewritten| rewritten.data)
+}
+
 #[async_trait]
 impl QueryPlanner for DmlQueryPlanner {
     #[instrument(
@@ -146,27 +198,10 @@ impl QueryPlanner for DmlQueryPlanner {
             return Ok(exec);
         }
         match self.database.rollup_sql(logical_plan, session_state).await {
-            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, outer_projection, having, wrappers, inner_wrappers, ticket })) => {
+            Ok(Some(crate::database::RollupRewrite { sql, grain, mode, matched, ticket })) => {
                 let rewritten = async {
                     let plan = session_state.create_logical_plan(&sql).await?;
-                    // HAVING first: it sits directly above the aggregate and
-                    // references its output names. A predicate naming a
-                    // *qualified* group-by column will not resolve against the
-                    // rollup's unqualified output — that errors here and is
-                    // recorded as a miss, which is the safe direction.
-                    let plan = match having {
-                        Some(predicate) => LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(predicate, Arc::new(plan))?),
-                        None => plan,
-                    };
-                    // Order matters: these sat UNDER the projection in the
-                    // original plan, so re-applying them above it would sort and
-                    // truncate a different set of columns.
-                    let plan = crate::rollup::PlanWrapper::rewrap(inner_wrappers, plan);
-                    let plan = match outer_projection {
-                        Some(expr) => LogicalPlan::Projection(datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan))?),
-                        None => plan,
-                    };
-                    session_state.optimize(&crate::rollup::PlanWrapper::rewrap(wrappers, plan))
+                    session_state.optimize(&substitute(logical_plan, &matched, requalified(plan, matched.schema())?)?)
                 }
                 .await;
                 match rewritten {

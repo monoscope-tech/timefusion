@@ -48,6 +48,23 @@ stats before the rollup path is reached.
 
 ## Step 1 — Replace the Aggregate in place, delete the peeling machinery
 
+> **DONE.** `match_aggregates` now finds the outermost `Aggregate` anywhere in
+> the tree and `dml.rs` swaps the rewrite in for that node; `PlanWrapper`,
+> `aggregate_with_having`, `decline`, `unqualified`, both peeling loops and the
+> positional `output_names` logic are deleted (net −107 lines). The shape below
+> is covered by `a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer`,
+> which asserts it routes **and** equals the raw answer on a real `Database`
+> session — the only place that shape exists.
+>
+> Two guards were added because searching the whole tree is strictly wider than
+> peeling a root, and both protect things the counters cannot show:
+> statements (`Dml`/`Explain`/…) are excluded, so an aggregate nested in an
+> UPDATE is never substituted out from under the DML interception; and
+> `substitute` errors if the target node is not found, rather than returning the
+> untouched raw plan and reporting it as a rollup hit.
+>
+> The rest of this section is kept as the rationale.
+
 **This is the whole remaining gap, and it is a deletion, not an addition.**
 
 `match_aggregates` (`src/rollup.rs:813`) dismantles the plan by peeling known node

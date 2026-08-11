@@ -359,9 +359,8 @@ struct RollupCoverage {
 #[derive(Debug)]
 pub(crate) struct RollupReadTicket(Vec<(RollupCoverageKey, u64, u64, String)>);
 
-/// A matched query's rollup substitute: the SQL to plan, the plan nodes peeled
-/// off the original root that must be re-applied above it, and the coverage
-/// ticket to re-check before the substitute is used.
+/// A matched query's rollup substitute: the SQL to plan, the `Aggregate` node it
+/// is substituted for, and the coverage ticket to re-check before it is used.
 #[derive(Debug)]
 pub(crate) struct RollupRewrite {
     pub sql: String,
@@ -371,11 +370,9 @@ pub(crate) struct RollupRewrite {
     /// two have very different cost profiles and conflating them hides which one
     /// production actually gets.
     pub mode: &'static str,
-    pub outer_projection: Option<Vec<datafusion::logical_expr::Expr>>,
-    pub having: Option<datafusion::logical_expr::Expr>,
-    pub wrappers: Vec<crate::rollup::PlanWrapper>,
-    /// Sort/Limit that sat BELOW the query's outer projection; re-applied there.
-    pub inner_wrappers: Vec<crate::rollup::PlanWrapper>,
+    /// The `Aggregate` this rewrite replaces, verbatim, so the caller can swap it
+    /// in place instead of taking the plan apart and rebuilding it.
+    pub matched: datafusion::logical_expr::LogicalPlan,
     pub ticket: RollupReadTicket,
 }
 /// Per-physical-table count of flush/ingest committers QUEUED on the commit lock
@@ -3011,10 +3008,7 @@ impl Database {
             sql: route.sql(&generations, interior),
             grain: format!("{}us", route.grain),
             mode,
-            outer_projection: route.outer_projection,
-            having: route.having,
-            wrappers: route.wrappers,
-            inner_wrappers: route.inner_wrappers,
+            matched: route.matched,
             ticket: RollupReadTicket(ticket),
         }))
     }

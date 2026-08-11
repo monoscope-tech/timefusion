@@ -228,34 +228,6 @@ pub fn to_rollup_batches(
         .collect()
 }
 
-/// A plan node peeled off the query root so the rewrite can be re-wrapped in it.
-#[derive(Debug, Clone)]
-pub(crate) enum PlanWrapper {
-    Sort(Vec<datafusion::logical_expr::SortExpr>, Option<usize>),
-    Limit(Option<Box<datafusion::logical_expr::Expr>>, Option<Box<datafusion::logical_expr::Expr>>),
-}
-
-impl PlanWrapper {
-    /// Peel one wrapper off the root, returning it and the plan beneath.
-    fn peel(plan: &datafusion::logical_expr::LogicalPlan) -> Option<(Self, &datafusion::logical_expr::LogicalPlan)> {
-        use datafusion::logical_expr::LogicalPlan;
-        match plan {
-            LogicalPlan::Sort(sort) => Some((Self::Sort(sort.expr.clone(), sort.fetch), &sort.input)),
-            LogicalPlan::Limit(limit) => Some((Self::Limit(limit.skip.clone(), limit.fetch.clone()), &limit.input)),
-            _ => None,
-        }
-    }
-
-    /// Re-apply `wrappers` (outermost first, as peeled) above `plan`.
-    pub fn rewrap(wrappers: Vec<Self>, plan: datafusion::logical_expr::LogicalPlan) -> datafusion::logical_expr::LogicalPlan {
-        use datafusion::logical_expr::{LogicalPlan, logical_plan};
-        wrappers.into_iter().rev().fold(plan, |input, wrapper| match wrapper {
-            Self::Sort(expr, fetch) => LogicalPlan::Sort(logical_plan::Sort { expr, input: std::sync::Arc::new(input), fetch }),
-            Self::Limit(skip, fetch) => LogicalPlan::Limit(logical_plan::Limit { skip, fetch, input: std::sync::Arc::new(input) }),
-        })
-    }
-}
-
 /// How a measure's per-leg partial states combine into the query's answer.
 ///
 /// The same combinator serves both shapes: over measure columns when the rollup
@@ -361,19 +333,10 @@ pub(crate) struct RoutedRollup {
     pub hi: i64,
     pub grain: i64,
     pub target: String,
-    /// Projection expressions to re-apply above the rewrite, qualifiers stripped.
-    pub outer_projection: Option<Vec<datafusion::logical_expr::Expr>>,
-    /// A HAVING predicate to re-apply directly above the rewrite, below
-    /// `outer_projection`. It references the aggregate's own output names.
-    pub having: Option<datafusion::logical_expr::Expr>,
-    /// Sort/Limit peeled off the query root, outermost first — re-applied ABOVE
-    /// `outer_projection`.
-    pub wrappers: Vec<PlanWrapper>,
-    /// Sort/Limit peeled from BELOW the outer projection, where `ORDER BY <an
-    /// aggregate> LIMIT n` puts them. Re-applied under the projection, which is
-    /// where they were: hoisting them above it would sort and truncate a
-    /// different set of columns.
-    pub inner_wrappers: Vec<PlanWrapper>,
+    /// The `Aggregate` node this route replaces, verbatim. The caller substitutes
+    /// the rewrite for exactly this node and leaves every node above it alone, so
+    /// this is the whole interface between the matcher and the plan.
+    pub matched: datafusion::logical_expr::LogicalPlan,
     row_filters: Vec<String>,
     /// `(expression, output alias)`. Every expression is valid, and means the
     /// same thing, on BOTH tables — which is what lets the union share them.
@@ -737,75 +700,6 @@ async fn measure_filters<'a>(
     Ok(filters)
 }
 
-/// Strip table qualifiers from every column reference.
-///
-/// A HAVING predicate and an outer projection are lifted off the source plan,
-/// so their group-by columns are qualified `otel_logs_and_spans.kind`. The
-/// rewrite reads from the rollup table, so those would not resolve. Names are
-/// unique in the rewrite's output by construction — each is a SELECT alias.
-fn unqualified(expr: datafusion::logical_expr::Expr) -> Result<datafusion::logical_expr::Expr, MissReason> {
-    use datafusion::{
-        common::tree_node::{Transformed, TreeNode},
-        logical_expr::Expr,
-    };
-    expr.transform(|expr| {
-        Ok(match expr {
-            Expr::Column(column) => Transformed::yes(Expr::Column(datafusion::common::Column::new_unqualified(column.name))),
-            expr => Transformed::no(expr),
-        })
-    })
-    .map(|transformed| transformed.data)
-    .map_err(|_| MissReason::UnsupportedShape)
-}
-
-/// An `Aggregate`, or the `Filter(Aggregate)` a HAVING clause plans to.
-fn aggregate_with_having(
-    plan: &datafusion::logical_expr::LogicalPlan,
-) -> Option<(&datafusion::logical_expr::Aggregate, Option<datafusion::logical_expr::Expr>)> {
-    use datafusion::logical_expr::LogicalPlan;
-    match plan {
-        LogicalPlan::Aggregate(aggregate) => Some((aggregate, None)),
-        LogicalPlan::Filter(filter) => match filter.input.as_ref() {
-            LogicalPlan::Aggregate(aggregate) => Some((aggregate, Some(filter.predicate.clone()))),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Decline a plan the matcher cannot rewrite.
-///
-/// `Ok(None)` means "not our business" and stays uncounted — otherwise every
-/// ordinary SELECT would land in `rollup_miss`. But when the plan *is* an
-/// aggregate over a rollup-declaring source, the decline is a real shape gap
-/// and must be visible: an operator who enables read routing and sees zero
-/// hits AND zero misses cannot tell the gate from the matcher.
-fn decline(plan: &datafusion::logical_expr::LogicalPlan) -> Result<Option<RoutedRollup>, MissReason> {
-    use datafusion::logical_expr::LogicalPlan;
-    fn aggregate_source(plan: &LogicalPlan) -> Option<String> {
-        match plan {
-            LogicalPlan::Aggregate(aggregate) => source_and_filters(&aggregate.input, &mut Vec::new()),
-            plan => plan.inputs().into_iter().find_map(aggregate_source),
-        }
-    }
-    match aggregate_source(plan) {
-        Some(source) if crate::schema_loader::get_schema(&source).is_some_and(|schema| !schema.rollups.is_empty()) => {
-            // The plan SHAPE is the whole content of this decline, and it is the
-            // one rollup miss with nothing to look at: prod declines shapes that
-            // match locally, because a pgwire session carries analyzer rules a
-            // bare session does not. Log the shape, not just the verdict.
-            tracing::warn!(
-                event = "rollup_declined_shape",
-                source,
-                plan = %plan.display_indent_schema().to_string().lines().take(6).collect::<Vec<_>>().join(" | "),
-                "aggregate over a rollup source in a shape the matcher does not accept"
-            );
-            Err(MissReason::UnsupportedShape)
-        }
-        _ => Ok(None),
-    }
-}
-
 /// Every rollup that could serve this aggregate, best first.
 ///
 /// The caller picks: only it knows which tiers are actually BUILT for the dates
@@ -813,59 +707,37 @@ fn decline(plan: &datafusion::logical_expr::LogicalPlan) -> Result<Option<Routed
 pub(crate) async fn match_aggregates(
     plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
 ) -> Result<Vec<RoutedRollup>, MissReason> {
-    use datafusion::logical_expr::{Expr, LogicalPlan};
+    use datafusion::logical_expr::LogicalPlan;
 
-    // Every real dashboard query ends in `ORDER BY … DESC`, often with a LIMIT,
-    // so the optimized root is `Sort(Projection(Aggregate))`. Peel those and
-    // hand them back for the caller to re-apply above the rewrite — matching
-    // only a bare aggregate root would leave the feature inert in production.
-    let mut wrappers = Vec::new();
-    let mut inner_wrappers = Vec::new();
-    let mut plan = plan;
-    while let Some((wrapper, input)) = PlanWrapper::peel(plan) {
-        wrappers.push(wrapper);
-        plan = input;
+    /// The outermost `Aggregate`, wherever the optimizer put it.
+    ///
+    /// Nothing above it is inspected, peeled or rebuilt. The rewrite is
+    /// substituted for this node IN PLACE, and a node carrying the aggregate's
+    /// output names and types is interchangeable with it by construction —
+    /// which is a property of the aggregate alone. Earlier versions matched a
+    /// fixed grammar of parents (`Sort`, then `Limit`, then a second
+    /// `Projection`…) and production kept producing one layer more than the
+    /// grammar knew, because the shape depends on the session's analyzer rules.
+    fn outermost_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Aggregate(_) => Some(plan),
+            plan => plan.inputs().into_iter().find_map(outermost_aggregate),
+        }
     }
 
-    let (aggregate, having, output_names, outer_projection) = match aggregate_with_having(plan) {
-        Some((aggregate, having)) => (aggregate, having, None, None),
-        None => {
-            let LogicalPlan::Projection(projection) = plan else { return decline(plan).map(Vec::from_iter) };
-            // `ORDER BY <an aggregate> LIMIT n` puts the Sort BELOW the outer
-            // projection, because the sort key has to still exist when the sort
-            // runs and is dropped afterwards. Root-only peeling therefore hit
-            // `Projection(Limit(Sort(Aggregate)))` and declined the single most
-            // common dashboard shape there is. These wrappers are re-applied
-            // UNDER the projection, which is where they were.
-            let mut inner = &*projection.input;
-            while let Some((wrapper, input)) = PlanWrapper::peel(inner) {
-                inner_wrappers.push(wrapper);
-                inner = input;
-            }
-            let Some((aggregate, having)) = aggregate_with_having(inner) else { return decline(plan).map(Vec::from_iter) };
-            // The output names are absorbed into the rewrite's SELECT aliases
-            // POSITIONALLY, so that is only valid when the projection passes
-            // every aggregate output through in order. Two things break it:
-            //
-            //  * a HAVING between the two, whose filter references the
-            //    aggregate's own names; and
-            //  * a projection that DROPS an aggregate output — `GROUP BY
-            //    time_bucket(…)` without selecting the bucket leaves a
-            //    3-field aggregate under a 2-field projection, so the group
-            //    column would be aliased with the first MEASURE's name.
-            //
-            // Either way, keep the aggregate's names and re-apply the
-            // projection above the rewrite instead.
-            if having.is_none()
-                && projection.expr.len() == aggregate.schema.fields().len()
-                && projection.expr.iter().all(|expr| matches!(unaliased(expr), Expr::Column(_)))
-            {
-                (aggregate, None, Some(projection.schema.fields().iter().map(|field| field.name().to_string()).collect::<Vec<_>>()), None)
-            } else {
-                (aggregate, having, None, Some(projection.clone()))
-            }
-        }
-    };
+    // Read paths only. Searching the whole tree — rather than a peeled root —
+    // means an aggregate nested inside a statement is now reachable, and neither
+    // kind is ours: rewriting inside an UPDATE would return a plan the DML
+    // interception below never sees, and rewriting inside an EXPLAIN would
+    // record a hit for a query that never runs.
+    if matches!(
+        plan,
+        LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::Copy(_) | LogicalPlan::Explain(_) | LogicalPlan::Analyze(_) | LogicalPlan::Statement(_)
+    ) {
+        return Ok(Vec::new());
+    }
+    let Some(matched) = outermost_aggregate(plan) else { return Ok(Vec::new()) };
+    let LogicalPlan::Aggregate(aggregate) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
     let mut predicates = Vec::new();
     let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(Vec::new()) };
     let Some(schema) = crate::schema_loader::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
@@ -880,15 +752,8 @@ pub(crate) async fn match_aggregates(
     let mut first_miss = None;
     let mut routes = Vec::new();
     for spec in candidates {
-        match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, output_names.as_ref(), session).await {
-            Ok(mut route) => {
-                route.outer_projection =
-                    outer_projection.clone().map(|projection| projection.expr.into_iter().map(unqualified).collect::<Result<Vec<_>, _>>()).transpose()?;
-                route.having = having.clone().map(unqualified).transpose()?;
-                route.wrappers = wrappers.clone();
-                route.inner_wrappers = inner_wrappers.clone();
-                routes.push(route);
-            }
+        match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, session).await {
+            Ok(route) => routes.push(route),
             // Report the FIRST spec's reason: it is the one the operator most
             // likely intended to serve this query, so it is the actionable gap.
             Err(reason) => first_miss = first_miss.or(Some(reason)),
@@ -900,18 +765,34 @@ pub(crate) async fn match_aggregates(
     // unbuilt for the oldest date in the window and miss, while a finer tier
     // that IS built sits unused. Measured in production: the 1h tier covered
     // 08-05.. and the 1m tier 08-04.., and a window starting 08-04 missed.
-    if routes.is_empty() { Err(first_miss.unwrap_or(MissReason::UnsupportedShape)) } else { Ok(routes) }
+    if !routes.is_empty() {
+        return Ok(routes);
+    }
+    // The per-reason miss counters say WHICH gap, but a shape gap is the one
+    // with nothing to look at — and the one no bare test session can reproduce,
+    // since the nodes above an aggregate depend on the session's analyzer rules.
+    // So it alone carries the plan text at warn; every other reason is a
+    // declared-schema question the counters already answer, and keeping those at
+    // debug stops an ordinary unroutable panel from spamming prod's warn stream.
+    let reason = first_miss.unwrap_or(MissReason::UnsupportedShape);
+    let shape = matched.display_indent_schema().to_string().lines().take(6).collect::<Vec<_>>().join(" | ");
+    match reason {
+        MissReason::UnsupportedShape => {
+            tracing::warn!(event = "rollup_declined_shape", source, reason = reason.label(), plan = %shape, "no declared rollup can serve this aggregate")
+        }
+        _ => tracing::debug!(event = "rollup_declined_shape", source, reason = reason.label(), plan = %shape, "no declared rollup can serve this aggregate"),
+    }
+    Err(reason)
 }
 
 /// Resolve one query against one declared rollup spec.
 ///
-/// Returns a route with `outer_projection`, `having` and `wrappers` left empty —
-/// those are properties of the query root, not of the spec, and the caller fills
-/// them in once a spec has won.
-#[allow(clippy::too_many_arguments)]
+/// Every output is aliased with the aggregate's OWN field name, never a name
+/// borrowed from a projection above it: the rewrite is substituted for the
+/// aggregate itself, and the untouched nodes above reference those names.
 async fn route_with_spec(
     spec: &RollupSpec, source: &str, table_name: &str, predicates: &[datafusion::logical_expr::Expr], aggregate: &datafusion::logical_expr::Aggregate,
-    output_names: Option<&Vec<String>>, session: &datafusion::execution::context::SessionState,
+    session: &datafusion::execution::context::SessionState,
 ) -> Result<RoutedRollup, MissReason> {
     use datafusion::logical_expr::{Expr, Operator, utils::split_conjunction};
 
@@ -975,7 +856,7 @@ async fn route_with_spec(
 
     let mut groups = Vec::new();
     for (index, expression) in aggregate.group_expr.iter().enumerate() {
-        let alias = output_names.and_then(|names| names.get(index)).map_or_else(|| aggregate.schema.field(index).name(), String::as_str);
+        let alias = aggregate.schema.field(index).name();
         let expression = match unaliased(expression) {
             Expr::Column(column) if spec.dimensions.iter().any(|dimension| dimension == &column.name) => column.name.clone(),
             Expr::ScalarFunction(function)
@@ -1000,14 +881,7 @@ async fn route_with_spec(
 
     let mut measures = Vec::new();
     for (index, expression) in aggregate.aggr_expr.iter().enumerate() {
-        let output_index = aggregate.group_expr.len() + index;
-        let (expression, alias) = match expression {
-            Expr::Alias(alias) => (alias.expr.as_ref(), output_names.and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| alias.name.clone())),
-            expression => (
-                expression,
-                output_names.and_then(|names| names.get(output_index)).cloned().unwrap_or_else(|| aggregate.schema.field(output_index).name().to_string()),
-            ),
-        };
+        let alias = aggregate.schema.field(aggregate.group_expr.len() + index).name().to_string();
         let Expr::AggregateFunction(function) = unaliased(expression) else { return Err(MissReason::NonDecomposableAggregate) };
         if function.params.distinct || !function.params.order_by.is_empty() {
             return Err(MissReason::NonDecomposableAggregate);
@@ -1062,10 +936,7 @@ async fn route_with_spec(
         hi,
         grain,
         target: spec.table_name(table_name),
-        outer_projection: None,
-        having: None,
-        wrappers: Vec::new(),
-        inner_wrappers: Vec::new(),
+        matched: datafusion::logical_expr::LogicalPlan::Aggregate(aggregate.clone()),
         row_filters,
         groups,
         measures,
@@ -1080,6 +951,7 @@ mod tests {
         datatypes::{DataType, Field, Schema, TimeUnit},
         record_batch::RecordBatch,
     };
+    use datafusion::common::tree_node::TreeNode as _;
     use std::sync::Arc;
 
     const SOURCE: &str = "otel_logs_and_spans";
@@ -1150,6 +1022,27 @@ mod tests {
         match_aggregates(&optimized(state, sql).await, state).await.map(|routes| routes.into_iter().next())
     }
 
+    /// Route `sql`, then reassemble exactly as `dml.rs` does — the same two
+    /// functions, not a test-only copy — and assert the result still describes
+    /// the query's own schema. That is the whole contract of the in-place
+    /// substitution: whatever the optimizer put above the aggregate survives
+    /// untouched, so the matcher never has to recognise it.
+    ///
+    /// `horizon` selects the rewrite shape: `None` for the single-leg rollup,
+    /// `Some(_)` for the raw-fringe union.
+    async fn assert_substitutes(
+        state: &datafusion::execution::context::SessionState, sql: &str, horizon: Option<i64>,
+    ) -> (datafusion::logical_expr::LogicalPlan, String) {
+        let original = optimized(state, sql).await;
+        let route = match_aggregates(&original, state).await.expect("match").into_iter().next().expect("route");
+        let generated = horizon.map_or_else(|| generated_sql(&route), |horizon| hybrid_sql(&route, horizon));
+        let rewrite = state.create_logical_plan(&generated).await.expect("parse rewrite");
+        let rewrite = crate::dml::requalified(rewrite, route.matched.schema()).expect("requalify the rewrite to the aggregate's fields");
+        let rebuilt = crate::dml::substitute(&original, &route.matched, rewrite).expect("substitute the rewrite for the aggregate");
+        rebuilt.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+        (rebuilt, generated)
+    }
+
     /// The rewrite when the rollup owns the whole window — the single-leg shape.
     fn generated_sql(route: &RoutedRollup) -> String {
         route.sql(&[("1970-01-01".into(), "generation".into())], (route.lo, route.hi))
@@ -1175,17 +1068,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matcher_preserves_a_scalar_outer_projection() {
+    async fn a_scalar_projection_above_the_aggregate_survives_untouched() {
         let state = session().await;
         let sql = format!("SELECT COUNT(*) + 1 AS total FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}");
-        let plan = optimized(&state, &sql).await;
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        let rewritten = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
-        let projection = route.outer_projection.expect("scalar projection");
-        let rewritten = datafusion::logical_expr::LogicalPlan::Projection(
-            datafusion::logical_expr::logical_plan::Projection::try_new(projection, Arc::new(rewritten)).expect("reapply projection"),
-        );
-        assert_eq!(rewritten.schema(), plan.schema());
+        assert_substitutes(&state, &sql, None).await;
     }
 
     #[tokio::test]
@@ -1299,13 +1185,8 @@ mod tests {
                     min(duration) AS lo, max(duration) AS hi \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2 ORDER BY 1 DESC LIMIT 10"
         );
-        let original = optimized(&state, &sql).await;
-        let route = route_for(&state, &sql).await.expect("match").expect("route");
-        let generated = hybrid_sql(&route, WIDE_HORIZON);
+        let (_, generated) = assert_substitutes(&state, &sql, Some(WIDE_HORIZON)).await;
         assert!(generated.contains("UNION ALL"), "precondition: this is the union path");
-        let plan = state.create_logical_plan(&generated).await.expect("parse union rewrite");
-        let rewrapped = PlanWrapper::rewrap(route.wrappers, plan);
-        rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
     }
 
     /// The metrics dashboard's shape: `AVG(value)` and a percentile, grouped by
@@ -1343,15 +1224,8 @@ mod tests {
         );
         assert!(generated.contains("tdigest_merge(value_digest)") && generated.contains("percentile_agg(CAST(value AS DOUBLE))"), "{generated}");
         // `approx_percentile(…)` is a scalar over the aggregate, so the query's
-        // own projection is re-applied above the rewrite — exactly as `dml.rs`
-        // does — and only then must the schemas agree.
-        let plan = state.create_logical_plan(&generated).await.expect("parse metrics rewrite");
-        let plan = datafusion::logical_expr::LogicalPlan::Projection(
-            datafusion::logical_expr::logical_plan::Projection::try_new(route.outer_projection.expect("scalar projection"), Arc::new(plan))
-                .expect("reapply projection"),
-        );
-        let rewrapped = PlanWrapper::rewrap(route.wrappers, plan);
-        rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+        // own projection sits above it and must survive the substitution.
+        assert_substitutes(&state, &sql, Some(WIDE_HORIZON)).await;
     }
 
     /// `now()` folds to a NANOSECOND literal, so a microsecond-only matcher
@@ -1400,9 +1274,9 @@ mod tests {
 
     /// Grouping by a bucket without SELECTing it is an ordinary dashboard shape
     /// ("count per hour, ordered by count"). The aggregate then has one more
-    /// output than the projection, and mapping names positionally aliased the
-    /// GROUP BY column with the first measure's name — the rewrite named its
-    /// bucket `c` and its count `m`. Seen in production as a miss.
+    /// output than the projection above it, and the rewrite must be named for
+    /// the AGGREGATE — an earlier version absorbed the projection's names
+    /// positionally and aliased the GROUP BY column with the first measure's.
     #[tokio::test]
     async fn a_group_key_that_is_not_selected_does_not_steal_a_measure_name() {
         let state = session().await;
@@ -1410,50 +1284,30 @@ mod tests {
             "SELECT COUNT(*) AS c, avg(duration) AS m FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} \
              GROUP BY time_bucket('1 hours', timestamp) ORDER BY 1 DESC"
         );
-        let original = optimized(&state, &sql).await;
-        let route = route_for(&state, &sql).await.expect("match").expect("route");
-        let generated = generated_sql(&route);
+        let (_, generated) = assert_substitutes(&state, &sql, None).await;
         assert!(!generated.contains("timestamp) AS \"c\""), "the bucket must not be aliased with a measure's name: {generated}");
-        let plan = state.create_logical_plan(&generated).await.expect("parse rewrite");
-        let plan = match route.outer_projection {
-            Some(expr) => datafusion::logical_expr::LogicalPlan::Projection(
-                datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan)).expect("reapply projection"),
-            ),
-            None => plan,
-        };
-        PlanWrapper::rewrap(route.wrappers, plan).schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
     }
 
-    /// `ORDER BY <an aggregate> LIMIT n` puts the Sort BELOW the outer
-    /// projection — the sort key must still exist when the sort runs, and is
-    /// dropped after — so the optimized root is
-    /// `Projection(Limit(Sort(Aggregate)))`. Peeling only at the root declined
-    /// it, and prod's `rollup_declined_shape` log showed this exact plan for the
-    /// most common dashboard query there is.
+    /// The exact plan prod's `rollup_declined_shape` log printed for the most
+    /// common dashboard query there is: `ORDER BY <an aggregate> LIMIT n` puts
+    /// the Sort BELOW the outer projection (the sort key must still exist when
+    /// the sort runs, and is dropped after), giving
+    /// `Projection(Sort(Projection(Aggregate)))`. Every peeling matcher chased
+    /// this one layer at a time and lost, because the layers above an aggregate
+    /// are whatever the session's analyzer rules produced — not a grammar.
     #[tokio::test]
-    async fn a_sort_below_the_outer_projection_is_peeled_and_reapplied_there() {
+    async fn the_shape_that_defeated_every_peeling_matcher_routes() {
         let state = session().await;
         let sql = format!(
             "SELECT COUNT(*) AS c, avg(duration)::BIGINT AS m FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} \
              GROUP BY time_bucket('1 hours', timestamp) ORDER BY 1 DESC LIMIT 2"
         );
-        let original = optimized(&state, &sql).await;
-        let route = route_for(&state, &sql).await.expect("match").expect("route");
-        // WHERE the optimizer puts the Sort depends on the session's analyzer
-        // rules — a pgwire session nests it under the projection, a bare one
-        // does not — so the invariant is that it is peeled from wherever it is
-        // and the plan reassembles, not which of the two lists it lands in.
-        assert!(!route.wrappers.is_empty() || !route.inner_wrappers.is_empty(), "the Sort/Limit must be peeled from somewhere, not declined");
-
-        let plan = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rewrite");
-        let plan = PlanWrapper::rewrap(route.inner_wrappers, plan);
-        let plan = match route.outer_projection {
-            Some(expr) => datafusion::logical_expr::LogicalPlan::Projection(
-                datafusion::logical_expr::logical_plan::Projection::try_new(expr, Arc::new(plan)).expect("reapply projection"),
-            ),
-            None => plan,
-        };
-        PlanWrapper::rewrap(route.wrappers, plan).schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+        let (rebuilt, _) = assert_substitutes(&state, &sql, None).await;
+        // The ORDER BY/LIMIT must still be there: a routed dashboard query that
+        // lost its sort returns rows in rollup order and silently truncates the
+        // wrong two.
+        let sorts = rebuilt.exists(|node| Ok(matches!(node, datafusion::logical_expr::LogicalPlan::Sort(sort) if sort.fetch == Some(2)))).expect("walk");
+        assert!(sorts, "the ORDER BY … LIMIT 2 must survive the substitution: {rebuilt}");
     }
 
     /// A sliver of certified interior is strictly worse than the raw plan: the
@@ -1468,76 +1322,121 @@ mod tests {
         assert!(interior(lo, hi, grain, grain * 40).is_some(), "40 of 100 buckets is worth it");
     }
 
-    /// A dimension-grouped query is the shape every dashboard panel sends. The
-    /// rewrite's aliases are unqualified while the source aggregate keeps the
-    /// table qualifier, so a derived `==` on DFSchema rejected all of them —
-    /// the feature was inert for exactly the queries it was built for.
+    /// A dimension-grouped query is the shape every dashboard panel sends, and
+    /// it is the one that makes qualifiers load-bearing: a rewrite is a SELECT,
+    /// so its aliases are unqualified, while the aggregate's group-by column
+    /// keeps `otel_logs_and_spans.`. Every untouched node above resolves columns
+    /// on `(qualifier, name)`, so the substitute must reproduce BOTH.
     #[tokio::test]
-    async fn a_grouped_rewrite_matches_the_original_schema_despite_qualifiers() {
+    async fn the_substituted_rewrite_carries_the_aggregates_qualifiers() {
         let state = session().await;
         let sql = format!("SELECT resource___service___name, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
         let original = optimized(&state, &sql).await;
-        let route = route_for(&state, &sql).await.expect("match").expect("route");
-        let rewritten = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
-        assert_ne!(rewritten.schema(), original.schema(), "precondition: the qualifiers really do differ");
-        rewritten.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+        let route = match_aggregates(&original, &state).await.expect("match").into_iter().next().expect("route");
+        let fields = |plan: &datafusion::logical_expr::LogicalPlan| {
+            plan.schema().iter().map(|(qualifier, field)| (qualifier.cloned(), field.name().clone())).collect::<Vec<_>>()
+        };
+        let bare = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
+        assert_ne!(fields(&bare), fields(&route.matched), "precondition: the raw rewrite really is missing the qualifiers");
+        let requalified = crate::dml::requalified(bare, route.matched.schema()).expect("requalify");
+        assert_eq!(fields(&requalified), fields(&route.matched), "the substitute must be field-for-field the aggregate it replaces");
+        requalified.schema().has_equivalent_names_and_types(route.matched.schema()).expect("names and types must match");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The rewrite must be aliased with the aggregate's OWN field names, however
+    /// arbitrary they are — never a name derived from the expression.
+    ///
+    /// Prod makes this concrete. The plan cache builds a template with the
+    /// literals lifted to `$N`, then substitutes the VALUES back; the field
+    /// names stay frozen as the template's, so a real production aggregate reads
+    ///
+    /// ```text
+    /// groupBy=[[time_bucket(Utf8View("30 seconds"), timestamp)
+    ///             AS time_bucket($1,otel_logs_and_spans.timestamp)]]
+    /// ```
+    ///
+    /// — a readable literal under a name nothing else could reconstruct. Every
+    /// node above references that name, so the substitute has to reproduce it.
+    #[tokio::test]
+    async fn the_rewrite_is_aliased_with_the_aggregates_own_field_names() {
+        let state = session().await;
+        // The production mechanism exactly: plan the template, then substitute
+        // the value. `replace_params_with_values` aliases the new literal back to
+        // the placeholder's name to keep the schema stable, which is how a field
+        // ends up named for an expression that is no longer there.
+        let sql = format!(
+            "SELECT time_bucket($1, timestamp) AS bucket, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1 ORDER BY 1 DESC"
+        );
+        let template = state.create_logical_plan(&sql).await.expect("plan the template");
+        let bound = template
+            .replace_params_with_values(&datafusion::common::ParamValues::List(vec![datafusion::scalar::ScalarValue::Utf8(Some("1 hours".into())).into()]))
+            .expect("substitute the literal");
+        let original = state.optimize(&bound).expect("optimize");
+        let route = match_aggregates(&original, &state).await.expect("match").into_iter().next().expect("route");
+
+        let name = route.matched.schema().field(0).name().clone();
+        assert!(name.contains("$1"), "precondition: the aggregate's field name must still carry the template's placeholder, got {name}");
+        let generated = generated_sql(&route);
+        assert!(
+            generated.contains(&format!("AS \"{name}\"")),
+            "the rollup leg must carry the aggregate's own field name, not one derived from the expression: {generated}"
+        );
+
+        let rewrite = state.create_logical_plan(&generated).await.expect("parse rewrite");
+        let rewrite = crate::dml::requalified(rewrite, route.matched.schema()).expect("requalify");
+        let rebuilt = crate::dml::substitute(&original, &route.matched, rewrite).expect("substitute");
+        rebuilt.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
     }
 
     /// `ORDER BY ... DESC` is on every real dashboard query, so a matcher that
     /// only accepts a bare aggregate root never fires in production.
     #[tokio::test]
-    async fn an_order_by_above_the_aggregate_is_peeled_and_reapplied() {
+    async fn an_order_by_above_the_aggregate_survives_the_substitution() {
         let state = session().await;
         let sql = format!(
             "SELECT resource___service___name, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1 ORDER BY 1 DESC LIMIT 10"
         );
-        let original = optimized(&state, &sql).await;
-        let route = route_for(&state, &sql).await.expect("match").expect("route");
-        assert!(!route.wrappers.is_empty(), "Sort/Limit must be peeled, not rejected");
-        let plan = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
-        let rewrapped = PlanWrapper::rewrap(route.wrappers, plan);
-        // The optimizer folds the LIMIT into the Sort's `fetch`, so one Sort is
-        // the whole peeled prefix — the ordering must be back on top of the
-        // rewrite, or a routed dashboard query returns rows in rollup order.
-        let datafusion::logical_expr::LogicalPlan::Sort(sort) = &rewrapped else { panic!("the peeled ORDER BY must be back on top: {rewrapped:?}") };
+        let (rebuilt, _) = assert_substitutes(&state, &sql, None).await;
+        // The optimizer folds the LIMIT into the Sort's `fetch`, so the Sort at
+        // the root carries both. Losing either returns rows in rollup order.
+        let datafusion::logical_expr::LogicalPlan::Sort(sort) = &rebuilt else { panic!("the ORDER BY must still be on top: {rebuilt}") };
         assert_eq!(sort.fetch, Some(10), "the LIMIT folded into the Sort must survive too");
-        rewrapped.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
     }
 
-    /// `HAVING` plans to a `Filter` between the aggregate and the projection,
-    /// which used to abort routing. It must be re-applied above the rewrite —
-    /// dropping it would return the rows the query asked to exclude.
+    /// `HAVING` plans to a `Filter` between the aggregate and the projection.
+    /// It needs no handling at all now — it is simply one of the nodes above the
+    /// aggregate — but dropping it would return the rows the query excluded, so
+    /// the guard stays.
     #[tokio::test]
-    async fn a_having_clause_is_reapplied_above_the_rewrite() {
+    async fn a_having_clause_still_filters_the_rewritten_plan() {
         let state = session().await;
         let sql = format!("SELECT kind, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1 HAVING COUNT(*) > 0");
-        let original = optimized(&state, &sql).await;
-        let route = route_for(&state, &sql).await.expect("match").expect("route");
-        let having = route.having.clone().expect("the HAVING predicate must be carried, not dropped");
-        let plan = state.create_logical_plan(&generated_sql(&route)).await.expect("parse rollup query");
-        let filtered =
-            datafusion::logical_expr::LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(having, Arc::new(plan)).expect("reapply having"));
-        let rebuilt = match route.outer_projection {
-            Some(projection) => datafusion::logical_expr::LogicalPlan::Projection(
-                datafusion::logical_expr::logical_plan::Projection::try_new(projection, Arc::new(filtered)).expect("reapply projection"),
-            ),
-            None => filtered,
-        };
-        rebuilt.schema().has_equivalent_names_and_types(original.schema()).expect("names and types must match");
+        let (rebuilt, _) = assert_substitutes(&state, &sql, None).await;
+        assert!(
+            rebuilt.exists(|node| Ok(matches!(node, datafusion::logical_expr::LogicalPlan::Filter(_)))).expect("walk"),
+            "the HAVING filter must survive: {rebuilt}"
+        );
     }
 
-    /// A shape gap over a rollup-declaring source must reach `rollup_miss`;
-    /// a plan that simply is not our business must stay uncounted, or every
-    /// ordinary SELECT would pollute the counter.
+    /// An aggregate no spec can serve must reach `rollup_miss`; a plan that
+    /// simply is not our business must stay uncounted, or every ordinary SELECT
+    /// would pollute the counter.
     #[tokio::test]
-    async fn an_unsupported_shape_is_counted_but_an_unrelated_query_is_not() {
+    async fn an_unsupported_aggregate_is_counted_but_an_unrelated_query_is_not() {
         let state = session().await;
-        let union = format!(
-            "SELECT kind, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1 \
-             UNION ALL SELECT kind, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'other' AND {WINDOW} GROUP BY 1"
+        // No pre-aggregated state can answer a standard deviation, so it must
+        // decline — visibly. The window is wide enough for every tier, or the
+        // reported reason would be the coarsest tier's `TinyInterior` instead.
+        let stddev = format!(
+            "SELECT stddev(duration) AS s FROM {SOURCE} WHERE project_id = 'project' \
+               AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(864000000000)"
         );
-        let unsupported = route_for(&state, &union).await;
-        assert_eq!(unsupported.err(), Some(MissReason::UnsupportedShape), "a rollup source we cannot rewrite must be visible");
+        assert_eq!(
+            route_for(&state, &stddev).await.err(),
+            Some(MissReason::NonDecomposableAggregate),
+            "an aggregate over a rollup source that no spec can serve must be visible"
+        );
         let unrelated = route_for(&state, &format!("SELECT kind FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await;
         assert!(matches!(unrelated, Ok(None)), "a non-aggregate query must not be counted as a miss: {unrelated:?}");
     }
