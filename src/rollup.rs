@@ -375,11 +375,65 @@ const fn ceil_grain(value: i64, grain: i64) -> i64 {
 /// half of one cannot be given to a fringe. That alignment is the invariant the
 /// whole rewrite rests on — with `a` or `b` off-grain the legs either double
 /// count a bucket or drop one, and no aggregate can detect it afterwards.
+/// Test-only: the single-interval shape, kept because the cost-floor and
+/// alignment cases read far more clearly against one range than a set.
+#[cfg(test)]
 pub(crate) fn interior(lo: i64, hi: i64, grain: i64, horizon: i64) -> Option<(i64, i64)> {
-    let (start, end) = (ceil_grain(lo, grain), floor_grain(hi.min(horizon), grain));
-    debug_assert!(start.rem_euclid(grain) == 0 && end.rem_euclid(grain) == 0, "interior endpoints must be grain-aligned");
-    let width = end.checked_sub(start).filter(|width| *width > 0)?;
-    (width >= MIN_INTERIOR_BUCKETS.saturating_mul(grain) && width >= hi.saturating_sub(lo) / MIN_INTERIOR_FRACTION).then_some((start, end))
+    interiors(lo, hi, grain, horizon, &[(lo, hi)]).into_iter().next()
+}
+
+/// Every grain-aligned range the rollup may own inside `[lo, hi)`.
+///
+/// `covered` is the set of ranges whose coverage was proved current, in
+/// ascending order; `horizon` caps them all, because a row still in the
+/// MemBuffer is missing from EVERY rollup partition regardless of which dates
+/// are certified.
+///
+/// Taking a set rather than a prefix is what stops one stale day in the middle
+/// of a window discarding the rollup for every day after it — measured in
+/// production, a single uncovered date made a 7-day query scan 8.4M raw rows
+/// while the other six days sat fully built.
+pub(crate) fn interiors(lo: i64, hi: i64, grain: i64, horizon: i64, covered: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let capped = hi.min(horizon);
+    let ranges: Vec<(i64, i64)> = covered
+        .iter()
+        .filter_map(|(start, end)| {
+            let (start, end) = (ceil_grain((*start).max(lo), grain), floor_grain((*end).min(capped), grain));
+            debug_assert!(start.rem_euclid(grain) == 0 && end.rem_euclid(grain) == 0, "interior endpoints must be grain-aligned");
+            // A run too short to hold whole buckets is handed back to the raw
+            // leg: it would cost a second scan to save less than one bucket.
+            (end.saturating_sub(start) >= MIN_INTERIOR_BUCKETS.saturating_mul(grain)).then_some((start, end))
+        })
+        .collect();
+    // The floor applies to the TOTAL, not to each run: what makes the union
+    // worth its extra scan and barrier is how much of the window it removes from
+    // the raw leg, and that is the sum however it is distributed. It is measured
+    // against the window the QUERY asked for, never the horizon-capped one — a
+    // sliver of certified data is no more worth a second scan just because the
+    // buffer bound happens to sit just past it.
+    let total: i64 = ranges.iter().map(|(start, end)| end - start).sum();
+    if total < hi.saturating_sub(lo) / MIN_INTERIOR_FRACTION { Vec::new() } else { ranges }
+}
+
+/// `[lo, hi)` minus `ranges` — the raw leg's share.
+///
+/// `ranges` must be ascending and disjoint, which `interiors` guarantees. Every
+/// bound is half-open and comes from the SAME list that drives the rollup leg,
+/// so the two together partition `[lo, hi)`: no row is read twice, none is
+/// missed, and no aggregate downstream could detect it if one were.
+pub(crate) fn complement(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut gaps = Vec::new();
+    let mut cursor = lo;
+    for (start, end) in ranges {
+        if cursor < *start {
+            gaps.push((cursor, *start));
+        }
+        cursor = cursor.max(*end);
+    }
+    if cursor < hi {
+        gaps.push((cursor, hi));
+    }
+    gaps
 }
 
 #[derive(Debug)]
@@ -455,7 +509,7 @@ impl RoutedRollup {
     /// When the interior is the whole window this collapses to a single
     /// statement against the rollup table, which is both cheaper and the shape
     /// the aligned fast path has always emitted.
-    pub fn sql(&self, generations: &[(String, String)], interior: (i64, i64)) -> String {
+    pub fn sql(&self, generations: &[(String, String)], interiors: &[(i64, i64)]) -> String {
         let generations = format!(
             " AND ({})",
             generations
@@ -464,7 +518,7 @@ impl RoutedRollup {
                 .collect::<Vec<_>>()
                 .join(" OR ")
         );
-        let fringes: Vec<(i64, i64)> = [(self.lo, interior.0), (interior.1, self.hi)].into_iter().filter(|(start, end)| start < end).collect();
+        let fringes = complement(self.lo, self.hi, interiors);
         if fringes.is_empty() {
             // Single leg: the rollup rows ARE the partial states, so the merge
             // applies directly to the measure columns.
@@ -481,7 +535,7 @@ impl RoutedRollup {
                 "SELECT {select} FROM {} WHERE project_id = {} AND ({}){generations}{row_filters}{group_by}",
                 self.target,
                 sql_literal(&self.project_id),
-                Self::range_sql(&interior),
+                interiors.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR "),
             );
         }
         let outer = self
@@ -498,7 +552,7 @@ impl RoutedRollup {
         let group_by = self.group_by();
         format!(
             "SELECT {outer} FROM ({} UNION ALL {}) AS rollup_union{group_by}",
-            self.leg(&self.target, std::slice::from_ref(&interior), &generations),
+            self.leg(&self.target, interiors, &generations),
             self.leg(&self.source, &fringes, ""),
         )
     }
@@ -1134,14 +1188,14 @@ mod tests {
 
     /// The rewrite when the rollup owns the whole window — the single-leg shape.
     fn generated_sql(route: &RoutedRollup) -> String {
-        route.sql(&[("1970-01-01".into(), "generation".into())], (route.lo, route.hi))
+        route.sql(&[("1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)])
     }
 
     /// The rewrite when only part of the window is certified, so raw fringes and
     /// a live tail are unioned in.
     fn hybrid_sql(route: &RoutedRollup, horizon: i64) -> String {
         let interior = interior(route.lo, route.hi, route.grain, horizon).expect("a routable interior");
-        route.sql(&[("1970-01-01".into(), "generation".into())], interior)
+        route.sql(&[("1970-01-01".into(), "generation".into())], &[interior])
     }
 
     #[tokio::test]
@@ -1508,6 +1562,62 @@ mod tests {
             None,
             "a disjunction reaches outside any single range"
         );
+    }
+
+    /// A hole in the middle of a window must cost only the days it covers, not
+    /// every day after it. Measured in production: one uncovered date made a
+    /// 7-day query scan 8.4M raw rows while six days sat fully built.
+    ///
+    /// The invariant is the same one the single interval had, now over a SET:
+    /// the rollup intervals and the raw complement must partition `[lo, hi)`
+    /// exactly — a gap drops rows, an overlap counts them twice, and nothing
+    /// downstream can tell.
+    #[test]
+    fn a_gap_in_coverage_costs_only_the_days_it_covers() {
+        const DAY: i64 = 86_400_000_000;
+        let grain = 3_600_000_000;
+        let (lo, hi) = (0, 7 * DAY);
+        // Days 0-1 and 4-6 covered; day 2-3 is the hole.
+        let covered = [(0, 2 * DAY), (4 * DAY, 7 * DAY)];
+        let intervals = interiors(lo, hi, grain, hi, &covered);
+        assert_eq!(intervals, vec![(0, 2 * DAY), (4 * DAY, 7 * DAY)], "both runs must be kept, not just the prefix");
+
+        let gaps = complement(lo, hi, &intervals);
+        assert_eq!(gaps, vec![(2 * DAY, 4 * DAY)], "only the hole is read raw");
+        let total: i64 = intervals.iter().chain(gaps.iter()).map(|(start, end)| end - start).sum();
+        assert_eq!(total, hi - lo, "the two legs must cover the window exactly once");
+
+        // The prefix rule would have kept only days 0-1 and scanned five raw.
+        let prefix_only: i64 = intervals.iter().map(|(start, end)| end - start).sum();
+        assert_eq!(prefix_only, 5 * DAY, "five of seven days must still come from the rollup");
+    }
+
+    /// The complement must stay a partition for any interval set, including the
+    /// degenerate ones — empty, whole-window, and touching either end.
+    #[test]
+    fn the_rollup_intervals_and_their_complement_always_partition_the_window() {
+        let (lo, hi) = (100_i64, 1_000_i64);
+        for ranges in [vec![], vec![(lo, hi)], vec![(lo, 400)], vec![(400, hi)], vec![(200, 300), (500, 600)], vec![(lo, 300), (300, 600)], vec![(900, hi)]] {
+            let gaps = complement(lo, hi, &ranges);
+            let total: i64 = ranges.iter().chain(gaps.iter()).map(|(start, end)| end - start).sum();
+            assert_eq!(total, hi - lo, "ranges {ranges:?} + gaps {gaps:?} must cover [{lo},{hi}) exactly once");
+            for gap in &gaps {
+                assert!(gap.0 < gap.1, "empty gaps must not be emitted: {gaps:?}");
+                assert!(ranges.iter().all(|range| gap.1 <= range.0 || gap.0 >= range.1), "gap {gap:?} overlaps {ranges:?}");
+            }
+        }
+    }
+
+    /// The buffer horizon caps EVERY interval, not just the last one: a row
+    /// still in the MemBuffer is missing from every rollup partition, whichever
+    /// dates happen to be certified.
+    #[test]
+    fn the_buffer_horizon_caps_every_interval() {
+        const DAY: i64 = 86_400_000_000;
+        let grain = 3_600_000_000;
+        let covered = [(0, 2 * DAY), (2 * DAY, 4 * DAY)];
+        let intervals = interiors(0, 4 * DAY, grain, 3 * DAY, &covered);
+        assert!(intervals.iter().all(|(_, end)| *end <= 3 * DAY), "nothing may reach past the horizon: {intervals:?}");
     }
 
     /// The rebuilt hours and the carried-forward hours must PARTITION the day:

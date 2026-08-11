@@ -421,8 +421,8 @@ rollups:
       - { name: server_duration_sum, agg: sum, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
       - { name: server_duration_min, agg: min, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
       - { name: server_duration_max, agg: max, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
-      - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span'" }
-      - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
+      - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+      - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
       - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
   # Coarse tier for wide windows. The matcher picks the coarsest grain that
   # divides the requested bucket width, so a 30-day chart (1d/6h buckets)
@@ -446,6 +446,6 @@ rollups:
          - { name: server_duration_sum, agg: sum, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
          - { name: server_duration_min, agg: min, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
          - { name: server_duration_max, agg: max, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
-         - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span'" }
-         - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
+         - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+         - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
          - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }

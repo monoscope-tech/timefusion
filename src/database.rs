@@ -1533,6 +1533,8 @@ fn batch_hours(batch: &RecordBatch) -> Option<HashMap<String, u32>> {
     Some(text.as_string::<i32>().iter().flatten().map(|date| (date.to_string(), crate::rollup::ALL_HOURS)).collect())
 }
 
+const DAY_MICROS: i64 = 86_400_000_000;
+
 /// Microseconds at 00:00:00 UTC on a `YYYY-MM-DD` partition value.
 fn date_start_micros(date: &str) -> Option<i64> {
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros().into()
@@ -3119,7 +3121,10 @@ impl Database {
         // be served, but everything before it can. Today's partition is normally
         // the first uncertified date, because every flush changes its file
         // fingerprint — which is precisely why the tail must be read raw.
-        let mut certified = route.hi;
+        // The certified SET, not a prefix. A gap in the middle used to discard
+        // every later date too, so one stale day made a 7-day query scan 8.4M
+        // raw rows while six days sat fully built.
+        let mut covered: Vec<(i64, i64)> = Vec::new();
         let mut miss = None;
         for date in dates {
             let date = date.to_string();
@@ -3131,8 +3136,8 @@ impl Database {
             // miss histogram cannot tell a missing cron from a churning
             // partition, which is the only question a rollout has to answer.
             let Some(coverage) = self.rollup_coverage.get(&key) else {
-                (certified, miss) = (day_start, Some(crate::rollup::MissReason::NotBuilt));
-                break;
+                miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
+                continue;
             };
             let source_fp = fingerprints
                 .get(&(route.project_id.clone(), date.clone()))
@@ -3141,35 +3146,43 @@ impl Database {
                 .unwrap_or_default();
             let source_epoch = self.rollup_source_epochs.get(&(route.project_id.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
             if coverage.source_fp != source_fp || coverage.source_epoch != source_epoch {
-                (certified, miss) = (day_start, Some(crate::rollup::MissReason::StaleCoverage));
-                break;
+                miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
+                continue;
             }
             debug!(project_id = %route.project_id, source = %route.source, target = %route.target, date, rows = coverage.rows, "rollup coverage selected");
+            // Merge with the previous run when the dates are adjacent, so a
+            // contiguous span costs one range predicate rather than one per day.
+            match covered.last_mut() {
+                Some(last) if last.1 == day_start => last.1 = day_start + DAY_MICROS,
+                _ => covered.push((day_start, day_start + DAY_MICROS)),
+            }
             generations.push((date.clone(), coverage.generation.clone()));
             ticket.push((key, source_fp, source_epoch, coverage.generation.clone()));
         }
-        // Every term is an upper bound on how far the rollup may be trusted, so
-        // `min` is the only combinator and adding a term can never be unsafe.
-        let horizon = buffered.map_or(certified, |buffered| certified.min(buffered));
+        // A buffered row is missing from EVERY rollup partition, whichever dates
+        // are certified, so this caps the whole set rather than trimming a tail.
+        let horizon = buffered.unwrap_or(route.hi);
         let realtime = self.config.maintenance.timefusion_rollup_realtime_tail;
         // With the tail off, the pre-fringe contract stands exactly: the rollup
         // answers the whole window or nothing at all.
-        if !realtime && (horizon < route.hi || route.lo.rem_euclid(route.grain) != 0 || route.hi.rem_euclid(route.grain) != 0) {
+        if !realtime && (miss.is_some() || horizon < route.hi || route.lo.rem_euclid(route.grain) != 0 || route.hi.rem_euclid(route.grain) != 0) {
             return Err(miss.unwrap_or(crate::rollup::MissReason::IncompleteCoverage));
         }
-        let Some(interior) = crate::rollup::interior(route.lo, route.hi, route.grain, horizon) else {
+        let interiors = crate::rollup::interiors(route.lo, route.hi, route.grain, horizon, &covered);
+        if interiors.is_empty() {
             return Err(miss.unwrap_or(crate::rollup::MissReason::TinyInterior));
-        };
-        // Drop dates the interior does not actually read: keeping them in the
-        // ticket would let an unrelated partition's churn invalidate a valid plan.
-        generations.retain(|(date, _)| date_intersects(date, interior));
-        ticket.retain(|((_, _, _, date), ..)| date_intersects(date, interior));
+        }
+        // Drop dates no interval actually reads: keeping them in the ticket would
+        // let an unrelated partition's churn invalidate a valid plan.
+        let reads = |date: &str| interiors.iter().any(|interval| date_intersects(date, *interval));
+        generations.retain(|(date, _)| reads(date));
+        ticket.retain(|((_, _, _, date), ..)| reads(date));
         if generations.is_empty() {
             return Err(miss.unwrap_or(crate::rollup::MissReason::NotBuilt));
         }
-        let mode = if interior == (route.lo, route.hi) { "full" } else { "hybrid" };
+        let mode = if interiors == [(route.lo, route.hi)] { "full" } else { "hybrid" };
         Ok(Some(RollupRewrite {
-            sql: route.sql(&generations, interior),
+            sql: route.sql(&generations, &interiors),
             grain: format!("{}us", route.grain),
             mode,
             matched: route.matched,
