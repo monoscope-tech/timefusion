@@ -675,7 +675,21 @@ impl ExecutionPlan for DmlExec {
 
         let future = async move {
             let DmlExec { op_type, table_name, project_id, predicate, assignments, source, database, buffered_layer, session, .. } = this;
-            database.invalidate_rollup_dml(&project_id, &table_name, predicate.as_ref(), &assignments);
+            // A merge-on-read table re-appends every affected row through
+            // `insert_records_batch`, which already invalidates each date those
+            // rows land in — and the append carries each row's ORIGINAL
+            // timestamp, so those are exactly the dates that changed, whatever
+            // the predicate looked like. Invalidating here as well can only be
+            // broader, never more precise.
+            //
+            // The exception is a statement that ASSIGNS `timestamp`: the row
+            // moves to a new date, the append invalidates only the new one, and
+            // the old partition is left holding coverage for a version that is
+            // now superseded. `invalidate_rollup_dml` falls back to the
+            // source-wide wipe for exactly that case.
+            if !is_version_append(&table_name) || assignments.iter().any(|(column, _)| column == "timestamp") {
+                database.invalidate_rollup_dml(&project_id, &table_name, predicate.as_ref(), &assignments);
+            }
             let result = match op_type {
                 DmlOperation::Update => {
                     perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, source, session, &span)

@@ -1867,6 +1867,17 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let after_update = rows_of(ctx.sql(&query).await?.collect().await?);
     assert_eq!(hits(), before + 1, "a DML confined to today must leave yesterday's coverage intact (misses +{})", misses() - misses_before);
     assert_eq!(after_update.iter().map(|row| row.1).sum::<i64>(), 6, "the enrichment must not change the counted rows: {after_update:?}");
+
+    // The same, with a predicate that says NOTHING about time. On a merge-on-read
+    // table the re-appended row invalidates its own date and no other, so
+    // precision here does not depend on the predicate's shape — which is the
+    // difference between working and getting lucky, since monoscope's enrichment
+    // happens to carry a time range but nothing guarantees the next writer will.
+    ctx.sql(&format!("UPDATE otel_logs_and_spans SET name = 'by-id' WHERE project_id = '{project_id}' AND id = 't0'")).await?.collect().await?;
+    let before = hits();
+    let after_by_id = rows_of(ctx.sql(&query).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "an id-scoped DML on today's row must leave yesterday's coverage intact (misses +{})", misses() - misses_before);
+    assert_eq!(after_by_id.iter().map(|row| row.1).sum::<i64>(), 6, "the id-scoped update must not change the counted rows: {after_by_id:?}");
     Ok(())
 }
 

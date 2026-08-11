@@ -7989,9 +7989,15 @@ impl Database {
 
     /// Invalidate only the partitions a DML statement can have changed.
     ///
-    /// The source-wide wipe below is correct but catastrophic under continuous
-    /// enrichment. Measured in production 2026-08-11: monoscope issues ~400
-    /// scoped `UPDATE otel_logs_and_spans SET hashes = …` per 10 minutes for one
+    /// For merge-on-read tables the caller skips this entirely — the re-appended
+    /// rows invalidate their own dates exactly. This is the path for the
+    /// statements that leave no appended rows behind: a non-MOR UPDATE/DELETE
+    /// rewrites Delta files in place, so nothing passes through
+    /// `invalidate_rollup_batches` and the predicate is all there is to go on.
+    ///
+    /// The source-wide wipe below is correct but catastrophic when it fires
+    /// often. Measured in production 2026-08-11: monoscope issues ~400 scoped
+    /// `UPDATE otel_logs_and_spans SET hashes = …` per 10 minutes for one
     /// project, and each one dropped EVERY date's coverage for the table — a
     /// blanket wipe roughly every 1.5 seconds. Nine days of built rollups could
     /// never survive to serve a single read, while `otel_metrics`, which takes
