@@ -672,8 +672,22 @@ fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mu
     }
 }
 
+/// Does this predicate constrain ONLY `project_id`/`timestamp`?
+///
+/// Those are the two the probe injects to satisfy the scan admission guard, and
+/// they are also the two a measure filter can never usefully be about — the
+/// rollup is already partitioned by project and bucketed by time. So dropping
+/// them recovers exactly the declared predicate.
+fn is_probe_scaffolding(expr: &datafusion::logical_expr::Expr) -> bool {
+    let mut columns = std::collections::HashSet::new();
+    if datafusion::logical_expr::utils::expr_to_columns(expr, &mut columns).is_err() {
+        return false;
+    }
+    !columns.is_empty() && columns.iter().all(|column| matches!(column.name.as_str(), "project_id" | "timestamp"))
+}
+
 async fn measure_filters<'a>(
-    session: &datafusion::execution::context::SessionState, source: &str, spec: &'a RollupSpec,
+    session: &datafusion::execution::context::SessionState, source: &str, spec: &'a RollupSpec, project_id: &str, lo: i64, hi: i64,
 ) -> Result<Vec<(&'a crate::schema_loader::RollupMeasure, String)>, MissReason> {
     let mut filters = Vec::with_capacity(spec.measures.len());
     for measure in &spec.measures {
@@ -691,12 +705,25 @@ async fn measure_filters<'a>(
                 // EVERY filtered measure — hence every spec declaring one —
                 // failed to resolve. Unit tests could not see it: a bare
                 // `MemTable` session has no Variant rewriter registered.
-                let plan =
-                    session.create_logical_plan(&format!("SELECT timestamp FROM {source} WHERE {filter}")).await.map_err(|_| MissReason::UnknownFilter)?;
+                //
+                // The probe also carries the QUERY's project and time bounds.
+                // Without them the scan admission guard rejects it outright —
+                // an unbounded scan of the whole table is exactly what that
+                // guard exists to stop — so on a real session every filtered
+                // measure failed and `otel_logs_and_spans`, whose nine
+                // `server_*` measures all declare filters, could never route at
+                // all. `otel_metrics` routed only because its measures declare
+                // none, so it skipped this probe entirely. The injected
+                // predicates are stripped back out below.
+                let probe = format!(
+                    "SELECT timestamp FROM {source} WHERE project_id = {} AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) AND ({filter})",
+                    sql_literal(project_id)
+                );
+                let plan = session.create_logical_plan(&probe).await.map_err(|_| MissReason::UnknownFilter)?;
                 let plan = session.optimize(&plan).map_err(|_| MissReason::UnknownFilter)?;
                 let mut filters = Vec::new();
                 source_and_filters(&plan, &mut filters).ok_or(MissReason::UnknownFilter)?;
-                canonical_and(filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction))
+                canonical_and(filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).filter(|term| !is_probe_scaffolding(term)))
             }
         };
         filters.push((measure, filter));
@@ -913,7 +940,7 @@ async fn route_with_spec(
     if hi.saturating_sub(lo) < grain.saturating_mul(MIN_INTERIOR_BUCKETS) {
         return Err(MissReason::TinyInterior);
     }
-    let configured_filters = measure_filters(session, source, spec).await?;
+    let configured_filters = measure_filters(session, source, spec, &project_id, lo, hi).await?;
 
     let mut groups = Vec::new();
     for (index, expression) in aggregate.group_expr.iter().enumerate() {
