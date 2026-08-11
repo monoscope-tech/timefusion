@@ -19761,4 +19761,3 @@ mod footer_repair_schedule_tests {
         assert!(budget > period, "a long run must not be capped by a short cadence");
     }
 }
-
