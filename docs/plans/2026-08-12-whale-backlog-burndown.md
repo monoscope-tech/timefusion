@@ -58,6 +58,30 @@ cycle, with deploys interrupting bins, meaningfully longer.
 That is the whole point: **the job is a backlog burndown with a throughput target, and it must
 be measured in files/day, not run to completion in one sitting.**
 
+## Baseline: the current burn rate is ZERO, and deploys are why
+
+Measured 2026-08-12, same day as the sizing:
+
+- Band unchanged across checkpoints `v478202` → `v478204`: **1038 files / 751.2 GB, delta +0**.
+- **One** repair-related log line in the whole process lifetime —
+  `footer_repair_verified_loaded`, which is the boot-time load of the verified list. No pass,
+  no `repair_bin_sliced`, no partition touched.
+- The service restarted **three times** that day: one env change
+  (`TIMEFUSION_CPU_PROFILE=false`) and two pushes to master, **two of which were markdown
+  only**.
+
+That is the mechanism, and it is arithmetic rather than bad luck. `footer_repair_schedule` is
+`0 30 * * * *` — hourly at :30 — with a 2.4 h budget, and `spawn_cron_job` *drops* overlapping
+ticks instead of queueing them. So a restart costs the in-flight bin and pushes the next
+attempt to the following :30. A process restarting every ~25–30 min (one image build) never
+completes a pass at all.
+
+`deploy.yml` had no `paths-ignore`, so **a docs-only commit rebuilt the image and replaced the
+container**. Fixed: `docs/**` and `**/*.md` no longer deploy. `paths-ignore` skips only when
+every changed path matches, so any commit touching code still ships.
+
+**Before treating slow burndown as a repair-throughput problem, count the day's deploys.**
+
 ## How to run it
 
 1. **Set a rate target and watch it, not the clock.** The only number that matters is active

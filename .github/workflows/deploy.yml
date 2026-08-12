@@ -3,6 +3,17 @@ name: Build and Deploy
 on:
   push:
     branches: [ master ]
+    # A docs-only push must not restart prod. Every deploy replaces the running
+    # container, and the footer-repair cron is hourly with a 2.4h budget
+    # (`spawn_cron_job` drops overlapping ticks), so a restart costs the
+    # in-flight bin AND pushes the next attempt to the following :30. On
+    # 2026-08-12 three pushes — two of them markdown only — meant the whale
+    # backlog (1038 files, see docs/plans/2026-08-12-whale-backlog-burndown.md)
+    # burned down by exactly zero files. `paths-ignore` skips only when EVERY
+    # changed path matches, so a commit touching code still deploys.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
 
 # Serialize deploys. Keep the active build alive: GitHub concurrency already
 # retains at most one pending run and replaces older pending runs with the
