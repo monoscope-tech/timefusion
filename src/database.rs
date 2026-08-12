@@ -3973,40 +3973,28 @@ impl Database {
         self.setup_session_udfs(ctx)
     }
 
-    /// Register set_config UDF for PostgreSQL compatibility
+    /// `set_config(name, value, is_local)` — PostgreSQL returns the value that
+    /// was set, which is all TF does: it holds no state for the settings
+    /// clients set this way.
+    ///
+    /// Echoing the argument is also what makes both call shapes work. An
+    /// all-literal call arrives as `ColumnarValue::Scalar`, and the previous
+    /// Array-only implementation rejected precisely the call pgAdmin makes on
+    /// connect (`set_config('bytea_output', 'escape', false)`).
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::{
-            arrow::{
-                array::{StringViewArray, StringViewBuilder},
-                datatypes::DataType,
-            },
-            logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
+            arrow::datatypes::DataType,
+            logical_expr::{ScalarFunctionImplementation, Volatility, create_udf},
         };
 
-        let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-            let ColumnarValue::Array(array) = &args[1] else {
-                return Err(DataFusionError::Execution("set_config: second argument must be an array".into()));
-            };
-            let param_value_array = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .ok_or_else(|| DataFusionError::Execution(format!("set_config: second argument must be StringViewArray, got {:?}", array.data_type())))?;
-
-            let mut builder = StringViewBuilder::new();
-            for i in 0..param_value_array.len() {
-                if param_value_array.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(param_value_array.value(i));
-                }
-            }
-            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
-        });
-
-        let set_config_udf =
-            create_udf("set_config", vec![DataType::Utf8View, DataType::Utf8View, DataType::Boolean], DataType::Utf8View, Volatility::Volatile, set_config_fn);
-
-        ctx.register_udf(set_config_udf);
+        let set_config_fn: ScalarFunctionImplementation = Arc::new(|args| Ok(args[1].clone()));
+        ctx.register_udf(create_udf(
+            "set_config",
+            vec![DataType::Utf8View, DataType::Utf8View, DataType::Boolean],
+            DataType::Utf8View,
+            Volatility::Volatile,
+            set_config_fn,
+        ));
     }
 
     /// Register JSON functions from datafusion-functions-json

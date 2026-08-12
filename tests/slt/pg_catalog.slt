@@ -143,3 +143,19 @@ query I
 SELECT count(*) FROM pg_available_extensions
 ----
 0
+
+# pgAdmin calls set_config() with all-literal arguments on connect. DataFusion
+# passes those as ColumnarValue::Scalar, not Array, which the UDF rejected:
+# "set_config: second argument must be an array".
+
+query T
+SELECT set_config('bytea_output', 'escape', false)
+----
+escape
+
+# The array path (a non-literal value) must keep working.
+query T rowsort
+SELECT set_config('search_path', c, false) FROM (VALUES ('a'), ('b')) t(c)
+----
+a
+b
