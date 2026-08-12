@@ -47,8 +47,17 @@ is a dedicated runtime for the health listener, not a longer deadline.
 signal we have.
 
 ### 2. The unexplained SIGSEGV
+> **The evidence is GONE (checked 2026-08-12).** There is no `wal.broken-*` anywhere on the
+> host — `/home/ubuntu/timefusion-data` holds only live directories. So the offline
+> reproduction below is no longer available, and this item cannot be worked as written.
+>
+> What is left: the CPU-profiler hypothesis is now testable by env var
+> (`TIMEFUSION_CPU_PROFILE`) without needing the corrupt WAL at all, and that is the cheapest
+> remaining move. If the segfault recurs, **copy the WAL off the host before restarting** —
+> that is what was missed here, and it cost the only reproduction.
+
 Between 12:14 and 12:23 every boot segfaulted (exit 139, no Rust panic). Evidence
-preserved at `/home/ubuntu/timefusion-data/wal.broken-1786451053`.
+was preserved at `/home/ubuntu/timefusion-data/wal.broken-1786451053`.
 
 Reproduce offline: copy that dir, point a local binary at it, run under
 `gdb`/`catchsegv`. No panic text ⇒ unsafe/FFI, so `RUST_BACKTRACE` will not help.
@@ -67,6 +76,12 @@ of this plan's follow-up, so the hypothesis can be tested by env var instead of
 by shipping an image into an outage.
 
 ### 3. CapRover `serviceUpdateOverride` — one word
+> **DONE 2026-08-12.** `UpdateConfig.Order` is now `stop-first`, applied through the CapRover
+> API with every other field of the app definition preserved (StopGracePeriod 90s, the memory
+> limit/reservation, the seccomp override). Takes effect on the next deploy; nothing was
+> restarted to apply it. `"FailureAction": "pause"` is untouched and still explains the wedge
+> shape — a separate call to make deliberately.
+
 The timefusion app config literally contains `"Order": "start-first"`, which is
 the WAL-lock deadlock. This is *why* every manual `stop-first` gets reverted; it
 was never a CapRover quirk. Change to `"stop-first"` in the UI. Needs the
