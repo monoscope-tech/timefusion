@@ -155,8 +155,50 @@ pause and accumulate not-ready tasks rather than rolling back).
 >
 > Not the flush escalation path: `flush_sort_unsorted_fallbacks_total` is **0**.
 >
-> **CORRECTION (later the same day): the "do NOT drain" conclusion below is NOT supported —
-> I over-read an unstable instrument.** Probing single dates directly gave `full-set` for
+> **MEASURED 2026-08-12 from the Delta log — this section's numbers are wrong by ~30x.**
+> Counting **active** add files (checkpoint v478202, `numOfAddFiles=2494` table-wide) for
+> past3, rather than inferring from EXPLAIN:
+>
+> | date | active files | size |
+> |---|---|---|
+> | …up to 07-19 | 1–8 each | small |
+> | 07-20 | 30 | 24.8 GB |
+> | 07-21 | 70 | 55.6 GB |
+> | 07-22 | 116 | 91.3 GB |
+> | 07-23 | 113 | 86.0 GB |
+> | 07-24 | 121 | 93.4 GB |
+> | 07-25 | 33 | 33.0 GB |
+> | 07-26 | 76 | 57.3 GB |
+> | 07-27 | 70 | 54.4 GB |
+> | 07-28 | 99 | 85.3 GB |
+> | 07-29 | 53 | 38.8 GB |
+> | 07-30 | 63 | 46.3 GB |
+> | **07-31** | **82** | **36.3 GB** |
+> | **08-01** | **80** | **35.2 GB** |
+> | 08-02 | 32 | 13.5 GB |
+> | 08-03 … 08-11 | 1–11 each | small |
+>
+> Three corrections, each load-bearing:
+>
+> 1. **07-31 is 82 active files / 36 GB, not "36 files".**
+> 2. **08-01 is NOT clean.** This plan records "08-01=0"; it has **80 active files / 35 GB**.
+>    The whale-tier counter that said zero was measuring something else.
+> 3. **It is a 13-day band, not one partition: 07-20 … 08-02 = 1038 active files, ~751 GB.**
+>    Every date outside that band is compacted to 1–6 files, so compaction works normally —
+>    something specific to that window left ~750 GB uncompacted and it never caught up.
+>
+> So "drain 07-31's 36 files, ~8h" was never the shape of this job. At the plan's own ~13
+> min/bin it is weeks, not hours, and it should be planned as a backlog-burndown with a
+> throughput target — not a one-shot repair. **Do not start it as written; size it first.**
+>
+> Method note, because it matters for the next person: every EXPLAIN-derived number in this
+> section (mine and the original) is unreliable — the same probe returned no-`DedupExec`,
+> `bounded` and `full-set` for one query inside an hour. The Delta checkpoint is ground truth
+> and costs one object read. Physical object listing is NOT ground truth either: 07-31 lists
+> 124 parquet objects against 82 active, the rest being retention-protected tombstones.
+
+> **Superseded correction (kept for the reasoning): the "do NOT drain" conclusion below is
+> NOT supported — I over-read an unstable instrument.** Probing single dates directly gave `full-set` for
 > BOTH `2026-07-31` and `2026-07-30` (a date this plan never mentions) while `2026-08-01` was
 > bounded — i.e. the legacy poisoning looks real and possibly wider than 36 files. Minutes
 > later the same single-date probes returned **no `DedupExec` at all**. Same query, same
