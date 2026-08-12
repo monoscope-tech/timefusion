@@ -102,6 +102,25 @@ Verify with the EXPLAIN probe as it drains: 11d should flip to `bounded` when
 07-31 is clean, then chase 128 files → 14-day and 663 → 30-day.
 
 ### 5. Enrichment writes are failing for the whale
+> **The described failure is GONE (measured 2026-08-12, 6h of prod logs).** The plan said to
+> confirm rather than assume; confirmed:
+>
+> | signature | count in 6h |
+> |---|---|
+> | `SortPreservingMergeExec` | **0** |
+> | `full-set` / `mode=full` dedup fallback | **0** |
+> | `Resources exhausted` | 11 — but **all** `ExternalSorter[N]`, none MOR dedup |
+>
+> Zero full-set fallbacks anywhere means the read-side ordering problem this item was about
+> has cleared. What is left is a *different* failure the plan anticipated ("if it survives the
+> repair, it is a separate bug") and it is not the read path at all: `ExternalSorter`
+> allocation failures on the **compaction** side. Track that as its own item; it does not
+> belong to the whale.
+>
+> Not verified: the 07-31 file count and the 11d `bounded` flip. The EXPLAIN probe needs the
+> monoscope-self project id, which is not written down anywhere in these docs — **record it
+> here next time**, since every whale verification step needs it.
+
 monoscope's `UPDATE` dies against the **query** pool with
 `SortPreservingMergeExec` at 15.0 GB of 16.4 GB — unbounded MOR dedup over
 poisoned partitions. Roughly one failure per 90s at peak. Should clear with
