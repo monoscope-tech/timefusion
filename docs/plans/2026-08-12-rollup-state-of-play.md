@@ -110,6 +110,18 @@ what the schema comment warns against. Do not build it.
   0, and an empty range set falls through to a full rebuild. That is the safe
   direction (dedup can drop rows, so an unchanged mask does not prove unchanged
   content) but it means compaction-driven rebuilds will always read as `full`.
+- `rollup_miss_unknown_filter_total` **is dominated by queries that were never
+  candidates, so do not read it as a promotion failure.** 3h of prod logs on
+  2026-08-12: 84 `rollup_promotion_unmatched` events, **none of them Golden
+  Signals** — 48 `attributes___db___system___name IS NOT NULL` (facet `SELECT
+  DISTINCT` discovery), 14 `jsonb_path_exists(to_jsonb(hashes), …)`, 10
+  `Like(Like …)`, 10 `duration IS NOT NULL`, 2 `array_has_all(hashes, …)`. All
+  log-explorer and facet traffic. The counter conflates "a filter we should have
+  matched and didn't" with "never eligible", which is the same defect the dedup
+  counters have; until those are split, a nonzero value means nothing. Two
+  follow-ups: classify never-eligible residuals into their own counter, and drop
+  the WARN to debug when the residual references no declared measure column at
+  all — 84 WARNs in 3h on a hot path will bury the real case when it comes.
 - `rollup_backfill_tick` logs `pool/queued/built/uncertifiable/failed` whenever
   there was work; `rollup_backfill_idle` logs `pool/gated/backoff/covered` when a
   non-empty pool survived nothing. **The backfill is currently queuing nothing at
