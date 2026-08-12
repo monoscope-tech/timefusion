@@ -197,6 +197,14 @@ fn register_identity_udfs(ctx: &SessionContext, role: &str, max_statement_secs: 
         Volatility::Stable,
     ));
     ctx.register_udf(ScalarUDF::from(CurrentSettingUdf::new(max_statement_secs)));
+    // pgAdmin checks replica status on connect; TF is never a standby.
+    ctx.register_udf(create_udf(
+        "pg_is_in_recovery",
+        vec![],
+        DataType::Boolean,
+        Volatility::Stable,
+        Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false))))),
+    ));
     ctx.register_udtf("pg_show_all_settings", Arc::new(PgShowAllSettingsFunction { max_statement_secs }));
 }
 
@@ -269,7 +277,7 @@ impl ScalarUDFImpl for CurrentSettingUdf {
 
 /// Every setting `current_setting()` answers — also the row set of
 /// `pg_show_all_settings()`, so the two can never disagree.
-const COMPATIBILITY_SETTING_NAMES: [&str; 10] = [
+const COMPATIBILITY_SETTING_NAMES: [&str; 15] = [
     "server_version",
     "server_version_num",
     "search_path",
@@ -280,6 +288,11 @@ const COMPATIBILITY_SETTING_NAMES: [&str; 10] = [
     "datestyle",
     "intervalstyle",
     "statement_timeout",
+    "bytea_output",
+    "client_min_messages",
+    "integer_datetimes",
+    "default_transaction_read_only",
+    "in_hot_standby",
 ];
 
 fn compatibility_setting(name: &str, max_statement_secs: u64) -> Option<String> {
@@ -287,11 +300,14 @@ fn compatibility_setting(name: &str, max_statement_secs: u64) -> Option<String> 
         "server_version" => PG_COMPAT_VERSION.to_string(),
         "server_version_num" => PG_COMPAT_VERSION_NUM.to_string(),
         "search_path" => PG_COMPAT_SCHEMA.to_string(),
-        "is_superuser" | "standard_conforming_strings" => "on".to_string(),
+        "is_superuser" | "standard_conforming_strings" | "integer_datetimes" => "on".to_string(),
+        "default_transaction_read_only" | "in_hot_standby" => "off".to_string(),
         "client_encoding" => "UTF8".to_string(),
         "timezone" => "UTC".to_string(),
         "datestyle" => "ISO, MDY".to_string(),
         "intervalstyle" => "postgres".to_string(),
+        "bytea_output" => "hex".to_string(),
+        "client_min_messages" => "notice".to_string(),
         "statement_timeout" => (max_statement_secs * 1_000).to_string(),
         _ => return None,
     })
@@ -408,6 +424,20 @@ mod tests {
         let all = ctx.sql("SELECT * FROM pg_show_all_settings()").await.unwrap().collect().await.unwrap();
         assert_eq!(all[0].num_rows(), COMPATIBILITY_SETTING_NAMES.len());
         assert_eq!(all[0].num_columns(), 17);
+    }
+
+    /// Every name in the row set must actually resolve, or the table function
+    /// silently drops it and `current_setting()` still errors on it.
+    #[tokio::test]
+    async fn pgadmin_connect_probes_all_resolve() {
+        let ctx = SessionContext::new();
+        register_identity_udfs(&ctx, "operator", 60);
+        for name in COMPATIBILITY_SETTING_NAMES {
+            assert!(compatibility_setting(name, 60).is_some(), "{name} is listed but unresolvable");
+        }
+        let batches = ctx.sql("SELECT current_setting('bytea_output'), pg_is_in_recovery()").await.unwrap().collect().await.unwrap();
+        assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "hex");
+        assert!(!batches[0].column(1).as_boolean().value(0));
     }
 
     #[tokio::test]
