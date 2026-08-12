@@ -1030,6 +1030,9 @@ const_default!(d_tantivy_max_index_mb: u64 = 64);
 // query has opened recently, and every eviction costs a blob re-download on
 // the next hit. 4 GB — the value this knob carried while it was dead code,
 // enforced by nothing — would thrash the hot window at prod scale.
+// Measured on prod 2026-08-12: 65 GB across 6499 leaf index dirs (~10 MB each),
+// so 64 sits right at the live working set — the reaper trims rather than
+// evicting the hot window on its first pass.
 const_default!(d_tantivy_cache_disk_gb: u64 = 64);
 const_default!(d_tantivy_cache_reap_schedule: String = "0 */10 * * * *");
 // Level 3: index packing is on the flush hot path; level 19 cost ~88% of a CPU
