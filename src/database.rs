@@ -9182,8 +9182,7 @@ impl Database {
         work.sort_by(|(da, pa, _), (db, pb, _)| db.cmp(da).then_with(|| pa.cmp(pb)));
         let total_work = work.len();
         work.rotate_left(sweep_resume_offset(total_work, self.dedup_sweep_cursor.load(std::sync::atomic::Ordering::Relaxed)));
-        let mut swept = 0usize;
-        for (date, pid, cur_files) in &work {
+        for (swept, (date, pid, cur_files)) in work.iter().enumerate() {
             let (date, pid) = (*date, pid);
             // Bail promptly on shutdown — a mid-sweep tick must not run
             // against a closing Foyer cache and hang the graceful drain.
@@ -9196,7 +9195,6 @@ impl Database {
                 info!(table_name, swept, remaining = total_work - swept, event = "dedup_sweep_truncated");
                 break;
             }
-            swept += 1;
             // Incremental skip: a partition already certified clean whose live
             // file set is unchanged since that pass can't have gained dupes —
             // they only arrive in NEW files. Skip the whole-partition probe,
@@ -9240,7 +9238,7 @@ impl Database {
                     // Any concurrent commit (flush/compaction) changes
                     // the set → don't mark; a >0 pass marks nothing (the
                     // NEXT 0-drop pass confirms the rewrite held).
-                    let certified = self.record_certification(table_ref, table_name, pid, date, &cur_files, (d, complete)).await?;
+                    let certified = self.record_certification(table_ref, table_name, pid, date, cur_files, (d, complete)).await?;
                     if let Some(fp_post) = certified {
                         // Rollup buckets are built HERE and nowhere else: a
                         // bucket computed over a bin that is later deduped is
