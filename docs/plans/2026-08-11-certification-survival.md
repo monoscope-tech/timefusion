@@ -1,5 +1,22 @@
 # Making dedup certification survive — measure before you build
 
+> **CLOSED 2026-08-12.** Not by the 24h measurement this plan asked for — by reading the code
+> the measurement was going to describe. **The sweep can only certify today and yesterday**
+> (`src/database.rs:9037`, `dates = (0..=timefusion_dedup_lookback_days).rev()`, default 1),
+> while dashboards query 7–30 days. Every partition older than yesterday is `NeverCertified`
+> **by construction**, so `never_certified_pct = 100` was never a warm-up artifact and no
+> amount of waiting would have moved it.
+>
+> That makes this plan's premise wrong in the way its own second read suspected: nothing is
+> expiring (`cert_dwell_total = 0`, `dedup_denied_fp_moved = 0` on three independent reads),
+> so there is nothing for *survival* to save. Persistence and the confirming-pass fix are
+> still correct and still cheap — leave them on — they are simply not where the missing 99.5%
+> is. Successor: **[2026-08-12-dedup-certification-coverage.md](2026-08-12-dedup-certification-coverage.md)**.
+>
+> Third read (2026-08-12, young process, 84 scans): `cert_granted_total` 0, `cert_dwell_total`
+> 0, `dedup_denied_fp_moved` 0, `never_certified_pct` 100.0, `dedup_skipped_pct` 0.0. Same
+> shape as both 08-11 reads. Kept below for the reasoning, not the instructions.
+
 **Status:** **Phase 0 and Phase 1 are built and both are ON.** The remaining work is to read
 the measurement — see "Reading Phase 0" — but the question it answers has changed shape, for
 the better.
