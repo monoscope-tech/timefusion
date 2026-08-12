@@ -1297,7 +1297,10 @@ mod tests {
     fn a_filter_carrying_tantivy_hints_matches_the_same_filter_without_them() {
         use datafusion::logical_expr::{col, lit};
         let text_match = |args: Vec<datafusion::logical_expr::Expr>| {
-            datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(crate::tantivy_index::udf::text_match_udf().into(), args))
+            datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                crate::tantivy_index::udf::text_match_udf().into(),
+                args,
+            ))
         };
         let base = col("kind").eq(lit("server")).or(col("name").eq(lit("monoscope.http")));
         // What the declared measure filter canonicalizes to (one hint).
