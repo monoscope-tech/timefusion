@@ -49,21 +49,35 @@ What has been ruled out:
 - Not the canonical string's Arrow type (`Utf8` vs `Utf8View`) — fixed in
   `da6aa3b`, necessary but not sufficient.
 - Not the log level: prod runs `RUST_LOG=info`, so the `rollup_promotion_unmatched`
-  warn would print. It never has.
+  warn prints. Once `cb04661` deployed it fired within minutes.
 
-That last point is the live lead. If the warn never fires, the decline happens
-**before** the promotion is attempted — which leaves the measure-filter probe
-(`measure_filters`) as the prime suspect. All three of its failure paths used to
-discard the error via `map_err(|_| UnknownFilter)`; `cb04661` makes them log. A
-probe failure disqualifies every filtered measure at once, which is exactly the
-observed shape.
+**What the deployed log actually said (2026-08-12 12:33Z).** Two things, and the
+prime suspect was wrong:
 
-One concrete asymmetry to check first: the prod optimizer rewrites `kind='server'`
-into `kind='server' AND text_match(kind,'server')` (tantivy pushdown, visible in
-`EXPLAIN`). Both sides are optimized, so they *should* still agree — but no bare
-test session registers that rule, so no test can see it. Read
-`rollup_measure_probe_failed` / `rollup_measure_probe_unwalkable` before
-theorising further.
+1. **`measure_filters` is healthy in prod — zero `rollup_measure_probe_*` events.**
+   Every declared measure resolves. That eliminates the probe as the cause.
+2. **Every conjunct was printed TWICE, on both sides** — `server_request_count`
+   came out as `(kind=... OR name=... OR name=...) AND (kind=... OR name=... OR
+   name=...)`. The optimizer leaves a predicate on the Filter node *and* re-pushes
+   it into the TableScan's `partial_filters`, so `source_and_filters` collects
+   both copies. `canonical_and` sorted (order-independent) but did not dedupe
+   (not multiplicity-independent). Both sides duplicated equally, so the
+   comparison still succeeded — by accident, not by construction. Fixed in
+   `6f0ce46`; `AND` is idempotent, so dedupe after the sort.
+
+That duplication is the **leading hypothesis** for the Golden Signals miss: no
+test session registers the tantivy pushdown rule, so nothing in a test ever
+duplicates a conjunct, and no test can observe an asymmetry that exists only on a
+real session. The log also confirms the rewrite is real — declared filters carry
+`text_match(kind, "server")` and `text_match(status_code, "ERROR")` alongside the
+equality.
+
+**Still unconfirmed:** no Golden Signals query has been observed since the fix
+deployed. The two promotion declines captured so far were a `SELECT DISTINCT
+attributes___db___system___name ... IS NOT NULL` probe — a genuinely
+non-dimension predicate, correctly refused. Confirm by watching for a
+`rollup_promotion_unmatched` whose `promoted=` field mentions `kind`, or for
+`rollup_hits_*` moving off zero.
 
 ---
 
@@ -114,7 +128,9 @@ boot emitting **1.6M** `Too many open files` lines and **refusing pgwire
 connections** (`Error accept socket`), which also pushed every other log line out
 of the ring buffer — including the rollup diagnostics this session needed.
 
-`cb04661` raises the soft limit to the hard limit at boot, in `main()` before the
+`cb04661` raises the soft limit to the hard limit at boot. **Verified in prod on
+e8f7f98: 1024 -> 524288.** (Check the TF process, not the container's main PID —
+that is `docker-init`, whose limits are still 1024 and will fool you.) It raises, in `main()` before the
 runtime is built and in `bootstrap()` for the e2e harness (which does not go
 through `main`). It has to be in-process: CapRover rewrites the service config on
 every deploy, so an out-of-band ulimit does not survive.
