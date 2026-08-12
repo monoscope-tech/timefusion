@@ -1076,7 +1076,16 @@ async fn route_with_spec(
     let (mut lo, mut hi) = (None, None);
     let mut row_filters = Vec::new();
     let mut promotable: Vec<&Expr> = Vec::new();
-    for term in predicates.iter().flat_map(split_conjunction) {
+    // Strip tantivy hints BEFORE classifying, for the same reason `canonical`
+    // strips them: they are accelerators the rewriter adds beside a predicate it
+    // never removes. Here the stakes are higher than a cosmetic mismatch — a
+    // hint on `kind` is orphaned into `promotable` once `kind = 'server'` itself
+    // is consumed as a dimension filter, so the promoted filter carries a term
+    // no declared measure can ever have and an otherwise routable panel is
+    // refused. Observed in prod 2026-08-12.
+    let mut terms: Vec<&Expr> = predicates.iter().flat_map(split_conjunction).collect();
+    strip_index_hints(&mut terms);
+    for term in terms {
         if narrow_timestamp(term, &mut lo, &mut hi)? {
             continue;
         }
@@ -1283,6 +1292,25 @@ mod tests {
 
     fn spec() -> RollupSpec {
         crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
+    }
+
+    /// A hint whose own predicate was consumed as a DIMENSION filter must not be
+    /// left behind in the promotable set. Prod 2026-08-12 showed exactly this:
+    /// `kind = 'server'` routed as a dimension filter while
+    /// `text_match(kind,"server")` stayed as a residual, so the promoted filter
+    /// carried a term no declared measure could ever have.
+    #[tokio::test]
+    async fn a_hint_beside_a_dimension_filter_does_not_become_a_residual() {
+        let state = session().await;
+        let hinted = format!(
+            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND kind = 'server' AND text_match(kind, 'server') \
+             AND timestamp >= to_timestamp_micros(1786500000000000) AND timestamp < to_timestamp_micros(1786530000000000) \
+             GROUP BY resource___service___name"
+        );
+        let plain = hinted.replace(" AND text_match(kind, 'server')", "");
+        let (with, without) = (route_for(&state, &hinted).await, route_for(&state, &plain).await);
+        assert!(without.is_ok(), "the un-hinted control must route: {without:?}");
+        assert_eq!(with.is_ok(), without.is_ok(), "a hint must not change whether the query routes: {with:?}");
     }
 
     /// The Golden Signals miss, reproduced exactly as prod produced it.
