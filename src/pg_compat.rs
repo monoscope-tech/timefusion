@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::{
         array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StringBuilder},
-        datatypes::{DataType, Field, Schema, SchemaRef},
+        datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     },
-    catalog::{MemTable, TableFunctionImpl, TableProvider},
+    catalog::{MemTable, SchemaProvider, TableFunctionImpl, TableProvider},
     common::ToDFSchema,
+    datasource::empty::EmptyTable,
     error::{DataFusionError, Result as DFResult},
     execution::context::SessionContext,
     logical_expr::{
@@ -75,7 +76,101 @@ impl PgCatalogContextProvider for PgCatalogContext {
 pub fn setup_catalog(ctx: &SessionContext, role: &str, max_statement_secs: u64) -> DFResult<()> {
     setup_pg_catalog(ctx, "datafusion", PgCatalogContext::new(role)).map_err(|err| *err)?;
     register_identity_udfs(ctx, role, max_statement_secs);
+    overlay_runtime_stat_views(ctx)
+}
+
+/// The runtime-statistics views pgAdmin's dashboard polls. TF keeps no session,
+/// lock or replication registry, so these are honestly empty — but they must
+/// *exist*, or every dashboard refresh raises a planning error.
+///
+/// Column shapes follow PostgreSQL 16. `oid`/`xid` map to UInt32, `name`/`inet`/
+/// `pg_lsn`/`interval` to Utf8, matching how the pg_catalog crate types its own.
+const RUNTIME_STAT_VIEWS: [(&str, &str); 6] = [
+    (
+        "pg_stat_activity",
+        "datid:oid,datname:text,pid:i4,leader_pid:i4,usesysid:oid,usename:text,application_name:text,client_addr:text,client_hostname:text,\
+         client_port:i4,backend_start:ts,xact_start:ts,query_start:ts,state_change:ts,wait_event_type:text,wait_event:text,state:text,\
+         backend_xid:oid,backend_xmin:oid,query_id:i8,query:text,backend_type:text",
+    ),
+    (
+        "pg_stat_database",
+        "datid:oid,datname:text,numbackends:i4,xact_commit:i8,xact_rollback:i8,blks_read:i8,blks_hit:i8,tup_returned:i8,tup_fetched:i8,\
+         tup_inserted:i8,tup_updated:i8,tup_deleted:i8,conflicts:i8,temp_files:i8,temp_bytes:i8,deadlocks:i8,checksum_failures:i8,\
+         checksum_last_failure:ts,blk_read_time:f8,blk_write_time:f8,session_time:f8,active_time:f8,idle_in_transaction_time:f8,sessions:i8,\
+         sessions_abandoned:i8,sessions_fatal:i8,sessions_killed:i8,stats_reset:ts",
+    ),
+    (
+        "pg_locks",
+        "locktype:text,database:oid,relation:oid,page:i4,tuple:i2,virtualxid:text,transactionid:oid,classid:oid,objid:oid,objsubid:i2,\
+         virtualtransaction:text,pid:i4,mode:text,granted:bool,fastpath:bool,waitstart:ts",
+    ),
+    ("pg_prepared_xacts", "transaction:oid,gid:text,prepared:ts,owner:text,database:text"),
+    (
+        "pg_stat_replication",
+        "pid:i4,usesysid:oid,usename:text,application_name:text,client_addr:text,client_hostname:text,client_port:i4,backend_start:ts,\
+         backend_xmin:oid,state:text,sent_lsn:text,write_lsn:text,flush_lsn:text,replay_lsn:text,write_lag:text,flush_lag:text,replay_lag:text,\
+         sync_priority:i4,sync_state:text,reply_time:ts",
+    ),
+    ("pg_available_extensions", "name:text,default_version:text,installed_version:text,comment:text"),
+];
+
+fn overlay_runtime_stat_views(ctx: &SessionContext) -> DFResult<()> {
+    let catalog = ctx.catalog("datafusion").ok_or_else(|| DataFusionError::Internal("catalog 'datafusion' missing after pg_catalog setup".to_string()))?;
+    let inner = catalog.schema("pg_catalog").ok_or_else(|| DataFusionError::Internal("schema 'pg_catalog' missing after setup".to_string()))?;
+    let extra = RUNTIME_STAT_VIEWS.iter().map(|(name, spec)| Ok((*name, empty_pg_table(spec)?))).collect::<DFResult<HashMap<_, _>>>()?;
+    catalog.register_schema("pg_catalog", Arc::new(PgCatalogOverlay { inner, extra }))?;
     Ok(())
+}
+
+fn empty_pg_table(spec: &str) -> DFResult<Arc<dyn TableProvider>> {
+    let fields = spec
+        .split(',')
+        .map(|column| {
+            let (name, code) = column.trim().split_once(':').ok_or_else(|| DataFusionError::Internal(format!("malformed column spec {column:?}")))?;
+            let data_type = match code {
+                "oid" => DataType::UInt32,
+                "i2" => DataType::Int16,
+                "i4" => DataType::Int32,
+                "i8" => DataType::Int64,
+                "f8" => DataType::Float64,
+                "bool" => DataType::Boolean,
+                "ts" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "text" => DataType::Utf8,
+                other => return Err(DataFusionError::Internal(format!("unknown column type code {other:?}"))),
+            };
+            Ok(Field::new(name, data_type, true))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    Ok(Arc::new(EmptyTable::new(Arc::new(Schema::new(fields)))))
+}
+
+/// Delegates to the pg_catalog crate's schema provider, adding tables it does
+/// not ship. It hardcodes its table list and does not implement
+/// `register_table`, so wrapping is the only way to extend it from here.
+#[derive(Debug)]
+struct PgCatalogOverlay {
+    inner: Arc<dyn SchemaProvider>,
+    extra: HashMap<&'static str, Arc<dyn TableProvider>>,
+}
+
+#[async_trait]
+impl SchemaProvider for PgCatalogOverlay {
+    fn table_names(&self) -> Vec<String> {
+        let mut names = self.inner.table_names();
+        names.extend(self.extra.keys().map(ToString::to_string));
+        names
+    }
+
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        match self.extra.get(name.to_ascii_lowercase().as_str()) {
+            Some(table) => Ok(Some(Arc::clone(table))),
+            None => self.inner.table(name).await,
+        }
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.extra.contains_key(name.to_ascii_lowercase().as_str()) || self.inner.table_exist(name)
+    }
 }
 
 pub fn effective_statement_timeout(client_timeout: Option<Duration>, max_statement_secs: u64) -> Option<Duration> {
@@ -424,6 +519,23 @@ mod tests {
         let all = ctx.sql("SELECT * FROM pg_show_all_settings()").await.unwrap().collect().await.unwrap();
         assert_eq!(all[0].num_rows(), COMPATIBILITY_SETTING_NAMES.len());
         assert_eq!(all[0].num_columns(), 17);
+    }
+
+    /// pgAdmin's dashboard polls these on a timer; a missing one is a planning
+    /// error on every refresh. Overlaying is load-bearing — the pg_catalog crate
+    /// hardcodes its table list, so a silent overlay regression looks like this.
+    #[tokio::test]
+    async fn runtime_stat_views_are_queryable_and_empty() {
+        let ctx = SessionContext::new();
+        setup_catalog(&ctx, "operator", 60).unwrap();
+        for (name, spec) in RUNTIME_STAT_VIEWS {
+            let plan = ctx.sql(&format!("SELECT * FROM pg_catalog.{name}")).await.unwrap();
+            assert_eq!(plan.schema().fields().len(), spec.split(',').count(), "{name} column count drifted from its spec");
+            let batches = plan.collect().await.unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0, "{name} should be empty");
+        }
+        // The overlay must not shadow what the crate already provides.
+        ctx.sql("SELECT oid FROM pg_catalog.pg_database LIMIT 1").await.unwrap().collect().await.unwrap();
     }
 
     /// Every name in the row set must actually resolve, or the table function

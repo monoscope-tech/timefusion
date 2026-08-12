@@ -94,3 +94,52 @@ query I
 SELECT array_upper(ARRAY['a', 'b', 'c']::text[], 1)
 ----
 3
+
+# pgAdmin's connect probes and dashboard polls. Unqualified names here on
+# purpose: that is how pgAdmin issues them, and it is the resolution path a
+# bare SessionContext (which searches `public`) cannot exercise.
+
+query T
+SELECT setting FROM pg_show_all_settings() WHERE name = 'server_version'
+----
+16.6
+
+query T
+SELECT current_setting('bytea_output')
+----
+hex
+
+query B
+SELECT pg_is_in_recovery()
+----
+false
+
+query I
+SELECT count(*) FROM pg_stat_activity
+----
+0
+
+query I
+SELECT count(*) FROM pg_stat_database
+----
+0
+
+query I
+SELECT count(*) FROM pg_locks
+----
+0
+
+query I
+SELECT count(*) FROM pg_prepared_xacts
+----
+0
+
+query I
+SELECT count(*) FROM pg_stat_replication
+----
+0
+
+query I
+SELECT count(*) FROM pg_available_extensions
+----
+0
