@@ -126,6 +126,14 @@ pause and accumulate not-ready tasks rather than rolling back).
 
 ## P1 — finish the whale
 
+> **§4 below is superseded by
+> [2026-08-12-whale-backlog-burndown.md](2026-08-12-whale-backlog-burndown.md).** Measured from
+> the Delta checkpoint rather than EXPLAIN: the job is 1038 active files / 751 GB across
+> 07-20 … 08-02, of which 1011 are under the 1 GiB repair cap. At the ~13 min/bin rate this
+> plan itself observed, that is ~220 hours of repair — a burndown with a rate target, not the
+> ~8-hour drain budgeted here. **Do not start it as written.**
+
+
 ### 4. Drain 07-31 (36 files)
 > **Measured 2026-08-12. The whale is `87576849-4941-49d3-a15d-680fef88a1a8` — project
 > "past3", i.e. monoscope-self.** Recording the id here because every verification step needs
