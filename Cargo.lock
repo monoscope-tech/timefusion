@@ -8391,6 +8391,7 @@ dependencies = [
  "include_dir",
  "insta",
  "instrumented-object-store",
+ "libc",
  "log",
  "lru 0.16.3",
  "memmap2",
