@@ -604,6 +604,11 @@ atomic_stats! {
     light_optimize_projects_completed,
     light_optimize_bins_committed,
     light_optimize_waves_committed,
+    /// GAUGE: repair bins sorting right now. A repair pass runs for up to
+    /// `timefusion_footer_repair_budget_secs` and logs nothing between its
+    /// per-bin events, so this is the only cheap way to tell "repair is
+    /// grinding" from "repair is wedged" without SSH.
+    repair_bins_in_flight,
     /// Dedup-engine waves (data_change: true) — counted separately so the
     /// light_optimize_* counters mean pure compaction only.
     dedup_bins_committed,

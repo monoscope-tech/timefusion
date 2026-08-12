@@ -319,6 +319,7 @@ impl StatsTableProvider {
             "light_optimize_projects_completed_total" => m.light_optimize_projects_completed,
             "light_optimize_bins_committed_total" => m.light_optimize_bins_committed,
             "light_optimize_waves_committed_total" => m.light_optimize_waves_committed,
+            "repair_bins_in_flight" => m.repair_bins_in_flight,
             "dedup_bins_committed_total" => m.dedup_bins_committed,
             "dedup_waves_committed_total" => m.dedup_waves_committed,
             "light_optimize_wal_yields_total" => m.light_optimize_wal_yields,

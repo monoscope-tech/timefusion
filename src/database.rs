@@ -2050,6 +2050,11 @@ pub struct Database {
     /// in 25 min with zero OCC conflicts). Separate pool ⇒ today's
     /// compaction always has its reserve; total budget stays constant.
     light_optimize_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Footer repair's slice, disjoint from packing's above. Same argument one
+    /// level down: repair sorts whole multi-hundred-MB files for minutes, and
+    /// sharing packing's pool meant packing had to be stopped outright for the
+    /// duration (see `pack_pool_bytes`).
+    repair_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Flush-path sort pool, for buckets too large for the in-process sort.
     /// Its own slice, not maintenance's: flush is on the INGEST path and must
     /// not queue behind a Z-order holding the maintenance pool for minutes.
@@ -2387,14 +2392,11 @@ pub struct Database {
     /// this so an overloaded box degrades to "every project within k ticks"
     /// instead of forever re-serving the same debt-ordered prefix.
     light_optimize_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// Repair bins currently sorting. Packing shares the light pool with them
-    /// and is sized as if every sort fitted `PER_SORT_BUDGET_BYTES` (4 GiB); a
-    /// whale footer-repair sort measured **14.4 GB** of the 15.4 GB pool
-    /// (`ExternalSorter` 7.4 GB + its unspillable `ExternalSorterMerge` 7.0 GB,
-    /// prod 2026-08-11 09:15). Three concurrent packing bins then held ~0.9 GB
-    /// and the next 162.8 MB ask died with 139.1 MB left — killing the repair
-    /// bin, not the packing one. See `light_optimize_brake`.
-    repair_bins_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Where the last deadline-truncated dedup sweep stopped, as a count of
+    /// (date, project) items served. Same role as `light_optimize_cursor`: the
+    /// sweep is bigger than one tick, so without rotation the tail of the work
+    /// list is never reached.
+    dedup_sweep_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// One repair pass at a time, PROCESS-WIDE.
     ///
     /// `round_robin_bins` already serialises repair within a table (concurrency
@@ -2753,6 +2755,7 @@ impl Database {
             runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            repair_runtime_env: Arc::new(std::sync::OnceLock::new()),
             flush_sort_gate: Arc::new(tokio::sync::Semaphore::new(flush_sort_permits)),
             flush_sort_runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
@@ -2813,7 +2816,7 @@ impl Database {
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            repair_bins_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
@@ -3434,6 +3437,14 @@ impl Database {
                         return;
                     };
                     info!("Running scheduled dedup on sealed partitions");
+                    // ONE budget for the whole pass, shared across tables. The
+                    // pass holds `maintenance_job_sem`, so overrunning the
+                    // period does not just delay itself — it skips every later
+                    // tick, and with it the dirty-bin drain (prod 2026-08-12:
+                    // 55+ minutes on a 5-minute schedule, 10 consecutive skips,
+                    // zero bins committed).
+                    let sweep_deadline =
+                        std::time::Instant::now() + db.config.derived.tick_budget(cron_period(&db.config.maintenance.timefusion_dedup_schedule));
                     for (project_id, table_name, table) in db.all_tables().await {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
@@ -3441,7 +3452,7 @@ impl Database {
                         // Dedup key: bare table name for unified tables, tenant-scoped
                         // for custom-storage ones (they are separate Delta logs).
                         let key = if project_id.is_empty() { table_name.clone() } else { format!("{project_id}:{table_name}") };
-                        db.run_dedup_for_table(&table, &table_name, &key, &Self::table_label(&project_id, &table_name)).await;
+                        db.run_dedup_for_table(&table, &table_name, &key, &Self::table_label(&project_id, &table_name), sweep_deadline).await;
                     }
                 }
             }
@@ -5052,6 +5063,37 @@ impl Database {
         (pool / 3 * self.config.derived.max_light_optimize_k()).min(pool * 3 / 4)
     }
 
+    /// Packing's OWN slice of the light share, so a repair sort cannot starve it.
+    ///
+    /// The two passes used to share one pool, which forced the crudest possible
+    /// interlock: `light_optimize_brake` STOPPED packing outright for as long as
+    /// any repair bin was in flight. With an 8640s repair budget on a 3600s
+    /// period (and a startup pass 3 minutes after every boot) that condition is
+    /// effectively always true — prod 2026-08-12 21:54-22:50 planned 193 packing
+    /// projects and completed ONE, every tick pausing at round 0 on
+    /// `repair_holds_light_pool` in under a millisecond. Ingest keeps making
+    /// small files the whole time, so packing debt only grows.
+    ///
+    /// Sizing is packing's MEASURED cost, not a share: a packing bin is a
+    /// handful of small files with a shallow merge and peaks 1.3-1.5 GB
+    /// (2026-08-11), so `k` bins fit in `k * PACK_BIN_BUDGET_BYTES`. Repair
+    /// keeps the rest — it is the pass with the genuinely large sorts.
+    fn pack_pool_bytes(&self) -> usize {
+        /// 2 GiB against a measured 1.3-1.5 GB peak per packing bin.
+        const PACK_BIN_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+        let light = self.light_optimize_pool_bytes();
+        (self.config.derived.max_light_optimize_k() * PACK_BIN_BUDGET_BYTES).min(light / 2).max(1)
+    }
+
+    /// Repair's slice: the light share minus packing's reservation. Still far
+    /// above the unspillable `REPAIR_SORT_PARTITIONS * REPAIR_SORT_RESERVATION_BYTES`
+    /// merge share, and the partition ladder handles the rest. A repair sort
+    /// peaked 14.3 GB of a 15.4 GB pool, but that is a spilling sort taking what
+    /// it is offered, not what it needs — it spills either way.
+    fn repair_pool_bytes(&self) -> usize {
+        self.light_optimize_pool_bytes() - self.pack_pool_bytes()
+    }
+
     /// Heavy maintenance (dedup, recompress, Z-order): the budget left after
     /// the light-optimize slice.
     fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
@@ -5060,9 +5102,14 @@ impl Database {
             .clone()
     }
 
-    /// Hot-tail light optimize: the reserved slice (see field doc).
+    /// Hot-tail PACKING: the reserved slice (see field doc).
     fn light_optimize_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
-        self.light_optimize_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.light_optimize_pool_bytes(), "light_optimize_spill")).clone()
+        self.light_optimize_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.pack_pool_bytes(), "light_optimize_spill")).clone()
+    }
+
+    /// Footer REPAIR: its own pool, disjoint from packing's (see `pack_pool_bytes`).
+    fn repair_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+        self.repair_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.repair_pool_bytes(), "repair_spill")).clone()
     }
 
     /// Sort one flush group, picking the strategy by size.
@@ -5234,7 +5281,7 @@ impl Database {
             .clone()
     }
 
-    /// Same pool as packing, deliberately SMALLER batches.
+    /// Its OWN pool (see `repair_pool_bytes`), deliberately SMALLER batches.
     ///
     /// A repair bin is one whole file — prod's worst is 1,088,634,971 bytes,
     /// which decodes to tens of GB of Arrow, spills many times, and then merges
@@ -5259,12 +5306,7 @@ impl Database {
         self.repair_session_states
             .entry(partitions)
             .or_insert_with(|| {
-                build_optimize_session_state_tuned(
-                    self.config.memory.timefusion_query_partitions,
-                    self.light_optimize_runtime_env(),
-                    Some("256"),
-                    Some(partitions),
-                )
+                build_optimize_session_state_tuned(self.config.memory.timefusion_query_partitions, self.repair_runtime_env(), Some("256"), Some(partitions))
             })
             .clone()
     }
@@ -8746,15 +8788,8 @@ impl Database {
             fresh
         });
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        if candidates.is_empty() {
-            // Logged even when the pool itself was empty, because that is the
-            // case with no other evidence anywhere. `partition_fingerprints`
-            // returns an EMPTY map when the table has no `num_records` stats —
-            // safe for the read path (it just forces a raw scan) but silently
-            // fatal here, since the backfill builds its entire candidate list
-            // from those keys. Prod 2026-08-12 ran ticks for 40 minutes with
-            // sealed days uncovered and printed nothing at all.
-            info!(source, partitions = fingerprints.len(), pool, gated, backoff, covered, event = "rollup_backfill_idle", "the backfill queued nothing");
+        if pool > 0 && candidates.is_empty() {
+            info!(source, pool, gated, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
         }
 
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
@@ -9038,6 +9073,26 @@ impl Database {
     /// last sweep, and skips partitions in failure backoff. Best-effort:
     /// per-partition errors are logged and back the partition off.
     pub async fn dedup_today_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str) -> Result<()> {
+        self.dedup_sweep(table_ref, table_name, dedup_key, None).await
+    }
+
+    /// `dedup_today_partitions` with a wall-clock bound on the tick.
+    ///
+    /// The sweep is O(dates × projects) and every item is real IO — a partition
+    /// probe, or (on the fingerprint-skip path) a rollup coverage lookup. At 193
+    /// projects that is ~386 items, and prod 2026-08-12 measured ~8.5s each: the
+    /// pass ran **55+ minutes** on a 5-minute schedule, logging nothing between
+    /// its first and last line. It holds `maintenance_job_sem` throughout, so
+    /// every subsequent tick was skipped ("Dedup job run still in progress after
+    /// 600s", 10 consecutive) and the dirty-bin drain — the part that actually
+    /// collapses duplicates — ran ~once an hour instead of twelve times.
+    ///
+    /// A `needs_rollup_retry` table can't use the version-skip at the top, so
+    /// the whole list is re-walked every tick; without a deadline the pass has
+    /// no way to end early. Truncation is safe: every item is independent and
+    /// idempotent, and the cursor rotates so the next tick starts where this one
+    /// stopped rather than re-serving the same prefix forever.
+    async fn dedup_sweep(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, deadline: Option<std::time::Instant>) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
             return Ok(());
@@ -9059,6 +9114,10 @@ impl Database {
 
         let mut total_dropped = 0u64;
         let mut any_ok = false;
+        // One (date, project) work list, so the deadline can cut the pass at any
+        // point and the cursor can resume there. The old nested loops iterated a
+        // HashSet, so the order was not even stable between ticks.
+        let mut work: Vec<(chrono::NaiveDate, String, Vec<String>)> = Vec::new();
         for date in dates {
             let date_marker = format!("date={}", date);
             // Per-project live file lists for this date. Custom-project tables
@@ -9067,27 +9126,43 @@ impl Database {
                 let table = table_ref.read().await;
                 Self::partition_files_by_pid(&table, &date_marker)?
             };
-            let project_ids: std::collections::HashSet<String> =
-                if files_by_pid.is_empty() { std::iter::once("default".to_string()).collect() } else { files_by_pid.keys().cloned().collect() };
-            for pid in &project_ids {
-                // Bail promptly on shutdown — a mid-sweep tick must not run
-                // against a closing Foyer cache and hang the graceful drain.
-                if self.maintenance_shutdown.is_cancelled() {
-                    debug!("dedup sweep: shutdown requested, aborting table={}", table_name);
-                    return Ok(());
-                }
-                // Incremental skip: a partition already certified clean whose live
-                // file set is unchanged since that pass can't have gained dupes —
-                // they only arrive in NEW files. Skip the whole-partition probe,
-                // keeping the sweep O(partitions-changed). The version guard above
-                // only fires when the WHOLE table is unchanged, which never holds
-                // under continuous ingest; this per-partition check does (sealed
-                // lookback days, and today between flushes).
-                let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
-                let cur_files = files_by_pid.get(pid).cloned().unwrap_or_default();
-                let current_fp = partition_file_fp(cur_files.clone());
-                if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().fp) == Some(current_fp) {
-                    if self.config.maintenance.rollup_build_enabled_for(pid)
+            match files_by_pid.is_empty() {
+                true => work.push((date, "default".to_string(), Vec::new())),
+                false => work.extend(files_by_pid.into_iter().map(|(pid, files)| (date, pid, files))),
+            }
+        }
+        // Stable order, then rotate: a truncated tick must not re-serve the same
+        // prefix on the next one (the starvation `light_optimize_cursor` fixes
+        // for packing).
+        work.sort_by(|(da, pa, _), (db, pb, _)| db.cmp(da).then_with(|| pa.cmp(pb)));
+        let total_work = work.len();
+        work.rotate_left(sweep_resume_offset(total_work, self.dedup_sweep_cursor.load(std::sync::atomic::Ordering::Relaxed)));
+        let mut swept = 0usize;
+        for (date, pid, cur_files) in &work {
+            let (date, pid) = (*date, pid);
+            // Bail promptly on shutdown — a mid-sweep tick must not run
+            // against a closing Foyer cache and hang the graceful drain.
+            if self.maintenance_shutdown.is_cancelled() {
+                debug!("dedup sweep: shutdown requested, aborting table={}", table_name);
+                return Ok(());
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                self.dedup_sweep_cursor.fetch_add(swept, std::sync::atomic::Ordering::Relaxed);
+                info!(table_name, swept, remaining = total_work - swept, event = "dedup_sweep_truncated");
+                break;
+            }
+            swept += 1;
+            // Incremental skip: a partition already certified clean whose live
+            // file set is unchanged since that pass can't have gained dupes —
+            // they only arrive in NEW files. Skip the whole-partition probe,
+            // keeping the sweep O(partitions-changed). The version guard above
+            // only fires when the WHOLE table is unchanged, which never holds
+            // under continuous ingest; this per-partition check does (sealed
+            // lookback days, and today between flushes).
+            let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
+            let current_fp = partition_file_fp(cur_files.clone());
+            if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().fp) == Some(current_fp) {
+                if self.config.maintenance.rollup_build_enabled_for(pid)
                         && self.rollup_retry_allowed(pid, table_name, &date.to_string())
                         && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
                         // Coverage is keyed on DATA identity, not on this file
@@ -9095,73 +9170,72 @@ impl Database {
                         // every partition stale and rebuild it on every tick.
                         && !self.rollup_coverage_current(pid, table_name, &date.to_string(), self.rollup_source_fingerprint(pid, table_name, &date.to_string()).await.unwrap_or_default())
                         && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), current_fp).await
-                    {
-                        self.record_rollup_failure(pid, table_name, &date.to_string());
-                        warn!(project_id = pid, date = %date, table_name, %error, "rollup retry failed; leaving the partition on raw scans");
-                    }
-                    continue;
-                }
-                let backoff_key = format!("{dedup_key}:{pid}:{date}");
-                if let Some(entry) = self.dedup_backoff.get(&backoff_key)
-                    && std::time::Instant::now() < entry.value().1
                 {
-                    crate::metrics::record_dedup_chunk_skipped();
-                    debug!("dedup sweep: {} in failure backoff, skipping", backoff_key);
-                    continue;
+                    self.record_rollup_failure(pid, table_name, &date.to_string());
+                    warn!(project_id = pid, date = %date, table_name, %error, "rollup retry failed; leaving the partition on raw scans");
                 }
-                match self.dedup_partition(table_ref, table_name, pid, date).await {
-                    Ok((d, complete)) => {
-                        self.dedup_backoff.remove(&backoff_key);
-                        total_dropped += d;
-                        any_ok = true;
-                        // Clean-partition fingerprint for the read-side dedup
-                        // skip: a 0-drop pass over a file set that is STILL
-                        // the live set proves the partition duplicate-free.
-                        // Any concurrent commit (flush/compaction) changes
-                        // the set → don't mark; a >0 pass marks nothing (the
-                        // NEXT 0-drop pass confirms the rewrite held).
-                        let certified = self.record_certification(table_ref, table_name, pid, date, &cur_files, (d, complete)).await?;
-                        if let Some(fp_post) = certified {
-                            // Rollup buckets are built HERE and nowhere else: a
-                            // bucket computed over a bin that is later deduped is
-                            // simply wrong, so the build trigger is the
-                            // certification signal rather than a timer. The
-                            // rewrite is idempotent (`rollup::bucket_id` is
-                            // deterministic in bucket+dimensions), so re-running
-                            // it for an already-built partition replaces its rows
-                            // instead of doubling every measure.
-                            // Any table that DECLARES rollups gets them rebuilt
-                            // at its certification point — no table name is
-                            // special-cased here any more.
-                            if get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
-                                && self.rollup_retry_allowed(pid, table_name, &date.to_string())
-                                && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), fp_post).await
-                            {
-                                self.record_rollup_failure(pid, table_name, &date.to_string());
-                                warn!(project_id = pid, date = %date, table_name, %error, "rollup build failed; leaving the partition on raw scans");
-                            }
+                continue;
+            }
+            let backoff_key = format!("{dedup_key}:{pid}:{date}");
+            if let Some(entry) = self.dedup_backoff.get(&backoff_key)
+                && std::time::Instant::now() < entry.value().1
+            {
+                crate::metrics::record_dedup_chunk_skipped();
+                debug!("dedup sweep: {} in failure backoff, skipping", backoff_key);
+                continue;
+            }
+            match self.dedup_partition(table_ref, table_name, pid, date).await {
+                Ok((d, complete)) => {
+                    self.dedup_backoff.remove(&backoff_key);
+                    total_dropped += d;
+                    any_ok = true;
+                    // Clean-partition fingerprint for the read-side dedup
+                    // skip: a 0-drop pass over a file set that is STILL
+                    // the live set proves the partition duplicate-free.
+                    // Any concurrent commit (flush/compaction) changes
+                    // the set → don't mark; a >0 pass marks nothing (the
+                    // NEXT 0-drop pass confirms the rewrite held).
+                    let certified = self.record_certification(table_ref, table_name, pid, date, &cur_files, (d, complete)).await?;
+                    if let Some(fp_post) = certified {
+                        // Rollup buckets are built HERE and nowhere else: a
+                        // bucket computed over a bin that is later deduped is
+                        // simply wrong, so the build trigger is the
+                        // certification signal rather than a timer. The
+                        // rewrite is idempotent (`rollup::bucket_id` is
+                        // deterministic in bucket+dimensions), so re-running
+                        // it for an already-built partition replaces its rows
+                        // instead of doubling every measure.
+                        // Any table that DECLARES rollups gets them rebuilt
+                        // at its certification point — no table name is
+                        // special-cased here any more.
+                        if get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
+                            && self.rollup_retry_allowed(pid, table_name, &date.to_string())
+                            && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), fp_post).await
+                        {
+                            self.record_rollup_failure(pid, table_name, &date.to_string());
+                            warn!(project_id = pid, date = %date, table_name, %error, "rollup build failed; leaving the partition on raw scans");
                         }
                     }
-                    Err(e) => {
-                        // Exponential backoff, 10min doubling to a 6h cap —
-                        // a failing partition must not re-run (and re-fail)
-                        // on every 5-minute sweep tick.
-                        let attempts = self.dedup_backoff.get(&backoff_key).map_or(0, |e| e.value().0) + 1;
-                        let delay = std::time::Duration::from_secs((600u64 << (attempts.min(7) - 1)).min(21_600));
-                        self.dedup_backoff.insert(backoff_key, (attempts, std::time::Instant::now() + delay));
-                        if let Some((_, prev)) = self.dedup_clean_fp.remove(&fp_key) {
-                            self.scan_metrics.record_cert_dwell(prev.since);
-                        }
-                        warn!(
-                            "dedup sweep: project={} date={} table={} failed (attempt {}, next retry in {}s): {}",
-                            pid,
-                            date,
-                            table_name,
-                            attempts,
-                            delay.as_secs(),
-                            e
-                        );
+                }
+                Err(e) => {
+                    // Exponential backoff, 10min doubling to a 6h cap —
+                    // a failing partition must not re-run (and re-fail)
+                    // on every 5-minute sweep tick.
+                    let attempts = self.dedup_backoff.get(&backoff_key).map_or(0, |e| e.value().0) + 1;
+                    let delay = std::time::Duration::from_secs((600u64 << (attempts.min(7) - 1)).min(21_600));
+                    self.dedup_backoff.insert(backoff_key, (attempts, std::time::Instant::now() + delay));
+                    if let Some((_, prev)) = self.dedup_clean_fp.remove(&fp_key) {
+                        self.scan_metrics.record_cert_dwell(prev.since);
                     }
+                    warn!(
+                        "dedup sweep: project={} date={} table={} failed (attempt {}, next retry in {}s): {}",
+                        pid,
+                        date,
+                        table_name,
+                        attempts,
+                        delay.as_secs(),
+                        e
+                    );
                 }
             }
         }
@@ -9261,7 +9335,7 @@ impl Database {
         // memory_brakes_total=0 while a drain pass rode RSS up unbraked.
         // `Repair` only to opt out of the packing-specific light-pool guard: the
         // dedup drain runs on the HEAVY pool, so a repair sort is not its rival.
-        !self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) && self.light_optimize_brake(TailPass::Repair).is_none()
+        !self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) && self.light_optimize_brake().is_none()
     }
 
     /// Order one drain pass and split off the work it will not do.
@@ -9661,7 +9735,7 @@ impl Database {
     /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
     /// fallback sweep). The 90s deadline is a warning threshold, not a
     /// cancellation: a slow-but-healthy table is allowed to finish.
-    async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
+    async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str, sweep_deadline: std::time::Instant) {
         if !self.config.maintenance.timefusion_dirty_bin_dedup_enabled {
             debug!(table_name, event = "dirty_bin_dedup_paused", "physical dirty-bin dedup is disabled; read-side dedup remains active");
             return;
@@ -9691,7 +9765,9 @@ impl Database {
         let certify_rollups = self.config.maintenance.timefusion_rollup_enabled && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
         if self.config.maintenance.timefusion_dedup_sweep_fallback || certify_rollups {
             let t0 = std::time::Instant::now();
-            match self.dedup_today_partitions(table, table_name, dedup_key).await {
+            // The sweep is the pass's unbounded half (see `dedup_sweep`); the
+            // drain above is bounded per bin and is the work worth finishing.
+            match self.dedup_sweep(table, table_name, dedup_key, Some(sweep_deadline)).await {
                 Ok(()) if t0.elapsed() > DEDUP_WARN => {
                     warn!("Dedup fallback sweep for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
                     crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10083,7 +10159,7 @@ impl Database {
                 let resume = remaining.first().and_then(|p| order_index.get(p).copied()).unwrap_or(0);
                 self.light_optimize_cursor.store(resume, Relaxed);
             },
-            || self.light_optimize_brake(pass),
+            || self.light_optimize_brake(),
             // Repair commits per bin: its bins are few and minutes long, so a
             // restart mid-wave must not discard the ones already finished.
             pass == TailPass::Repair,
@@ -10160,10 +10236,10 @@ impl Database {
                         // error path) accounts for it.
                         return (project_id, Ok(BinOutcome::Converged));
                     }
-                    // Publish the sort while it runs so the packing pass can see
-                    // it and stand down (see `light_optimize_brake`). The guard
+                    // Publish the sort while it runs, so `timefusion_stats` can
+                    // distinguish a grinding repair from a wedged one. The guard
                     // decrements on every exit path including the timeout.
-                    let _in_flight = (pass == TailPass::Repair).then(|| InFlightGuard::enter(&self.repair_bins_in_flight));
+                    let _in_flight = (pass == TailPass::Repair).then(|| InFlightGuard::enter(&crate::metrics::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(left, self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, pass)).await {
                         Ok(staged) => staged,
                         Err(_) => Err(anyhow::anyhow!("hot bin staging exceeded the {left:?} left in the tick budget")),
@@ -11240,34 +11316,22 @@ impl Database {
     /// bounded by the tick deadline — a full stop there starves compaction
     /// indefinitely, which degrades reads and merges. Memory near the cgroup
     /// limit is an imminent OOM: hard STOP.
-    fn light_optimize_brake(&self, pass: TailPass) -> Option<Brake> {
+    fn light_optimize_brake(&self) -> Option<Brake> {
         use std::sync::atomic::Ordering::Relaxed;
-        // A repair sort takes the light pool almost whole (see
-        // `repair_bins_in_flight`), so packing's k — derived from a 4 GiB
-        // `PER_SORT_BUDGET_BYTES` that the repair sort exceeds 3.6x — is a
-        // fiction while one is running.
+        // NOTE: packing is no longer braked by an in-flight repair. It was, for
+        // as long as the two passes shared one memory pool — a repair sort
+        // measured 12.7-14.4 GB of a 15.4 GB pool, leaving a 1.3-1.5 GB packing
+        // bin nowhere to go, and a packing bin that dies with `Resources
+        // exhausted` compacts nothing AND takes the repair bin down with it.
         //
-        // STOP, not Degrade. Degrade was tried first (2026-08-11, same day) to
-        // keep packing's one-bin service floor, on the reasoning that starving
-        // packing grows partitions to 50-65 files. The arithmetic refutes it:
-        // a repair sort measured 12.7-14.4 GB of a 15.4 GB pool, and ONE
-        // packing bin is 1.3-1.5 GB, so the floor does not fit either. Prod
-        // 14:46 with the floor in place:
-        //
-        //   ExternalSorter[0]#187854      6.5 GB, peak 14.3 GB   <- repair
-        //   ExternalSorterMerge[0]#187855 6.2 GB, peak  7.2 GB   <- repair
-        //   ExternalSorterMerge[0]#189072 1515.8 MB              <- packing
-        //   ExternalSorterMerge[1]#189074 1255.7 MB              <- packing
-        //   -> failed to allocate 8.5 MB; 8.3 MB left of 15.4 GB
-        //
-        // A packing bin that dies with `Resources exhausted` compacts nothing
-        // AND takes the repair bin down with it, so the floor bought no
-        // service — it only converted one loser into two. Repair is bounded
-        // (one bin ~13 min, the pass by its tick budget), so packing resumes
-        // between bins rather than being starved indefinitely.
-        if pass == TailPass::Pack && self.repair_bins_in_flight.load(Relaxed) > 0 {
-            return Some(Brake::Stop("repair_holds_light_pool"));
-        }
+        // The interlock was the wrong fix for that: it made packing's
+        // availability a function of repair's schedule, and repair's budget
+        // (8640s) exceeds its period (3600s), with a startup pass 3 minutes
+        // after every boot. Prod 2026-08-12 21:54-22:50 therefore planned 193
+        // packing projects and completed ONE — every tick pausing at round 0 in
+        // under a millisecond while ingest kept making small files. The two
+        // passes now hold disjoint pools (`pack_pool_bytes` / `repair_pool_bytes`),
+        // which removes the contention the brake was standing in for.
         if let Some(stale_buckets) = self.buffered_layer().map(|layer| layer.stale_unflushed_bucket_count()).filter(|count| *count > 0) {
             info!(stale_buckets, event = "light_optimize_flush_debt_yield");
             crate::metrics::maintenance_stats().light_optimize_flush_debt_yields.fetch_add(1, Relaxed);
@@ -13593,12 +13657,20 @@ enum BinOutcome<T> {
     Retry,
 }
 
-/// Decrement-on-drop counter, so a bin that times out or panics still clears
-/// its slot — a leaked count would degrade packing for the process's lifetime.
-struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+/// Where a deadline-truncated dedup sweep resumes: the served-item cursor
+/// wrapped into the current work list. The cursor only ever grows (each tick
+/// adds what it served), so the modulo is what makes successive short ticks walk
+/// the whole list instead of re-serving its head.
+fn sweep_resume_offset(len: usize, cursor: usize) -> usize {
+    if len == 0 { 0 } else { cursor % len }
+}
+
+/// Decrement-on-drop gauge, so a bin that times out or panics still clears its
+/// slot rather than reading as permanently busy.
+struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicU64);
 
 impl<'a> InFlightGuard<'a> {
-    fn enter(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+    fn enter(counter: &'a std::sync::atomic::AtomicU64) -> Self {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self(counter)
     }
@@ -17736,15 +17808,40 @@ mod tests {
         );
     }
 
-    /// A repair bin that times out or panics must still clear its slot: a leaked
-    /// count degrades packing to concurrency 1 for the rest of the process.
+    /// A dedup sweep that can be cut by its deadline must still reach every
+    /// (date, project) item. Prod 2026-08-12 ran the sweep unbounded — 55+
+    /// minutes on a 5-minute schedule, holding `maintenance_job_sem` and
+    /// skipping 10 consecutive ticks — so bounding it is only safe if the
+    /// remainder is served next tick rather than dropped. A cursor that reset,
+    /// or one applied without the wrap, would re-serve the head forever and
+    /// starve the tail exactly as the unbounded pass starved the drain.
+    #[test]
+    fn a_truncated_dedup_sweep_walks_the_whole_work_list_across_ticks() {
+        let (total, per_tick) = (386usize, 40usize); // prod's ~193 projects x 2 dates
+        let mut seen = vec![false; total];
+        let mut cursor = 0usize;
+        for _ in 0..total.div_ceil(per_tick) {
+            let offset = super::sweep_resume_offset(total, cursor);
+            for i in 0..per_tick {
+                seen[(offset + i) % total] = true;
+            }
+            cursor += per_tick; // the cursor only ever grows, as `fetch_add(swept)` does
+        }
+        assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
+        // An empty list must not panic on the modulo.
+        assert_eq!(super::sweep_resume_offset(0, 7), 0);
+    }
+
+    /// A repair bin that times out or panics must still clear its slot, or
+    /// `repair_bins_in_flight` reads "busy" forever and the gauge stops being
+    /// able to tell a grinding repair from a wedged one.
     #[test]
     fn an_in_flight_repair_slot_clears_even_when_the_bin_unwinds() {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-        let counter = AtomicUsize::new(0);
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let counter = AtomicU64::new(0);
         {
             let _guard = super::InFlightGuard::enter(&counter);
-            assert_eq!(counter.load(Relaxed), 1, "packing must be able to SEE the sort while it runs");
+            assert_eq!(counter.load(Relaxed), 1, "the gauge must SHOW the sort while it runs");
         }
         assert_eq!(counter.load(Relaxed), 0);
         let _ = std::panic::catch_unwind(|| {
@@ -18583,6 +18680,34 @@ mod tests {
         // …and a wave still stages immediately.
         assert!(db.light_rewrite_sem.try_acquire().is_ok(), "hot-compact waves must not wait on a dedup drain");
         drop(heavy);
+        Ok(())
+    }
+
+    /// Packing and footer repair must hold DISJOINT memory pools.
+    ///
+    /// While they shared one, the only way to keep a 14.4 GB repair sort from
+    /// killing a 1.5 GB packing bin was to stop packing outright whenever a
+    /// repair bin was in flight. Repair's budget (8640s) exceeds its period
+    /// (3600s) and a startup pass runs 3 minutes after every boot, so that
+    /// condition is effectively permanent: prod 2026-08-12 21:54-22:50 planned
+    /// 193 packing projects and completed ONE, each tick pausing at round 0 on
+    /// `repair_holds_light_pool` within a millisecond while ingest kept
+    /// fragmenting today's partition.
+    ///
+    /// The split must stay memory-NEUTRAL — the two slices partition the light
+    /// share rather than adding to it — or this trades a compaction stall for
+    /// an OOM.
+    #[tokio::test]
+    async fn packing_and_repair_hold_disjoint_pools_that_partition_the_light_share() -> Result<()> {
+        let db = Database::with_config(create_test_config("pool-split")).await?;
+        assert_eq!(db.pack_pool_bytes() + db.repair_pool_bytes(), db.light_optimize_pool_bytes(), "the split must not grow the maintenance budget");
+        assert!(db.pack_pool_bytes() > 0 && db.repair_pool_bytes() > 0, "neither pass may be sized to zero");
+        assert!(!Arc::ptr_eq(&db.light_optimize_runtime_env(), &db.repair_runtime_env()), "sharing one RuntimeEnv is sharing one pool");
+
+        // The brake must be blind to repair: an in-flight repair bin is exactly
+        // the state that used to zero packing's throughput.
+        let _repair_bin = InFlightGuard::enter(&crate::metrics::maintenance_stats().repair_bins_in_flight);
+        assert!(db.light_optimize_brake().is_none(), "a repair bin in flight must no longer stop packing");
         Ok(())
     }
 
