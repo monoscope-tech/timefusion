@@ -704,18 +704,31 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
             value => format!("{value:?}"),
         },
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
-            let mut terms = Vec::new();
-            fn collect(expr: &Expr, operator: Operator, terms: &mut Vec<String>) {
+            let mut operands: Vec<&Expr> = Vec::new();
+            fn collect<'a>(expr: &'a Expr, operator: Operator, operands: &mut Vec<&'a Expr>) {
                 match unaliased(expr) {
                     Expr::BinaryExpr(binary) if binary.op == operator => {
-                        collect(&binary.left, operator, terms);
-                        collect(&binary.right, operator, terms);
+                        collect(&binary.left, operator, operands);
+                        collect(&binary.right, operator, operands);
                     }
-                    expr => terms.push(canonical(expr)),
+                    expr => operands.push(expr),
                 }
             }
-            collect(expr, binary.op, &mut terms);
+            collect(expr, binary.op, &mut operands);
+            if binary.op == Operator::And {
+                strip_index_hints(&mut operands);
+            }
+            let mut terms = operands.into_iter().map(canonical).collect::<Vec<_>>();
             terms.sort();
+            // Idempotence, at EVERY level rather than only the outermost one:
+            // the duplicated conjuncts observed in prod were nested inside an OR
+            // branch, where a top-level dedupe cannot reach them.
+            terms.dedup();
+            // Stripping or deduping can leave one operand, and a one-element
+            // conjunction IS that operand — `((X))` must not differ from `(X)`.
+            if terms.len() == 1 {
+                return terms.remove(0);
+            }
             format!(
                 "({})",
                 terms.join(match binary.op {
@@ -729,6 +742,43 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
         Expr::ScalarFunction(function) => format!("{}({})", function.name(), function.args.iter().map(canonical).collect::<Vec<_>>().join(",")),
         expr => format!("{expr:?}"),
     }
+}
+
+/// Drop tantivy `text_match` accelerators from one AND level.
+///
+/// `optimizers::tantivy_rewriter` ADDITIVELY ANDs `text_match(col, q)` next to a
+/// predicate it can accelerate and, by its own stated invariant, never removes
+/// the original comparison — so the semantics live entirely in the other terms
+/// and the hint is noise for an equality comparison.
+///
+/// It has to go, because the two sides do not receive the same hints. Measured
+/// in prod 2026-08-12, the query side of the Golden Signals filter carried
+/// THREE hints in two different arities — `text_match(kind,"server")` and
+/// `text_match(kind,"server","eq")` — where the declared measure filter carried
+/// one. That is also a rewriter bug (its invariant 3 claims idempotence under
+/// repeated passes), but the matcher must not depend on the rewriter being
+/// idempotent to compare two spellings of the same predicate.
+///
+/// Only a hint on a column this AND level already compares is dropped, so a
+/// `text_match` the USER wrote against some other column is preserved and the
+/// filter correctly fails to match any declared measure.
+fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
+    use datafusion::logical_expr::Expr;
+    fn hint_column(expr: &Expr) -> Option<String> {
+        match unaliased(expr) {
+            Expr::ScalarFunction(function) if function.name() == "text_match" => match unaliased(function.args.first()?) {
+                Expr::Column(column) => Some(column.name.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let compared: std::collections::HashSet<String> = operands
+        .iter()
+        .filter(|operand| hint_column(operand).is_none())
+        .flat_map(|operand| operand.column_refs().into_iter().map(|column| column.name.clone()))
+        .collect();
+    operands.retain(|operand| hint_column(operand).is_none_or(|column| !compared.contains(&column)));
 }
 
 fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logical_expr::Expr>) -> String {
@@ -1233,6 +1283,33 @@ mod tests {
 
     fn spec() -> RollupSpec {
         crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
+    }
+
+    /// The Golden Signals miss, reproduced exactly as prod produced it.
+    ///
+    /// `tantivy_rewriter` ADDITIVELY ANDs `text_match` hints beside a predicate
+    /// it can accelerate. It does not add the same ones to both sides: measured
+    /// 2026-08-12, the query carried `text_match(kind,"server")` AND
+    /// `text_match(kind,"server","eq")` where the declared measure filter
+    /// carried only the two-arg form. Every earlier test agreed with prod
+    /// because no bare test session registers that rewriter at all.
+    #[test]
+    fn a_filter_carrying_tantivy_hints_matches_the_same_filter_without_them() {
+        use datafusion::logical_expr::{col, lit};
+        let text_match = |args: Vec<datafusion::logical_expr::Expr>| {
+            datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(crate::tantivy_index::udf::text_match_udf().into(), args))
+        };
+        let base = col("kind").eq(lit("server")).or(col("name").eq(lit("monoscope.http")));
+        // What the declared measure filter canonicalizes to (one hint).
+        let declared = col("kind").eq(lit("server")).and(text_match(vec![col("kind"), lit("server")])).or(col("name").eq(lit("monoscope.http")));
+        // What the query carries: a second hint, in the three-arg arity.
+        let query = col("kind")
+            .eq(lit("server"))
+            .and(text_match(vec![col("kind"), lit("server")]))
+            .and(text_match(vec![col("kind"), lit("server"), lit("eq")]))
+            .or(col("name").eq(lit("monoscope.http")));
+        assert_eq!(canonical_and([&query]), canonical_and([&declared]), "hint arity must not decide whether a panel routes");
+        assert_eq!(canonical_and([&query]), canonical_and([&base]), "a hint is an accelerator, not a predicate");
     }
 
     /// `AND` is idempotent, so a conjunct repeated by the planner must not change
