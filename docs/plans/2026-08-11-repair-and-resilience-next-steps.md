@@ -75,6 +75,39 @@ in boot (signal handlers + libunwind). Gated behind `TIMEFUSION_CPU_PROFILE` as
 of this plan's follow-up, so the hypothesis can be tested by env var instead of
 by shipping an image into an outage.
 
+> **THE TEST HAS NEVER BEEN RUN (checked 2026-08-12).** The gate is
+> **default-ON** — `profiling.rs:47` only disables when the var is explicitly
+> `false`/`0`. `TIMEFUSION_CPU_PROFILE` is **not set** on the prod service, and
+> prod logged `profiling: enabled (jemalloc heap auto-dump + rolling CPU
+> flamegraph)` at 14:43 UTC today. So the prime suspect has been live in
+> production continuously since the incident, and writing this gate did not
+> neutralise anything — it only made the test *possible*.
+>
+> To actually run it: set `TIMEFUSION_CPU_PROFILE=false` on the service. Heap
+> profiling is unaffected (jemalloc's own, via the baked `malloc_conf`), so OOM
+> attribution survives; what is lost is the rolling CPU flamegraph.
+>
+> **APPLIED 2026-08-12 14:51 UTC.** `TIMEFUSION_CPU_PROFILE=false` is set on the
+> service (via the CapRover API, full-replace with every other field preserved —
+> today's `stop-first` included). Prod now logs `profiling: jemalloc heap
+> auto-dump only — CPU sampler disabled by TIMEFUSION_CPU_PROFILE`, replicas
+> `1/1`, heap dumps still landing.
+>
+> The restart cost is bounded by design and that is why this was worth doing now
+> rather than saving for a quiet moment: resumable footer repair is on by default
+> (`49c5adf`, "turn resume on by default so a rewrite survives a restart"), so a
+> restart costs the pass its current bin, not its progress. The certification
+> counters do reset — but that measurement no longer needs a clean window, since
+> the coverage finding was derived from the code (see the coverage plan).
+>
+> **The clock starts here.** The hypothesis is that the CPU sampler (signal
+> handlers + libunwind) caused the 2026-08-11 exit-139 crashloop. The test is
+> simply: does a SIGSEGV recur with the sampler off? A recurrence falsifies it and
+> the search moves on; a long quiet period is weak evidence for it, since the
+> original was a burst between 12:14 and 12:23 and not a steady failure. What is
+> lost meanwhile is the rolling CPU flamegraph — if perf work needs it back, flip
+> the var and note the gap in coverage.
+
 ### 3. CapRover `serviceUpdateOverride` — one word
 > **DONE 2026-08-12.** `UpdateConfig.Order` is now `stop-first`, applied through the CapRover
 > API with every other field of the app definition preserved (StopGracePeriod 90s, the memory
@@ -94,6 +127,64 @@ pause and accumulate not-ready tasks rather than rolling back).
 ## P1 — finish the whale
 
 ### 4. Drain 07-31 (36 files)
+> **Measured 2026-08-12. The whale is `87576849-4941-49d3-a15d-680fef88a1a8` — project
+> "past3", i.e. monoscope-self.** Recording the id here because every verification step needs
+> it and it was written down nowhere.
+>
+> **Read the probe methodology note first — it is cache-sensitive.** Sweeping the 30
+> most-recently-active projects at 30d:
+>
+> | | bounded | full-set | no DedupExec |
+> |---|---|---|---|
+> | first (COLD) sweep | 11 | **19** | 0 |
+> | re-run (WARM), twice, identical | 11 | **1** | 18 |
+>
+> Same query, same projects, minutes apart. Warm, 18 projects plan with no `DedupExec` at all;
+> cold, those same 18 plan `full-set`. So **an EXPLAIN probe does not measure repair progress
+> unless cache warmth is held constant** — "11d flipped to bounded" can be warmth, not repair.
+> This matches the known `dedup_skip` behaviour that needs a warm fast-resolve cache. Any
+> future use of this probe must state whether it was cold or warm; a cold sweep is the
+> conservative one.
+>
+> Substantively, warm state: **29 of 30 active projects are healthy at 30 days.** The one that
+> is not is past3, and it is worse than this plan describes — `full-set` at **every** width
+> probed, 1d / 3d / 7d / 9d / 11d / 14d / 30d. The 2026-08-09 profile had it bounded through
+> 8d and full from 9d, which localised the problem to `date=2026-07-31`. Full-set at **1 day**
+> cannot be a 07-31 partition: something is voiding ordering in past3's *recent* data too, so
+> draining 07-31 alone will not fix it.
+>
+> Not the flush escalation path: `flush_sort_unsorted_fallbacks_total` is **0**.
+>
+> **Followed up, and it is not a poisoned partition at all — do NOT drain 07-31.** past3 has
+> **399 files in `repair_verified_sorted.txt`**, so repair has not been ignoring it. Sliding
+> the window instead of widening it locates the real thing (2-day window, varying only where
+> it *ends*):
+>
+> | 2d window ending | mode |
+> |---|---|
+> | now | full-set |
+> | 2h ago | full-set |
+> | 6h ago | **bounded** |
+> | 12h / 18h / 24h ago | **bounded** |
+>
+> Ordering is voided by the **most recent few hours of flush output**, not by anything in
+> 07-31. Any window that excludes the last ~2–6h is bounded; any window that includes it is
+> full-set. Freshly flushed files are unsorted until compaction reaches them, and every
+> dashboard that covers "now" — which is most of them — pays full-set until it does.
+>
+> It also **rotates between tenants**. Minutes after the table above, past3's own last-2h had
+> gone bounded while `edb04135` (Blockradar), bounded at 30d in the earlier sweep, had gone
+> full-set at last-2h. So "the whale" is not a property of one project; it is whichever tenant
+> compaction is currently behind on, and past3 shows it most because it ingests most.
+>
+> This retires the model this section was written around (one poisoned partition, one whale,
+> ~8h of repair to drain it). The open question is now a throughput one: **how long flush
+> output stays unsorted before compaction sorts it, and whether that lag is bounded for a
+> high-ingest tenant.** Measure that before spending repair time.
+>
+> Caveat that applies to every number above: the probe is both cache- and time-sensitive (see
+> the cold/warm table). Single readings mislead; slide the window and repeat.
+
 No blockers: every file is under the admission cap, largest 631 MB. At ~13
 min/bin that is ~8 hours of uninterrupted repair; the real rate is set by how
 often the process restarts.
