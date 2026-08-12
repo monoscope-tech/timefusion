@@ -144,22 +144,59 @@ fn run_pgwire_healthcheck() -> anyhow::Result<()> {
 /// fast right now".
 const PROBE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// A probe verdict is useless without knowing WHICH stage was slow: a slow
+/// `connect` is the accept loop (or the listen backlog) not getting scheduled,
+/// a slow `auth` read is the handshake task losing its runtime slice behind
+/// CPU-bound maintenance. On 2026-08-11 a probe timeout killed the task
+/// mid-repair with CPU at 805%/4800% and 17.8 of 96 GiB — neither saturation
+/// nor OOM, so the deadline was measuring something we could not see.
+///
+/// Printed on BOTH paths (Docker records healthcheck output either way), so a
+/// `docker inspect` health log reads as a stage histogram over time rather than
+/// a column of bare "unhealthy". Deliberately not widened — read the stages
+/// first; widening the deadline destroys the only signal there is.
 fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
     let timeout = PROBE_OP_TIMEOUT;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let t0 = std::time::Instant::now();
+    let stage = |t: &mut std::time::Instant| {
+        let d = t.elapsed();
+        *t = std::time::Instant::now();
+        d.as_millis()
+    };
+    let mut mark = t0;
+
+    let connect = (|| {
+        let s = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+        s.set_read_timeout(Some(timeout))?;
+        s.set_write_timeout(Some(timeout))?;
+        Ok::<_, std::io::Error>(s)
+    })();
+    let connect_ms = stage(&mut mark);
+    let mut stream = connect.inspect_err(|e| println!("probe stage=connect ms={connect_ms} result=error err={e}"))?;
 
     let body = b"user\0timefusion_healthcheck\0database\0postgres\0\0";
     let mut startup = Vec::with_capacity(8 + body.len());
     startup.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
     startup.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
     startup.extend_from_slice(body);
-    stream.write_all(&startup)?;
+    let wrote = stream.write_all(&startup);
+    let write_ms = stage(&mut mark);
+    wrote.inspect_err(|e| println!("probe stage=write connect_ms={connect_ms} ms={write_ms} result=error err={e}"))?;
+
+    // The stage that actually costs: the server has to schedule the handshake
+    // task and answer. Starvation shows up here, not in connect.
     let mut tag = [0u8; 1];
-    stream.read_exact(&mut tag)?;
+    let read = stream.read_exact(&mut tag);
+    let auth_ms = stage(&mut mark);
+    let total_ms = t0.elapsed().as_millis();
+    if let Err(e) = &read {
+        println!("probe stage=auth connect_ms={connect_ms} write_ms={write_ms} ms={auth_ms} total_ms={total_ms} result=error err={e}");
+    } else {
+        println!("probe connect_ms={connect_ms} write_ms={write_ms} auth_ms={auth_ms} total_ms={total_ms} result=ok tag={}", tag[0] as char);
+    }
+    read?;
     anyhow::ensure!(tag[0] == b'R', "PGWire is bound but not ready (response tag {:?})", tag[0] as char);
     Ok(())
 }
@@ -325,6 +362,14 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     if let Err(e) = timefusion::metrics::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer), tantivy_svc_for_metrics.as_ref().map(Arc::downgrade)) {
         error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
     }
+
+    // Starts here, not after WAL replay: replay is exactly the window where a
+    // probe deadline gets missed, so the sampler has to already be running to
+    // catch it. Its OWN token, not `early_shutdown` — that one is cancelled at
+    // the early-bind handoff, which is precisely when the sampler starts being
+    // interesting.
+    let lag_shutdown = tokio_util::sync::CancellationToken::new();
+    timefusion::metrics::spawn_runtime_lag_sampler(lag_shutdown.clone());
 
     // Fast-forward walrus cursors before WAL replay so we don't re-inject
     // entries Delta already has. Fast path: a `clean_shutdown=true` snapshot
@@ -613,6 +658,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let grace = if preflushed_handoff { configured_grace.min(Duration::from_secs(1)) } else { configured_grace };
     let deadline = tokio::time::Instant::now() + grace;
     pgwire_shutdown.cancel();
+    lag_shutdown.cancel();
     let pg_drain_budget = if preflushed_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.2) };
     match tokio::time::timeout(pg_drain_budget, pg_task).await {
         Ok(Ok(())) => info!("PGWire drained cleanly"),

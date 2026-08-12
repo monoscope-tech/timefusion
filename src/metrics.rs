@@ -247,6 +247,22 @@ pub fn init_metrics(
         .with_callback(|obs| obs.observe(TANTIVY_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed), &[]))
         .build();
 
+    // Runtime scheduling lag — see `spawn_runtime_lag_sampler`. `last` is the
+    // current state; `max` is the high-water mark for the process lifetime, so
+    // a spike that has since recovered is still visible after the fact.
+    meter
+        .u64_observable_gauge("timefusion.runtime.scheduling_lag_ms")
+        .with_description(
+            "How late a 500ms timer task actually woke — nonzero means workers are starved, which is what a missed health probe looks like from inside",
+        )
+        .with_callback(|obs| obs.observe(RUNTIME_LAG_LAST_MS.load(Relaxed), &[]))
+        .build();
+    meter
+        .u64_observable_gauge("timefusion.runtime.scheduling_lag_max_ms")
+        .with_description("Worst scheduling lag this process lifetime; survives the spike so a post-mortem can still see it")
+        .with_callback(|obs| obs.observe(RUNTIME_LAG_MAX_MS.load(Relaxed), &[]))
+        .build();
+
     // Index lag: how far behind ingest the newest published tantivy index is.
     // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
     // indexing lag that the rewriter / search service can't shortcut around.
@@ -315,6 +331,53 @@ static TANTIVY_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 pub fn record_tantivy_cache_bytes(bytes: u64) {
     TANTIVY_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Worst scheduling delay seen by the runtime-lag sampler this process, in ms.
+static RUNTIME_LAG_MAX_MS: AtomicU64 = AtomicU64::new(0);
+/// Most recent sample, so a gauge shows the CURRENT state rather than a
+/// high-water mark that never comes back down.
+static RUNTIME_LAG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How late a task that asked to wake in exactly `SAMPLE_EVERY` actually woke.
+///
+/// This is the direct test of the "the health probe lost its runtime slice"
+/// hypothesis behind the 2026-08-11 `exit 137` (probe deadline missed at CPU
+/// 805%/4800% and 17.8 of 96 GiB — neither saturation nor OOM, so the cause was
+/// never visible in resource metrics). Every maintenance sort, repair rewrite
+/// and flush escalation runs on the same multi-thread runtime as the pgwire
+/// handshake; CPU-bound work that does not yield starves it, and this is what
+/// that looks like from inside.
+///
+/// Read it against the probe's `auth_ms` stage: lag spiking into the seconds at
+/// the moment a probe misses confirms starvation and points at a dedicated
+/// runtime for the listener. Lag flat while probes still miss rules it out, and
+/// the search moves to the accept path.
+///
+/// Cost is one timer wakeup per interval — deliberately cheap enough to leave
+/// on in prod, since the failure it explains only happens in prod.
+pub fn spawn_runtime_lag_sampler(cancel: tokio_util::sync::CancellationToken) {
+    const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+    // Below this, a sample is ordinary timer slack and not worth a log line.
+    const NOTEWORTHY: u128 = 250;
+    tokio::spawn(async move {
+        loop {
+            let deadline = tokio::time::Instant::now() + SAMPLE_EVERY;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+            // `sleep_until` fires no EARLIER than the deadline, so the excess is
+            // entirely scheduling delay: the timer expired and no worker picked
+            // this task up.
+            let lag_ms = tokio::time::Instant::now().saturating_duration_since(deadline).as_millis();
+            RUNTIME_LAG_LAST_MS.store(lag_ms as u64, Relaxed);
+            RUNTIME_LAG_MAX_MS.fetch_max(lag_ms as u64, Relaxed);
+            if lag_ms >= NOTEWORTHY {
+                warn!(lag_ms, "tokio runtime scheduling lag — a task that asked for {SAMPLE_EVERY:?} woke this late; the pgwire handshake shares this runtime");
+            }
+        }
+    });
 }
 
 /// Generates the no-attribute "increment by one" recorders. Each no-ops on the
@@ -700,4 +763,30 @@ pub fn process_rss_bytes() -> Option<usize> {
     // Linux target TF deploys to (x86_64) — avoids a libc dependency.
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     statm.split_whitespace().nth(1)?.parse::<usize>().ok().map(|pages| pages * 4096)
+}
+
+#[cfg(test)]
+mod runtime_lag_tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use super::{RUNTIME_LAG_LAST_MS, RUNTIME_LAG_MAX_MS, spawn_runtime_lag_sampler};
+
+    /// The sampler must report near-zero on an idle runtime and must stop on
+    /// cancel. A sampler that reported lag when nothing was competing would
+    /// make the starvation signal unreadable — which is the whole point of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_runtime_reports_no_meaningful_lag_and_stops_on_cancel() {
+        RUNTIME_LAG_MAX_MS.store(0, Relaxed);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        spawn_runtime_lag_sampler(cancel.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let idle_max = RUNTIME_LAG_MAX_MS.load(Relaxed);
+        assert!(idle_max < 250, "idle runtime must not look starved, got {idle_max}ms");
+
+        cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        RUNTIME_LAG_LAST_MS.store(u64::MAX, Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert_eq!(RUNTIME_LAG_LAST_MS.load(Relaxed), u64::MAX, "a cancelled sampler must stop writing samples");
+    }
 }
