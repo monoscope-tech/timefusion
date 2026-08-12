@@ -8766,16 +8766,7 @@ impl Database {
             // fatal here, since the backfill builds its entire candidate list
             // from those keys. Prod 2026-08-12 ran ticks for 40 minutes with
             // sealed days uncovered and printed nothing at all.
-            info!(
-                source,
-                partitions = fingerprints.len(),
-                pool,
-                gated,
-                backoff,
-                covered,
-                event = "rollup_backfill_idle",
-                "the backfill queued nothing"
-            );
+            info!(source, partitions = fingerprints.len(), pool, gated, backoff, covered, event = "rollup_backfill_idle", "the backfill queued nothing");
         }
 
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
