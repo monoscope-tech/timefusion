@@ -1026,7 +1026,12 @@ pub struct AppConfig {
 
 const_default!(d_tantivy_backfill_max_file_mb: u64 = 512);
 const_default!(d_tantivy_max_index_mb: u64 = 64);
-const_default!(d_tantivy_cache_disk_gb: u64 = 4);
+// Sized against a working set, not a wish: the reaper only evicts what no
+// query has opened recently, and every eviction costs a blob re-download on
+// the next hit. 4 GB — the value this knob carried while it was dead code,
+// enforced by nothing — would thrash the hot window at prod scale.
+const_default!(d_tantivy_cache_disk_gb: u64 = 64);
+const_default!(d_tantivy_cache_reap_schedule: String = "0 */10 * * * *");
 // Level 3: index packing is on the flush hot path; level 19 cost ~88% of a CPU
 // window per flush for ~10-15% smaller output (profiled 2026-07-05).
 const_default!(d_tantivy_zstd_level: i32 = 3);
@@ -1042,8 +1047,18 @@ const_default!(d_tantivy_prefilter_min_selectivity_pct: u32 = 50);
 pub struct TantivyConfig {
     #[serde(default = "d_tantivy_max_index_mb")]
     pub timefusion_tantivy_max_index_size_mb: u64,
+    /// Byte budget for the local extracted-index cache
+    /// (`<timefusion_data_dir>/tantivy_cache`), enforced LRU-first by the
+    /// "Tantivy cache reap" cron. That cron is the ONLY thing that deletes
+    /// from that tree, and the tree shares a volume with the WAL — a full
+    /// volume means failed WAL appends, not just a cold cache.
     #[serde(default = "d_tantivy_cache_disk_gb")]
     pub timefusion_tantivy_cache_disk_gb: u64,
+    /// How often to enforce `timefusion_tantivy_cache_disk_gb`. Each sweep
+    /// walks the whole cache tree, so this trades staleness of the bound
+    /// against that walk; empty disables the reap (and with it the bound).
+    #[serde(default = "d_tantivy_cache_reap_schedule")]
+    pub timefusion_tantivy_cache_reap_schedule: String,
     #[serde(default = "d_tantivy_zstd_level")]
     pub timefusion_tantivy_compression_level: i32,
     #[serde(default = "d_tantivy_min_files")]
@@ -1139,6 +1154,12 @@ impl TantivyConfig {
     }
     pub fn route_equality(&self) -> bool {
         self.timefusion_tantivy_route_equality
+    }
+    /// Disk budget in bytes. Floored at 1 GB: a zero here would reap the cache
+    /// to nothing every 10 minutes and turn every query into a re-download,
+    /// which is a worse failure than the leak this bounds.
+    pub fn cache_disk_bytes(&self) -> u64 {
+        self.timefusion_tantivy_cache_disk_gb.max(1) * 1024 * 1024 * 1024
     }
 }
 

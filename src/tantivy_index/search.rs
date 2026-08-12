@@ -7,9 +7,19 @@
 //!
 //! On-miss: download blob → unpack to a fresh tempdir → atomically rename
 //! into the cache path. Open the index from the cache path with mmap; the
-//! opened (Index, IndexReader) pair is kept in a process LRU keyed by blob
-//! path (blobs are immutable — new data always lands at a new path — so
-//! entries never need invalidation, only eviction).
+//! opened (Index, IndexReader) pair is kept in a process LRU keyed by the
+//! cache dir, which is 1:1 with the blob path (blobs are immutable — new
+//! data always lands at a new path — so entries never need invalidation,
+//! only eviction).
+//!
+//! The disk tree is bounded by [`TantivySearchService::reap_disk_cache`],
+//! run by the "Tantivy cache reap" cron: nothing else ever deletes from it.
+//! `gc_after_compaction` reaps manifest entries and their object-store blobs,
+//! but the *extracted* copy under `cache_root` is invisible to it, and
+//! compaction rewrites parquet constantly — so every compacted-away file
+//! leaves a dir behind that no query will open again. `cache_root` is
+//! `timefusion_data_dir`, which also holds the WAL, so unbounded growth ends
+//! in failed WAL appends rather than a merely cold cache.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,7 +29,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -87,17 +97,40 @@ pub struct SearchResult {
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
     pub cache_root: PathBuf,
-    readers: Mutex<LruCache<String, (Index, IndexReader)>>,
+    readers: Mutex<LruCache<PathBuf, (Index, IndexReader)>>,
     /// TTL cache of parsed manifests, keyed (table, project). Per-service
     /// (not global) so distinct object stores never cross-contaminate.
     manifests: DashMap<(String, String), (Instant, Arc<manifest::Manifest>)>,
     /// Cold `open_index` calls — observability for the reader cache.
     pub index_opens: AtomicU64,
+    /// Last time each cache dir was served to a query — the reaper's recency
+    /// signal. mmap reads don't reliably move a directory's atime, so the
+    /// filesystem cannot be asked what is hot. Dirs absent here (never touched
+    /// by this process, i.e. the post-restart case) fall back to dir mtime,
+    /// which is their unpack time.
+    last_used: DashMap<PathBuf, SystemTime>,
+}
+
+/// Outcome of one [`TantivySearchService::reap_disk_cache`] sweep.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReapReport {
+    pub dirs_scanned: usize,
+    pub bytes_before: u64,
+    pub dirs_removed: usize,
+    pub bytes_removed: u64,
+    pub errors: usize,
 }
 
 impl TantivySearchService {
     pub fn new(object_store: Arc<dyn ObjectStore>, cache_root: PathBuf) -> Self {
-        Self { object_store, cache_root, readers: Mutex::new(LruCache::new(READER_CACHE_ENTRIES)), manifests: DashMap::new(), index_opens: AtomicU64::new(0) }
+        Self {
+            object_store,
+            cache_root,
+            readers: Mutex::new(LruCache::new(READER_CACHE_ENTRIES)),
+            manifests: DashMap::new(),
+            index_opens: AtomicU64::new(0),
+            last_used: DashMap::new(),
+        }
     }
 
     /// Single-predicate convenience used by tests/tools.
@@ -149,7 +182,7 @@ impl TantivySearchService {
         // `None` hits = the index lacks a queried field (coverage gap).
         let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid)| async move {
             let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
-            let (index, reader) = self.open_cached(&blob_path, &dir).with_context(|| format!("open index {file_uuid}"))?;
+            let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
             match build_node_query(&index, node)? {
                 PredsQuery::MissingField => Ok::<_, anyhow::Error>((None, rows, entry_covered, ordinals_valid)),
                 PredsQuery::Query(q) => Ok((Some(query_with_searcher(&reader.searcher(), &*q, None)?), rows, entry_covered, ordinals_valid)),
@@ -260,20 +293,26 @@ impl TantivySearchService {
         Ok(m)
     }
 
-    /// LRU-cached open. Blob paths are immutable so entries are never stale.
-    fn open_cached(&self, blob_path: &str, dir: &Path) -> Result<(Index, IndexReader)> {
-        if let Some(v) = self.readers.lock().get(blob_path) {
+    /// LRU-cached open, keyed by cache dir — 1:1 with the (immutable) blob
+    /// path, so entries are never stale, and the reaper can drop the reader
+    /// for a dir it deletes under that same key.
+    fn open_cached(&self, dir: &Path) -> Result<(Index, IndexReader)> {
+        if let Some(v) = self.readers.lock().get(dir) {
             return Ok(v.clone());
         }
         let index = store::open_index(dir)?;
         let reader = index.reader().map_err(|e| anyhow!("open reader: {e}"))?;
         self.index_opens.fetch_add(1, Ordering::Relaxed);
-        self.readers.lock().put(blob_path.to_string(), (index.clone(), reader.clone()));
+        self.readers.lock().put(dir.to_path_buf(), (index.clone(), reader.clone()));
         Ok((index, reader))
     }
 
     async fn ensure_cached(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> Result<PathBuf> {
         let dir = store::local_cache_path(&self.cache_root, table, project_id, file_uuid);
+        // Stamped on every hit, not only on miss: recency is what the reaper
+        // sorts by, and a dir serving a query every minute must never look as
+        // old as its unpack time.
+        self.last_used.insert(dir.clone(), SystemTime::now());
         if has_any_segment(&dir) {
             return Ok(dir);
         }
@@ -292,6 +331,108 @@ impl TantivySearchService {
             Err(e) => return Err(e).context("rename into cache"),
         }
         Ok(dir)
+    }
+
+    /// Bound the extracted-index disk tree at `budget_bytes`, evicting
+    /// least-recently-used dirs until it fits. Blocking IO — call from
+    /// `spawn_blocking`.
+    ///
+    /// Eviction is pure cache loss, never a correctness risk: every dir is an
+    /// immutable extraction of an object-store blob, and the next query that
+    /// wants it re-downloads through `ensure_cached`. That is also why this
+    /// consults nothing but the filesystem — it does NOT need to know which
+    /// parquet files are still live, so a compacted-away file's dir is reaped
+    /// by the same rule that reaps a merely cold one: nobody opened it.
+    ///
+    /// Unlinking a dir whose index is still mmap'd is safe on Unix (existing
+    /// mappings stay valid), but the space is not reclaimed until the last
+    /// mapping drops — so the reader-LRU entry is dropped with the dir.
+    ///
+    /// Racing `ensure_cached` is likewise only ever a cache miss: the loser
+    /// either re-downloads, or fails `open_index` on a half-deleted dir and
+    /// its query falls back to a full scan.
+    pub fn reap_disk_cache(&self, budget_bytes: u64) -> ReapReport {
+        let root = self.cache_root.join("tantivy_cache");
+        let mut entries = collect_index_dirs(&root);
+        let mut report = ReapReport { dirs_scanned: entries.len(), bytes_before: entries.iter().map(|e| e.bytes).sum(), ..Default::default() };
+        let mut live = report.bytes_before;
+        if live <= budget_bytes {
+            return report;
+        }
+        // Coldest first; a `last_used` stamp from this process beats dir mtime.
+        entries.sort_by_key(|e| self.last_used.get(&e.dir).map_or(e.mtime, |v| *v));
+        for entry in entries {
+            if live <= budget_bytes {
+                break;
+            }
+            self.readers.lock().pop(&entry.dir);
+            self.last_used.remove(&entry.dir);
+            match std::fs::remove_dir_all(&entry.dir) {
+                Ok(()) => {
+                    live = live.saturating_sub(entry.bytes);
+                    report.dirs_removed += 1;
+                    report.bytes_removed += entry.bytes;
+                    prune_empty_parents(&entry.dir, &root);
+                }
+                // Already gone, or racing an unpack — either way not ours to
+                // account for, and retried on the next sweep.
+                Err(_) => report.errors += 1,
+            }
+        }
+        report
+    }
+}
+
+/// One extracted index directory, as the reaper sees it.
+struct CachedDir {
+    dir: PathBuf,
+    bytes: u64,
+    /// Unpack time, the recency fallback for dirs this process never served
+    /// (post-restart, or another process's leftovers).
+    mtime: SystemTime,
+}
+
+/// Walk `root` and return every extracted index directory with its size. A
+/// directory is a leaf index iff it holds `meta.json`; anything else is an
+/// interior node of the `{table}/{project}/{file_uuid}` tree and is descended
+/// into. Crashed-unpack leftovers (`tempfile`'s `.tmpXXXX` dirs) hold a
+/// `meta.json` too, so they are collected — with an old mtime and no
+/// `last_used` entry they sort to the very front of the eviction order, which
+/// is exactly where they belong.
+///
+/// The list is materialized because eviction has to sort it globally. That is
+/// on the order of 100 bytes per index dir, so it stays clear of mattering on
+/// a memory-tight box even with a cache in the hundreds of GB.
+fn collect_index_dirs(root: &Path) -> Vec<CachedDir> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        // Materialized so the leaf test can be made before descending.
+        let children: Vec<_> = rd.flatten().collect();
+        if children.iter().any(|c| c.file_name() == "meta.json") {
+            let (bytes, mtime) = children
+                .iter()
+                .filter_map(|c| c.metadata().ok())
+                .fold((0u64, SystemTime::UNIX_EPOCH), |(b, t), m| (b + m.len(), t.max(m.modified().unwrap_or(SystemTime::UNIX_EPOCH))));
+            out.push(CachedDir { dir, bytes, mtime });
+        } else {
+            stack.extend(children.iter().filter(|c| c.file_type().is_ok_and(|t| t.is_dir())).map(|c| c.path()));
+        }
+    }
+    out
+}
+
+/// Remove now-empty ancestors of a reaped dir, stopping at `root` (kept) or at
+/// the first non-empty directory. Without this the `{table}/{project}`
+/// skeleton outlives every index it ever held.
+fn prune_empty_parents(dir: &Path, root: &Path) {
+    let mut cur = dir.parent();
+    while let Some(p) = cur.filter(|p| *p != root && p.starts_with(root)) {
+        if std::fs::remove_dir(p).is_err() {
+            return; // non-empty, or racing a concurrent unpack — leave it
+        }
+        cur = p.parent();
     }
 }
 
@@ -324,7 +465,82 @@ fn has_any_segment(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::entry_overlaps;
+    use std::{path::PathBuf, sync::Arc, time::SystemTime};
+
+    use super::{TantivySearchService, collect_index_dirs, entry_overlaps};
+
+    /// Fake extracted index of `bytes` bytes at `<root>/tantivy_cache/<rel>`.
+    fn fake_index(root: &std::path::Path, rel: &str, bytes: usize) -> PathBuf {
+        let dir = root.join("tantivy_cache").join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), "{}").unwrap();
+        std::fs::write(dir.join("seg0.store"), vec![b'x'; bytes]).unwrap();
+        dir
+    }
+
+    fn service(root: &std::path::Path) -> TantivySearchService {
+        TantivySearchService::new(Arc::new(object_store::memory::InMemory::new()), root.to_path_buf())
+    }
+
+    #[test]
+    fn collect_walks_to_leaves_and_never_into_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_index(tmp.path(), "tbl/proj-a/0f0f-aaaa", 100);
+        fake_index(tmp.path(), "tbl/proj-b/bucket-uuid", 50);
+        let dirs = collect_index_dirs(&tmp.path().join("tantivy_cache"));
+        assert_eq!(dirs.len(), 2, "one entry per leaf, regardless of nesting depth");
+        // meta.json is 2 bytes; a leaf's size is the whole dir, not just the payload.
+        let mut sizes: Vec<u64> = dirs.iter().map(|d| d.bytes).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![52, 102]);
+    }
+
+    #[test]
+    fn reap_evicts_coldest_first_until_under_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let (cold, warm) = (fake_index(tmp.path(), "tbl/p/cold", 1000), fake_index(tmp.path(), "tbl/p/warm", 1000));
+        // `warm` was served by a query; `cold` never was.
+        svc.last_used.insert(warm.clone(), SystemTime::now());
+
+        let report = svc.reap_disk_cache(1500);
+        assert_eq!(report.dirs_scanned, 2);
+        assert_eq!(report.dirs_removed, 1, "evicts only as much as the budget demands");
+        assert!(!cold.exists(), "the dir no query touched goes first");
+        assert!(warm.exists(), "the recently-served dir survives");
+        assert!(report.bytes_before - report.bytes_removed <= 1500);
+        // Emptied ancestors go with it, but the cache root itself stays.
+        assert!(tmp.path().join("tantivy_cache").exists());
+        assert!(!tmp.path().join("tantivy_cache/tbl/p/cold").exists());
+    }
+
+    #[test]
+    fn reap_under_budget_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let dir = fake_index(tmp.path(), "tbl/p/only", 1000);
+        let report = svc.reap_disk_cache(u64::MAX);
+        assert_eq!((report.dirs_removed, report.bytes_removed), (0, 0));
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn reap_on_a_missing_root_reports_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = service(tmp.path()).reap_disk_cache(0);
+        assert_eq!((report.dirs_scanned, report.dirs_removed), (0, 0));
+    }
+
+    #[test]
+    fn reap_drops_the_reader_entry_with_the_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path());
+        let dir = fake_index(tmp.path(), "tbl/p/x", 1000);
+        // A stale reader pinning the mmap would hold the space despite the unlink.
+        assert!(svc.reap_disk_cache(0).dirs_removed == 1);
+        assert!(svc.readers.lock().peek(&dir).is_none());
+        assert!(svc.last_used.get(&dir).is_none());
+    }
 
     #[test]
     fn time_prune_overlap_logic() {
