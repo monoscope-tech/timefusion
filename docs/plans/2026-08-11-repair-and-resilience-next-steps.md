@@ -155,7 +155,29 @@ pause and accumulate not-ready tasks rather than rolling back).
 >
 > Not the flush escalation path: `flush_sort_unsorted_fallbacks_total` is **0**.
 >
-> **Followed up, and it is not a poisoned partition at all — do NOT drain 07-31.** past3 has
+> **CORRECTION (later the same day): the "do NOT drain" conclusion below is NOT supported —
+> I over-read an unstable instrument.** Probing single dates directly gave `full-set` for
+> BOTH `2026-07-31` and `2026-07-30` (a date this plan never mentions) while `2026-08-01` was
+> bounded — i.e. the legacy poisoning looks real and possibly wider than 36 files. Minutes
+> later the same single-date probes returned **no `DedupExec` at all**. Same query, same
+> project, three different answers within an hour: no-DedupExec / bounded / full-set.
+>
+> **Treat every EXPLAIN-derived claim in this section — including this plan's original
+> "10d bounded, 11d full-set" — as unreliable.** The sliding-window table below is real as far
+> as it goes, but it only ever covered *recent* dates, so it cannot support any conclusion
+> about 07-31. Mine did, and that was wrong.
+>
+> Ground truth instead of plan shapes: `repair_verified_sorted.txt` holds, for past3,
+> **one** verified-sorted file each for 07-17..08-02 (with 07-24 and 07-30 absent entirely),
+> against 21 / 67 / 52 / 239 for 08-08..08-11. Whether "1 verified file" means *clean because
+> compacted down to one file* or *1 of 36 done* decides the whole question, and it needs the
+> partition's actual file count — which is the one cheap measurement still missing. Get that
+> before deciding to drain or not; do not decide from EXPLAIN.
+>
+> The rolling fresh-flush effect described below is a separate, additional problem. Both can
+> be true.
+
+> **Follow-up on the recent-window behaviour.** past3 has
 > **399 files in `repair_verified_sorted.txt`**, so repair has not been ignoring it. Sliding
 > the window instead of widening it locates the real thing (2-day window, varying only where
 > it *ends*):
