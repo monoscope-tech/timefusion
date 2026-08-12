@@ -734,6 +734,14 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
 fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logical_expr::Expr>) -> String {
     let mut expressions = expressions.into_iter().map(canonical).collect::<Vec<_>>();
     expressions.sort();
+    // AND is idempotent, so `X AND X` must canonicalize to `X`. Both sides
+    // genuinely do repeat conjuncts: the optimizer leaves a predicate on the
+    // Filter node AND re-pushes it into the TableScan's `partial_filters`, so
+    // `source_and_filters` collects it twice (observed in prod 2026-08-12 —
+    // every declared filter printed as `(X) AND (X)`). It happened to cancel
+    // out while both sides duplicated equally, which is precisely the kind of
+    // accident that stops holding the moment one side is shaped differently.
+    expressions.dedup();
     expressions.join(" AND ")
 }
 
@@ -1225,6 +1233,22 @@ mod tests {
 
     fn spec() -> RollupSpec {
         crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
+    }
+
+    /// `AND` is idempotent, so a conjunct repeated by the planner must not change
+    /// the canonical string. Prod 2026-08-12 printed every declared measure
+    /// filter as `(X) AND (X)`: the optimizer leaves a predicate on the Filter
+    /// node and re-pushes it into the TableScan's `partial_filters`, so both
+    /// copies were collected. The two sides duplicated equally and so still
+    /// compared equal — by luck, not construction.
+    #[test]
+    fn a_conjunct_repeated_by_the_planner_canonicalizes_once() {
+        use datafusion::logical_expr::{col, lit};
+        let (left, right) = (col("kind").eq(lit("server")), col("name").eq(lit("monoscope.http")));
+        let once = canonical_and([&left, &right]);
+        assert_eq!(canonical_and([&left, &right, &left]), once, "a repeated conjunct must not change the canonical form");
+        assert_eq!(canonical_and([&right, &left, &right, &left]), once, "order and multiplicity must both be canonical");
+        assert!(!once.contains(" AND ") || once.matches(" AND ").count() == 1, "two distinct conjuncts join exactly once: {once}");
     }
 
     #[test]
