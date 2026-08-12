@@ -1,3 +1,7 @@
+> **SUPERSEDED 2026-08-12** by [2026-08-12-rollup-state-of-play.md](2026-08-12-rollup-state-of-play.md).
+> Steps 1-3 are done and shipped; step 4 is re-scoped there (the endpoint-tier
+> premise was wrong). Kept for the reasoning, not the instructions.
+
 # Rollups: next steps and refactors
 
 **Status 2026-08-11.** Read routing is live and correct. `otel_metrics` routes and

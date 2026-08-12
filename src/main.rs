@@ -56,6 +56,7 @@ use anyhow::Context;
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use timefusion::{
+    bootstrap,
     buffered_write_layer::BufferedWriteLayer,
     clock,
     config::{self, AppConfig},
@@ -68,6 +69,10 @@ use tracing::{error, info, warn};
 fn main() -> anyhow::Result<()> {
     // Initialize environment before any threads spawn
     dotenv().ok();
+    // Before the runtime, so every worker thread and listener socket inherits
+    // the raised limit. `bootstrap()` calls it too, for the e2e harness — which
+    // does NOT go through main().
+    bootstrap::raise_file_limit();
 
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("healthcheck") {

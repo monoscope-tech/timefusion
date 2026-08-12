@@ -43,7 +43,7 @@ pub struct Bootstrapped {
 /// service config on every deploy, so a ulimit set out of band does not survive.
 /// Best-effort by design — a platform that refuses the raise is not a reason to
 /// fail boot, and the log line is enough to diagnose it.
-fn raise_file_limit() {
+pub fn raise_file_limit() {
     // SAFETY: both calls take a valid, fully-initialized `rlimit`, and neither
     // retains the pointer past the call.
     unsafe {
