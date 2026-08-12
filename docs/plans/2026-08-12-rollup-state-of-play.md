@@ -35,49 +35,42 @@ Verified in production:
 
 ---
 
-## The one open functional item: promotion does not fire in prod
+## Golden Signals: ROOT-CAUSED and fixed (`76eedbb`)
 
-Golden Signals filters `(kind='server' OR name='apitoolkit-http-span' OR
-name='monoscope.http')` — a *row* filter that textually equals the `server_*`
-measures' declared filter. The matcher promotes such a filter to the pre-filtered
-measures plus a `HAVING SUM(count_F) > 0` guard. It works in unit tests and in a
-real-`Database` integration test. **It does not fire in prod, and we do not yet
-know why.**
+The promotion failed in prod and passed in every test because of **tantivy index
+hints**, not because of anything in the promotion logic.
 
-What has been ruled out:
+Isolated on prod by snapshotting the counters, running exactly one Golden
+Signals-shaped query, and snapshotting again: **+1 `unknown_filter`, nothing
+else.** The log then printed both canonical strings:
 
-- Not the canonical string's Arrow type (`Utf8` vs `Utf8View`) — fixed in
-  `da6aa3b`, necessary but not sufficient.
-- Not the log level: prod runs `RUST_LOG=info`, so the `rollup_promotion_unmatched`
-  warn prints. Once `cb04661` deployed it fired within minutes.
+```
+query    (((kind = "server") AND text_match(kind,"server")
+                              AND text_match(kind,"server","eq")) OR name=... )
+declared  ((kind = "server") AND text_match(kind,"server")) OR name=...
+```
 
-**What the deployed log actually said (2026-08-12 12:33Z).** Two things, and the
-prime suspect was wrong:
+`optimizers/tantivy_rewriter` **additively** ANDs `text_match(col, q)` beside a
+predicate it can accelerate and never removes the original comparison — so the
+semantics live entirely in the other terms and the hint is noise for an equality
+comparison. But the two sides do not receive the same hints: the query carried
+three across two arities where the declared filter carried one.
 
-1. **`measure_filters` is healthy in prod — zero `rollup_measure_probe_*` events.**
-   Every declared measure resolves. That eliminates the probe as the cause.
-2. **Every conjunct was printed TWICE, on both sides** — `server_request_count`
-   came out as `(kind=... OR name=... OR name=...) AND (kind=... OR name=... OR
-   name=...)`. The optimizer leaves a predicate on the Filter node *and* re-pushes
-   it into the TableScan's `partial_filters`, so `source_and_filters` collects
-   both copies. `canonical_and` sorted (order-independent) but did not dedupe
-   (not multiplicity-independent). Both sides duplicated equally, so the
-   comparison still succeeded — by accident, not by construction. Fixed in
-   `6f0ce46`; `AND` is idempotent, so dedupe after the sort.
+Fix: at each AND level, drop any `text_match` on a column that level already
+compares. Scoped that way, a `text_match` the *user* wrote against a different
+column survives and the filter correctly matches no declared measure. Two
+supporting normalizations were required — dedupe at every level (the duplicates
+were nested inside an OR, out of reach of a top-level dedupe) and collapse a
+one-element conjunction to its operand.
 
-That duplication is the **leading hypothesis** for the Golden Signals miss: no
-test session registers the tantivy pushdown rule, so nothing in a test ever
-duplicates a conjunct, and no test can observe an asymmetry that exists only on a
-real session. The log also confirms the rewrite is real — declared filters carry
-`text_match(kind, "server")` and `text_match(status_code, "ERROR")` alongside the
-equality.
+**Note a second, separate bug:** `tantivy_rewriter`'s invariant 3 claims
+idempotence under repeated passes. Two arities of the same hint on one expression
+say otherwise. The matcher no longer depends on it either way, but the rewriter
+is still emitting redundant hints into every plan.
 
-**Still unconfirmed:** no Golden Signals query has been observed since the fix
-deployed. The two promotion declines captured so far were a `SELECT DISTINCT
-attributes___db___system___name ... IS NOT NULL` probe — a genuinely
-non-dimension predicate, correctly refused. Confirm by watching for a
-`rollup_promotion_unmatched` whose `promoted=` field mentions `kind`, or for
-`rollup_hits_*` moving off zero.
+**Why no test caught it:** a bare test session registers no tantivy rewriter, so
+nothing in a test ever carried a hint. The regression test now builds the exact
+prod expression by hand.
 
 ---
 
@@ -90,9 +83,14 @@ only in `src/Pkg/Parser.hs`, as part of the **ad-hoc query DSL** — user-typed
 search predicates, not a fixed widget. Their shape is unbounded, so no declared
 dimension set can route them, and a coarse endpoint tier would serve none of them.
 
-Correctly refusing them is the right behaviour. Measure endpoint cardinality only
-if a *specific, fixed* widget shows up in the miss log — not on the strength of
-this counter.
+Correctly refusing them is the right behaviour.
+
+**Cardinality measured anyway, so the judgment is data-backed** (2026-08-12, one
+project, one 3-hour window): **252 distinct `attributes___url___path` values**
+against 3 distinct services. Rows per bucket scale with the product of the
+dimensions, so an endpoint tier would be ~250x wider per bucket than the current
+3-dimension spec — a slightly smaller copy of the source table, which is exactly
+what the schema comment warns against. Do not build it.
 
 ---
 
@@ -112,11 +110,14 @@ this counter.
   0, and an empty range set falls through to a full rebuild. That is the safe
   direction (dedup can drop rows, so an unchanged mask does not prove unchanged
   content) but it means compaction-driven rebuilds will always read as `full`.
-- `rollup_backfill_tick` now logs `queued/built/uncertifiable/failed` whenever
-  there was work. Previously it logged only on success, so a tick that queued 200
-  partitions and certified none was byte-identical to an idle tick — which is how
-  a frozen backfill hides. If `queued` is high and `built` is 0, the blocker is
-  certification, not the rollup build.
+- `rollup_backfill_tick` logs `pool/queued/built/uncertifiable/failed` whenever
+  there was work; `rollup_backfill_idle` logs `pool/gated/backoff/covered` when a
+  non-empty pool survived nothing. **The backfill is currently queuing nothing at
+  all** — zero ticks logged across 40 minutes on 2026-08-12, while the rollup
+  table showed 08-01..08-08 covered for only the original canary and 08-09..08-11
+  for 4-6 projects. So the widening has NOT reached the sealed days. `7b651f3`
+  ships the funnel that says which of gated / backoff / already-covered is
+  swallowing them; read `rollup_backfill_idle` first.
 
 ---
 
