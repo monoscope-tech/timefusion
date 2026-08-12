@@ -8733,15 +8733,34 @@ impl Database {
                 let date_key = date.to_string();
                 fingerprints.keys().filter(move |(_, d)| *d == date_key).map(move |(project, _)| (project.clone(), date)).collect::<Vec<_>>()
             })
-            .filter(|(project, date)| {
-                self.config.maintenance.rollup_build_enabled_for(project)
-                    && self.rollup_retry_allowed(project, source, &date.to_string())
-                    && fingerprints
-                        .get(&(project.clone(), date.to_string()))
-                        .is_some_and(|fp| !self.rollup_coverage_current(project, source, &date.to_string(), *fp))
-            })
             .collect();
+        // Why a partition was NOT queued, tallied. An empty candidate list is the
+        // one outcome with no evidence attached: prod 2026-08-12 logged ZERO
+        // backfill ticks for 40 minutes while sealed days 08-01..08-08 held only
+        // the canary project, and "converged" and "the filter dropped everything"
+        // were indistinguishable from outside.
+        let pool = candidates.len();
+        let (mut gated, mut backoff, mut covered) = (0usize, 0usize, 0usize);
+        candidates.retain(|(project, date)| {
+            let date_key = date.to_string();
+            if !self.config.maintenance.rollup_build_enabled_for(project) {
+                gated += 1;
+                return false;
+            }
+            if !self.rollup_retry_allowed(project, source, &date_key) {
+                backoff += 1;
+                return false;
+            }
+            let fresh = fingerprints.get(&(project.clone(), date_key.clone())).is_some_and(|fp| !self.rollup_coverage_current(project, source, &date_key, *fp));
+            if !fresh {
+                covered += 1;
+            }
+            fresh
+        });
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        if pool > 0 && candidates.is_empty() {
+            info!(source, pool, gated, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
+        }
 
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
         let started = std::time::Instant::now();
@@ -8786,7 +8805,7 @@ impl Database {
         // uncertifiable used to be byte-identical in the log to a tick with
         // nothing to do — which is how a frozen backfill hides.
         if queued > 0 {
-            info!(source, queued, built, uncertifiable, failed, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
+            info!(source, pool, queued, built, uncertifiable, failed, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
         }
         let _ = schema;
         Ok(built)
