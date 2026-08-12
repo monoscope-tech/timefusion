@@ -10,6 +10,8 @@ autotests = false
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
+# Only for the boot-time RLIMIT_NOFILE raise; already in the tree transitively.
+libc = "0.2"
 datafusion = "54.0.0"
 datafusion-datasource = "54.0.0"
 arrow = "58"

@@ -3572,6 +3572,36 @@ impl Database {
             }
         });
 
+        // Tantivy cache reap — bound the extracted-index disk tree. The only
+        // thing that deletes from it: `gc_after_compaction` reaps manifest
+        // entries and object-store blobs, but never the local extraction, and
+        // that tree shares a volume with the WAL. Uses the search service (the
+        // reader, which owns the cache), not the indexer.
+        spawn_cron_job("Tantivy cache reap", &self.config.tantivy.timefusion_tantivy_cache_reap_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
+                    let Some(svc) = db.tantivy_search().cloned() else { return };
+                    let budget = db.config.tantivy.cache_disk_bytes();
+                    // Walks the whole cache tree and unlinks — never on the runtime's worker threads.
+                    let Ok(report) = tokio::task::spawn_blocking(move || svc.reap_disk_cache(budget)).await else { return };
+                    crate::metrics::record_tantivy_cache_bytes(report.bytes_before - report.bytes_removed);
+                    if report.dirs_removed > 0 || report.errors > 0 {
+                        info!(
+                            "tantivy cache reap: scanned={} before={}MB removed={} freed={}MB errors={} budget={}MB",
+                            report.dirs_scanned,
+                            report.bytes_before / 1024 / 1024,
+                            report.dirs_removed,
+                            report.bytes_removed / 1024 / 1024,
+                            report.errors,
+                            budget / 1024 / 1024
+                        );
+                    }
+                }
+            }
+        });
+
         // Checkpoint + expired-log cleanup — runs the post-commit hooks out-of-band
         // (see the 2026-07-09 incident) so R2 500s on the checkpoint PUT / bulk log
         // delete never fail a landed commit; faster cadence keeps the log bounded.
@@ -8715,7 +8745,8 @@ impl Database {
 
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
         let started = std::time::Instant::now();
-        let mut built = 0;
+        let (mut built, mut uncertifiable, mut failed) = (0, 0usize, 0usize);
+        let queued = candidates.len();
         for (project_id, date) in candidates {
             // The FIRST unit always runs: a day-sized aggregate is indivisible,
             // so checking the budget before it would let a slow day produce
@@ -8733,20 +8764,29 @@ impl Database {
                 Ok(Some(clean_fp)) => {
                     if let Err(error) = self.rebuild_rollup_partition(source, &project_id, &date_key, clean_fp).await {
                         self.record_rollup_failure(&project_id, source, &date_key);
+                        failed += 1;
                         warn!(project_id, date = %date, source, %error, "rollup backfill build failed");
                         continue;
                     }
                     built += 1;
                 }
-                Ok(None) => debug!(project_id, date = %date, source, "rollup backfill: partition not certifiable yet"),
+                Ok(None) => {
+                    uncertifiable += 1;
+                    debug!(project_id, date = %date, source, "rollup backfill: partition not certifiable yet");
+                }
                 Err(error) => {
                     self.record_rollup_failure(&project_id, source, &date_key);
+                    failed += 1;
                     warn!(project_id, date = %date, source, %error, "rollup backfill certification failed");
                 }
             }
         }
-        if built > 0 {
-            info!(source, built, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
+        // Log whenever there was WORK, not only when some of it succeeded. A tick
+        // that queues 200 partitions and builds none because every one is
+        // uncertifiable used to be byte-identical in the log to a tick with
+        // nothing to do — which is how a frozen backfill hides.
+        if queued > 0 {
+            info!(source, queued, built, uncertifiable, failed, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
         }
         let _ = schema;
         Ok(built)

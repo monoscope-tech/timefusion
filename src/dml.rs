@@ -220,10 +220,10 @@ impl QueryPlanner for DmlQueryPlanner {
                                 crate::metrics::record_rollup_hit(mode, &grain);
                                 return Ok(exec);
                             }
-                            Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::StaleCoverage.label()),
+                            Ok(_) => crate::metrics::record_rollup_miss(crate::rollup::MissReason::StaleCoverage),
                             Err(error) => {
                                 warn!(%error, event = "rollup_rewrite_failed", stage = "physical", "rollup rewrite could not be planned; using raw plan");
-                                crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
+                                crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape);
                             }
                         },
                         // The mismatch names the offending field and both types.
@@ -231,17 +231,17 @@ impl QueryPlanner for DmlQueryPlanner {
                         // way to tell WHICH column drifted.
                         Err(error) => {
                             warn!(%error, event = "rollup_rewrite_failed", stage = "schema", "rollup rewrite does not match the query schema; using raw plan");
-                            crate::metrics::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch.label());
+                            crate::metrics::record_rollup_miss(crate::rollup::MissReason::RewriteSchemaMismatch);
                         }
                     },
                     Err(error) => {
                         warn!(%error, event = "rollup_rewrite_failed", stage = "sql", "rollup rewrite SQL could not be planned; using raw plan");
-                        crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape.label());
+                        crate::metrics::record_rollup_miss(crate::rollup::MissReason::UnsupportedShape);
                     }
                 }
             }
             Ok(None) => {}
-            Err(reason) => crate::metrics::record_rollup_miss(reason.label()),
+            Err(reason) => crate::metrics::record_rollup_miss(reason),
         }
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {

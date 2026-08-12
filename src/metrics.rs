@@ -238,6 +238,15 @@ pub fn init_metrics(
         .tantivy_recovery_pending_files
         as u64);
 
+    // Extracted-index disk cache, as of the last reap. Shares a volume with
+    // the WAL, so a plateau at the configured budget is healthy and a climb
+    // past it means the reap cron has stopped running.
+    meter
+        .u64_observable_gauge("timefusion.tantivy.cache_disk_bytes")
+        .with_description("Bytes under <data_dir>/tantivy_cache as of the most recent reap; 0 until the first one runs")
+        .with_callback(|obs| obs.observe(TANTIVY_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed), &[]))
+        .build();
+
     // Index lag: how far behind ingest the newest published tantivy index is.
     // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
     // indexing lag that the rewriter / search service can't shortcut around.
@@ -297,6 +306,15 @@ pub fn record_flush(success: bool) {
     if let Some(m) = METRICS.get() {
         (if success { &m.flush_completed } else { &m.flush_failed }).add(1, &[]);
     }
+}
+
+/// Last observed size of the tantivy extracted-index disk cache. Written by
+/// the reap cron, read by the `cache_disk_bytes` gauge callback — the walk it
+/// comes from is far too expensive to run per scrape.
+static TANTIVY_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn record_tantivy_cache_bytes(bytes: u64) {
+    TANTIVY_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Generates the no-attribute "increment by one" recorders. Each no-ops on the
@@ -415,26 +433,36 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
     }
 }
 
-/// One dashboard aggregate that fell through to a raw scan. `reason` is a
-/// `MissReason::label` — a closed, bounded set, never a table or project id.
-pub fn record_rollup_miss(reason: &'static str) {
+/// One dashboard aggregate that fell through to a raw scan.
+///
+/// Takes the REASON, not its label: the match below is exhaustive, so a new
+/// variant fails the build instead of landing in a catch-all bucket. It
+/// previously matched on the string and four of the thirteen reasons had no
+/// arm, so `missing_project`, `unbounded_time`, `non_decomposable` and
+/// `rewrite_schema_mismatch` were indistinguishable in prod — 29 misses that
+/// could not be diagnosed without a deploy.
+pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
+    use crate::rollup::MissReason as R;
     let stats = maintenance_stats();
     stats.rollup_misses_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match reason {
-        "not_built" => &stats.rollup_miss_not_built,
-        "stale_coverage" => &stats.rollup_miss_stale_coverage,
-        "tiny_interior" => &stats.rollup_miss_tiny_interior,
-        "unsupported_shape" => &stats.rollup_miss_unsupported,
-        "incomplete_coverage" => &stats.rollup_miss_incomplete_coverage,
-        "unknown_filter" => &stats.rollup_miss_unknown_filter,
-        "missing_measure" => &stats.rollup_miss_missing_measure,
-        "unaligned_bucket_width" => &stats.rollup_miss_unaligned_bucket,
-        "unknown_group_by" => &stats.rollup_miss_unknown_group_by,
-        _ => &stats.rollup_miss_other,
+        R::NotBuilt => &stats.rollup_miss_not_built,
+        R::StaleCoverage => &stats.rollup_miss_stale_coverage,
+        R::TinyInterior => &stats.rollup_miss_tiny_interior,
+        R::UnsupportedShape => &stats.rollup_miss_unsupported,
+        R::IncompleteCoverage => &stats.rollup_miss_incomplete_coverage,
+        R::UnknownFilter => &stats.rollup_miss_unknown_filter,
+        R::MissingMeasure => &stats.rollup_miss_missing_measure,
+        R::PartialBucket => &stats.rollup_miss_unaligned_bucket,
+        R::UnknownGroupBy => &stats.rollup_miss_unknown_group_by,
+        R::MissingProject => &stats.rollup_miss_missing_project,
+        R::UnboundedTime => &stats.rollup_miss_unbounded_time,
+        R::NonDecomposableAggregate => &stats.rollup_miss_non_decomposable,
+        R::RewriteSchemaMismatch => &stats.rollup_miss_rewrite_schema_mismatch,
     }
     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = METRICS.get() {
-        m.rollup_misses.add(1, &[KeyValue::new("reason", reason)]);
+        m.rollup_misses.add(1, &[KeyValue::new("reason", reason.label())]);
     }
 }
 
@@ -587,7 +615,10 @@ atomic_stats! {
     rollup_miss_missing_measure,
     rollup_miss_unaligned_bucket,
     rollup_miss_unknown_group_by,
-    rollup_miss_other,
+    rollup_miss_missing_project,
+    rollup_miss_unbounded_time,
+    rollup_miss_non_decomposable,
+    rollup_miss_rewrite_schema_mismatch,
     dirty_bin_queue_depth,
     dirty_bin_enqueued,
     dirty_bin_eligible,

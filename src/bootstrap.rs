@@ -30,6 +30,36 @@ pub struct Bootstrapped {
     pub shutdown: CancellationToken,
 }
 
+/// Raise the open-file soft limit to the hard limit.
+///
+/// Docker hands a process the daemon's default soft limit — 1024 in prod, against
+/// a 524288 hard limit — and a database that memory-maps parquet, holds a tantivy
+/// index per partition and serves pgwire exhausts that in seconds. On 2026-08-12
+/// prod spent its first 5.5 minutes after boot emitting 1.6M `Too many open files`
+/// lines and REFUSING pgwire connections (`Error accept socket`), which also
+/// pushed every other line out of the log ring buffer.
+///
+/// This belongs in the process, not the service definition: CapRover rewrites the
+/// service config on every deploy, so a ulimit set out of band does not survive.
+/// Best-effort by design — a platform that refuses the raise is not a reason to
+/// fail boot, and the log line is enough to diagnose it.
+fn raise_file_limit() {
+    // SAFETY: both calls take a valid, fully-initialized `rlimit`, and neither
+    // retains the pointer past the call.
+    unsafe {
+        let mut limit = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 || limit.rlim_cur >= limit.rlim_max {
+            return;
+        }
+        let (previous, target) = (limit.rlim_cur, limit.rlim_max);
+        limit.rlim_cur = target;
+        match libc::setrlimit(libc::RLIMIT_NOFILE, &limit) {
+            0 => tracing::info!(previous, target, "raised the open-file soft limit to the hard limit"),
+            _ => tracing::warn!(previous, target, error = %std::io::Error::last_os_error(), "could not raise the open-file soft limit"),
+        }
+    }
+}
+
 /// Build the BufferedWriteLayer + Database wiring exactly as `main.rs` does,
 /// minus listener binding / signal handling / telemetry init (the caller
 /// owns those — they differ between prod and test).
@@ -39,6 +69,7 @@ pub struct Bootstrapped {
 /// `CancellationToken` can be triggered to ask spawned work to wind down.
 pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     crate::clock::init_from_env();
+    raise_file_limit();
 
     let t_db = std::time::Instant::now();
     let mut db = Database::with_config(Arc::clone(&cfg)).await?;

@@ -836,10 +836,24 @@ async fn measure_filters<'a>(
                     "SELECT timestamp FROM {source} WHERE project_id = {} AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) AND ({filter})",
                     sql_literal(project_id)
                 );
-                let plan = session.create_logical_plan(&probe).await.map_err(|_| MissReason::UnknownFilter)?;
-                let plan = session.optimize(&plan).map_err(|_| MissReason::UnknownFilter)?;
+                // A failure here disqualifies EVERY filtered measure, so the spec
+                // stops routing at all — and from outside the process it looks
+                // identical to a query whose own filter simply did not match.
+                // Discarding the error is what made the two indistinguishable.
+                let planned = async {
+                    let plan = session.create_logical_plan(&probe).await?;
+                    session.optimize(&plan)
+                }
+                .await;
+                let plan = planned.map_err(|error| {
+                    tracing::warn!(event = "rollup_measure_probe_failed", source, measure = %measure.name, probe, %error, "a declared measure filter could not be planned");
+                    MissReason::UnknownFilter
+                })?;
                 let mut filters = Vec::new();
-                source_and_filters(&plan, &mut filters).ok_or(MissReason::UnknownFilter)?;
+                source_and_filters(&plan, &mut filters).ok_or_else(|| {
+                    tracing::warn!(event = "rollup_measure_probe_unwalkable", source, measure = %measure.name, plan = %plan.display_indent(), "a declared measure filter planned to a shape the matcher cannot read");
+                    MissReason::UnknownFilter
+                })?;
                 canonical_and(filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).filter(|term| !is_probe_scaffolding(term)))
             }
         };
