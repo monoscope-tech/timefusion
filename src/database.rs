@@ -8758,8 +8758,24 @@ impl Database {
             fresh
         });
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        if pool > 0 && candidates.is_empty() {
-            info!(source, pool, gated, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
+        if candidates.is_empty() {
+            // Logged even when the pool itself was empty, because that is the
+            // case with no other evidence anywhere. `partition_fingerprints`
+            // returns an EMPTY map when the table has no `num_records` stats —
+            // safe for the read path (it just forces a raw scan) but silently
+            // fatal here, since the backfill builds its entire candidate list
+            // from those keys. Prod 2026-08-12 ran ticks for 40 minutes with
+            // sealed days uncovered and printed nothing at all.
+            info!(
+                source,
+                partitions = fingerprints.len(),
+                pool,
+                gated,
+                backoff,
+                covered,
+                event = "rollup_backfill_idle",
+                "the backfill queued nothing"
+            );
         }
 
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
