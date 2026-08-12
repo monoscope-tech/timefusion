@@ -15,6 +15,11 @@ pub enum MissReason {
     UnboundedTime,
     UnknownGroupBy,
     UnknownFilter,
+    /// The residual row filter constrains columns no declared measure filters
+    /// on, so no rollup could ever have answered it. Separated from
+    /// `UnknownFilter` so that counter means "a filter we should have matched
+    /// and didn't" — see the decline site for the prod evidence.
+    FilterNotEligible,
     MissingMeasure,
     NonDecomposableAggregate,
     PartialBucket,
@@ -39,6 +44,7 @@ impl MissReason {
             Self::UnboundedTime => "unbounded_time",
             Self::UnknownGroupBy => "unknown_group_by",
             Self::UnknownFilter => "unknown_filter",
+            Self::FilterNotEligible => "filter_not_eligible",
             Self::MissingMeasure => "missing_measure",
             Self::NonDecomposableAggregate => "non_decomposable",
             // Names the ONLY thing this reason still means: a `time_bucket`
@@ -1148,21 +1154,49 @@ async fn route_with_spec(
                 .find(|(measure, filter)| measure.agg == "count" && measure.column.is_none() && filter == promoted)
                 .map(|(measure, _)| *measure)
                 .ok_or_else(|| {
+                    let declared = || {
+                        configured_filters
+                            .iter()
+                            .filter(|(measure, _)| measure.agg == "count" && measure.column.is_none())
+                            .map(|(measure, filter)| format!("{}={filter}", measure.name))
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    };
+                    // A residual constraining columns NO declared filter even
+                    // mentions was never a candidate — it is log-explorer and
+                    // facet traffic (`attributes___…___name IS NOT NULL`,
+                    // `jsonb_path_exists`, `LIKE`), not a promotion that failed.
+                    // Prod 2026-08-12: 84 declines in 3h, every one of them this
+                    // shape and not one a dashboard panel. Folding those into
+                    // `unknown_filter` made the counter unreadable — it could not
+                    // distinguish "should have matched and didn't" from "never
+                    // eligible" — and warning about them 84 times in 3h on a hot
+                    // path is how the real case gets buried.
+                    if !promotable
+                        .iter()
+                        .flat_map(|expr| expr.column_refs())
+                        .any(|column| configured_filters.iter().any(|(_, filter)| filter.contains(column.name.as_str())))
+                    {
+                        tracing::debug!(
+                            event = "rollup_promotion_not_eligible",
+                            source,
+                            spec = spec.name.as_deref().unwrap_or_default(),
+                            promoted = %promoted,
+                            "a residual row filter constrains columns no declared measure uses"
+                        );
+                        return MissReason::FilterNotEligible;
+                    }
+                    // A genuine near-miss: the residual talks about the same
+                    // columns a declared measure filters on, yet did not match.
                     // The two canonical strings are the whole content of this
-                    // decline and there is no way to see them from outside. A
-                    // near-miss between textually identical predicates has now
-                    // cost two deploys to diagnose; print both.
+                    // decline and there is no way to see them from outside. This
+                    // has already cost two deploys to diagnose; print both.
                     tracing::warn!(
                         event = "rollup_promotion_unmatched",
                         source,
                         spec = spec.name.as_deref().unwrap_or_default(),
                         promoted = %promoted,
-                        declared = %configured_filters
-                            .iter()
-                            .filter(|(measure, _)| measure.agg == "count" && measure.column.is_none())
-                            .map(|(measure, filter)| format!("{}={filter}", measure.name))
-                            .collect::<Vec<_>>()
-                            .join(" | "),
+                        declared = %declared(),
                         "a residual row filter matched no declared count measure"
                     );
                     MissReason::UnknownFilter
@@ -1303,9 +1337,7 @@ mod tests {
     async fn a_hint_beside_a_dimension_filter_does_not_become_a_residual() {
         let state = session().await;
         let hinted = format!(
-            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND kind = 'server' AND text_match(kind, 'server') \
-             AND timestamp >= to_timestamp_micros(1786500000000000) AND timestamp < to_timestamp_micros(1786530000000000) \
-             GROUP BY resource___service___name"
+            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND kind = 'server' AND text_match(kind, 'server')              AND timestamp >= to_timestamp_micros(1786500000000000) AND timestamp < to_timestamp_micros(1786530000000000)              GROUP BY resource___service___name"
         );
         let plain = hinted.replace(" AND text_match(kind, 'server')", "");
         let (with, without) = (route_for(&state, &hinted).await, route_for(&state, &plain).await);
@@ -1955,6 +1987,9 @@ mod tests {
 
     /// A residual filter that matches NOTHING declared must still refuse. The
     /// promotion widens what routes; it must not widen what is answered wrongly.
+    ///
+    /// `status_message` appears in no declared measure filter, so this is the
+    /// *not eligible* half of the split: nothing could ever have answered it.
     #[tokio::test]
     async fn a_residual_filter_with_no_declared_measure_still_refuses() {
         let state = session().await;
@@ -1962,7 +1997,35 @@ mod tests {
             "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND status_message = 'nope' \
              GROUP BY time_bucket('1 hours', timestamp)"
         );
-        assert_eq!(route_for(&state, &sql).await.err(), Some(MissReason::UnknownFilter), "an unmatched residual must not be promoted");
+        assert_eq!(route_for(&state, &sql).await.err(), Some(MissReason::FilterNotEligible), "an unmatched residual must not be promoted");
+    }
+
+    /// The other half of the split, and the reason it exists: a residual that
+    /// constrains a column a declared measure DOES filter on is a near-miss
+    /// worth a warning, because it is the shape a real dashboard panel takes.
+    ///
+    /// Prod 2026-08-12 read `unknown_filter = 20` and it was 100% facet and
+    /// log-explorer traffic (`attributes___…___name IS NOT NULL`,
+    /// `jsonb_path_exists`, `LIKE`) — none of it a panel. Folding both cases
+    /// into one counter made it impossible to tell "we should have matched this"
+    /// from "this was never a candidate", so the number could not be acted on.
+    /// These two tests are what stop them collapsing back together.
+    #[tokio::test]
+    async fn a_near_miss_on_a_declared_column_is_distinguished_from_an_ineligible_one() {
+        let state = session().await;
+        // The shape a drifted panel takes: the declared server filter plus one
+        // extra conjunct. It cannot match, but it talks about `kind`/`name`,
+        // which declared measures do filter on — so it is worth a warning.
+        let sql = format!(
+            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} \
+                    AND (kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND status_message = 'nope' \
+             GROUP BY time_bucket('1 hours', timestamp)"
+        );
+        assert_eq!(
+            route_for(&state, &sql).await.err(),
+            Some(MissReason::UnknownFilter),
+            "a residual on a column declared measures filter on is a near-miss, not an ineligible query"
+        );
     }
 
     /// An aggregate inside a CTE is reachable now, because the matcher searches

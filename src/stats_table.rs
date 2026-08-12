@@ -338,6 +338,7 @@ impl StatsTableProvider {
             "rollup_miss_unsupported_total" => m.rollup_miss_unsupported,
             "rollup_miss_incomplete_coverage_total" => m.rollup_miss_incomplete_coverage,
             "rollup_miss_unknown_filter_total" => m.rollup_miss_unknown_filter,
+            "rollup_miss_filter_not_eligible_total" => m.rollup_miss_filter_not_eligible,
             "rollup_miss_missing_measure_total" => m.rollup_miss_missing_measure,
             "rollup_miss_unaligned_bucket_total" => m.rollup_miss_unaligned_bucket,
             "rollup_miss_unknown_group_by_total" => m.rollup_miss_unknown_group_by,
