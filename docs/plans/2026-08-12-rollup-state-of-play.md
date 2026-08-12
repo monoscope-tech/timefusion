@@ -122,14 +122,20 @@ what the schema comment warns against. Do not build it.
   follow-ups: classify never-eligible residuals into their own counter, and drop
   the WARN to debug when the residual references no declared measure column at
   all — 84 WARNs in 3h on a hot path will bury the real case when it comes.
-- `rollup_backfill_tick` logs `pool/queued/built/uncertifiable/failed` whenever
-  there was work; `rollup_backfill_idle` logs `pool/gated/backoff/covered` when a
-  non-empty pool survived nothing. **The backfill is currently queuing nothing at
-  all** — zero ticks logged across 40 minutes on 2026-08-12, while the rollup
-  table showed 08-01..08-08 covered for only the original canary and 08-09..08-11
-  for 4-6 projects. So the widening has NOT reached the sealed days. `7b651f3`
-  ships the funnel that says which of gated / backoff / already-covered is
-  swallowing them; read `rollup_backfill_idle` first.
+- `rollup_backfill_tick` logs `pool/queued/built/uncertifiable/failed`;
+  `rollup_backfill_idle` logs `partitions/pool/gated/backoff/covered` on any
+  no-work tick. **Read `Rollup backfill job run still in progress after 600s
+  (skips=N)` FIRST**, though — a backfill tick routinely outlives its 10-minute
+  cron period, so later ticks are skipped and neither completion log fires. An
+  absence of backfill logs means "still running", NOT "nothing queued"; I read it
+  the wrong way round for most of 2026-08-12.
+- **Convergence is real, newest-first, and slow.** Measured by
+  `SELECT date, count(DISTINCT project_id) FROM
+  otel_logs_and_spans_rollup_dashboard_1m_v2 GROUP BY 1` three hours apart:
+  08-10 went 4 -> 7 projects and 08-11 5 -> 7, while 08-01..08-08 stayed at 1.
+  That is the intended order (`candidates.sort_by(|a, b| b.1.cmp(&a.1))` is
+  newest-first), so the old sealed days are last in line, not stuck. Judge
+  progress with that query, not with log volume.
 
 ---
 
