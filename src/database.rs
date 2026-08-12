@@ -825,12 +825,24 @@ fn build_optimize_session_state_with_batch(
     build_optimize_session_state_tuned(target_partitions, runtime_env, batch_override, None)
 }
 
-/// `repair_partitions` lifts `MAINTENANCE_MAX_PARTITIONS` and pins the sort's
-/// parallelism to the given value. Only sound for a session whose caller runs
-/// ONE rewrite at a time — see `repair_session_state`, which picks the value
-/// from [`REPAIR_SORT_PARTITION_LADDER`].
+/// A sort whose caller runs FEW enough concurrent bins that
+/// `MAINTENANCE_MAX_PARTITIONS` — sized for the many-sibling-sorters case —
+/// does not apply to it. Both hot-tail passes qualify: they hold their own
+/// pools and are bounded by `light_rewrite_sem`, not by the heavy rewrite fan-out.
+#[derive(Clone, Copy)]
+struct UncappedSort {
+    partitions: usize,
+    /// Per-partition up-front reservation, where the 32 MB default is wrong.
+    /// Repair raises it because its unspillable `SortPreservingMergeExec` is
+    /// per-partition and it sorts whole multi-hundred-MB files; packing merges a
+    /// handful of small files and keeps the default.
+    reservation_bytes: Option<usize>,
+}
+
+/// `uncapped` lifts `MAINTENANCE_MAX_PARTITIONS` and pins the sort's
+/// parallelism to the given value — see [`UncappedSort`].
 fn build_optimize_session_state_tuned(
-    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>, repair_partitions: Option<usize>,
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>, uncapped: Option<UncappedSort>,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
@@ -841,12 +853,12 @@ fn build_optimize_session_state_tuned(
     // indivisible admission unit, and small-cgroup pools must be able to admit
     // one before spilling can engage.
     let batch_size = batch_override.unwrap_or_else(|| crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size()));
-    let mut cfg = match repair_partitions {
+    let mut cfg = match uncapped {
         None => maintenance_session_config(SessionConfig::new(), batch_size, target_partitions),
-        Some(n) => maintenance_session_config(SessionConfig::new(), batch_size, usize::MAX).with_target_partitions(n),
+        Some(u) => maintenance_session_config(SessionConfig::new(), batch_size, usize::MAX).with_target_partitions(u.partitions),
     };
-    if repair_partitions.is_some() {
-        let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", &REPAIR_SORT_RESERVATION_BYTES.to_string());
+    if let Some(reservation) = uncapped.and_then(|u| u.reservation_bytes) {
+        let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", &reservation.to_string());
     }
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
@@ -5074,15 +5086,21 @@ impl Database {
     /// `repair_holds_light_pool` in under a millisecond. Ingest keeps making
     /// small files the whole time, so packing debt only grows.
     ///
-    /// Sizing is packing's MEASURED cost, not a share: a packing bin is a
-    /// handful of small files with a shallow merge and peaks 1.3-1.5 GB
-    /// (2026-08-11), so `k` bins fit in `k * PACK_BIN_BUDGET_BYTES`. Repair
-    /// keeps the rest — it is the pass with the genuinely large sorts.
+    /// An EVEN split of the light share, which comfortably covers both sides'
+    /// measured demand — on prod's 15 GB share that is 7.5 GB each:
+    ///
+    /// * packing needs `k` bins at a measured 1.3-1.5 GB peak (2026-08-11) plus
+    ///   `PACK_SORT_PARTITIONS * k` reservations at the 32 MB default — 3 bins
+    ///   ⇒ ~4.5 GB + 768 MB.
+    /// * repair needs more than its unspillable per-partition merge share
+    ///   (`REPAIR_SORT_PARTITIONS * REPAIR_SORT_RESERVATION_BYTES`, 4 GB at the
+    ///   ladder's top rung), and the ladder steps down when a bin exhausts it.
+    ///
+    /// Repair loses headroom against the 15.4 GB it used to take alone, but a
+    /// spilling sort takes what it is offered rather than what it needs — it
+    /// spills either way, and the alternative was packing getting nothing at all.
     fn pack_pool_bytes(&self) -> usize {
-        /// 2 GiB against a measured 1.3-1.5 GB peak per packing bin.
-        const PACK_BIN_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
-        let light = self.light_optimize_pool_bytes();
-        (self.config.derived.max_light_optimize_k() * PACK_BIN_BUDGET_BYTES).min(light / 2).max(1)
+        (self.light_optimize_pool_bytes() / 2).max(1)
     }
 
     /// Repair's slice: the light share minus packing's reservation. Still far
@@ -5274,11 +5292,33 @@ impl Database {
             .clone()
     }
 
-    /// Light-optimize session state, built once (see field doc).
+    /// Packing session state, built once (see field doc).
+    ///
+    /// Lifts `MAINTENANCE_MAX_PARTITIONS` for the same reason repair does: that
+    /// cap is sized for the heavy fan-out (4 rewrite permits x 2 merge tasks =
+    /// 8 sibling sorters sharing one pool), and packing is neither — it runs at
+    /// most `max_light_optimize_k` bins, in a pool nothing else touches. Paying
+    /// the cap anyway sorted at 2-way parallelism on a 48-core box.
+    ///
+    /// The count is DERIVED, not pinned: each partition's reservation is
+    /// unspillable, so on a small box a fixed 8 is worse than the cap it lifts
+    /// — the test config's 341 MB pack pool would hand 268 MB of it to
+    /// reservations before a single row was sorted.
     fn light_optimize_session_state(&self) -> datafusion::execution::session_state::SessionState {
         self.light_optimize_session_state
-            .get_or_init(|| build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env()))
+            .get_or_init(|| {
+                build_optimize_session_state_tuned(
+                    self.config.memory.timefusion_query_partitions,
+                    self.light_optimize_runtime_env(),
+                    None,
+                    Some(UncappedSort { partitions: self.pack_sort_partitions(), reservation_bytes: None }),
+                )
+            })
             .clone()
+    }
+
+    fn pack_sort_partitions(&self) -> usize {
+        pack_sort_partitions(self.pack_pool_bytes(), self.config.derived.max_light_optimize_k(), self.config.derived.cores)
     }
 
     /// Its OWN pool (see `repair_pool_bytes`), deliberately SMALLER batches.
@@ -5306,7 +5346,12 @@ impl Database {
         self.repair_session_states
             .entry(partitions)
             .or_insert_with(|| {
-                build_optimize_session_state_tuned(self.config.memory.timefusion_query_partitions, self.repair_runtime_env(), Some("256"), Some(partitions))
+                build_optimize_session_state_tuned(
+                    self.config.memory.timefusion_query_partitions,
+                    self.repair_runtime_env(),
+                    Some("256"),
+                    Some(UncappedSort { partitions, reservation_bytes: Some(REPAIR_SORT_RESERVATION_BYTES) }),
+                )
             })
             .clone()
     }
@@ -13581,7 +13626,12 @@ mod repair_batch_tests {
         use datafusion::execution::runtime_env::RuntimeEnv;
         let batch = |state: &datafusion::execution::session_state::SessionState| state.config().options().execution.batch_size;
         let pack = super::build_optimize_session_state(0, std::sync::Arc::new(RuntimeEnv::default()));
-        let repair = super::build_optimize_session_state_tuned(0, std::sync::Arc::new(RuntimeEnv::default()), Some("256"), Some(super::REPAIR_SORT_PARTITIONS));
+        let repair = super::build_optimize_session_state_tuned(
+            0,
+            std::sync::Arc::new(RuntimeEnv::default()),
+            Some("256"),
+            Some(super::UncappedSort { partitions: super::REPAIR_SORT_PARTITIONS, reservation_bytes: Some(super::REPAIR_SORT_RESERVATION_BYTES) }),
+        );
         assert_eq!(batch(&repair), 256, "repair shrinks the sort's indivisible admission unit");
         // Repair runs ONE bin at a time, so the many-concurrent-sorters premise
         // behind `MAINTENANCE_MAX_PARTITIONS` does not apply to it. Paying the
@@ -13655,6 +13705,28 @@ enum BinOutcome<T> {
     /// Selection went stale (concurrent rewrite); keep the project pending so
     /// the next round's re-plan serves it a fresh bin.
     Retry,
+}
+
+/// Parallelism for ONE packing sort. Two independent budgets, whichever binds:
+///
+/// * memory — `k` concurrent bins may spend at most a quarter of the pack pool
+///   on up-front reservations, which are UNSPILLABLE;
+/// * CPU — the `k` bins together may use at most half the box, leaving the rest
+///   for the read path (packing runs continuously, so this is a standing cost).
+///
+/// Never below `MAINTENANCE_MAX_PARTITIONS`: this only ever LIFTS that cap,
+/// which is sized for the heavy path's 8 sibling sorters on a shared pool.
+///
+/// Derived rather than pinned because both terms move with the box. A width
+/// that is comfortable on prod's 7.5 GB / 48-core profile hands most of a small
+/// box's pool to reservations before a single row is sorted.
+fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize {
+    /// `maintenance_session_config`'s `sort_spill_reservation_bytes`.
+    const DEFAULT_RESERVATION_BYTES: usize = 33_554_432;
+    let k = k.max(1);
+    let memory_bound = pack_pool_bytes / (4 * k * DEFAULT_RESERVATION_BYTES);
+    let cpu_bound = cores / 2 / k;
+    memory_bound.min(cpu_bound).max(MAINTENANCE_MAX_PARTITIONS)
 }
 
 /// Where a deadline-truncated dedup sweep resumes: the served-item cursor
@@ -16602,7 +16674,12 @@ mod tests {
     #[test]
     fn repair_session_reserves_merge_memory_up_front() {
         let env = Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default());
-        let repair = build_optimize_session_state_tuned(0, Arc::clone(&env), Some("256"), Some(REPAIR_SORT_PARTITIONS));
+        let repair = build_optimize_session_state_tuned(
+            0,
+            Arc::clone(&env),
+            Some("256"),
+            Some(UncappedSort { partitions: REPAIR_SORT_PARTITIONS, reservation_bytes: Some(REPAIR_SORT_RESERVATION_BYTES) }),
+        );
         let exec = &repair.config().options().execution;
         assert_eq!(exec.sort_spill_reservation_bytes, REPAIR_SORT_RESERVATION_BYTES);
         assert_eq!(exec.target_partitions, REPAIR_SORT_PARTITIONS, "repair runs one bin at a time, so it is not capped at 2");
@@ -16618,6 +16695,51 @@ mod tests {
         // a large per-partition reservation is what exhausts the bounded pool.
         let plain = build_optimize_session_state_tuned(0, env, None, None);
         assert_eq!(plain.config().options().execution.sort_spill_reservation_bytes, 33_554_432);
+    }
+
+    /// Packing sorts at more than `MAINTENANCE_MAX_PARTITIONS`, but must NOT
+    /// take repair's inflated per-partition reservation with it.
+    ///
+    /// The cap is sized for the heavy fan-out (8 sibling sorters on one pool);
+    /// packing runs at most `k` bins in a pool nothing else touches, and paying
+    /// the cap anyway sorted 2-way on a 48-core box. The reservation is the
+    /// safety rail on that: it is UNSPILLABLE and per-partition, so pairing
+    /// raised partitions with repair's 256 MB would reserve more of packing's
+    /// pool than the bins themselves use.
+    #[tokio::test]
+    async fn packing_sorts_wider_than_the_heavy_cap_but_keeps_the_default_reservation() -> Result<()> {
+        let db = Database::with_config(create_test_config("pack-partitions")).await?;
+        let exec = db.light_optimize_session_state().config().options().execution.clone();
+        assert_eq!(exec.sort_spill_reservation_bytes, 33_554_432, "repair's reservation must not leak onto the packing path");
+        assert_eq!(exec.target_partitions, db.pack_sort_partitions(), "the session must use the derived width, not the shared cap");
+        // The rail that keeps the split honest on ANY box: reservations stay a
+        // small fraction of the pool the bins themselves have to fit in.
+        let reserved = exec.sort_spill_reservation_bytes * exec.target_partitions * db.config.derived.max_light_optimize_k().max(1);
+        assert!(reserved * 4 <= db.pack_pool_bytes().max(4), "reservations claim {reserved} of a {} byte pack pool", db.pack_pool_bytes());
+        Ok(())
+    }
+
+    /// Prod's box (48 cores, a 7.5 GB pack pool at k=3) must actually LIFT the
+    /// heavy cap — that cap is sized for 8 sibling sorters on one shared pool,
+    /// and paying it anyway sorted packing 2-way on 48 cores. A small box must
+    /// fall back to it instead, because the per-partition reservation is
+    /// unspillable and would eat the pool before any row was sorted.
+    #[test]
+    fn pack_sort_width_follows_the_pool_and_the_box_not_a_pinned_constant() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        // Prod: memory affords 20, CPU (48/2/3) binds at 8.
+        assert_eq!(super::pack_sort_partitions(7 * GIB + GIB / 2, 3, 48), 8);
+        assert_eq!(super::pack_sort_partitions(341 * 1024 * 1024, 1, 8), MAINTENANCE_MAX_PARTITIONS, "a small pool must fall back to the cap, never below it");
+        assert_eq!(super::pack_sort_partitions(64 * GIB, 1, 8), 4, "cores bound the width even when memory is abundant");
+
+        // Neither budget may be exceeded, across two orders of magnitude of box.
+        for (pool_gib, k, cores) in [(1usize, 1usize, 4usize), (2, 2, 8), (8, 3, 16), (16, 3, 48), (64, 4, 96)] {
+            let parts = super::pack_sort_partitions(pool_gib * GIB, k, cores);
+            assert!(parts >= MAINTENANCE_MAX_PARTITIONS, "the derivation must only ever lift the cap");
+            let at_cap = parts == MAINTENANCE_MAX_PARTITIONS;
+            assert!(at_cap || parts * k * 2 <= cores, "packing may take at most half the box across its {k} bins");
+            assert!(at_cap || parts * k * 4 * 33_554_432 <= pool_gib * GIB, "reservations may take at most a quarter of the pack pool");
+        }
     }
 
     #[test]
