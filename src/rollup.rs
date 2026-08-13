@@ -307,9 +307,9 @@ pub(crate) enum Merge {
     Max,
     Avg,
     TDigest,
-    /// A distinct count. Unlike every other variant the query's output is NOT
-    /// the folded state — `approx_distinct` returns a number — so `sql` reads
-    /// the estimate back out of the merged sketch.
+    /// A distinct-count sketch. Like `TDigest`, the query's output IS the folded
+    /// state: `distinct_count` reads the number out of it in the projection
+    /// above the aggregate, which the rewrite never touches.
     Hll,
 }
 
@@ -346,7 +346,7 @@ impl Merge {
                 format!("CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END")
             }
             (Self::TDigest, [digest]) => format!("tdigest_merge({digest})"),
-            (Self::Hll, [sketch]) => format!("hll_count(hll_merge({sketch}))"),
+            (Self::Hll, [sketch]) => format!("hll_merge({sketch})"),
             // `arity()` is the single source of truth for how many states each
             // variant is built with, so this is unreachable by construction.
             _ => unreachable!("merge {self:?} built with {} states", states.len()),
@@ -1275,14 +1275,15 @@ async fn route_with_spec(
             "max" => (Merge::Max, measure("max", column.as_deref()).map(|m| vec![m])),
             "avg" => (Merge::Avg, measure("sum", column.as_deref()).zip(measure("count", column.as_deref())).map(|(sum, count)| vec![sum, count])),
             "percentile_agg" => (Merge::TDigest, measure("tdigest", column.as_deref()).map(|m| vec![m])),
-            // The query-side spelling, shared with Timescale Toolkit; the rollup
-            // answers it from a stored sketch. DataFusion's own `approx_distinct`
-            // is deliberately NOT routed: it returns UInt64, so substituting an
-            // Int64 rewrite for it would trip the schema-mismatch guard. Exact
-            // `COUNT(DISTINCT x)` stays non-decomposable and is still declined —
+            // `hll_agg`, a.k.a. Toolkit's `approx_count_distinct`. It behaves
+            // exactly like `percentile_agg` above: the aggregate yields the STATE
+            // and the scalar that reads a number out of it (`distinct_count`)
+            // sits above, untouched. DataFusion's own `approx_distinct` is NOT
+            // routed — it returns a bare count with no state to store. Exact
+            // `COUNT(DISTINCT x)` stays non-decomposable and is still declined;
             // approximating it without being asked is what the measure list
             // refuses to do.
-            "approx_count_distinct" => (Merge::Hll, measure("hll", column.as_deref()).map(|m| vec![m])),
+            "hll_agg" => (Merge::Hll, measure("hll", column.as_deref()).map(|m| vec![m])),
             _ => return Err(MissReason::NonDecomposableAggregate),
         };
         let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
