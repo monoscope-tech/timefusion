@@ -239,7 +239,7 @@ mod tests {
         // 1.04/sqrt(4096) = 1.6% standard error; allow 3 sigma so the test is not
         // flaky against a hash-dependent but deterministic outcome.
         for n in [5_000u64, 50_000, 1_000_000] {
-            let estimate = sketch_of(0..n) .estimate() as f64;
+            let estimate = sketch_of(0..n).estimate() as f64;
             let error = (estimate - n as f64).abs() / n as f64;
             assert!(error < 0.05, "n={n}: estimated {estimate}, error {:.3}%", error * 100.0);
         }
