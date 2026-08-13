@@ -3909,7 +3909,15 @@ impl Database {
         let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
         let _ = options.set("datafusion.execution.sort_spill_reservation_bytes", &sort_spill_reservation_bytes.to_string());
 
-        let runtime_env = self.shared_runtime_env();
+        // A maintenance scan borrows the MAINTENANCE pool, not the query pool.
+        // Two reasons, both about staying inside the configured budget rather
+        // than growing RSS: that pool has a spill directory, so a whole-day
+        // aggregate spills to disk instead of holding every group in memory;
+        // and a background rewrite must not compete with interactive queries
+        // for the query pool it was previously charging against. Certification
+        // — the other half of a backfill unit — already used this env, so the
+        // two halves were charged to different budgets.
+        let runtime_env = if self.maintenance_scan { self.maintenance_runtime_env() } else { self.shared_runtime_env() };
 
         // Set up tracing options with configurable sampling
         let record_metrics = self.config.memory.timefusion_tracing_record_metrics;
@@ -16967,6 +16975,27 @@ mod tests {
         // a test config may leave it 0, meaning DataFusion's own core-count
         // default. Either way the maintenance scan must be strictly smaller.
         assert!(scan < query, "the whole point is fewer concurrent decoders: {scan} vs {query} (configured {query_partitions})");
+        Ok(())
+    }
+
+    /// A maintenance scan must also be CHARGED to the maintenance pool.
+    ///
+    /// Parallelism bounds the decode buffers; the pool is what bounds the
+    /// aggregate. The maintenance env carries a spill directory, so a whole-day
+    /// GROUP BY spills to disk instead of holding every group in memory, and a
+    /// background rewrite stops competing with interactive queries for the query
+    /// pool. Certification — the other half of a backfill unit — already used
+    /// this env, so the two halves were being charged to different budgets.
+    #[tokio::test]
+    async fn a_maintenance_scan_is_charged_to_the_maintenance_pool() -> Result<()> {
+        let db = Database::with_config(create_test_config("maintenance-scan-pool")).await?;
+        let pool_of = |db: Database| Arc::new(db).create_session_context().task_ctx().runtime_env().memory_pool.clone();
+
+        let mut maintenance = db.clone();
+        maintenance.maintenance_scan = true;
+        let (query_pool, maintenance_pool) = (pool_of(db.clone()), pool_of(maintenance));
+        assert!(!Arc::ptr_eq(&query_pool, &maintenance_pool), "a background rewrite must not draw on the query pool");
+        assert!(Arc::ptr_eq(&maintenance_pool, &db.maintenance_runtime_env().memory_pool), "it must draw on the maintenance pool");
         Ok(())
     }
 
