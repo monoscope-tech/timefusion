@@ -8935,8 +8935,7 @@ impl Database {
         // newest date its permanent front-of-queue seat and buys every other
         // partition a turn at the one slot that is allowed to overrun.
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        let start = sweep_resume_offset(candidates.len(), self.rollup_backfill_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        candidates.rotate_left(start);
+        rotate_head_window(&mut candidates, self.rollup_backfill_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         if pool > 0 && candidates.is_empty() {
             info!(source, pool, gated, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
         }
@@ -13893,6 +13892,25 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
     memory_bound.min(cpu_bound).max(MAINTENANCE_MAX_PARTITIONS)
 }
 
+/// How many of the newest candidates share the one overrun-allowed slot.
+///
+/// Rotating the WHOLE list would walk 200+ candidates before returning to the
+/// newest date — at 4 units per tick and a 10-minute cron, most of a day — which
+/// throws away the recency priority the sort exists to provide. Rotating only a
+/// head window keeps the tick working on recent dates while still guaranteeing
+/// no single partition owns the slot forever. The window slides on its own:
+/// `candidates` only ever holds partitions that still need work, so a built date
+/// drops out and the next one moves up.
+const BACKFILL_ROTATION_WINDOW: usize = 16;
+
+/// Rotate the newest [`BACKFILL_ROTATION_WINDOW`] candidates by `cursor`,
+/// leaving the rest of the (date-descending) list in place.
+fn rotate_head_window<T>(candidates: &mut [T], cursor: usize) {
+    let window = candidates.len().min(BACKFILL_ROTATION_WINDOW);
+    let head = &mut candidates[..window];
+    head.rotate_left(sweep_resume_offset(window, cursor));
+}
+
 /// Should a rollup backfill tick stop before ATTEMPTING another partition?
 ///
 /// The first attempt is always exempt: a day-sized aggregate is indivisible, so
@@ -18178,6 +18196,37 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
         // An empty list must not panic on the modulo.
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
+    }
+
+    /// Rotation must not cost recency. Rotating the WHOLE candidate list would
+    /// walk 200+ entries before coming back to the newest date — at 4 units per
+    /// tick and a 10-minute cron, most of a day — so a dashboard asking for
+    /// yesterday would wait behind a 31-day-old partition. Rotate only a head
+    /// window: recent dates keep the slot, and no single one owns it forever.
+    #[test]
+    fn rotation_shares_the_head_slot_without_reaching_into_old_dates() {
+        let pool: Vec<usize> = (0..207).collect(); // index 0 = newest, as the sort leaves it
+        let window = super::BACKFILL_ROTATION_WINDOW;
+
+        let mut served = std::collections::HashSet::new();
+        for cursor in 0..window * 3 {
+            let mut candidates = pool.clone();
+            super::rotate_head_window(&mut candidates, cursor);
+            served.insert(candidates[0]);
+            assert!(candidates[0] < window, "the overrun slot must stay on recent dates, got index {}", candidates[0]);
+        }
+        assert_eq!(served.len(), window, "every candidate in the window must get a turn at the slot");
+
+        // The tail keeps its date order, so nothing is reordered into the past.
+        let mut candidates = pool.clone();
+        super::rotate_head_window(&mut candidates, 5);
+        assert_eq!(&candidates[window..], &pool[window..], "only the head window may be rotated");
+
+        // Shorter-than-window and empty lists must not panic.
+        let mut short = vec![1, 2, 3];
+        super::rotate_head_window(&mut short, 7);
+        assert_eq!(short.len(), 3);
+        super::rotate_head_window(&mut Vec::<usize>::new(), 3);
     }
 
     /// The build SQL writes `date = '2026-08-01'` — a STRING literal against a
