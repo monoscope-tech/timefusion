@@ -2,6 +2,7 @@ mod defer_expensive_projection;
 mod exists_in_projection;
 mod ordered_union_for_topk;
 pub mod pg_array_literal_rewriter;
+pub mod row_to_json_record;
 mod tantivy_rewriter;
 mod variant_insert_rewriter;
 mod variant_select_rewriter;

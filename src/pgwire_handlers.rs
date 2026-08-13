@@ -726,7 +726,31 @@ pub(crate) fn parse_handoff(query: &str) -> bool {
 /// `sql parser error: Expected: an SQL statement, found: ABORT`, which then
 /// poisons the whole session.
 fn rewrite_pg_synonyms(query: &str) -> Cow<'_, str> {
-    strip_keyword(query.trim_start(), "ABORT", |c| c.is_whitespace() || c == ';').map_or(Cow::Borrowed(query), |rest| Cow::Owned(format!("ROLLBACK{rest}")))
+    let query = strip_keyword(query.trim_start(), "ABORT", |c| c.is_whitespace() || c == ';')
+        .map_or(Cow::Borrowed(query), |rest| Cow::Owned(format!("ROLLBACK{rest}")));
+    rewrite_row_to_json_record(&query).map_or(query, Cow::Owned)
+}
+
+/// `row_to_json(t)` over a derived-table alias, which DataFusion rejects while
+/// planning the SQL — before any analyzer rule could see it. pgAdmin's dashboard
+/// polls that shape every 5s.
+///
+/// This is an AST rewrite, not a text substitution: the statement is parsed,
+/// visited, and unparsed only if something actually changed. Anything that fails
+/// to parse, or that the visitor declines to touch, is returned unchanged and
+/// reaches DataFusion byte-for-byte as before — a malformed or unusual statement
+/// can never be corrupted into a different valid statement by this path.
+fn rewrite_row_to_json_record(query: &str) -> Option<String> {
+    use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+    if !crate::optimizers::row_to_json_record::might_need_rewrite(query) {
+        return None;
+    }
+    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, query).ok()?;
+    let [statement] = statements.as_mut_slice() else {
+        return None;
+    };
+    crate::optimizers::row_to_json_record::rewrite(statement).then(|| statement.to_string())
 }
 
 /// (keyword, space-padded keyword, `query.type`, operation). First match wins,
@@ -895,6 +919,7 @@ pub struct LoggingExtendedQueryHandler {
     inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
     max_statement_secs: u64,
+    query_parser: Arc<RewritingQueryParser>,
 }
 
 impl LoggingExtendedQueryHandler {
@@ -909,17 +934,51 @@ impl LoggingExtendedQueryHandler {
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
-        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS }
+        let inner = DfSessionService::new_with_hooks(session_context, hooks);
+        let query_parser = Arc::new(RewritingQueryParser { inner: ExtendedQueryHandler::query_parser(&inner) });
+        Self { inner, scan_metrics: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS, query_parser }
+    }
+}
+
+/// Applies the same statement rewrites to the extended protocol that
+/// `rewrite_pg_synonyms` applies to the simple one. pgAdmin's dashboard uses
+/// simple queries, but a rewrite that fires on one protocol and not the other
+/// would mean identical SQL succeeding or failing depending on how the client
+/// sent it.
+pub struct RewritingQueryParser {
+    inner: Arc<<DfSessionService as ExtendedQueryHandler>::QueryParser>,
+}
+
+#[async_trait]
+impl datafusion_postgres::pgwire::api::stmt::QueryParser for RewritingQueryParser {
+    type Statement = <DfSessionService as ExtendedQueryHandler>::Statement;
+
+    async fn parse_sql<C>(&self, client: &C, sql: &str, types: &[Option<datafusion_postgres::pgwire::api::Type>]) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let rewritten = rewrite_row_to_json_record(sql);
+        self.inner.parse_sql(client, rewritten.as_deref().unwrap_or(sql), types).await
+    }
+
+    fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<datafusion_postgres::pgwire::api::Type>> {
+        self.inner.get_parameter_types(statement)
+    }
+
+    fn get_result_schema(
+        &self, statement: &Self::Statement, format: Option<&datafusion_postgres::pgwire::api::portal::Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        self.inner.get_result_schema(statement, format)
     }
 }
 
 #[async_trait]
 impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
     type Statement = <DfSessionService as ExtendedQueryHandler>::Statement;
-    type QueryParser = <DfSessionService as ExtendedQueryHandler>::QueryParser;
+    type QueryParser = RewritingQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        self.inner.query_parser()
+        Arc::clone(&self.query_parser)
     }
 
     async fn do_describe_statement<C>(&self, client: &mut C, statement: &StoredStatement<Self::Statement>) -> PgWireResult<DescribeStatementResponse>

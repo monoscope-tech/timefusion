@@ -207,3 +207,25 @@ query B
 SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'no_such_relation') AS absent
 ----
 true
+
+# PG's row_to_json(record) is to_json over a row. pgAdmin's dashboard calls it
+# as `row_to_json(t)` over a subquery alias, which DataFusion rejects during SQL
+# planning (see bare_relation_alias_is_still_unsupported) — the struct form is
+# what TF supports.
+
+query T
+SELECT row_to_json(named_struct('total', 1, 'active', 2, 'idle', 3)) AS chart_data
+----
+{"active":2,"idle":3,"total":1}
+
+# pgAdmin's dashboard shape: `row_to_json(t)` naming a whole row. PG allows a
+# bare relation alias as a record; DataFusion rejects it during SQL planning, so
+# RowToJsonRecordRewriter turns it into named_struct over the derived table's
+# own column aliases before the statement is planned.
+
+query TT
+SELECT 'session_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data
+FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_activity) AS "total",
+             (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'active') AS "active") t
+----
+session_stats {"active":0,"total":0}

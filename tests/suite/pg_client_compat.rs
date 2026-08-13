@@ -147,3 +147,31 @@ async fn pgadmin_role_probe_answers_with_a_bound_parameter() -> Result<()> {
     }
     Ok(())
 }
+
+/// pgAdmin's dashboard polls this every 5s over the SIMPLE protocol, so it must
+/// work there and not only via the extended path the .slt harness exercises.
+/// `row_to_json(t)` names a whole row, which DataFusion rejects during SQL
+/// planning; RowToJsonRecordRewriter turns it into named_struct first.
+#[tokio::test(flavor = "multi_thread")]
+async fn pgadmin_dashboard_row_to_json_over_simple_protocol() -> Result<()> {
+    let server = TestServer::start().await?;
+    let messages = server
+        .client()
+        .await?
+        .simple_query(
+            "SELECT 'session_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
+             FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_activity) AS \"total\", \
+                          (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'active') AS \"active\") t",
+        )
+        .await?;
+    let row = messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .context("expected a row")?;
+    assert_eq!(row.get("chart_name"), Some("session_stats"));
+    assert_eq!(row.get("chart_data"), Some(r#"{"active":0,"total":0}"#));
+    Ok(())
+}
