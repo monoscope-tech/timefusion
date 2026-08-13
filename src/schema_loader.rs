@@ -239,7 +239,11 @@ impl RollupSpec {
         for m in &self.measures {
             let ty = match (m.agg.as_str(), &m.column) {
                 ("count", _) => "Int64".to_string(),
-                ("tdigest" | "hll", Some(_)) => "Binary".to_string(),
+                // `src_field` for its error, not its type: a sketch column is
+                // always Binary, but naming a column that does not exist must
+                // still fail HERE rather than synthesize a phantom field that
+                // only breaks when the build SQL runs.
+                ("tdigest" | "hll", Some(c)) => src_field(c).map(|_| "Binary".to_string())?,
                 (_, Some(c)) => src_field(c)?.data_type,
                 (a, None) => anyhow::bail!("rollup {}: `{a}` measure `{}` needs a source column", self.table_name(&source.table_name), m.name),
             };
@@ -802,6 +806,27 @@ mod tests {
         let rollup = spec.synthesize(source).expect("valid rollup");
         assert_eq!(rollup.field_def("rollup_generation"), Some((ArrowDataType::Utf8View, false)));
         assert_eq!(rollup.field_def("digest"), Some((ArrowDataType::Binary, true)));
+    }
+
+    /// An `hll` measure stores a sketch, exactly as `tdigest` does, and unlike
+    /// every other aggregate it must accept a NON-numeric source column — the
+    /// columns anyone wants a distinct count of (trace id, user id, service
+    /// name) are all strings.
+    #[test]
+    fn an_hll_measure_stores_a_sketch_over_any_column_type() {
+        let source = get_schema("otel_logs_and_spans").expect("source schema");
+        let spec = |column: &str| RollupSpec {
+            grain: "1m".into(),
+            name: Some("hll_test".into()),
+            dimensions: vec!["kind".into()],
+            measures: vec![RollupMeasure { name: "traces".into(), agg: "hll".into(), column: Some(column.into()), filter: None }],
+            derive_from: None,
+        };
+        for column in ["context___trace_id", "duration"] {
+            let rollup = spec(column).synthesize(source).expect("valid rollup");
+            assert_eq!(rollup.field_def("traces"), Some((ArrowDataType::Binary, true)), "column {column}");
+        }
+        assert!(spec("no_such_column").synthesize(source).is_err(), "an unknown column must still be rejected");
     }
 
     #[test]

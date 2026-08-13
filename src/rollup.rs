@@ -1439,6 +1439,45 @@ mod tests {
         assert!(sql.contains("GROUP BY 1, 2, 3, 4"));
     }
 
+    /// The two SQL shapes an `hll` measure has to produce: build the sketch from
+    /// raw rows, and RE-AGGREGATE it when a coarse tier derives from a fine one.
+    /// Getting the second wrong is silent — `SUM` over a Binary column is the
+    /// default branch — so it is asserted rather than assumed.
+    #[test]
+    fn an_hll_measure_builds_a_sketch_and_re_aggregates_as_one() {
+        let spec = |derive_from: Option<&str>| RollupSpec {
+            grain: "1h".into(),
+            name: Some("hll_shape".into()),
+            dimensions: vec!["kind".into()],
+            measures: vec![crate::schema_loader::RollupMeasure {
+                name: "traces".into(),
+                agg: "hll".into(),
+                column: Some("context___trace_id".into()),
+                filter: Some("kind = 'server'".into()),
+            }],
+            derive_from: derive_from.map(str::to_string),
+        };
+        let raw = build_partition_sql(&spec(None), SOURCE, "project", "2026-08-01").expect("valid SQL");
+        assert!(raw.contains("hll_agg(context___trace_id) FILTER (WHERE kind = 'server') AS traces"), "{raw}");
+
+        // The declared filter is deliberately NOT re-applied on the derived leg:
+        // the base row already had it, and its columns do not exist there.
+        let derived = build_partition_sql_from(&spec(Some("fine")), SOURCE, "fine_table", "project", "2026-08-01").expect("valid SQL");
+        assert!(derived.contains("hll_merge(traces) AS traces"), "{derived}");
+        assert!(!derived.contains("FILTER"), "the derived leg must not re-apply the measure filter: {derived}");
+    }
+
+    /// `distinct_count(approx_count_distinct(x))` is what monoscope sends. The
+    /// aggregate in the plan is `hll_agg`, and it must fold to the merged STATE —
+    /// the `distinct_count` accessor stays in the projection above, exactly as
+    /// `approx_percentile` does over `percentile_agg`.
+    #[test]
+    fn the_hll_merge_folds_states_and_leaves_the_accessor_alone() {
+        assert_eq!(Merge::Hll.arity(), 1);
+        assert_eq!(Merge::Hll.partial_op(), "hll_merge");
+        assert_eq!(Merge::Hll.sql(&["__s0_0".to_string()]), "hll_merge(__s0_0)");
+    }
+
     const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v2";
     /// Ten grains wide. A window narrower than `MIN_INTERIOR_BUCKETS` grains can
     /// never route — the aligned interior would be at most one bucket — so a
