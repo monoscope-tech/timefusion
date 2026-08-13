@@ -15,6 +15,7 @@ pub mod dml_coalescer;
 pub mod errors;
 pub mod functions;
 pub mod grpc_handlers;
+pub mod hll;
 pub mod hot_tier;
 pub mod insert_coerce;
 pub mod logical_count_index;
