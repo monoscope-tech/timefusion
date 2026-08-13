@@ -970,8 +970,8 @@ impl PlanCacheHook {
         };
         // Overflow sweep, on EITHER bound: entry count, or the retained text
         // bytes that stand in for retained plan memory (see
-        // `PLAN_CACHE_MAX_TEXT_BYTES` — a bulk INSERT's entry is thousands of
-        // times bigger than a SELECT's, so the count alone bounds nothing).
+        // `PLAN_CACHE_TEXT_BYTES_PER_SLOT` — a bulk INSERT's entry is thousands
+        // of times bigger than a SELECT's, so the count alone bounds nothing).
         //
         // Only the first thread per crossing runs `retain` (the rest re-insert
         // as if the cap hadn't been crossed and get swept next time): `retain`
@@ -992,17 +992,33 @@ impl PlanCacheHook {
                 max_text_bytes = self.max_text_bytes,
                 "plan_cache exceeded capacity — evicting ~half. Subsequent queries on evicted plans will re-pay the optimize cost. If this fires steadily, the workload's plan-template variety has grown past the cache budget."
             );
-            // Not `soft_cap`: it re-tests the ENTRY count itself, so it is a
-            // no-op on a byte-only crossing — which is the crossing that
-            // matters here. Halve until BOTH bounds hold, because one random
-            // halving can keep the large half and a single bulk INSERT is a
-            // meaningful fraction of the budget on its own. Re-summed from the
-            // survivors each round: `retain` drops an arbitrary half, so the
-            // counter cannot be decremented incrementally.
-            while !self.cache.is_empty() && (self.cache.len() >= self.capacity || self.cache_text_bytes.load(Relaxed) >= self.max_text_bytes) {
-                self.cache.retain(|_, _| fastrand::bool());
-                self.cache_text_bytes.store(self.cache.iter().map(|e| e.key().len()).sum(), Relaxed);
+            // A byte crossing evicts LARGEST-FIRST, not `soft_cap`'s random
+            // half. Random halving is right when entries are interchangeable,
+            // but here they are not: the bytes are owed by a handful of bulk
+            // INSERTs and the population is mostly small dashboard SELECTs, so
+            // a random half would keep paying the pressure while throwing away
+            // the hot templates that make the cache worth having. Dropping the
+            // biggest frees the budget in the fewest evictions, which is also
+            // the smallest hit to the hit rate. (`soft_cap` would be a no-op
+            // here regardless: it re-tests the entry count itself.)
+            if self.cache_text_bytes.load(Relaxed) >= self.max_text_bytes {
+                let mut by_size: Vec<(usize, String)> = self.cache.iter().map(|e| (e.key().len(), e.key().clone())).collect();
+                by_size.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                let mut held = self.cache_text_bytes.load(Relaxed);
+                for (len, key) in by_size {
+                    if held < self.max_text_bytes {
+                        break;
+                    }
+                    if self.cache.remove(&key).is_some() {
+                        held = held.saturating_sub(len);
+                    }
+                }
+                self.cache_text_bytes.store(held, Relaxed);
             }
+            soft_cap(&self.cache, self.capacity);
+            // Re-summed from the survivors: `soft_cap` drops an arbitrary half,
+            // so the counter cannot be decremented incrementally.
+            self.cache_text_bytes.store(self.cache.iter().map(|e| e.key().len()).sum(), Relaxed);
             self.evicting.store(false, Release);
         }
         // A statement that alone exceeds the budget is served but not cached:
@@ -1441,12 +1457,28 @@ mod tests {
 
         // The budget held, and the accounting matches what is actually retained
         // — a counter that drifted from the map would silently stop bounding it.
+        // The sweep runs BEFORE the admission that follows it (sweeping after
+        // would evict the statement just built, since it is the largest), so
+        // the steady-state bound is the budget plus one statement.
+        let largest: usize = hook.cache.iter().map(|e| e.key().len()).max().unwrap_or(0);
         let retained: usize = hook.cache.iter().map(|e| e.key().len()).sum();
-        assert!(retained < hook.max_text_bytes, "cache retains {retained} text bytes, over its {} budget", hook.max_text_bytes);
+        assert!(retained <= hook.max_text_bytes + largest, "cache retains {retained} text bytes, over its {} budget", hook.max_text_bytes);
         assert_eq!(hook.cache_text_bytes.load(Relaxed), retained, "the byte counter drifted from the map it bounds");
         // And it bounded by BYTES, not by count: the entry cap never applied.
         assert!(hook.cache.len() < STATEMENTS, "the sweep must have dropped entries; {} of {STATEMENTS} retained", hook.cache.len());
         assert!(hook.cache.len() < hook.capacity, "the entry cap must not be what bounded this");
+
+        // Evicting largest-first is what makes the bound affordable: the small
+        // dashboard SELECT that shares the cache with this flood must survive
+        // it, or bounding memory would just have traded an OOM for a cache that
+        // never hits. A random half-drop fails this ~50% of the time per sweep.
+        let select = "SELECT id FROM t WHERE project_id = $1";
+        assert!(hook.cached_plan(&parse(select), &ctx).await.is_some());
+        for batch in 1..=STATEMENTS {
+            let values = (0..batch * 50).map(|r| format!("(${}, ${})", r * 2 + 1, r * 2 + 2)).collect::<Vec<_>>().join(",");
+            let _ = hook.cached_plan(&parse(&format!("INSERT INTO t (id, project_id) VALUES {values}")), &ctx).await;
+        }
+        assert!(hook.cache.contains_key(&parse(select).to_string()), "the flood evicted the small hot SELECT instead of the bulk INSERTs paying for the bytes");
     }
 
     /// A `'$1'` STRING LITERAL makes the text-based `has_placeholder` fire while
