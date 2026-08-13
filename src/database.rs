@@ -9720,8 +9720,18 @@ impl Database {
             // (and with it every later tick, since the pass holds
             // `maintenance_job_sem`). Failing open to the per-bin path is the
             // established behaviour for a probe that does not finish.
-            let probe_budget = pass_deadline.saturating_duration_since(std::time::Instant::now()).min(stage_deadline);
-            self.batch_probe_classify(table, table_name, ready, probe_budget).await
+            //
+            // An INSTANT, not a duration. A duration is a per-probe ceiling, and
+            // probes run in waves of `rewrite_permits` — so 16 groups at 2
+            // permits could each burn the whole remaining pass and take EIGHT
+            // times the budget the caller meant to hand out. That is the
+            // "Dedup job run still in progress after 600s (skips=5)" prod
+            // 2026-08-13 was reporting: the phase outran its 5-minute tick and
+            // every overlapping tick was dropped, so the queue only grew.
+            // `checked_add`: `stage_deadline` is `Duration::MAX` wherever the
+            // caller means "no per-probe ceiling", and that overflows an Instant.
+            let probe_deadline = std::time::Instant::now().checked_add(stage_deadline).map_or(pass_deadline, |ceiling| pass_deadline.min(ceiling));
+            self.batch_probe_classify(table, table_name, ready, probe_deadline).await
         } else {
             ready
         };
@@ -9870,7 +9880,7 @@ impl Database {
     /// singleton keeps the per-bin path — its bin-scoped probe prunes to ten
     /// minutes of files where the whole-date probe scans them all.
     async fn batch_probe_classify(
-        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, deadline: std::time::Duration,
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, deadline: std::time::Instant,
     ) -> Vec<(String, String, i64)> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut groups: std::collections::HashMap<(String, String), Vec<i64>> = Default::default();
@@ -9901,12 +9911,26 @@ impl Database {
         // phase is emitted on completion, so a phase that does not complete
         // prints nothing at all — which is how prod 2026-08-12 spent 55 minutes
         // in a 5-minute dedup tick with no log between its first and last line.
-        info!(table_name, groups = groups.len(), budget_secs = deadline.as_secs(), event = "dedup_batch_probe_start");
+        info!(
+            table_name,
+            groups = groups.len(),
+            budget_secs = deadline.saturating_duration_since(std::time::Instant::now()).as_secs(),
+            event = "dedup_batch_probe_start"
+        );
         let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
+            // What is left of the PHASE at the moment this probe starts, so the
+            // waves behind the permit limit share one budget instead of each
+            // claiming it whole. Zero left means this group was never examined:
+            // leave its bins queued rather than dequeuing them for a probe that
+            // cannot run, so a later tick can still classify them cheaply.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Vec::new();
+            }
             for bin in &bins {
                 self.dedup_dirty_bins.remove(&(project.clone(), table_name.to_string(), date.clone(), *bin));
             }
-            match tokio::time::timeout(deadline, self.probe_dup_bins(table, table_name, &project, &date)).await {
+            match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
                 Ok(Ok(dup_bins)) => {
                     let stats = crate::metrics::maintenance_stats();
                     let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
@@ -21137,6 +21161,45 @@ mod tests {
         assert_eq!(crate::metrics::maintenance_stats().dirty_bin_batch_probe_clean.load(Relaxed), 2, "both clean bins are consumed by the batch probe alone");
         assert!(db.dedup_dirty_bins.is_empty(), "clean and dup bins are all consumed");
         assert_eq!(delta_physical_row_count(&table).await?, 3, "the duplicate collapsed; clean rows untouched");
+        Ok(())
+    }
+
+    /// The probe phase's deadline is shared by every group, not re-granted to
+    /// each one.
+    ///
+    /// It used to be a `Duration`, applied as a per-probe timeout — but probes
+    /// run in waves of `rewrite_permits`, so 16 groups at 2 permits could take
+    /// EIGHT times the budget the caller handed out. Prod 2026-08-13 reported
+    /// exactly that as "Dedup job run still in progress after 600s (skips=5)":
+    /// the phase outran its 5-minute tick and every overlapping tick was
+    /// dropped, so the dirty-bin queue only grew (359 deep).
+    ///
+    /// An `Instant` makes over-granting unrepresentable. What is left to test
+    /// is the boundary it creates: a group reached with nothing left must leave
+    /// its bins QUEUED — dequeuing for a probe that cannot run would spend the
+    /// cheap classification path's entry ticket on nothing.
+    #[tokio::test]
+    async fn dedup_batch_probe_leaves_bins_queued_when_the_phase_budget_is_gone() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-probedeadline-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
+        let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        const TEN_MIN: i64 = 10 * 60 * 1_000_000;
+        let row = |id: &str, ts: i64| json_to_batch(vec![test_span_ts(id, "only", &project, ts)]);
+        // Two bins on one date, so the group clears the `bins.len() >= 2` filter.
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("a", base)?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("b", base - TEN_MIN)?], true, None).await?;
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+
+        let ready: Vec<(String, String, i64)> = db.dedup_dirty_bins.iter().map(|e| (e.key().0.clone(), e.key().2.clone(), e.key().3)).collect();
+        let queued_before = db.dedup_dirty_bins.len();
+        assert_eq!(queued_before, 2, "both bins are queued to begin with");
+
+        let out = db.batch_probe_classify(&table, "otel_logs_and_spans", ready, std::time::Instant::now()).await;
+
+        assert_eq!(db.dedup_dirty_bins.len(), queued_before, "an exhausted phase budget must not dequeue bins it never probed");
+        assert_eq!(out.len(), queued_before, "and every bin still fails OPEN to the per-bin staging path");
         Ok(())
     }
 
