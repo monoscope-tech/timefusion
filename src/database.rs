@@ -8966,11 +8966,12 @@ impl Database {
             // split — but an unbounded first attempt is how the whole job starved:
             // prod 2026-08-13 logged a run "still in progress" across six
             // consecutive 600s warnings, produced no tick record at all, and was
-            // killed by the ~50min process restart, over and over. A unit that
-            // cannot finish inside one tick budget never will, because nothing
-            // gives it more time than that. Abandon it, record the failure so
-            // `rollup_retry_allowed` backs it off, and let the partitions that DO
-            // fit get built.
+            // killed by the ~50min process restart, over and over. Nothing gives
+            // a unit more time than `BACKFILL_UNIT_BUDGET_MULTIPLE` tick budgets,
+            // so one that needs more can never be built by this path — and
+            // letting it try consumes every process lifetime. Abandon it, record
+            // the failure so `rollup_retry_allowed` backs it off, and let the
+            // partitions that DO fit get built.
             //
             // Cancelling mid-build is safe: the Delta commit is the last step, so
             // a dropped future leaves no partial state — only wasted work.
