@@ -35,6 +35,16 @@ jobs:
   ab:
     name: "${{ inputs.baseline_cpu }} vs ${{ inputs.candidate_cpu }}"
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # The bench profile inherits `release` (thin LTO, 16 CGUs), and building this
+    # dep tree that way killed a 4-vCPU runner mid-link. Lighten codegen for both
+    # legs: the A/B stays valid because the two legs differ ONLY in target-cpu,
+    # and if anything this UNDER-states the win by muting cross-crate inlining.
+    env:
+      CARGO_PROFILE_BENCH_LTO: "false"
+      CARGO_PROFILE_BENCH_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_BENCH_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
