@@ -8589,7 +8589,7 @@ impl Database {
     /// recomputes the latter — otherwise every build would store a fingerprint
     /// the read path could never match.
     async fn rebuild_rollup_partition(&self, source: &str, project_id: &str, date: &str, _certified_fp: u64) -> Result<()> {
-        if !self.config.maintenance.rollup_build_enabled_for(project_id) {
+        if !self.config.maintenance.rollup_build_enabled() {
             return Ok(());
         }
         let Some(schema) = get_schema(source) else { return Ok(()) };
@@ -8910,13 +8910,9 @@ impl Database {
         // the canary project, and "converged" and "the filter dropped everything"
         // were indistinguishable from outside.
         let pool = candidates.len();
-        let (mut gated, mut backoff, mut covered) = (0usize, 0usize, 0usize);
+        let (mut backoff, mut covered) = (0usize, 0usize);
         candidates.retain(|(project, date)| {
             let date_key = date.to_string();
-            if !self.config.maintenance.rollup_build_enabled_for(project) {
-                gated += 1;
-                return false;
-            }
             if !self.rollup_retry_allowed(project, source, &date_key) {
                 backoff += 1;
                 return false;
@@ -8937,7 +8933,7 @@ impl Database {
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         rotate_head_window(&mut candidates, self.rollup_backfill_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         if pool > 0 && candidates.is_empty() {
-            info!(source, pool, gated, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
+            info!(source, pool, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
         }
 
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
@@ -9348,7 +9344,7 @@ impl Database {
             let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
             let current_fp = partition_file_fp(cur_files.clone());
             if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().fp) == Some(current_fp) {
-                if self.config.maintenance.rollup_build_enabled_for(pid)
+                if self.config.maintenance.rollup_build_enabled()
                         && self.rollup_retry_allowed(pid, table_name, &date.to_string())
                         && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
                         // Coverage is keyed on DATA identity, not on this file

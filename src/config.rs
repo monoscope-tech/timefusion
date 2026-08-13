@@ -2126,9 +2126,6 @@ pub struct MaintenanceConfig {
     /// Allow raw fringes and a live raw tail around certified rollup windows.
     #[serde(default)]
     pub timefusion_rollup_realtime_tail: bool,
-    /// Optional comma-separated build canary projects.
-    #[serde(default)]
-    pub timefusion_rollup_build_projects: Option<String>,
     /// Optional comma-separated read canary projects.
     #[serde(default)]
     pub timefusion_rollup_read_projects: Option<String>,
@@ -2302,8 +2299,15 @@ impl MaintenanceConfig {
         projects.is_none_or(|projects| projects.trim().is_empty() || projects.split(',').map(str::trim).any(|project| project == project_id))
     }
 
-    pub fn rollup_build_enabled_for(&self, project_id: &str) -> bool {
-        self.timefusion_rollup_enabled && Self::selected(project_id, self.timefusion_rollup_build_projects.as_deref())
+    /// Builds run for EVERY project once rollups are on.
+    ///
+    /// There was a per-project canary allow-list here. It was deleted because a
+    /// hidden list of project UUIDs is a debugging trap: "why has this project
+    /// no rollup" has an answer that lives in an env var nobody remembers
+    /// setting, and any project created after the list was written silently
+    /// never gets built.
+    pub fn rollup_build_enabled(&self) -> bool {
+        self.timefusion_rollup_enabled
     }
 
     pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {
@@ -2453,20 +2457,23 @@ impl AppConfig {
 mod tests {
     use super::*;
 
+    /// Builds follow the global switch and NOTHING else. The read side keeps
+    /// its canary list; the build side deliberately has none, so a project
+    /// missing a rollup is never explained by a forgotten env var.
     #[test]
-    fn rollup_gates_default_off_and_respect_canary_projects() {
+    fn rollup_builds_follow_the_global_switch_for_every_project() {
         let mut config = AppConfig::default().maintenance;
-        assert!(!config.rollup_build_enabled_for("project-a"));
+        assert!(!config.rollup_build_enabled());
         assert!(!config.rollup_read_enabled_for("project-a"));
 
         config.timefusion_rollup_enabled = true;
-        config.timefusion_rollup_build_projects = Some("project-a, project-b".into());
         config.timefusion_rollup_read_enabled = true;
         config.timefusion_rollup_read_projects = Some("project-b".into());
-        assert!(config.rollup_build_enabled_for("project-a"));
+        for project in ["project-a", "project-b", "project-c", "a-project-created-tomorrow"] {
+            assert!(config.rollup_build_enabled(), "builds must cover every project: {project}");
+        }
         assert!(!config.rollup_read_enabled_for("project-a"));
         assert!(config.rollup_read_enabled_for("project-b"));
-        assert!(!config.rollup_build_enabled_for("project-c"));
     }
 
     /// The tree budgets 100% of whatever limit it is given — correct for a
