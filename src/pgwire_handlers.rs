@@ -26,7 +26,7 @@ use datafusion_postgres::{
 use futures::{Sink, StreamExt, TryStreamExt, stream};
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use tracing::{Instrument, error, field::Empty, info, instrument};
+use tracing::{Instrument, error, field::Empty, info, instrument, warn};
 
 use crate::{
     database::Database,
@@ -874,7 +874,19 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
                 .await
                 .map(|(responses, deadline)| with_response_deadlines(responses, deadline));
         record_statement_latency(self.scan_metrics.as_deref(), query, "simple", t0.elapsed().as_micros() as u64, result.is_ok());
+        log_statement_failure("simple", &result);
         result
+    }
+}
+
+/// Logs a failing statement from INSIDE its query span, so the span's
+/// `query.text` lands on the same line as the error. `LoggingErrorHandler` runs
+/// outside the span and can only report the message — which is why a pgAdmin
+/// planning failure showed up in prod as a bare "Invalid function" with no way
+/// to tell which statement produced it.
+fn log_statement_failure(protocol: &str, result: &PgWireResult<impl Sized>) {
+    if let Err(error) = result {
+        warn!(protocol, error = %error, "statement failed");
     }
 }
 
@@ -957,6 +969,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         .await
         .map(|(response, deadline)| with_response_deadline(response, deadline));
         record_statement_latency(self.scan_metrics.as_deref(), query, "extended", t0.elapsed().as_micros() as u64, result.is_ok());
+        log_statement_failure("extended", &result);
         result
     }
 }
