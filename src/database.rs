@@ -9426,6 +9426,7 @@ impl Database {
 
     async fn dedup_dirty_bins_for_table(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, flush_healthy: &(dyn Fn() -> bool + Sync), stage_deadline: std::time::Duration,
+        pass_deadline: std::time::Instant,
     ) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
@@ -9507,8 +9508,19 @@ impl Database {
         // every queued bin of a (project, date) at once; only dup-bearing
         // bins continue into per-bin staging. Probe failure or timeout fails
         // OPEN to the per-bin path.
-        let mut ready =
-            if schema.dedup_keys.iter().any(|k| k == "timestamp") { self.batch_probe_classify(table, table_name, ready, stage_deadline).await } else { ready };
+        let mut ready = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
+            // Bound the probe phase by what is LEFT of the PASS, not just by the
+            // per-probe ceiling: a whole-date probe over a fragmented whale
+            // partition can run for the ceiling's full hour, and the phase logs
+            // only on completion, so one such probe silently consumes the tick
+            // (and with it every later tick, since the pass holds
+            // `maintenance_job_sem`). Failing open to the per-bin path is the
+            // established behaviour for a probe that does not finish.
+            let probe_budget = pass_deadline.saturating_duration_since(std::time::Instant::now()).min(stage_deadline);
+            self.batch_probe_classify(table, table_name, ready, probe_budget).await
+        } else {
+            ready
+        };
         if ready.is_empty() {
             self.persist_dirty_bins();
             return Ok(());
@@ -9681,6 +9693,11 @@ impl Database {
         // the tiebreak so each provider built still retires the most bins.
         groups.sort_by(|((_, da), a), ((_, db), b)| db.cmp(da).then(b.len().cmp(&a.len())));
         groups.truncate(BATCH_PROBE_GROUPS);
+        // BEFORE the probes, not only after each one. Every other line in this
+        // phase is emitted on completion, so a phase that does not complete
+        // prints nothing at all — which is how prod 2026-08-12 spent 55 minutes
+        // in a 5-minute dedup tick with no log between its first and last line.
+        info!(table_name, groups = groups.len(), budget_secs = deadline.as_secs(), event = "dedup_batch_probe_start");
         let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
             for bin in &bins {
                 self.dedup_dirty_bins.remove(&(project.clone(), table_name.to_string(), date.clone(), *bin));
@@ -9794,7 +9811,7 @@ impl Database {
         // dragged each pass by hours while the bins never finished. 3600s
         // still bounds the hung-read wedge this exists for (was 6.5h).
         const DEDUP_BIN_STAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
-        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE).await {
+        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE, sweep_deadline).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
                 warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
                 crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16581,6 +16598,12 @@ mod tests {
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
 
+    /// A pass deadline no test will reach, for the drain's bounding parameter.
+    /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
+    fn far_future() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
     /// The merge-on-read gate: `keep_greatest_ordering` yields the lead sort key
     /// only when the table declares a `dedup_tiebreak` AND that key is a dedup
     /// key of an i64-backed type. Without a tiebreak it must yield `None` — that
@@ -20391,19 +20414,19 @@ mod tests {
             dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), &project, &old_date)
         };
         assert_eq!(selected.len(), 2, "snapshot selection must retain both duplicate-bearing files: {selected:?}");
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 2, "sealed bin is deduplicated without dropping an adjacent-bin row from the same file");
         assert!(db.dedup_dirty_bins.is_empty(), "completed sealed bin is consumed");
 
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "later", old)?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "late retry requeues the previously consumed bin");
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 2, "later observed timestamp survives the requeue rewrite and the neighbour remains");
 
         let fresh = Utc::now().timestamp_micros();
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "a", fresh)?], true, None).await?;
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "b", fresh)?], true, None).await?;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "unsealed bin remains queued without rewrite");
         assert_eq!(delta_physical_row_count(&table).await?, 4, "unsealed copies remain for read-side dedup");
         Ok(())
@@ -20429,7 +20452,7 @@ mod tests {
         // Healthy at pass start, unhealthy for exactly one mid-pass sample.
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let flaky = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &flaky, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &flaky, std::time::Duration::MAX, far_future()).await?;
         assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2, "the unhealthy sample must have been consumed");
         assert_eq!(delta_physical_row_count(&table).await?, 1, "a transient unhealthy flush sample must not forfeit the staged dedup work");
         assert!(db.dedup_dirty_bins.is_empty(), "bin is consumed, not requeued");
@@ -20459,7 +20482,7 @@ mod tests {
         assert_eq!(db.dedup_dirty_bins.len(), 3);
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
 
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(crate::metrics::maintenance_stats().dirty_bin_batch_probe_clean.load(Relaxed), 2, "both clean bins are consumed by the batch probe alone");
         assert!(db.dedup_dirty_bins.is_empty(), "clean and dup bins are all consumed");
@@ -20486,12 +20509,12 @@ mod tests {
         // A 1ms deadline fires before any real staging read can complete —
         // standing in for the hung GET.
         use std::sync::atomic::Ordering::Relaxed;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_millis(1)).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_millis(1), far_future()).await?;
         assert!(crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.load(Relaxed) >= 1, "the per-bin deadline must fire");
         assert_eq!(db.dedup_dirty_bins.len(), 1, "the timed-out bin is requeued, not lost");
         assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
 
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1, "the requeued bin dedups under a sane deadline");
         assert!(db.dedup_dirty_bins.is_empty());
         Ok(())
@@ -20571,7 +20594,7 @@ mod tests {
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
         // Batch of 1 with a cold-only queue still serves it (lowest priority ≠
         // never), so the drain deduplicates rather than abandoning the rows.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(
             crate::metrics::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
             deferred_before,
@@ -20599,7 +20622,7 @@ mod tests {
 
         let yields_before = crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(
             crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
             yields_before + 1,
@@ -20609,7 +20632,7 @@ mod tests {
         assert_eq!(delta_physical_row_count(&table).await?, 2, "no rewrite happened; read-side dedup keeps results correct");
 
         // Healthy again ⇒ the same bin drains normally.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1);
         Ok(())
     }
