@@ -18374,10 +18374,7 @@ mod tests {
         // Operands either way round, since the optimizer may swap them.
         assert_eq!(super::date_partition_window(&[date(20_000).eq(col("date"))]), Some((20_000 * DAY, 20_001 * DAY - 1)));
         // Beside the project filter a real rollup build carries.
-        assert_eq!(
-            super::date_partition_window(&[col("project_id").eq(lit("p")), col("date").eq(date(1))]),
-            Some((DAY, 2 * DAY - 1))
-        );
+        assert_eq!(super::date_partition_window(&[col("project_id").eq(lit("p")), col("date").eq(date(1))]), Some((DAY, 2 * DAY - 1)));
         // Anything that is not a date equality yields nothing, so the skip stays
         // denied rather than being granted over an unproven window.
         assert_eq!(super::date_partition_window(&[col("project_id").eq(lit("p"))]), None);
