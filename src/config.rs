@@ -369,6 +369,21 @@ impl DerivedBudget {
     }
 
     /// Formerly `MemoryConfig::maintenance_pool_bytes` (explicit-knob-or-clamped-derive).
+    /// Hand `bytes` back from the maintenance pool, never below the floor.
+    /// Returns what was actually surrendered.
+    ///
+    /// Maintenance is the RESIDUAL claimant — the tree gives it
+    /// `limit - reserved` — so it is exactly the pool that silently absorbed
+    /// every ceiling `reserved` forgot: MemBuffer's 120% admission overshoot,
+    /// the tantivy writer peak, and the DataFusion metadata cache. Shrinking it
+    /// to match the audit is restoring the intended reservation, not taxing
+    /// maintenance arbitrarily. See `autotune::apply`.
+    pub fn reclaim_maintenance_pool(&mut self, bytes: usize) -> usize {
+        let before = self.maintenance_pool_bytes;
+        self.maintenance_pool_bytes = before.saturating_sub(bytes).max(MAINTENANCE_FLOOR_BYTES);
+        before - self.maintenance_pool_bytes
+    }
+
     pub fn maintenance_pool_bytes(&self) -> usize {
         self.maintenance_pool_bytes
     }

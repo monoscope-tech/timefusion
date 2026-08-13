@@ -146,7 +146,28 @@ pub fn apply(config: &mut AppConfig) {
     // auto-derived split respects the ≈72% invariant by construction; this
     // checks the FINAL post-override sum and warns loudly — operators keep
     // authority, but the failure mode becomes visible instead of an OOM.
-    let audit = budget_audit(config, total_ram_mb);
+    // RECLAIM, don't merely warn. The tree reserves `query + ingest + foyer +
+    // writer + untracked_slack` and hands maintenance the remainder — but the
+    // audit counts three ceilings that `reserved` never included: MemBuffer at
+    // its 120% admission hard limit rather than the nominal ingest fraction,
+    // the tantivy writer peak, and the DataFusion metadata cache. Roughly 5.8 GB
+    // on prod, silently taken out of maintenance's share.
+    //
+    // That was harmless only while maintenance was too broken to claim its pool.
+    // When the rollup backfill started completing builds again on 2026-08-13 the
+    // box went straight to `committed_mb=64956` against `warn_at_mb=61440` and
+    // OOM-killed repeatedly. A warning nobody is awake to read is not a budget,
+    // so take the overage back from the residual claimant that absorbed it.
+    let mut audit = budget_audit(config, total_ram_mb);
+    if audit.oversubscribed() {
+        let overage = audit.committed_mb.saturating_sub(audit.warn_at_mb) * MB;
+        let reclaimed = config.derived.reclaim_maintenance_pool(overage) / MB;
+        audit = budget_audit(config, total_ram_mb);
+        warn!(
+            "bootstrap.phase=budget_reclaim reclaimed_mb={reclaimed} from the maintenance pool              (it is the residual claimant, so it is what absorbed the unreserved MemBuffer overshoot,              tantivy peak and metadata cache) — maintenance_pool now {}mb, committed {}mb vs warn_at {}mb",
+            audit.maintenance_pool_mb, audit.committed_mb, audit.warn_at_mb
+        );
+    }
     let _ = BOOT_AUDIT.set(audit);
     // Always emit the breakdown, "we fit" included: the slack figure is the
     // operator's only view of how much room the untracked consumers have.
@@ -303,6 +324,43 @@ mod tests {
         assert_eq!(a.mem_buffer_hard_mb, effective * 6 / 5);
         assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.tantivy_peak_mb + a.df_metadata_cache_mb);
         assert!(a.oversubscribed(), "a 24GB MemBuffer in a 24GiB container must be flagged: {a:?}");
+    }
+
+    /// An oversubscribed budget must be RECLAIMED, not merely warned about.
+    ///
+    /// The tree reserves query + ingest + foyer + writer + untracked_slack and
+    /// hands maintenance the remainder, but the audit counts three ceilings
+    /// `reserved` never included: MemBuffer at its 120% admission hard limit
+    /// (not the nominal ingest fraction), the tantivy writer peak, and the
+    /// DataFusion metadata cache — ~5.8 GB on prod, taken silently out of
+    /// maintenance's share. Harmless only while maintenance was too broken to
+    /// claim its pool; the day the rollup backfill started completing builds
+    /// again (2026-08-13) prod sat at committed 64956 / warn_at 61440 and
+    /// OOM-killed repeatedly. A warning nobody is awake to read is not a budget.
+    #[test]
+    fn an_oversubscribed_budget_is_reclaimed_from_the_residual_pool() {
+        let mut cfg = AppConfig::default();
+        cfg.buffer.timefusion_buffer_max_memory_mb = 24000;
+        let ram_mb = 24 * 1024;
+        let before = budget_audit(&cfg, ram_mb);
+        assert!(before.oversubscribed(), "fixture must start oversubscribed: {before:?}");
+
+        let overage = before.committed_mb.saturating_sub(before.warn_at_mb);
+        let reclaimed = cfg.derived.reclaim_maintenance_pool(overage * MB) / MB;
+        let after = budget_audit(&cfg, ram_mb);
+
+        assert!(reclaimed > 0, "something must actually be surrendered");
+        assert_eq!(after.maintenance_pool_mb, before.maintenance_pool_mb - reclaimed, "the reclaim comes out of maintenance");
+        assert_eq!(after.committed_mb, before.committed_mb - reclaimed, "and therefore out of committed");
+        // Every other budget is untouched — maintenance is the residual
+        // claimant, so it is the one that absorbed the unreserved ceilings.
+        assert_eq!((after.query_pool_mb, after.mem_buffer_hard_mb, after.foyer_mb), (before.query_pool_mb, before.mem_buffer_hard_mb, before.foyer_mb));
+
+        // A pool that would go below the floor stops there rather than going
+        // negative — a 1 GB maintenance pool still sorts and spills.
+        let floored = cfg.derived.reclaim_maintenance_pool(usize::MAX);
+        assert!(cfg.derived.maintenance_pool_bytes() >= 1024 * 1024 * 1024, "must not reclaim below the floor");
+        assert!(floored <= after.maintenance_pool_mb * MB);
     }
 
     #[test]
