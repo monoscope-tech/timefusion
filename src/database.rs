@@ -3455,8 +3455,21 @@ impl Database {
                     // tick, and with it the dirty-bin drain (prod 2026-08-12:
                     // 55+ minutes on a 5-minute schedule, 10 consecutive skips,
                     // zero bins committed).
-                    let sweep_deadline =
-                        std::time::Instant::now() + db.config.derived.tick_budget(cron_period(&db.config.maintenance.timefusion_dedup_schedule));
+                    //
+                    // SPLIT between the pass's two halves, because they run in
+                    // sequence and the first one will otherwise take all of it:
+                    // with a single shared deadline prod 2026-08-13 logged
+                    // `dedup_sweep_truncated swept=0 remaining=19` — the drain's
+                    // probes spent the whole 239s and the sweep, which is what
+                    // certifies partitions and builds rollups, did not run at all.
+                    // Trading a starved sweep for a starved drain is not a fix.
+                    let budget = db.config.derived.tick_budget(cron_period(&db.config.maintenance.timefusion_dedup_schedule));
+                    let now = std::time::Instant::now();
+                    // The drain gets the larger share: it is the half that
+                    // physically removes duplicates, and the sweep's work is
+                    // resumable at a cursor while a half-drained bin is not.
+                    let drain_deadline = now + budget.mul_f64(0.6);
+                    let sweep_deadline = now + budget;
                     for (project_id, table_name, table) in db.all_tables().await {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
@@ -3464,7 +3477,7 @@ impl Database {
                         // Dedup key: bare table name for unified tables, tenant-scoped
                         // for custom-storage ones (they are separate Delta logs).
                         let key = if project_id.is_empty() { table_name.clone() } else { format!("{project_id}:{table_name}") };
-                        db.run_dedup_for_table(&table, &table_name, &key, &Self::table_label(&project_id, &table_name), sweep_deadline).await;
+                        db.run_dedup_for_table(&table, &table_name, &key, &Self::table_label(&project_id, &table_name), drain_deadline, sweep_deadline).await;
                     }
                 }
             }
@@ -9795,7 +9808,10 @@ impl Database {
     /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
     /// fallback sweep). The 90s deadline is a warning threshold, not a
     /// cancellation: a slow-but-healthy table is allowed to finish.
-    async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str, sweep_deadline: std::time::Instant) {
+    async fn run_dedup_for_table(
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str, drain_deadline: std::time::Instant,
+        sweep_deadline: std::time::Instant,
+    ) {
         if !self.config.maintenance.timefusion_dirty_bin_dedup_enabled {
             debug!(table_name, event = "dirty_bin_dedup_paused", "physical dirty-bin dedup is disabled; read-side dedup remains active");
             return;
@@ -9811,7 +9827,7 @@ impl Database {
         // dragged each pass by hours while the bins never finished. 3600s
         // still bounds the hung-read wedge this exists for (was 6.5h).
         const DEDUP_BIN_STAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
-        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE, sweep_deadline).await {
+        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE, drain_deadline).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
                 warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
                 crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -17973,6 +17989,24 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
         // An empty list must not panic on the modulo.
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
+    }
+
+    /// The dedup tick's two halves run in SEQUENCE, so one shared deadline is
+    /// not a split — the first half takes all of it. Prod 2026-08-13, with
+    /// exactly that shape, logged `dedup_sweep_truncated swept=0 remaining=19`:
+    /// the drain's probes spent the whole 239s budget and the sweep (partition
+    /// certification and rollup builds) never ran a single item.
+    #[test]
+    fn the_dedup_tick_budget_leaves_the_sweep_a_share_the_drain_cannot_take() {
+        let budget = std::time::Duration::from_secs(240);
+        let now = std::time::Instant::now();
+        let (drain_deadline, sweep_deadline) = (now + budget.mul_f64(0.6), now + budget);
+        assert!(drain_deadline < sweep_deadline, "a drain that can run to the pass deadline starves the sweep behind it");
+        let sweep_share = sweep_deadline - drain_deadline;
+        assert!(sweep_share >= budget.mul_f64(0.3), "the sweep's guaranteed share is too thin to certify anything: {sweep_share:?}");
+        // Both halves must still fit the tick, or the pass overruns its period
+        // and `maintenance_job_sem` skips every later tick.
+        assert!(sweep_deadline <= now + budget);
     }
 
     /// A repair bin that times out or panics must still clear its slot, or
