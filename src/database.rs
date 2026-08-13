@@ -2857,8 +2857,14 @@ impl Database {
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            rollup_backfill_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            rollup_source_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            // SEEDED, not zero. A cursor that restarts at 0 rotates nothing when
+            // the process lives ~30 min and a tick can take 24: every lifetime
+            // picks the same head partition and the same first source, which is
+            // exactly the starvation the rotation exists to break. Seeding from
+            // the clock makes successive PROCESSES start at different offsets,
+            // so rotation works across restarts and not merely within one.
+            rollup_backfill_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(rotation_seed())),
+            rollup_source_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(rotation_seed())),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
@@ -13944,6 +13950,16 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
     memory_bound.min(cpu_bound).max(MAINTENANCE_MAX_PARTITIONS)
 }
 
+/// Starting offset for the backfill rotation cursors, varying per PROCESS.
+///
+/// `sweep_resume_offset` takes this modulo the work-list length, so any value
+/// spreads; what matters is only that two consecutive processes do not pick the
+/// same one. Seconds-since-epoch does that and is monotonic, so a restart loop
+/// walks forward through the work list rather than re-picking its head.
+fn rotation_seed() -> usize {
+    usize::try_from(crate::clock::now_micros().unsigned_abs() / 1_000_000).unwrap_or(0)
+}
+
 /// A backfill unit's deadline, as a multiple of the tick budget.
 ///
 /// The tick budget alone (0.8 x a 10-minute cron = 8 min) is too tight: a
@@ -18349,6 +18365,33 @@ mod tests {
             Ok::<_, ()>(Some(()))
         };
         assert_eq!(tokio::time::timeout(budget, quick).await, Ok(Ok(Some(()))));
+    }
+
+    /// Rotation must survive a RESTART, not merely a tick.
+    ///
+    /// The cursors used to start at 0 on every construction. With prod's ~30-min
+    /// process lifetime and ticks that can take 24, a cursor barely advances
+    /// before the process dies — so every lifetime picked the same head
+    /// partition and the same first source, and the rotation fixes did nothing
+    /// at all. Seeding per process is what makes them work.
+    #[test]
+    fn the_rotation_cursor_starts_somewhere_new_each_process() {
+        let seed = super::rotation_seed();
+        assert!(seed > 0, "a zero seed is the bug this exists to prevent");
+
+        // Two processes a minute apart must not pick the same head of a 16-entry
+        // window — the head-window size the backfill rotates over.
+        let later = seed + 60;
+        let window = super::BACKFILL_ROTATION_WINDOW;
+        assert_ne!(
+            super::sweep_resume_offset(window, seed),
+            super::sweep_resume_offset(window, later),
+            "restarts a minute apart must not re-pick the same head"
+        );
+        // And the offset is always a legal index, whatever the clock says.
+        for len in [1usize, 2, 16, 207] {
+            assert!(super::sweep_resume_offset(len, seed) < len);
+        }
     }
 
     /// Rotation must not cost recency. Rotating the WHOLE candidate list would
