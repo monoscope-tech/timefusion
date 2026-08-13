@@ -8964,7 +8964,17 @@ impl Database {
         // uncertifiable used to be byte-identical in the log to a tick with
         // nothing to do — which is how a frozen backfill hides.
         if queued > 0 {
-            info!(source, pool, queued, attempted, built, uncertifiable, failed, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
+            info!(
+                source,
+                pool,
+                queued,
+                attempted,
+                built,
+                uncertifiable,
+                failed,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                event = "rollup_backfill_tick"
+            );
         }
         let _ = schema;
         Ok(built)

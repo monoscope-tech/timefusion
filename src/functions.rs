@@ -1360,7 +1360,10 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 fn hll_insert_array(sketch: &mut crate::hll::Hll, array: &ArrayRef) -> datafusion::error::Result<()> {
     macro_rules! feed {
         ($ty:ty) => {{
-            let typed = array.as_any().downcast_ref::<$ty>().ok_or_else(|| DataFusionError::Execution("hll_agg: array does not match its own data type".to_string()))?;
+            let typed = array
+                .as_any()
+                .downcast_ref::<$ty>()
+                .ok_or_else(|| DataFusionError::Execution("hll_agg: array does not match its own data type".to_string()))?;
             typed.iter().flatten().for_each(|value| sketch.insert_hash(crate::hll::hash_bytes(AsRef::<[u8]>::as_ref(&value))));
             return Ok(());
         }};
@@ -1498,7 +1501,8 @@ fn create_hll_count_udf() -> ScalarUDF {
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
             let array = as_array(args.first().ok_or_else(|| DataFusionError::Execution("hll_count requires one argument".to_string()))?)?;
-            let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("hll_count expects a Binary sketch".to_string()))?;
+            let binary =
+                array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("hll_count expects a Binary sketch".to_string()))?;
             // NULL in, NULL out: a group that never saw the measure has no sketch,
             // which is not the same claim as "zero distinct values".
             let counts: Int64Array = binary
