@@ -125,10 +125,7 @@ pub(crate) const BUILD_CHUNK_HOURS: u32 = 6;
 /// read-side guard can catch.
 pub(crate) fn build_chunk_masks(chunk_hours: u32) -> Vec<u32> {
     let chunk_hours = chunk_hours.clamp(1, 24);
-    (0..24)
-        .step_by(chunk_hours as usize)
-        .map(|start| (start..(start + chunk_hours).min(24)).fold(0u32, |mask, hour| mask | (1 << hour)))
-        .collect()
+    (0..24).step_by(chunk_hours as usize).map(|start| (start..(start + chunk_hours).min(24)).fold(0u32, |mask, hour| mask | (1 << hour))).collect()
 }
 
 /// The `[start, end)` ranges `hours` marks on the day beginning at `day_start`,

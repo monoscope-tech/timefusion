@@ -8673,9 +8673,10 @@ impl Database {
             // * anything else: one whole-day rebuild, the original behaviour.
             let plans: Vec<Vec<(i64, i64)>> = match (dirty.zip(day_start).filter(|_| hours_fit), day_start.filter(|_| hours_fit)) {
                 (Some((hours, day_start)), _) => vec![crate::rollup::dirty_ranges(day_start, hours)],
-                (None, Some(day_start)) => {
-                    crate::rollup::build_chunk_masks(crate::rollup::BUILD_CHUNK_HOURS).into_iter().map(|mask| crate::rollup::dirty_ranges(day_start, mask)).collect()
-                }
+                (None, Some(day_start)) => crate::rollup::build_chunk_masks(crate::rollup::BUILD_CHUNK_HOURS)
+                    .into_iter()
+                    .map(|mask| crate::rollup::dirty_ranges(day_start, mask))
+                    .collect(),
                 (None, None) => vec![Vec::new()],
             };
             let incremental = dirty.is_some() && hours_fit;
