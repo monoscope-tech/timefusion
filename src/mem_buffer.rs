@@ -7,7 +7,7 @@ use arrow::{
     array::{Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray, UInt32Array},
     compute::{concat, filter_record_batch},
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit},
-    row::{OwnedRow, RowConverter, SortField},
+    row::{RowConverter, SortField},
 };
 use dashmap::DashMap;
 use datafusion::{
@@ -685,9 +685,15 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
     // Choose one surviving index per key. With no tiebreak: last occurrence wins
     // (unconditional insert). With a tiebreak: the greatest value wins, ties →
     // last (we only keep the existing pick when its tiebreak is strictly greater).
-    let mut chosen: std::collections::HashMap<OwnedRow, u32> = std::collections::HashMap::with_capacity(rows.num_rows());
+    // BORROWED keys, ahash, no per-row allocation. This runs once per row of
+    // every flush and every dedup rewrite, and it used to `.owned()` each key —
+    // one heap allocation per row — into a SipHash map. `Row<'_>` already hashes
+    // and compares by the same encoded bytes, and it borrows `rows`, which
+    // outlives this map, so the copy bought nothing.
+    let mut chosen: std::collections::HashMap<arrow::row::Row<'_>, u32, ahash::RandomState> =
+        std::collections::HashMap::with_capacity_and_hasher(rows.num_rows(), ahash::RandomState::new());
     for i in 0..rows.num_rows() {
-        let k = rows.row(i).owned();
+        let k = rows.row(i);
         match (&tb_rows, chosen.get(&k)) {
             (Some(tb), Some(&j)) if tb.row(i) < tb.row(j as usize) => {}
             _ => {
@@ -716,8 +722,14 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
         return Ok(batches);
     }
     // NULL and false both mean live; only `true` retires the key.
-    let keep: std::collections::HashSet<u32> =
-        chosen.into_values().filter(|&i| tombstones.as_ref().is_none_or(|f| !(f.is_valid(i as usize) && f.value(i as usize)))).collect();
+    //
+    // A dense bitmap, not a `HashSet<u32>`: the survivors are indices into
+    // `0..num_rows`, so the set below is a direct-addressed lookup with no
+    // hashing at all — and the filter loop under it probes it once per row.
+    let mut keep = vec![false; rows.num_rows()];
+    for i in chosen.into_values().filter(|&i| tombstones.as_ref().is_none_or(|f| !(f.is_valid(i as usize) && f.value(i as usize)))) {
+        keep[i as usize] = true;
+    }
     // Filter each batch against its slice of the global row-index space
     // (`scan` carries the running base offset).
     Ok(batches
@@ -726,7 +738,7 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
             let n = b.num_rows() as u32;
             Some((b, std::mem::replace(base, *base + n), n))
         })
-        .map(|(b, base, n)| filter_record_batch(b, &BooleanArray::from((0..n).map(|r| keep.contains(&(base + r))).collect::<Vec<bool>>())))
+        .map(|(b, base, n)| filter_record_batch(b, &BooleanArray::from_iter((0..n).map(|r| Some(keep[(base + r) as usize])))))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|kept| kept.num_rows() > 0)
@@ -2252,11 +2264,15 @@ impl MemBuffer {
         let sort_fields: Vec<SortField> = src_key_cols.iter().map(|c| SortField::new(c.data_type().clone())).collect();
         let row_converter = RowConverter::new(sort_fields).map_err(arrow_err)?;
         let src_rows = row_converter.convert_columns(&src_key_cols).map_err(arrow_err)?;
-        let mut src_lookup: HashMap<OwnedRow, u32> = HashMap::with_capacity(source.batch.num_rows());
+        // Borrowed keys + ahash, as in `dedup_batches`: `src_rows` outlives this
+        // map, so owning each key only bought a heap allocation per source row
+        // on the enrichment UPDATE path.
+        let mut src_lookup: HashMap<arrow::row::Row<'_>, u32, ahash::RandomState> =
+            HashMap::with_capacity_and_hasher(source.batch.num_rows(), ahash::RandomState::new());
         for (i, row) in src_rows.iter().enumerate() {
             // First-wins on duplicate source keys (PG leaves multi-match
             // semantics undefined; deterministic first-row-wins is our pick).
-            src_lookup.entry(row.owned()).or_insert(i as u32);
+            src_lookup.entry(row).or_insert(i as u32);
         }
 
         let mut total_updated = 0u64;
@@ -2300,7 +2316,7 @@ impl MemBuffer {
                     .collect::<DFResult<Vec<_>>>()?;
                 let tgt_rows = row_converter.convert_columns(&tgt_key_cols).map_err(arrow_err)?;
 
-                let src_idxs: UInt32Array = (0..num_rows).map(|i| src_lookup.get(&tgt_rows.row(i).owned()).copied()).collect();
+                let src_idxs: UInt32Array = (0..num_rows).map(|i| src_lookup.get(&tgt_rows.row(i)).copied()).collect();
 
                 // The common case is zero joined rows in this batch (source is a
                 // handful of ids vs the whole buffer): skip the widened-batch

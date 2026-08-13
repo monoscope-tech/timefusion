@@ -62,7 +62,26 @@ ENV CARGO_PROFILE_RELEASE_STRIP=none
 # pointers; without them every allocation collapses into one bogus leaf frame
 # (2026-07-31: 28GB attributed to a random bz2 symbol — dumps unusable for OOM
 # attribution). ~1% perf cost, and it makes every future OOM self-explaining.
-ENV RUSTFLAGS="-C force-frame-pointers=yes"
+#
+# Microarchitecture. Without `-C target-cpu` rustc emits BASELINE x86-64 — SSE2,
+# no AVX2, no BMI2, no FMA — which for a columnar engine is most of the machine
+# left unused: arrow-rs 58 dropped its explicit `simd` feature and relies on LLVM
+# autovectorization, and every Arrow compare/filter/aggregate kernel, the parquet
+# bit-packing and RLE decoders, and the null-bitmap popcounts are gated behind
+# exactly these target features. Prod is an AMD EPYC 8224P (Zen 4c) advertising
+# avx2, avx512f/bw/dq/vl/vnni/vbmi2, bmi1/2, fma, vaes and vpclmulqdq.
+#
+# `x86-64-v3` (AVX2 + BMI2 + FMA + POPCNT), not `native` and not `v4`:
+#   - `native` would target the BUILD RUNNER's CPU, not the deploy host, so the
+#     binary can SIGILL on a machine the builder never saw.
+#   - `v4` (AVX-512) is supported by this host but pins us to it; v3 is portable
+#     to any server CPU since ~2015 and captures the large SSE2 -> AVX2 step.
+# Canary v4/znver4 with `--build-arg TARGET_CPU=x86-64-v4`; an arm64 build must
+# pass its own value (e.g. `neoverse-n1`), since these names are x86-only.
+ARG TARGET_CPU=x86-64-v3
+# ONE definition, used by both the cook and build steps below — they must see
+# identical RUSTFLAGS or cargo-chef's cached dep layer is silently discarded.
+ENV RUSTFLAGS="-C force-frame-pointers=yes -C target-cpu=${TARGET_CPU}"
 # ...but frame pointers alone were not enough: jemalloc's profiler unwinds with
 # whatever method it was *configured* with, and stock tikv-jemalloc-sys leaves it
 # on the libgcc unwinder, which returns zero frames here — 100% of an 88GB prod
