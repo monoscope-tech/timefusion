@@ -166,7 +166,13 @@ impl Hll {
         // Flajolet's harmonic-mean estimator. `alpha` is the standard bias
         // constant for m >= 128.
         let alpha = 0.7213 / (1.0 + 1.079 / M as f64);
-        let harmonic: f64 = registers.iter().map(|&r| f64::from(2u32).powi(-i32::from(r))).sum();
+        // 2^-r by constructing the IEEE-754 exponent directly, not `powi`. The
+        // sum runs over all M registers on every estimate, and `powi` is an
+        // opaque call LLVM will not vectorize; this is widen-subtract-shift-
+        // bitcast, which it turns into AVX2. Total for any `r: u8` — the
+        // exponent field cannot underflow, so a corrupt payload is still a
+        // finite positive number rather than UB.
+        let harmonic: f64 = registers.iter().map(|&r| f64::from_bits((1023 - u64::from(r)) << 52)).sum();
         (alpha * (M * M) as f64 / harmonic).round() as u64
     }
 
