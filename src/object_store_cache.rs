@@ -1148,9 +1148,23 @@ impl FoyerObjectStoreCache {
         let mut response_slice = None;
         let mut range_meta = None;
 
-        // First check if we have the full file cached
+        // First check if we have the full file cached IN MEMORY.
+        //
+        // Memory tier only, deliberately. A hybrid `get` that misses L1 loads
+        // the entry off the disk tier and deserializes the WHOLE file body —
+        // prod averages ~117 MB per entry — to then slice out the ~1 MB the
+        // caller asked for. L1 is 4 GB against ~1100 cached files, so under
+        // concurrent scans every ranged read evicted the previous file's body
+        // and re-read the next one: `EntryDeserializer::deserialize` was the
+        // single largest stack in the live heap (23.7%, 4.34 GiB, 2026-08-13)
+        // and the process OOM-killed every 10-30 minutes.
+        //
+        // Nothing is lost by skipping the disk tier here: the exact and aligned
+        // RANGE entries probed below are on that same disk, are the size of the
+        // read rather than the size of the file, and are what a ranged reader
+        // should be hitting. Whole-file readers still take `get_cached`.
         let full_cache_key = Self::make_cache_key(location);
-        if let Ok(Some(entry)) = self.cache.get(&full_cache_key).await {
+        if let Some(entry) = self.cache.memory().get(&full_cache_key) {
             let value = entry.value();
             if !value.is_expired(self.config.ttl) && range.end <= value.data.len() as u64 {
                 record_range_hit(&self.stats, range.end - range.start).await;
@@ -1392,7 +1406,11 @@ impl FoyerObjectStoreCache {
     /// meta cache. Returns `None` if neither has a live entry.
     async fn cached_meta(&self, location: &Path) -> Option<ObjectMeta> {
         let live = |e: Option<CacheEntry>| e.filter(|e| !e.value().is_expired(self.config.ttl)).map(|e| e.value().meta.clone());
-        if let Some(meta) = live(self.cache.get(&Self::make_cache_key(location)).await.ok().flatten()) {
+        // Memory tier only, for the reason spelled out in `get_range_cached`:
+        // reaching the disk tier here would deserialize a ~117 MB file body to
+        // read an `ObjectMeta`. The meta cache below holds the same thing at
+        // its own size, and a miss costs one HEAD that `admit_meta` memoizes.
+        if let Some(meta) = live(self.cache.memory().get(&Self::make_cache_key(location))) {
             return Some(meta);
         }
         is_parquet_file(location).then_some(())?;
@@ -2764,6 +2782,55 @@ mod tests {
         // are reclaimed from disk shortly after rather than waiting for VACUUM.
         shared.evict_data_entry(path.as_ref());
         assert!(!shared.cache.memory().contains(&path.to_string()), "evicted entry should be dropped from the in-memory cache");
+
+        cache.shutdown().await?;
+        Ok(())
+    }
+
+    /// A ranged read must never pull a whole file off the DISK tier.
+    ///
+    /// Prod 2026-08-13: `get_range` opened with a hybrid `get` on the full-file
+    /// key, so any file whose body had aged out of the 4 GB memory tier was
+    /// loaded and deserialized whole — ~117 MB — to serve a ~1 MB slice. With
+    /// ~1100 cached files that happened on nearly every ranged read;
+    /// `EntryDeserializer::deserialize` held 23.7% of the live heap and the
+    /// process was OOM-killed every 10-30 minutes. The read must fall through
+    /// to the range path instead, which caches entries the size of the read.
+    #[tokio::test]
+    async fn a_ranged_read_never_loads_the_whole_file_from_the_disk_tier() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("range_no_fullfile")).await?;
+        let cache = FoyerObjectStoreCache::new_with_shared_cache(inner, &shared);
+
+        // A file well past `l1_max_entry_bytes`, so it is exactly the class that
+        // lives on disk and is expensive to deserialize.
+        let path = Path::from("table/date=2026-06-05/part.parquet");
+        let body = vec![b'z'; 4 * 1024 * 1024];
+        cache.put(&path, PutPayload::from(Bytes::from(body))).await?;
+
+        // Drop ONLY the memory copy: the body stays on the disk tier, which is
+        // the steady state for all but the ~35 hottest files on prod.
+        shared.cache.memory().remove(&FoyerObjectStoreCache::make_cache_key(&path));
+        cache.reset_stats().await;
+
+        let served = cache.get_range(&path, 1024..2048).await?;
+        assert_eq!(served.len(), 1024, "the read must still be served correctly");
+
+        // A full-file hit would report `range_hits`, having deserialized the
+        // whole body to slice 1 KiB out of it. The range path instead fetches
+        // one 1 MiB aligned range and caches THAT, so the next read of the same
+        // region is both a hit and cheap.
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.range_hits, 0, "the ranged read was served from the whole-file entry — it deserialized the entire body off disk");
+        assert_eq!(stats.main.range_bytes_read, PARQUET_RANGE_ALIGNMENT_BYTES, "the fallback must read the aligned RANGE, not the file");
+
+        // And the range it cached serves the repeat without touching the inner
+        // store — the amplification is removed, not merely relocated.
+        cache.reset_stats().await;
+        assert_eq!(cache.get_range(&path, 1024..2048).await?.len(), 1024);
+        let repeat = cache.get_stats().await;
+        assert_eq!(repeat.main.range_hits, 1, "the admitted range must serve the repeat read");
+        assert_eq!(repeat.main.inner_bytes_read, 0, "a cached range must not re-fetch");
 
         cache.shutdown().await?;
         Ok(())
