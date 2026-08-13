@@ -2413,6 +2413,11 @@ pub struct Database {
     /// every table, so without rotation the tail of the table list is never
     /// reached — see the cron's comment.
     dedup_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
+    /// Which partition a rollup backfill tick starts with. The first unit runs
+    /// regardless of budget, so a partition too expensive to finish inside one
+    /// process lifetime would otherwise head-of-line block every cheaper one
+    /// behind it, forever.
+    rollup_backfill_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// One repair pass at a time, PROCESS-WIDE.
     ///
     /// `round_robin_bins` already serialises repair within a table (concurrency
@@ -2834,6 +2839,7 @@ impl Database {
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            rollup_backfill_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
@@ -8902,7 +8908,16 @@ impl Database {
             }
             fresh
         });
+        // Newest sealed date first — it is the one a dashboard is most likely to
+        // ask for — then ROTATE, because the first unit runs regardless of budget.
+        // Prod 2026-08-13: the process lifetime was ~50 min and the head partition
+        // took longer than that, so every tick restarted the same unit and NO
+        // partition was ever built (08-12 missing entirely). Rotation costs the
+        // newest date its permanent front-of-queue seat and buys every other
+        // partition a turn at the one slot that is allowed to overrun.
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        let start = sweep_resume_offset(candidates.len(), self.rollup_backfill_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        candidates.rotate_left(start);
         if pool > 0 && candidates.is_empty() {
             info!(source, pool, gated, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
         }
@@ -8910,14 +8925,13 @@ impl Database {
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
         let started = std::time::Instant::now();
         let (mut built, mut uncertifiable, mut failed) = (0, 0usize, 0usize);
+        let mut attempted = 0usize;
         let queued = candidates.len();
         for (project_id, date) in candidates {
-            // The FIRST unit always runs: a day-sized aggregate is indivisible,
-            // so checking the budget before it would let a slow day produce
-            // nothing on every tick, forever.
-            if built > 0 && (built >= self.config.maintenance.timefusion_rollup_backfill_units_per_tick || started.elapsed() >= budget) {
+            if backfill_tick_exhausted(attempted, built, self.config.maintenance.timefusion_rollup_backfill_units_per_tick, started.elapsed(), budget) {
                 break;
             }
+            attempted += 1;
             if self.maintenance_shutdown.is_cancelled() || !self.dedup_flush_healthy() {
                 break;
             }
@@ -8950,7 +8964,7 @@ impl Database {
         // uncertifiable used to be byte-identical in the log to a tick with
         // nothing to do — which is how a frozen backfill hides.
         if queued > 0 {
-            info!(source, pool, queued, built, uncertifiable, failed, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
+            info!(source, pool, queued, attempted, built, uncertifiable, failed, elapsed_ms = started.elapsed().as_millis() as u64, event = "rollup_backfill_tick");
         }
         let _ = schema;
         Ok(built)
@@ -13850,6 +13864,22 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
     memory_bound.min(cpu_bound).max(MAINTENANCE_MAX_PARTITIONS)
 }
 
+/// Should a rollup backfill tick stop before ATTEMPTING another partition?
+///
+/// The first attempt is always exempt: a day-sized aggregate is indivisible, so
+/// checking the budget before it would let a slow day produce nothing on every
+/// tick, forever.
+///
+/// The exemption keys on attempts, not successes. Guarding on `built` meant a
+/// tick whose partitions were all uncertifiable or failing never enforced its
+/// budget at all — the counter stayed 0, so every unit inherited the first
+/// unit's exemption and the loop ran the entire candidate list. Prod 2026-08-13
+/// logged one tick still running across four consecutive 600s warnings,
+/// committing nothing, until the process restarted under it.
+const fn backfill_tick_exhausted(attempted: usize, built: usize, units_per_tick: usize, elapsed: std::time::Duration, budget: std::time::Duration) -> bool {
+    attempted > 0 && (built >= units_per_tick || elapsed.as_nanos() >= budget.as_nanos())
+}
+
 /// Where a deadline-truncated dedup sweep resumes: the served-item cursor
 /// wrapped into the current work list. The cursor only ever grows (each tick
 /// adds what it served), so the modulo is what makes successive short ticks walk
@@ -18079,6 +18109,29 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
         // An empty list must not panic on the modulo.
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
+    }
+
+    /// The rollup backfill's budget must bind even when NOTHING is being built.
+    ///
+    /// Prod 2026-08-13: the backfill tick ran past four consecutive 600s
+    /// "still in progress" warnings and committed nothing, then the process
+    /// restarted under it — for four days, so 08-12 has no rollup at all and
+    /// every dashboard query fell back to a raw scan (8-24s instead of ~40ms).
+    /// The exemption that lets the first indivisible unit overrun was keyed on
+    /// `built`, which stays 0 for a tick whose partitions are all uncertifiable
+    /// or failing — so every unit inherited it and the loop ran unbounded.
+    #[test]
+    fn a_backfill_tick_that_builds_nothing_still_honours_its_budget() {
+        let budget = std::time::Duration::from_secs(240);
+        let (over, under) = (std::time::Duration::from_secs(3600), std::time::Duration::from_secs(1));
+        // The bug, stated directly: nothing built, an hour spent, keep going.
+        assert!(super::backfill_tick_exhausted(1, 0, 8, over, budget), "a tick building nothing must still stop at its budget");
+        assert!(super::backfill_tick_exhausted(9, 0, 8, under, budget) == false, "under budget with units left, it must keep trying");
+        // The first unit is still exempt, or an indivisible day-sized aggregate
+        // that outlasts one budget never runs at all.
+        assert!(!super::backfill_tick_exhausted(0, 0, 8, over, budget), "the first attempt must never be pre-empted");
+        // Unit cap and deadline both bind once something has been attempted.
+        assert!(super::backfill_tick_exhausted(1, 8, 8, under, budget), "the per-tick unit cap must bind");
     }
 
     /// The dedup tick's two halves run in SEQUENCE, so one shared deadline is
