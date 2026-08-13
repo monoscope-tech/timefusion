@@ -3895,6 +3895,11 @@ impl Database {
             // PG parity: `COALESCE(list_col, '{}')` — re-type PG array string
             // literals as list literals before TypeCoercion fails the call.
             Arc::new(crate::optimizers::PgArrayLiteralRewriter),
+            // PG clients put EXISTS in a SELECT list (pgAdmin's `is_catalog`);
+            // DataFusion only decorrelates EXISTS in a filter, so rewrite it to
+            // the equivalent correlated `count(1) > 0` scalar subquery, which it
+            // does decorrelate. Before TypeCoercion so the comparison coerces.
+            Arc::new(crate::optimizers::ExistsInProjection),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
             Arc::new(crate::optimizers::VariantSelectRewriter),
         ];
@@ -5093,14 +5098,16 @@ impl Database {
         Arc::new(RuntimeEnvBuilder::new().with_memory_pool(pool).with_disk_manager_builder(disk).build().expect("build maintenance runtime env"))
     }
 
-    /// Light-optimize slice of the maintenance budget: one per-sort budget
-    /// (1/3 of the pool) per concurrent hot-tail sort, capped so heavy
-    /// maintenance always keeps at least 1/4. 1/4 (6GB of 24) was marginal:
-    /// a single busiest-project bin sort peaked ~5.8GB (prod 2026-07-23,
-    /// SortPreservingMerge exhaustion even with serial fan-out).
+    /// Light-optimize slice of the maintenance budget.
+    ///
+    /// Deferred to `light_share_bytes` rather than recomputed. The old
+    /// expression — `(pool/3 * max_k).min(pool * 3/4)` — happened to equal the
+    /// budget tree's own light share ONLY while `HEAVY_MIN_SHARE` was 0.25, so
+    /// the two agreed by coincidence and the same number had two definitions.
+    /// Moving the share (2026-08-13, 0.25 → 0.40) would silently have changed
+    /// `light_optimize_k` while leaving the actual pools where they were.
     fn light_optimize_pool_bytes(&self) -> usize {
-        let pool = self.config.derived.maintenance_pool_bytes();
-        (pool / 3 * self.config.derived.max_light_optimize_k()).min(pool * 3 / 4)
+        self.config.derived.light_share_bytes()
     }
 
     /// Packing's OWN slice of the light share, so a repair sort cannot starve it.
@@ -5142,10 +5149,12 @@ impl Database {
 
     /// Heavy maintenance (dedup, recompress, Z-order): the budget left after
     /// the light-optimize slice.
+    fn heavy_pool_bytes(&self) -> usize {
+        self.config.derived.maintenance_pool_bytes() - self.light_optimize_pool_bytes()
+    }
+
     fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
-        self.maintenance_runtime_env
-            .get_or_init(|| self.build_spill_runtime_env(self.config.derived.maintenance_pool_bytes() - self.light_optimize_pool_bytes(), "maintenance_spill"))
-            .clone()
+        self.maintenance_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.heavy_pool_bytes(), "maintenance_spill")).clone()
     }
 
     /// Hot-tail PACKING: the reserved slice (see field doc).
@@ -8082,82 +8091,115 @@ impl Database {
             let rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
             let staging_table = { table_ref.read().await.clone() };
             let stage_store = staging_table.log_store().object_store(None);
+            // Shards are INDEPENDENT — disjoint bucket ranges, each staging its
+            // own parquet — so run them CONCURRENTLY. End to end, a bin needing
+            // N shards paid N scans + sorts + writes back to back while holding
+            // one rewrite permit: prod 2026-08-13 watched three otel_metrics
+            // bins burn the whole 3600s per-bin deadline and fail that way,
+            // on a box using 5 of its 48 cores. The permit still bounds
+            // concurrent BINS; `shard_k` bounds shards within one, so peak
+            // Arrow is `shard_k x decoded_budget` rather than one budget.
+            let shard_k = dedup_shard_concurrency(decoded_budget, self.config.derived.cores);
+            let staged_shards: Vec<StagedShard> = futures::stream::iter(0..shards)
+                .map(|shard| {
+                    let (ctx, staging_table, scan_name) = (&ctx, &staging_table, &scan_name);
+                    let (partition_filter, in_list, bucket_expr) = (&partition_filter, &in_list, &bucket_expr);
+                    async move {
+                        let mut adds: Vec<Action> = Vec::new();
+                        let staged: anyhow::Result<(usize, usize)> = async {
+                            let shard_pred = if shards > 1 {
+                                // Contiguous bucket range per shard (even ±1); string compare of
+                                // zero-padded lowercase hex == numeric order.
+                                let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
+                                let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < '{hi:02x}'") } else { String::new() };
+                                format!(" AND {bucket_expr} >= '{lo:02x}'{upper}")
+                            } else {
+                                String::new()
+                            };
+                            let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
+                            let batches: Vec<RecordBatch> =
+                                ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
+                            let shard_before: usize = batches.iter().map(|b| b.num_rows()).sum();
+                            if shard_before == 0 {
+                                return Ok((0, 0));
+                            }
+                            // Version collapse: greatest `dedup_tiebreak` per key wins, so a
+                            // merge-on-read table's newest version survives and the older ones
+                            // are dropped here rather than at every read.
+                            //
+                            // Tombstones are RETAINED (`drop_tombstones = None`). Dropping one
+                            // requires that no older version of its key can exist outside this
+                            // rewrite's input. The input is every live file of this
+                            // (project_id, date) snapshot holding a row in the 10-minute chunk
+                            // window; since `timestamp` is a dedup key and `date` derives from
+                            // it, all versions of a key do share that window — but three ways
+                            // an older version outlives the rewrite are NOT excludable here:
+                            //   1. files appended after the file-id query (flush, WAL replay,
+                            //      an off-box writer). `commit_wave`'s liveness check verifies
+                            //      the TARGETS still exist; it cannot see a new file carrying
+                            //      an older version of the same key.
+                            //   2. rows still in MemBuffer/WAL/hot tier. The 2h sealed-chunk
+                            //      guard bounds EVENT time, not arrival: a late client re-send
+                            //      (or a version append, which carries the base row's original
+                            //      `timestamp`) lands in a long-sealed window at any wall clock.
+                            //   3. tables whose `dedup_keys` omit `timestamp` take the
+                            //      whole-partition branch above, where versions of one key may
+                            //      sit in date partitions this sweep never holds together.
+                            // A retained tombstone costs one row per deleted key forever; a
+                            // dropped one silently resurrects the row. Retain.
+                            let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None)?;
+                            let shard_after = deduped.iter().map(|b| b.num_rows()).sum::<usize>();
+                            // Variant struct columns may still be BinaryView if the partition
+                            // mixes tiers — cast to Binary so the write accepts the schema.
+                            let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+                            // Rewrite: the files this replaces are committed and sorted.
+                            // Rather than swap them for one unsorted output, fail the bin
+                            // and let the next sweep retry (`Forbid`).
+                            let (deduped, sorted) = self.sort_flush_group(schema, deduped, UnsortedFallback::Forbid).await?;
+                            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
+                            let mut writer = deltalake::writer::RecordBatchWriter::for_table(staging_table)
+                                .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
+                                .with_writer_properties(writer_properties);
+                            let target_schema = writer.arrow_schema();
+                            let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
+                            for b in deduped {
+                                let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
+                                writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
+                                // Bound the output file (see `timefusion_writer_max_file_bytes`):
+                                // a whole-chunk rewrite is exactly where the multi-GB,
+                                // unrepairable files came from.
+                                if writer.buffer_len() >= max_file_bytes {
+                                    adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
+                                }
+                            }
+                            adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
+                            Ok((shard_before, shard_after))
+                        }
+                        .await;
+                        (adds, staged)
+                    }
+                })
+                .buffer_unordered(shard_k)
+                .collect()
+                .await;
+            drop(rewrite_permit);
+            // Fold: every shard hands back its adds even when it failed, so a
+            // mid-flight failure still leaks nothing.
             let (mut before, mut after) = (0usize, 0usize);
             let mut adds: Vec<Action> = Vec::new();
-            let stage_result: anyhow::Result<()> = async {
-                for shard in 0..shards {
-                    let shard_pred = if shards > 1 {
-                        // Contiguous bucket range per shard (even ±1); string compare of
-                        // zero-padded lowercase hex == numeric order.
-                        let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
-                        let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < '{hi:02x}'") } else { String::new() };
-                        format!(" AND {bucket_expr} >= '{lo:02x}'{upper}")
-                    } else {
-                        String::new()
-                    };
-                    let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
-                    let batches: Vec<RecordBatch> =
-                        ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
-                    let shard_before: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    if shard_before == 0 {
-                        continue;
+            let mut stage_result: anyhow::Result<()> = Ok(());
+            for (shard_adds, outcome) in staged_shards {
+                adds.extend(shard_adds);
+                match outcome {
+                    Ok((shard_before, shard_after)) => (before, after) = (before + shard_before, after + shard_after),
+                    Err(error) => {
+                        stage_result = Err(match stage_result {
+                            Ok(()) => error,
+                            Err(first) => first,
+                        })
                     }
-                    before += shard_before;
-                    // Version collapse: greatest `dedup_tiebreak` per key wins, so a
-                    // merge-on-read table's newest version survives and the older ones
-                    // are dropped here rather than at every read.
-                    //
-                    // Tombstones are RETAINED (`drop_tombstones = None`). Dropping one
-                    // requires that no older version of its key can exist outside this
-                    // rewrite's input. The input is every live file of this
-                    // (project_id, date) snapshot holding a row in the 10-minute chunk
-                    // window; since `timestamp` is a dedup key and `date` derives from
-                    // it, all versions of a key do share that window — but three ways
-                    // an older version outlives the rewrite are NOT excludable here:
-                    //   1. files appended after the file-id query (flush, WAL replay,
-                    //      an off-box writer). `commit_wave`'s liveness check verifies
-                    //      the TARGETS still exist; it cannot see a new file carrying
-                    //      an older version of the same key.
-                    //   2. rows still in MemBuffer/WAL/hot tier. The 2h sealed-chunk
-                    //      guard bounds EVENT time, not arrival: a late client re-send
-                    //      (or a version append, which carries the base row's original
-                    //      `timestamp`) lands in a long-sealed window at any wall clock.
-                    //   3. tables whose `dedup_keys` omit `timestamp` take the
-                    //      whole-partition branch above, where versions of one key may
-                    //      sit in date partitions this sweep never holds together.
-                    // A retained tombstone costs one row per deleted key forever; a
-                    // dropped one silently resurrects the row. Retain.
-                    let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None)?;
-                    after += deduped.iter().map(|b| b.num_rows()).sum::<usize>();
-                    // Variant struct columns may still be BinaryView if the partition
-                    // mixes tiers — cast to Binary so the write accepts the schema.
-                    let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-                    // Rewrite: the files this replaces are committed and sorted.
-                    // Rather than swap them for one unsorted output, fail the bin
-                    // and let the next sweep retry (`Forbid`).
-                    let (deduped, sorted) = self.sort_flush_group(schema, deduped, UnsortedFallback::Forbid).await?;
-                    let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
-                    let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
-                        .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
-                        .with_writer_properties(writer_properties);
-                    let target_schema = writer.arrow_schema();
-                    let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
-                    for b in deduped {
-                        let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
-                        writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
-                        // Bound the output file (see `timefusion_writer_max_file_bytes`):
-                        // a whole-chunk rewrite is exactly where the multi-GB,
-                        // unrepairable files came from.
-                        if writer.buffer_len() >= max_file_bytes {
-                            adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
-                        }
-                    }
-                    adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
                 }
-                Ok(())
             }
-            .await;
-            drop(rewrite_permit);
             if let Err(e) = stage_result {
                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                 return Err(e);
@@ -12119,6 +12161,39 @@ fn build_query_runtime_env(
 /// `[0, DEDUP_BUCKET_COUNT)` into contiguous ranges, so more shards than buckets
 /// would leave rows uncovered. Doubles as a runaway-shard-count backstop.
 const DEDUP_BUCKET_COUNT: u64 = 256;
+
+/// One shard's staged parquet plus its (before, after) row counts — or the
+/// error that stopped it. The adds come back either way, so a shard that fails
+/// mid-flight still hands over what it wrote for cleanup.
+type StagedShard = (Vec<deltalake::kernel::Action>, anyhow::Result<(usize, usize)>);
+
+/// Arrow ONE dedup bin may hold across all its concurrent shards.
+///
+/// Deliberately equal to the old `d_dedup_max_decoded_bytes`, because that is
+/// what a bin already peaked at when it ran a single 2 GiB shard at a time.
+/// Concurrency here is funded by SHRINKING the shard, not by raising the
+/// ceiling: peak Arrow per bin is unchanged, so `maintenance_rewrite_sem` still
+/// bounds the process the same way it did.
+const DEDUP_BIN_ARROW_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How many shards of ONE dedup bin may rewrite at once.
+///
+/// Each shard materializes up to `decoded_budget` of Arrow OUTSIDE any pool
+/// (which is what `maintenance_rewrite_sem` exists to bound), so the count is
+/// exactly how many fit in `DEDUP_BIN_ARROW_BUDGET` — and never more than a
+/// quarter of the cores, since several bins may be in flight on their own
+/// permits.
+///
+/// Shards ran strictly end to end until 2026-08-13, which is what made a
+/// multi-shard bin take longer than its own 3600s deadline: three otel_metrics
+/// bins timed out and requeued on a box running 5 of its 48 cores.
+fn dedup_shard_concurrency(decoded_budget: u64, cores: usize) -> usize {
+    match decoded_budget {
+        // No per-shard ceiling configured ⇒ one shard already holds everything.
+        0 => 1,
+        budget => (DEDUP_BIN_ARROW_BUDGET / budget).clamp(1, (cores / 4).max(1) as u64) as usize,
+    }
+}
 
 /// Returns the hash-shard count needed to keep one dedup rewrite within either
 /// configured byte budget. A zero budget disables that ceiling.
@@ -18894,6 +18969,11 @@ mod tests {
         let db = Database::with_config(create_test_config("pool-split")).await?;
         assert_eq!(db.pack_pool_bytes() + db.repair_pool_bytes(), db.light_optimize_pool_bytes(), "the split must not grow the maintenance budget");
         assert!(db.pack_pool_bytes() > 0 && db.repair_pool_bytes() > 0, "neither pass may be sized to zero");
+        // The light and heavy pools must TILE the maintenance budget. They had
+        // independent definitions that agreed only while HEAVY_MIN_SHARE was
+        // 0.25, so moving that share silently desynced pools from `light_optimize_k`.
+        assert_eq!(db.light_optimize_pool_bytes() + db.heavy_pool_bytes(), db.config.derived.maintenance_pool_bytes(), "light + heavy must tile the pool");
+        assert_eq!(db.heavy_pool_bytes(), db.config.derived.heavy_share_bytes(), "the heavy pool must be the budget tree's heavy share, not a second opinion");
         assert!(!Arc::ptr_eq(&db.light_optimize_runtime_env(), &db.repair_runtime_env()), "sharing one RuntimeEnv is sharing one pool");
 
         // The brake must be blind to repair: an in-flight repair bin is exactly
@@ -20607,6 +20687,20 @@ mod tests {
 
     #[test]
     fn dedup_shards_bound_oversized_rewrites() {
+        // Shard concurrency is funded by SHRINKING the shard, so the product
+        // `shards_in_flight x per-shard budget` must not exceed what one
+        // sequential 2 GiB shard already held. A change that raises the budget
+        // without lowering the concurrency (or vice versa) breaks that.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for budget in [GIB / 8, GIB / 4, GIB / 2, GIB, 2 * GIB] {
+            let k = dedup_shard_concurrency(budget, 48) as u64;
+            assert!(k >= 1, "a bin must always make progress");
+            assert!(k * budget <= super::DEDUP_BIN_ARROW_BUDGET, "{k} shards x {budget} B exceeds the per-bin Arrow budget");
+        }
+        assert_eq!(dedup_shard_concurrency(GIB / 2, 48), 4, "prod: 512 MiB shards, four in flight, same 2 GiB peak as one old shard");
+        assert_eq!(dedup_shard_concurrency(GIB / 2, 8), 2, "cores/4 bounds it on a small box");
+        assert_eq!(dedup_shard_concurrency(0, 48), 1, "no configured ceiling means one shard already holds everything");
+
         assert_eq!(dedup_shard_count(100, 100, 100, 100), 1);
         assert_eq!(dedup_shard_count(101, 100, 100, 100), 2);
         assert_eq!(dedup_shard_count(u64::MAX, 1, 1, 0), DEDUP_BUCKET_COUNT);

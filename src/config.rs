@@ -236,7 +236,23 @@ const HEAVY_REWRITE_PERMITS: usize = 4;
 /// cgroup) backstops the total.
 const PER_SORT_BUDGET_BYTES: usize = 4 * GIB;
 /// Heavy maintenance keeps at least this share of the maintenance pool.
-const HEAVY_MIN_SHARE: f64 = 0.25;
+///
+/// 0.40 since 2026-08-13, from 0.25. This is a REBALANCE inside the existing
+/// pool, not a bigger pool: the maintenance total is unchanged, so nothing is
+/// taken from the untracked slack the 2026-08-02 OOM series was traced to.
+///
+/// It follows the workload. Hot-tail packing (the light share) converged once
+/// it stopped being starved — bins now select 5-6 files and 2-6 projects have
+/// work per tick, against 50-65-file partitions before — while the dirty-bin
+/// dedup queue was still growing at roughly 13 enqueued per bin drained. Heavy
+/// is where the backlog now is.
+///
+/// 0.40 specifically, because `light_optimize_k` divides the light share by
+/// `PER_SORT_BUDGET_BYTES`: at 0.60 light on prod's 20.5 GiB pool that is
+/// 12.3 GiB, which still yields K=3. Going further would drop packing to K=2
+/// and buy heavy little, since its concurrency is bounded by the rewrite
+/// permits rather than by bytes.
+const HEAVY_MIN_SHARE: f64 = 0.40;
 /// Floor so a tiny box never zeroes the maintenance pool.
 const MAINTENANCE_FLOOR_BYTES: usize = GIB;
 
@@ -439,15 +455,27 @@ impl DerivedBudget {
         cron_period.mul_f64(0.8)
     }
 
-    /// Wave-boundary memory brake: 70% of the cgroup limit. One-way safety
-    /// valve only (see doc §5) — never used to size K. Was 85%: during the
-    /// 2026-07-30 backlog-drain regime, allocation bursts between wave
-    /// boundaries repeatedly outran jemalloc purge in the 85%→100% window
-    /// (contained OOM kills at 08:24/09:19/10:03, each costing a replay
-    /// cycle). 70% trades drain speed for burst headroom; revisit upward
-    /// once steady-state (no deferred-bin backlog) is the norm.
+    /// Wave-boundary memory brake, as a fraction of the BUDGETED limit. One-way
+    /// safety valve only (see doc §5) — never used to size K.
+    ///
+    /// 80% since 2026-08-13, from 70%. The number to reason about is not this
+    /// fraction but where it lands against the cgroup the OOM killer watches,
+    /// and those differ: `memory_limit_bytes` is the budgeted limit, itself
+    /// capped below the cgroup (prod runs `TIMEFUSION_MEMORY_BUDGET_GB=82` in a
+    /// 96 GiB container). So 70% was really 60% of the cgroup — 38 GiB of
+    /// headroom the brake would never let maintenance use — and 80% is 68% of
+    /// it, still leaving ~30 GiB.
+    ///
+    /// That distinction is why this is not a return to the 85% that failed: in
+    /// the 2026-07-30 backlog-drain regime, allocation bursts between wave
+    /// boundaries outran jemalloc purge in the 85%→100% window (contained OOM
+    /// kills at 08:24/09:19/10:03, each costing a replay cycle). The comment
+    /// there asked to revisit upward "once steady-state is the norm"; with
+    /// compaction converged and the dirty-bin backlog draining, it is — and the
+    /// brake had started firing on ~18% of ticks against transient dedup peaks
+    /// while true RSS sat near 23 GiB.
     pub fn memory_brake_limit_bytes(&self) -> usize {
-        (self.memory_limit_bytes as f64 * 0.70) as usize
+        (self.memory_limit_bytes as f64 * 0.80) as usize
     }
 
     /// WAL emergency-flush byte threshold, as a fraction of the ingest
@@ -932,12 +960,23 @@ const_default!(d_snapshot_reconcile: u64 = 500);
 // correct, and the skip metric (timefusion.dedup.chunk_skipped) surfaces the
 // debt. Guards against e.g. a z-ordered whole-day file (1GB+ on disk, several
 // GB decompressed × copies) dragging the whole day into one rewrite.
-const_default!(d_dedup_max_rewrite_bytes: u64 = 2 * GIB as u64);
-// 2 GiB estimated decoded footprint (was 4 GiB while rewrite permits were 2;
-// halved when permits went to 3 so permits x budget stays ≤ 8 GiB in flight —
-// see HEAVY_REWRITE_PERMITS). A chunk this large already dwarfs the
+// Kept in step with `d_dedup_max_decoded_bytes` — `dedup_shard_count` takes the
+// MAX of the two shard counts, so leaving this at 2 GiB would let the compressed
+// term silently cap sharding below what the decoded budget asked for.
+const_default!(d_dedup_max_rewrite_bytes: u64 = GIB as u64 / 2);
+// 512 MiB estimated decoded footprint (was 2 GiB; 4 GiB while rewrite permits
+// were 2, halved when permits went to 3 so permits x budget stays ≤ 8 GiB in
+// flight — see HEAVY_REWRITE_PERMITS). A chunk this large already dwarfs the
 // DataFusion pool; larger chunks skip rather than risk the cgroup.
-const_default!(d_dedup_max_decoded_bytes: u64 = 2 * GIB as u64);
+//
+// Quartered again on 2026-08-13 to FUND SHARD CONCURRENCY, not to save memory:
+// `dedup_shard_concurrency` runs `DEDUP_BIN_ARROW_BUDGET / this` shards at
+// once, so a smaller shard buys parallelism at an unchanged peak — 4 x 512 MiB
+// in flight is the same 2 GiB one shard used to hold alone. It also makes each
+// unit finish well inside the per-bin deadline, which is the whole reason those
+// otel_metrics bins were failing: a unit bigger than its budget produces
+// nothing, forever.
+const_default!(d_dedup_max_decoded_bytes: u64 = GIB as u64 / 2);
 // 12× compressed→decoded: zstd on wide Variant/JSON otel rows routinely
 // decodes 10-20×; 12 is a deliberately conservative floor.
 const_default!(d_dedup_decode_inflation: u64 = 12);
@@ -2602,10 +2641,21 @@ mod tests {
         assert_eq!(b.tick_budget(Duration::from_secs(300)), Duration::from_secs(240));
     }
 
+    /// The brake must stay well clear of the cgroup the OOM killer watches, and
+    /// the budgeted limit is NOT that cgroup — prod budgets 82 GiB inside a
+    /// 96 GiB container, so the fraction here lands lower against the real one.
+    /// Pinned because raising the fraction without re-checking that gap is
+    /// exactly how 85% produced contained OOM kills on 2026-07-30.
     #[test]
-    fn memory_brake_is_70pct_of_limit() {
+    fn memory_brake_leaves_real_headroom_under_the_cgroup() {
         let b = DerivedBudget::from_limits(100 * GIB, 48);
-        assert_eq!(b.memory_brake_limit_bytes(), 70 * GIB);
+        assert_eq!(b.memory_brake_limit_bytes(), 80 * GIB);
+
+        // Prod's shape: 82 GiB budgeted in a 96 GiB cgroup.
+        let prod = DerivedBudget::from_limits(82 * GIB, 48);
+        let cgroup = 96 * GIB;
+        assert!(prod.memory_brake_limit_bytes() < cgroup * 7 / 10, "the brake must stay under 70% of the CGROUP, not just of the budget");
+        assert!(cgroup - prod.memory_brake_limit_bytes() >= 25 * GIB, "at least 25 GiB must remain between the brake and the OOM killer");
     }
 
     // cgroup parsers never panic on "max", garbage, or empty content.
