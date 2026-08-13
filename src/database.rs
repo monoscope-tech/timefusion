@@ -8941,6 +8941,10 @@ impl Database {
         }
 
         let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
+        // A single unit may outrun the tick budget — overlapping cron ticks are
+        // skipped, so a run is allowed to exceed its period — but not the process
+        // lifetime, which is what actually decides whether the commit lands.
+        let unit_budget = budget * BACKFILL_UNIT_BUDGET_MULTIPLE;
         let started = std::time::Instant::now();
         let (mut built, mut uncertifiable, mut failed) = (0, 0usize, 0usize);
         let mut attempted = 0usize;
@@ -8977,7 +8981,7 @@ impl Database {
                     None => Ok(None),
                 }
             };
-            match tokio::time::timeout(budget, unit).await {
+            match tokio::time::timeout(unit_budget, unit).await {
                 Err(_elapsed) => {
                     self.record_rollup_failure(&project_id, source, &date_key);
                     failed += 1;
@@ -8985,8 +8989,8 @@ impl Database {
                         project_id,
                         date = %date,
                         source,
-                        budget_secs = budget.as_secs(),
-                        "rollup backfill unit exceeded one tick budget and was abandoned; it cannot be built by this path"
+                        budget_secs = unit_budget.as_secs(),
+                        "rollup backfill unit exceeded its deadline and was abandoned; it cannot be built by this path"
                     );
                 }
                 Ok(Ok(Some(()))) => {
@@ -13918,6 +13922,19 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
     memory_bound.min(cpu_bound).max(MAINTENANCE_MAX_PARTITIONS)
 }
 
+/// A backfill unit's deadline, as a multiple of the tick budget.
+///
+/// The tick budget alone (0.8 x a 10-minute cron = 8 min) is too tight: a
+/// partition needing 15 minutes would be abandoned even though prod's ~50-minute
+/// process lifetime affords it easily, and abandoning it means it is NEVER
+/// built. Unbounded is worse — that is the starvation this exists to stop, one
+/// unit burning 60+ minutes and dying on the restart with nothing committed.
+///
+/// 3x (24 min) sits between: comfortably inside the observed process lifetime,
+/// comfortably outside a normal day-sized aggregate. Raise it only alongside
+/// evidence that the process lives longer.
+const BACKFILL_UNIT_BUDGET_MULTIPLE: u32 = 3;
+
 /// How many of the newest candidates share the one overrun-allowed slot.
 ///
 /// Rotating the WHOLE list would walk 200+ candidates before returning to the
@@ -18236,7 +18253,16 @@ mod tests {
     /// be built by this path and must not consume every process lifetime trying.
     #[tokio::test(start_paused = true)]
     async fn a_unit_that_outlasts_the_tick_budget_is_abandoned() {
-        let budget = std::time::Duration::from_secs(240);
+        // The deadline must sit between a normal day-sized aggregate and the
+        // process lifetime. Too tight and a partition that WOULD commit is
+        // abandoned forever (backoff, never retried by a path with more time);
+        // unbounded is the starvation this exists to stop.
+        let tick = std::time::Duration::from_secs(480); // 0.8 x the 10-minute cron
+        let unit_budget = tick * super::BACKFILL_UNIT_BUDGET_MULTIPLE;
+        assert!(unit_budget >= std::time::Duration::from_secs(15 * 60), "a 15-minute partition must still be allowed to finish: {unit_budget:?}");
+        assert!(unit_budget <= std::time::Duration::from_secs(40 * 60), "the deadline must land inside the ~50min process lifetime: {unit_budget:?}");
+
+        let budget = unit_budget;
         // Stands in for certify+build on a partition too big for this path.
         let forever = async {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
