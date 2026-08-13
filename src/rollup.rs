@@ -155,6 +155,7 @@ pub(crate) fn build_partition_sql_ranges(
                     "min" => "MIN",
                     "max" => "MAX",
                     "tdigest" => "tdigest_merge",
+                    "hll" => "hll_merge",
                     _ => "SUM",
                 };
                 return Ok(format!("{merge}({}) AS {}", measure.name, measure.name));
@@ -163,6 +164,7 @@ pub(crate) fn build_partition_sql_ranges(
                 ("count", None) => "COUNT(*)".to_string(),
                 ("count", Some(column)) => format!("COUNT({column})"),
                 ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+                ("hll", Some(column)) => format!("hll_agg({column})"),
                 (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
                 (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
             };
@@ -305,6 +307,10 @@ pub(crate) enum Merge {
     Max,
     Avg,
     TDigest,
+    /// A distinct count. Unlike every other variant the query's output is NOT
+    /// the folded state — `approx_distinct` returns a number — so `sql` reads
+    /// the estimate back out of the merged sketch.
+    Hll,
 }
 
 impl Merge {
@@ -321,6 +327,7 @@ impl Merge {
             Self::Min => "MIN",
             Self::Max => "MAX",
             Self::TDigest => "tdigest_merge",
+            Self::Hll => "hll_merge",
             _ => "SUM",
         }
     }
@@ -339,6 +346,7 @@ impl Merge {
                 format!("CASE WHEN COALESCE(SUM({count}), 0) = 0 THEN CAST(NULL AS DOUBLE) ELSE CAST(SUM({sum}) AS DOUBLE) / CAST(SUM({count}) AS DOUBLE) END")
             }
             (Self::TDigest, [digest]) => format!("tdigest_merge({digest})"),
+            (Self::Hll, [sketch]) => format!("hll_count(hll_merge({sketch}))"),
             // `arity()` is the single source of truth for how many states each
             // variant is built with, so this is unreachable by construction.
             _ => unreachable!("merge {self:?} built with {} states", states.len()),
@@ -1267,6 +1275,14 @@ async fn route_with_spec(
             "max" => (Merge::Max, measure("max", column.as_deref()).map(|m| vec![m])),
             "avg" => (Merge::Avg, measure("sum", column.as_deref()).zip(measure("count", column.as_deref())).map(|(sum, count)| vec![sum, count])),
             "percentile_agg" => (Merge::TDigest, measure("tdigest", column.as_deref()).map(|m| vec![m])),
+            // The query-side spelling, shared with Timescale Toolkit; the rollup
+            // answers it from a stored sketch. DataFusion's own `approx_distinct`
+            // is deliberately NOT routed: it returns UInt64, so substituting an
+            // Int64 rewrite for it would trip the schema-mismatch guard. Exact
+            // `COUNT(DISTINCT x)` stays non-decomposable and is still declined —
+            // approximating it without being asked is what the measure list
+            // refuses to do.
+            "approx_count_distinct" => (Merge::Hll, measure("hll", column.as_deref()).map(|m| vec![m])),
             _ => return Err(MissReason::NonDecomposableAggregate),
         };
         let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
@@ -1277,6 +1293,7 @@ async fn route_with_spec(
                 let aggregate = measure.agg.to_uppercase();
                 let expression = match (merge, measure.column.as_deref()) {
                     (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+                    (Merge::Hll, Some(column)) => format!("hll_agg({column})"),
                     (_, None) => "COUNT(*)".to_string(),
                     (_, Some(column)) => format!("{aggregate}({column})"),
                 };

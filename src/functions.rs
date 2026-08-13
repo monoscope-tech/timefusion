@@ -454,6 +454,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     ctx.register_udaf(create_percentile_agg_udaf());
     ctx.register_udaf(create_tdigest_merge_udaf());
     ctx.register_udaf(AggregateUDF::from(HllAggUDF::default()));
+    ctx.register_udaf(AggregateUDF::from(HllAggUDF::counting()));
     ctx.register_udaf(create_hll_merge_udaf());
     ctx.register_udf(create_hll_count_udf());
 
@@ -1392,6 +1393,9 @@ struct HllAccumulator {
     sketch: crate::hll::Hll,
     /// `hll_agg` hashes raw values; `hll_merge` folds stored sketches.
     merging: bool,
+    /// `evaluate` returns the estimate rather than the sketch. The STATE stays
+    /// the sketch regardless, so partial/final aggregation is unaffected.
+    counting: bool,
 }
 
 impl Accumulator for HllAccumulator {
@@ -1404,7 +1408,10 @@ impl Accumulator for HllAccumulator {
     }
 
     fn evaluate(&mut self) -> datafusion::error::Result<ScalarValue> {
-        Ok(ScalarValue::Binary(Some(self.sketch.to_bytes())))
+        Ok(match self.counting {
+            true => ScalarValue::Int64(Some(self.sketch.estimate() as i64)),
+            false => ScalarValue::Binary(Some(self.sketch.to_bytes())),
+        })
     }
 
     fn size(&self) -> usize {
@@ -1412,7 +1419,7 @@ impl Accumulator for HllAccumulator {
     }
 
     fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
-        self.evaluate().map(|state| vec![state])
+        Ok(vec![ScalarValue::Binary(Some(self.sketch.to_bytes()))])
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
@@ -1420,24 +1427,47 @@ impl Accumulator for HllAccumulator {
     }
 }
 
-/// `hll_agg(any) -> Binary`. A hand-written `AggregateUDFImpl` rather than
-/// `create_udaf` because the argument is deliberately untyped: a distinct count
-/// is meaningful over every column type, and an `Exact` signature would make
-/// `hll_agg(duration)` a planning error instead of a cast.
+/// The two aggregates that build a sketch from raw values. They share an
+/// accumulator and differ only in what they hand back: `hll_agg` the sketch
+/// itself (a rollup measure), `approx_count_distinct` the estimate (what a query
+/// asks for). Because the STATE is the sketch either way, both fold correctly
+/// across partitions — and the rollup matcher can answer the second from the
+/// first.
+///
+/// A hand-written `AggregateUDFImpl` rather than `create_udaf` because the
+/// argument is deliberately untyped: a distinct count is meaningful over every
+/// column type, and an `Exact` signature would make `hll_agg(duration)` a
+/// planning error instead of a cast.
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct HllAggUDF {
     signature: Signature,
+    /// `true` evaluates to the count, `false` to the serialized sketch.
+    counting: bool,
+}
+
+impl HllAggUDF {
+    /// `approx_count_distinct(any) -> Int64`.
+    ///
+    /// Named for Timescale Toolkit's function of the same name and signature, so
+    /// monoscope emits ONE spelling for both backends — the same trick
+    /// `percentile_agg`/`approx_percentile` already play for percentiles.
+    /// DataFusion's own `approx_distinct` stays registered and unchanged; this
+    /// one exists because its state is storable, which is what lets a rollup
+    /// answer it.
+    fn counting() -> Self {
+        Self { counting: true, ..Self::default() }
+    }
 }
 
 impl Default for HllAggUDF {
     fn default() -> Self {
-        Self { signature: Signature::any(1, Volatility::Immutable) }
+        Self { signature: Signature::any(1, Volatility::Immutable), counting: false }
     }
 }
 
 impl datafusion::logical_expr::AggregateUDFImpl for HllAggUDF {
     fn name(&self) -> &str {
-        "hll_agg"
+        if self.counting { "approx_count_distinct" } else { "hll_agg" }
     }
 
     fn signature(&self) -> &Signature {
@@ -1445,7 +1475,7 @@ impl datafusion::logical_expr::AggregateUDFImpl for HllAggUDF {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Binary)
+        Ok(if self.counting { DataType::Int64 } else { DataType::Binary })
     }
 
     fn state_fields(&self, _args: datafusion::logical_expr::function::StateFieldsArgs) -> datafusion::error::Result<Vec<FieldRef>> {
@@ -1453,7 +1483,7 @@ impl datafusion::logical_expr::AggregateUDFImpl for HllAggUDF {
     }
 
     fn accumulator(&self, _acc_args: datafusion::logical_expr::function::AccumulatorArgs) -> datafusion::error::Result<Box<dyn Accumulator>> {
-        Ok(Box::new(HllAccumulator::default()))
+        Ok(Box::new(HllAccumulator { counting: self.counting, ..Default::default() }))
     }
 }
 
@@ -1468,22 +1498,23 @@ fn create_hll_merge_udaf() -> AggregateUDF {
     )
 }
 
-/// `hll_count(Binary) -> UInt64`. UInt64, not Int64, so a rollup rewrite of
-/// `approx_distinct(x)` keeps the query's own output type.
+/// `hll_count(Binary) -> Int64`. Int64 because that is PG `bigint`, which is
+/// what Timescale Toolkit's `distinct_count` returns and therefore what a
+/// rollup rewrite must produce to keep the query's output type.
 fn create_hll_count_udf() -> ScalarUDF {
     create_udf(
         "hll_count",
         vec![DataType::Binary],
-        DataType::UInt64,
+        DataType::Int64,
         Volatility::Immutable,
         Arc::new(|args: &[ColumnarValue]| {
             let array = as_array(args.first().ok_or_else(|| DataFusionError::Execution("hll_count requires one argument".to_string()))?)?;
             let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("hll_count expects a Binary sketch".to_string()))?;
             // NULL in, NULL out: a group that never saw the measure has no sketch,
             // which is not the same claim as "zero distinct values".
-            let counts: datafusion::arrow::array::UInt64Array = binary
+            let counts: Int64Array = binary
                 .iter()
-                .map(|bytes| bytes.map(|bytes| crate::hll::Hll::from_bytes(bytes).map(|s| s.estimate()).map_err(DataFusionError::Execution)).transpose())
+                .map(|bytes| bytes.map(|bytes| crate::hll::Hll::from_bytes(bytes).map(|s| s.estimate() as i64).map_err(DataFusionError::Execution)).transpose())
                 .collect::<datafusion::error::Result<_>>()?;
             Ok(ColumnarValue::Array(Arc::new(counts)))
         }) as ScalarFunctionImplementation,
@@ -1534,6 +1565,19 @@ mod hll_tests {
         assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (1.5),(2.5),(1.5)) t(v)").await, 2);
         assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES ('a'),('b'),('a')) t(v)").await, 2);
         assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (arrow_cast(1, 'Timestamp(Microsecond, None)'))) t(v)").await, 1);
+    }
+
+    /// `approx_count_distinct` is the query-side spelling and must agree with
+    /// the stored-sketch path it gets rewritten into, or a rollup would answer a
+    /// different number than the raw fallback.
+    #[tokio::test]
+    async fn approx_count_distinct_agrees_with_the_stored_sketch_path() {
+        let rows = "SELECT value % 30000 AS v, value % 7 AS bucket FROM generate_series(1, 300000) t(value)";
+        let direct = scalar(&format!("SELECT approx_count_distinct(v) FROM ({rows})")).await;
+        let via_rollup = scalar(&format!("SELECT hll_count(hll_merge(s)) FROM (SELECT hll_agg(v) AS s FROM ({rows}) GROUP BY bucket)")).await;
+        assert_eq!(direct, via_rollup, "the rewrite must not change the answer");
+        let error = (direct as f64 - 30_000.0).abs() / 30_000.0;
+        assert!(error < 0.05, "estimated {direct}, want ~30000");
     }
 
     /// `hll_count(NULL)` is NULL, not 0: a rollup row that never saw the measure

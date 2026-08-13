@@ -165,14 +165,14 @@ impl RollupSpec {
             anyhow::ensure!(is_ident(&measure.name), "rollup {}: measure `{}` must be an SQL identifier", self.table_name(&source.table_name), measure.name);
             anyhow::ensure!(names.insert(&measure.name), "rollup {}: duplicate or colliding measure `{}`", self.table_name(&source.table_name), measure.name);
             anyhow::ensure!(
-                matches!(measure.agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest"),
+                matches!(measure.agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest" | "hll"),
                 "rollup {}: unsupported aggregate `{}`",
                 self.table_name(&source.table_name),
                 measure.agg
             );
             match (&measure.agg[..], measure.column.as_deref()) {
                 ("count", None) => {}
-                ("count", Some(column)) | ("sum" | "min" | "max", Some(column)) => {
+                ("count", Some(column)) | ("sum" | "min" | "max" | "hll", Some(column)) => {
                     anyhow::ensure!(field(column).is_some(), "rollup {}: unknown column `{column}`", self.table_name(&source.table_name));
                 }
                 ("tdigest", Some(column)) => {
@@ -239,7 +239,7 @@ impl RollupSpec {
         for m in &self.measures {
             let ty = match (m.agg.as_str(), &m.column) {
                 ("count", _) => "Int64".to_string(),
-                ("tdigest", Some(_)) => "Binary".to_string(),
+                ("tdigest" | "hll", Some(_)) => "Binary".to_string(),
                 (_, Some(c)) => src_field(c)?.data_type,
                 (a, None) => anyhow::bail!("rollup {}: `{a}` measure `{}` needs a source column", self.table_name(&source.table_name), m.name),
             };
