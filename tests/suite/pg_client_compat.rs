@@ -110,3 +110,40 @@ async fn catalog_query_does_not_create_a_routing_scan() -> Result<()> {
     assert_eq!(server.db.scan_metrics.provider_scan_total.load(Ordering::Relaxed), before);
     Ok(())
 }
+
+/// pgAdmin's connect-time role probe, with the bound parameter it really sends.
+///
+/// The query is unplannable — `ARRAY(WITH RECURSIVE ...)` hits both DataFusion's
+/// missing array-subquery constructor and a recursive-CTE planning bug — so
+/// `PgCompatibilityHook` answers it instead. This covers what the .slt case
+/// cannot: the extended protocol with a parameter bound, where the hook's plan
+/// declares no placeholders. Booleans must arrive as real bools, not the
+/// strings "t"/"f", because pgAdmin treats any non-empty string as true.
+#[tokio::test(flavor = "multi_thread")]
+async fn pgadmin_role_probe_answers_with_a_bound_parameter() -> Result<()> {
+    let server = TestServer::start().await?;
+    let row = server
+        .client()
+        .await?
+        .query_one(
+            "SELECT roles.oid AS id, roles.rolname AS name, roles.rolsuper AS is_superuser,
+             CASE WHEN roles.rolsuper THEN true ELSE roles.rolcreaterole END AS can_create_role,
+             CASE WHEN roles.rolsuper THEN true ELSE roles.rolcreatedb END AS can_create_db,
+             CASE WHEN $1 = any(array(WITH RECURSIVE cte AS (
+               SELECT pg_roles.oid, pg_roles.rolname FROM pg_catalog.pg_roles WHERE pg_roles.oid = roles.oid
+               UNION ALL
+               SELECT m.roleid, pgr.rolname FROM cte cte_1
+                 JOIN pg_catalog.pg_auth_members m ON m.member = cte_1.oid
+                 JOIN pg_catalog.pg_roles pgr ON pgr.oid = m.roleid)
+               SELECT rolname FROM cte)) THEN true ELSE false END AS can_signal_backend
+             FROM pg_catalog.pg_roles AS roles WHERE rolname = session_user",
+            &[&"pg_signal_backend"],
+        )
+        .await?;
+    assert_eq!(row.get::<_, i32>("id"), 0);
+    assert_eq!(row.get::<_, &str>("name"), "postgres");
+    for flag in ["is_superuser", "can_create_role", "can_create_db", "can_signal_backend"] {
+        assert!(row.get::<_, bool>(flag), "{flag} should be true for a superuser");
+    }
+    Ok(())
+}

@@ -11,12 +11,13 @@ use datafusion::{
     datasource::empty::EmptyTable,
     error::{DataFusionError, Result as DFResult},
     execution::context::SessionContext,
+    logical_expr::expr::Placeholder,
     logical_expr::{
-        ColumnarValue, Expr, LogicalPlan, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-        create_udf,
+        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature,
+        TypeSignature, Volatility, create_udf, lit,
     },
     scalar::ScalarValue,
-    sql::sqlparser::ast::Statement,
+    sql::sqlparser::ast::{SelectItem, SetExpr, Statement, TableFactor},
 };
 use datafusion_postgres::{
     datafusion_pg_catalog::{
@@ -211,12 +212,69 @@ impl ServerParameterProvider for TimeFusionServerParameterProvider {
 
 #[derive(Debug)]
 pub struct PgCompatibilityHook {
+    role: String,
     max_statement_secs: u64,
 }
 
+/// Alias that identifies pgAdmin's role probe. No other client query uses it.
+const ROLE_PROBE_ALIAS: &str = "can_signal_backend";
+
+#[derive(Debug, Clone)]
+enum RoleField {
+    Oid(i32),
+    Text(String),
+    Bool(bool),
+}
+
 impl PgCompatibilityHook {
-    pub fn new(max_statement_secs: u64) -> Self {
-        Self { max_statement_secs }
+    pub fn new(role: impl Into<String>, max_statement_secs: u64) -> Self {
+        Self { role: role.into(), max_statement_secs }
+    }
+
+    /// pgAdmin's connect-time role probe, answered here rather than planned.
+    ///
+    /// It computes `can_signal_backend` as
+    /// `array_contains(ARRAY(WITH RECURSIVE ...), $1)`, and DataFusion supports
+    /// neither the array-subquery constructor (`Invalid function 'array'`) nor
+    /// that recursive CTE (`project index 0 out of bounds`). The statement
+    /// cannot be planned at all, so pgAdmin cannot connect without this.
+    ///
+    /// An unrecognised alias bails to the planner on purpose: a pgAdmin version
+    /// that adds a column then fails loudly with the same planning error,
+    /// rather than being served a fabricated value for it.
+    fn role_probe(&self, statement: &Statement) -> Option<Vec<(String, RoleField)>> {
+        let Statement::Query(query) = statement else {
+            return None;
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if !select.from.iter().any(|from| is_pg_roles(&from.relation)) {
+            return None;
+        }
+        let aliases = select
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        aliases.iter().any(|alias| alias == ROLE_PROBE_ALIAS).then_some(())?;
+        aliases.into_iter().map(|alias| Some((alias.clone(), self.role_field(&alias)?))).collect()
+    }
+
+    fn role_field(&self, alias: &str) -> Option<RoleField> {
+        Some(match alias {
+            // The pg_catalog crate reports this role with oid 0.
+            "id" => RoleField::Oid(0),
+            "name" => RoleField::Text(self.role.clone()),
+            // TF authenticates a single superuser, and each of these is
+            // `CASE WHEN rolsuper THEN true ELSE ... END` in pgAdmin's own SQL,
+            // so a superuser makes every one of them true.
+            "is_superuser" | "can_create_role" | "can_create_db" | ROLE_PROBE_ALIAS => RoleField::Bool(true),
+            _ => return None,
+        })
     }
 
     fn show(&self, statement: &Statement, client: &(impl ClientInfo + ?Sized)) -> Option<(String, String)> {
@@ -245,12 +303,18 @@ impl QueryHook for PgCompatibilityHook {
     async fn handle_simple_query(
         &self, statement: &Statement, _session_context: &SessionContext, client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        if let Some(fields) = self.role_probe(statement) {
+            return Some(role_probe_response(&fields).map(Response::Query));
+        }
         self.show(statement, client).map(|(name, value)| show_response(&name, &value).map(Response::Query))
     }
 
     async fn handle_extended_parse_query(
         &self, statement: &Statement, _session_context: &SessionContext, _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
+        if let Some(fields) = self.role_probe(statement) {
+            return Some(role_probe_plan(statement, &fields));
+        }
         self.show(statement, _client).map(|_| show_plan())
     }
 
@@ -258,8 +322,84 @@ impl QueryHook for PgCompatibilityHook {
         &self, statement: Option<&Statement>, _logical_plan: &LogicalPlan, _params: &datafusion::common::ParamValues, _session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        // Deliberately NOT intercepted for the role probe: `handle_extended_parse_query`
+        // already returned a plan that produces the row, and letting the normal
+        // executor run it is what encodes the columns in the result format the
+        // client asked for. A hand-built Response here is always text, which a
+        // client requesting binary cannot decode for int4/bool.
         statement.and_then(|statement| self.show(statement, client)).map(|(name, value)| show_response(&name, &value).map(Response::Query))
     }
+}
+
+fn is_pg_roles(relation: &TableFactor) -> bool {
+    matches!(relation, TableFactor::Table { name, .. } if name.to_string().to_ascii_lowercase().ends_with("pg_roles"))
+}
+
+fn role_probe_field_type(value: &RoleField) -> (Type, DataType) {
+    match value {
+        RoleField::Oid(_) => (Type::INT4, DataType::Int32),
+        RoleField::Text(_) => (Type::VARCHAR, DataType::Utf8),
+        RoleField::Bool(_) => (Type::BOOL, DataType::Boolean),
+    }
+}
+
+fn role_probe_response(fields: &[(String, RoleField)]) -> PgWireResult<QueryResponse> {
+    let infos = Arc::new(
+        fields.iter().map(|(name, value)| FieldInfo::new(name.clone(), None, None, role_probe_field_type(value).0, FieldFormat::Text)).collect::<Vec<_>>(),
+    );
+    let row = {
+        let mut encoder = DataRowEncoder::new(Arc::clone(&infos));
+        for (_, value) in fields {
+            match value {
+                RoleField::Oid(oid) => encoder.encode_field(&Some(*oid))?,
+                RoleField::Text(text) => encoder.encode_field(&Some(text.as_str()))?,
+                RoleField::Bool(flag) => encoder.encode_field(&Some(*flag))?,
+            }
+        }
+        encoder.take_row()
+    };
+    Ok(QueryResponse::new(infos, stream::once(async move { Ok(row) })))
+}
+
+/// A tautology over every `$n` the original statement bound, so the substitute
+/// plan declares the same parameters. Without it the client's Bind is rejected
+/// with "expected 0 parameters but got 1" — pgAdmin binds the role name it is
+/// testing for. The type is Utf8 because that is what pgAdmin sends; the
+/// predicate is always true, so the value is never actually consulted.
+fn bound_parameter_tautology(statement: &Statement) -> Option<Expr> {
+    let text = statement.to_string();
+    (1..)
+        .take_while(|index| text.contains(&format!("${index}")))
+        .map(|index| {
+            Expr::Placeholder(Placeholder::new_with_field(format!("${index}"), Some(Arc::new(Field::new(format!("${index}"), DataType::Utf8, true)))))
+                .is_null()
+                .or(lit(true))
+        })
+        .reduce(Expr::and)
+}
+
+/// A plan that *produces* the row, rather than an empty relation shaped like it:
+/// the extended protocol executes this plan, and only the real executor encodes
+/// columns in the result format the client requested.
+fn role_probe_plan(statement: &Statement, fields: &[(String, RoleField)]) -> PgWireResult<LogicalPlan> {
+    let projection = fields
+        .iter()
+        .map(|(name, value)| {
+            match value {
+                RoleField::Oid(oid) => lit(*oid),
+                RoleField::Text(text) => lit(text.as_str()),
+                RoleField::Bool(flag) => lit(*flag),
+            }
+            .alias(name)
+        })
+        .collect::<Vec<_>>();
+    let builder = LogicalPlanBuilder::empty(true);
+    match bound_parameter_tautology(statement) {
+        Some(predicate) => builder.filter(predicate).and_then(|builder| builder.project(projection)),
+        None => builder.project(projection),
+    }
+    .and_then(LogicalPlanBuilder::build)
+    .map_err(|err| PgWireError::ApiError(Box::new(err)))
 }
 
 fn client_statement_timeout(client: &(impl ClientInfo + ?Sized)) -> Option<Duration> {

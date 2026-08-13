@@ -131,7 +131,7 @@ impl LoggingHandlerFactory {
     fn hooks(&self) -> Vec<Arc<dyn QueryHook>> {
         vec![
             Arc::new(CursorStatementHook),
-            Arc::new(PgCompatibilityHook::new(self.max_statement_secs)),
+            Arc::new(PgCompatibilityHook::new(self.auth_config.username.clone(), self.max_statement_secs)),
             self.plan_cache.clone() as Arc<dyn QueryHook>,
             Arc::new(SetShowHook),
             Arc::new(TransactionStatementHook),
