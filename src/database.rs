@@ -2366,6 +2366,18 @@ pub struct Database {
     bypass_buffer: bool,
     /// Internal aggregate builds must never read the rollup they are rebuilding.
     bypass_rollup: bool,
+    /// Per-clone override for `query_delta_only`: plan the scan with MAINTENANCE
+    /// parallelism instead of query parallelism.
+    ///
+    /// A rollup build is a background rewrite, but it was being planned as if a
+    /// user were waiting for it — `target_partitions` = the container's CPU
+    /// quota (48 in prod) rather than `MAINTENANCE_MAX_PARTITIONS` (2). Parquet
+    /// decode buffers scale with that fan-out and are NOT tracked by the memory
+    /// pool, so a whole-day scan of a busy partition ran 24x the concurrent
+    /// decode it needed. Prod 2026-08-13 OOM-killed the instance (exit 137)
+    /// four times in the ninety minutes after the backfill started completing
+    /// builds again.
+    maintenance_scan: bool,
     /// Late-binding shared cells like `buffered_layer`: attached by `with_*`
     /// builders after boot has already cloned Database into sessions/planners,
     /// so a plain Option would leave those clones silently service-less.
@@ -2836,6 +2848,7 @@ impl Database {
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
             bypass_buffer: false,
             bypass_rollup: false,
+            maintenance_scan: false,
             tantivy_search: Arc::new(std::sync::OnceLock::new()),
             tantivy_indexer: Arc::new(std::sync::OnceLock::new()),
             dml_coalescer: Arc::new(std::sync::OnceLock::new()),
@@ -3251,6 +3264,8 @@ impl Database {
         let mut db_clone = self.clone();
         db_clone.bypass_buffer = true;
         db_clone.bypass_rollup = true;
+        // Background rewrite, not an interactive query: see `maintenance_scan`.
+        db_clone.maintenance_scan = true;
         let db_arc = Arc::new(db_clone);
         let mut ctx = Arc::clone(&db_arc).create_session_context();
         datafusion_functions_json::register_all(&mut ctx)?;
@@ -3813,7 +3828,9 @@ impl Database {
 
         // Cap query parallelism at the container's CPU quota (derived in
         // autotune::apply; 0 = leave DataFusion's default). See MemoryConfig.
-        if self.config.memory.timefusion_query_partitions > 0 {
+        if self.maintenance_scan {
+            let _ = options.set("datafusion.execution.target_partitions", &MAINTENANCE_MAX_PARTITIONS.to_string());
+        } else if self.config.memory.timefusion_query_partitions > 0 {
             let _ = options.set("datafusion.execution.target_partitions", &self.config.memory.timefusion_query_partitions.to_string());
         }
 
@@ -16920,6 +16937,36 @@ mod tests {
         let state = Arc::new(db).create_session_context().state();
         let exec = &state.config().options().execution;
         assert_eq!(exec.batch_size, 2048, "wide otel rows: one 8192-row batch measured 63MB");
+        Ok(())
+    }
+
+    /// A rollup build is a background rewrite and must be PLANNED like one.
+    ///
+    /// It goes through `query_delta_only`, which built its session exactly like
+    /// an interactive query's — so `target_partitions` was the container's CPU
+    /// quota (48 in prod) rather than `MAINTENANCE_MAX_PARTITIONS`. Parquet
+    /// decode buffers scale with that fan-out and are invisible to the memory
+    /// pool (same blind spot as the batch-size test above), so a whole-day scan
+    /// of a busy partition ran 24x the concurrent decode it needed. Prod
+    /// 2026-08-13 OOM-killed the instance four times in the ninety minutes
+    /// after the backfill started completing builds again.
+    #[tokio::test]
+    async fn a_maintenance_scan_plans_with_maintenance_parallelism() -> Result<()> {
+        let config = create_test_config("maintenance-scan-partitions");
+        let query_partitions = config.memory.timefusion_query_partitions;
+        let db = Database::with_config(config).await?;
+
+        let partitions = |db: Database| Arc::new(db).create_session_context().state().config().options().execution.target_partitions;
+        let query = partitions(db.clone());
+
+        let mut maintenance = db.clone();
+        maintenance.maintenance_scan = true;
+        let scan = partitions(maintenance);
+        assert_eq!(scan, super::MAINTENANCE_MAX_PARTITIONS, "a background rewrite must plan with maintenance parallelism");
+        // In prod `timefusion_query_partitions` is the autotuned CPU quota (48);
+        // a test config may leave it 0, meaning DataFusion's own core-count
+        // default. Either way the maintenance scan must be strictly smaller.
+        assert!(scan < query, "the whole point is fewer concurrent decoders: {scan} vs {query} (configured {query_partitions})");
         Ok(())
     }
 
