@@ -67,6 +67,15 @@ pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
     // (2026-07-31, 7d68f01): a DML plan reading those files must not trip the
     // physical-vs-logical aggregate schema check either.
     let cfg = cfg.set_bool("datafusion.execution.skip_physical_aggregate_schema_check", true);
+    // A MERGE-UPDATE re-reads and rewrites WHOLE wide otel rows, so it is the
+    // most decode-expensive read in the system — and it was the only one still
+    // on DataFusion's 8192-row default. The query and maintenance sessions have
+    // run these same rows at 2048 since the 2026-08-07 heap work; this session
+    // was missed, and a dump taken mid-burst on 2026-08-13 put 38.3 GiB (57% of
+    // live heap) back in exactly the stack that work had cut —
+    // `extend_from_dictionary` under `ByteArrayDecoder::read`.
+    let mut cfg = cfg;
+    let _ = cfg.options_mut().set("datafusion.execution.batch_size", crate::database::WIDE_ROW_DECODE_BATCH_SIZE);
     Arc::new(
         SessionStateBuilder::new()
             .with_config(cfg)
@@ -1508,6 +1517,32 @@ pub async fn perform_delta_merge_update(
     // schema failures (prod 2026-07-19): dump the exact predicates + keys so the
     // next occurrence pins the plan shape that leaks a column into the scan.
     .inspect_err(|e| warn!(target: "dml", "Delta MERGE-UPDATE failed for {project_id}/{table_name} keys={:?}: {e}", source.join_keys))
+}
+
+#[cfg(test)]
+mod session_tests {
+    /// The DML session must decode the wide otel schema at the same batch size
+    /// as every other session that reads it.
+    ///
+    /// A MERGE-UPDATE re-reads and rewrites WHOLE wide rows, so it is the most
+    /// decode-expensive read in the system, and decode buffers cost
+    /// `batch_size × row width` with none of it pool-accounted. The query and
+    /// maintenance sessions were cut to 2048 by the 2026-08-07 heap work; this
+    /// one kept DataFusion's 8192 default, and a dump taken mid-burst on
+    /// 2026-08-13 put 38.3 GiB — 57% of live heap — back in the very stack that
+    /// work had cut. A default that differs by session is invisible until it is
+    /// measured in a heap profile, so pin it.
+    #[test]
+    fn the_dml_session_decodes_wide_rows_at_the_shared_batch_size() {
+        let base = datafusion::execution::session_state::SessionStateBuilder::new().with_default_features().build();
+        let want: usize = crate::database::WIDE_ROW_DECODE_BATCH_SIZE.parse().expect("the shared constant is a number");
+        // The inherited default is the bug: assert the session actually moves
+        // off it, so this cannot pass by coincidence if DataFusion's default
+        // ever happens to equal ours.
+        assert!(base.config().options().execution.batch_size > want, "DataFusion's default is the wider batch this fix exists to override");
+        let session = super::delta_session_from(&base);
+        assert_eq!(session.config().options().execution.batch_size, want, "a DML rewrite must not decode at a wider batch than a query does");
+    }
 }
 
 #[cfg(test)]

@@ -946,6 +946,21 @@ const REPAIR_SORT_RESERVATION_BYTES: usize = 512 * 1024 * 1024;
 /// lives ~20 minutes between deploys still gets a repair pass in.
 const STARTUP_REPAIR_DELAY: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Rows per decode batch for any session that reads the wide otel schema.
+///
+/// Every per-partition, per-query parquet decode buffer costs
+/// `batch_size × row width` and none of it is pool-accounted, so this is the
+/// direct multiplier on the largest untracked consumer in the process. See the
+/// full derivation at the query session's `batch_size` — 65536 -> 8192 -> 2048
+/// across two heap profiles, the second of which pinned parquet's own
+/// `ByteArrayDecoder` / `extend_from_dictionary` offset buffers at ~29 GB.
+///
+/// Named because the value only works if EVERY session reading these rows uses
+/// it. It was set on the query and maintenance sessions and missed on the DML
+/// merge session, which inherited DataFusion's 8192 default while doing the
+/// most decode-expensive thing in the system — rewriting whole wide rows.
+pub(crate) const WIDE_ROW_DECODE_BATCH_SIZE: &str = "2048";
+
 /// Config tuning shared by every delta-rs maintenance session.
 /// `schema_force_view_types=false` keeps Variant columns as `Binary` (not
 /// `BinaryView`) so delta_kernel's unshredded-variant schema check passes; the
@@ -3866,7 +3881,7 @@ impl Database {
         // `coalesce_target_batch_size` setting was silently dead (no such
         // DataFusion option; `options.set` returned Err into a `let _`) and is
         // removed rather than left implying a bound it never applied.
-        let _ = options.set("datafusion.execution.batch_size", "2048");
+        let _ = options.set("datafusion.execution.batch_size", WIDE_ROW_DECODE_BATCH_SIZE);
 
         // Optimize for sorted data (timestamps are typically sorted)
         let _ = options.set("datafusion.optimizer.prefer_existing_sort", "true");
