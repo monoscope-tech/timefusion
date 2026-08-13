@@ -15031,8 +15031,48 @@ impl ProjectRoutingTable {
             }
         });
 
-        (min_ts.is_some() || max_ts.is_some()).then(|| (min_ts.unwrap_or(i64::MIN), max_ts.unwrap_or(i64::MAX)))
+        if min_ts.is_some() || max_ts.is_some() {
+            return Some((min_ts.unwrap_or(i64::MIN), max_ts.unwrap_or(i64::MAX)));
+        }
+        // No timestamp bound — fall back to an equality on the `date` PARTITION
+        // column, which spans exactly one day.
+        //
+        // This is what makes a rollup build skippable. `build_partition_sql`
+        // filters `project_id = … AND date = …` and never mentions `timestamp`,
+        // so the window came out `None`, the skip was denied `NoWindow`, and the
+        // scan ran an UNBOUNDED merge-on-read dedup. Prod 2026-08-13: every
+        // otel_metrics backfill died on `unordered merge-on-read dedup exceeded
+        // its 2048 MB` — 207 partitions that could never be built.
+        //
+        // Sound because certification is itself keyed by (project, date): a
+        // window derived from `date = X` asks `dedup_window_clean` exactly the
+        // question it stores an answer for. It assumes nothing about whether a
+        // row's timestamp agrees with its date partition, which the timestamp
+        // path above does.
+        date_partition_window(filters)
     }
+}
+
+/// The micros span of a `date = <Date32>` equality, if the filters carry one.
+///
+/// Free-standing so the sourness of getting it wrong — a window that reaches
+/// into a neighbouring date whose certification was never asked about — is
+/// directly testable.
+fn date_partition_window(filters: &[Expr]) -> Option<(i64, i64)> {
+    use crate::optimizers::is_col_through_cast;
+    const DAY_MICROS: i64 = 86_400_000_000;
+    filters.iter().find_map(|filter| {
+        let Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) = filter else { return None };
+        let literal = match (is_col_through_cast(left, "date"), is_col_through_cast(right, "date")) {
+            (true, _) => right.as_ref(),
+            (_, true) => left.as_ref(),
+            _ => return None,
+        };
+        let Expr::Literal(ScalarValue::Date32(Some(days)), _) = literal else { return None };
+        let start = i64::from(*days).checked_mul(DAY_MICROS)?;
+        // Inclusive end, one microsecond short of the next day.
+        Some((start, start.checked_add(DAY_MICROS - 1)?))
+    })
 }
 
 /// What [`Database::migrate_add_columns`] did.
@@ -18138,6 +18178,39 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
         // An empty list must not panic on the modulo.
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
+    }
+
+    /// A rollup build filters `project_id = … AND date = …` and never mentions
+    /// `timestamp`, so the read-dedup skip saw no window, denied `NoWindow`, and
+    /// the scan ran an UNBOUNDED merge-on-read dedup. Prod 2026-08-13: every
+    /// otel_metrics backfill died on `unordered merge-on-read dedup exceeded its
+    /// 2048 MB`, so 207 partitions could never be built at all.
+    ///
+    /// The window must cover its day EXACTLY. Reaching one microsecond into the
+    /// next date would ask `dedup_window_clean` about a date whose certification
+    /// was never established, and it would deny — silently costing the skip.
+    #[test]
+    fn a_date_partition_equality_is_a_one_day_window() {
+        use datafusion::prelude::{col, lit};
+        const DAY: i64 = 86_400_000_000;
+        let date = |days: i32| lit(ScalarValue::Date32(Some(days)));
+
+        let (start, end) = super::date_partition_window(&[col("date").eq(date(20_000))]).expect("a date equality is a window");
+        assert_eq!(start, 20_000 * DAY);
+        assert_eq!(end, 20_001 * DAY - 1, "the window must stop one micro short of the next date");
+
+        // Operands either way round, since the optimizer may swap them.
+        assert_eq!(super::date_partition_window(&[date(20_000).eq(col("date"))]), Some((20_000 * DAY, 20_001 * DAY - 1)));
+        // Beside the project filter a real rollup build carries.
+        assert_eq!(
+            super::date_partition_window(&[col("project_id").eq(lit("p")), col("date").eq(date(1))]),
+            Some((DAY, 2 * DAY - 1))
+        );
+        // Anything that is not a date equality yields nothing, so the skip stays
+        // denied rather than being granted over an unproven window.
+        assert_eq!(super::date_partition_window(&[col("project_id").eq(lit("p"))]), None);
+        assert_eq!(super::date_partition_window(&[col("date").gt(date(1))]), None);
+        assert_eq!(super::date_partition_window(&[col("timestamp").eq(lit(1_i64))]), None);
     }
 
     /// A source whose partitions all fail expensively must not starve the
