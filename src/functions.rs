@@ -453,6 +453,9 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     ctx.register_udf(create_time_bucket_udf());
     ctx.register_udaf(create_percentile_agg_udaf());
     ctx.register_udaf(create_tdigest_merge_udaf());
+    ctx.register_udaf(AggregateUDF::from(HllAggUDF::default()));
+    ctx.register_udaf(create_hll_merge_udaf());
+    ctx.register_udf(create_hll_count_udf());
 
     // text_match(col, 'query') for tantivy-accelerated full-text search. Naive
     // substring fallback keeps correctness when tantivy is disabled or when
@@ -868,16 +871,23 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
+    aliases: Vec<String>,
 }
 
 impl ToJsonUDF {
     fn new() -> Self {
-        Self { signature: Signature::any(1, Volatility::Immutable) }
+        // PG's `row_to_json(record)` is `to_json` over a row. pgAdmin's
+        // dashboard polls `row_to_json(t)` over a subquery alias every 5s.
+        Self { signature: Signature::any(1, Volatility::Immutable), aliases: vec!["row_to_json".to_string()] }
     }
 }
 
 impl ScalarUDFImpl for ToJsonUDF {
     scalar_udf_boilerplate!("to_json");
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -1016,6 +1026,29 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
                         .ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string())),
                 })
                 .collect::<datafusion::error::Result<_>>()?
+        }
+        // A record renders as a JSON object keyed by field name — PG's
+        // `row_to_json(t)`. Without this the generic fallback below tries to cast
+        // Struct to Utf8View and fails outright.
+        DataType::Struct(fields) => {
+            let columns = array
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StructArray>()
+                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to StructArray".to_string()))?;
+            // Field values are converted column-wise, then transposed per row.
+            let per_field = fields
+                .iter()
+                .zip(columns.columns())
+                .map(|(field, column)| array_to_json_values_inner(column, false).map(|values| (field.name().clone(), values)))
+                .collect::<datafusion::error::Result<Vec<_>>>()?;
+            (0..array.len())
+                .map(|row| {
+                    if columns.is_null(row) {
+                        return JsonValue::Null;
+                    }
+                    per_field.iter().map(|(name, values)| (name.clone(), values[row].clone())).collect::<serde_json::Map<_, _>>().into()
+                })
+                .collect()
         }
         DataType::List(_) => list_to_json_values::<i32>(array)?,
         DataType::LargeList(_) => list_to_json_values::<i64>(array)?,
@@ -1302,6 +1335,215 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
             })
             .collect::<datafusion::error::Result<_>>()?;
         Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+// ============================================================================
+// HyperLogLog: `hll_agg` / `hll_merge` / `hll_count`
+// ============================================================================
+//
+// The distinct-count analogue of `percentile_agg` / `tdigest_merge` /
+// `approx_percentile` above, and it exists for the same reason: DataFusion's
+// own `approx_distinct` computes a fine estimate but gives no way to STORE the
+// sketch and fold it later, so a rollup cannot carry a distinct count. (Its
+// `HyperLogLog` type is `pub(crate)`, so it cannot be reused here either.)
+//
+// These three are the rollup's storage layer, not a second user-facing API:
+// queries keep asking for `approx_distinct(x)`, and the rollup matcher answers
+// it with `hll_count(hll_merge(state))` when a measure covers it.
+
+/// Feed one array's non-null values into a sketch.
+///
+/// Strings and binaries are hashed in place; anything else is cast to Utf8View
+/// first, which preserves distinctness for every primitive type at the cost of
+/// a formatting pass that only non-string columns pay.
+fn hll_insert_array(sketch: &mut crate::hll::Hll, array: &ArrayRef) -> datafusion::error::Result<()> {
+    macro_rules! feed {
+        ($ty:ty) => {{
+            let typed = array.as_any().downcast_ref::<$ty>().ok_or_else(|| DataFusionError::Execution("hll_agg: array does not match its own data type".to_string()))?;
+            typed.iter().flatten().for_each(|value| sketch.insert_hash(crate::hll::hash_bytes(AsRef::<[u8]>::as_ref(&value))));
+            return Ok(());
+        }};
+    }
+    match array.data_type() {
+        DataType::Utf8View => feed!(StringViewArray),
+        DataType::Utf8 => feed!(StringArray),
+        DataType::LargeUtf8 => feed!(datafusion::arrow::array::LargeStringArray),
+        DataType::BinaryView => feed!(BinaryViewArray),
+        DataType::Binary => feed!(BinaryArray),
+        DataType::LargeBinary => feed!(datafusion::arrow::array::LargeBinaryArray),
+        _ => hll_insert_array(sketch, &datafusion::arrow::compute::cast(array, &DataType::Utf8View)?),
+    }
+}
+
+/// Decode and fold a column of serialized sketches.
+fn hll_merge_array(sketch: &mut crate::hll::Hll, arrays: &[ArrayRef]) -> datafusion::error::Result<()> {
+    let Some(array) = arrays.first() else { return Ok(()) };
+    let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("hll_merge expects Binary values".to_string()))?;
+    binary.iter().flatten().try_for_each(|bytes| {
+        sketch.merge(&crate::hll::Hll::from_bytes(bytes).map_err(DataFusionError::Execution)?);
+        Ok(())
+    })
+}
+
+/// Shared by both UDAFs: they differ only in what `update_batch` feeds in.
+#[derive(Debug, Default)]
+struct HllAccumulator {
+    sketch: crate::hll::Hll,
+    /// `hll_agg` hashes raw values; `hll_merge` folds stored sketches.
+    merging: bool,
+}
+
+impl Accumulator for HllAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::error::Result<()> {
+        match values.first() {
+            Some(array) if !self.merging => hll_insert_array(&mut self.sketch, array),
+            Some(_) => hll_merge_array(&mut self.sketch, values),
+            None => Ok(()),
+        }
+    }
+
+    fn evaluate(&mut self) -> datafusion::error::Result<ScalarValue> {
+        Ok(ScalarValue::Binary(Some(self.sketch.to_bytes())))
+    }
+
+    fn size(&self) -> usize {
+        self.sketch.size()
+    }
+
+    fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
+        self.evaluate().map(|state| vec![state])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::error::Result<()> {
+        hll_merge_array(&mut self.sketch, states)
+    }
+}
+
+/// `hll_agg(any) -> Binary`. A hand-written `AggregateUDFImpl` rather than
+/// `create_udaf` because the argument is deliberately untyped: a distinct count
+/// is meaningful over every column type, and an `Exact` signature would make
+/// `hll_agg(duration)` a planning error instead of a cast.
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct HllAggUDF {
+    signature: Signature,
+}
+
+impl Default for HllAggUDF {
+    fn default() -> Self {
+        Self { signature: Signature::any(1, Volatility::Immutable) }
+    }
+}
+
+impl datafusion::logical_expr::AggregateUDFImpl for HllAggUDF {
+    fn name(&self) -> &str {
+        "hll_agg"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Binary)
+    }
+
+    fn state_fields(&self, _args: datafusion::logical_expr::function::StateFieldsArgs) -> datafusion::error::Result<Vec<FieldRef>> {
+        Ok(vec![Arc::new(Field::new("sketch", DataType::Binary, true))])
+    }
+
+    fn accumulator(&self, _acc_args: datafusion::logical_expr::function::AccumulatorArgs) -> datafusion::error::Result<Box<dyn Accumulator>> {
+        Ok(Box::new(HllAccumulator::default()))
+    }
+}
+
+fn create_hll_merge_udaf() -> AggregateUDF {
+    create_udaf(
+        "hll_merge",
+        vec![DataType::Binary],
+        Arc::new(DataType::Binary),
+        Volatility::Immutable,
+        Arc::new(|_| Ok(Box::new(HllAccumulator { merging: true, ..Default::default() }) as Box<dyn Accumulator>)),
+        Arc::new(vec![DataType::Binary]),
+    )
+}
+
+/// `hll_count(Binary) -> UInt64`. UInt64, not Int64, so a rollup rewrite of
+/// `approx_distinct(x)` keeps the query's own output type.
+fn create_hll_count_udf() -> ScalarUDF {
+    create_udf(
+        "hll_count",
+        vec![DataType::Binary],
+        DataType::UInt64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| {
+            let array = as_array(args.first().ok_or_else(|| DataFusionError::Execution("hll_count requires one argument".to_string()))?)?;
+            let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("hll_count expects a Binary sketch".to_string()))?;
+            // NULL in, NULL out: a group that never saw the measure has no sketch,
+            // which is not the same claim as "zero distinct values".
+            let counts: datafusion::arrow::array::UInt64Array = binary
+                .iter()
+                .map(|bytes| bytes.map(|bytes| crate::hll::Hll::from_bytes(bytes).map(|s| s.estimate()).map_err(DataFusionError::Execution)).transpose())
+                .collect::<datafusion::error::Result<_>>()?;
+            Ok(ColumnarValue::Array(Arc::new(counts)))
+        }) as ScalarFunctionImplementation,
+    )
+}
+
+#[cfg(test)]
+mod hll_tests {
+    use datafusion::prelude::SessionContext;
+
+    use super::*;
+
+    async fn scalar(sql: &str) -> u64 {
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let batches = ctx.sql(sql).await.expect("plan").collect().await.expect("execute");
+        let column = batches[0].column(0);
+        ScalarValue::try_from_array(column, 0).unwrap().cast_to(&DataType::UInt64).unwrap().to_string().parse().unwrap()
+    }
+
+    /// A `series % n` source gives a known distinct count, and 200k rows over
+    /// the default target-partition count guarantees the partial/final split —
+    /// so this also proves the state survives repartitioning.
+    #[tokio::test]
+    async fn hll_count_of_hll_agg_matches_the_true_cardinality() {
+        for (n, tolerance) in [(1u64, 0.0), (500, 0.0), (5_000, 0.05), (200_000, 0.05)] {
+            let estimate = scalar(&format!("SELECT hll_count(hll_agg(v)) FROM (SELECT value % {n} AS v FROM generate_series(1, 200000) t(value))")).await;
+            let error = (estimate as f64 - n as f64).abs() / n as f64;
+            assert!(error <= tolerance, "n={n}: estimated {estimate}, error {:.2}% > {:.0}%", error * 100.0, tolerance * 100.0);
+        }
+    }
+
+    /// The rollup property: sketches built per group and folded afterwards must
+    /// agree with one built over everything at once. Without this a 30-day tile
+    /// cannot be answered from 1-minute buckets.
+    #[tokio::test]
+    async fn merging_per_bucket_sketches_equals_one_pass_over_all_rows() {
+        let rows = "SELECT value % 30000 AS v, value % 7 AS bucket FROM generate_series(1, 300000) t(value)";
+        let merged = scalar(&format!("SELECT hll_count(hll_merge(s)) FROM (SELECT hll_agg(v) AS s FROM ({rows}) GROUP BY bucket)")).await;
+        let one_pass = scalar(&format!("SELECT hll_count(hll_agg(v)) FROM ({rows})")).await;
+        assert_eq!(merged, one_pass, "folding per-bucket states must equal a single pass");
+    }
+
+    /// Distinct counts are asked of every column type, and NULL is not a value.
+    #[tokio::test]
+    async fn non_string_columns_work_and_nulls_are_ignored() {
+        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (1),(2),(2),(NULL)) t(v)").await, 2);
+        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (1.5),(2.5),(1.5)) t(v)").await, 2);
+        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES ('a'),('b'),('a')) t(v)").await, 2);
+        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (arrow_cast(1, 'Timestamp(Microsecond, None)'))) t(v)").await, 1);
+    }
+
+    /// `hll_count(NULL)` is NULL, not 0: a rollup row that never saw the measure
+    /// makes no claim about its cardinality.
+    #[tokio::test]
+    async fn a_missing_sketch_is_null_not_zero() {
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let batches = ctx.sql("SELECT hll_count(arrow_cast(NULL, 'Binary'))").await.unwrap().collect().await.unwrap();
+        assert!(batches[0].column(0).is_null(0));
     }
 }
 
@@ -1782,5 +2024,44 @@ mod tests {
         for bad in ["invalid", "5", "abc minutes", "m5", "9223372036854 weeks"] {
             assert!(parse_interval_to_micros(bad).is_err(), "expected error for: {bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod row_to_json_tests {
+    use super::*;
+
+    /// `row_to_json` is PG's `to_json` over a record. Struct support also fixes
+    /// `to_json`/`to_jsonb` of a struct column, which previously failed with
+    /// "Cast error: Casting from Struct(...) to Utf8View not supported".
+    ///
+    /// Keys come out SORTED, matching PG's `jsonb`, not `json` (which preserves
+    /// column order). Both share this code path, and serde_json's Map is a
+    /// BTreeMap unless the crate-wide `preserve_order` feature is on — not worth
+    /// flipping globally for key order no caller depends on.
+    #[tokio::test]
+    async fn row_to_json_renders_a_struct_as_a_json_object() {
+        use datafusion::prelude::SessionContext;
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        for sql in ["SELECT row_to_json(named_struct('total', 1, 'active', 2)) AS d", "SELECT to_json(named_struct('total', 1, 'active', 2)) AS d"] {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let column = batches[0].column(0).as_any().downcast_ref::<StringViewArray>().unwrap();
+            assert_eq!(column.value(0), r#"{"active":2,"total":1}"#, "sql: {sql}");
+        }
+    }
+
+    /// Documented limitation. PG lets `row_to_json(t)` name a whole row; DataFusion
+    /// rejects the bare relation alias during SQL PLANNING ("No field named t"),
+    /// before any analyzer rule can rewrite it — so pgAdmin's dashboard charts
+    /// still fail. Fixing it needs an AST-level rewrite that reads the derived
+    /// table's column aliases; the struct form above is what works today.
+    #[tokio::test]
+    async fn bare_relation_alias_is_still_unsupported() {
+        use datafusion::prelude::SessionContext;
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let error = ctx.sql("SELECT row_to_json(t) FROM (SELECT 1 AS total) t").await.unwrap_err().to_string();
+        assert!(error.contains("No field named t"), "unexpected error: {error}");
     }
 }
