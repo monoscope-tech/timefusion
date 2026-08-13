@@ -1576,6 +1576,14 @@ mod hll_tests {
         assert!(error < 0.05, "estimated {direct}, want ~30000");
     }
 
+    /// The session query wraps the sketch in `FILTER (WHERE …)`; verified on
+    /// prod Timescale in the same shape, so the one text runs on both.
+    #[tokio::test]
+    async fn the_filtered_form_the_session_query_sends_runs_here_too() {
+        let sql = "SELECT distinct_count(approx_count_distinct(v) FILTER (WHERE v IS NOT NULL))::BIGINT FROM (VALUES (1),(2),(2),(NULL)) t(v)";
+        assert_eq!(scalar(sql).await, 2);
+    }
+
     /// `hll_count(NULL)` is NULL, not 0: a rollup row that never saw the measure
     /// makes no claim about its cardinality.
     #[tokio::test]
