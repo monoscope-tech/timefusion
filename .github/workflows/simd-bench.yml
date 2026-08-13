@@ -1,0 +1,66 @@
+# A/B the microarchitecture flag on x86, because nothing else can.
+#
+# `-C target-cpu` was never set until 2026-08-13, so prod ran a BASELINE x86-64
+# binary (SSE2, no AVX2/BMI2/FMA) while arrow-rs relies on autovectorization for
+# its compare/filter/aggregate kernels and the parquet decoders. Disassembly
+# proves the flag landed — `%ymm` occurrences went 29,943 -> 1,321,656 — but an
+# instruction count is not a speedup, and the dev machines are arm64, so the only
+# honest way to size the win is to run the same benchmark twice on x86 with
+# nothing but the flag changed.
+#
+# Manual on purpose: each leg rebuilds every dependency (RUSTFLAGS is part of the
+# cache key), so this is ~2 full release builds, not something to hang off pushes.
+name: SIMD A/B bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_cpu:
+        description: "target-cpu for leg A (what prod shipped before)"
+        default: "x86-64"
+      candidate_cpu:
+        description: "target-cpu for leg B (x86-64-v3 today; x86-64-v4 to canary AVX-512)"
+        default: "x86-64-v3"
+      filter:
+        description: "criterion filter, e.g. flush_dedup"
+        default: "flush_dedup"
+      bench:
+        description: "bench target"
+        default: "dedup_benchmarks"
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    name: "${{ inputs.baseline_cpu }} vs ${{ inputs.candidate_cpu }}"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The runner is not the deploy host. If it lacks the candidate's features
+      # the numbers are meaningless (or the binary faults), so say what it has.
+      - name: Runner CPU
+        run: lscpu | grep -iE "^Model name|^Flags" | tr ' ' '\n' | grep -iE "^(model|avx|avx2|avx512f|bmi1|bmi2|fma)$|Model" || lscpu | head -20
+
+      - name: Leg A — ${{ inputs.baseline_cpu }}
+        env:
+          RUSTFLAGS: -C target-cpu=${{ inputs.baseline_cpu }}
+        run: cargo bench --bench ${{ inputs.bench }} -- ${{ inputs.filter }} --save-baseline legA
+
+      # Same source, same bench, same machine — only the flag differs, so the
+      # delta criterion prints is attributable to the microarchitecture alone.
+      - name: Leg B — ${{ inputs.candidate_cpu }}
+        env:
+          RUSTFLAGS: -C target-cpu=${{ inputs.candidate_cpu }}
+        run: cargo bench --bench ${{ inputs.bench }} -- ${{ inputs.filter }} --baseline legA
+
+      - name: Criterion reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ inputs.baseline_cpu }}-vs-${{ inputs.candidate_cpu }}
+          path: target/criterion
+          retention-days: 7
