@@ -46,14 +46,29 @@ impl VisitorMut for RowToJsonRecord {
     type Break = ();
 
     fn post_visit_query(&mut self, query: &mut Query) -> std::ops::ControlFlow<Self::Break> {
-        if let SetExpr::Select(select) = query.body.as_mut() {
-            self.rewrite_select(select);
-        }
+        self.rewrite_set_expr(query.body.as_mut());
         std::ops::ControlFlow::Continue(())
     }
 }
 
 impl RowToJsonRecord {
+    /// A UNION's branches are `SetExpr`s, not `Query`s, so they are never
+    /// reached by matching on `query.body` alone. pgAdmin's dashboard sends one
+    /// `SELECT ... UNION ALL SELECT ...` per chart, and every branch was being
+    /// skipped. Re-running over an already-rewritten branch is a no-op, since
+    /// its argument is no longer a bare identifier.
+    fn rewrite_set_expr(&mut self, body: &mut SetExpr) {
+        match body {
+            SetExpr::Select(select) => self.rewrite_select(select),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.rewrite_set_expr(left);
+                self.rewrite_set_expr(right);
+            }
+            SetExpr::Query(query) => self.rewrite_set_expr(query.body.as_mut()),
+            _ => {}
+        }
+    }
+
     fn rewrite_select(&mut self, select: &mut Select) {
         // `post_visit_query` means inner queries are already rewritten, so the
         // aliases collected here belong to this SELECT's own FROM.
@@ -174,6 +189,20 @@ mod tests {
         assert!(sql.contains("named_struct('a', t.\"a\")"), "got: {sql}");
         // A schema-qualified UDF name does not resolve in DataFusion.
         assert!(!sql.contains("pg_catalog.row_to_json"), "qualifier must be stripped: {sql}");
+    }
+
+    /// The shape prod actually sends: one branch per chart, UNION ALL. A visitor
+    /// that only matches `query.body == Select` silently skips every branch.
+    #[test]
+    fn every_union_branch_is_rewritten() {
+        let sql = rewritten(
+            r#"SELECT 'a' AS chart_name, pg_catalog.row_to_json(t) AS chart_data FROM (SELECT 1 AS "Total") t
+               UNION ALL
+               SELECT 'b' AS chart_name, pg_catalog.row_to_json(t) AS chart_data FROM (SELECT 2 AS "Active") t"#,
+        );
+        assert!(sql.contains(r#"named_struct('Total', t."Total")"#), "first branch: {sql}");
+        assert!(sql.contains(r#"named_struct('Active', t."Active")"#), "second branch: {sql}");
+        assert!(!sql.contains("row_to_json(t)"), "no branch may keep the bare alias: {sql}");
     }
 
     fn unchanged(sql: &str) {

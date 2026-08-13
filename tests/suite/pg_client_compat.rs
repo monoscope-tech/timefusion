@@ -175,3 +175,36 @@ async fn pgadmin_dashboard_row_to_json_over_simple_protocol() -> Result<()> {
     assert_eq!(row.get("chart_data"), Some(r#"{"active":0,"total":0}"#));
     Ok(())
 }
+
+/// pgAdmin sends one branch per chart, UNION ALL, with capitalised quoted
+/// aliases. The first fix matched only `query.body == Select`, so every branch
+/// of the real query was skipped and prod still logged
+/// `No field named t. Valid fields are t."Total", t."Active", t."Idle"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pgadmin_dashboard_rewrites_every_union_branch() -> Result<()> {
+    let server = TestServer::start().await?;
+    let messages = server
+        .client()
+        .await?
+        .simple_query(
+            "SELECT 'session_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
+             FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_activity) AS \"Total\", \
+                          (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'idle') AS \"Idle\") t \
+             UNION ALL \
+             SELECT 'tps_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
+             FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_database) AS \"Transactions\") t",
+        )
+        .await?;
+    let rows: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "both union branches must return");
+    let mut data: Vec<_> = rows.iter().map(|row| row.get("chart_data").unwrap_or_default()).collect();
+    data.sort_unstable();
+    assert_eq!(data, vec![r#"{"Idle":0,"Total":0}"#, r#"{"Transactions":0}"#]);
+    Ok(())
+}
