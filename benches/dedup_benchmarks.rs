@@ -204,12 +204,36 @@ fn mem_report(rt: &tokio::runtime::Runtime) {
     }
 }
 
+/// The FLUSH-path dedup (`mem_buffer::dedup_batches`), which is a different
+/// function from the read-side `DedupExec` above and runs once per row of every
+/// flush AND every dedup rewrite. It keys a hash map by the encoded sort-key
+/// row, so it is dominated by hashing and by whatever that key costs to
+/// materialize — which is what makes it worth measuring on its own.
+fn bench_flush_dedup(c: &mut Criterion) {
+    let keys = vec!["id".to_string(), "timestamp".to_string()];
+    let mut group = c.benchmark_group("flush_dedup");
+    for &(total, distinct) in &[(200_000usize, 200_000usize), (200_000, 100_000), (200_000, 20_000)] {
+        // Unsorted: the realistic flush shape, and it denies the map any
+        // locality that would mask per-row key costs.
+        let batches = make_batches(total, distinct, false);
+        group.throughput(Throughput::Elements(total as u64));
+        group.bench_function(format!("{}k_rows_{}pct_dup", total / 1000, 100 - distinct * 100 / total), |b| {
+            b.iter(|| {
+                let out = timefusion::mem_buffer::dedup_batches(batches.clone(), &keys, Some("version"), None).unwrap();
+                std::hint::black_box(out.iter().map(|x| x.num_rows()).sum::<usize>())
+            })
+        });
+    }
+    group.finish();
+}
+
 fn maybe_report(c: &mut Criterion) {
     if std::env::var("DEDUP_MEM_REPORT").is_ok() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();
         mem_report(&rt);
     }
     bench_dedup(c);
+    bench_flush_dedup(c);
 }
 
 criterion_group!(benches, maybe_report);
