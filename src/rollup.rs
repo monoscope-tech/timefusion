@@ -105,6 +105,32 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
 pub(crate) const ALL_HOURS: u32 = (1 << 24) - 1;
 const HOUR_MICROS: i64 = 3_600_000_000;
 
+/// Hours per chunk when a full rebuild is split. 6 → four chunks a day.
+///
+/// The point is the PEAK, not the total: a chunk scans a quarter of the day, so
+/// the aggregate holds a quarter of the groups and the scan a quarter of the
+/// decode. Total work is unchanged. Smaller chunks would bound it further but
+/// each is a separate Delta commit on the partition, and the carry-forward leg
+/// re-reads every already-built row, so the cost grows quadratically in chunk
+/// count.
+pub(crate) const BUILD_CHUNK_HOURS: u32 = 6;
+
+/// Split a whole day into the hour masks a chunked rebuild walks, in ascending
+/// order.
+///
+/// Ascending and CONTIGUOUS matters. Each chunk rebuilds its own hours and
+/// carries every other hour forward from the target, so the masks must partition
+/// the day exactly — overlap double-counts a bucket and a gap drops one, which
+/// is the failure mode `build_partition_sql_ranges` warns about and which no
+/// read-side guard can catch.
+pub(crate) fn build_chunk_masks(chunk_hours: u32) -> Vec<u32> {
+    let chunk_hours = chunk_hours.clamp(1, 24);
+    (0..24)
+        .step_by(chunk_hours as usize)
+        .map(|start| (start..(start + chunk_hours).min(24)).fold(0u32, |mask, hour| mask | (1 << hour)))
+        .collect()
+}
+
 /// The `[start, end)` ranges `hours` marks on the day beginning at `day_start`,
 /// with adjacent hours merged so a contiguous span costs one predicate.
 pub(crate) fn dirty_ranges(day_start: i64, hours: u32) -> Vec<(i64, i64)> {
@@ -1428,6 +1454,74 @@ mod tests {
         // turned every routed query into "DedupExec key `id` not in input
         // schema" and then a failed raw fallback.
         assert!(target.dedup_keys.is_empty(), "a rollup must not require read-time dedup: {:?}", target.dedup_keys);
+    }
+
+    /// The chunk masks must PARTITION the day exactly.
+    ///
+    /// Each chunk rebuilds its own hours and carries every other hour forward
+    /// from the target, so an overlap double-counts a bucket and a gap drops
+    /// one. Neither is visible to any read-side guard — the rollup simply
+    /// reports a wrong number forever.
+    #[test]
+    fn chunk_masks_partition_the_day_exactly() {
+        for chunk_hours in [1u32, 2, 5, 6, 7, 24] {
+            let masks = build_chunk_masks(chunk_hours);
+            assert_eq!(masks.iter().fold(0u32, |a, m| a | m), ALL_HOURS, "chunk_hours={chunk_hours}: must cover every hour");
+            assert_eq!(
+                masks.iter().map(|m| m.count_ones()).sum::<u32>(),
+                24,
+                "chunk_hours={chunk_hours}: hours counted twice — a bucket would be double-aggregated"
+            );
+            assert!(masks.iter().all(|m| *m != 0), "an empty chunk would commit a no-op rebuild");
+            assert_eq!(masks.len(), 24usize.div_ceil(chunk_hours as usize));
+        }
+        // Degenerate inputs clamp rather than panic or loop.
+        assert_eq!(build_chunk_masks(0), build_chunk_masks(1));
+        assert_eq!(build_chunk_masks(99), vec![ALL_HOURS]);
+        // The default splits the day into four contiguous six-hour spans.
+        let default = build_chunk_masks(BUILD_CHUNK_HOURS);
+        assert_eq!(default.len(), 4);
+        assert_eq!(dirty_ranges(0, default[0]), vec![(0, 6 * 3_600_000_000)], "a chunk must be ONE contiguous range, not six");
+    }
+
+    /// A chunk's two legs must be exact complements, and four chunks must
+    /// reconstruct the whole day.
+    ///
+    /// Each chunk re-aggregates its own hours and carries every OTHER hour
+    /// forward from the target. If the two predicates ever disagree, a bucket is
+    /// either aggregated twice or dropped — silently, and permanently, since no
+    /// read-side guard re-checks a built rollup.
+    #[test]
+    fn each_chunk_rebuilds_its_hours_and_carries_the_complement() {
+        let spec = spec();
+        let day_start = 1_754_000_000_000_000;
+        let masks = build_chunk_masks(BUILD_CHUNK_HOURS);
+        let mut rebuilt_hours = 0u32;
+
+        for mask in &masks {
+            let ranges = dirty_ranges(day_start, *mask);
+            let sql = build_partition_sql_ranges(&spec, SOURCE, SOURCE, "tgt", "project", "2026-08-01", &ranges).expect("valid SQL");
+            rebuilt_hours |= mask;
+
+            // Both legs are present, and the carried leg reads the TARGET.
+            assert!(sql.contains("UNION ALL"), "a chunk must carry the rest of the day forward: {sql}");
+            assert!(sql.contains("FROM tgt WHERE"), "the carried leg must read the target: {sql}");
+            // The rebuilt leg's predicate and the carried leg's NOT(...) must be
+            // the SAME text — complementarity by construction, not by accident.
+            // Rebuilt from `ranges` rather than scraped out of the SQL: the
+            // measures carry their own `FILTER (WHERE … AND (…))` clauses, so
+            // splitting on " AND (" finds one of those instead.
+            let predicate = ranges
+                .iter()
+                .map(|(start, end)| format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            assert!(sql.contains(&format!("AND ({predicate}) GROUP BY")), "rebuilt leg must filter to the chunk: {sql}");
+            assert!(sql.contains(&format!("AND NOT ({predicate})")), "carried leg must be the exact complement: {sql}");
+            // One contiguous span per chunk, so the predicate stays cheap.
+            assert_eq!(ranges.len(), 1, "a six-hour chunk is one range, not six");
+        }
+        assert_eq!(rebuilt_hours, ALL_HOURS, "the chunks together must rebuild every hour of the day");
     }
 
     #[test]

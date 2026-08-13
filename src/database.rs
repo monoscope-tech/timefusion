@@ -8658,16 +8658,42 @@ impl Database {
                 .map_or_else(|| source.to_string(), |base| base.table_name(source));
             // Whole rollup buckets must nest inside an hour, or one bucket
             // would be half-rebuilt and half-carried-forward.
-            let ranges = dirty
-                .zip(day_start)
-                .filter(|_| crate::rollup::grain_fits_hours(spec))
-                .map_or_else(Vec::new, |(hours, day_start)| crate::rollup::dirty_ranges(day_start, hours));
-            let incremental = !ranges.is_empty();
-            let rows = self.query_delta_only(&crate::rollup::build_partition_sql_ranges(spec, source, &from, &target, project_id, date, &ranges)?).await?;
+            let hours_fit = crate::rollup::grain_fits_hours(spec);
+            // The range-sets this rebuild executes IN SEQUENCE, each one a
+            // separate scan + commit.
+            //
+            // * an incremental rebuild: exactly the dirty hours, as before;
+            // * a full rebuild whose grain nests in an hour: CHUNKED, so the
+            //   peak is a quarter of the day rather than all of it. Each chunk
+            //   rebuilds its own hours and carries the rest forward from the
+            //   target, so after the last one the partition holds the whole day.
+            //   A whale partition could not be built at all otherwise — one
+            //   scan of a busy day exceeded both the unit deadline and the
+            //   memory the box has (prod 2026-08-13);
+            // * anything else: one whole-day rebuild, the original behaviour.
+            let plans: Vec<Vec<(i64, i64)>> = match (dirty.zip(day_start).filter(|_| hours_fit), day_start.filter(|_| hours_fit)) {
+                (Some((hours, day_start)), _) => vec![crate::rollup::dirty_ranges(day_start, hours)],
+                (None, Some(day_start)) => {
+                    crate::rollup::build_chunk_masks(crate::rollup::BUILD_CHUNK_HOURS).into_iter().map(|mask| crate::rollup::dirty_ranges(day_start, mask)).collect()
+                }
+                (None, None) => vec![Vec::new()],
+            };
+            let incremental = dirty.is_some() && hours_fit;
             let generation = crate::rollup::generation_id(spec, source, project_id, date, source_fp);
-            let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
-            let row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();
-            self.replace_rollup_partition(project_id, &target, date, batches).await?;
+            let chunked = plans.len() > 1;
+            let mut row_count = 0;
+            for (index, ranges) in plans.iter().enumerate() {
+                let rows = self.query_delta_only(&crate::rollup::build_partition_sql_ranges(spec, source, &from, &target, project_id, date, ranges)?).await?;
+                let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
+                // Each commit REPLACES the partition with (this chunk's hours,
+                // freshly aggregated) UNION (every other hour, carried forward),
+                // so the last one's row count is the partition's.
+                row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+                self.replace_rollup_partition(project_id, &target, date, batches).await?;
+                if chunked {
+                    debug!(project_id, date, target, chunk = index + 1, chunks = plans.len(), rows = row_count, "rollup chunk committed");
+                }
+            }
             if self.rollup_source_fingerprint(project_id, source, date).await? != source_fp
                 || self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value()) != source_epoch
             {
@@ -8680,7 +8706,7 @@ impl Database {
                 &crate::metrics::maintenance_stats().rollup_rebuilds_full
             };
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            info!(project_id, date, target, rows = row_count, hours_rebuilt = ranges.len(), incremental, event = "rollup_partition_built");
+            info!(project_id, date, target, rows = row_count, chunks = plans.len(), incremental, event = "rollup_partition_built");
         }
         self.clear_rollup_backoff(project_id, source, date);
         // Every spec is now current for this source state, so from here on the
