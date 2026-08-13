@@ -15324,8 +15324,8 @@ fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
 
 /// Decode-admission pressure valve: how many of the wide-scan semaphore's
 /// `total` permits one decode poll must claim right now. 1 under normal
-/// pressure (full concurrency); a quarter of the pool from 88% of the cgroup
-/// limit; the whole pool (fully serialized decodes) from 95%. Decode heap is
+/// pressure (full concurrency); a quarter of the pool from 70% of the cgroup
+/// limit; the whole pool (fully serialized decodes) from 82%. Decode heap is
 /// the one large consumer no DataFusion pool tracks, so near the OOM line the
 /// only lever is concurrency: 16 concurrent ~150MB-batch decodes were exactly
 /// the burst that outran jemalloc purge + memcg reclaim in the 2026-08-01/02
@@ -15401,10 +15401,25 @@ fn decode_units(last_batch_bytes: u64) -> u32 {
 }
 
 /// Tier math for `scan_pressure_permits`, separated for testability.
+///
+/// The tiers were 88%/95% and that was measurably too late. A valve only
+/// throttles polls it has not yet admitted; the batches already decoding still
+/// run to completion, so the tier has to fire far enough ahead of the kill line
+/// to cover an in-flight burst. Prod 2026-08-13: the 88% warning was logged 34
+/// SECONDS before the memcg OOM-killed the process, and the burst that took it
+/// there ran at ~450 MB/s (21 GB in 50 s) — one tier transition's worth of
+/// warning and nothing the valve could still stop.
+///
+/// 70%/82% buys that headroom. On the 80 GB effective limit it engages at 56 GB
+/// with 40 GB of slack to the 96 GB cgroup ceiling, ~90 s at the observed burst
+/// rate instead of ~34 s. It costs nothing in normal operation: this instance
+/// idles at 15-25 GB (19-31%) and sits around 25-31 GB after boot, so the first
+/// tier is still comfortably above the working set — queries only start queuing
+/// once the process is genuinely heading for the wall.
 fn pressure_permit_claim(usage_pct: u64, total: u32) -> u32 {
     match usage_pct {
-        p if p >= 95 => total,
-        p if p >= 88 => (total / 4).max(1),
+        p if p >= 82 => total,
+        p if p >= 70 => (total / 4).max(1),
         _ => 1,
     }
 }
@@ -17249,19 +17264,27 @@ mod tests {
         assert_eq!(metrics.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
     }
 
-    /// The decode pressure valve: full concurrency until 88% of the cgroup
-    /// limit, quarter pool to 95%, fully serialized past that. Claims never
+    /// The decode pressure valve: full concurrency until 70% of the cgroup
+    /// limit, quarter pool to 82%, fully serialized past that. Claims never
     /// exceed the pool (progress guaranteed) and never drop to zero.
+    ///
+    /// The tiers must stay AHEAD of an in-flight burst, not merely ahead of the
+    /// kill line: the valve cannot recall a batch already decoding. At 88% prod
+    /// 2026-08-13 got 34 seconds of warning before the memcg killed it, against
+    /// a burst running at ~450 MB/s — so the old tiers could only ever narrate
+    /// the OOM. They must also stay CLEAR of the working set (15-31 GB of an
+    /// 80 GB limit, 19-38%) or every query queues in steady state.
     #[test]
     fn pressure_permit_claim_tiers() {
         assert_eq!(pressure_permit_claim(0, 16), 1);
-        assert_eq!(pressure_permit_claim(87, 16), 1);
-        assert_eq!(pressure_permit_claim(88, 16), 4);
-        assert_eq!(pressure_permit_claim(94, 16), 4);
-        assert_eq!(pressure_permit_claim(95, 16), 16);
+        assert_eq!(pressure_permit_claim(38, 16), 1, "the post-boot working set must not throttle anything");
+        assert_eq!(pressure_permit_claim(69, 16), 1);
+        assert_eq!(pressure_permit_claim(70, 16), 4);
+        assert_eq!(pressure_permit_claim(81, 16), 4);
+        assert_eq!(pressure_permit_claim(82, 16), 16);
         assert_eq!(pressure_permit_claim(200, 16), 16);
-        assert_eq!(pressure_permit_claim(88, 2), 1, "tiny pools floor at 1");
-        assert_eq!(pressure_permit_claim(95, 1), 1);
+        assert_eq!(pressure_permit_claim(70, 2), 1, "tiny pools floor at 1");
+        assert_eq!(pressure_permit_claim(82, 1), 1);
     }
 
     /// spawn_cron_job must fire on the wall-clock schedule (regression: the
