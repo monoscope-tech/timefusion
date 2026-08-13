@@ -31,7 +31,7 @@
 use std::sync::{
     Arc, OnceLock,
     atomic::{
-        AtomicBool, AtomicU64,
+        AtomicBool, AtomicU64, AtomicUsize,
         Ordering::{AcqRel, Relaxed, Release},
     },
 };
@@ -81,6 +81,30 @@ fn soft_cap<K: Eq + std::hash::Hash, V>(map: &DashMap<K, V>, cap: usize) {
         map.retain(|_, _| fastrand::bool());
     }
 }
+
+/// Canonical-SQL bytes the verbatim plan cache may retain per slot of
+/// `capacity` — i.e. the size it assumes a cached statement has.
+///
+/// `capacity` alone counts ENTRIES, which is only a bound when entries are
+/// entry-sized. A pgwire bulk INSERT's is not: `insert_coerce::rewrite_plan`
+/// wraps every `$N` inside `Values` with a `CAST`, so one 500-row x 88-column
+/// batch is ~44k `Cast` nodes, and the canonical text includes every tuple —
+/// so each distinct BATCH SIZE is a distinct key holding a distinct multi-MB
+/// plan. A client that varies its batch size therefore fills all 1024 slots
+/// with plans that are each thousands of times bigger than a SELECT's.
+///
+/// Prod 2026-08-13 measured exactly that: cloning plans, exprs and casts
+/// accounted for ~55% of all heap growth across three dumps taken minutes
+/// apart (3.8 -> 6.1 -> 9.6 GiB), and the box was OOM-killed every 10-30
+/// minutes.
+///
+/// The key's length is the weight. It is the text the plan was built from and
+/// the plan scales with it — ~30x expansion at the 88-column schema. 8 KiB is
+/// several times the longest dashboard SELECT, so the two bounds bind in the
+/// intended order: statement variety trips the count, statement SIZE trips the
+/// bytes. At the default 1024 slots the budget is 8 MiB of text, a few hundred
+/// MB of plans — a bound where there was none.
+const PLAN_CACHE_TEXT_BYTES_PER_SLOT: usize = 8 * 1024;
 
 /// Walk a plan and replace every `CAST(Literal(v), T)` with `Literal(cast(v, T))`.
 ///
@@ -390,6 +414,12 @@ pub struct PlanCacheHook {
     time_fn_shapes: bool,
     /// Single-flight guard for the capacity sweep — see `cached_plan`.
     evicting: AtomicBool,
+    /// Summed key length of `cache`, against `max_text_bytes`. Maintained
+    /// incrementally because the sweep it feeds runs on the Parse path;
+    /// re-summed from the survivors after each sweep, which is rare.
+    cache_text_bytes: AtomicUsize,
+    /// `capacity` slots at `PLAN_CACHE_TEXT_BYTES_PER_SLOT` each.
+    max_text_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -705,6 +735,8 @@ impl PlanCacheHook {
             shape_skips: AtomicU64::new(0),
             time_fn_shapes,
             evicting: AtomicBool::new(false),
+            cache_text_bytes: AtomicUsize::new(0),
+            max_text_bytes: capacity.max(1).saturating_mul(PLAN_CACHE_TEXT_BYTES_PER_SLOT),
         }
     }
 
@@ -936,12 +968,19 @@ impl PlanCacheHook {
             Ok(p) => p,
             Err(e) => return Some(Err(api_err(e))),
         };
-        // Overflow sweep. Only the first thread per crossing runs `retain` (the
-        // rest re-insert as if the cap hadn't been crossed and get swept next
-        // time): `retain` write-locks each shard in turn, so an unsynchronized
-        // stampede of missing threads would serialize every concurrent reader
-        // behind N sweeps. `retain` can't panic here, so a flat store suffices.
-        if self.cache.len() >= self.capacity && !self.evicting.swap(true, AcqRel) {
+        // Overflow sweep, on EITHER bound: entry count, or the retained text
+        // bytes that stand in for retained plan memory (see
+        // `PLAN_CACHE_MAX_TEXT_BYTES` — a bulk INSERT's entry is thousands of
+        // times bigger than a SELECT's, so the count alone bounds nothing).
+        //
+        // Only the first thread per crossing runs `retain` (the rest re-insert
+        // as if the cap hadn't been crossed and get swept next time): `retain`
+        // write-locks each shard in turn, so an unsynchronized stampede of
+        // missing threads would serialize every concurrent reader behind N
+        // sweeps. `retain` can't panic here, so a flat store suffices.
+        let text_bytes = self.cache_text_bytes.load(Relaxed);
+        let over = self.cache.len() >= self.capacity || text_bytes >= self.max_text_bytes;
+        if over && !self.evicting.swap(true, AcqRel) {
             // Operator-visible: the workload has more distinct plan templates than
             // the cache can hold (~5 in the OLAP steady state, so this should never
             // fire in prod). Expect the next queries to re-pay state.optimize().
@@ -949,12 +988,30 @@ impl PlanCacheHook {
                 target: "plan_cache",
                 size = self.cache.len(),
                 capacity = self.capacity,
+                text_bytes,
+                max_text_bytes = self.max_text_bytes,
                 "plan_cache exceeded capacity — evicting ~half. Subsequent queries on evicted plans will re-pay the optimize cost. If this fires steadily, the workload's plan-template variety has grown past the cache budget."
             );
-            soft_cap(&self.cache, self.capacity);
+            // Not `soft_cap`: it re-tests the ENTRY count itself, so it is a
+            // no-op on a byte-only crossing — which is the crossing that
+            // matters here. Halve until BOTH bounds hold, because one random
+            // halving can keep the large half and a single bulk INSERT is a
+            // meaningful fraction of the budget on its own. Re-summed from the
+            // survivors each round: `retain` drops an arbitrary half, so the
+            // counter cannot be decremented incrementally.
+            while !self.cache.is_empty() && (self.cache.len() >= self.capacity || self.cache_text_bytes.load(Relaxed) >= self.max_text_bytes) {
+                self.cache.retain(|_, _| fastrand::bool());
+                self.cache_text_bytes.store(self.cache.iter().map(|e| e.key().len()).sum(), Relaxed);
+            }
             self.evicting.store(false, Release);
         }
-        self.cache.insert(canonical, plan.clone());
+        // A statement that alone exceeds the budget is served but not cached:
+        // admitting it would evict everything else on the next crossing and
+        // still not survive, so it would cost the whole cache to store nothing.
+        if canonical.len() < self.max_text_bytes {
+            self.cache_text_bytes.fetch_add(canonical.len(), Relaxed);
+            self.cache.insert(canonical, plan.clone());
+        }
         Some(Ok(plan))
     }
 
@@ -1353,6 +1410,43 @@ mod tests {
         // Non-cacheable AST kind bypasses too.
         assert!(hook.cached_plan(&parse("SET TIME ZONE 'UTC'"), &ctx).await.is_none());
         assert_eq!(hook.shape_counters(), (3, 0));
+    }
+
+    /// Varying the INSERT batch size must not grow the cache without bound.
+    ///
+    /// Every distinct batch size is a distinct canonical text and therefore a
+    /// distinct entry, and each entry holds a `Values` plan with one `CAST` per
+    /// placeholder — so entry COUNT bounds nothing. Prod 2026-08-13: this
+    /// retention was ~55% of all heap growth and the process was OOM-killed
+    /// every 10-30 minutes with `Cast::new` / `Expr::clone` / `LogicalPlan::clone`
+    /// at the top of the profile.
+    #[tokio::test]
+    async fn varying_insert_batch_sizes_cannot_grow_the_plan_cache_past_its_byte_budget() {
+        // Fewer statements than slots, so the ENTRY cap can never fire and only
+        // the byte budget can bound this — the prod shape, where 1024 slots were
+        // never filled by count and filled many times over by bytes.
+        const STATEMENTS: usize = 40;
+        let hook = PlanCacheHook::new(64, false);
+        let ctx = test_ctx();
+
+        // Each statement is a bulk INSERT longer than the last: a client that
+        // batches by time or by buffer rather than by a fixed row count.
+        for batch in 1..=STATEMENTS {
+            let values = (0..batch * 50).map(|r| format!("(${}, ${})", r * 2 + 1, r * 2 + 2)).collect::<Vec<_>>().join(",");
+            assert!(
+                hook.cached_plan(&parse(&format!("INSERT INTO t (id, project_id) VALUES {values}")), &ctx).await.is_some(),
+                "the INSERT must still plan and be served"
+            );
+        }
+
+        // The budget held, and the accounting matches what is actually retained
+        // — a counter that drifted from the map would silently stop bounding it.
+        let retained: usize = hook.cache.iter().map(|e| e.key().len()).sum();
+        assert!(retained < hook.max_text_bytes, "cache retains {retained} text bytes, over its {} budget", hook.max_text_bytes);
+        assert_eq!(hook.cache_text_bytes.load(Relaxed), retained, "the byte counter drifted from the map it bounds");
+        // And it bounded by BYTES, not by count: the entry cap never applied.
+        assert!(hook.cache.len() < STATEMENTS, "the sweep must have dropped entries; {} of {STATEMENTS} retained", hook.cache.len());
+        assert!(hook.cache.len() < hook.capacity, "the entry cap must not be what bounded this");
     }
 
     /// A `'$1'` STRING LITERAL makes the text-based `has_placeholder` fire while
