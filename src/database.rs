@@ -8691,8 +8691,15 @@ impl Database {
                 // so the last one's row count is the partition's.
                 row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();
                 self.replace_rollup_partition(project_id, &target, date, batches).await?;
+                // INFO, not debug. A chunked whale build runs for many minutes
+                // and prod logs at info, so at debug the only signal would be
+                // the final `rollup_partition_built` — leaving a build in
+                // flight indistinguishable from a wedged one. That silence is
+                // exactly what hid this subsystem being broken for four days
+                // (2026-08-13); one line per chunk is a cheap price for knowing
+                // a long build is progressing.
                 if chunked {
-                    debug!(project_id, date, target, chunk = index + 1, chunks = plans.len(), rows = row_count, "rollup chunk committed");
+                    info!(project_id, date, target, chunk = index + 1, chunks = plans.len(), rows = row_count, event = "rollup_chunk_committed");
                 }
             }
             if self.rollup_source_fingerprint(project_id, source, date).await? != source_fp
