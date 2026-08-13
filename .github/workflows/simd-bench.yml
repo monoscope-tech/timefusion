@@ -57,17 +57,53 @@ jobs:
       - name: Runner CPU
         run: lscpu | grep -iE "^Model name|^Flags" | tr ' ' '\n' | grep -iE "^(model|avx|avx2|avx512f|bmi1|bmi2|fma)$|Model" || lscpu | head -20
 
-      - name: Leg A — ${{ inputs.baseline_cpu }}
+      # Build BOTH binaries first, then INTERLEAVE them on the same machine.
+      #
+      # Running leg A to completion and then leg B does not measure the flag: on
+      # 2026-08-13 the second leg came out 27-45% slower in BOTH orderings, i.e.
+      # the effect tracked run ORDER, not target-cpu, and between-run variance on
+      # a shared 4-vCPU runner reached 2.5x on the same configuration. Alternating
+      # A/B/A/B/A/B inside one job cancels a monotone drift (thermal, noisy
+      # neighbour, cache state) instead of charging it to whichever leg ran last.
+      - name: Build leg A — ${{ inputs.baseline_cpu }}
         env:
           RUSTFLAGS: -C target-cpu=${{ inputs.baseline_cpu }}
-        run: cargo bench --bench ${{ inputs.bench }} -- ${{ inputs.filter }} --save-baseline legA
+        run: |
+          cargo bench --bench ${{ inputs.bench }} --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' | tail -1 > /tmp/pathA
+          cp "$(cat /tmp/pathA)" /tmp/benchA && /tmp/benchA --version 2>/dev/null || true
 
-      # Same source, same bench, same machine — only the flag differs, so the
-      # delta criterion prints is attributable to the microarchitecture alone.
-      - name: Leg B — ${{ inputs.candidate_cpu }}
+      - name: Build leg B — ${{ inputs.candidate_cpu }}
         env:
           RUSTFLAGS: -C target-cpu=${{ inputs.candidate_cpu }}
-        run: cargo bench --bench ${{ inputs.bench }} -- ${{ inputs.filter }} --baseline legA
+        run: |
+          cargo bench --bench ${{ inputs.bench }} --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' | tail -1 > /tmp/pathB
+          cp "$(cat /tmp/pathB)" /tmp/benchB
+
+      - name: Interleaved A/B/A/B/A/B
+        run: |
+          set -o pipefail
+          for round in 1 2 3; do
+            echo "::group::round $round — A (${{ inputs.baseline_cpu }})"
+            /tmp/benchA --bench ${{ inputs.filter }} --save-baseline "A$round" 2>&1 | grep -E "^flush|time:" || true
+            echo "::endgroup::"
+            echo "::group::round $round — B (${{ inputs.candidate_cpu }})"
+            /tmp/benchB --bench ${{ inputs.filter }} --save-baseline "B$round" 2>&1 | grep -E "^flush|time:" || true
+            echo "::endgroup::"
+          done
+          echo "=== MEDIAN ESTIMATE PER BENCH (criterion point estimates, ns) ==="
+          for bench_dir in target/criterion/*/; do
+            name=$(basename "$bench_dir")
+            [ -d "$bench_dir" ] || continue
+            for leg in A B; do
+              vals=$(for r in 1 2 3; do
+                f="$bench_dir/$leg$r/estimates.json"
+                [ -f "$f" ] && jq -r '.mean.point_estimate' "$f"
+              done | sort -n | tr '\n' ' ')
+              [ -n "$vals" ] && echo "$name  leg$leg  samples(sorted ns): $vals"
+            done
+          done
 
       - name: Criterion reports
         if: always()
