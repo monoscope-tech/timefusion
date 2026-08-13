@@ -18126,7 +18126,7 @@ mod tests {
         let (over, under) = (std::time::Duration::from_secs(3600), std::time::Duration::from_secs(1));
         // The bug, stated directly: nothing built, an hour spent, keep going.
         assert!(super::backfill_tick_exhausted(1, 0, 8, over, budget), "a tick building nothing must still stop at its budget");
-        assert!(super::backfill_tick_exhausted(9, 0, 8, under, budget) == false, "under budget with units left, it must keep trying");
+        assert!(!super::backfill_tick_exhausted(9, 0, 8, under, budget), "under budget with units left, it must keep trying");
         // The first unit is still exempt, or an indivisible day-sized aggregate
         // that outlasts one budget never runs at all.
         assert!(!super::backfill_tick_exhausted(0, 0, 8, over, budget), "the first attempt must never be pre-empted");
