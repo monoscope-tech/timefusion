@@ -18306,6 +18306,26 @@ mod tests {
         super::rotate_head_window(&mut Vec::<usize>::new(), 3);
     }
 
+    /// The window and its CONSUMER must agree: `dedup_window_clean` turns the
+    /// window into dates via `window_dates` and asks certification about each
+    /// one. A date-equality window must therefore resolve to EXACTLY one date.
+    ///
+    /// This is what the inclusive end buys. An exclusive-style end
+    /// (`day_start + DAY`) would land on the next day's midnight, `window_dates`
+    /// would return two dates, and the skip would be denied whenever the
+    /// following date happened to be uncertified — silently, and only for some
+    /// partitions, which is the worst way for it to be wrong.
+    #[test]
+    fn a_date_window_resolves_to_exactly_the_date_it_came_from() {
+        use datafusion::prelude::{col, lit};
+        for days in [0_i32, 1, 20_666, 25_000] {
+            let (lo, hi) = super::date_partition_window(&[col("date").eq(lit(ScalarValue::Date32(Some(days))))]).expect("a window");
+            let dates = super::window_dates(lo, hi).expect("resolvable");
+            let expected = chrono::DateTime::from_timestamp_micros(lo).expect("in range").date_naive();
+            assert_eq!(dates, vec![expected], "days={days} must ask about one date, got {dates:?}");
+        }
+    }
+
     /// The build SQL writes `date = '2026-08-01'` — a STRING literal against a
     /// Date32 column. Everything above only works if DataFusion's type coercion
     /// turns that into a `Date32` literal rather than casting the COLUMN to
