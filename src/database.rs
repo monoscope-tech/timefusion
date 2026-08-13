@@ -8956,24 +8956,50 @@ impl Database {
             let date_key = date.to_string();
             // A rollup over a partition that still holds duplicates is simply
             // wrong, so certify first — the sweep never reaches this far back.
-            match self.certify_partition(&table_ref, source, &project_id, date).await {
-                Ok(Some(clean_fp)) => {
-                    if let Err(error) = self.rebuild_rollup_partition(source, &project_id, &date_key, clean_fp).await {
-                        self.record_rollup_failure(&project_id, source, &date_key);
-                        failed += 1;
-                        warn!(project_id, date = %date, source, %error, "rollup backfill build failed");
-                        continue;
-                    }
+            //
+            // DEADLINE on the unit, not just on the loop. The loop's budget check
+            // exempts the first attempt because a day-sized aggregate cannot be
+            // split — but an unbounded first attempt is how the whole job starved:
+            // prod 2026-08-13 logged a run "still in progress" across six
+            // consecutive 600s warnings, produced no tick record at all, and was
+            // killed by the ~50min process restart, over and over. A unit that
+            // cannot finish inside one tick budget never will, because nothing
+            // gives it more time than that. Abandon it, record the failure so
+            // `rollup_retry_allowed` backs it off, and let the partitions that DO
+            // fit get built.
+            //
+            // Cancelling mid-build is safe: the Delta commit is the last step, so
+            // a dropped future leaves no partial state — only wasted work.
+            let unit = async {
+                let clean_fp = self.certify_partition(&table_ref, source, &project_id, date).await?;
+                match clean_fp {
+                    Some(clean_fp) => self.rebuild_rollup_partition(source, &project_id, &date_key, clean_fp).await.map(|()| Some(())),
+                    None => Ok(None),
+                }
+            };
+            match tokio::time::timeout(budget, unit).await {
+                Err(_elapsed) => {
+                    self.record_rollup_failure(&project_id, source, &date_key);
+                    failed += 1;
+                    warn!(
+                        project_id,
+                        date = %date,
+                        source,
+                        budget_secs = budget.as_secs(),
+                        "rollup backfill unit exceeded one tick budget and was abandoned; it cannot be built by this path"
+                    );
+                }
+                Ok(Ok(Some(()))) => {
                     built += 1;
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     uncertifiable += 1;
                     debug!(project_id, date = %date, source, "rollup backfill: partition not certifiable yet");
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     self.record_rollup_failure(&project_id, source, &date_key);
                     failed += 1;
-                    warn!(project_id, date = %date, source, %error, "rollup backfill certification failed");
+                    warn!(project_id, date = %date, source, %error, "rollup backfill unit failed (certification or build)");
                 }
             }
         }
@@ -18196,6 +18222,34 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
         // An empty list must not panic on the modulo.
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
+    }
+
+    /// A unit that cannot finish inside one tick budget must be ABANDONED, not
+    /// allowed to run forever.
+    ///
+    /// The loop's budget check exempts the first attempt, because a day-sized
+    /// aggregate cannot be split. Prod 2026-08-13 showed what an unbounded first
+    /// attempt actually costs: a run logged "still in progress" across six
+    /// consecutive 600s warnings, emitted NO tick record at all, and was killed
+    /// by the ~50min process restart — repeatedly, for days. Nothing ever gives
+    /// a unit more time than a tick budget, so a unit that needs more can never
+    /// be built by this path and must not consume every process lifetime trying.
+    #[tokio::test(start_paused = true)]
+    async fn a_unit_that_outlasts_the_tick_budget_is_abandoned() {
+        let budget = std::time::Duration::from_secs(240);
+        // Stands in for certify+build on a partition too big for this path.
+        let forever = async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok::<_, ()>(Some(()))
+        };
+        assert!(tokio::time::timeout(budget, forever).await.is_err(), "an over-budget unit must time out rather than run to completion");
+
+        // A unit that fits still completes untouched.
+        let quick = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok::<_, ()>(Some(()))
+        };
+        assert_eq!(tokio::time::timeout(budget, quick).await, Ok(Ok(Some(()))));
     }
 
     /// Rotation must not cost recency. Rotating the WHOLE candidate list would
