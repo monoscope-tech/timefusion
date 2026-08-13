@@ -18180,6 +18180,49 @@ mod tests {
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
     }
 
+    /// The build SQL writes `date = '2026-08-01'` — a STRING literal against a
+    /// Date32 column. Everything above only works if DataFusion's type coercion
+    /// turns that into a `Date32` literal rather than casting the COLUMN to
+    /// Utf8; in the latter shape there is no Date32 literal to read and the fix
+    /// would silently do nothing. Asserted against a real optimized plan rather
+    /// than assumed.
+    #[tokio::test]
+    async fn the_builds_string_date_literal_survives_as_a_date32_window() {
+        use datafusion::{
+            arrow::datatypes::{DataType, Field, Schema},
+            datasource::MemTable,
+            logical_expr::LogicalPlan,
+            prelude::SessionContext,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("project_id", DataType::Utf8, true), Field::new("date", DataType::Date32, false)]));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
+
+        // Byte-for-byte the predicate `build_partition_sql` emits.
+        let state = ctx.state();
+        let plan = state.optimize(&state.create_logical_plan("SELECT * FROM t WHERE project_id = 'p' AND date = '2026-08-01'").await.unwrap()).unwrap();
+
+        let mut filters = Vec::new();
+        fn collect(plan: &LogicalPlan, out: &mut Vec<Expr>) {
+            if let LogicalPlan::Filter(f) = plan {
+                out.push(f.predicate.clone());
+            }
+            if let LogicalPlan::TableScan(scan) = plan {
+                out.extend(scan.filters.iter().cloned());
+            }
+            plan.inputs().iter().for_each(|input| collect(input, out));
+        }
+        collect(&plan, &mut filters);
+        // Split conjunctions, as the scan path does before extracting a window.
+        let conjuncts: Vec<Expr> = filters.iter().flat_map(|f| datafusion::logical_expr::utils::split_conjunction(f).into_iter().cloned()).collect();
+
+        let window = super::date_partition_window(&conjuncts);
+        assert!(window.is_some(), "the optimized plan must still expose a Date32 equality; got {conjuncts:?}");
+        // 2026-08-01 is 20666 days after the epoch.
+        let days = chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap().signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days();
+        assert_eq!(window, Some((days * 86_400_000_000, (days + 1) * 86_400_000_000 - 1)));
+    }
+
     /// A rollup build filters `project_id = … AND date = …` and never mentions
     /// `timestamp`, so the read-dedup skip saw no window, denied `NoWindow`, and
     /// the scan ran an UNBOUNDED merge-on-read dedup. Prod 2026-08-13: every
