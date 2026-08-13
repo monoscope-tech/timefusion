@@ -2409,6 +2409,10 @@ pub struct Database {
     /// sweep is bigger than one tick, so without rotation the tail of the work
     /// list is never reached.
     dedup_sweep_cursor: Arc<std::sync::atomic::AtomicUsize>,
+    /// Which table a dedup tick starts with. The pass's budget is shared across
+    /// every table, so without rotation the tail of the table list is never
+    /// reached — see the cron's comment.
+    dedup_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// One repair pass at a time, PROCESS-WIDE.
     ///
     /// `round_robin_bins` already serialises repair within a table (concurrency
@@ -2829,6 +2833,7 @@ impl Database {
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
@@ -3470,7 +3475,17 @@ impl Database {
                     // resumable at a cursor while a half-drained bin is not.
                     let drain_deadline = now + budget.mul_f64(0.6);
                     let sweep_deadline = now + budget;
-                    for (project_id, table_name, table) in db.all_tables().await {
+                    // ROTATE the table order. The budget is shared across every
+                    // table, so a fixed order means the first table spends it and
+                    // the rest are served in name order forever — prod 2026-08-13
+                    // reached `otel_metrics` with `budget_secs=0` and swept 0 of
+                    // its 19 items on every tick, while `otel_logs_and_spans` ran
+                    // first every time. Same starvation the sweep and packing
+                    // cursors already fix, one level up.
+                    let mut tables = db.all_tables().await;
+                    let start = sweep_resume_offset(tables.len(), db.dedup_table_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    tables.rotate_left(start);
+                    for (project_id, table_name, table) in tables {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
