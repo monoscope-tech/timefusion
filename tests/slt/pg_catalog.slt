@@ -180,3 +180,30 @@ CASE WHEN 'pg_signal_backend' = any(array(WITH RECURSIVE cte AS (
 FROM pg_catalog.pg_roles AS roles WHERE rolname = session_user
 ----
 0 postgres true true true true
+
+# pgAdmin's object-explorer schema query computes `is_catalog` with EXISTS in
+# the SELECT LIST. DataFusion decorrelates EXISTS only in filter position, so a
+# projection EXISTS reaches physical planning and fails with "Physical plan does
+# not support logical expression Exists". ExistsInProjection rewrites it to the
+# equivalent `(SELECT count(1) FROM q) > 0`, which DataFusion does decorrelate.
+
+query TB
+SELECT nsp.nspname AS schema_name,
+  (nsp.nspname = 'pg_catalog' AND EXISTS
+     (SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'pg_class' AND relnamespace = nsp.oid LIMIT 1))
+  OR (nsp.nspname = 'pgagent' AND EXISTS
+     (SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'pga_job' AND relnamespace = nsp.oid LIMIT 1))
+  OR (nsp.nspname = 'information_schema' AND EXISTS
+     (SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'tables' AND relnamespace = nsp.oid LIMIT 1))
+  AS is_catalog
+FROM pg_catalog.pg_namespace nsp
+ORDER BY nsp.nspname
+----
+pg_catalog true
+public false
+
+# NOT EXISTS in a projection must invert, not just be dropped.
+query B
+SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'no_such_relation') AS absent
+----
+true

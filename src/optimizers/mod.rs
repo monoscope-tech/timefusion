@@ -1,4 +1,5 @@
 mod defer_expensive_projection;
+mod exists_in_projection;
 mod ordered_union_for_topk;
 pub mod pg_array_literal_rewriter;
 mod tantivy_rewriter;
@@ -15,6 +16,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 pub use defer_expensive_projection::DeferExpensiveProjection;
+pub use exists_in_projection::ExistsInProjection;
 pub use ordered_union_for_topk::{OrderedUnionForTopK, ordered_children};
 pub use pg_array_literal_rewriter::PgArrayLiteralRewriter;
 pub use tantivy_rewriter::TantivyPredicateRewriter;
