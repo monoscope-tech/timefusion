@@ -2418,6 +2418,11 @@ pub struct Database {
     /// process lifetime would otherwise head-of-line block every cheaper one
     /// behind it, forever.
     rollup_backfill_cursor: Arc<std::sync::atomic::AtomicUsize>,
+    /// Which SOURCE TABLE a backfill run starts with. Each source gets its own
+    /// tick budget, so a run walks them in sequence — and a source whose every
+    /// partition fails expensively consumes the whole process lifetime, leaving
+    /// the sources behind it unbuilt.
+    rollup_source_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// One repair pass at a time, PROCESS-WIDE.
     ///
     /// `round_robin_bins` already serialises repair within a table (concurrency
@@ -2840,6 +2845,7 @@ impl Database {
             dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rollup_backfill_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            rollup_source_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
@@ -3514,7 +3520,20 @@ impl Database {
             move || {
                 let db = db.clone();
                 async move {
-                    for source in crate::schema_loader::registry().list_tables() {
+                    // ROTATE the source order. Each source gets its own tick
+                    // budget, so a run walks them in SEQUENCE and the tail is
+                    // only reached if everything ahead of it finishes inside one
+                    // process lifetime. Prod 2026-08-13: one `otel_metrics` tick
+                    // logged `queued=207 attempted=3 built=0 failed=3
+                    // elapsed_ms=695402` -- every attempt dying on the 2048 MB
+                    // merge-on-read dedup cap -- and burned the run before
+                    // `otel_logs_and_spans` was reached, which is the table the
+                    // dashboards actually read. Same starvation the dedup table
+                    // cursor fixes (d25d8ef).
+                    let mut sources = crate::schema_loader::registry().list_tables();
+                    let start = sweep_resume_offset(sources.len(), db.rollup_source_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    sources.rotate_left(start);
+                    for source in sources {
                         match db.rollup_backfill_tick(&source).await {
                             Ok(0) => {}
                             Ok(built) => info!(source, built, "rollup backfill built sealed partitions"),
@@ -18119,6 +18138,33 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
         // An empty list must not panic on the modulo.
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
+    }
+
+    /// A source whose partitions all fail expensively must not starve the
+    /// sources behind it.
+    ///
+    /// Prod 2026-08-13: one `otel_metrics` backfill tick logged `queued=207
+    /// attempted=3 built=0 failed=3 elapsed_ms=695402` — every attempt dying on
+    /// the 2048 MB merge-on-read dedup cap — and consumed the whole run, so
+    /// `otel_logs_and_spans` (the table the dashboards read, missing 08-12
+    /// entirely) was never reached. Each source has its OWN tick budget, so
+    /// bounding the budget cannot fix this; only rotation can.
+    #[test]
+    fn a_failing_source_does_not_starve_the_sources_behind_it() {
+        let sources = ["otel_metrics", "otel_logs_and_spans", "otel_traces"];
+        // One source per run is all a process lifetime affords when the first
+        // one spends 695s of a 600s budget.
+        let served: Vec<&str> = (0..sources.len())
+            .map(|cursor| {
+                let mut rotated = sources;
+                let offset = super::sweep_resume_offset(rotated.len(), cursor);
+                rotated.rotate_left(offset);
+                rotated[0]
+            })
+            .collect();
+        for source in sources {
+            assert!(served.contains(&source), "`{source}` never got to run first across {} runs: {served:?}", sources.len());
+        }
     }
 
     /// The rollup backfill's budget must bind even when NOTHING is being built.
