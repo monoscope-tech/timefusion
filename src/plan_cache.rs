@@ -149,25 +149,20 @@ struct WeighedMap<V> {
 impl<V: Clone> WeighedMap<V> {
     fn new(capacity: usize, bytes_per_slot: usize) -> Self {
         let capacity = capacity.max(1);
-        Self {
-            map: DashMap::new(),
-            capacity,
-            max_bytes: capacity.saturating_mul(bytes_per_slot),
-            bytes: AtomicUsize::new(0),
-            sweeping: AtomicBool::new(false),
-        }
+        Self { map: DashMap::new(), capacity, max_bytes: capacity.saturating_mul(bytes_per_slot), bytes: AtomicUsize::new(0), sweeping: AtomicBool::new(false) }
     }
 
     fn get(&self, key: &str) -> Option<V> {
         self.map.get(key).map(|e| e.value().0.clone())
     }
 
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
     fn bytes(&self) -> usize {
         self.bytes.load(Relaxed)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
     }
 
     fn contains_key(&self, key: &str) -> bool {
@@ -231,7 +226,6 @@ impl<V: Clone> WeighedMap<V> {
         self.bytes.store(held, Relaxed);
     }
 }
-
 
 /// Walk a plan and replace every `CAST(Literal(v), T)` with `Literal(cast(v, T))`.
 ///

@@ -40,7 +40,7 @@ h1{font-size:19px;font-weight:650;margin:0 0 2px;text-wrap:balance}
 .tile .d{font-size:12px;color:var(--ink2);margin-top:2px}
 .v .dim{color:var(--ink3);font-weight:500}
 .grid{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow-x:auto}
-table{border-collapse:collapse;width:100%;min-width:980px}
+table{border-collapse:collapse;width:100%;min-width:1040px}
 th{font-size:11px;letter-spacing:.04em;color:var(--ink3);text-align:right;font-weight:600;padding:9px 7px;border-bottom:1px solid var(--line);white-space:nowrap}
 th:first-child{text-align:left;padding-left:12px}
 td{padding:6px 7px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums;font-size:12.5px}
@@ -61,23 +61,30 @@ tr:last-child td{border-bottom:none}
 .note{color:var(--ink2);font-size:12.5px;margin:14px 2px 0;max-width:76ch}
 .note b{color:var(--ink)}
 .foot{color:var(--ink3);font-size:11.5px;margin-top:18px}
+.gb{font-size:10.5px;opacity:.6;font-weight:400;letter-spacing:.01em}
+.open{color:var(--ink3)!important;background:var(--mut-bg)!important;font-weight:400!important}
+th.openh{color:var(--warn)}
+.ratio{color:var(--ink3)}
+.ratio.hot{color:var(--danger);font-weight:600}
+td.na{opacity:.28}
 </style>
 <div class="wrap">
 <h1>Active parquet files per project × day — otel_logs_and_spans</h1>
-<p class="sub">unified table on R2 · snapshot v463266 · 2026-08-04 01:33 CEST · ⚠ CORRECTION 03:20 CEST: the "shred→heal" pattern below was DATA LOSS, not healing — see the note</p>
+<p class="sub">unified table on OVH · snapshot v481359 · 2026-08-14 22:22 UTC · 08-14 is the OPEN partition (fragmentation there is expected)</p>
 
 <div class="tiles">
-  <div class="tile"><div class="k">⚠ Data loss (confirmed)</div><div class="v" style="color:var(--danger)">3/3 <span class="dim">audited</span></div><div class="d">drain dropped rows outside each 10-min bin: 00000000/08-01 −99.95%, 28f62f01/08-02 −96.9%, whale/08-02 −35% of keys. Fix 981ea6d deployed; full audit running</div></div>
-  <div class="tile"><div class="k">Recovery window</div><div class="v">guarded</div><div class="d">all lost rows still in unvacuumed parquet; VACUUM_RETENTION forced 720h (default would have deleted them from 18:15Z 08-04). DO NOT VACUUM</div></div>
-  <div class="tile"><div class="k">Whale 08-03 low volume</div><div class="v">benign</div><div class="d">whale = monoscope self-observability; volume ∝ TF internal churn — the drop is the churn fixes, not lost customer data</div></div>
-  <div class="tile"><div class="k">Restarts</div><div class="v">~10–30 min</div><div class="d">drain-leak climb still unattributed; revert image 251c410 deployed ~02:30 CEST — watching whether kills continue on it</div></div>
+  <div class="tile"><div class="k">Sealed-day backlog</div><div class="v" style="color:var(--danger)">231 <span class="dim">files / 4.1 GB</span></div><div class="d">08-13 sealed fragmented across 11 of 13 projects. A converged day is ~14 files for the same ~3 GB, so 08-13 is ~16× its floor — compaction has not swept it</div></div>
+  <div class="tile"><div class="k">Converged reference</div><div class="v" style="color:var(--good)">14–15 <span class="dim">files/day</span></div><div class="d">08-10 and 08-11 are what healthy looks like: ~1 file per project per day at ~1 GB target. 08-06 matches too</div></div>
+  <div class="tile"><div class="k">Hot tier</div><div class="v">437 <span class="dim">GB / 6535 files</span></div><div class="d">uncompressed since 0709263; grew ~346 GB in ~8 h toward the 600 GB cap. Disk 982 G used of 1.8 T</div></div>
+  <div class="tile"><div class="k">⚠ Memory</div><div class="v" style="color:var(--danger)">106% <span class="dim">of budget</span></div><div class="d">charged 90.9 GB vs 85.9 GB limit; 3 × exit 137 in the last 3 h. Demotion skips restarted (19)</div></div>
 </div>
 
 <div class="legend">
   <span><span class="sw c1">1</span> converged</span>
   <span><span class="sw c2">2–9</span> near floor</span>
-  <span><span class="sw c3">10–99</span> needs a pass</span>
-  <span><span class="sw c4">100+</span> fragmented / in flight</span>
+  <span><span class="sw c3">10–49</span> needs a pass</span>
+  <span><span class="sw c4">50+</span> fragmented</span>
+  <span><span class="sw open">n</span> open partition — not a backlog</span><span style="color:var(--ink3)">cell = files · GB below</span>
 </div>
 
 <div class="grid">
@@ -87,23 +94,39 @@ tr:last-child td{border-bottom:none}
 </table>
 </div>
 
-<p class="note"><b>⚠ CORRECTION (03:20 CEST):</b> the row-count audit proved the "shred→heal to 1 file" pattern celebrated in earlier revisions was <b>data loss, not compaction</b>. The unthrottled dirty-bin drain (13:00–17:30Z) passed its 10-minute bin predicate as the partition filter, so each bin rewrite removed whole multi-bin parquet files and re-wrote only its own ten minutes — the "1 file / ≈0GB" end state IS the loss signature. Audited so far: 00000000/08-01 lost 1,357,023 of 1,357,744 keys (99.95%, survivors are hour 13 only); 28f62f01/08-02 lost 2,324,817 (96.9%, survivors span 12:40–13:19); whale/08-02 lost ~35% (~7.8M keys, bin-shaped holes). Zero tombstoned winners — every missing key is real loss. <b>The bleeding is stopped</b> (fix <code>981ea6d</code>, deployed in <code>251c410</code>) and <b>every lost row is still recoverable</b> from removed-but-unvacuumed parquet — vacuum retention is forced to 720h on the service (the 24h default would have started deleting at 18:15Z today); a full-table audit + recovery re-append is in progress. Whale 08-03 "ingest collapse" resolved separately as benign (self-observability volume ∝ TF churn). Leftovers: OOM restarts continue (~10–30 min, unattributed); 6297304f 07-30/31 pre-sweep fragmentation; 3 giant DML quarantine payloads; 16 files in <code>date=2238-12-31</code> (excluded).</p>
+<p class="note"><b>08-13 is the finding.</b> It is a <i>sealed</i> day still carrying <b>231 files for 4.1 GB</b> — against 14–15 files for ~3 GB on 08-10/08-11, which is what a swept day looks like. The fragmentation is broad, not one tenant: 28f62f01 52, 6297304f 49, whale 46, dcad860a 23, 00000000 35. That is the signature of maintenance not completing a pass, and it lines up with the day's restart rate — a partition only converges if a sweep runs to completion, and the process was being OOM-killed repeatedly. 08-07/08-08 (28f62f01, 51–53) and 08-12 (28f62f01 50) are the same story on earlier days, never cleaned up. <b>08-14 is the open partition</b> at 22:22 UTC, so its 248 files are the day still being written, not a backlog.<br><br><b>⚠ Watch, not yet diagnosed:</b> the box is <b>over its memory budget</b> (charged 90.9 GB vs an 85.9 GB limit) with <b>three exit-137 kills in three hours</b>, and <code>demote_skipped_total</code> has gone 0 → 19, so the hot tier is starting to drop writes again. The hot tier went uncompressed today and is at 437 GB / 6535 files; TF's own memory accounting is <code>memory.current − inactive_file</code>, which does <i>not</i> discount recently-read (active) page cache — so a large uncompressed tier can inflate the governor's view of usage even though the kernel could reclaim it. That interaction is the prime suspect and needs confirming before more disk is bought.</p>
 
-<p class="foot">Counts = active Adds in the Delta snapshot (tombstones excluded) · whale row shaded thresholds ×10 (its 1GB floor is ~40–100 files/day)</p>
+<p class="note" style="margin-top:12px"><b>Previously (closed 2026-08-05).</b> The drain-partition-filter data-loss incident is <b>resolved</b>: the final audit certified <b>all clean across 36 partition-dates</b>, with ~28M+ drain-dropped keys re-appended through the live writer and file-verified. <b>Permanently written off</b>: ~7.3M keys in whale/08-02 plus ~2,000 oversize rows (whale/08-03, 98fdd4f3/08-02) — a vacuum cron fired during a deploy-wiped-env window and destroyed the recovery source. All of it was TF self-observability or drain-orphaned rows held nowhere else. Hardening shipped as <code>981ea6d</code> (drain partition filter), <code>e583beb</code> (DML tombstones exempt from the event-time bound) and <code>e30e0da</code> (vacuum default 24h→72h). Still open from that review: the CapRover app-def should carry <code>stop-first</code> update order and a persisted <code>VACUUM_RETENTION</code>, so an env wipe can never re-arm that landmine. Note also that <b>the whale no longer needs its old ×10 threshold</b> — it ran 53–99 files/day in late July and now sealed-day converges to 1–3, same as everyone else.</p>
+
+<p class="foot">Counts = active Adds in the Delta snapshot (tombstones excluded) · healthy ≈ file count matches partition GB at the 1 GB target · <code>date=None</code> (8 files) excluded · whale thresholds are no longer scaled — it converges like the rest now</p>
 </div>
 
 <script>
-const DATES=["07-19","07-20","07-21","07-22","07-23","07-24","07-25","07-26","07-27","07-28","07-29","07-30","07-31","08-01","08-02","08-03"];
-const GRID=[["87576849",5,30,70,116,113,121,33,76,70,99,53,75,107,83,164,41],["6297304f",1,1,1,1,1,1,1,1,1,1,3,49,9,1,1,42],["28f62f01",0,1,1,1,1,1,1,9,1,1,1,3,1,1,1,50],["edb04135",1,1,1,1,1,1,1,1,1,1,1,1,16,1,1,2],["be87ebc1",1,1,1,1,1,1,1,4,1,1,1,1,1,1,1,41],["d062e010",1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,40],["00000000",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,41],["98fdd4f3",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,40],["2a39bd83",1,1,1,1,1,1,1,1,1,1,1,5,1,1,1,6],["94c5dc1f",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,39],["dcad860a",1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,43],["8100121c",1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2],["5ce1c976",1,1,1,1,1,1,1,1,1,1,1,2,1,0,1,1],["4f020cf8",0,0,1,1,1,1,1,0,1,0,0,1,0,1,0,0]];
-const WHALE="87576849", TODAY="08-03";
-document.getElementById("hdr").innerHTML="<th>project</th>"+DATES.map(d=>`<th>${d}</th>`).join("")+"<th>status</th>";
-const cls=(p,d,v)=>{if(v===0)return"";const m=p===WHALE?10:1; // whale floor is ~10x
-  if(d===TODAY)return v<=2*m?"c2":v<=15*m?"c3":"c4";
-  return v<=m?"c1":v<=9*m?"c2":v<=99*m?"c3":"c4"};
-const chip=p=>p==="87576849"?`<span class="chip run">08-02 healing</span>`:p==="6297304f"?`<span class="chip run">07-30/31 pending</span>`:`<span class="chip done">converged</span>`;
-document.getElementById("rows").innerHTML=GRID.map(r=>{
-  const p=r[0];
-  return `<tr><td class="proj">${p}${p==="00000000"?' <span class="tag">(default)</span>':p===WHALE?' <span class="tag">(whale)</span>':""}</td>`+
-    DATES.map((d,i)=>{const v=r[i+1];return `<td><span class="${cls(p,d,v)}" style="padding:1px 4px">${v||"·"}</span></td>`}).join("")+
-    `<td>${chip(p)}</td></tr>`}).join("");
+const days=["08-06","08-07","08-08","08-09","08-10","08-11","08-12","08-13","08-14"];
+const rows=[
+ ["00000000","",[[1,0.2],[1,0.2],[1,0.2],[9,0.3],[1,0.2],[1,0.2],[1,0.2],[35,0.3],[28,0.3]]],
+ ["28f62f01","",[[2,0.9],[53,1.3],[51,1.2],[2,0.9],[2,0.8],[2,0.8],[50,1.2],[52,1.1],[44,1.2]]],
+ ["2a39bd83","",[[1,0],[1,0],[1,0],[3,0],[1,0],[1,0],[1,0],[1,0],[10,0]]],
+ ["4f020cf8","new",[null,null,null,null,null,null,[4,0],[2,0],[4,0]]],
+ ["5ce1c976","",[[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0]]],
+ ["6297304f","",[[2,0.6],[1,0.3],[1,0],[1,0.2],[2,0.9],[1,0.4],[4,0.4],[49,0.4],[26,0.5]]],
+ ["8100121c","",[[1,0],[1,0],[1,0],[3,0],[1,0],[1,0],[4,0],[4,0],[5,0]]],
+ ["87576849","whale",[[1,0.3],[1,0.4],[2,0.8],[11,0.9],[1,0.3],[3,1.2],[11,0.9],[46,1.3],[29,0.7]]],
+ ["94c5dc1f","",[[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[3,0],[13,0]]],
+ ["98fdd4f3","",[[1,0.2],[1,0.2],[1,0.1],[3,0.2],[1,0.2],[1,0.2],[1,0.2],[7,0.2],[17,0.2]]],
+ ["be87ebc1","",[[1,0.1],[1,0.1],[1,0.1],[5,0.1],[1,0.1],[1,0.1],[1,0.1],[5,0.1],[20,0.2]]],
+ ["d062e010","",[[1,0.1],[1,0.1],[1,0],[2,0.1],[1,0.1],[1,0.2],[1,0.1],[3,0.1],[21,0.2]]],
+ ["dcad860a","",[[1,0.4],[1,0.3],[1,0.4],[4,0.1],[1,0.4],[1,0.4],[1,0.4],[23,0.6],[30,0.7]]],
+];
+const cls=n=>n>=50?"c4":n>=10?"c3":n>=2?"c2":"c1";
+document.getElementById("hdr").innerHTML =
+  "<th>project</th>"+days.map((d,i)=>`<th class="${i===days.length-1?"openh":""}">${d}${i===days.length-1?" open":""}</th>`).join("")+"<th>08-13 vs floor</th>";
+document.getElementById("rows").innerHTML = rows.map(([p,tag,cells])=>{
+  const sealed=cells[7];
+  const ratio = sealed ? (sealed[0]<=1?"—":`${sealed[0]}×`) : "—";
+  const last=cells.length-1;
+  return `<tr><td class="proj">${p}<span class="tag">${tag?" "+tag:""}</span></td>`+
+    cells.map((c,i)=>c?`<td class="${i===last?"open":cls(c[0])}">${c[0]}<div class="gb">${c[1].toFixed(1)} GB</div></td>`:`<td class="na">·</td>`).join("")+
+    `<td class="ratio${sealed&&sealed[0]>=10?" hot":""}">${ratio}</td></tr>`;
+}).join("");
 </script>
