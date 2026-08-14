@@ -14477,6 +14477,33 @@ fn build_writer_properties(
         .build()
 }
 
+/// The table's declared ordering, expressed against a leg's OUTPUT schema.
+///
+/// Only the LEADING run of sorting columns that survived projection is claimed —
+/// a query that projects `timestamp` away gets no claim rather than a false one.
+/// `sorted` is the leg's own attestation that its rows are actually in that
+/// order; `None` means claim nothing, which is always safe (the plan sorts).
+///
+/// Shared by both legs that can make the claim: the in-memory source via
+/// `declare_ordering`, and the hot tier's `ArrowSource` via `with_output_ordering`.
+pub(crate) fn table_ordering(table_name: &str, out: &SchemaRef, sorted: bool) -> Option<datafusion::physical_expr::LexOrdering> {
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    let table = crate::schema_loader::get_schema(table_name).filter(|_| sorted)?;
+    LexOrdering::new(
+        table
+            .sorting_columns
+            .iter()
+            .map_while(|sc| {
+                let idx = out.index_of(&sc.name).ok()?;
+                Some(PhysicalSortExpr::new(
+                    Arc::new(PhysicalColumn::new(&sc.name, idx)),
+                    arrow::compute::SortOptions { descending: sc.descending, nulls_first: sc.nulls_first },
+                ))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
@@ -14695,27 +14722,10 @@ impl ProjectRoutingTable {
         Ok(Arc::new(DataSourceExec::new(Arc::new(Self::declare_ordering(mem_source, sorted, &self.table_name, &out)))))
     }
 
-    /// Attach the table's declared ordering to an in-memory source.
-    ///
-    /// Declared against the source's OUTPUT schema (post-projection), and only
-    /// for the leading run of sorting columns that survived it — a query that
-    /// projects `timestamp` away gets no claim rather than a false one. Failure
-    /// to attach is never fatal: an undeclared source is merely slower.
+    /// Attach the table's declared ordering to an in-memory source. Failure to
+    /// attach is never fatal: an undeclared source is merely slower.
     fn declare_ordering(source: MemorySourceConfig, sorted: bool, table_name: &str, out: &SchemaRef) -> MemorySourceConfig {
-        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-        let Some(table) = crate::schema_loader::get_schema(table_name).filter(|_| sorted) else { return source };
-        let exprs: Vec<PhysicalSortExpr> = table
-            .sorting_columns
-            .iter()
-            .map_while(|sc| {
-                let idx = out.index_of(&sc.name).ok()?;
-                Some(PhysicalSortExpr::new(
-                    Arc::new(PhysicalColumn::new(&sc.name, idx)),
-                    arrow::compute::SortOptions { descending: sc.descending, nulls_first: sc.nulls_first },
-                ))
-            })
-            .collect();
-        let Some(ordering) = LexOrdering::new(exprs) else { return source };
+        let Some(ordering) = table_ordering(table_name, out, sorted) else { return source };
         // `try_with_sort_information` consumes the source, so keep a copy to
         // fall back to — the undeclared source must still serve its rows.
         let undeclared = source.clone();
@@ -16300,47 +16310,36 @@ impl TableProvider for ProjectRoutingTable {
         scan_metrics.mem_plan_us_total.fetch_add(mem_plan_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         let mem_partitions = mem_leg.partitions;
 
-        // Hot-tier third leg (P1) — see `HotTier::query_partitioned` for the
-        // coverage contract. Consulted only when Delta is actually being
-        // scanned: `skip_delta` means the window is entirely newer than
-        // anything ever flushed, and the hot tier only ever holds flushed
-        // (post-commit) data.
+        // Hot-tier third leg (P1) — see `HotTier::scan` for the coverage
+        // contract. Consulted only when Delta is actually being scanned:
+        // `skip_delta` means the window is entirely newer than anything ever
+        // flushed, and the hot tier only ever holds flushed (post-commit) data.
         // ...and only when the scan is shallow enough for the tier to be worth
-        // its heap. The hot leg is materialized EAGERLY at plan time into a
-        // `MemorySourceConfig` — charged to the query pool only at execute
-        // time (`HotLegPooledExec`) and outside `GatedScanExec`, which wraps
-        // only the Delta plan. A 7d/14d scan's
-        // `query_time_range` covers the whole hot window, so it would pull the
-        // entire tier into heap to shave a few files off a scan already
-        // dominated by thousands; past the retention window the tier is by
-        // definition a fraction of the answer. Same depth signal the wide-scan
-        // gate uses (`scan_lookback_micros`: now - min_ts, so a one-sided
-        // `>= now()-1h` dashboard reads as shallow), thresholded on the tier's
-        // own window rather than the gate's — the tier exists for exactly the
-        // 1h/3h reads inside it.
+        // reading. Past the retention window the tier is by definition a
+        // fraction of the answer, so a 7d/14d scan would open every file in it
+        // to shave a few off a scan already dominated by thousands. Same depth
+        // signal the wide-scan gate uses (`scan_lookback_micros`: now - min_ts,
+        // so a one-sided `>= now()-1h` dashboard reads as shallow), thresholded
+        // on the tier's own window rather than the gate's — the tier exists for
+        // exactly the 1h/3h reads inside it.
         //
         // DEDUP: a non-empty hot leg forces the union path below, which never
-        // sets `skip_dedup` — see `HotTier::query_partitioned`'s dedup contract
-        // (the hot leg serves pre-dedup rows and relies on `DedupExec`).
+        // sets `skip_dedup` — see `HotTier::scan`'s dedup contract (the hot leg
+        // serves pre-dedup rows and relies on `DedupExec`).
         let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters), layer.hot_tier_retention_micros());
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
         let hot_plan_started = std::time::Instant::now();
         let hot: crate::hot_tier::HotLeg = match skip_delta || too_deep {
             true => Default::default(),
-            false => {
-                layer
-                    .hot_tier()
-                    .query_partitioned(&project_id, &self.table_name, query_time_range, &mem_ranges, &optimized_filters, &self.schema, projection)
-                    .await
-            }
+            false => layer.hot_tier().scan(&project_id, &self.table_name, query_time_range, &mem_ranges, &optimized_filters, &self.schema, projection),
         };
         scan_metrics.hot_plan_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         scan_metrics.hot_plan_us_total.fetch_add(hot_plan_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-        let (hot_partitions, hot_ranges, version_gate, hot_sorted, hot_bytes) = (hot.partitions, hot.ranges, hot.version_gate, hot.sorted, hot.bytes);
+        let (hot_plan, hot_ranges, version_gate) = (hot.plan, hot.ranges, hot.version_gate);
 
         // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
-        if mem_partitions.is_empty() && hot_partitions.is_empty() && hot_ranges.is_empty() {
+        if mem_partitions.is_empty() && hot_plan.is_none() && hot_ranges.is_empty() {
             debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
             let mut delta_only_filters = optimized_filters.clone();
             if let Some(f) = tantivy_id_filter.clone() {
@@ -16459,24 +16458,11 @@ impl TableProvider for ProjectRoutingTable {
             self.scan_delta_table(&table, state, projection, &delta_filters, limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref()).await?;
         tag_shape(&|s| s.has_delta = true);
 
-        // Union the legs in recency order — mem, then hot tier, then Delta —
-        // so DedupExec's keep-first favours the freshest copy of a row. The hot
-        // leg already applied the projection (it filters post-projection), so
-        // it carries the projected schema and pushes nothing further.
-        let hot_plan = match hot_partitions.is_empty() {
-            true => None,
-            false => {
-                let hot_schema = match projection {
-                    Some(p) => Arc::new(self.schema.project(p)?),
-                    None => self.schema.clone(),
-                };
-                let hot_out = hot_schema.clone();
-                let source = MemorySourceConfig::try_new(&hot_partitions, hot_schema, None).map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let source = Self::declare_ordering(source, hot_sorted, &self.table_name, &hot_out);
-                let exec = Arc::new(DataSourceExec::new(Arc::new(source)));
-                Some(Arc::new(crate::hot_tier::HotLegPooledExec::new(exec, hot_bytes)) as Arc<dyn ExecutionPlan>)
-            }
-        };
+        // Union the legs in recency order — mem, then hot tier, then Delta — so
+        // DedupExec's keep-first favours the freshest copy of a row. The hot leg
+        // arrives already built (projected, filtered and ordering-declared by
+        // `HotTier::scan`), so there is nothing left to assemble here.
+        //
         // Identity travels WITH the plan, so the flatten cannot desynchronise it
         // from the sortability it implies (see `wrap_result`).
         use crate::read_dedup::LegKind;

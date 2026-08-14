@@ -58,7 +58,6 @@ async fn drained_buckets_are_demoted_and_served() -> anyhow::Result<()> {
     let hot = env.snapshot_stats().hot_tier;
     assert!(hot.read_hits > 0, "the scan must have read the hot tier ({hot:?})");
     assert_eq!(hot.read_misses, 0, "no hot-tier file may read as torn/absent ({hot:?})");
-    assert_eq!(hot.leg_budget_stops, 0, "two rows must not exhaust the per-scan byte budget ({hot:?})");
 
     Ok(())
 }

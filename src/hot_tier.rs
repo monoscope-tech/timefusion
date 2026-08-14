@@ -38,77 +38,33 @@ use std::{
 
 use arrow::{
     array::RecordBatch,
-    buffer::Buffer,
     datatypes::{DataType, SchemaRef, TimeUnit},
 };
-use arrow_ipc::{
-    Block, CompressionType, convert::fb_to_schema, reader::FileDecoder, reader::read_footer_length, root_as_footer, writer::FileWriter, writer::IpcWriteOptions,
-};
+use arrow_ipc::{CompressionType, writer::FileWriter, writer::IpcWriteOptions};
 use dashmap::{DashMap, DashSet};
-use datafusion::{
-    error::Result as DFResult,
-    execution::{
-        TaskContext,
-        memory_pool::{MemoryConsumer, MemoryReservation},
-    },
-    logical_expr::Expr,
-    physical_expr::PhysicalExpr,
-    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream},
-};
+use datafusion::{error::Result as DFResult, logical_expr::Expr, physical_expr::PhysicalExpr, physical_plan::ExecutionPlan};
 use tracing::{debug, info, warn};
 
-use crate::mem_buffer::{TableKey, compile_filter_conjunction, filter_snapshot, overlaps, table_key};
+use crate::mem_buffer::{TableKey, compile_filter_conjunction, overlaps, table_key};
 
-/// Reconcile a demoted file's schema with the table's, tolerating ONLY a
-/// nullability difference: names, order and data types must match exactly.
-/// Returns `None` when they genuinely drift, or when a column the table
-/// declares NOT NULL actually contains nulls (re-stamping there would hand
-/// DataFusion a batch that lies about its own data).
-///
-/// Cheap: metadata-only when the schemas already agree, otherwise one
-/// `null_count()` per tightened column plus a `RecordBatch` rebuild that
-/// re-uses the same `ArrayData` (no row copy).
-fn align_nullability(batches: &[RecordBatch], schema: &SchemaRef) -> Option<Vec<RecordBatch>> {
-    let first = batches.first()?;
-    let have = first.schema();
-    if have.fields() == schema.fields() {
-        return Some(batches.to_vec());
-    }
-    let compatible = have.fields().len() == schema.fields().len()
-        && have.fields().iter().zip(schema.fields()).all(|(h, w)| h.name() == w.name() && h.data_type() == w.data_type());
-    if !compatible {
-        return None;
-    }
-    // Only columns the table tightens need checking; widening is always safe.
-    let tightened: Vec<usize> =
-        schema.fields().iter().enumerate().filter_map(|(i, w)| (!w.is_nullable() && have.field(i).is_nullable()).then_some(i)).collect();
-    batches
-        .iter()
-        .map(|b| tightened.iter().all(|&i| b.column(i).null_count() == 0).then(|| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).ok())?)
-        .collect()
-}
 
 const EXT: &str = "arrow";
 const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
 /// magic + minimal footer + trailer; anything shorter is definitionally torn.
 const MIN_FILE_LEN: usize = 6 + 10;
-/// The tier's three ceilings. Every one of them is an operator knob
-/// (`TIMEFUSION_HOT_TIER_{MAX_DISK_GB,LEG_BUDGET_MB,MEMO_MB}`) because each
-/// bounds a resource this box has already been killed by: the WAL/data volume,
-/// query heap, and pinned mappings.
+/// The tier's only ceiling — an operator knob
+/// (`TIMEFUSION_HOT_TIER_MAX_DISK_GB`) because it bounds the WAL/data volume
+/// this box has already been killed by. Query heap needs no knob of its own
+/// since `HotTier::scan` streams inside the query's memory pool.
 #[derive(Clone, Copy, Debug)]
 pub struct HotTierLimits {
     /// Directory cap; over it GC unlinks oldest-first.
     pub max_disk_bytes: u64,
-    /// Post-filter Arrow bytes ONE scan may materialize from demoted files.
-    pub leg_budget_bytes: u64,
-    /// Bytes of file mappings the decode memo may pin, LRU-evicted.
-    pub memo_bytes: u64,
 }
 
 impl Default for HotTierLimits {
     fn default() -> Self {
-        Self { max_disk_bytes: 64 << 30, leg_budget_bytes: 512 << 20, memo_bytes: 1 << 30 }
+        Self { max_disk_bytes: 64 << 30 }
     }
 }
 
@@ -250,8 +206,11 @@ impl HotBucketMeta {
 /// What the hot tier contributes to one scan.
 #[derive(Debug, Default)]
 pub struct HotLeg {
-    /// One batch partition per served file.
-    pub partitions: Vec<Vec<RecordBatch>>,
+    /// The leg's scan — projected, filtered, and streamed from disk at execute
+    /// time. `None` when the tier contributes nothing. The plan carries its own
+    /// ordering claim, so that claim cannot desynchronise from the rows it
+    /// describes (the lesson `wrap_result` records for leg identity).
+    pub plan: Option<Arc<dyn ExecutionPlan>>,
     /// Windows the served files are authoritative for; the caller excludes them
     /// from the Delta leg.
     pub ranges: Vec<(i64, i64)>,
@@ -264,86 +223,25 @@ pub struct HotLeg {
     /// in an excluded window can be newer than the file that owns it and the
     /// exclusion stands unweakened.
     pub version_gate: Option<i64>,
-    /// Every served partition is ordered by the table's declared
-    /// `sorting_columns`, so the caller may declare that ordering on the
-    /// `MemorySourceConfig`. True exactly when the table declares sorting
-    /// columns: `write_bucket` sorts every file it writes and refuses to write
-    /// one it could not sort, and projection/filtering preserve row order.
-    pub sorted: bool,
-    /// Post-filter bytes the served partitions hold — the heap this leg keeps
-    /// alive for the life of the plan. `HotLegPooledExec` charges exactly this
-    /// to the query's memory pool.
-    pub bytes: u64,
 }
 
 impl HotLeg {
     pub fn is_empty(&self) -> bool {
-        self.partitions.is_empty() && self.ranges.is_empty()
-    }
-}
-
-/// Charges the hot leg's materialized bytes to the query's memory pool.
-///
-/// The leg is built eagerly at plan time (`read_leg`) into plain
-/// `RecordBatch`es that live until the plan drops, invisible to every
-/// DataFusion pool — N concurrent scans could otherwise stack N ×
-/// `leg_budget_bytes` of unaccounted heap. The first `execute` call reserves
-/// the leg's post-filter size from the query pool; the reservation is held by
-/// the plan node itself, so it frees exactly when the batches do. The charge
-/// happens at execute rather than plan time only because planning has no pool
-/// in scope — the allocation it accounts for already exists either way, so a
-/// failed `try_grow` fails the query (the sound direction: the leg's ranges
-/// were already excluded from the Delta leg, serving without it would drop
-/// windows).
-#[derive(Debug)]
-pub struct HotLegPooledExec {
-    inner: Arc<dyn ExecutionPlan>,
-    bytes: u64,
-    reservation: std::sync::Mutex<Option<MemoryReservation>>,
-}
-
-impl HotLegPooledExec {
-    pub fn new(inner: Arc<dyn ExecutionPlan>, bytes: u64) -> Self {
-        Self { inner, bytes, reservation: std::sync::Mutex::new(None) }
-    }
-}
-
-impl DisplayAs for HotLegPooledExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "HotLegPooledExec: bytes={}", self.bytes)
-    }
-}
-
-impl ExecutionPlan for HotLegPooledExec {
-    fn name(&self) -> &'static str {
-        "HotLegPooledExec"
+        self.plan.is_none() && self.ranges.is_empty()
     }
 
-    fn properties(&self) -> &Arc<PlanProperties> {
-        self.inner.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.inner]
-    }
-
-    fn with_new_children(self: Arc<Self>, mut children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children.swap_remove(0), self.bytes)))
-    }
-
-    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        let mut guard = self.reservation.lock().unwrap();
-        if guard.is_none() {
-            let r = MemoryConsumer::new("HotTierLeg").register(context.memory_pool());
-            r.try_grow(self.bytes as usize)?;
-            *guard = Some(r);
-        }
-        drop(guard);
-        self.inner.execute(partition, context)
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<datafusion::common::Statistics>> {
-        self.inner.partition_statistics(partition)
+    /// Run the leg and collect its rows. Only for callers that genuinely need
+    /// BATCHES rather than a plan — the count-pushdown overlay, which merges hot
+    /// rows into a cached winner set. The query path must use `plan` and let
+    /// DataFusion stream it. A failure yields no rows, which for that overlay
+    /// means falling back to the Delta base: slower, never wrong.
+    pub async fn collect(&self) -> Vec<RecordBatch> {
+        let Some(plan) = self.plan.clone() else { return Vec::new() };
+        let ctx = datafusion::prelude::SessionContext::new();
+        datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap_or_else(|e| {
+            warn!("hot leg could not be collected ({e}); the overlay falls back to the Delta base");
+            Vec::new()
+        })
     }
 }
 
@@ -363,10 +261,6 @@ pub struct HotTierStats {
     /// expected — a drifted file contributes zero rows while the tier still
     /// looks healthy).
     pub mem_skipped: u64,
-    /// Files whose rows were ALL filtered out. They must contribute no
-    /// exclusion either; nonzero means windows are falling through to Delta
-    /// (correct) rather than vanishing (the 2026-08-07 hole shape).
-    pub empty_after_filter: u64,
     /// Windows served WITHOUT claiming a Delta exclusion because coverage was
     /// not proven. These are the reads that would previously have lost rows.
     pub unproven_windows: u64,
@@ -385,30 +279,11 @@ pub struct HotTierStats {
     /// times that verdict has been reached.
     pub suppressed_tables: usize,
     pub suppressions: u64,
-    /// Decode memo: entries and the mapping bytes they pin (bounded by
-    /// `HotTierLimits::memo_bytes`), plus LRU evictions. Sustained eviction
-    /// means the working set exceeds the memo — a re-decode per scan, not a
-    /// correctness problem.
-    pub memo_files: usize,
-    pub memo_bytes: u64,
-    pub memo_evicted: u64,
-    /// Scans that hit `HotTierLimits::leg_budget_bytes` and stopped adding hot
-    /// files. Non-zero means those windows were served from Delta instead;
-    /// sustained non-zero means the budget is the effective tier size.
-    pub leg_budget_stops: u64,
     /// The suppressed tables and their remaining cooldown in seconds, capped at
     /// [`MAX_SUPPRESSED_ROWS`].
     pub suppressed: Vec<(TableKey, i64)>,
 }
 
-/// One memoized decode: the batches, the mapping bytes it pins, and its LRU
-/// stamp (a monotonic counter, not a clock — cheaper and monotone under test
-/// time control).
-struct MemoEntry {
-    batches: Arc<Vec<RecordBatch>>,
-    bytes: u64,
-    used: AtomicU64,
-}
 
 #[derive(Default)]
 pub struct HotTier {
@@ -421,22 +296,9 @@ pub struct HotTier {
     /// own several files: late arrivals into an already-drained bucket flush
     /// again and demote a second, disjoint row set.
     index: DashMap<TableKey, BTreeMap<(i64, u64), HotBucketMeta>>,
-    /// Decoded batches, memoized per file. Files are immutable and the batches
-    /// are zero-copy views over the mmap, so an entry costs `ArrayData` structs
-    /// plus the mapping — not row data. Dropped when the file is, when
-    /// `limits.memo_bytes` is exceeded (LRU), or on `rescan`.
-    decoded: DashMap<PathBuf, MemoEntry>,
-    /// Files successfully served since boot. Projection-specific decodes are
-    /// intentionally not in `decoded`, so memo presence is no longer a sound
-    /// proxy for whether demotion paid off before DML invalidated a file.
+    /// Files served to a scan since boot — the signal for whether demotion paid
+    /// off before DML invalidated a file.
     read_files: DashSet<PathBuf>,
-    /// Bytes of mapping currently pinned by `decoded`, and the LRU stamp
-    /// source. `memo_bytes` is only ever mutated through `memo_insert` /
-    /// `memo_forget`, which is what keeps it in step with the map.
-    memo_bytes: AtomicU64,
-    memo_clock: AtomicU64,
-    memo_evicted: AtomicU64,
-    leg_budget_stops: AtomicU64,
     health: DashMap<TableKey, Arc<DemotionHealth>>,
     seq: AtomicU64,
     suppressions: AtomicU64,
@@ -445,7 +307,6 @@ pub struct HotTier {
     read_hits: AtomicU64,
     read_misses: AtomicU64,
     mem_skipped: AtomicU64,
-    empty_after_filter: AtomicU64,
     unproven_windows: AtomicU64,
     schema_drift: AtomicU64,
     gc_deleted: AtomicU64,
@@ -732,244 +593,117 @@ impl HotTier {
     /// pass-through (raw == committed), and with `dedup_keys` a non-empty hot
     /// leg forces `ProjectRoutingTable::scan` down the union path, which never
     /// sets `skip_dedup` — the two branches that do are guarded on
-    /// `hot_partitions.is_empty() && hot_ranges.is_empty()`. Granting
-    /// `skip_dedup` on a plan carrying a hot leg would break this.
+    /// `HotLeg::is_empty`. Granting `skip_dedup` on a plan carrying a hot leg
+    /// would break this.
+    ///
+    /// The leg as a PLAN rather than as decoded rows: DataFusion's own
+    /// `ArrowSource` streams each file at EXECUTE time, a batch at a time,
+    /// inside the query's memory pool.
+    ///
+    /// This replaces the eager walk (`read_leg`), which decoded every file
+    /// while PLANNING. Prod 2026-08-14 measured `hot_plan_us_avg` at **954 ms**
+    /// on 98% of scans — serial across files, overlapping nothing, outside every
+    /// memory pool, with `leg_budget_bytes` silently truncating wide legs back
+    /// to R2 (`leg_budget_stops_total` 35). Streaming removes all four at once:
+    /// decode overlaps execution, file groups run in parallel, batches are
+    /// pooled and spillable, and there is no admission bound left to truncate.
+    ///
+    /// Any failure builds NO leg at all rather than a partial one: `ranges`
+    /// excludes windows from Delta on the promise that this leg serves them, so
+    /// half a leg is worse than none. Returning empty falls the whole window
+    /// through to Delta — slower, never wrong.
     #[allow(clippy::too_many_arguments)]
-    pub async fn query_partitioned(
-        self: &Arc<Self>, project_id: &str, table_name: &str, query_range: Option<(i64, i64)>, mem_ranges: &[(i64, i64)], filters: &[Expr], schema: &SchemaRef,
-        projection: Option<&Vec<usize>>,
+    pub fn scan(
+        self: &Arc<Self>, project_id: &str, table_name: &str, query_range: Option<(i64, i64)>, mem_ranges: &[(i64, i64)], filters: &[Expr],
+        schema: &SchemaRef, projection: Option<&Vec<usize>>,
     ) -> HotLeg {
         let metas = self.buckets_in_range(project_id, table_name, query_range);
         if metas.is_empty() {
-            return Default::default();
+            return HotLeg::default();
         }
         let declared = crate::schema_loader::get_schema(table_name);
         let versioned = declared.as_ref().is_some_and(|s| s.version_append);
         let orders = declared.is_some_and(|s| !s.sorting_columns.is_empty());
-        let (tier, mem_ranges, filters, schema, projection) = (self.clone(), mem_ranges.to_vec(), filters.to_vec(), schema.clone(), projection.cloned());
-        // open + mmap + decode + page faults are blocking syscalls; a planner
-        // future must not run them on its async worker.
-        tokio::task::spawn_blocking(move || tier.read_leg(&metas, &mem_ranges, &filters, &schema, projection.as_deref(), versioned, orders))
-            .await
-            .unwrap_or_default()
+        let plan = plan_leg(&metas, mem_ranges, versioned, orders, &footer_is_readable);
+        self.mem_skipped.fetch_add((metas.len() - plan.served.len()) as u64, Relaxed);
+        if plan.served.is_empty() {
+            return HotLeg::default();
+        }
+        match self.leg_exec(&metas, &plan, filters, schema, projection, table_name) {
+            Ok(exec) => {
+                self.read_hits.fetch_add(plan.served.len() as u64, Relaxed);
+                for &i in &plan.served {
+                    self.read_files.insert(metas[i].path.clone());
+                }
+                self.unproven_windows.fetch_add((plan.served.len() - plan.ranges.len()) as u64, Relaxed);
+                HotLeg { plan: Some(exec), ranges: plan.ranges, version_gate: plan.version_gate }
+            }
+            Err(e) => {
+                self.read_misses.fetch_add(1, Relaxed);
+                warn!("hot leg for {project_id}/{table_name} could not be planned ({e}); the whole window falls through to Delta");
+                HotLeg::default()
+            }
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn read_leg(
-        &self, metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], filters: &[Expr], schema: &SchemaRef, projection: Option<&[usize]>, versioned: bool,
-        orders: bool,
-    ) -> HotLeg {
-        let cols = plan_columns(projection, filters, schema);
-        let filter_schema = cols.as_ref().map_or_else(|| schema.clone(), |c| c.schema.clone());
-        let pred = compile_filter_conjunction(filters, &filter_schema).ok().flatten();
-        // Imperative: `used` is a running total whose overflow must stop the
-        // walk, and each step is a counted/logged side effect.
-        // `sorted` is an AND across the files actually SERVED: projection and
-        // filtering preserve row order, so a leg of sorted files is sorted, but
-        // one unmarked file (older binary, unsortable batches) retracts the
-        // claim for all of them — `try_with_sort_information` declares one
-        // ordering for the whole source.
-        // A bucket demoted more than once has several files, each holding part
-        // of the span while `min_ts..end_ts` spans it — so no single one may
-        // claim the window even if its own drain was complete.
-        let mut files_per_bucket: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-        for m in metas {
-            *files_per_bucket.entry(m.bucket_id).or_default() += 1;
-        }
-        let (mut partitions, mut ranges, mut used, mut gate, mut sorted) = (Vec::new(), Vec::new(), 0u64, None::<i64>, orders);
-        for meta in metas {
-            let Some(filtered) = self.materialize(meta, mem_ranges, cols.as_ref(), &pred, schema) else { continue };
-            // The hot leg is materialized at PLAN time into a
-            // `MemorySourceConfig` — no `GatedScanExec`, no spill, and the
-            // query pool only learns of it at execute time via
-            // `HotLegPooledExec`. `limits.leg_budget_bytes` is therefore what
-            // bounds ONE scan's materialization, charged on the post-filter
-            // bytes actually retained (`filter_record_batch` heap-copies, so
-            // these are real allocations, unlike the zero-copy decode they
-            // came from).
-            //
-            // Range and partition are pushed TOGETHER, after the check: a file
-            // whose rows we refuse to hold must also not be excluded from the
-            // Delta leg, or its window is served by nobody.
-            // Contributing NOTHING must also mean excluding nothing. `ranges`
-            // excludes a whole TIME WINDOW from the Delta leg, but a file only
-            // ever vouches for the rows it actually hands over; when the
-            // predicate retains none, the exclusion would still hide every Delta
-            // row in that window and the leg would serve no replacement — the
-            // window is then served by nobody. Skipping is safe in the other
-            // direction: the same predicate filters the Delta copy identically,
-            // so falling through cannot duplicate rows.
-            if filtered.is_empty() {
-                self.empty_after_filter.fetch_add(1, Relaxed);
-                continue;
-            }
-            let bytes: u64 = filtered.iter().map(|b| b.get_array_memory_size() as u64).sum();
-            if used + bytes > self.limits.leg_budget_bytes {
-                self.leg_budget_stops.fetch_add(1, Relaxed);
-                debug!("hot leg stopped at {used} bytes (budget {}); {:?} and older windows fall through to Delta", self.limits.leg_budget_bytes, meta.path);
-                break;
-            }
-            used += bytes;
-            sorted &= meta.sorted;
-            // Serve the rows either way; only the EXCLUSION needs proof. An
-            // unproven window is read from both legs and DedupExec collapses
-            // the overlap — slower, never wrong.
-            if meta.covers_window && files_per_bucket.get(&meta.bucket_id) == Some(&1) {
-                ranges.push(meta.range());
-            } else {
-                self.unproven_windows.fetch_add(1, Relaxed);
-            }
-            // The gate travels with the range it guards: a file that cannot
-            // vouch for a stamp (`None`) drops it to `i64::MIN`, which admits
-            // every stamped Delta row in the excluded windows — the safe
-            // direction, since an over-admitted row is a duplicate `DedupExec`
-            // collapses while an under-admitted one is a stale read.
-            if versioned {
-                gate = Some(gate.unwrap_or(i64::MAX).min(meta.max_stamp.unwrap_or(i64::MIN)));
-            }
-            partitions.push(filtered);
-        }
-        HotLeg { partitions, ranges, version_gate: gate, sorted, bytes: used }
-    }
-
-    /// One file's contribution to the leg, projected and filtered. `None` =
-    /// unusable, which by the coverage contract means NO rows AND no exclusion
-    /// range, so that window falls through to Delta intact.
-    fn materialize(
-        &self, meta: &HotBucketMeta, mem_ranges: &[(i64, i64)], cols: Option<&LegColumns>, pred: &Option<Arc<dyn PhysicalExpr>>, schema: &SchemaRef,
-    ) -> Option<Vec<RecordBatch>> {
-        if mem_ranges.iter().any(|r| overlaps(meta.range(), *r)) {
-            self.mem_skipped.fetch_add(1, Relaxed);
-            return None;
-        }
-        // Decode only the columns this query needs. Projecting an already-
-        // decoded full batch is too late: Arrow IPC decoding touches every
-        // column buffer first, page-faulting tens of GB from the mmap for a
-        // four-column count query. Projection at the decoder keeps the unused
-        // body/attribute buffers cold.
-        let batches = match cols {
-            Some(c) => self.read_file_projected(&meta.path, &c.needed)?,
-            None => self.read_file(&meta.path)?,
+    /// Build the leg's physical plan: scan → filter → cut predicate-only
+    /// columns. The scan carries the projection, so unused column buffers are
+    /// never decoded at all.
+    fn leg_exec(
+        &self, metas: &[HotBucketMeta], plan: &LegPlan, filters: &[Expr], schema: &SchemaRef, projection: Option<&Vec<usize>>, table_name: &str,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::{
+            datasource::physical_plan::ArrowSource,
+            error::DataFusionError,
+            execution::object_store::ObjectStoreUrl,
+            physical_expr::expressions::Column as PhysicalColumn,
+            physical_plan::{filter::FilterExec, projection::ProjectionExec},
         };
-        // A file that decodes to NOTHING would pass the schema check below
-        // (`first()` is None), report its range and contribute no rows — the one
-        // shape that silently excludes a window from Delta and serves it from
-        // nowhere. `demote` rejects all-empty input so this is unreachable
-        // today; the coverage contract must not depend on that.
-        if batches.is_empty() {
-            self.read_misses.fetch_add(1, Relaxed);
-            return None;
+        use datafusion_datasource::{PartitionedFile, file_groups::FileGroup, file_scan_config::FileScanConfigBuilder, source::DataSourceExec};
+        let cols = plan_columns(projection.map(|p| p.as_slice()), filters, schema);
+        let out_schema = cols.as_ref().map_or_else(|| schema.clone(), |c| c.schema.clone());
+        // One file per group => one partition per file, so files decode in
+        // parallel. DataFusion may split a group further by record-batch block
+        // offset (`ArrowSource::repartitioned`), giving parallelism WITHIN a
+        // file too — something the eager walk could never do.
+        let groups = plan
+            .served
+            .iter()
+            .map(|&i| {
+                let m = &metas[i];
+                let path = object_store::path::Path::from_absolute_path(&m.path).map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(FileGroup::new(vec![PartitionedFile::new(path.as_ref().to_string(), m.bytes)]))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        let mut cfg = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(ArrowSource::new_file_source(schema.clone())))
+            .with_file_groups(groups)
+            .with_projection_indices(cols.as_ref().map(|c| c.needed.clone()))?;
+        // The ordering is declared against the leg's own output schema, and only
+        // when every served file attested to it (`LegPlan::sorted`).
+        if let Some(ordering) = crate::database::table_ordering(table_name, &out_schema, plan.sorted) {
+            cfg = cfg.with_output_ordering(vec![ordering]);
         }
-        // One schema per IPC file by construction, so one compare per file.
-        // Drift (a column added since the demotion) breaks the
-        // `MemorySourceConfig` contract — treat the file as absent.
-        //
-        // Nullability alone is NOT drift. Prod 2026-07-31: demoted batches
-        // carried `timestamp` nullable while the table declares it NOT NULL, so
-        // strict field equality rejected 100% of reads — the tier served zero
-        // rows while files/bytes/writes all looked healthy (caught only by
-        // `schema_drift_total` == `read_hits_total`). Re-stamp instead, once the
-        // data proves it satisfies the stricter schema.
-        //
-        // The root cause was upstream — MemBuffer pinned whatever nullability
-        // the first batch to arrive happened to carry — and is fixed at the
-        // source in `mem_buffer::align_nullability`. This stays as tolerance for
-        // files demoted by an older binary.
-        let expected_schema = cols.map_or_else(|| schema.clone(), |c| c.schema.clone());
-        let Some(batches) = align_nullability(batches.as_ref(), &expected_schema) else {
-            self.schema_drift.fetch_add(1, Relaxed);
-            return None;
+        let exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(cfg.build());
+        // Same predicate the eager path applied post-decode — now a plan node,
+        // so it runs per batch and can terminate a scan early.
+        let exec = match compile_filter_conjunction(filters, &out_schema).ok().flatten() {
+            Some(pred) => Arc::new(FilterExec::try_new(pred, exec)?) as Arc<dyn ExecutionPlan>,
+            None => exec,
         };
-        let filtered = filter_snapshot(batches, pred);
         // Cut the predicate-only columns back off (positions are `0..n` by
-        // construction in `plan_columns`, so this cannot fail).
-        Some(match cols.and_then(|c| c.output.as_ref()) {
-            Some(out) => filtered.iter().flat_map(|b| b.project(out)).collect(),
-            None => filtered,
-        })
-    }
-
-    /// Zero-copy read of one demoted file, memoized. `None` = treat as absent
-    /// (torn, unlinked under us, or written by something that isn't us) — the
-    /// caller must then let the Delta leg serve that window.
-    pub fn read_file(&self, path: &Path) -> Option<Arc<Vec<RecordBatch>>> {
-        if let Some(hit) = self.decoded.get(path) {
-            hit.used.store(self.memo_clock.fetch_add(1, Relaxed), Relaxed);
-            self.read_hits.fetch_add(1, Relaxed);
-            self.read_files.insert(path.to_path_buf());
-            return Some(hit.batches.clone());
-        }
-        match decode_file(path, false, None) {
-            Ok(batches) => {
-                self.read_hits.fetch_add(1, Relaxed);
-                self.read_files.insert(path.to_path_buf());
-                let batches = Arc::new(batches);
-                self.memo_insert(path, batches.clone());
-                Some(batches)
+        // construction in `plan_columns`).
+        match cols.as_ref().and_then(|c| c.output.as_ref()) {
+            Some(out) => {
+                let exprs = out
+                    .iter()
+                    .map(|&i| {
+                        let f = out_schema.field(i);
+                        (Arc::new(PhysicalColumn::new(f.name(), i)) as Arc<dyn PhysicalExpr>, f.name().clone())
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Arc::new(ProjectionExec::try_new(exprs, exec)?))
             }
-            Err(e) => {
-                self.read_misses.fetch_add(1, Relaxed);
-                debug!("hot tier file {path:?} unreadable, falling through to Delta: {e:#}");
-                None
-            }
-        }
-    }
-
-    /// Projection-aware IPC decode for query legs. Projection-specific batches
-    /// are deliberately not stored in the full-file memo: mixing projections
-    /// under a path-only key is incorrect, while decoding the narrow mmap view
-    /// is cheap and avoids faulting unused column pages into memory.
-    fn read_file_projected(&self, path: &Path, projection: &[usize]) -> Option<Arc<Vec<RecordBatch>>> {
-        match decode_file(path, false, Some(projection)) {
-            Ok(batches) => {
-                self.read_hits.fetch_add(1, Relaxed);
-                self.read_files.insert(path.to_path_buf());
-                Some(Arc::new(batches))
-            }
-            Err(e) => {
-                self.read_misses.fetch_add(1, Relaxed);
-                debug!("hot tier file {path:?} projected decode failed, falling through to Delta: {e:#}");
-                None
-            }
-        }
-    }
-
-    /// Memoize one full-schema decode and enforce the memo's byte ceiling.
-    /// Charge the larger of file bytes and decoded Arrow bytes: legacy files
-    /// are zero-copy mmap views (file size dominates), while compressed files
-    /// own decompressed buffers (Arrow size dominates). Under-counting the
-    /// latter would turn LZ4's disk win into invisible heap growth.
-    fn memo_insert(&self, path: &Path, batches: Arc<Vec<RecordBatch>>) {
-        let Ok(file_bytes) = fs::metadata(path).map(|m| m.len()) else { return };
-        let decoded_bytes = batches.iter().map(|b| b.get_array_memory_size() as u64).sum();
-        let bytes = file_bytes.max(decoded_bytes);
-        let used = AtomicU64::new(self.memo_clock.fetch_add(1, Relaxed));
-        if let Some(old) = self.decoded.insert(path.to_path_buf(), MemoEntry { batches, bytes, used }) {
-            self.memo_bytes.fetch_sub(old.bytes, Relaxed);
-        }
-        self.memo_bytes.fetch_add(bytes, Relaxed);
-        // The entry just inserted carries the newest stamp, so it is evicted
-        // last — a memo smaller than one file degrades to "no memo", never to
-        // an evict-what-we-just-read spin.
-        while self.memo_bytes.load(Relaxed) > self.limits.memo_bytes {
-            let Some(lru) = self.decoded.iter().min_by_key(|e| e.used.load(Relaxed)).map(|e| e.key().clone()) else { break };
-            if self.memo_forget(&lru) {
-                self.memo_evicted.fetch_add(1, Relaxed);
-            } else {
-                break; // raced with another evictor; it owns the accounting
-            }
-        }
-    }
-
-    /// Drop one memo entry, returning whether THIS call removed it (the caller
-    /// counts evictions, and only the remover may charge the bytes back).
-    fn memo_forget(&self, path: &Path) -> bool {
-        match self.decoded.remove(path) {
-            Some((_, e)) => {
-                self.memo_bytes.fetch_sub(e.bytes, Relaxed);
-                true
-            }
-            None => false,
+            None => Ok(exec),
         }
     }
 
@@ -1039,7 +773,6 @@ impl HotTier {
     /// queries are unaffected.
     fn unlink(&self, paths: &[PathBuf]) {
         for p in paths {
-            self.memo_forget(p);
             self.read_files.remove(p);
             let _ = fs::remove_file(p);
         }
@@ -1050,9 +783,7 @@ impl HotTier {
     /// else is left strictly alone.
     pub fn rescan(&self) {
         self.index.clear();
-        self.decoded.clear();
         self.read_files.clear();
-        self.memo_bytes.store(0, Relaxed);
         let files = dir_entries(&self.root)
             .filter_map(named)
             .flat_map(|(pid, dir)| dir_entries(dir).filter_map(named).map(move |(tname, dir)| ((pid.clone(), tname), dir)))
@@ -1134,10 +865,6 @@ impl HotTier {
             suppressed_tables,
             suppressed,
             suppressions: self.suppressions.load(Relaxed),
-            memo_files: self.decoded.len(),
-            memo_bytes: self.memo_bytes.load(Relaxed),
-            memo_evicted: self.memo_evicted.load(Relaxed),
-            leg_budget_stops: self.leg_budget_stops.load(Relaxed),
             tables: self.index.len(),
             files,
             bytes,
@@ -1146,7 +873,6 @@ impl HotTier {
             read_hits: self.read_hits.load(Relaxed),
             read_misses: self.read_misses.load(Relaxed),
             mem_skipped: self.mem_skipped.load(Relaxed),
-            empty_after_filter: self.empty_after_filter.load(Relaxed),
             unproven_windows: self.unproven_windows.load(Relaxed),
             schema_drift: self.schema_drift.load(Relaxed),
             gc_deleted: self.gc_deleted.load(Relaxed),
@@ -1186,6 +912,48 @@ fn plan_columns(projection: Option<&[usize]>, filters: &[Expr], schema: &SchemaR
     Some(LegColumns { needed, schema, output })
 }
 
+/// Cheap plan-time validation: the file opens, carries both ARROW1 magics, a
+/// parseable footer, and at least one record batch. Reads only the tail — not
+/// one batch is decoded.
+///
+/// This is what keeps the module's "a torn or unreadable file is ABSENT, never
+/// a query failure" promise now that decoding happens at execute time. A file
+/// rejected here loses its rows AND its exclusion together, so its window falls
+/// through to Delta intact. Left to `ArrowSource`, that same file would instead
+/// fail the query mid-execution with its window ALREADY excluded — the one
+/// shape that turns a cache miss into an outage.
+///
+/// Zero record batches counts as unusable for the same reason: a file serving
+/// no rows must not exclude a window that Delta could serve.
+fn footer_is_readable(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    use arrow_ipc::{root_as_footer, reader::read_footer_length};
+    (|| -> anyhow::Result<bool> {
+        let mut f = fs::File::open(path)?;
+        let len = f.metadata()?.len();
+        anyhow::ensure!(len >= MIN_FILE_LEN as u64, "shorter than an empty IPC file");
+        let mut magic = [0u8; 6];
+        f.read_exact(&mut magic)?;
+        anyhow::ensure!(&magic == ARROW_MAGIC, "missing leading ARROW1");
+        let mut trailer = [0u8; 10];
+        f.seek(SeekFrom::End(-10))?;
+        f.read_exact(&mut trailer)?;
+        anyhow::ensure!(&trailer[4..] == ARROW_MAGIC, "missing trailing ARROW1");
+        let footer_len = read_footer_length(trailer)?;
+        anyhow::ensure!(footer_len as u64 + 10 <= len, "footer length exceeds file");
+        let mut buf = vec![0u8; footer_len];
+        f.seek(SeekFrom::End(-10 - footer_len as i64))?;
+        f.read_exact(&mut buf)?;
+        let footer = root_as_footer(&buf).map_err(|e| anyhow::anyhow!("unparseable IPC footer: {e}"))?;
+        Ok(footer.recordBatches().is_some_and(|b| !b.is_empty()))
+    })()
+    .unwrap_or_else(|e| {
+        debug!("hot tier file {path:?} unusable at plan time, falling through to Delta: {e:#}");
+        false
+    })
+}
+
 /// Everything a leg may CLAIM about a set of files, derived from METADATA
 /// ALONE — not one batch is decoded. `read_leg` recomputes the same claims
 /// while materializing; this is the form a lazy (`ArrowSource`) leg needs,
@@ -1223,7 +991,7 @@ pub(crate) struct LegPlan {
 
 /// `orders` = the table declares sorting columns; `versioned` = it appends
 /// versions. Both come from the declared schema, not from the files.
-pub(crate) fn plan_leg(metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], versioned: bool, orders: bool) -> LegPlan {
+pub(crate) fn plan_leg(metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], versioned: bool, orders: bool, usable: &dyn Fn(&Path) -> bool) -> LegPlan {
     // Counted over ALL metas, not just served ones: a bucket demoted more than
     // once has several files each holding PART of the span while `min_ts..
     // end_ts` spans it, so no single one may claim the window. A sibling that
@@ -1236,9 +1004,10 @@ pub(crate) fn plan_leg(metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], versi
     metas
         .iter()
         .enumerate()
-        // A file MemBuffer still owns is skipped whole — no rows and no
-        // exclusion, so the window stays with the tier holding the fresher copy.
-        .filter(|(_, m)| !mem_ranges.iter().any(|r| overlaps(m.range(), *r)))
+        // A file MemBuffer still owns, or one that will not read, is skipped
+        // whole — no rows and no exclusion, so the window stays with the tier
+        // that can actually serve it.
+        .filter(|(_, m)| !mem_ranges.iter().any(|r| overlaps(m.range(), *r)) && usable(&m.path))
         .fold(LegPlan { sorted: orders, ..Default::default() }, |mut plan, (i, m)| {
             plan.served.push(i);
             // One unmarked file retracts the claim for the whole leg:
@@ -1261,7 +1030,11 @@ pub(crate) fn plan_leg(metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], versi
 /// turns a silent realigning COPY into an error — production reads leave it
 /// off (correctness over strictness), tests turn it on to prove the
 /// zero-copy assumption actually holds for files we write.
+#[cfg(test)]
 fn decode_file(path: &Path, require_alignment: bool, projection: Option<&[usize]>) -> anyhow::Result<Vec<RecordBatch>> {
+    use arrow::buffer::Buffer;
+    use arrow_ipc::{Block, convert::fb_to_schema, reader::FileDecoder, reader::read_footer_length, root_as_footer};
+
     let file = fs::File::open(path)?;
     // SAFETY: hot-tier files are immutable once renamed into place — we never
     // rewrite one, and GC only unlinks (the mapping survives the unlink), so
@@ -1315,7 +1088,16 @@ mod tests {
     }
 
     fn limits(max_disk_bytes: u64) -> HotTierLimits {
-        HotTierLimits { max_disk_bytes, leg_budget_bytes: u64::MAX, memo_bytes: u64::MAX }
+        HotTierLimits { max_disk_bytes }
+    }
+
+    /// Run a leg's plan the way a query does. Tests assert on ROWS SERVED, not
+    /// on batches a plan-time decode happened to materialize — the whole point
+    /// of the streaming leg is that nothing is decoded until this runs.
+    async fn served(leg: &HotLeg) -> Vec<RecordBatch> {
+        let Some(plan) = leg.plan.clone() else { return Vec::new() };
+        let ctx = datafusion::prelude::SessionContext::new();
+        datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap()
     }
 
     fn open(dir: &tempfile::TempDir) -> Arc<HotTier> {
@@ -1327,27 +1109,25 @@ mod tests {
     /// field-equality check discarded 100% of reads — `schema_drift_total`
     /// tracked `read_hits_total` exactly (75/75) while files/bytes/writes all
     /// looked healthy, so the tier burned disk and RAM serving zero rows.
-    /// Nullability alone must NOT count as drift.
-    #[test]
-    fn nullability_difference_is_not_drift_but_real_nulls_are() {
+    ///
+    /// Pinned here at the level it now manifests: the streaming leg has no
+    /// post-decode re-stamp to get right, so what must hold is simply that a
+    /// nullability-widened file still SERVES ITS ROWS under the strict table
+    /// schema. (The root cause is fixed upstream in
+    /// `mem_buffer::align_nullability`; this is tolerance for files written by
+    /// an older binary.)
+    #[tokio::test]
+    async fn nullability_widened_file_still_serves_its_rows() {
         let nullable = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true), Field::new("name", DataType::Utf8, false)]));
-        let strict = schema(); // ts NOT NULL
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        let b = RecordBatch::try_new(nullable, vec![Arc::new(Int64Array::from(vec![1i64, 2])), Arc::new(StringArray::from(vec!["a", "b"]))]).unwrap();
+        tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[b], min_ts: 1, max_ts: 2, covers_window: true });
 
-        // Widened-on-disk, no actual nulls => re-stamped to the strict schema.
-        let b = RecordBatch::try_new(nullable.clone(), vec![Arc::new(Int64Array::from(vec![1i64, 2])), Arc::new(StringArray::from(vec!["a", "b"]))]).unwrap();
-        let out = align_nullability(&[b], &strict).expect("nullability alone is not drift");
-        assert_eq!(out[0].schema().fields(), strict.fields(), "batch is re-stamped to the table schema");
-        assert_eq!(out[0].num_rows(), 2, "no rows lost");
-
-        // A real NULL in a NOT NULL column must still be rejected — re-stamping
-        // there would hand DataFusion a batch that lies about its own data.
-        let with_null =
-            RecordBatch::try_new(nullable, vec![Arc::new(Int64Array::from(vec![Some(1i64), None])), Arc::new(StringArray::from(vec!["a", "b"]))]).unwrap();
-        assert!(align_nullability(&[with_null], &strict).is_none(), "a genuine null in a NOT NULL column is drift");
-
-        // A genuinely different column set is still drift.
-        let other = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
-        assert!(align_nullability(&[batch(2)], &other).is_none(), "column-count drift still rejected");
+        // Scanned with the STRICT table schema, as a query would.
+        let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 2, "nullability alone must not cost the tier its rows");
+        assert_eq!(leg.ranges, vec![(1, 3)]);
     }
 
     /// New hot files are buffer-compressed and remain lossless. Repetitive
@@ -1383,29 +1163,29 @@ mod tests {
     #[test]
     fn plan_leg_derives_every_claim_from_metadata_alone() {
         let full = vec![meta(1, 0, 10, true, true, Some(7)), meta(2, 20, 30, true, true, Some(9))];
-        let p = plan_leg(&full, &[], true, true);
+        let p = plan_leg(&full, &[], true, true, &|_| true);
         assert_eq!(p, LegPlan { served: vec![0, 1], ranges: vec![(0, 10), (20, 30)], version_gate: Some(7), sorted: true }, "baseline claims everything");
 
         // A table that declares no sorting columns cannot claim an ordering
         // however its files are marked; one unsorted file retracts the claim
         // for the whole leg, because the source declares ONE ordering.
-        assert!(!plan_leg(&full, &[], true, false).sorted, "no declared sorting columns => no claim");
+        assert!(!plan_leg(&full, &[], true, false, &|_| true).sorted, "no declared sorting columns => no claim");
         let mixed = vec![full[0].clone(), meta(2, 20, 30, true, false, Some(9))];
-        assert!(!plan_leg(&mixed, &[], true, true).sorted, "one unsorted file retracts the leg's ordering");
-        assert_eq!(plan_leg(&mixed, &[], true, true).ranges, p.ranges, "...but it still serves and still excludes");
+        assert!(!plan_leg(&mixed, &[], true, true, &|_| true).sorted, "one unsorted file retracts the leg's ordering");
+        assert_eq!(plan_leg(&mixed, &[], true, true, &|_| true).ranges, p.ranges, "...but it still serves and still excludes");
 
         // The gate is the MIN over served files, and an unknown stamp drops it
         // to i64::MIN — admitting every stamped Delta row, never hiding one.
-        assert_eq!(plan_leg(&full, &[], false, true).version_gate, None, "a table that appends no versions needs no gate");
+        assert_eq!(plan_leg(&full, &[], false, true, &|_| true).version_gate, None, "a table that appends no versions needs no gate");
         let unstamped = vec![full[0].clone(), meta(2, 20, 30, true, true, None)];
-        assert_eq!(plan_leg(&unstamped, &[], true, true).version_gate, Some(i64::MIN), "an unknown stamp admits everything");
+        assert_eq!(plan_leg(&unstamped, &[], true, true, &|_| true).version_gate, Some(i64::MIN), "an unknown stamp admits everything");
 
         // `covers_window` is necessary but not sufficient: a bucket demoted
         // more than once holds only PART of its span in each file.
         let partial = vec![meta(1, 0, 10, false, true, Some(7)), full[1].clone()];
-        assert_eq!(plan_leg(&partial, &[], true, true).ranges, vec![(20, 30)], "an incomplete drain claims no window");
+        assert_eq!(plan_leg(&partial, &[], true, true, &|_| true).ranges, vec![(20, 30)], "an incomplete drain claims no window");
         let split = vec![meta(1, 0, 10, true, true, Some(7)), meta(1, 0, 10, true, true, Some(8)), full[1].clone()];
-        let p = plan_leg(&split, &[], true, true);
+        let p = plan_leg(&split, &[], true, true, &|_| true);
         assert_eq!(p.ranges, vec![(20, 30)], "two files for one bucket: neither may claim the span");
         assert_eq!(p.served, vec![0, 1, 2], "...though both still SERVE their rows");
     }
@@ -1416,46 +1196,43 @@ mod tests {
     #[test]
     fn plan_leg_skips_files_membuffer_still_owns_without_forfeiting_their_bucket() {
         let metas = vec![meta(1, 0, 10, true, true, Some(7)), meta(2, 20, 30, true, true, Some(9))];
-        let p = plan_leg(&metas, &[(5, 15)], true, true);
+        let p = plan_leg(&metas, &[(5, 15)], true, true, &|_| true);
         assert_eq!(p.served, vec![1], "the overlapped file is skipped whole");
         assert_eq!(p.ranges, vec![(20, 30)], "and excludes nothing, so that window falls through to Delta");
         assert_eq!(p.version_gate, Some(9), "a skipped file does not constrain the gate");
 
         // Both halves of a twice-demoted bucket, one of them mem-owned.
         let split = vec![meta(1, 0, 10, true, true, Some(7)), meta(1, 10, 20, true, true, Some(8))];
-        let p = plan_leg(&split, &[(12, 14)], true, true);
+        let p = plan_leg(&split, &[(12, 14)], true, true, &|_| true);
         assert_eq!(p.served, vec![0], "the mem-owned half is skipped");
         assert!(p.ranges.is_empty(), "the survivor must NOT claim the bucket's span — it holds half of it");
     }
 
-    /// The contract that lets the eager path be replaced. Unfiltered, the two
-    /// agree exactly. Under a predicate that empties every file they diverge —
-    /// `plan_leg` still excludes, because it cannot see emptiness — and that
-    /// divergence is only sound once the rows are streamed rather than admitted
-    /// under a budget. See `LegPlan`.
+    /// The claims `plan_leg` makes from metadata are the ones the leg actually
+    /// honours: every file it says it serves hands over its rows, and every
+    /// window it excludes is one of those files'.
     #[tokio::test]
-    async fn plan_leg_agrees_with_the_eager_path_except_where_only_streaming_is_safe() {
+    async fn plan_leg_claims_match_the_rows_the_leg_serves() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         for i in 0..4i64 {
             tier.demote("p1", "t", Bucket { bucket_id: i, batches: &[batch(8)], min_ts: i * 100, max_ts: i * 100 + 10, covers_window: true });
         }
         let metas = tier.buckets_in_range("p1", "t", None);
-        let eager = tier.read_leg(&metas, &[], &[], &schema(), None, false, false);
-        let plan = plan_leg(&metas, &[], false, false);
-        assert_eq!(plan.ranges, eager.ranges, "unfiltered, the metadata claims are exactly the eager ones");
-        assert_eq!(plan.served.len(), eager.partitions.len());
-        assert_eq!((plan.version_gate, plan.sorted), (eager.version_gate, eager.sorted));
+        let plan = plan_leg(&metas, &[], false, false, &footer_is_readable);
+        assert_eq!((plan.served.len(), plan.ranges.len()), (4, 4), "four proven single-file buckets");
 
-        // A predicate no row satisfies: the eager path sees the emptiness and
-        // withholds every exclusion; `plan_leg` cannot, and excludes all four.
-        // That is SAFE because the same predicate empties the Delta copy of
-        // those windows identically — an excluded window with no rows on either
-        // side loses nothing.
+        let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
+        assert_eq!(leg.ranges, plan.ranges, "the leg claims exactly what the metadata plan did");
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 32, "and serves every row it claimed");
+
+        // A predicate no row satisfies still excludes: the claim rests on the
+        // files COVERING those windows, and the same predicate empties Delta's
+        // copies identically. See `LegPlan`.
         let never = vec![datafusion::prelude::col("ts").lt(datafusion::prelude::lit(i64::MIN))];
-        let eager = tier.read_leg(&metas, &[], &never, &schema(), None, false, false);
-        assert!(eager.ranges.is_empty() && eager.partitions.is_empty(), "the eager path serves and excludes nothing");
-        assert_eq!(plan_leg(&metas, &[], false, false).ranges.len(), 4, "the lazy plan still excludes — the predicate empties Delta identically");
+        let leg = tier.scan("p1", "t", None, &[], &never, &schema(), None);
+        assert_eq!(leg.ranges.len(), 4);
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
     }
 
     /// The hot leg projects to the requested columns BEFORE filtering, keeps a
@@ -1468,17 +1245,17 @@ mod tests {
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(8)], min_ts: 10, max_ts: 20, covers_window: true });
         let filters = vec![datafusion::prelude::col("ts").gt(datafusion::prelude::lit(5i64))];
         // Project only `name`; `ts` is predicate-only and must not leak out.
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &filters, &schema(), Some(&vec![1])).await;
-        assert_eq!(ranges, vec![(10, 21)]);
-        let batches: Vec<_> = parts.into_iter().flatten().collect();
+        let leg = tier.scan("p1", "t", None, &[], &filters, &schema(), Some(&vec![1]));
+        assert_eq!(leg.ranges, vec![(10, 21)]);
+        let batches = served(&leg).await;
         assert_eq!(batches[0].num_columns(), 1);
         assert_eq!(batches[0].schema().field(0).name(), "name");
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2, "only ts=6,7 match");
 
         // A file MemBuffer still owns is skipped whole — no rows, no range, so
         // the window stays with the tier that has the fresher copy.
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[(15, 25)], &filters, &schema(), None).await;
-        assert!(parts.is_empty() && ranges.is_empty());
+        let leg = tier.scan("p1", "t", None, &[(15, 25)], &filters, &schema(), None);
+        assert!(leg.is_empty());
         assert_eq!(tier.stats().mem_skipped, 1);
     }
 
@@ -1515,7 +1292,7 @@ mod tests {
         tier.demote("p1", "mor_versioned", Bucket { bucket_id: 1, batches: &[rows(vec![100, 400])], min_ts: 0, max_ts: 1, covers_window: true });
         tier.demote("p1", "mor_versioned", Bucket { bucket_id: 2, batches: &[rows(vec![200, 300])], min_ts: 2, max_ts: 3, covers_window: true });
 
-        let leg = tier.query_partitioned("p1", "mor_versioned", None, &[], &[], &versioned, None).await;
+        let leg = tier.scan("p1", "mor_versioned", None, &[], &[], &versioned, None);
         assert_eq!(leg.version_gate, Some(300), "the gate is the least per-file maximum, so no file's newer rows are excluded");
         assert_eq!(leg.ranges.len(), 2);
 
@@ -1529,13 +1306,13 @@ mod tests {
         )
         .unwrap();
         tier.demote("p1", "mor_versioned", Bucket { bucket_id: 3, batches: &[unstamped], min_ts: 4, max_ts: 5, covers_window: true });
-        let leg = tier.query_partitioned("p1", "mor_versioned", None, &[], &[], &versioned, None).await;
+        let leg = tier.scan("p1", "mor_versioned", None, &[], &[], &versioned, None);
         assert_eq!(leg.version_gate, Some(i64::MIN), "an unstamped file must not let the gate hide newer Delta rows");
 
         // A table that does not append versions gets no gate at all — its
         // exclusion stands unweakened, byte-for-byte the pre-merge-on-read plan.
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: true });
-        let leg = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
+        let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
         assert_eq!(leg.version_gate, None);
 
         // Restart: `rescan` recovers the stamp from the filename.
@@ -1552,14 +1329,18 @@ mod tests {
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(32)], min_ts: 10, max_ts: 20, covers_window: true });
         let path = tier.buckets_in_range("p1", "t", None)[0].path.clone();
 
+        // Each unusable shape must cost the file BOTH its rows and its
+        // exclusion, so the window falls through to Delta. If the probe let one
+        // through, `ArrowSource` would fail the query at execute time with the
+        // window already excluded — a cache miss turned into an outage.
         let full = fs::read(&path).unwrap();
-        fs::write(&path, &full[..full.len() / 2]).unwrap();
-        assert!(tier.read_file(&path).is_none(), "truncated file must read as absent");
-
-        fs::write(&path, b"not an arrow file at all").unwrap();
-        assert!(tier.read_file(&path).is_none());
-        assert!(tier.read_file(Path::new("/definitely/not/here.arrow")).is_none());
-        assert_eq!(tier.stats().read_misses, 3);
+        for corrupt in [&full[..full.len() / 2], b"not an arrow file at all".as_slice(), b"".as_slice()] {
+            fs::write(&path, corrupt).unwrap();
+            assert!(!footer_is_readable(&path), "corrupt file must probe as unusable");
+            let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
+            assert!(leg.is_empty(), "no rows AND no exclusion — the whole window falls through to Delta");
+        }
+        assert!(!footer_is_readable(Path::new("/definitely/not/here.arrow")));
     }
 
     #[test]
@@ -1574,7 +1355,7 @@ mod tests {
         let restarted = open(&dir);
         let metas = restarted.buckets_in_range("p1", "t", None);
         assert_eq!(metas.iter().map(|m| (m.bucket_id, m.min_ts, m.end_ts)).collect::<Vec<_>>(), vec![(1, 10, 21), (2, 30, 41)]);
-        assert_eq!(*restarted.read_file(&metas[0].path).unwrap(), vec![batch(8)]);
+        assert_eq!(decode_file(&metas[0].path, false, None).unwrap(), vec![batch(8)], "recovered files still decode");
         // A post-restart demotion must not collide with a recovered seq.
         restarted.demote("p1", "t", Bucket { bucket_id: 2, batches: &[batch(8)], min_ts: 41, max_ts: 42, covers_window: true });
         assert_eq!(restarted.buckets_in_range("p1", "t", None).len(), 3);
@@ -1812,15 +1593,15 @@ mod tests {
         let s = tier.stats();
         assert_eq!((s.suppressed_tables, s.files), (1, 1));
 
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
-        assert_eq!(ranges, vec![(10, 21)]);
-        assert_eq!(parts.into_iter().flatten().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
+        assert_eq!(leg.ranges, vec![(10, 21)]);
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
         assert_eq!(tier.stats().read_hits, 1);
     }
 
-    /// The leg is planned eagerly into an unpooled, ungated `MemorySourceConfig`,
-    /// so a deep scan must never consult it at all — a 14d dashboard would
-    /// otherwise materialize the ENTIRE hot window before execution starts.
+    /// Past the tier's own span it holds a shrinking fraction of the answer, so
+    /// a deep scan opens none of its files — every window comes from Delta,
+    /// which has all of them.
     #[test]
     fn deep_scans_skip_the_hot_leg_entirely() {
         let hour = 3_600_000_000i64;
@@ -1833,83 +1614,12 @@ mod tests {
         // so it lands just OVER one window. At a 1x threshold that query — the
         // one the tier is most useful for — skipped the tier entirely.
         assert!(!skip_for_lookback(Some(six_h + 1), six_h), "a hair past the window is still the tier's own span, not a deep scan");
-        assert!(!skip_for_lookback(Some(2 * six_h), six_h), "slack up to the multiple; leg_budget_bytes bounds the heap, not this");
+        assert!(!skip_for_lookback(Some(2 * six_h), six_h), "slack up to the multiple; the query's memory pool bounds the heap, not this");
         assert!(skip_for_lookback(Some(2 * six_h + 1), six_h), "past the multiple the tier is a fraction of the answer");
         assert!(skip_for_lookback(Some(14 * 24 * hour), six_h), "14d");
         assert!(skip_for_lookback(None, six_h), "no lower bound = infinitely deep");
         // Tier off (retention 0): nothing is ever consulted, however shallow.
         assert!(skip_for_lookback(Some(1), 0) && skip_for_lookback(None, 0));
-    }
-
-    /// The per-scan byte budget, and the invariant that makes it SAFE: a file
-    /// the budget refuses contributes neither rows NOR its exclusion range. If
-    /// the two ever diverge, that window is excluded from the Delta leg and
-    /// served by nobody — silent row loss.
-    #[tokio::test]
-    async fn leg_budget_stops_rows_and_ranges_together() {
-        let dir = tempfile::tempdir().unwrap();
-        // Budget for ~2 files: measure one file's post-filter footprint first.
-        let probe = tempfile::tempdir().unwrap();
-        let t0 = HotTier::open(probe.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX));
-        t0.demote("p1", "t", Bucket { bucket_id: 0, batches: &[batch(64)], min_ts: 0, max_ts: 10, covers_window: true });
-        let HotLeg { partitions: parts, .. } = t0.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
-        let one: u64 = parts.into_iter().flatten().map(|b| b.get_array_memory_size() as u64).sum();
-
-        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { leg_budget_bytes: one * 2, ..limits(u64::MAX) });
-        for i in 0..5i64 {
-            tier.demote("p1", "t", Bucket { bucket_id: i, batches: &[batch(64)], min_ts: i * 100, max_ts: i * 100 + 10, covers_window: true });
-        }
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
-        assert_eq!(parts.len(), 2, "the budget admits two files' worth and stops");
-        assert_eq!(ranges, vec![(0, 11), (100, 111)], "exactly the admitted files' ranges are excluded from Delta — no more");
-        assert_eq!(parts.len(), ranges.len(), "one range per admitted partition, always");
-        assert!(parts.iter().flatten().map(|b| b.get_array_memory_size() as u64).sum::<u64>() <= one * 2, "retained bytes stay under budget");
-        assert_eq!(tier.stats().leg_budget_stops, 1);
-
-        // Budget edge: a budget smaller than ONE file admits nothing at all —
-        // and, critically, excludes nothing, so every window falls to Delta.
-        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { leg_budget_bytes: 1, ..limits(u64::MAX) });
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
-        assert!(parts.is_empty() && ranges.is_empty(), "no rows AND no exclusion — the whole window must fall through to Delta");
-    }
-
-    /// The decode memo owns either mmap views or decompressed Arrow buffers, so
-    /// an unbounded memo can retain the whole tier. It must charge the larger
-    /// representation, cap bytes, and evict least-recently-used.
-    #[test]
-    fn memo_is_byte_capped_and_evicts_lru() {
-        let dir = tempfile::tempdir().unwrap();
-        let big = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX));
-        for i in 0..3i64 {
-            big.demote("p1", "t", Bucket { bucket_id: i, batches: &[batch(64)], min_ts: i * 100, max_ts: i * 100 + 10, covers_window: true });
-        }
-        let metas = big.buckets_in_range("p1", "t", None);
-        let file_bytes = metas[0].bytes;
-        let decoded = decode_file(&metas[0].path, false, None).unwrap();
-        let decoded_bytes = decoded.iter().map(|b| b.get_array_memory_size() as u64).sum::<u64>();
-        let entry_bytes = file_bytes.max(decoded_bytes);
-
-        // Cap at two files. Read 0, 1, 2 — the first read must be the victim.
-        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), HotTierLimits { memo_bytes: entry_bytes * 2, ..limits(u64::MAX) });
-        let metas = tier.buckets_in_range("p1", "t", None);
-        for m in &metas {
-            assert!(tier.read_file(&m.path).is_some());
-        }
-        let s = tier.stats();
-        assert_eq!((s.memo_files, s.memo_evicted), (2, 1), "the memo holds exactly its cap, evicting one");
-        assert_eq!(s.memo_bytes, entry_bytes * 2, "memo_bytes tracks decoded ownership: {s:?}");
-        assert!(!tier.decoded.contains_key(&metas[0].path), "the least-recently-used entry is the one dropped");
-        assert!(tier.decoded.contains_key(&metas[2].path));
-        // Touching 1 makes 2 the LRU; the next insert must then evict 2.
-        tier.read_file(&metas[1].path).unwrap();
-        tier.read_file(&metas[0].path).unwrap();
-        assert!(!tier.decoded.contains_key(&metas[2].path), "recency, not insertion order, decides the victim");
-        assert_eq!(tier.stats().memo_files, 2);
-
-        // Unlinking an entry gives its bytes back — the accounting can't drift.
-        tier.unlink(&metas.iter().map(|m| m.path.clone()).collect::<Vec<_>>());
-        let s = tier.stats();
-        assert_eq!((s.memo_files, s.memo_bytes), (0, 0));
     }
 
     /// A file decoding to ZERO batches would pass the schema check (`first()`
@@ -1926,12 +1636,11 @@ mod tests {
         // A well-formed IPC file carrying the schema and no record batches.
         let f = fs::File::create(&path).unwrap();
         FileWriter::try_new_with_options(f, schema().as_ref(), IpcWriteOptions::default()).unwrap().finish().unwrap();
-        assert_eq!(tier.read_file(&path).unwrap().len(), 0, "it decodes fine — it is just empty");
-
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
-        assert!(parts.is_empty(), "no rows");
-        assert!(ranges.is_empty(), "and NO exclusion range: the window must fall through to Delta, not vanish");
-        assert_eq!(tier.stats().read_misses, 1, "counted as a miss, like any other unusable file");
+        // `footer_is_readable` rejects it at plan time, so it costs the file
+        // both its rows and its exclusion — exactly as the eager decode did.
+        assert!(!footer_is_readable(&path), "a file with no record batches is unusable");
+        let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
+        assert!(leg.is_empty(), "no rows AND no exclusion: the window falls through to Delta, not into a hole");
     }
 
     /// PROD 2026-08-07 — the hole shape. A file whose rows the predicate ALL
@@ -1950,18 +1659,21 @@ mod tests {
         let tier = open(&dir);
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(8)], min_ts: 10, max_ts: 20, covers_window: true });
 
-        // Matches no row in the file, so the leg retains nothing.
+        // Matches no row in the file, so the leg serves nothing...
         let never = col("ts").eq(lit(i64::MIN));
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[never], &schema(), None).await;
-        assert!(parts.is_empty(), "no rows survive the predicate");
-        assert!(ranges.is_empty(), "and NO exclusion range: the window must fall through to Delta, not vanish");
-        assert_eq!(tier.stats().empty_after_filter, 1);
+        let leg = tier.scan("p1", "t", None, &[], &[never], &schema(), None);
+        assert!(served(&leg).await.is_empty(), "no rows survive the predicate");
+        // ...but it STILL claims its window, and that is sound. A claim requires
+        // `covers_window` on a single-file bucket, i.e. the file holds every row
+        // in the span, so Delta's copies of those rows are duplicates of the
+        // ones just filtered away — the same predicate empties them too.
+        assert_eq!(leg.ranges, vec![(10, 21)], "a PROVEN window may be excluded even when the predicate empties it");
 
-        // Control: a predicate that DOES match still claims its range, or the
-        // Delta leg would double-count the rows the hot tier just served.
+        // Control: a matching predicate claims the range for the original
+        // reason — or the Delta leg would double-count the rows just served.
         let all = col("ts").gt_eq(lit(i64::MIN));
-        let HotLeg { partitions: parts, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[all], &schema(), None).await;
-        assert!(!parts.is_empty() && ranges.len() == 1, "serving rows ⇒ claim the range");
+        let leg = tier.scan("p1", "t", None, &[], &[all], &schema(), None);
+        assert!(!served(&leg).await.is_empty() && leg.ranges.len() == 1, "serving rows ⇒ claim the range");
     }
 
     /// PROD 2026-08-07 — the hole. A file claimed a Delta exclusion over its
@@ -1979,21 +1691,20 @@ mod tests {
 
         // One full drain of a bucket: proven, so it may exclude its window.
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: true });
-        let HotLeg { ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
-        assert_eq!(ranges.len(), 1, "a proven, single-file bucket claims its window");
+        assert_eq!(tier.scan("p1", "t", None, &[], &[], &schema(), None).ranges.len(), 1, "a proven, single-file bucket claims its window");
 
         // A SECOND drain of the SAME bucket: each file now holds only part of
         // the span, so neither may claim it — even though both were full drains.
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(4)], min_ts: 21, max_ts: 30, covers_window: true });
-        let HotLeg { partitions, ranges, .. } = tier.query_partitioned("p1", "t", None, &[], &[], &schema(), None).await;
-        assert!(ranges.is_empty(), "multi-file bucket must claim NOTHING: neither file covers the span");
-        assert_eq!(partitions.len(), 2, "but both files still SERVE their rows");
+        let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
+        assert!(leg.ranges.is_empty(), "multi-file bucket must claim NOTHING: neither file covers the span");
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 8, "but both files still SERVE their rows");
 
         // A file from an older binary carries no claim and must not invent one.
         tier.demote("p2", "t", Bucket { bucket_id: 1, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: false });
-        let HotLeg { partitions, ranges, .. } = tier.query_partitioned("p2", "t", None, &[], &[], &schema(), None).await;
-        assert!(ranges.is_empty(), "unproven coverage ⇒ no exclusion; the window falls through to Delta");
-        assert_eq!(partitions.len(), 1, "rows are still served");
+        let leg = tier.scan("p2", "t", None, &[], &[], &schema(), None);
+        assert!(leg.ranges.is_empty(), "unproven coverage ⇒ no exclusion; the window falls through to Delta");
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 4, "rows are still served");
         assert!(tier.stats().unproven_windows >= 3);
     }
 
@@ -2010,33 +1721,23 @@ mod tests {
         assert_eq!(tier.stats().write_failures, 0, "an unsafe name is a skip, not a failure");
     }
 
-    /// The leg's plan-time heap must be visible to the query pool: a leg
-    /// larger than the pool fails its query with ResourcesExhausted instead of
-    /// stacking unaccounted bytes toward the cgroup kill, and the charge is
-    /// made ONCE across partitions.
+    /// The leg must be a PLAN, not rows. This is the whole change: the eager
+    /// leg decoded every file while planning (prod 2026-08-14: `hot_plan_us_avg`
+    /// 954 ms on 98% of scans, held outside every memory pool). Planning must
+    /// now touch no batch, and each file must land in its own partition so they
+    /// decode in parallel instead of one after another.
     #[tokio::test]
-    async fn pooled_leg_charges_the_query_pool_once_and_oversize_fails() {
-        use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
-        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
+    async fn planning_builds_a_partitioned_plan_without_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        for i in 0..3i64 {
+            tier.demote("p1", "t", Bucket { bucket_id: i, batches: &[batch(64)], min_ts: i * 100, max_ts: i * 100 + 10, covers_window: true });
+        }
+        let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
+        let plan = leg.plan.clone().expect("three usable files must produce a leg");
+        assert_eq!(plan.properties().output_partitioning().partition_count(), 3, "one partition per file, so the files decode concurrently");
 
-        let source = MemorySourceConfig::try_new(&[vec![batch(4)], vec![batch(4)]], schema(), None).unwrap();
-        let inner = Arc::new(DataSourceExec::new(Arc::new(source)));
-        let ctx = |pool_bytes| {
-            let env = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes))).build_arc().unwrap();
-            Arc::new(TaskContext::default().with_runtime(env))
-        };
-
-        let fits = HotLegPooledExec::new(inner.clone(), 512);
-        let ctx_fits = ctx(1024);
-        fits.execute(0, ctx_fits.clone()).unwrap();
-        fits.execute(1, ctx_fits.clone()).unwrap();
-        assert_eq!(ctx_fits.memory_pool().reserved(), 512, "one charge for the whole leg, not per partition");
-
-        let oversize = HotLegPooledExec::new(inner, 2048);
-        let err = match oversize.execute(0, ctx(1024)) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("oversized leg must fail its query"),
-        };
-        assert!(err.contains("Resources exhausted"), "got: {err}");
+        // The rows exist only once the plan runs.
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 192);
     }
 }

@@ -656,9 +656,8 @@ const_default!(d_retention_mins: u64 = 70);
 // the default now matches the soaked deployment instead of leaving the tier
 // dependent on an env var that a fresh deployment would silently omit.
 //
-// Disk is bounded by `d_hot_tier_max_disk_gb` and heap by
-// `d_hot_tier_leg_budget_mb`, both independent of this value; raising it costs
-// disk and page cache, not process memory.
+// Disk is bounded by `d_hot_tier_max_disk_gb`, independent of this value;
+// raising it costs disk and page cache, not process memory.
 // 24h since 2026-08-02: dashboards' widest recent window is 24h, and
 // `skip_for_lookback`'s 2x-retention ceiling made anything past 12h skip the
 // tier entirely. Disk must scale with it (6h held ~24GB => 24h ~ 96GB) or
@@ -676,20 +675,14 @@ const_default!(d_retention_mins: u64 = 70);
 // already unlinks by age "then oldest-first until under the disk cap", so the
 // cap simply binds first and the tier holds as many hours as the disk affords
 // (~40h at the measured 79.6 GB/24h) instead of stopping short of it. Heap is
-// bounded independently by `leg_budget_bytes`, and depth by
-// `skip_for_lookback`, so neither scales with this number.
+// bounded by the query's own memory pool (`HotTier::scan` streams), and depth
+// by `skip_for_lookback`, so neither scales with this number.
 //
 // Raise `d_hot_tier_max_disk_gb` to convert disk into coverage: a full 72h
 // needs ~240 GB, which the 128 GB cap does not have today. That is a capacity
 // decision, not a code one, and until it is made the cap is the real window.
 const_default!(d_hot_tier_retention_hours: u64 = 72);
 const_default!(d_hot_tier_max_disk_gb: u64 = 128);
-// 1GB: at 512MB the leg-budget walk stopped mid-window on wide 24h scans and
-// pushed the older half to R2 — the exact latency the tier exists to remove.
-// Not higher: the hot leg materializes eagerly OUTSIDE every memory pool, so
-// this is un-pooled heap per concurrent scan (x16 gated scans worst case).
-const_default!(d_hot_tier_leg_budget_mb: u64 = 1024);
-const_default!(d_hot_tier_memo_mb: u64 = 1024);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
@@ -1401,17 +1394,6 @@ pub struct BufferConfig {
     /// cache whose size knob was dead code), so this one is a real dial.
     #[serde(default = "d_hot_tier_max_disk_gb")]
     pub timefusion_hot_tier_max_disk_gb: u64,
-    /// Per-scan heap ceiling for the hot leg: post-filter Arrow bytes one
-    /// query may materialize out of demoted files before the leg stops adding
-    /// them (remaining windows fall through to Delta). The hot leg is planned
-    /// eagerly and sits in no memory pool, so this is its ONLY bound.
-    #[serde(default = "d_hot_tier_leg_budget_mb")]
-    pub timefusion_hot_tier_leg_budget_mb: u64,
-    /// Process-wide ceiling on memoized decodes. Each memo entry pins one
-    /// file's mmap (clean, reclaimable pages) plus its `ArrayData` structs;
-    /// over the cap the least-recently-used entries are dropped.
-    #[serde(default = "d_hot_tier_memo_mb")]
-    pub timefusion_hot_tier_memo_mb: u64,
     #[serde(default = "d_buffer_max_memory")]
     pub timefusion_buffer_max_memory_mb: usize,
     #[serde(default = "d_stop_grace")]
@@ -1527,13 +1509,10 @@ impl BufferConfig {
     pub fn hot_tier_retention(&self) -> Option<Duration> {
         (self.timefusion_hot_tier_retention_hours > 0).then(|| Duration::from_secs(self.timefusion_hot_tier_retention_hours * 3_600))
     }
-    /// The tier's three ceilings — disk, per-scan heap, memoized decodes.
+    /// The tier's only ceiling. Per-scan heap needs no knob: `HotTier::scan`
+    /// streams its files inside the query's own memory pool.
     pub fn hot_tier_limits(&self) -> crate::hot_tier::HotTierLimits {
-        crate::hot_tier::HotTierLimits {
-            max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GIB as u64),
-            leg_budget_bytes: self.timefusion_hot_tier_leg_budget_mb.saturating_mul(MIB as u64),
-            memo_bytes: self.timefusion_hot_tier_memo_mb.saturating_mul(MIB as u64),
-        }
+        crate::hot_tier::HotTierLimits { max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GIB as u64) }
     }
 
     /// mtime age past which a WAL file is PRESUMED dead weight. This is a

@@ -338,10 +338,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
             let projection: Vec<usize> =
                 ["timestamp", "id", tiebreak, deleted].into_iter().map(|column| arrow_schema.index_of(column).ok()).collect::<Option<_>>()?;
             let mem_ranges = layer.get_bucket_ranges(&q.project_id, &q.table_name);
-            let hot = layer
-                .hot_tier()
-                .query_partitioned(&q.project_id, &q.table_name, Some((q.lo, q.hi)), &mem_ranges, &filters, &arrow_schema, Some(&projection))
-                .await;
+            let hot = layer.hot_tier().scan(&q.project_id, &q.table_name, Some((q.lo, q.hi)), &mem_ranges, &filters, &arrow_schema, Some(&projection));
             (mem, mem_ranges, hot)
         }
         None => (Vec::new(), Vec::new(), Default::default()),
@@ -390,7 +387,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         return None;
     }
     let mut authoritative_batches = mem_batches;
-    authoritative_batches.extend(hot.partitions.into_iter().flatten());
+    authoritative_batches.extend(hot.collect().await);
     let covered_ranges = crate::mem_buffer::merge_ranges([mem_ranges, hot.ranges].concat());
     let delta_batches = database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?;
     indexes.into_iter().try_fold(0u64, |total, (date, index)| {

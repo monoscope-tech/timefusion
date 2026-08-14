@@ -228,12 +228,9 @@ impl StatsTableProvider {
                                         "read_hits_total" => h.read_hits,
                                         "read_misses_total" => h.read_misses,
                                         "mem_skipped_total" => h.mem_skipped,
-                            // Files whose rows were all filtered out; they now contribute no
-                            // exclusion range either. See hot_tier::read_leg.
-                            "empty_after_filter_total" => h.empty_after_filter,
-                    // Windows served without a Delta exclusion because coverage was not
-                    // proven — these are the reads that used to lose rows.
-                    "unproven_windows_total" => h.unproven_windows,
+                                        // Windows served without a Delta exclusion because coverage
+                                        // was not proven — the reads that used to lose rows.
+                                        "unproven_windows_total" => h.unproven_windows,
                                         "schema_drift_total" => h.schema_drift,
                                         "gc_deleted_total" => h.gc_deleted,
                                         "gc_bytes_freed_total" => h.gc_bytes_freed,
@@ -251,15 +248,6 @@ impl StatsTableProvider {
                                         // intended; it used to be an invisible silent waste.
                                         "suppressed_tables" => h.suppressed_tables,
                                         "suppressions_total" => h.suppressions,
-                                        // The two heap bounds. `memo_bytes` is the mapping the decode
-                                        // memo pins (LRU-capped); `leg_budget_stops_total` counts scans
-                                        // that hit the per-query hot-leg byte budget and served the
-                                        // remaining windows from Delta instead — sustained non-zero
-                                        // means the budget, not retention, is the tier's real size.
-                                        "memo_files" => h.memo_files,
-                                        "memo_bytes" => h.memo_bytes,
-                                        "memo_evicted_total" => h.memo_evicted,
-                                        "leg_budget_stops_total" => h.leg_budget_stops,
                                     ],
                     h.suppressed
                         .iter()
