@@ -8628,11 +8628,24 @@ impl Database {
         if !self.config.maintenance.rollup_build_enabled() {
             return Ok(());
         }
+        let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
+        self.rebuild_rollup_partition_holding_permit(source, project_id, date).await
+    }
+
+    /// `rebuild_rollup_partition`, for a caller that ALREADY holds a
+    /// `maintenance_rewrite_sem` permit.
+    ///
+    /// The backfill acquires its own so that queueing for the permit happens
+    /// outside its unit deadline — with several units in flight against a
+    /// smaller rewrite pool, a unit could otherwise burn its whole budget
+    /// waiting and be abandoned having done no work. Re-acquiring here instead
+    /// would deadlock: two units each holding one of two permits, each waiting
+    /// for the other's.
+    async fn rebuild_rollup_partition_holding_permit(&self, source: &str, project_id: &str, date: &str) -> Result<()> {
         let Some(schema) = get_schema(source) else { return Ok(()) };
         let source_fp = self.rollup_source_fingerprint(project_id, source, date).await?;
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         let source_epoch = self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
-        let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
 
         // Rebuild only the hours that changed, when we can prove which those
         // are. `rollup_dirty` holds a claim ONLY while every change since the
@@ -9011,17 +9024,32 @@ impl Database {
         // skipped, so a run is allowed to exceed its period — but not the process
         // lifetime, which is what actually decides whether the commit lands.
         let unit_budget = budget * BACKFILL_UNIT_BUDGET_MULTIPLE;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let started = std::time::Instant::now();
-        let (mut built, mut uncertifiable, mut failed) = (0, 0usize, 0usize);
-        let mut attempted = 0usize;
+        let (built, uncertifiable, failed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        let attempted = AtomicUsize::new(0);
         let queued = candidates.len();
-        for (project_id, date) in candidates {
-            if backfill_tick_exhausted(attempted, built, self.config.maintenance.timefusion_rollup_backfill_units_per_tick, started.elapsed(), budget) {
-                break;
+        let units_per_tick = self.config.maintenance.timefusion_rollup_backfill_units_per_tick;
+        // Units run CONCURRENTLY. Serially, one unit that ran to its deadline and
+        // committed nothing consumed the whole tick — prod 2026-08-15 sustained
+        // ~3 partitions an hour against `queued=355`, which never converges
+        // because coverage is invalidated faster than that. Concurrency does not
+        // raise peak Arrow: the heavy rewrite stays behind
+        // `maintenance_rewrite_sem`, which each unit takes BEFORE arming its
+        // deadline, so a unit is never abandoned for time it spent queueing.
+        let concurrency = self.config.maintenance.timefusion_rollup_backfill_concurrency.max(1);
+        let (attempted, built, uncertifiable, failed) = (&attempted, &built, &uncertifiable, &failed);
+        let table_ref = &table_ref;
+        let unit_of = move |(project_id, date): (String, chrono::NaiveDate)| async move {
+            // Re-checked per unit, not once per tick: with units in flight the
+            // budget can be spent while this one waits for a slot, and starting
+            // work the tick has no time left for is what stacks cron runs.
+            if backfill_tick_exhausted(attempted.load(Relaxed), built.load(Relaxed), units_per_tick, started.elapsed(), budget) {
+                return;
             }
-            attempted += 1;
+            attempted.fetch_add(1, Relaxed);
             if self.maintenance_shutdown.is_cancelled() || !self.dedup_flush_healthy() {
-                break;
+                return;
             }
             let date_key = date.to_string();
             // A rollup over a partition that still holds duplicates is simply
@@ -9041,17 +9069,29 @@ impl Database {
             //
             // Cancelling mid-build is safe: the Delta commit is the last step, so
             // a dropped future leaves no partial state — only wasted work.
+            // The permit is taken OUTSIDE the deadline below: with units in
+            // flight against a smaller rewrite pool, time spent queueing is not
+            // this unit's to be judged on.
+            let permit = match self.maintenance_rewrite_sem.acquire().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    warn!(project_id, date = %date, source, %error, "rollup rewrite semaphore closed");
+                    return;
+                }
+            };
             let unit = async {
-                let clean_fp = self.certify_partition(&table_ref, source, &project_id, date).await?;
+                let clean_fp = self.certify_partition(table_ref, source, &project_id, date).await?;
                 match clean_fp {
-                    Some(clean_fp) => self.rebuild_rollup_partition(source, &project_id, &date_key, clean_fp).await.map(|()| Some(())),
+                    Some(_) => self.rebuild_rollup_partition_holding_permit(source, &project_id, &date_key).await.map(|()| Some(())),
                     None => Ok(None),
                 }
             };
-            match tokio::time::timeout(unit_budget, unit).await {
+            let outcome = tokio::time::timeout(unit_budget, unit).await;
+            drop(permit);
+            match outcome {
                 Err(_elapsed) => {
                     self.record_rollup_failure(&project_id, source, &date_key);
-                    failed += 1;
+                    failed.fetch_add(1, Relaxed);
                     warn!(
                         project_id,
                         date = %date,
@@ -9061,19 +9101,22 @@ impl Database {
                     );
                 }
                 Ok(Ok(Some(()))) => {
-                    built += 1;
+                    built.fetch_add(1, Relaxed);
                 }
                 Ok(Ok(None)) => {
-                    uncertifiable += 1;
+                    uncertifiable.fetch_add(1, Relaxed);
                     debug!(project_id, date = %date, source, "rollup backfill: partition not certifiable yet");
                 }
                 Ok(Err(error)) => {
                     self.record_rollup_failure(&project_id, source, &date_key);
-                    failed += 1;
+                    failed.fetch_add(1, Relaxed);
                     warn!(project_id, date = %date, source, %error, "rollup backfill unit failed (certification or build)");
                 }
             }
-        }
+        };
+        futures::stream::iter(candidates).map(unit_of).buffer_unordered(concurrency).collect::<()>().await;
+        let (attempted, built, uncertifiable, failed) =
+            (attempted.load(Relaxed), built.load(Relaxed), uncertifiable.load(Relaxed), failed.load(Relaxed));
         // Log whenever there was WORK, not only when some of it succeeded. A tick
         // that queues 200 partitions and builds none because every one is
         // uncertifiable used to be byte-identical in the log to a tick with
@@ -19723,6 +19766,27 @@ mod tests {
         let ctx1 = Arc::new(db.clone()).create_session_context();
         let ctx2 = Arc::new(db.clone()).create_session_context();
         assert!(Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()), "contexts must share one RuntimeEnv/memory pool");
+        Ok(())
+    }
+
+    /// The backfill runs units concurrently and takes the heavy rewrite permit
+    /// ITSELF, before arming each unit's deadline, so that time spent queueing
+    /// is not charged to the unit. That only works while the inner build does
+    /// not re-acquire: two units each holding one of two permits, each waiting
+    /// on the other's, is a deadlock that would freeze the backfill outright.
+    ///
+    /// So: with every heavy permit held, the permit-holding entry point must
+    /// still run to completion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_backfill_build_entry_point_does_not_retake_the_rewrite_permit() -> Result<()> {
+        let db = Database::with_config(create_test_config("rollup-permit-split")).await?;
+        let _held = db.maintenance_rewrite_sem.clone().acquire_many_owned(db.maintenance_rewrite_sem.available_permits() as u32).await?;
+        assert_eq!(db.maintenance_rewrite_sem.available_permits(), 0, "every heavy permit is held");
+
+        // An unknown source short-circuits before any IO, so this measures the
+        // acquisition and nothing else.
+        let build = db.rebuild_rollup_partition_holding_permit("no_such_table", "p", "2026-08-10");
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), build).await.is_ok(), "the permit-holding path must not block on the semaphore");
         Ok(())
     }
 
