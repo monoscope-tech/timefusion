@@ -15411,13 +15411,39 @@ fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
 
 /// Decode-admission pressure valve: how many of the wide-scan semaphore's
 /// `total` permits one decode poll must claim right now. 1 under normal
-/// pressure (full concurrency); a quarter of the pool from 88% of the cgroup
-/// limit; the whole pool (fully serialized decodes) from 95%. Decode heap is
-/// the one large consumer no DataFusion pool tracks, so near the OOM line the
-/// only lever is concurrency: 16 concurrent ~150MB-batch decodes were exactly
-/// the burst that outran jemalloc purge + memcg reclaim in the 2026-08-01/02
+/// pressure (full concurrency); a quarter of the pool at the first tier; the
+/// whole pool (fully serialized decodes) at the second. Decode heap is the one
+/// large consumer no DataFusion pool tracks, so near the OOM line the only
+/// lever is concurrency: 16 concurrent ~150MB-batch decodes were exactly the
+/// burst that outran jemalloc purge + memcg reclaim in the 2026-08-01/02
 /// hourly-OOM regime (70 kills / 3 days). Queries degrade to queued-but-alive
 /// instead of the whole process dying and paying a cold-cache restart spiral.
+///
+/// # The tiers fire on RATE, not only on level
+///
+/// A fixed percentage of the limit has now failed in both directions:
+///
+/// - 88%/95% fires too LATE. The valve only throttles polls it has not yet
+///   admitted, so it has to lead an in-flight burst. Prod 2026-08-13 logged the
+///   88% transition **34 seconds** before the memcg kill, against a burst
+///   measured at ~450 MB/s. It was narrating the OOM, not preventing it.
+/// - 70%/82% fires too EARLY, and worse, ON the working set. Under real morning
+///   traffic usage sits at 69-70%, so the first tier landed exactly on it: prod
+///   logged **52 transitions in 25 minutes**, each one cutting decode
+///   concurrency to a quarter of the pool for every query in the system
+///   (2026-08-14, reverted in 135648b).
+///
+/// Level alone cannot separate those cases, because "sitting at 70%" and
+/// "passing through 70% at 450 MB/s" are the same number. The rate is what
+/// distinguishes them, so the tiers are expressed as PROJECTED SECONDS TO THE
+/// LIMIT: engage when the headroom that remains, divided by how fast it is
+/// being consumed, drops below the time the valve needs to act. A box parked at
+/// 70% has a rate near zero and a projection of forever, so it never throttles
+/// — which is the property 70%/82% could not have at any threshold.
+///
+/// The absolute 88%/95% tiers are KEPT as a backstop, so this is never later
+/// than what it replaces: whichever tier is reached first wins.
+///
 /// The pressure number is memcg-charged usage minus reclaimable file cache —
 /// the same measure the maintenance wave brake acts on — sampled at most every
 /// 250ms (decode polls are ~ms-scale, so per-poll file reads would be pure
@@ -15427,25 +15453,60 @@ fn scan_pressure_permits(total: u32) -> u32 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     static SAMPLED_AT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
     static USAGE_PCT: AtomicU64 = AtomicU64::new(0);
+    static PREV_USED: AtomicU64 = AtomicU64::new(0);
+    /// Smoothed growth rate in bytes/sec. Saturating at 0 on a fall: a
+    /// *shrinking* process is never heading for the wall, and letting negative
+    /// rates into the average would mask a burst that follows a big free.
+    static RATE_BPS: AtomicU64 = AtomicU64::new(0);
+    /// Projected seconds until usage reaches the limit at the current rate.
+    static ETA_SECS: AtomicU64 = AtomicU64::new(u64::MAX);
     let now_ms = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
     let last = SAMPLED_AT_MS.load(Relaxed);
     if last == u64::MAX || now_ms.saturating_sub(last) >= 250 {
         SAMPLED_AT_MS.store(now_ms, Relaxed);
         let limit = crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes);
-        let pct = match (process_memory_bytes(), limit) {
-            (Some(used), l) if l > 0 => (used * 100 / l) as u64,
-            _ => 0,
-        };
-        let prev = USAGE_PCT.swap(pct, Relaxed);
+        let used = process_memory_bytes().unwrap_or(0);
+        let pct = if limit > 0 { (used * 100 / limit) as u64 } else { 0 };
+        let prev_used = PREV_USED.swap(used as u64, Relaxed);
+        let dt_ms = now_ms.saturating_sub(last);
+        // First sample (no `last`) has no interval to differentiate over.
+        if last != u64::MAX && dt_ms > 0 && prev_used > 0 {
+            let gained = (used as u64).saturating_sub(prev_used);
+            let sample_bps = gained.saturating_mul(1000) / dt_ms;
+            // EWMA over ~4 samples (~1s). Enough to reject a single noisy read
+            // without blunting a sustained burst — at 450 MB/s the estimate is
+            // within ~15% of truth inside 2 seconds.
+            let prev_rate = RATE_BPS.load(Relaxed);
+            RATE_BPS.store((prev_rate * 3 + sample_bps) / 4, Relaxed);
+        }
+        let rate = RATE_BPS.load(Relaxed);
+        let headroom = (limit as u64).saturating_sub(used as u64);
+        ETA_SECS.store(if rate > 0 { headroom / rate } else { u64::MAX }, Relaxed);
+        let prev_pct = USAGE_PCT.swap(pct, Relaxed);
         // Tier transitions are rare and load-bearing for OOM post-mortems:
         // counters die with the process, the log survives it.
-        let (was, now) = (pressure_permit_claim(prev, total), pressure_permit_claim(pct, total));
+        let was = pressure_permit_claim_at(prev_pct, u64::MAX, total);
+        let now = pressure_permit_claim_at(pct, ETA_SECS.load(Relaxed), total);
         if was != now {
-            warn!("scan pressure valve: {prev}% -> {pct}% of cgroup limit, decode permit claim {was} -> {now} (of {total})");
+            warn!(
+                "scan pressure valve: {prev_pct}% -> {pct}% of cgroup limit, growth {} MB/s, projected {} to limit, decode permit claim {was} -> {now} (of {total})",
+                rate / (1024 * 1024),
+                match ETA_SECS.load(Relaxed) {
+                    u64::MAX => "never".to_string(),
+                    s => format!("{s}s"),
+                }
+            );
         }
     }
-    pressure_permit_claim(USAGE_PCT.load(Relaxed), total)
+    pressure_permit_claim_at(USAGE_PCT.load(Relaxed), ETA_SECS.load(Relaxed), total)
 }
+
+/// First tier: the valve needs this long to drain in-flight decodes and have
+/// the throttle mean anything. Sized against the measured ~450 MB/s burst,
+/// which crosses 40 GB of headroom in ~90s.
+const VALVE_ETA_TIER1_SECS: u64 = 90;
+/// Second tier: fully serialize. At this projection nothing else will do.
+const VALVE_ETA_TIER2_SECS: u64 = 30;
 
 /// Sub-divisions of one reader slot in the wide-scan gate.
 ///
@@ -15488,11 +15549,17 @@ fn decode_units(last_batch_bytes: u64) -> u32 {
 }
 
 /// Tier math for `scan_pressure_permits`, separated for testability.
-fn pressure_permit_claim(usage_pct: u64, total: u32) -> u32 {
-    match usage_pct {
-        p if p >= 95 => total,
-        p if p >= 88 => (total / 4).max(1),
-        _ => 1,
+/// Permits one decode poll must claim, given both what is used now and how fast
+/// it is being used. Whichever tier is reached first wins — the absolute
+/// percentages are the backstop for a burst too fast to have been projected,
+/// the projections are what catch a burst early enough to throttle it.
+fn pressure_permit_claim_at(usage_pct: u64, eta_secs: u64, total: u32) -> u32 {
+    if usage_pct >= 95 || eta_secs <= VALVE_ETA_TIER2_SECS {
+        total
+    } else if usage_pct >= 88 || eta_secs <= VALVE_ETA_TIER1_SECS {
+        (total / 4).max(1)
+    } else {
+        1
     }
 }
 
@@ -17312,19 +17379,38 @@ mod tests {
         assert_eq!(metrics.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
     }
 
-    /// The decode pressure valve: full concurrency until 88% of the cgroup
-    /// limit, quarter pool to 95%, fully serialized past that. Claims never
-    /// exceed the pool (progress guaranteed) and never drop to zero.
+    /// The decode pressure valve's ABSOLUTE backstop tiers: full concurrency
+    /// until 88% of the cgroup limit, quarter pool to 95%, fully serialized past
+    /// that. Claims never exceed the pool (progress guaranteed) and never drop
+    /// to zero. The rate-based tiers are covered separately below.
     #[test]
     fn pressure_permit_claim_tiers() {
-        assert_eq!(pressure_permit_claim(0, 16), 1);
-        assert_eq!(pressure_permit_claim(87, 16), 1);
-        assert_eq!(pressure_permit_claim(88, 16), 4);
-        assert_eq!(pressure_permit_claim(94, 16), 4);
-        assert_eq!(pressure_permit_claim(95, 16), 16);
-        assert_eq!(pressure_permit_claim(200, 16), 16);
-        assert_eq!(pressure_permit_claim(88, 2), 1, "tiny pools floor at 1");
-        assert_eq!(pressure_permit_claim(95, 1), 1);
+        const CALM: u64 = u64::MAX; // not projected to reach the limit at all
+        assert_eq!(pressure_permit_claim_at(0, CALM, 16), 1);
+        assert_eq!(pressure_permit_claim_at(87, CALM, 16), 1);
+        assert_eq!(pressure_permit_claim_at(88, CALM, 16), 4);
+        assert_eq!(pressure_permit_claim_at(94, CALM, 16), 4);
+        assert_eq!(pressure_permit_claim_at(95, CALM, 16), 16);
+        assert_eq!(pressure_permit_claim_at(200, CALM, 16), 16);
+        assert_eq!(pressure_permit_claim_at(88, CALM, 2), 1, "tiny pools floor at 1");
+        assert_eq!(pressure_permit_claim_at(95, CALM, 1), 1);
+    }
+
+    /// The whole point of the rework: a box PARKED at the old first tier's
+    /// percentage must not throttle, and a box RUSHING at the wall from well
+    /// below it must. 70%/82% could not express that, and flapped 52 times in
+    /// 25 minutes on a working set that simply sat at 69-70% (135648b).
+    #[test]
+    fn the_valve_fires_on_rate_not_on_a_parked_working_set() {
+        // Morning traffic: parked at 70%, going nowhere. Full concurrency.
+        assert_eq!(pressure_permit_claim_at(70, u64::MAX, 16), 1, "a steady working set must never be throttled");
+        // Same 70%, but projected to hit the limit inside a minute. Throttle.
+        assert_eq!(pressure_permit_claim_at(70, 60, 16), 4, "a burst must engage the valve well before 88%");
+        // And with seconds left, serialize — still from only 70% used.
+        assert_eq!(pressure_permit_claim_at(70, 10, 16), 16);
+        // The absolute backstop survives: a burst too fast to project still
+        // trips on level alone.
+        assert_eq!(pressure_permit_claim_at(96, u64::MAX, 16), 16);
     }
 
     /// spawn_cron_job must fire on the wall-clock schedule (regression: the
