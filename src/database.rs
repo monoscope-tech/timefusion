@@ -9801,6 +9801,24 @@ impl Database {
         const DEDUP_WAVE_UNITS: usize = 8;
         let mut staging = futures::stream::iter(ready.into_iter().map(|(project_id, date, bin)| async move {
             let key: DirtyBinKey = (project_id.clone(), table_name.to_string(), date.clone(), bin);
+            // STOP ADMITTING once the pass is out of budget, and bound each bin
+            // by what is left rather than by `stage_deadline` alone.
+            //
+            // Staging used to consult neither: 64 bins each free to run for the
+            // 3600s per-bin ceiling, inside a tick whose whole budget is ~240s.
+            // The pass holds `maintenance_job_sem` and `spawn_cron_job` drops
+            // overlapping ticks, so one over-running pass costs every tick
+            // behind it AND every other maintenance job — prod 2026-08-14 logged
+            // "Dedup job run still in progress after 600s" on every 5-minute
+            // tick for 45 minutes straight, alongside the same warning for hot
+            // compaction and the rollup backfill queued behind it.
+            //
+            // Bailing here leaves the bin QUEUED (the dequeue below has not run
+            // yet), so an unadmitted bin is simply served by the next tick.
+            let remaining = pass_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
             // No persist here: rewriting the whole multi-MB queue file per
             // dequeue made the drain O(queue x batch) in fsync I/O. Crash
             // direction is safe — an unpersisted dequeue reappears after
@@ -9818,8 +9836,9 @@ impl Database {
                 // maintenance semaphore (prod 2026-08-05). The Err lands in
                 // the ordinary failure arm below: requeue + warn.
                 Ok(parsed) => {
+                    let bin_deadline = stage_deadline.min(remaining);
                     match tokio::time::timeout(
-                        stage_deadline,
+                        bin_deadline,
                         self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())),
                     )
                     .await
@@ -9827,13 +9846,13 @@ impl Database {
                         Ok(staged) => staged,
                         Err(_) => {
                             crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            Err(anyhow::anyhow!("staging exceeded the {stage_deadline:?} per-bin deadline (hung object-store read?)"))
+                            Err(anyhow::anyhow!("staging exceeded the {bin_deadline:?} deadline (hung object-store read, or the pass ran out of budget)"))
                         }
                     }
                 }
                 Err(e) => Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}")),
             };
-            (key, started.elapsed(), staged)
+            Some((key, started.elapsed(), staged))
         }))
         .buffer_unordered(permits);
 
@@ -9846,7 +9865,10 @@ impl Database {
         // KEEP DRAINING the stream — an in-flight staging future has already
         // removed its key from the queue and dropping it would lose the bin.
         let mut committing = true;
-        while let Some((key, elapsed, staged)) = staging.next().await {
+        while let Some(admitted) = staging.next().await {
+            // `None` = the pass ran out of budget before this bin was admitted;
+            // it is still queued, so the next tick serves it.
+            let Some((key, elapsed, staged)) = admitted else { continue };
             let stats = crate::metrics::maintenance_stats();
             let (project_id, _, date, bin) = key.clone();
             if !committing {
@@ -21238,6 +21260,47 @@ mod tests {
 
         assert_eq!(db.dedup_dirty_bins.len(), queued_before, "an exhausted phase budget must not dequeue bins it never probed");
         assert_eq!(out.len(), queued_before, "and every bin still fails OPEN to the per-bin staging path");
+        Ok(())
+    }
+
+    /// A drain pass out of budget must stop admitting bins and leave them queued.
+    ///
+    /// Staging consulted neither the pass deadline nor what was left of it: up
+    /// to 64 bins, each free to run for the 3600s PER-BIN ceiling, inside a tick
+    /// whose entire budget is ~240s. The pass holds `maintenance_job_sem` and
+    /// `spawn_cron_job` drops overlapping ticks, so one over-running pass costs
+    /// every tick behind it and every other maintenance job with it — prod
+    /// 2026-08-14 logged "Dedup job run still in progress after 600s" on every
+    /// 5-minute tick for 45 minutes straight, with hot compaction and the rollup
+    /// backfill stacked behind it.
+    ///
+    /// An unadmitted bin must stay QUEUED: dequeuing happens inside the staging
+    /// future, so bailing before it is what makes the next tick able to serve
+    /// the bin instead of losing it.
+    #[tokio::test]
+    async fn dedup_drain_out_of_budget_leaves_its_bins_queued() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-passbudget-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
+        let row = |observed: &str| json_to_batch(vec![test_span_ts("sealed", observed, &project, old)]);
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1);
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+
+        // An already-elapsed pass deadline with a generous per-bin ceiling: only
+        // the pass budget can stop this, and it must.
+        let started = std::time::Instant::now();
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_secs(3600), std::time::Instant::now()).await?;
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "the pass must return on its budget, not run the per-bin ceiling");
+        assert_eq!(db.dedup_dirty_bins.len(), 1, "an unadmitted bin stays queued for the next tick");
+        assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
+
+        // And the bin is still perfectly drainable once a pass has budget.
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        assert_eq!(delta_physical_row_count(&table).await?, 1, "the deferred bin dedups on a pass that has budget");
+        assert!(db.dedup_dirty_bins.is_empty());
         Ok(())
     }
 
