@@ -2440,6 +2440,10 @@ pub struct Database {
     /// every table, so without rotation the tail of the table list is never
     /// reached — see the cron's comment.
     dedup_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
+    /// Which table a hot-compaction tick starts with. Same reason as
+    /// `dedup_table_cursor`: the tick budget is shared across every table, so
+    /// without rotation the tail of the table list is never compacted.
+    hot_compact_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Which partition a rollup backfill tick starts with. The first unit runs
     /// regardless of budget, so a partition too expensive to finish inside one
     /// process lifetime would otherwise head-of-line block every cheaper one
@@ -2872,6 +2876,7 @@ impl Database {
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hot_compact_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             // SEEDED, not zero. A cursor that restarts at 0 rotates nothing when
             // the process lives ~30 min and a tick can take 24: every lifetime
             // picks the same head partition and the same first source, which is
@@ -3380,12 +3385,7 @@ impl Database {
                         return;
                     }
                     info!("Running scheduled hot-tail compaction on today's small files");
-                    for (project_id, table_name, table) in db.all_tables().await {
-                        if db.maintenance_shutdown.is_cancelled() {
-                            return;
-                        }
-                        db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), TailPass::Pack).await;
-                    }
+                    db.run_hot_compact_sweep(TailPass::Pack).await;
                     // Hot compaction only ever touches TODAY's partition, so a
                     // sealed day the daily cold sweep failed to finish stays
                     // fragmented forever. Piggy-back a bounded catch-up slice on
@@ -3436,12 +3436,7 @@ impl Database {
                         return;
                     }
                     info!("Running scheduled footer repair on sealed partitions");
-                    for (project_id, table_name, table) in db.all_tables().await {
-                        if db.maintenance_shutdown.is_cancelled() {
-                            return;
-                        }
-                        db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), TailPass::Repair).await;
-                    }
+                    db.run_hot_compact_sweep(TailPass::Repair).await;
                 }
             }
         });
@@ -3480,12 +3475,7 @@ impl Database {
                     return;
                 }
                 info!(delay_secs = STARTUP_REPAIR_DELAY.as_secs(), "Running startup footer repair (not waiting for the next tick)");
-                for (project_id, table_name, table) in db.all_tables().await {
-                    if db.maintenance_shutdown.is_cancelled() {
-                        return;
-                    }
-                    db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), TailPass::Repair).await;
-                }
+                db.run_hot_compact_sweep(TailPass::Repair).await;
             });
         }
 
@@ -10111,7 +10101,44 @@ impl Database {
 
     /// One table's hot-tail compaction (bin-pack today's small files). The 180s
     /// deadline is a warning threshold, not a cancellation.
-    async fn run_hot_compact_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str, pass: TailPass) {
+    /// Run `pass` over every table under ONE shared tick deadline, rotating the
+    /// table the tick starts with.
+    ///
+    /// Both properties are load-bearing and neither existed. Each table used to
+    /// derive its own full `tail_pass_tick_budget`, so a sweep over ~9 tables
+    /// could run 9x the budget the schedule allows: prod 2026-08-14 logged "Hot
+    /// compact job run still in progress after 600s" on every 5-minute tick for
+    /// 45 minutes unbroken, holding `maintenance_job_sem` the whole time with
+    /// dedup and the rollup backfill queued behind it. That is what "compaction
+    /// never keeps up" looks like from the inside — not slow work, but work that
+    /// never yields.
+    ///
+    /// Sharing one deadline without rotating would then serve the head of the
+    /// table list forever and never reach the tail. The dedup cron already makes
+    /// exactly this trade for exactly this reason.
+    async fn run_hot_compact_sweep(&self, pass: TailPass) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let deadline = std::time::Instant::now() + self.tail_pass_tick_budget(pass);
+        let mut tables = self.all_tables().await;
+        let start = sweep_resume_offset(tables.len(), self.hot_compact_table_cursor.fetch_add(1, Relaxed));
+        tables.rotate_left(start);
+        for (project_id, table_name, table) in tables {
+            if self.maintenance_shutdown.is_cancelled() {
+                return;
+            }
+            // A table reached with no budget left can only plan a bin it cannot
+            // finish. Leave it for the next tick, which rotation puts first.
+            if std::time::Instant::now() >= deadline {
+                info!(?pass, event = "hot_compact_tick_budget_exhausted");
+                return;
+            }
+            self.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), pass, Some(deadline)).await;
+        }
+    }
+
+    async fn run_hot_compact_for_table(
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str, pass: TailPass, tick_deadline: Option<std::time::Instant>,
+    ) {
         use std::sync::atomic::Ordering::Relaxed;
         const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         let t0 = std::time::Instant::now();
@@ -10129,7 +10156,7 @@ impl Database {
             ]
         };
         let before = snap();
-        let result = self.optimize_table_light(table, table_name, pass).await;
+        let result = self.optimize_table_light_until(table, table_name, pass, tick_deadline).await;
         let [planned, completed, bins, brakes] = std::array::from_fn(|i| snap()[i] - before[i]);
         let elapsed = t0.elapsed();
         match result {
@@ -10341,6 +10368,16 @@ impl Database {
     ///
     /// `TIMEFUSION_LIGHT_OPTIMIZE_ENABLED=false` remains the incident kill switch.
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass) -> Result<()> {
+        self.optimize_table_light_until(table_ref, table_name, pass, None).await
+    }
+
+    /// `tick_deadline` caps this table's wall clock at what is left of the
+    /// TICK, rather than granting it a fresh per-table budget. `None` keeps the
+    /// nominal per-pass budget, which is what a direct caller (a test, a manual
+    /// invocation) wants.
+    pub async fn optimize_table_light_until(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass, tick_deadline: Option<std::time::Instant>,
+    ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         // `crate::clock`, not `Utc::now()`: the hot tail scopes itself to TODAY's
         // partition and to an event-time seal window, so a wall-clock read here
@@ -10473,7 +10510,10 @@ impl Database {
         // Bound total rounds so a large backlog can't wedge the tick even if the
         // wall-clock budget is raised.
         let max_waves = max_waves(pass);
-        let deadline = std::time::Instant::now() + budget;
+        // The tick's remaining time wins over this pass's nominal budget. Both
+        // bounds matter: the nominal one sizes a pass in isolation, the tick one
+        // stops N tables from each claiming a full budget (see the cron).
+        let deadline = tick_deadline.map_or_else(|| std::time::Instant::now() + budget, |tick| tick.min(std::time::Instant::now() + budget));
         let order_index: HashMap<String, usize> = project_ids.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect();
         let failed = round_robin_bins(
             project_ids,
@@ -18868,6 +18908,44 @@ mod tests {
         assert_eq!(calls.iter().filter(|(p, _)| p == "converged").count(), 1, "converged project must not be retried");
         assert_eq!(calls.iter().filter(|(p, _)| p == "broken").count(), 1, "failed project must not be retried");
         assert_eq!(calls.iter().filter(|(p, _)| p == "busy").count(), 3, "busy project keeps its rounds");
+    }
+
+    /// A hot-compaction sweep spends ONE tick budget across all tables, and
+    /// starts at a different table each tick.
+    ///
+    /// Each table used to derive its own full `tail_pass_tick_budget`, so a
+    /// sweep over ~9 tables could run 9x what the schedule allows. Prod
+    /// 2026-08-14 logged "Hot compact job run still in progress after 600s" on
+    /// every 5-minute tick for 45 minutes unbroken, holding `maintenance_job_sem`
+    /// with dedup and the rollup backfill stacked behind it.
+    ///
+    /// The two properties are inseparable: a shared budget without rotation just
+    /// moves the starvation from "the tail of the tick" to "the tail of the
+    /// table list, forever".
+    #[tokio::test]
+    async fn a_hot_compact_sweep_shares_one_budget_and_rotates_its_starting_table() -> Result<()> {
+        let db = Database::with_config(create_test_config(&format!("hotcompact-sweep-{}", uuid::Uuid::new_v4().simple()))).await?;
+        for name in ["otel_logs_and_spans", "otel_metrics"] {
+            db.get_or_create_unified_table(name).await?;
+        }
+        let tables = db.all_tables().await.len();
+        assert!(tables > 1, "the sweep's whole point needs more than one table");
+
+        // The budget is shared, so the sweep cannot take a multiple of it. This
+        // is a no-op sweep (nothing to compact), so the real assertion is the
+        // ROTATION below; this one guards the shape.
+        let started = std::time::Instant::now();
+        db.run_hot_compact_sweep(TailPass::Pack).await;
+        assert!(started.elapsed() < db.tail_pass_tick_budget(TailPass::Pack), "the sweep must fit inside one tick budget, not one per table");
+
+        // Consecutive ticks must start at different tables, or the tail of the
+        // list is never compacted once the budget is genuinely contended.
+        use std::sync::atomic::Ordering::Relaxed;
+        let offset = || sweep_resume_offset(tables, db.hot_compact_table_cursor.load(Relaxed));
+        let first = offset();
+        db.run_hot_compact_sweep(TailPass::Pack).await;
+        assert_ne!(first, offset(), "the sweep must rotate its starting table between ticks");
+        Ok(())
     }
 
     /// The tick must stop starting rounds past its wall-clock budget rather than
