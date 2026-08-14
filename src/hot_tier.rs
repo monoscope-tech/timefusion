@@ -1186,6 +1186,77 @@ fn plan_columns(projection: Option<&[usize]>, filters: &[Expr], schema: &SchemaR
     Some(LegColumns { needed, schema, output })
 }
 
+/// Everything a leg may CLAIM about a set of files, derived from METADATA
+/// ALONE — not one batch is decoded. `read_leg` recomputes the same claims
+/// while materializing; this is the form a lazy (`ArrowSource`) leg needs,
+/// where the claims must be fixed before a single row is read.
+///
+/// It claims a SUPERSET of what `read_leg` serves, because it cannot know which
+/// files a predicate empties. That difference is safe: the excluded window's
+/// Delta copy is filtered by the SAME predicate, so a window empty here is empty
+/// there and nothing is lost. Serving extra files likewise only LOWERS
+/// `version_gate` (admitting more stamped Delta rows, which `DedupExec`
+/// collapses) and only RETRACTS `sorted` (forcing a sort that was already
+/// correct) — both the conservative direction.
+///
+/// **The soundness precondition is that every file in `served` is actually
+/// read.** `ranges` excludes a window from Delta on the promise that this leg
+/// serves it; a caller that keeps the claim but drops the rows serves that
+/// window from NOWHERE. So this is only usable by a leg with no admission
+/// bound — which is exactly why the lazy `ArrowSource` leg can use it and the
+/// eager path cannot: `leg_budget_bytes` stops that walk mid-list, and
+/// `leg_budget_stops_rows_and_ranges_together` pins that its rows and ranges
+/// must therefore fall away together. Streaming removes the budget, and with it
+/// the only unsafe divergence.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LegPlan {
+    /// Indices into `metas` of the files to serve, in `metas` order.
+    pub served: Vec<usize>,
+    /// Windows the served files are authoritative for; the caller excludes them
+    /// from the Delta leg.
+    pub ranges: Vec<(i64, i64)>,
+    /// Merge-on-read gate — see [`HotLeg::version_gate`].
+    pub version_gate: Option<i64>,
+    /// Every served file is ordered by the table's declared `sorting_columns`.
+    pub sorted: bool,
+}
+
+/// `orders` = the table declares sorting columns; `versioned` = it appends
+/// versions. Both come from the declared schema, not from the files.
+pub(crate) fn plan_leg(metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], versioned: bool, orders: bool) -> LegPlan {
+    // Counted over ALL metas, not just served ones: a bucket demoted more than
+    // once has several files each holding PART of the span while `min_ts..
+    // end_ts` spans it, so no single one may claim the window. A sibling that
+    // MemBuffer still owns is exactly such a partial file — dropping it from the
+    // count would let the survivor claim a window it only partly holds.
+    let mut files_per_bucket: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for m in metas {
+        *files_per_bucket.entry(m.bucket_id).or_default() += 1;
+    }
+    metas
+        .iter()
+        .enumerate()
+        // A file MemBuffer still owns is skipped whole — no rows and no
+        // exclusion, so the window stays with the tier holding the fresher copy.
+        .filter(|(_, m)| !mem_ranges.iter().any(|r| overlaps(m.range(), *r)))
+        .fold(LegPlan { sorted: orders, ..Default::default() }, |mut plan, (i, m)| {
+            plan.served.push(i);
+            // One unmarked file retracts the claim for the whole leg:
+            // `try_with_sort_information` declares ONE ordering for the source.
+            plan.sorted &= m.sorted;
+            // The gate travels with the ranges it guards, so it is the MIN over
+            // every served file: an unknown stamp drops it to `i64::MIN`, which
+            // admits every stamped Delta row — the safe direction.
+            if versioned {
+                plan.version_gate = Some(plan.version_gate.unwrap_or(i64::MAX).min(m.max_stamp.unwrap_or(i64::MIN)));
+            }
+            if m.covers_window && files_per_bucket.get(&m.bucket_id) == Some(&1) {
+                plan.ranges.push(m.range());
+            }
+            plan
+        })
+}
+
 /// mmap + validate + decode. `require_alignment` is the arrow-rs knob that
 /// turns a silent realigning COPY into an error — production reads leave it
 /// off (correctness over strictness), tests turn it on to prove the
@@ -1300,6 +1371,91 @@ mod tests {
         // Out-of-range windows must not select it.
         assert!(tier.buckets_in_range("p1", "otel_logs_and_spans", Some((201, 300))).is_empty());
         assert!(tier.buckets_in_range("other", "otel_logs_and_spans", None).is_empty());
+    }
+
+    fn meta(bucket_id: i64, min_ts: i64, end_ts: i64, covers_window: bool, sorted: bool, max_stamp: Option<i64>) -> HotBucketMeta {
+        HotBucketMeta { bucket_id, seq: 0, min_ts, end_ts, bytes: 1, sorted, max_stamp, covers_window, path: PathBuf::from(format!("b{bucket_id}-{min_ts}")) }
+    }
+
+    /// Every claim the leg makes is a function of METADATA, so a lazy leg can
+    /// fix them before decoding a row. Each rule is checked by flipping exactly
+    /// one input away from a fully-claiming baseline.
+    #[test]
+    fn plan_leg_derives_every_claim_from_metadata_alone() {
+        let full = vec![meta(1, 0, 10, true, true, Some(7)), meta(2, 20, 30, true, true, Some(9))];
+        let p = plan_leg(&full, &[], true, true);
+        assert_eq!(p, LegPlan { served: vec![0, 1], ranges: vec![(0, 10), (20, 30)], version_gate: Some(7), sorted: true }, "baseline claims everything");
+
+        // A table that declares no sorting columns cannot claim an ordering
+        // however its files are marked; one unsorted file retracts the claim
+        // for the whole leg, because the source declares ONE ordering.
+        assert!(!plan_leg(&full, &[], true, false).sorted, "no declared sorting columns => no claim");
+        let mixed = vec![full[0].clone(), meta(2, 20, 30, true, false, Some(9))];
+        assert!(!plan_leg(&mixed, &[], true, true).sorted, "one unsorted file retracts the leg's ordering");
+        assert_eq!(plan_leg(&mixed, &[], true, true).ranges, p.ranges, "...but it still serves and still excludes");
+
+        // The gate is the MIN over served files, and an unknown stamp drops it
+        // to i64::MIN — admitting every stamped Delta row, never hiding one.
+        assert_eq!(plan_leg(&full, &[], false, true).version_gate, None, "a table that appends no versions needs no gate");
+        let unstamped = vec![full[0].clone(), meta(2, 20, 30, true, true, None)];
+        assert_eq!(plan_leg(&unstamped, &[], true, true).version_gate, Some(i64::MIN), "an unknown stamp admits everything");
+
+        // `covers_window` is necessary but not sufficient: a bucket demoted
+        // more than once holds only PART of its span in each file.
+        let partial = vec![meta(1, 0, 10, false, true, Some(7)), full[1].clone()];
+        assert_eq!(plan_leg(&partial, &[], true, true).ranges, vec![(20, 30)], "an incomplete drain claims no window");
+        let split = vec![meta(1, 0, 10, true, true, Some(7)), meta(1, 0, 10, true, true, Some(8)), full[1].clone()];
+        let p = plan_leg(&split, &[], true, true);
+        assert_eq!(p.ranges, vec![(20, 30)], "two files for one bucket: neither may claim the span");
+        assert_eq!(p.served, vec![0, 1, 2], "...though both still SERVE their rows");
+    }
+
+    /// A file MemBuffer still owns contributes nothing AND excludes nothing —
+    /// but it still counts against its bucket, or the sibling that survives
+    /// would claim a window the two of them only jointly cover.
+    #[test]
+    fn plan_leg_skips_files_membuffer_still_owns_without_forfeiting_their_bucket() {
+        let metas = vec![meta(1, 0, 10, true, true, Some(7)), meta(2, 20, 30, true, true, Some(9))];
+        let p = plan_leg(&metas, &[(5, 15)], true, true);
+        assert_eq!(p.served, vec![1], "the overlapped file is skipped whole");
+        assert_eq!(p.ranges, vec![(20, 30)], "and excludes nothing, so that window falls through to Delta");
+        assert_eq!(p.version_gate, Some(9), "a skipped file does not constrain the gate");
+
+        // Both halves of a twice-demoted bucket, one of them mem-owned.
+        let split = vec![meta(1, 0, 10, true, true, Some(7)), meta(1, 10, 20, true, true, Some(8))];
+        let p = plan_leg(&split, &[(12, 14)], true, true);
+        assert_eq!(p.served, vec![0], "the mem-owned half is skipped");
+        assert!(p.ranges.is_empty(), "the survivor must NOT claim the bucket's span — it holds half of it");
+    }
+
+    /// The contract that lets the eager path be replaced. Unfiltered, the two
+    /// agree exactly. Under a predicate that empties every file they diverge —
+    /// `plan_leg` still excludes, because it cannot see emptiness — and that
+    /// divergence is only sound once the rows are streamed rather than admitted
+    /// under a budget. See `LegPlan`.
+    #[tokio::test]
+    async fn plan_leg_agrees_with_the_eager_path_except_where_only_streaming_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        for i in 0..4i64 {
+            tier.demote("p1", "t", Bucket { bucket_id: i, batches: &[batch(8)], min_ts: i * 100, max_ts: i * 100 + 10, covers_window: true });
+        }
+        let metas = tier.buckets_in_range("p1", "t", None);
+        let eager = tier.read_leg(&metas, &[], &[], &schema(), None, false, false);
+        let plan = plan_leg(&metas, &[], false, false);
+        assert_eq!(plan.ranges, eager.ranges, "unfiltered, the metadata claims are exactly the eager ones");
+        assert_eq!(plan.served.len(), eager.partitions.len());
+        assert_eq!((plan.version_gate, plan.sorted), (eager.version_gate, eager.sorted));
+
+        // A predicate no row satisfies: the eager path sees the emptiness and
+        // withholds every exclusion; `plan_leg` cannot, and excludes all four.
+        // That is SAFE because the same predicate empties the Delta copy of
+        // those windows identically — an excluded window with no rows on either
+        // side loses nothing.
+        let never = vec![datafusion::prelude::col("ts").lt(datafusion::prelude::lit(i64::MIN))];
+        let eager = tier.read_leg(&metas, &[], &never, &schema(), None, false, false);
+        assert!(eager.ranges.is_empty() && eager.partitions.is_empty(), "the eager path serves and excludes nothing");
+        assert_eq!(plan_leg(&metas, &[], false, false).ranges.len(), 4, "the lazy plan still excludes — the predicate empties Delta identically");
     }
 
     /// The hot leg projects to the requested columns BEFORE filtering, keeps a
