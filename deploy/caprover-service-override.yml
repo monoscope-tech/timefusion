@@ -12,6 +12,22 @@ EndpointSpec:
       TargetPort: 50051
       PublishedPort: 50051
       PublishMode: ingress
+TaskTemplate:
+  # The cgroup limit is TimeFusion's ONLY memory knob: the self-sizing budget
+  # tree derives every pool from it at startup (`detected_limit_gb`), so setting
+  # it by hand after a deploy is not a tuning detail, it is the whole config.
+  #
+  # It lives HERE because a deploy rewrites the service spec and clobbers any
+  # limit set with `docker service update`. That has now happened repeatedly —
+  # most recently 2026-08-14, when a deploy reset it from 120G to 96G and the
+  # box OOM-looped for twelve hours at a ceiling nobody had chosen.
+  #
+  # 120 GiB of the host's 188 GB, leaving room for monoscope and the collectors.
+  Resources:
+    Limits:
+      MemoryBytes: 128849018880
+    Reservations:
+      MemoryBytes: 34359738368
 UpdateConfig:
   Parallelism: 1
   Delay: 100000000
