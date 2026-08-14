@@ -6141,5 +6141,4 @@ mod tests {
         assert_eq!(s.demote_skipped_total, 0, "nothing this small may be skipped");
         assert_eq!(s.demote_queued_bytes, 0, "the queue drains back to zero");
     }
-
 }

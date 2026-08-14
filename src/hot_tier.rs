@@ -156,7 +156,6 @@ pub fn skip_for_lookback(lookback: Option<i64>) -> bool {
     lookback.is_none()
 }
 
-
 /// One demoted bucket file. `[min_ts, end_ts)` is the file's ACTUAL row range,
 /// not its bucket window, and is HALF-OPEN — the same convention as
 /// `MemBuffer::get_bucket_ranges`, so both feed the Delta exclusion unchanged.
