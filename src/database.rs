@@ -13323,27 +13323,44 @@ pub(crate) fn process_memory_bytes() -> Option<usize> {
     if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
         && let Ok(v) = raw.trim().parse::<usize>()
     {
-        // Discount the INACTIVE file cache. `memory.current` counts it, but the
-        // kernel reclaims it before OOM-killing anything, so charging it to the
-        // brake is charging pressure that does not exist — and it is not small:
-        // prod 2026-08-01 read 88.4 GB current = 75.6 GB anon + 11.7 GB
-        // inactive file. That 11.7 GB brought the brake forward by the same
-        // amount, and since the brake means "no maintenance AT ALL", it shortens
-        // the post-restart window in which compaction and dedup can make any
-        // progress (19.8k-deep dirty-bin backlog, 14 bins processed per process
-        // lifetime). Active file cache is left charged: it is being read now and
-        // reclaiming it costs IO.
-        return Some(v.saturating_sub(cgroup_inactive_file_bytes().unwrap_or(0)));
+        // Discount CLEAN page cache — all of it, active included. The kernel
+        // reclaims a clean file page before it OOM-kills anything, so charging
+        // it is charging pressure that does not exist.
+        //
+        // This used to discount only `inactive_file`, on the reasoning that an
+        // active page "is being read now and reclaiming it costs IO". That
+        // reasoning cost performance, not safety, and it stopped being tenable
+        // when the hot tier became a large uncompressed local store that is
+        // DESIGNED to be read constantly: its pages are promoted to active on
+        // second touch and demoted only under pressure, so `active_file` grows
+        // to fill whatever memory is free. Prod 2026-08-15 read 91.4 GB current
+        // = 54.5 GB anon + 20.6 GB active file + 15.0 GB inactive file, i.e.
+        // 88% of an 80 GB budget of which a quarter was the tier's own reads.
+        // The brake means "no maintenance AT ALL", so the tier was starving the
+        // compaction that keeps queries fast — a feedback loop where caching
+        // more makes the process believe it has less.
+        //
+        // It also poisons the RATE the scan valve differentiates: a hot-tier
+        // scan streaming at 450 MB/s reads exactly like a 450 MB/s heap burst.
+        // Discounting clean cache leaves `used` anon-dominated, which is the
+        // only series where growth actually predicts a kill.
+        return Some(v.saturating_sub(cgroup_reclaimable_file_bytes().unwrap_or(0)));
     }
     crate::metrics::process_rss_bytes()
 }
 
-/// `inactive_file` from cgroup v2 `memory.stat` — the page cache the kernel
-/// drops first under pressure. `None` when unreadable (the caller then charges
-/// the full `memory.current`, i.e. today's behaviour).
-fn cgroup_inactive_file_bytes() -> Option<usize> {
-    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?;
-    raw.lines().find_map(|l| l.strip_prefix("inactive_file ")?.trim().parse().ok())
+/// Clean page cache from cgroup v2 `memory.stat`. `None` when unreadable (the
+/// caller then charges the full `memory.current`, the conservative direction).
+fn cgroup_reclaimable_file_bytes() -> Option<usize> {
+    reclaimable_file_bytes(&std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?)
+}
+
+/// `file` less the part that cannot be dropped without first writing it back.
+/// Dirty and under-writeback pages stay charged: reclaim has to wait on IO for
+/// them, so they are pressure in a way a clean page never is.
+fn reclaimable_file_bytes(stat: &str) -> Option<usize> {
+    let field = |name: &str| stat.lines().find_map(|line| line.strip_prefix(name)?.trim().parse::<usize>().ok());
+    Some(field("file ")?.saturating_sub(field("file_dirty ").unwrap_or(0) + field("file_writeback ").unwrap_or(0)))
 }
 
 /// Host free memory: `MemAvailable` from /proc/meminfo, which inside a
@@ -17411,6 +17428,30 @@ mod tests {
         // The absolute backstop survives: a burst too fast to project still
         // trips on level alone.
         assert_eq!(pressure_permit_claim_at(96, u64::MAX, 16), 16);
+    }
+
+    /// The hot tier's own reads must not read as memory pressure.
+    ///
+    /// Verbatim `memory.stat` from prod 2026-08-15, where charging `active_file`
+    /// put the brake at 88% of an 80 GB budget and starved compaction. Only
+    /// `anon` + kernel is unreclaimable there; the 35.6 GB of file cache is the
+    /// tier being read, and the kernel drops it rather than kill the process.
+    #[test]
+    fn clean_page_cache_is_not_charged_as_memory_pressure() {
+        const PROD: &str = "anon 54533181440\nfile 35626905600\nkernel 1233899520\nfile_mapped 526012416\n\
+                            file_dirty 99794944\nfile_writeback 0\ninactive_file 14998753280\nactive_file 20628152320\n";
+        let current: usize = 91_423_989_760;
+        let limit: usize = 85_899_345_920;
+
+        let reclaimable = super::reclaimable_file_bytes(PROD).expect("`file` is present");
+        assert_eq!(reclaimable, 35_626_905_600 - 99_794_944, "dirty pages stay charged; every other file page does not");
+
+        let charged = current - reclaimable;
+        assert_eq!(charged * 100 / limit, 65, "prod read 88% while only 65% of the budget was unreclaimable");
+        // The anon+kernel figure this is standing in for, within rounding.
+        assert!(charged.abs_diff(54_533_181_440 + 1_233_899_520) < 200_000_000, "charged must track anon + kernel, not the page cache");
+
+        assert_eq!(super::reclaimable_file_bytes("anon 1\n"), None, "no `file` line means charge everything");
     }
 
     /// spawn_cron_job must fire on the wall-clock schedule (regression: the
