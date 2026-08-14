@@ -47,7 +47,6 @@ use tracing::{debug, info, warn};
 
 use crate::mem_buffer::{TableKey, compile_filter_conjunction, overlaps, table_key};
 
-
 const EXT: &str = "arrow";
 const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
 /// magic + minimal footer + trailer; anything shorter is definitionally torn.
@@ -283,7 +282,6 @@ pub struct HotTierStats {
     /// [`MAX_SUPPRESSED_ROWS`].
     pub suppressed: Vec<(TableKey, i64)>,
 }
-
 
 #[derive(Default)]
 pub struct HotTier {
@@ -614,8 +612,8 @@ impl HotTier {
     /// through to Delta — slower, never wrong.
     #[allow(clippy::too_many_arguments)]
     pub fn scan(
-        self: &Arc<Self>, project_id: &str, table_name: &str, query_range: Option<(i64, i64)>, mem_ranges: &[(i64, i64)], filters: &[Expr],
-        schema: &SchemaRef, projection: Option<&Vec<usize>>,
+        self: &Arc<Self>, project_id: &str, table_name: &str, query_range: Option<(i64, i64)>, mem_ranges: &[(i64, i64)], filters: &[Expr], schema: &SchemaRef,
+        projection: Option<&Vec<usize>>,
     ) -> HotLeg {
         let metas = self.buckets_in_range(project_id, table_name, query_range);
         if metas.is_empty() {
@@ -928,7 +926,7 @@ fn plan_columns(projection: Option<&[usize]>, filters: &[Expr], schema: &SchemaR
 fn footer_is_readable(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
 
-    use arrow_ipc::{root_as_footer, reader::read_footer_length};
+    use arrow_ipc::{reader::read_footer_length, root_as_footer};
     (|| -> anyhow::Result<bool> {
         let mut f = fs::File::open(path)?;
         let len = f.metadata()?.len();
