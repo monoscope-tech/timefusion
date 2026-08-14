@@ -21,12 +21,16 @@
 //! parsing the uuid string as a datetime errors out.
 //!
 //! Fix. After the plan is built and before pgwire reads placeholder types,
-//! walk the tree, find Values nodes, and wrap each untyped placeholder in
-//! `CAST($N AS <values_column_type>)`. The Values column types ARE correct
+//! walk the tree, find Values nodes, and stamp each placeholder's own `field`
+//! with its Values column's field. The Values column types ARE correct
 //! (they've been unified through the Projection), so this makes the
 //! placeholders' types match what pgwire needs to ship back to the client.
 //! Invoked from the `plan_cache` miss path so every parsed plan goes
 //! through it once before being cached.
+//!
+//! This is deliberately a rewrite IN PLACE and not a wrapper: it must not add
+//! a node per cell, because a prepared statement retains its whole plan for
+//! the life of the connection. See `rewrite_plan`.
 
 use std::sync::{
     Arc, OnceLock,
@@ -41,7 +45,7 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     common::tree_node::{Transformed, TreeNode},
-    logical_expr::{Cast, Expr, LogicalPlan, Values},
+    logical_expr::{Expr, LogicalPlan, Values, expr::Placeholder},
 };
 use tracing::warn;
 
@@ -57,14 +61,22 @@ pub fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
                 .map(|row| {
                     row.into_iter()
                         .zip(schema.fields())
-                        // Always wrap in Cast. Even if the Placeholder's inferred `field`
-                        // already has a matching type, that information is only set
-                        // reliably for row-1 placeholders in a multi-row VALUES; row-2+
-                        // get `field: None` and so `get_parameter_types()` reports them as
-                        // unknown. The explicit Cast forces extract_placeholder_cast_types
-                        // to pick up every placeholder.
+                        // Type the placeholder IN PLACE rather than wrapping it. DataFusion
+                        // only sets `field` reliably for row-1 placeholders in a multi-row
+                        // VALUES — row-2+ get `None`, so `get_parameter_types()` reports
+                        // them as unknown and pgwire infers positionally from row 1.
+                        // Stamping the Values column's own field fixes that at zero cost:
+                        // `get_parameter_types()` reads `Placeholder::field` directly, so
+                        // datafusion-postgres never falls back to
+                        // `extract_placeholder_cast_types`.
+                        //
+                        // This used to wrap each cell in `CAST($N AS <ty>)`, which is one
+                        // extra `Expr` + `Box` PER CELL. A 350-row x 68-column metrics
+                        // batch is ~23.8k cells, so the plan ran to ~10 MB — and prepared
+                        // statements retain one plan each (see the fork's `ParsedStatement`),
+                        // which is what OOM-killed prod every 30-60 min on 2026-08-14.
                         .map(|(expr, f)| match expr {
-                            Expr::Placeholder(_) => Expr::Cast(Cast::new(Box::new(expr), f.data_type().clone())),
+                            Expr::Placeholder(p) => Expr::Placeholder(Placeholder::new_with_field(p.id, Some(Arc::clone(f)))),
                             _ => expr,
                         })
                         .collect()
@@ -207,6 +219,79 @@ pub fn observe_batch(table: &str, batch: &RecordBatch) {
             batch.column_by_name(field.name()).and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>()).and_then(datafusion::arrow::compute::max)
     {
         observe_stamp(table, max);
+    }
+}
+
+#[cfg(test)]
+mod coerce_tests {
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema, TimeUnit},
+        common::tree_node::TreeNodeRecursion,
+        datasource::MemTable,
+        prelude::SessionContext,
+        sql::{
+            parser::Statement as DfStatement,
+            sqlparser::{dialect::PostgreSqlDialect, parser::Parser},
+        },
+    };
+
+    use super::*;
+
+    /// `INSERT INTO t (ts, id, name) VALUES ($1,$2,$3), ($4,$5,$6), ...` planned
+    /// and coerced, the way the pgwire Parse path does it.
+    async fn coerced_insert(rows: usize) -> LogicalPlan {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap())).unwrap();
+        let tuples: Vec<String> = (0..rows).map(|r| format!("(${},${},${})", r * 3 + 1, r * 3 + 2, r * 3 + 3)).collect();
+        let sql = format!("INSERT INTO t (ts, id, name) VALUES {}", tuples.join(","));
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, &sql).unwrap().remove(0);
+        rewrite_plan(ctx.state().statement_to_plan(DfStatement::Statement(Box::new(ast))).await.unwrap())
+    }
+
+    fn count_exprs(plan: &LogicalPlan, mut pred: impl FnMut(&Expr) -> bool) -> usize {
+        let mut n = 0;
+        plan.apply(|node| {
+            node.apply_expressions(|e| {
+                e.apply(|e| {
+                    n += usize::from(pred(e));
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })
+        .unwrap();
+        n
+    }
+
+    /// The original bug: row-2+ placeholders came back untyped, so pgwire
+    /// inferred them positionally from row 1 and a uuid in column 2 got parsed
+    /// as a timestamptz.
+    #[tokio::test]
+    async fn every_placeholder_in_every_row_is_typed() {
+        let plan = coerced_insert(3).await;
+        let types = plan.get_parameter_types().unwrap();
+        assert_eq!(types.len(), 9, "one entry per placeholder");
+        for i in 1..=9 {
+            let got = types.get(&format!("${i}")).unwrap_or_else(|| panic!("${i} missing"));
+            let expect = if i % 3 == 1 { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) } else { DataType::Utf8 };
+            assert_eq!(got.as_ref(), Some(&expect), "${i} must carry its own column's type, not row 1's");
+        }
+    }
+
+    /// The coercion must cost NOTHING per cell. It used to wrap each placeholder
+    /// in `CAST($N AS ty)` — one extra `Expr` + `Box` per cell — which on a
+    /// 350x68 metrics batch is ~23.8k nodes and ~10 MB of plan. Prepared
+    /// statements retain a plan each, so that OOM-killed prod on 2026-08-14.
+    #[tokio::test]
+    async fn coercion_adds_no_nodes_per_cell() {
+        let plan = coerced_insert(10).await;
+        let casts = count_exprs(&plan, |e| matches!(e, Expr::Cast(_)));
+        assert_eq!(casts, 0, "placeholders must be typed in place, never wrapped in a per-cell Cast");
+        assert_eq!(count_exprs(&plan, |e| matches!(e, Expr::Placeholder(_))), 30, "all 30 placeholders survive the rewrite");
     }
 }
 
