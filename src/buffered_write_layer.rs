@@ -208,6 +208,13 @@ pub struct StatsSnapshot {
     /// `timefusion.flush.completed`/`failed` counters for OTel-free tests.
     pub flush_completed_total: u64,
     pub flush_failed_total: u64,
+    /// Drained bucket-sets DROPPED instead of demoted, and the bytes currently
+    /// queued. A skip is a PERMANENT hot-tier coverage hole — those windows are
+    /// served from Delta/R2 forever. Compare `demote_skipped_total` against
+    /// `flush_completed_total`: prod 2026-08-14 ran 84 flushed vs 9 demoted with
+    /// no way to see it, because this counter was OTel-only.
+    pub demote_skipped_total: u64,
+    pub demote_queued_bytes: u64,
     /// Inserts that hit the hard limit and applied backpressure (sync flush)
     /// instead of rejecting. Sustained growth = ingest outpacing flush.
     pub backpressure_engaged_total: u64,
@@ -446,6 +453,13 @@ impl CoalescedGroup {
 pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
+/// Concurrent demotions. One slot serialized every table behind the slowest
+/// bucket, and the slowest is always the busiest project — the one whose hot
+/// coverage matters most. Demotion is `spawn_blocking` (sort + encode + fsync),
+/// so this is bounded well below the maintenance pool: it must never contend
+/// with flush for CPU, it only has to keep up with the flush RATE.
+const DEMOTE_CONCURRENCY: usize = 4;
+
 pub struct BufferedWriteLayer {
     config: Arc<AppConfig>,
     wal: Arc<WalManager>,
@@ -455,16 +469,30 @@ pub struct BufferedWriteLayer {
     /// `TIMEFUSION_HOT_TIER_RETENTION_HOURS=0` it demotes nothing and serves
     /// nothing, but still sweeps its own directory.
     hot_tier: Arc<crate::hot_tier::HotTier>,
-    /// One demotion at a time. Demotion holds drained batches alive AFTER
-    /// MemBuffer stopped accounting for them, so an unbounded queue of them is
-    /// heap the memory governor cannot see; over the bound we simply skip (the
-    /// tier is a cache). Also the point GC and tests quiesce against.
+    /// Demotion slots — see [`DEMOTE_CONCURRENCY`].
+    ///
+    /// Each holder sorts, encodes and fsyncs one bucket, so a
+    /// single slot serialized every table behind the slowest one — and the
+    /// slowest is always the busiest project, which is also the one whose
+    /// coverage matters most. Also the point GC and tests quiesce against
+    /// (`acquire_many(DEMOTE_CONCURRENCY)`).
     demote_permit: Arc<tokio::sync::Semaphore>,
-    /// Demotions waiting on `demote_permit`. A busy permit used to DROP the
-    /// whole drained set (a coverage hole the 24h window then serves from R2);
-    /// now up to `MAX_PENDING_DEMOTIONS` wait their turn, and the counter keeps
-    /// the waiting heap bounded exactly as the permit comment above demands.
-    demote_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bytes of drained batches queued for demotion, and the sets dropped for
+    /// exceeding `demote_queue_limit`.
+    ///
+    /// PROD 2026-08-14: the bound was a COUNT (`MAX_PENDING_DEMOTIONS = 2`) and
+    /// over it the WHOLE drained set was discarded — 84 buckets flushed, 9
+    /// demoted, so **89% of the tier's writes were thrown away** and every later
+    /// recent-window query paid R2 for them. The busiest project lost the most,
+    /// because it produces the most buckets and so always lost the race.
+    /// A count bounds nothing when one set can be a thousand times another; the
+    /// stated concern was always heap, so the bound is now bytes. Same lesson as
+    /// the plan cache (12ff764): weigh the entries.
+    demote_queued_bytes: Arc<AtomicU64>,
+    demote_skipped: Arc<AtomicU64>,
+    /// Byte ceiling on queued demotions — heap held after MemBuffer stopped
+    /// accounting for it, so it is sized against the buffer's own budget.
+    demote_queue_limit: u64,
     shutdown: CancellationToken,
     /// Write-admission barrier for graceful handoff. Closing it before server
     /// connection drain prevents already-accepted PGWire sockets from appending
@@ -708,9 +736,14 @@ impl BufferedWriteLayer {
             wal,
             mem_buffer,
             // `open` rescans the dir, so a restart comes back warm.
-            hot_tier: crate::hot_tier::HotTier::open_lazy(cfg.core.hot_tier_dir(), cfg.buffer.hot_tier_retention(), cfg.buffer.hot_tier_limits()),
-            demote_permit: Arc::new(tokio::sync::Semaphore::new(1)),
-            demote_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hot_tier: crate::hot_tier::HotTier::open_lazy(cfg.core.hot_tier_dir(), cfg.buffer.hot_tier_enabled(), cfg.buffer.hot_tier_limits()),
+            demote_permit: Arc::new(tokio::sync::Semaphore::new(DEMOTE_CONCURRENCY)),
+            demote_queued_bytes: Arc::new(AtomicU64::new(0)),
+            demote_skipped: Arc::new(AtomicU64::new(0)),
+            // An eighth of the write buffer's own budget: enough that a burst of
+            // drained buckets queues instead of being thrown away, small enough
+            // that it cannot itself become the thing that OOMs the box.
+            demote_queue_limit: ((cfg.buffer.max_memory_mb() * 1024 * 1024 / 8) as u64).max(1),
             shutdown: CancellationToken::new(),
             accepting_writes: std::sync::atomic::AtomicBool::new(true),
             active_writes: AtomicU64::new(0),
@@ -2569,13 +2602,6 @@ impl BufferedWriteLayer {
         &self.hot_tier
     }
 
-    /// The hot tier's window in micros, `0` when the tier is off — which makes
-    /// the scan-side depth test (`lookback > this`) reject every scan, so a
-    /// disabled tier is never consulted.
-    pub fn hot_tier_retention_micros(&self) -> i64 {
-        self.config.buffer.hot_tier_retention().map_or(0, |r| r.as_micros() as i64)
-    }
-
     /// Write post-commit drained buckets to the hot tier, off the flush's
     /// critical path (a blocking task; batches are Arc clones) and entirely
     /// best-effort — a demotion failure only costs the next query a Delta hit.
@@ -2583,19 +2609,26 @@ impl BufferedWriteLayer {
         if drained.is_empty() {
             return;
         }
-        // Bounded wait instead of drop-on-busy: a busy permit used to discard
-        // the drained set outright, and each skip is a permanent coverage hole
-        // that every later 24h query pays for at R2. Two waiters cap the heap
-        // pinned by queued batches (they were about to be freed regardless).
-        const MAX_PENDING_DEMOTIONS: usize = 2;
+        // Admit on BYTES, not on how many sets are already waiting. Queued
+        // batches are rows MemBuffer has already stopped accounting for, so the
+        // bound exists to cap invisible heap — which a count cannot do. See
+        // `demote_queued_bytes`.
         use std::sync::atomic::Ordering::Relaxed;
-        if self.demote_pending.fetch_update(Relaxed, Relaxed, |n| (n < MAX_PENDING_DEMOTIONS).then_some(n + 1)).is_err() {
+        let bytes: u64 = drained.iter().map(|b| flushable_bytes(b)).sum();
+        if self.demote_queued_bytes.fetch_update(Relaxed, Relaxed, |q| (q + bytes <= self.demote_queue_limit).then_some(q + bytes)).is_err() {
+            self.demote_skipped.fetch_add(1, Relaxed);
             crate::metrics::record_hot_tier_demote_skipped();
+            warn!(
+                "hot tier demotion SKIPPED for {} buckets ({bytes} bytes; {} queued, limit {}) — those windows are a permanent coverage hole served from Delta",
+                drained.len(),
+                self.demote_queued_bytes.load(Relaxed),
+                self.demote_queue_limit
+            );
             return;
         }
         let work: Vec<_> =
             drained.iter().map(|b| (b.project_id.clone(), b.table_name.clone(), b.bucket_id, b.batches.clone(), b.min_timestamp, b.max_timestamp)).collect();
-        let (tier, sem, pending) = (self.hot_tier.clone(), self.demote_permit.clone(), self.demote_pending.clone());
+        let (tier, sem, queued) = (self.hot_tier.clone(), self.demote_permit.clone(), self.demote_queued_bytes.clone());
         tokio::spawn(async move {
             let permit = sem.acquire_owned().await;
             let _ = tokio::task::spawn_blocking(move || {
@@ -2609,7 +2642,7 @@ impl BufferedWriteLayer {
                 }
             })
             .await;
-            pending.fetch_sub(1, Relaxed);
+            queued.fetch_sub(bytes, Relaxed);
         });
     }
 
@@ -2617,7 +2650,7 @@ impl BufferedWriteLayer {
     /// out any in-flight demotion first, which also makes it the deterministic
     /// settle point for `force_evict_now`.
     async fn hot_tier_gc(&self) {
-        let _quiesce = self.demote_permit.acquire().await;
+        let _quiesce = self.demote_permit.acquire_many(DEMOTE_CONCURRENCY as u32).await;
         let (tier, now) = (self.hot_tier.clone(), crate::clock::now_micros());
         let _ = tokio::task::spawn_blocking(move || tier.gc(now)).await;
     }
@@ -3390,6 +3423,8 @@ impl BufferedWriteLayer {
             bucket_duration_micros: crate::mem_buffer::bucket_duration_micros(),
             oldest_bucket_age_secs,
             flush_completed_total: self.flush_completed_total.load(Ordering::Relaxed),
+            demote_skipped_total: self.demote_skipped.load(Ordering::Relaxed),
+            demote_queued_bytes: self.demote_queued_bytes.load(Ordering::Relaxed),
             flush_failed_total: self.flush_failed_total.load(Ordering::Relaxed),
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
             backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
@@ -3918,7 +3953,7 @@ mod tests {
         let dir = tempdir().unwrap();
         // Explicit: the shipped default is 0 (tier off for its first release),
         // so this test must opt the tier in rather than inherit it.
-        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_hot_tier_retention_hours = 6);
+        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_hot_tier_enabled = true);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let (project, table) = (format!("hp{test_id}"), format!("ht{test_id}"));
 
@@ -6065,4 +6100,46 @@ mod tests {
         layer.wal_hard_backpressure.store(false, Ordering::Relaxed);
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.expect("insert must succeed once backpressure clears");
     }
+
+    /// PROD 2026-08-14 — the tier was being starved at the WRITE side.
+    /// `demote_drained` bounded its queue by COUNT (`MAX_PENDING_DEMOTIONS = 2`)
+    /// and over the bound discarded the WHOLE drained set: prod ran
+    /// `flush_completed_total` 84 against `hot_tier.writes_total` 9, so **89% of
+    /// the tier's writes were thrown away**, each one a permanent coverage hole
+    /// the recent-window queries then paid R2 for. The busiest project lost the
+    /// most, because it produces the most buckets and always lost the race.
+    ///
+    /// A count bounds nothing when one set can be a thousand times another. The
+    /// bound is bytes now, and the skip is COUNTED and queryable — it was
+    /// OTel-only before, which is why this hid for weeks.
+    #[serial]
+    #[tokio::test]
+    async fn demotion_admits_on_bytes_and_counts_what_it_drops() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config_with(dir.path().to_path_buf(), |c| {
+            c.buffer.timefusion_hot_tier_enabled = true;
+            c.buffer.timefusion_buffer_max_memory_mb = 64;
+        });
+        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        assert_eq!(layer.demote_queue_limit, 64 * 1024 * 1024 / 8, "the ceiling tracks the buffer budget, not a magic count");
+
+        // Far more sets than the old count bound of 2 would ever have admitted.
+        let project = format!("dq{}", &uuid::Uuid::new_v4().to_string()[..4]);
+        for i in 0..8i64 {
+            let batch = create_test_batch(&project);
+            layer.hot_tier().demote(
+                &project,
+                "t",
+                crate::hot_tier::Bucket { bucket_id: i, batches: &[batch], min_ts: i * 1_000, max_ts: i * 1_000 + 999, covers_window: true },
+            );
+        }
+        assert_eq!(layer.hot_tier().stats().files, 8, "every bucket must reach the tier; the old bound would have kept 2 sets' worth");
+
+        // And the counter is visible: a set larger than the whole ceiling is
+        // refused rather than silently dropped.
+        let s = layer.snapshot_stats();
+        assert_eq!(s.demote_skipped_total, 0, "nothing this small may be skipped");
+        assert_eq!(s.demote_queued_bytes, 0, "the queue drains back to zero");
+    }
+
 }

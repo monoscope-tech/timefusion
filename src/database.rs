@@ -16326,7 +16326,7 @@ impl TableProvider for ProjectRoutingTable {
         // DEDUP: a non-empty hot leg forces the union path below, which never
         // sets `skip_dedup` — see `HotTier::scan`'s dedup contract (the hot leg
         // serves pre-dedup rows and relies on `DedupExec`).
-        let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters), layer.hot_tier_retention_micros());
+        let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters));
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
         let hot_plan_started = std::time::Instant::now();
         let hot: crate::hot_tier::HotLeg = match skip_delta || too_deep {

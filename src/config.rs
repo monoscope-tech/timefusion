@@ -649,40 +649,21 @@ const_default!(d_flush_interval: u64 = 60);
 // they assert "sealed => next tick flushes"). See flush_completed_buckets.
 const_default!(d_flush_dwell_secs: i64 = -1);
 const_default!(d_retention_mins: u64 = 70);
-// ON by default since 2026-08-02. It shipped at 0 (OFF) for its first
-// release — a new disk + page-cache consumer on a memory-tight box (host-level
-// OOM kills, 2026-07-31) — with the note "flip this default once soaked". Prod
-// has run TIMEFUSION_HOT_TIER_RETENTION_HOURS=6 since, so this is that flip:
-// the default now matches the soaked deployment instead of leaving the tier
-// dependent on an env var that a fresh deployment would silently omit.
+// The local hot tier: demoted sealed buckets served as the scan's third leg.
 //
-// Disk is bounded by `d_hot_tier_max_disk_gb`, independent of this value;
-// raising it costs disk and page cache, not process memory.
-// 24h since 2026-08-02: dashboards' widest recent window is 24h, and
-// `skip_for_lookback`'s 2x-retention ceiling made anything past 12h skip the
-// tier entirely. Disk must scale with it (6h held ~24GB => 24h ~ 96GB) or
-// oldest-first GC silently shrinks the effective window back down.
-//
-// 72h since 2026-08-09, and the "disk must scale with it" caveat above is
-// exactly the point rather than an objection. Prod profiling found the 1h/3d
-// cliff to be a plan-shape flip: `HotLegPooledExec` serves every 1h query in
-// 0.3-1.0 s, and the moment a window leaves the tier the same query costs
-// 17-31 s. Meanwhile the tier sat at 79.6 GB of its 128 GB cap — a quarter of
-// the disk bought and unused, because an hour count, not the disk, was the
-// binding constraint.
-//
-// Raising it is SELF-LIMITING, which is what makes this safe: `HotTier::gc`
-// already unlinks by age "then oldest-first until under the disk cap", so the
-// cap simply binds first and the tier holds as many hours as the disk affords
-// (~40h at the measured 79.6 GB/24h) instead of stopping short of it. Heap is
-// bounded by the query's own memory pool (`HotTier::scan` streams), and depth
-// by `skip_for_lookback`, so neither scales with this number.
-//
-// Raise `d_hot_tier_max_disk_gb` to convert disk into coverage: a full 72h
-// needs ~240 GB, which the 128 GB cap does not have today. That is a capacity
-// decision, not a code one, and until it is made the cap is the real window.
-const_default!(d_hot_tier_retention_hours: u64 = 72);
-const_default!(d_hot_tier_max_disk_gb: u64 = 128);
+// It holds WHATEVER FITS ON DISK (2026-08-14) — there is no time retention.
+// It used to keep a fixed number of hours (6 -> 24 -> 72), which made the tier's
+// value depend on guessing the right number and left disk unused: prod ran a
+// 128GB cap on a box with 1.1TB free. GC now unlinks oldest-first purely to stay
+// under `d_hot_tier_max_disk_gb`, so buying disk buys coverage directly, and
+// `skip_for_lookback` reads the tier's MEASURED span rather than a setting.
+const_default!(d_hot_tier_enabled: bool = true);
+// 600GB of the box's 1.1TB free. Files are UNCOMPRESSED since 2026-08-14
+// (~4x the bytes of the LZ4 era), so this holds roughly the coverage the old
+// 128GB compressed cap did — bought with disk that was sitting idle instead of
+// with decompression CPU and anon heap. Raise it to buy more history; that is
+// now the only knob that changes how far back the tier reaches.
+const_default!(d_hot_tier_max_disk_gb: u64 = 600);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
@@ -1386,8 +1367,8 @@ pub struct BufferConfig {
     /// This is the tier's main switch — hours of window; **0 turns demotion
     /// off** (GC still sweeps, so the directory can't strand bytes). Past this
     /// age a demoted file is unlinked and its window falls back to Delta.
-    #[serde(default = "d_hot_tier_retention_hours")]
-    pub timefusion_hot_tier_retention_hours: u64,
+    #[serde(default = "d_hot_tier_enabled")]
+    pub timefusion_hot_tier_enabled: bool,
     /// Hard cap on the tier's directory; over it, GC unlinks oldest-first. The
     /// tier shares the WAL/data volume, which has twice been eaten by an
     /// unbounded consumer (273GB of orphaned spill dirs, 238GB of tantivy
@@ -1504,10 +1485,11 @@ impl BufferConfig {
     pub fn retention_mins(&self) -> u64 {
         self.timefusion_buffer_retention_mins.max(1)
     }
-    /// Hot-tier window, `None` when `TIMEFUSION_HOT_TIER_RETENTION_HOURS=0`
-    /// (the tier's off switch: no demotion, no third scan leg, no disk use).
-    pub fn hot_tier_retention(&self) -> Option<Duration> {
-        (self.timefusion_hot_tier_retention_hours > 0).then(|| Duration::from_secs(self.timefusion_hot_tier_retention_hours * 3_600))
+    /// `TIMEFUSION_HOT_TIER_ENABLED=false` is the tier's off switch: no
+    /// demotion, no third scan leg, no disk use. There is no time retention —
+    /// the tier holds whatever `hot_tier_limits().max_disk_bytes` affords.
+    pub fn hot_tier_enabled(&self) -> bool {
+        self.timefusion_hot_tier_enabled
     }
     /// The tier's only ceiling. Per-scan heap needs no knob: `HotTier::scan`
     /// streams its files inside the query's own memory pool.

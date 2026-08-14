@@ -183,6 +183,11 @@ impl StatsTableProvider {
                         "backpressure_force_flush_total" => s.backpressure_force_flush_total,
                         "flush_completed_total" => s.flush_completed_total,
                         "flush_failed_total" => s.flush_failed_total,
+                        // A skip is a PERMANENT hot-tier coverage hole. Compare
+                        // against flush_completed_total: sustained skips mean the
+                        // tier is not holding the recent window it exists for.
+                        "demote_skipped_total" => s.demote_skipped_total,
+                        "demote_queued_bytes" => s.demote_queued_bytes,
                         // Ingest-vs-drain: both climb in steady state. If ingested pulls
                         // ahead of flushed while pressure_pct=100 and flush_failed_total is
                         // flat, ingest is outpacing a working drain (throughput wedge) —

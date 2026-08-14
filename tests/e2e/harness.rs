@@ -551,7 +551,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
-    cfg.buffer.timefusion_hot_tier_retention_hours = args.hot_tier_retention_hours;
+    cfg.buffer.timefusion_hot_tier_enabled = args.hot_tier_retention_hours > 0;
     if let Some(b) = args.sort_skip_bytes {
         cfg.maintenance.timefusion_sort_skip_bytes = b;
     }

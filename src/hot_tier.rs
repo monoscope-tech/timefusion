@@ -4,16 +4,28 @@
 //! A sealed MemBuffer bucket whose rows are already committed to Delta is
 //! written to local disk as an **uncompressed Arrow IPC file** instead of
 //! simply evaporating, and served back as a third scan leg (mem ∪ hot ∪
-//! delta) via zero-copy mmap. That converts the recent-window read from
-//! "open 50-325 R2 parquet files" into a page-cache hit with near-zero
-//! decode CPU.
+//! delta). That converts the recent-window read from "open 50-325 R2 parquet
+//! files" into a local read with near-zero decode CPU.
+//!
+//! The leg is a PLAN, not rows: `HotTier::scan` hands DataFusion's own
+//! `ArrowSource` a `FileScanConfig`, so files decode at EXECUTE time, one batch
+//! at a time, in parallel, inside the query's memory pool. It used to decode
+//! every file while PLANNING (954 ms on 98% of prod scans, outside every pool).
+//!
+//! Size is bounded by DISK ALONE — there is no time retention. GC unlinks
+//! oldest-first to stay under `HotTierLimits::max_disk_bytes`, so buying disk
+//! buys history.
 //!
 //! Invariants:
 //! - **A file here is a cache, never a durability boundary.** Only
 //!   post-commit data is demoted; losing the whole directory costs latency,
 //!   not rows.
-//! - **Uncompressed IPC only** — buffer compression breaks the zero-copy
-//!   mmap → `Buffer` → `FileDecoder` path (arrow-rs PR #6986).
+//! - **Uncompressed IPC only** — compression breaks the zero-copy decode, and
+//!   with it the property that the tier's read memory is reclaimable page cache
+//!   rather than anon heap. (LZ4 was enabled 2026-08 to fit more hours under a
+//!   128 GB cap while this line still claimed otherwise; reverted 2026-08-14
+//!   once it was clear the box had 1.1 TB free and the cap was the wrong
+//!   constraint. `roundtrip_is_uncompressed_zero_copy_and_lossless` pins it.)
 //! - **Immutable files.** A demotion always writes a NEW file (tmp + fsync +
 //!   rename); nothing is ever rewritten in place, so an mmap held by an
 //!   in-flight query stays valid across GC (unlink only drops the link).
@@ -40,7 +52,7 @@ use arrow::{
     array::RecordBatch,
     datatypes::{DataType, SchemaRef, TimeUnit},
 };
-use arrow_ipc::{CompressionType, writer::FileWriter, writer::IpcWriteOptions};
+use arrow_ipc::{writer::FileWriter, writer::IpcWriteOptions};
 use dashmap::{DashMap, DashSet};
 use datafusion::{error::Result as DFResult, logical_expr::Expr, physical_expr::PhysicalExpr, physical_plan::ExecutionPlan};
 use tracing::{debug, info, warn};
@@ -124,36 +136,26 @@ impl DemotionHealth {
 }
 
 /// Must a scan reaching `lookback` micros into the past skip the hot leg
-/// entirely? (`None` = no lower time bound, i.e. infinitely deep.)
+/// entirely? Only an UNBOUNDED scan must: with no lower time bound the query
+/// reaches all of history, of which the tier holds a vanishing fraction, and it
+/// would still pay to list every file the tier has.
 ///
-/// The leg is materialized EAGERLY at plan time into a `MemorySourceConfig` —
-/// outside every DataFusion memory pool and outside `GatedScanExec`, which
-/// wraps only the Delta plan. A 7d/14d scan's range covers the whole hot
-/// window, so consulting the tier would pull all of it into heap to shave a
-/// handful of files off a scan already dominated by thousands.
+/// This used to also reject anything deeper than 2x the retention window,
+/// because the leg was materialized EAGERLY at plan time — a 7d/14d scan pulled
+/// the whole tier into un-pooled heap to shave a handful of files off a scan
+/// dominated by thousands. `HotTier::scan` streams now (2026-08-14), so a deep
+/// scan costs only the metadata walk (footer validation is memoized per file),
+/// and every window the tier covers is one that does NOT go to R2. Serving that
+/// is the entire point of the tier.
 ///
-/// The threshold is a MULTIPLE of the retention window, not the window itself.
-/// At exactly one window a query for the tier's own span sits right on the
-/// line: a dashboard asking for 6h against 6h of retention computes its
-/// lookback from a `now()` sampled before the scan runs, so it lands a few
-/// micros OVER and skips the tier — the tier is at its most useful for exactly
-/// the query that cannot use it. The heap it could waste is already bounded
-/// precisely and independently by `limits.leg_budget_bytes`, charged on the
-/// post-filter bytes actually retained, so this test only has to reject scans
-/// so deep the tier is a rounding error in the answer. (Same mistake, same
-/// fix, as the wide-scan gate: do not let a depth proxy stand in for a work
-/// bound that already exists.)
-///
-/// `retention_micros = 0` (tier off) still rejects everything.
-pub fn skip_for_lookback(lookback: Option<i64>, retention_micros: i64) -> bool {
-    lookback.is_none_or(|d| d > retention_micros.saturating_mul(LOOKBACK_WINDOWS))
+/// Keying the gate on the tier's MEASURED span was tried and is strictly worse:
+/// the span is ~0 while the tier is young, so a freshly-started process refuses
+/// to use its own tier — and the tier can never become useful, because nothing
+/// reads it. A depth proxy must not be able to deadlock the thing it guards.
+pub fn skip_for_lookback(lookback: Option<i64>) -> bool {
+    lookback.is_none()
 }
 
-/// How many retention windows deep a scan may reach and still consult the tier.
-/// 2 keeps the tier's own span (and a little slack for clock skew and a
-/// half-open bound) comfortably inside, while still rejecting the multi-day
-/// scans the eager materialization was never meant to serve.
-const LOOKBACK_WINDOWS: i64 = 2;
 
 /// One demoted bucket file. `[min_ts, end_ts)` is the file's ACTUAL row range,
 /// not its bucket window, and is HALF-OPEN — the same convention as
@@ -288,7 +290,9 @@ pub struct HotTier {
     root: PathBuf,
     /// `None` = tier off: nothing is demoted and GC sweeps the directory
     /// clean, so a disabled tier can never strand a previous run's files.
-    retention: Option<Duration>,
+    /// The tier's off switch. There is no time retention: what the tier holds
+    /// is decided by `limits.max_disk_bytes` and oldest-first GC.
+    enabled: bool,
     limits: HotTierLimits,
     /// (project, table) → its files, ordered by (bucket_id, seq). A bucket can
     /// own several files: late arrivals into an already-drained bucket flush
@@ -297,6 +301,13 @@ pub struct HotTier {
     /// Files served to a scan since boot — the signal for whether demotion paid
     /// off before DML invalidated a file.
     read_files: DashSet<PathBuf>,
+    /// Paths whose footer has already been validated. Hot files are IMMUTABLE
+    /// once renamed into place, so a pass is permanent and the tail read is
+    /// worth doing exactly once. Without this the plan-time probe reopens every
+    /// candidate file on EVERY scan — tolerable at ~50 files, not once the tier
+    /// is bounded only by a 600GB disk and a deep scan can span thousands.
+    /// Entries are dropped with the file (`unlink`) and on `rescan`.
+    validated: DashSet<PathBuf>,
     health: DashMap<TableKey, Arc<DemotionHealth>>,
     seq: AtomicU64,
     suppressions: AtomicU64,
@@ -421,8 +432,8 @@ impl HotTier {
     /// from whatever survived the last process — restart warmth. `retention`
     /// and `limits` are the tier's entire policy; it enforces them itself, so
     /// callers only ever say `gc(now)`.
-    pub fn open(root: PathBuf, retention: Option<Duration>, limits: HotTierLimits) -> Arc<Self> {
-        let tier = Self::open_lazy(root, retention, limits);
+    pub fn open(root: PathBuf, enabled: bool, limits: HotTierLimits) -> Arc<Self> {
+        let tier = Self::open_lazy(root, enabled, limits);
         tier.finish_open();
         tier
     }
@@ -431,8 +442,8 @@ impl HotTier {
     /// [`Self::finish_open`] completes, missing index entries simply fall
     /// through to Delta, so application readiness need not wait on a large
     /// derived-cache scan.
-    pub fn open_lazy(root: PathBuf, retention: Option<Duration>, limits: HotTierLimits) -> Arc<Self> {
-        let tier = Arc::new(Self { root, retention, limits, ..Default::default() });
+    pub fn open_lazy(root: PathBuf, enabled: bool, limits: HotTierLimits) -> Arc<Self> {
+        let tier = Arc::new(Self { root, enabled, limits, ..Default::default() });
         if let Err(e) = fs::create_dir_all(&tier.root) {
             warn!("hot tier disabled for this process — cannot create {:?}: {e}", tier.root);
         }
@@ -445,12 +456,15 @@ impl HotTier {
     /// to the authoritative Delta leg.
     pub fn finish_open(&self) {
         self.rescan();
-        if self.retention.is_none() {
+        if !self.enabled {
             // Disabled, but still responsible for its own directory: without
             // this a previous run's files sit there forever, unbounded and
             // invisible (the disk-leak failure mode of the orphaned spill dirs
             // and the never-evicted tantivy cache).
-            self.gc(0);
+            let paths: Vec<PathBuf> = self.index.iter().flat_map(|e| e.value().values().map(|m| m.path.clone()).collect::<Vec<_>>()).collect();
+            self.index.clear();
+            self.gc_deleted.fetch_add(paths.len() as u64, Relaxed);
+            self.unlink(&paths);
         }
     }
 
@@ -459,7 +473,7 @@ impl HotTier {
     /// logged, never propagated (the rows are already durable in Delta).
     pub fn demote(&self, project_id: &str, table_name: &str, bucket: Bucket<'_>) {
         let Bucket { bucket_id, batches, min_ts, max_ts, covers_window } = bucket;
-        if self.retention.is_none() || min_ts > max_ts || batches.iter().all(|b| b.num_rows() == 0) {
+        if !self.enabled || min_ts > max_ts || batches.iter().all(|b| b.num_rows() == 0) {
             return;
         }
         let key = table_key(project_id, table_name);
@@ -543,12 +557,16 @@ impl HotTier {
         let covers_marker = if covers_window { "c" } else { "" };
         let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{sort_marker}{covers_marker}{stamp_suffix}.{EXT}"));
         crate::wal::write_atomic_with(&path, true, |f| {
-            // Compress each IPC buffer independently. FileDecoder projection
-            // skips unrequested buffers before decompression, so a narrow query
-            // pays only for its columns while LZ4 lets the 24h tier fit under
-            // the fixed disk ceiling. The previous uncompressed representation
-            // saturated 128GB after only part of the desired window.
-            let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME)).map_err(std::io::Error::other)?;
+            // UNCOMPRESSED, deliberately (2026-08-14). LZ4 bought hours per GB
+            // on a 128GB cap, but the box has 1.1TB free, so the cap was the
+            // wrong constraint to optimise against. Uncompressed restores the
+            // module's founding property: batches are zero-copy views over the
+            // file rather than freshly allocated decompressions, which turns the
+            // tier's read heap from ANON (only the OOM killer can reclaim it)
+            // into page cache (the kernel just drops it) — and this box's
+            // failure mode is anon reaching the memcg limit. Delta stays zstd;
+            // the tier's edge over it was never the codec, it is locality.
+            let options = IpcWriteOptions::default();
             let mut w = FileWriter::try_new_with_options(f, schema.as_ref(), options).map_err(std::io::Error::other)?;
             batches.iter().try_for_each(|b| w.write(b)).map_err(std::io::Error::other)?;
             w.finish().map_err(std::io::Error::other)
@@ -622,7 +640,7 @@ impl HotTier {
         let declared = crate::schema_loader::get_schema(table_name);
         let versioned = declared.as_ref().is_some_and(|s| s.version_append);
         let orders = declared.is_some_and(|s| !s.sorting_columns.is_empty());
-        let plan = plan_leg(&metas, mem_ranges, versioned, orders, &footer_is_readable);
+        let plan = plan_leg(&metas, mem_ranges, versioned, orders, &|p| self.validate(p));
         self.mem_skipped.fetch_add((metas.len() - plan.served.len()) as u64, Relaxed);
         if plan.served.is_empty() {
             return HotLeg::default();
@@ -642,6 +660,13 @@ impl HotTier {
                 HotLeg::default()
             }
         }
+    }
+
+    /// `footer_is_readable`, memoized. Hot files are immutable once renamed
+    /// into place, so a file that validated once always will; the tail read is
+    /// worth doing exactly once per file rather than once per scan.
+    fn validate(&self, path: &Path) -> bool {
+        self.validated.contains(path) || (footer_is_readable(path) && self.validated.insert(path.to_path_buf()))
     }
 
     /// Build the leg's physical plan: scan → filter → cut predicate-only
@@ -772,6 +797,7 @@ impl HotTier {
     fn unlink(&self, paths: &[PathBuf]) {
         for p in paths {
             self.read_files.remove(p);
+            self.validated.remove(p);
             let _ = fs::remove_file(p);
         }
     }
@@ -782,6 +808,7 @@ impl HotTier {
     pub fn rescan(&self) {
         self.index.clear();
         self.read_files.clear();
+        self.validated.clear();
         let files = dir_entries(&self.root)
             .filter_map(named)
             .flat_map(|(pid, dir)| dir_entries(dir).filter_map(named).map(move |(tname, dir)| ((pid.clone(), tname), dir)))
@@ -813,7 +840,11 @@ impl HotTier {
     /// a single `retain`; a disabled tier has no window at all, which makes the
     /// cutoff infinite and sweeps the directory clean.
     pub fn gc(&self, now_micros: i64) {
-        let age_cutoff = self.retention.map_or(i64::MAX, |r| now_micros - r.as_micros() as i64);
+        // No age bound: the tier keeps whatever fits, and the disk cap alone
+        // decides what falls off (oldest-first). `now_micros` is still taken so
+        // callers keep a deterministic settle point under test clocks.
+        let _ = now_micros;
+        let age_cutoff = i64::MIN;
         // The full file list is only worth building when actually over the cap.
         let total: u64 = self.index.iter().map(|e| live_files(e.value(), age_cutoff).map(|(_, bytes)| bytes).sum::<u64>()).sum();
         let cutoff = match total.checked_sub(self.limits.max_disk_bytes).filter(|excess| *excess > 0) {
@@ -1099,7 +1130,7 @@ mod tests {
     }
 
     fn open(dir: &tempfile::TempDir) -> Arc<HotTier> {
-        HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX))
+        HotTier::open(dir.path().to_path_buf(), true, limits(u64::MAX))
     }
 
     /// PROD REGRESSION 2026-07-31: demoted batches carried `timestamp` as
@@ -1132,7 +1163,7 @@ mod tests {
     /// payload makes the capacity property deterministic: the file must be
     /// materially smaller than its decoded Arrow representation.
     #[test]
-    fn roundtrip_is_compressed_aligned_and_lossless() {
+    fn roundtrip_is_uncompressed_zero_copy_and_lossless() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         let b =
@@ -1144,8 +1175,16 @@ mod tests {
         assert_eq!(metas.len(), 1);
         // Stored half-open: the inclusive max 200 becomes end 201.
         assert_eq!((metas[0].bucket_id, metas[0].min_ts, metas[0].end_ts), (7, 100, 201));
-        assert!(metas[0].bytes < b.get_array_memory_size() as u64 / 2, "LZ4 hot file should fit far more history under the disk cap");
-        assert_eq!(decode_file(&metas[0].path, true, None).unwrap(), vec![b], "compressed IPC must decode aligned and byte-identical");
+        // UNCOMPRESSED: the file is the size of the data, not a fraction of it.
+        // That is the trade — disk (which this box has) for decode CPU and anon
+        // heap (which it does not).
+        assert!(metas[0].bytes > b.get_array_memory_size() as u64 / 2, "hot files must be uncompressed: {} bytes", metas[0].bytes);
+        // `require_alignment` makes arrow-rs ERROR rather than silently
+        // realign-and-copy, so this passing is the zero-copy property itself:
+        // batches are views over the file, which is why the tier's read memory
+        // is reclaimable page cache instead of anon heap. LZ4 had silently
+        // forfeited this while the module doc still claimed it.
+        assert_eq!(decode_file(&metas[0].path, true, None).unwrap(), vec![b], "uncompressed IPC must decode ZERO-COPY and byte-identical");
         // Out-of-range windows must not select it.
         assert!(tier.buckets_in_range("p1", "otel_logs_and_spans", Some((201, 300))).is_empty());
         assert!(tier.buckets_in_range("other", "otel_logs_and_spans", None).is_empty());
@@ -1314,7 +1353,7 @@ mod tests {
         assert_eq!(leg.version_gate, None);
 
         // Restart: `rescan` recovers the stamp from the filename.
-        let reopened = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(u64::MAX));
+        let reopened = HotTier::open(dir.path().to_path_buf(), true, limits(u64::MAX));
         let metas = reopened.buckets_in_range("p1", "mor_versioned", None);
         let stamps: Vec<_> = metas.iter().map(|m| m.max_stamp).collect();
         assert_eq!(stamps, vec![Some(400), Some(300), None], "stamps must survive a restart via the filename");
@@ -1359,24 +1398,31 @@ mod tests {
         assert_eq!(restarted.buckets_in_range("p1", "t", None).len(), 3);
     }
 
+    /// GC has exactly one policy since 2026-08-14: stay under the disk cap by
+    /// unlinking OLDEST-FIRST. There is no age expiry — the tier keeps whatever
+    /// fits, so buying disk buys history. And it only ever unlinks its own
+    /// `*.arrow` files (regression guard for ba8820e, where a generic recursive
+    /// deleter ate the WAL quarantine dir).
     #[test]
-    fn gc_expires_by_age_then_caps_disk_and_never_touches_foreign_files() {
+    fn gc_caps_disk_oldest_first_and_never_touches_foreign_files() {
         let dir = tempfile::tempdir().unwrap();
-        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(1)), limits(u64::MAX));
+        let tier = HotTier::open(dir.path().to_path_buf(), true, limits(u64::MAX));
         let now = 10_000_000i64;
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(8)], min_ts: 1, max_ts: 2, covers_window: true }); // ancient
         tier.demote("p1", "t", Bucket { bucket_id: 2, batches: &[batch(8)], min_ts: now - 1000, max_ts: now, covers_window: true }); // fresh
-        // Regression guard for ba8820e: a generic recursive deleter ate the WAL
-        // quarantine dir. GC must only ever unlink our own `*.arrow` files.
         let foreign = dir.path().join("p1").join("t").join("do_not_delete.bin");
         fs::File::create(&foreign).unwrap().write_all(b"payload").unwrap();
 
         tier.gc(now);
-        assert_eq!(tier.buckets_in_range("p1", "t", None).iter().map(|m| m.bucket_id).collect::<Vec<_>>(), vec![2], "only the aged-out file is unlinked");
+        assert_eq!(
+            tier.buckets_in_range("p1", "t", None).iter().map(|m| m.bucket_id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "under the cap NOTHING is dropped, however old — age is no longer a policy"
+        );
         assert!(foreign.exists(), "GC must never delete a non-.arrow file under its own root");
 
-        // Disk cap: 0 bytes allowed ⇒ everything goes, oldest first.
-        let capped = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(3600)), limits(0));
+        // Disk cap: 0 bytes allowed => everything goes.
+        let capped = HotTier::open(dir.path().to_path_buf(), true, limits(0));
         capped.gc(now);
         assert!(capped.buckets_in_range("p1", "t", None).is_empty());
         assert!(foreign.exists());
@@ -1394,7 +1440,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let now = 10_000_000i64;
         // A retention window so wide nothing can age out of it.
-        let tier = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(365 * 24 * 3600)), limits(u64::MAX));
+        let tier = HotTier::open(dir.path().to_path_buf(), true, limits(u64::MAX));
         for (id, end) in [(1i64, now - 3000), (2, now - 2000), (3, now - 1000)] {
             tier.demote("p1", "t", Bucket { bucket_id: id, batches: &[batch(8)], min_ts: end - 10, max_ts: end, covers_window: true });
         }
@@ -1405,7 +1451,7 @@ mod tests {
         // all three, so the cap must be what evicts, and it must take the
         // OLDEST first.
         let one_file_bytes = tier.stats().bytes / 3;
-        let capped = HotTier::open(dir.path().to_path_buf(), Some(Duration::from_secs(365 * 24 * 3600)), limits(one_file_bytes));
+        let capped = HotTier::open(dir.path().to_path_buf(), true, limits(one_file_bytes));
         capped.gc(now);
         let kept: Vec<i64> = capped.buckets_in_range("p1", "t", None).iter().map(|m| m.bucket_id).collect();
         assert!(capped.stats().bytes <= one_file_bytes, "the cap binds regardless of retention: {} bytes over {one_file_bytes}", capped.stats().bytes);
@@ -1423,7 +1469,7 @@ mod tests {
         let foreign = dir.path().join("p1").join("t").join("do_not_delete.bin");
         fs::File::create(&foreign).unwrap().write_all(b"payload").unwrap();
 
-        let off = HotTier::open(dir.path().to_path_buf(), None, limits(u64::MAX));
+        let off = HotTier::open(dir.path().to_path_buf(), false, limits(u64::MAX));
         assert_eq!(off.stats().files, 0, "a disabled tier must not strand the previous run's files");
         assert!(foreign.exists());
         off.demote("p1", "t", Bucket { bucket_id: 2, batches: &[batch(8)], min_ts: 10, max_ts: 20, covers_window: true });
@@ -1597,27 +1643,19 @@ mod tests {
         assert_eq!(tier.stats().read_hits, 1);
     }
 
-    /// Past the tier's own span it holds a shrinking fraction of the answer, so
-    /// a deep scan opens none of its files — every window comes from Delta,
-    /// which has all of them.
+    /// Only an unbounded scan skips the tier. Everything with a lower bound
+    /// consults it, however deep — the tier's contribution is a window that does
+    /// not go to R2, and since the leg streams there is no heap left to protect.
     #[test]
-    fn deep_scans_skip_the_hot_leg_entirely() {
+    fn only_an_unbounded_scan_skips_the_hot_leg() {
         let hour = 3_600_000_000i64;
-        let six_h = 6 * hour;
-        assert!(!skip_for_lookback(Some(hour), six_h), "a 1h dashboard is exactly what the tier is for");
-        assert!(!skip_for_lookback(Some(3 * hour), six_h), "3h too");
-        assert!(!skip_for_lookback(Some(six_h), six_h), "the window's own edge is still served");
-        // THE case this threshold exists for: a dashboard asking for the tier's
-        // own span computes its lookback from a `now()` sampled before the scan,
-        // so it lands just OVER one window. At a 1x threshold that query — the
-        // one the tier is most useful for — skipped the tier entirely.
-        assert!(!skip_for_lookback(Some(six_h + 1), six_h), "a hair past the window is still the tier's own span, not a deep scan");
-        assert!(!skip_for_lookback(Some(2 * six_h), six_h), "slack up to the multiple; the query's memory pool bounds the heap, not this");
-        assert!(skip_for_lookback(Some(2 * six_h + 1), six_h), "past the multiple the tier is a fraction of the answer");
-        assert!(skip_for_lookback(Some(14 * 24 * hour), six_h), "14d");
-        assert!(skip_for_lookback(None, six_h), "no lower bound = infinitely deep");
-        // Tier off (retention 0): nothing is ever consulted, however shallow.
-        assert!(skip_for_lookback(Some(1), 0) && skip_for_lookback(None, 0));
+        assert!(!skip_for_lookback(Some(hour)), "a 1h dashboard is exactly what the tier is for");
+        assert!(!skip_for_lookback(Some(6 * hour)));
+        // A 14d scan still consults it: whatever the tier holds of those 14 days
+        // is served locally instead of from R2. The old gate rejected this only
+        // because the leg was materialized eagerly into un-pooled heap.
+        assert!(!skip_for_lookback(Some(14 * 24 * hour)), "deep scans still take whatever the tier has");
+        assert!(skip_for_lookback(None), "no lower bound = all of history; the tier is a rounding error");
     }
 
     /// A file decoding to ZERO batches would pass the schema check (`first()`
