@@ -47,7 +47,7 @@ use datafusion::{
     },
     common::{
         ParamValues,
-        tree_node::{Transformed, TreeNode},
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     error::Result as DfResult,
     logical_expr::{Cast, Expr, LogicalPlan, Values, dml::WriteOp},
@@ -82,29 +82,156 @@ fn soft_cap<K: Eq + std::hash::Hash, V>(map: &DashMap<K, V>, cap: usize) {
     }
 }
 
-/// Canonical-SQL bytes the verbatim plan cache may retain per slot of
-/// `capacity` — i.e. the size it assumes a cached statement has.
+/// Estimated retained bytes per `Expr` node in a cached plan.
 ///
-/// `capacity` alone counts ENTRIES, which is only a bound when entries are
-/// entry-sized. A pgwire bulk INSERT's is not: `insert_coerce::rewrite_plan`
-/// wraps every `$N` inside `Values` with a `CAST`, so one 500-row x 88-column
-/// batch is ~44k `Cast` nodes, and the canonical text includes every tuple —
-/// so each distinct BATCH SIZE is a distinct key holding a distinct multi-MB
-/// plan. A client that varies its batch size therefore fills all 1024 slots
-/// with plans that are each thousands of times bigger than a SELECT's.
+/// Derived from what one node actually costs: the `Expr` enum itself, the `Box`
+/// its children hang off, the placeholder's `id` `String`, and the `DataType`
+/// clones — call it ~384 B. It only has to be right to an order of magnitude;
+/// its job is to stop a bound from being wrong by 20x, not to be exact.
 ///
-/// Prod 2026-08-13 measured exactly that: cloning plans, exprs and casts
-/// accounted for ~55% of all heap growth across three dumps taken minutes
-/// apart (3.8 -> 6.1 -> 9.6 GiB), and the box was OOM-killed every 10-30
-/// minutes.
+/// Sanity check against the incident that produced it: a 350-row x 68-column
+/// metrics INSERT is ~23.8k placeholder nodes ≈ 9 MB, and prod held ~350 such
+/// shapes on each of 30 connections. That is the ~100 GB the box died at.
+const PLAN_BYTES_PER_EXPR: usize = 384;
+
+/// Plan bytes a cache may retain per slot of `capacity`.
 ///
-/// The key's length is the weight. It is the text the plan was built from and
-/// the plan scales with it — ~30x expansion at the 88-column schema. 8 KiB is
-/// several times the longest dashboard SELECT, so the two bounds bind in the
-/// intended order: statement variety trips the count, statement SIZE trips the
-/// bytes. At the default 1024 slots the budget is 8 MiB of text, a few hundred
-/// MB of plans — a bound where there was none.
-const PLAN_CACHE_TEXT_BYTES_PER_SLOT: usize = 8 * 1024;
+/// The bound must be expressed in the units of the thing being bounded. The
+/// previous version weighed the CANONICAL SQL TEXT and assumed "~30x expansion"
+/// to plan bytes. Measured on prod 2026-08-14 the expansion was **~600x** —
+/// 16.8 MB of retained text against ~14 GiB of retained plan — so the cache
+/// believed it held 16 MiB while holding GiBs, and the byte bound bounded
+/// nothing. Weigh the plan.
+const PLAN_CACHE_PLAN_BYTES_PER_SLOT: usize = 128 * 1024;
+
+/// After a byte crossing, sweep down to this fraction of the budget.
+///
+/// Without hysteresis the sweep evicts to `max_bytes - 1` and the very next
+/// insert re-crosses it: prod logged **1036 sweeps in 10 minutes** (~1.7/s),
+/// each one sorting the whole map, while `text_bytes` sat pinned just over the
+/// cap forever. A sweep that does not leave headroom is not a sweep, it is a
+/// per-insert full scan.
+const SWEEP_LOW_WATER_NUM: usize = 1;
+const SWEEP_LOW_WATER_DEN: usize = 2;
+
+/// Estimated retained size of a plan, in bytes. See [`PLAN_BYTES_PER_EXPR`].
+fn plan_bytes(plan: &LogicalPlan) -> usize {
+    let mut nodes = 0usize;
+    // Infallible: the closures never return Err.
+    let _ = plan.apply_with_subqueries(|p| {
+        p.apply_expressions(|e| {
+            e.apply(|_| {
+                nodes += 1;
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    nodes.saturating_mul(PLAN_BYTES_PER_EXPR)
+}
+
+/// A `DashMap` bounded by BOTH entry count and total entry WEIGHT.
+///
+/// Counting entries bounds nothing when entry sizes vary by 1000x, which is
+/// exactly the plan-cache workload: a bulk INSERT's plan is millions of times
+/// bigger than a dashboard SELECT's. Each entry therefore carries the weight it
+/// was admitted with, so the sweep never has to re-walk the values it is
+/// ranking and the counter cannot drift from the map it bounds.
+struct WeighedMap<V> {
+    map: DashMap<String, (V, usize)>,
+    capacity: usize,
+    max_bytes: usize,
+    bytes: AtomicUsize,
+    /// Single-flight guard: `sweep` write-locks each shard in turn, so an
+    /// unsynchronized stampede would serialize every reader behind N sweeps.
+    sweeping: AtomicBool,
+}
+
+impl<V: Clone> WeighedMap<V> {
+    fn new(capacity: usize, bytes_per_slot: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            map: DashMap::new(),
+            capacity,
+            max_bytes: capacity.saturating_mul(bytes_per_slot),
+            bytes: AtomicUsize::new(0),
+            sweeping: AtomicBool::new(false),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<V> {
+        self.map.get(key).map(|e| e.value().0.clone())
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes.load(Relaxed)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    /// Admit `value` at `weight`, sweeping first if either bound is crossed.
+    ///
+    /// An entry heavier than the whole budget is NOT admitted: it would evict
+    /// everything else on the next crossing and still not survive, so it would
+    /// cost the whole cache to store nothing.
+    fn insert(&self, key: String, value: V, weight: usize, label: &'static str) {
+        if (self.map.len() >= self.capacity || self.bytes() >= self.max_bytes) && !self.sweeping.swap(true, AcqRel) {
+            self.sweep(label);
+            self.sweeping.store(false, Release);
+        }
+        if weight < self.max_bytes {
+            self.bytes.fetch_add(weight, Relaxed);
+            if let Some((_, prev)) = self.map.insert(key, (value, weight)) {
+                self.bytes.fetch_sub(prev, Relaxed);
+            }
+        }
+    }
+
+    /// Evict HEAVIEST-FIRST down to the low-water mark.
+    ///
+    /// Heaviest-first, not `soft_cap`'s random half: the bytes are owed by a
+    /// handful of bulk INSERTs while the population is mostly small dashboard
+    /// SELECTs, so a random half would keep paying the pressure AND throw away
+    /// the hot templates that make the cache worth having. Dropping the biggest
+    /// frees the budget in the fewest evictions, which is also the smallest hit
+    /// to the hit rate.
+    fn sweep(&self, label: &'static str) {
+        let low_water = self.max_bytes / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM;
+        // Operator-visible: the workload has more distinct plan templates than
+        // the cache can hold. Expect the next queries to re-pay state.optimize().
+        warn!(
+            target: "plan_cache",
+            cache = label,
+            size = self.map.len(),
+            capacity = self.capacity,
+            bytes = self.bytes(),
+            max_bytes = self.max_bytes,
+            low_water,
+            "plan_cache over budget — evicting heaviest-first down to the low-water mark. If this fires steadily, the workload's plan-template variety has grown past the cache budget."
+        );
+        let mut by_weight: Vec<(usize, String)> = self.map.iter().map(|e| (e.value().1, e.key().clone())).collect();
+        by_weight.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        // Both bounds are swept in one pass: drop while EITHER is exceeded.
+        let mut held = self.bytes();
+        let mut len = self.map.len();
+        for (weight, key) in by_weight {
+            if held <= low_water && len < self.capacity {
+                break;
+            }
+            if self.map.remove(&key).is_some() {
+                held = held.saturating_sub(weight);
+                len -= 1;
+            }
+        }
+        self.bytes.store(held, Relaxed);
+    }
+}
+
 
 /// Walk a plan and replace every `CAST(Literal(v), T)` with `Literal(cast(v, T))`.
 ///
@@ -387,8 +514,7 @@ pub fn global() -> Option<Arc<PlanCacheHook>> {
 /// that just clears the cache once exceeded — cheap, correct, and never holds
 /// a lock across the await in `handle_simple_query`.
 pub struct PlanCacheHook {
-    cache: DashMap<String, LogicalPlan>,
-    capacity: usize,
+    cache: WeighedMap<LogicalPlan>,
     hits: AtomicU64,
     misses: AtomicU64,
     /// Shape cache for LITERAL-bearing SELECTs (generated dashboard SQL that
@@ -398,7 +524,10 @@ pub struct PlanCacheHook {
     /// query's actual literals (cast to the inferred types) — skipping parse,
     /// analyze, AND optimize. `None` = negative entry: this shape failed to
     /// plan/parameterize once; don't retry it per query.
-    shapes: DashMap<String, Option<ShapeEntry>>,
+    /// Bounded by WEIGHT as well as count. It holds `LogicalPlan`s exactly like
+    /// `cache` does, and was previously bounded by entry count alone — the same
+    /// bug 12ff764 fixed for `cache` and never applied here.
+    shapes: WeighedMap<Option<ShapeEntry>>,
     /// Canonical texts we served a pre-optimized substituted plan for, so
     /// `was_pre_optimized` can tell the handler to skip `state.optimize()`.
     /// Literal-bearing texts are one-shot (next dashboard refresh has new
@@ -412,14 +541,6 @@ pub struct PlanCacheHook {
     /// of being bypassed. Off by default — it's the hot dashboard path, so enable
     /// deliberately (TIMEFUSION_PLAN_CACHE_TIME_FNS=1) after canarying.
     time_fn_shapes: bool,
-    /// Single-flight guard for the capacity sweep — see `cached_plan`.
-    evicting: AtomicBool,
-    /// Summed key length of `cache`, against `max_text_bytes`. Maintained
-    /// incrementally because the sweep it feeds runs on the Parse path;
-    /// re-summed from the survivors after each sweep, which is rare.
-    cache_text_bytes: AtomicUsize,
-    /// `capacity` slots at `PLAN_CACHE_TEXT_BYTES_PER_SLOT` each.
-    max_text_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -725,18 +846,14 @@ impl Default for PlanCacheHook {
 impl PlanCacheHook {
     pub fn new(capacity: usize, time_fn_shapes: bool) -> Self {
         Self {
-            cache: DashMap::new(),
-            capacity: capacity.max(1),
+            cache: WeighedMap::new(capacity, PLAN_CACHE_PLAN_BYTES_PER_SLOT),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
-            shapes: DashMap::new(),
+            shapes: WeighedMap::new(capacity, PLAN_CACHE_PLAN_BYTES_PER_SLOT),
             served: DashMap::new(),
             shape_hits: AtomicU64::new(0),
             shape_skips: AtomicU64::new(0),
             time_fn_shapes,
-            evicting: AtomicBool::new(false),
-            cache_text_bytes: AtomicUsize::new(0),
-            max_text_bytes: capacity.max(1).saturating_mul(PLAN_CACHE_TEXT_BYTES_PER_SLOT),
         }
     }
 
@@ -795,7 +912,7 @@ impl PlanCacheHook {
     /// this shape failed to plan once; don't retry per query.
     async fn get_or_build_shape(&self, shape_key: &str, param_stmt: Statement, value_count: usize, session_context: &SessionContext) -> Option<ShapeEntry> {
         if let Some(e) = self.shapes.get(shape_key) {
-            return e.value().clone(); // Some(entry) hit / None negative
+            return e; // Some(entry) hit / None negative
         }
         // Build the placeholder plan once for this shape. The error is logged
         // rather than swallowed so we can see WHY a shape negative-caches in prod
@@ -818,10 +935,10 @@ impl PlanCacheHook {
         if built.is_none() {
             self.shape_skips.fetch_add(1, Relaxed);
         }
-        // Shape variety should be tiny in steady state, so the same soft cap the
-        // template cache uses is enough.
-        soft_cap(&self.shapes, self.capacity);
-        self.shapes.insert(shape_key.to_string(), built.clone());
+        // Shape entries hold a `LogicalPlan` just like template entries, so they
+        // get the same WEIGHED bound. A negative entry weighs only its key.
+        let weight = built.as_ref().map_or(0, |e| plan_bytes(&e.plan)) + shape_key.len();
+        self.shapes.insert(shape_key.to_string(), built.clone(), weight, "shape");
         built
     }
 
@@ -941,7 +1058,7 @@ impl PlanCacheHook {
         if let Some(plan) = self.cache.get(&canonical) {
             self.hits.fetch_add(1, Relaxed);
             debug!(target: "plan_cache", %canonical, "plan cache hit");
-            return Some(Ok(plan.clone()));
+            return Some(Ok(plan));
         }
 
         // Miss: build the plan, install it, hand a clone back to caller.
@@ -968,66 +1085,12 @@ impl PlanCacheHook {
             Ok(p) => p,
             Err(e) => return Some(Err(api_err(e))),
         };
-        // Overflow sweep, on EITHER bound: entry count, or the retained text
-        // bytes that stand in for retained plan memory (see
-        // `PLAN_CACHE_TEXT_BYTES_PER_SLOT` — a bulk INSERT's entry is thousands
-        // of times bigger than a SELECT's, so the count alone bounds nothing).
-        //
-        // Only the first thread per crossing runs `retain` (the rest re-insert
-        // as if the cap hadn't been crossed and get swept next time): `retain`
-        // write-locks each shard in turn, so an unsynchronized stampede of
-        // missing threads would serialize every concurrent reader behind N
-        // sweeps. `retain` can't panic here, so a flat store suffices.
-        let text_bytes = self.cache_text_bytes.load(Relaxed);
-        let over = self.cache.len() >= self.capacity || text_bytes >= self.max_text_bytes;
-        if over && !self.evicting.swap(true, AcqRel) {
-            // Operator-visible: the workload has more distinct plan templates than
-            // the cache can hold (~5 in the OLAP steady state, so this should never
-            // fire in prod). Expect the next queries to re-pay state.optimize().
-            warn!(
-                target: "plan_cache",
-                size = self.cache.len(),
-                capacity = self.capacity,
-                text_bytes,
-                max_text_bytes = self.max_text_bytes,
-                "plan_cache exceeded capacity — evicting ~half. Subsequent queries on evicted plans will re-pay the optimize cost. If this fires steadily, the workload's plan-template variety has grown past the cache budget."
-            );
-            // A byte crossing evicts LARGEST-FIRST, not `soft_cap`'s random
-            // half. Random halving is right when entries are interchangeable,
-            // but here they are not: the bytes are owed by a handful of bulk
-            // INSERTs and the population is mostly small dashboard SELECTs, so
-            // a random half would keep paying the pressure while throwing away
-            // the hot templates that make the cache worth having. Dropping the
-            // biggest frees the budget in the fewest evictions, which is also
-            // the smallest hit to the hit rate. (`soft_cap` would be a no-op
-            // here regardless: it re-tests the entry count itself.)
-            if self.cache_text_bytes.load(Relaxed) >= self.max_text_bytes {
-                let mut by_size: Vec<(usize, String)> = self.cache.iter().map(|e| (e.key().len(), e.key().clone())).collect();
-                by_size.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                let mut held = self.cache_text_bytes.load(Relaxed);
-                for (len, key) in by_size {
-                    if held < self.max_text_bytes {
-                        break;
-                    }
-                    if self.cache.remove(&key).is_some() {
-                        held = held.saturating_sub(len);
-                    }
-                }
-                self.cache_text_bytes.store(held, Relaxed);
-            }
-            soft_cap(&self.cache, self.capacity);
-            // Re-summed from the survivors: `soft_cap` drops an arbitrary half,
-            // so the counter cannot be decremented incrementally.
-            self.cache_text_bytes.store(self.cache.iter().map(|e| e.key().len()).sum(), Relaxed);
-            self.evicting.store(false, Release);
-        }
-        // A statement that alone exceeds the budget is served but not cached:
-        // admitting it would evict everything else on the next crossing and
-        // still not survive, so it would cost the whole cache to store nothing.
-        if canonical.len() < self.max_text_bytes {
-            self.cache_text_bytes.fetch_add(canonical.len(), Relaxed);
-            self.cache.insert(canonical, plan.clone());
-        }
+        // Admit at the plan's own estimated weight, not at the length of the SQL
+        // that produced it — the two differ by ~600x for a bulk INSERT. The
+        // sweep, its hysteresis and the over-budget bail all live in
+        // `WeighedMap::insert`.
+        let weight = plan_bytes(&plan) + canonical.len();
+        self.cache.insert(canonical, plan.clone(), weight, "template");
         Some(Ok(plan))
     }
 
@@ -1458,15 +1521,15 @@ mod tests {
         // The budget held, and the accounting matches what is actually retained
         // — a counter that drifted from the map would silently stop bounding it.
         // The sweep runs BEFORE the admission that follows it (sweeping after
-        // would evict the statement just built, since it is the largest), so
+        // would evict the statement just built, since it is the heaviest), so
         // the steady-state bound is the budget plus one statement.
-        let largest: usize = hook.cache.iter().map(|e| e.key().len()).max().unwrap_or(0);
-        let retained: usize = hook.cache.iter().map(|e| e.key().len()).sum();
-        assert!(retained <= hook.max_text_bytes + largest, "cache retains {retained} text bytes, over its {} budget", hook.max_text_bytes);
-        assert_eq!(hook.cache_text_bytes.load(Relaxed), retained, "the byte counter drifted from the map it bounds");
+        let largest = hook.cache.map.iter().map(|e| e.value().1).max().unwrap_or(0);
+        let retained: usize = hook.cache.map.iter().map(|e| e.value().1).sum();
+        assert!(retained <= hook.cache.max_bytes + largest, "cache retains {retained} plan bytes, over its {} budget", hook.cache.max_bytes);
+        assert_eq!(hook.cache.bytes(), retained, "the byte counter drifted from the map it bounds");
         // And it bounded by BYTES, not by count: the entry cap never applied.
         assert!(hook.cache.len() < STATEMENTS, "the sweep must have dropped entries; {} of {STATEMENTS} retained", hook.cache.len());
-        assert!(hook.cache.len() < hook.capacity, "the entry cap must not be what bounded this");
+        assert!(hook.cache.len() < hook.cache.capacity, "the entry cap must not be what bounded this");
 
         // Evicting largest-first is what makes the bound affordable: the small
         // dashboard SELECT that shares the cache with this flood must survive
@@ -1479,6 +1542,40 @@ mod tests {
             let _ = hook.cached_plan(&parse(&format!("INSERT INTO t (id, project_id) VALUES {values}")), &ctx).await;
         }
         assert!(hook.cache.contains_key(&parse(select).to_string()), "the flood evicted the small hot SELECT instead of the bulk INSERTs paying for the bytes");
+    }
+
+    /// A sweep must leave HEADROOM, not stop the instant it is legal.
+    ///
+    /// The largest-first loop used to break as soon as `held < max_bytes`, so it
+    /// evicted to exactly the cap and the very next insert re-crossed it. Prod
+    /// 2026-08-14 logged **1036 sweeps in 10 minutes** (~1.7/s) with the byte
+    /// counter pinned just over the cap the whole time — every Parse paying a
+    /// full sort of the map. One insert must not be able to re-trigger a sweep.
+    #[test]
+    fn a_sweep_leaves_headroom_so_the_next_insert_cannot_re_trigger_it() {
+        // 8 slots x 1 KiB = 8 KiB of budget, entries of 1 KiB each.
+        let map: WeighedMap<u8> = WeighedMap::new(8, 1024);
+        for i in 0..8 {
+            map.insert(format!("k{i}"), 0, 1024, "test");
+        }
+        assert!(map.bytes() >= map.max_bytes, "the budget must actually be reached to arm the sweep");
+
+        // This insert sweeps. After it, the map must sit at or under the low
+        // water mark plus the one entry just admitted.
+        map.insert("trigger".into(), 0, 1024, "test");
+        let low_water = map.max_bytes / SWEEP_LOW_WATER_DEN * SWEEP_LOW_WATER_NUM;
+        assert!(map.bytes() <= low_water + 1024, "swept to {} bytes, expected <= {} — no headroom left", map.bytes(), low_water + 1024);
+        assert!(map.bytes() < map.max_bytes, "a sweep that lands ON the cap re-arms itself on the next insert");
+    }
+
+    /// An entry heavier than the entire budget is served but never admitted:
+    /// caching it would evict everything else and still not survive.
+    #[test]
+    fn an_entry_bigger_than_the_budget_is_not_admitted() {
+        let map: WeighedMap<u8> = WeighedMap::new(4, 1024);
+        map.insert("huge".into(), 0, 4 * 1024, "test");
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.bytes(), 0, "a rejected entry must not be charged to the budget");
     }
 
     /// A `'$1'` STRING LITERAL makes the text-based `has_placeholder` fire while
