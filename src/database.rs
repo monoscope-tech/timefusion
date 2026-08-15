@@ -4003,6 +4003,12 @@ impl Database {
                 let mut rules = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules;
                 let pos = rules.iter().position(|r| r.name() == "EnforceDistribution").unwrap_or(0);
                 rules.insert(pos, Arc::new(crate::optimizers::OrderedUnionForTopK));
+                // After EnforceSorting/EnforceDistribution, never before: this rule exists to
+                // undo their (locally correct) decision to discharge DedupExec's ordering as
+                // trivially satisfied when a pushed equality pins the sort column to a
+                // constant, which leaves the operator reading through an order-erasing
+                // coalesce. See `DedupNeedsOrderedInput`.
+                rules.push(Arc::new(crate::optimizers::DedupNeedsOrderedInput));
                 rules.push(instrument_rule);
                 rules
             })

@@ -524,6 +524,12 @@ impl DedupExec {
         self.required_ordering = ordering;
         self
     }
+
+    /// The ordering keep-greatest depends on, for `DedupNeedsOrderedInput` to
+    /// rebuild a merge the optimizer discharged as trivially satisfied.
+    pub fn required_ordering(&self) -> Option<&datafusion::physical_expr::LexOrdering> {
+        self.required_ordering.as_ref()
+    }
 }
 
 impl DisplayAs for DedupExec {
