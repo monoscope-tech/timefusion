@@ -263,14 +263,18 @@ impl TaskJournal {
                 }
             }
         }
-        Ok(Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() })
+        let mut journal = Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() };
+        if journal.migrate_derived_slices() != 0 {
+            journal.checkpoint()?;
+        }
+        Ok(journal)
     }
 
     /// Early coordinator builds journaled the one-hour tier in ten-minute
     /// units. Supersede those unpublished fragments and replace them with one
     /// aligned hour task; completed tagged publications remain available for
     /// metadata recovery and are not rewritten by this migration.
-    pub fn migrate_derived_slices(&mut self) -> usize {
+    fn migrate_derived_slices(&mut self) -> usize {
         let malformed = self
             .snapshot
             .tasks
@@ -933,9 +937,6 @@ mod tests {
         journal.upsert(task("p", 0, NORMAL_SLICE_MICROS, Operation::DerivedRollup));
         journal.checkpoint().expect("old checkpoint");
 
-        let mut journal = TaskJournal::load(dir.path()).expect("journal to migrate");
-        assert!(journal.migrate_derived_slices() > 0);
-        journal.checkpoint().expect("migration checkpoint");
         let journal = TaskJournal::load(dir.path()).expect("migrated journal");
         assert!(journal.tasks().any(|task| task.key.operation == Operation::DerivedRollup && task.key.slice.width() == DERIVED_SLICE_MICROS));
         assert!(journal.tasks().any(|task| task.key.operation == Operation::DerivedRollup
