@@ -1,4 +1,4 @@
-.PHONY: lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # THE inner-loop command: the whole suite, every time you change something.
 #
@@ -33,12 +33,23 @@ lint:
 lint-fix:
 	cargo lint-fix
 
-# Pre-push gate: CI's lint first (fails fast and cheap — a lint error should not
-# cost a full test run), then the whole suite. No hand-picked subset any more:
-# with nextest the full run is short enough that skipping targets only buys a
-# surprise in CI. Set TIMEFUSION_TEST_S3_ENDPOINT to reuse a persistent MinIO.
-prepush: lint
+# Pre-push gate: CI's checks in CI's order — formatting, then lint (both fail
+# fast and cheap; neither should cost a full test run), then the whole suite. No
+# hand-picked subset any more: with nextest the full run is short enough that
+# skipping targets only buys a surprise in CI. Set TIMEFUSION_TEST_S3_ENDPOINT
+# to reuse a persistent MinIO.
+#
+# `fmt` is here because `lint` does NOT cover it and CI runs both: 2026-08-15 a
+# push passed local `cargo lint` and the full suite, then failed CI on two
+# rustfmt line-break diffs alone. A red CI on master blocks the deploy queue for
+# everyone, which is far more expensive than the second this costs.
+prepush: fmt lint
 	RUST_LOG=off cargo nextest run $${ARGS}
+
+# CI's exact formatting gate (ci.yml "Format"). rust-toolchain.toml pins the
+# channel, so this is the same rustfmt CI runs.
+fmt:
+	cargo fmt --all --check
 
 # Everything, including the #[ignore]d tests.
 test-all:
