@@ -33,6 +33,8 @@ pub enum MissReason {
     /// The certified interior is too small a slice of the window to be worth the
     /// union's second scan.
     TinyInterior,
+    /// Hybrid routing would create too many disjoint raw/rollup predicates.
+    TooManyBranches,
     RewriteSchemaMismatch,
 }
 
@@ -55,6 +57,7 @@ impl MissReason {
             Self::StaleCoverage => "stale_coverage",
             Self::IncompleteCoverage => "incomplete_coverage",
             Self::TinyInterior => "tiny_interior",
+            Self::TooManyBranches => "too_many_branches",
             Self::RewriteSchemaMismatch => "rewrite_schema_mismatch",
         }
     }
@@ -64,22 +67,19 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Deterministic identity for one built partition.
+/// Deterministic identity for one rollup generation.
 ///
 /// It was a random UUID, which made the rollup rows on S3 unreadable after a
-/// restart: reads filter on the generation and the only copy of it lived in a
-/// DashMap. Deriving it from the inputs makes the rollup TABLE the durable
-/// record — coverage can be recovered by reading back what is stored and
-/// checking it still matches — and makes a rebuild over an unchanged source
-/// produce byte-identical `id`s, so a replace is idempotent per row rather than
-/// only per partition.
+/// restart. It deliberately does not include the source fingerprint: independently
+/// replaceable slices of one date must share a generation so a query can merge
+/// them. The fingerprint remains in each Add tag and in the read ticket, where
+/// it is a validity check rather than a row-selection key.
 ///
 /// The spec participates because adding a measure without bumping the table
 /// name would otherwise serve rows built under the old spec as if current.
-pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, source_fp: u64) -> String {
+pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = fnv::FnvHasher::default();
-    source_fp.hash(&mut hasher);
     format!("{spec:?}").hash(&mut hasher);
     (source, project_id, date).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -236,14 +236,14 @@ pub(crate) fn build_partition_sql_ranges(
         .iter()
         .map(|measure| {
             if derived {
-                let merge = match measure.agg.as_str() {
-                    "min" => "MIN",
-                    "max" => "MAX",
-                    "tdigest" => "tdigest_merge",
-                    "hll" => "hll_merge",
-                    _ => "SUM",
+                let expression = match measure.agg.as_str() {
+                    "min" => format!("MIN({})", measure.name),
+                    "max" => format!("MAX({})", measure.name),
+                    "tdigest" => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
+                    "hll" => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
+                    _ => format!("SUM({})", measure.name),
                 };
-                return Ok(format!("{merge}({}) AS {}", measure.name, measure.name));
+                return Ok(format!("{expression} AS {}", measure.name));
             }
             let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
                 ("count", None) => "COUNT(*)".to_string(),
@@ -293,25 +293,30 @@ pub(crate) fn build_partition_sql_ranges(
 pub(crate) fn build_cohort_sql_range(
     spec: &RollupSpec, source: &str, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64),
 ) -> anyhow::Result<String> {
+    build_cohort_sql_range_mode(spec, source, from, project_ids, date, (start, end), from != source)
+}
+
+pub(crate) fn build_cohort_sql_range_mode(
+    spec: &RollupSpec, _source: &str, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64), derived: bool,
+) -> anyhow::Result<String> {
     if project_ids.is_empty() {
         anyhow::bail!("rollup cohort has no projects");
     }
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
-    let derived = from != source;
     let dimensions = spec.dimensions.join(", ");
     let measures = spec
         .measures
         .iter()
         .map(|measure| {
             if derived {
-                let merge = match measure.agg.as_str() {
-                    "min" => "MIN",
-                    "max" => "MAX",
-                    "tdigest" => "tdigest_merge",
-                    "hll" => "hll_merge",
-                    _ => "SUM",
+                let expression = match measure.agg.as_str() {
+                    "min" => format!("MIN({})", measure.name),
+                    "max" => format!("MAX({})", measure.name),
+                    "tdigest" => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
+                    "hll" => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
+                    _ => format!("SUM({})", measure.name),
                 };
-                return Ok(format!("{merge}({}) AS {}", measure.name, measure.name));
+                return Ok(format!("{expression} AS {}", measure.name));
             }
             let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
                 ("count", None) => "COUNT(*)".to_string(),
@@ -652,6 +657,10 @@ pub(crate) fn complement(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> Vec<(i64, i
         gaps.push((cursor, hi));
     }
     gaps
+}
+
+pub(crate) fn hybrid_branch_count(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> usize {
+    ranges.len().saturating_add(complement(lo, hi, ranges).len())
 }
 
 #[derive(Debug)]
@@ -1588,8 +1597,9 @@ mod tests {
     #[tokio::test]
     async fn an_open_ended_window_routes() {
         let state = session().await;
-        let sql =
-            format!("SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name");
+        let sql = format!(
+            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name"
+        );
         let route = route_for(&state, &sql).await;
         assert!(route.is_ok(), "an open-ended window must route: {route:?}");
     }
@@ -1603,8 +1613,9 @@ mod tests {
     #[tokio::test]
     async fn an_open_ended_window_keeps_an_open_raw_tail() {
         let state = session().await;
-        let sql =
-            format!("SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name");
+        let sql = format!(
+            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name"
+        );
         let route = route_for(&state, &sql).await.expect("route").expect("a route");
         let generated = hybrid_sql(&route, crate::clock::now_micros());
         let tail = generated.rsplit("timestamp >=").next().expect("a trailing range");
@@ -1718,6 +1729,22 @@ mod tests {
         assert!(target.dedup_keys.is_empty(), "a rollup must not require read-time dedup: {:?}", target.dedup_keys);
     }
 
+    #[test]
+    fn slice_generation_is_stable_across_source_fingerprints() {
+        let spec = spec();
+        assert_eq!(generation_id(&spec, SOURCE, "p", "2026-08-15", 1), generation_id(&spec, SOURCE, "p", "2026-08-15", 2));
+    }
+
+    #[test]
+    fn selected_raw_view_does_not_turn_raw_measures_into_state_merges() {
+        let spec = spec();
+        let projects = vec!["p".to_owned()];
+        let raw = build_cohort_sql_range_mode(&spec, SOURCE, "__selected_raw", &projects, "2026-08-15", (0, 60_000_000), false).expect("raw SQL");
+        let states = build_cohort_sql_range_mode(&spec, SOURCE, "__states", &projects, "2026-08-15", (0, 60_000_000), true).expect("state SQL");
+        assert!(raw.contains("COUNT(*) AS request_count"), "{raw}");
+        assert!(states.contains("SUM(request_count) AS request_count"), "{states}");
+    }
+
     /// The chunk masks must PARTITION the day exactly.
     ///
     /// Each chunk rebuilds its own hours and carries every other hour forward
@@ -1819,7 +1846,7 @@ mod tests {
         // The declared filter is deliberately NOT re-applied on the derived leg:
         // the base row already had it, and its columns do not exist there.
         let derived = build_partition_sql_from(&spec(Some("fine")), SOURCE, "fine_table", "project", "2026-08-01").expect("valid SQL");
-        assert!(derived.contains("hll_merge(traces) AS traces"), "{derived}");
+        assert!(derived.contains("hll_merge(CAST(traces AS BYTEA)) AS traces"), "{derived}");
         assert!(!derived.contains("FILTER"), "the derived leg must not re-apply the measure filter: {derived}");
     }
 
@@ -2307,6 +2334,13 @@ mod tests {
                 assert!(ranges.iter().all(|range| gap.1 <= range.0 || gap.0 >= range.1), "gap {gap:?} overlaps {ranges:?}");
             }
         }
+    }
+
+    #[test]
+    fn hybrid_branch_count_includes_rollup_and_raw_ranges() {
+        let ranges = vec![(10, 20), (30, 40), (50, 60)];
+        assert_eq!(hybrid_branch_count(0, 70, &ranges), 7);
+        assert_eq!(hybrid_branch_count(10, 60, &ranges), 5);
     }
 
     /// The buffer horizon caps EVERY interval, not just the last one: a row
