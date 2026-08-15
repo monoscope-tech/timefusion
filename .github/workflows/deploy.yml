@@ -169,7 +169,9 @@ jobs:
           set -euo pipefail
           : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
           boot_micros="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" || true)"
+          last_old_response_epoch_ms="$(date +%s%3N)"
           echo "boot_micros=${boot_micros}" >> "$GITHUB_OUTPUT"
+          echo "last_old_response_epoch_ms=${last_old_response_epoch_ms}" >> "$GITHUB_OUTPUT"
           # Record total rollout wall time separately from the concurrent SQL
           # probe's actual client-visible unready interval.
           echo "handoff_started_epoch_ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
@@ -182,6 +184,7 @@ jobs:
           CAPROVER_TOKEN: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
           PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
           PREVIOUS_BOOT_MICROS: ${{ steps.production_before.outputs.boot_micros }}
+          LAST_OLD_RESPONSE_EPOCH_MS: ${{ steps.production_before.outputs.last_old_response_epoch_ms }}
         run: |
           set -euo pipefail
           : "${CAPROVER_SERVER:?CAPTAINROVER_SERVER is required}"
@@ -202,7 +205,10 @@ jobs:
           (
             unready_started_ms=0
             max_unready_ms=0
-            last_old_response_ms="$(date +%s%3N)"
+            # The preceding step already proved this exact old boot answered a
+            # query. Seed from that timestamp so a very short handoff remains
+            # measurable even when the first concurrent sample hits 57P03.
+            last_old_response_ms="$LAST_OLD_RESPONSE_EPOCH_MS"
             query_handoff_ms=0
             while [ ! -e "$probe_stop" ]; do
               attempt_started_ms="$(date +%s%3N)"
