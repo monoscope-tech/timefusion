@@ -6142,3 +6142,86 @@ mod tests {
         assert_eq!(s.demote_queued_bytes, 0, "the queue drains back to zero");
     }
 }
+
+#[cfg(test)]
+mod replay_cost_probe {
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+
+    use crate::test_utils::test_helpers::{json_to_batch, test_layer, test_span};
+
+    /// Not an assertion — a measurement, kept because the attribution it
+    /// produces is not obvious and was wrong twice. Builds a replay backlog,
+    /// then times `recover_from_wal` so its own cost breakdown attributes the
+    /// wall clock. Scale with REPLAY_ENTRIES / REPLAY_ROWS; the default is
+    /// deliberately small so `make test-all` (which runs #[ignore]d tests)
+    /// stays fast.
+    ///
+    ///   WALRUS_QUIET=1 REPLAY_ENTRIES=6000 \
+    ///     cargo nextest run --lib replay_cost_probe --no-capture --run-ignored all
+    ///
+    /// WALRUS_QUIET matters: without it walrus `println!`s per block read and
+    /// the measurement becomes 4x its real cost (and unreadable).
+    ///
+    /// Measured 2026-08-15 (dev build, 6000 x 50-row entries, 86KB payload/ea):
+    ///   total 26633ms (4.44ms/ea) = decode 5336ms (20%) + apply 2455ms (9%)
+    ///   + 18842ms (71%) UNATTRIBUTED — the walrus read and per-entry
+    ///   bookkeeping, not the Arrow decode everyone assumes.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measurement, not an assertion"]
+    async fn measure_replay_cost() {
+        // The attribution lives in `recover_from_wal`'s own `info!` breakdown.
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_test_writer().try_init();
+        let entries: usize = std::env::var("REPLAY_ENTRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
+        let rows_per_entry: usize = std::env::var("REPLAY_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+
+        let dir = tempdir().unwrap();
+        let cfg = crate::config::AppConfig::default();
+        let mut cfg = cfg;
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        // Never flush during the build or the replay: we are timing replay, not IO.
+        cfg.buffer.timefusion_flush_interval_secs = 86_400;
+        cfg.buffer.timefusion_buffer_max_memory_mb = 64_000;
+        let cfg = Arc::new(cfg);
+
+        let layer = Arc::new(test_layer(Arc::clone(&cfg)).unwrap());
+        let batch = json_to_batch((0..rows_per_entry).map(|i| test_span(&format!("id{i}"), &format!("span{i}"), "probe-project")).collect()).unwrap();
+
+        let t_build = std::time::Instant::now();
+        for _ in 0..entries {
+            layer.insert("probe-project", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
+        }
+        let build_ms = t_build.elapsed().as_millis();
+        let wal_bytes: u64 = walkdir_size(dir.path());
+        println!("\n== built {entries} entries x {rows_per_entry} rows in {build_ms}ms; wal dir {}MB ==", wal_bytes / (1024 * 1024));
+
+        // Fresh layer over the SAME data dir: its cursors are at zero, so the
+        // whole log is unread and replay has to do real work.
+        drop(layer);
+        let replayer = Arc::new(test_layer(cfg).unwrap());
+        let t = std::time::Instant::now();
+        let stats = replayer.recover_from_wal().await.unwrap();
+        println!(
+            "== REPLAY: {} entries in {}ms ({:.3}ms/entry) ==\n",
+            stats.entries_replayed,
+            t.elapsed().as_millis(),
+            t.elapsed().as_secs_f64() * 1000.0 / stats.entries_replayed.max(1) as f64
+        );
+    }
+
+    fn walkdir_size(p: &std::path::Path) -> u64 {
+        let mut total = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let md = e.metadata();
+                match md {
+                    Ok(m) if m.is_dir() => total += walkdir_size(&e.path()),
+                    Ok(m) => total += m.len(),
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+}
