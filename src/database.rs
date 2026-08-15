@@ -3537,40 +3537,60 @@ impl Database {
         // re-clearing them. See `load_verified_sorted`.
         db.load_verified_sorted();
 
-        let reconciled_tasks = db.reconcile_maintenance_task_cursors().await?;
-        info!(reconciled_tasks, event = "maintenance_task_reconcile_complete");
-        let planned_compaction_tasks = db.plan_compaction_debt().await?;
-        db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
-        info!(planned_compaction_tasks, event = "maintenance_compaction_debt_planned");
-
-        // Durable coordinator workers. They claim journaled work instead of
-        // waiting on a shared semaphore, and admission rejects a unit unless
-        // all of its CPU/decode/object tokens are available at once.
+        // Snapshot discovery can take minutes for production-sized catalogs.
+        // Keep it off the readiness path: coverage is conservative until this
+        // completes, so queries fall back to raw rather than seeing stale
+        // aggregates. Workers start only after cursor reconciliation has
+        // durably queued every discovered partition.
         let coordinator_workers = (self.config.derived.cores / 4).clamp(1, 8);
-        for worker in 0..coordinator_workers {
+        {
             let db = Arc::clone(&db);
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                loop {
-                    if cancel.is_cancelled() {
+                match db.reconcile_maintenance_task_cursors().await {
+                    Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
+                    Err(error) => {
+                        warn!(%error, event = "maintenance_task_reconcile_failed");
                         return;
                     }
-                    match db.run_maintenance_coordinator_once().await {
-                        Ok(true) => tokio::task::yield_now().await,
-                        Ok(false) => {
-                            tokio::select! {
-                                _ = cancel.cancelled() => return,
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                            }
-                        }
-                        Err(error) => {
-                            warn!(worker, %error, event = "maintenance_coordinator_error");
-                            tokio::select! {
-                                _ = cancel.cancelled() => return,
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                            }
-                        }
+                }
+                match db.plan_compaction_debt().await {
+                    Ok(planned_compaction_tasks) => {
+                        db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
+                        info!(planned_compaction_tasks, event = "maintenance_compaction_debt_planned");
                     }
+                    Err(error) => warn!(%error, event = "maintenance_compaction_debt_plan_failed"),
+                }
+
+                // Durable coordinator workers claim journaled work instead of
+                // waiting on a shared semaphore. Admission rejects a unit
+                // unless all resource tokens are available at once.
+                for worker in 0..coordinator_workers {
+                    let db = Arc::clone(&db);
+                    let cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            if cancel.is_cancelled() {
+                                return;
+                            }
+                            match db.run_maintenance_coordinator_once().await {
+                                Ok(true) => tokio::task::yield_now().await,
+                                Ok(false) => {
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => return,
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(worker, %error, event = "maintenance_coordinator_error");
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => return,
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                    }
+                                }
+                            }
+                        }
+                    });
                 }
             });
         }
