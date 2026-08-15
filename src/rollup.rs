@@ -103,6 +103,75 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
 /// One bit per hour of a UTC day. `ALL_HOURS` is the conservative value: every
 /// invalidation means it unless the caller can prove a narrower set.
 pub(crate) const ALL_HOURS: u32 = (1 << 24) - 1;
+pub(crate) const ROLLUP_COHORT_MAX_PROJECTS: usize = 64;
+pub(crate) const ROLLUP_COHORT_MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const ROLLUP_WAVE_MAX_PROJECTS: usize = 1_024;
+pub(crate) const ROLLUP_WAVE_MAX_ACTIONS: usize = 4_096;
+
+pub(crate) fn commit_wave_ranges(action_counts: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let (mut start, mut actions) = (0, 0usize);
+    for (index, count) in action_counts.iter().copied().enumerate() {
+        let project_limit = index.saturating_sub(start) >= ROLLUP_WAVE_MAX_PROJECTS;
+        let action_limit = index > start && actions.saturating_add(count) > ROLLUP_WAVE_MAX_ACTIONS;
+        if project_limit || action_limit {
+            ranges.push(start..index);
+            start = index;
+            actions = 0;
+        }
+        actions = actions.saturating_add(count);
+    }
+    if start < action_counts.len() {
+        ranges.push(start..action_counts.len());
+    }
+    ranges
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RollupScanProject {
+    pub project_id: String,
+    pub estimated_decoded_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RollupScanCohort {
+    pub projects: Vec<RollupScanProject>,
+    pub estimated_decoded_bytes: u64,
+}
+
+pub(crate) fn pack_scan_cohorts(projects: impl IntoIterator<Item = RollupScanProject>) -> Vec<RollupScanCohort> {
+    let mut cohorts = Vec::new();
+    let mut current = RollupScanCohort { projects: Vec::new(), estimated_decoded_bytes: 0 };
+    for project in projects {
+        let exceeds_count = current.projects.len() >= ROLLUP_COHORT_MAX_PROJECTS;
+        let exceeds_bytes =
+            !current.projects.is_empty() && current.estimated_decoded_bytes.saturating_add(project.estimated_decoded_bytes) > ROLLUP_COHORT_MAX_DECODED_BYTES;
+        if exceeds_count || exceeds_bytes {
+            cohorts.push(current);
+            current = RollupScanCohort { projects: Vec::new(), estimated_decoded_bytes: 0 };
+        }
+        current.estimated_decoded_bytes = current.estimated_decoded_bytes.saturating_add(project.estimated_decoded_bytes);
+        current.projects.push(project);
+    }
+    if !current.projects.is_empty() {
+        cohorts.push(current);
+    }
+    cohorts
+}
+
+pub(crate) fn split_scan_cohort(cohort: RollupScanCohort) -> Option<(RollupScanCohort, RollupScanCohort)> {
+    if cohort.projects.len() < 2 {
+        return None;
+    }
+    let midpoint = cohort.projects.len() / 2;
+    let mut projects = cohort.projects;
+    let right = projects.split_off(midpoint);
+    let make = |projects: Vec<RollupScanProject>| RollupScanCohort {
+        estimated_decoded_bytes: projects.iter().map(|project| project.estimated_decoded_bytes).sum(),
+        projects,
+    };
+    Some((make(projects), make(right)))
+}
 const HOUR_MICROS: i64 = 3_600_000_000;
 
 /// Hours per chunk when a full rebuild is split. 6 → four chunks a day.
@@ -225,6 +294,83 @@ pub(crate) fn build_partition_sql_ranges(
     ))
 }
 
+/// Aggregate one disjoint time range for a bounded set of projects. Unlike the
+/// legacy incremental SQL this never carries target rows forward: four calls
+/// cover the day and their staged union is the complete replacement.
+pub(crate) fn build_cohort_sql_range(
+    spec: &RollupSpec, source: &str, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64),
+) -> anyhow::Result<String> {
+    if project_ids.is_empty() {
+        anyhow::bail!("rollup cohort has no projects");
+    }
+    let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
+    let derived = from != source;
+    let dimensions = spec.dimensions.join(", ");
+    let measures = spec
+        .measures
+        .iter()
+        .map(|measure| {
+            if derived {
+                let merge = match measure.agg.as_str() {
+                    "min" => "MIN",
+                    "max" => "MAX",
+                    "tdigest" => "tdigest_merge",
+                    "hll" => "hll_merge",
+                    _ => "SUM",
+                };
+                return Ok(format!("{merge}({}) AS {}", measure.name, measure.name));
+            }
+            let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
+                ("count", None) => "COUNT(*)".to_string(),
+                ("count", Some(column)) => format!("COUNT({column})"),
+                ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+                ("hll", Some(column)) => format!("hll_agg({column})"),
+                (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
+                (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
+            };
+            Ok(match &measure.filter {
+                Some(filter) => format!("{expression} FILTER (WHERE {filter}) AS {}", measure.name),
+                None => format!("{expression} AS {}", measure.name),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .join(", ");
+    let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
+    let group_by = std::iter::once("1".to_string())
+        .chain(std::iter::once("2".to_string()))
+        .chain((3..).take(spec.dimensions.len()).map(|index| index.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let projects = project_ids.iter().map(|project| sql_literal(project)).collect::<Vec<_>>().join(", ");
+    Ok(format!(
+        "SELECT project_id, to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp{select_dimensions}, {measures} \
+         FROM {from} WHERE project_id IN ({projects}) AND date = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) \
+         GROUP BY {group_by}",
+        sql_literal(date)
+    ))
+}
+
+pub(crate) fn build_cohort_carry_sql(spec: &RollupSpec, target: &str, date: &str, project_masks: &[(String, u32)], day_start: i64) -> anyhow::Result<String> {
+    if project_masks.is_empty() {
+        anyhow::bail!("rollup carry cohort has no projects");
+    }
+    let dimensions = if spec.dimensions.is_empty() { String::new() } else { format!(", {}", spec.dimensions.join(", ")) };
+    let measures = spec.measures.iter().map(|measure| measure.name.clone()).collect::<Vec<_>>().join(", ");
+    let predicates = project_masks
+        .iter()
+        .map(|(project, mask)| {
+            let dirty = dirty_ranges(day_start, *mask)
+                .into_iter()
+                .map(|(start, end)| format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!("(project_id = {} AND NOT ({dirty}))", sql_literal(project))
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Ok(format!("SELECT project_id, timestamp{dimensions}, {measures} FROM {target} WHERE date = {} AND ({predicates})", sql_literal(date)))
+}
+
 fn generated_bucket_id(bucket: i64, grain: i64, generation: &str, dimensions: &[datafusion::scalar::ScalarValue]) -> String {
     use std::hash::{Hash, Hasher};
 
@@ -314,6 +460,42 @@ pub fn to_rollup_batches(
             Ok(arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), columns)?)
         })
         .collect()
+}
+
+/// Split a cohort aggregate by its output `project_id` and shape each project
+/// with its own generation. The aggregate must retain `project_id` as a group
+/// key; synthesizing it from the cohort request would mix tenant identities.
+pub(crate) fn to_rollup_batches_by_project(
+    spec: &RollupSpec, source: &str, date: &str, generations: &std::collections::HashMap<String, String>, aggregated: &[arrow::record_batch::RecordBatch],
+) -> anyhow::Result<std::collections::HashMap<String, Vec<arrow::record_batch::RecordBatch>>> {
+    use arrow::{
+        array::{Array, StringArray},
+        compute::cast,
+        datatypes::DataType,
+    };
+
+    let mut grouped: std::collections::HashMap<String, Vec<arrow::record_batch::RecordBatch>> = std::collections::HashMap::new();
+    for batch in aggregated.iter().filter(|batch| batch.num_rows() > 0) {
+        let projects = batch.column_by_name("project_id").ok_or_else(|| anyhow::anyhow!("cohort aggregate is missing project_id"))?;
+        let projects = cast(projects, &DataType::Utf8)?;
+        let projects = projects.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("cohort project_id cannot cast to Utf8"))?;
+        let mut rows_by_project: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
+        for row in 0..batch.num_rows() {
+            if projects.is_null(row) {
+                anyhow::bail!("cohort aggregate project_id is null");
+            }
+            rows_by_project.entry(projects.value(row)).or_default().push(u32::try_from(row)?);
+        }
+        for (project_id, rows) in rows_by_project {
+            let indices = arrow::array::UInt32Array::from(rows);
+            let columns = batch.columns().iter().map(|column| arrow::compute::take(column, &indices, None)).collect::<arrow::error::Result<Vec<_>>>()?;
+            let slice = arrow::record_batch::RecordBatch::try_new(batch.schema(), columns)?;
+            let generation = generations.get(project_id).ok_or_else(|| anyhow::anyhow!("cohort output contains unexpected project `{project_id}`"))?;
+            let shaped = to_rollup_batches(spec, source, project_id, date, generation, &[slice])?;
+            grouped.entry(project_id.to_string()).or_default().extend(shaped);
+        }
+    }
+    Ok(grouped)
 }
 
 /// How a measure's per-leg partial states combine into the query's answer.
@@ -2308,5 +2490,100 @@ mod tests {
             other[0].column_by_name("id").expect("id").as_any().downcast_ref::<StringViewArray>().expect("utf8 id").value(0),
             "generations must not share a dedup identity"
         );
+    }
+
+    #[test]
+    fn cohort_packing_honors_project_and_byte_caps() {
+        let projects = (0..65).map(|index| RollupScanProject { project_id: format!("p{index}"), estimated_decoded_bytes: 1024 });
+        let cohorts = pack_scan_cohorts(projects);
+        assert_eq!(cohorts.iter().map(|cohort| cohort.projects.len()).collect::<Vec<_>>(), vec![64, 1]);
+
+        let half = ROLLUP_COHORT_MAX_DECODED_BYTES / 2 + 1;
+        let cohorts = pack_scan_cohorts([
+            RollupScanProject { project_id: "a".into(), estimated_decoded_bytes: half },
+            RollupScanProject { project_id: "b".into(), estimated_decoded_bytes: half },
+        ]);
+        assert_eq!(cohorts.len(), 2);
+    }
+
+    #[test]
+    fn commit_waves_honor_project_and_action_caps() {
+        let by_projects = commit_wave_ranges(&vec![1; ROLLUP_WAVE_MAX_PROJECTS + 1]);
+        assert_eq!(by_projects, vec![0..ROLLUP_WAVE_MAX_PROJECTS, ROLLUP_WAVE_MAX_PROJECTS..ROLLUP_WAVE_MAX_PROJECTS + 1]);
+        let by_actions = commit_wave_ranges(&[2_000, 2_000, 100]);
+        assert_eq!(by_actions, vec![0..2, 2..3]);
+        assert_eq!(commit_wave_ranges(&[]), Vec::<std::ops::Range<usize>>::new());
+    }
+
+    #[test]
+    fn cohort_sql_groups_project_id_and_bounds_the_scan() {
+        let sql = build_cohort_sql_range(&spec(), SOURCE, SOURCE, &["project-a".into(), "project'b".into()], "2026-08-15", (10, 20)).expect("cohort SQL");
+        assert!(sql.starts_with("SELECT project_id,"), "project identity must survive aggregation: {sql}");
+        assert!(sql.contains("project_id IN ('project-a', 'project''b')"), "project filter must be bounded and escaped: {sql}");
+        assert!(sql.contains("timestamp >= to_timestamp_micros(10) AND timestamp < to_timestamp_micros(20)"), "range must be half-open: {sql}");
+        assert!(sql.contains("GROUP BY 1, 2"), "project and bucket must both group: {sql}");
+    }
+
+    #[test]
+    fn cohort_carry_sql_keeps_only_clean_hours_per_project() {
+        let sql = build_cohort_carry_sql(&spec(), "rollup_target", "1970-01-01", &[("a".into(), 1), ("b".into(), 1 << 2)], 0).expect("carry SQL");
+        assert!(sql.contains("project_id = 'a' AND NOT ((timestamp >= to_timestamp_micros(0)"), "project a excludes hour zero: {sql}");
+        assert!(sql.contains("project_id = 'b' AND NOT ((timestamp >= to_timestamp_micros(7200000000)"), "project b excludes hour two: {sql}");
+        assert!(sql.starts_with("SELECT project_id, timestamp"), "carry rows retain project identity: {sql}");
+    }
+
+    #[test]
+    fn cohort_split_recomputes_estimates_and_isolates_singletons() {
+        let cohort = RollupScanCohort {
+            projects: (0..5).map(|index| RollupScanProject { project_id: format!("p{index}"), estimated_decoded_bytes: index + 1 }).collect(),
+            estimated_decoded_bytes: 15,
+        };
+        let (left, right) = split_scan_cohort(cohort).expect("splittable cohort");
+        assert_eq!((left.projects.len(), left.estimated_decoded_bytes), (2, 3));
+        assert_eq!((right.projects.len(), right.estimated_decoded_bytes), (3, 12));
+        assert!(
+            split_scan_cohort(RollupScanCohort {
+                projects: vec![RollupScanProject { project_id: "only".into(), estimated_decoded_bytes: 1 }],
+                estimated_decoded_bytes: 1,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cohort_batch_shaping_preserves_project_generations() {
+        let spec = spec();
+        let mut fields = vec![
+            Arc::new(Field::new("project_id", DataType::Utf8, false)),
+            Arc::new(Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)),
+        ];
+        fields.extend(spec.dimensions.iter().map(|name| Arc::new(Field::new(name, DataType::Utf8, true))));
+        fields.extend(spec.measures.iter().map(|measure| {
+            Arc::new(Field::new(&measure.name, if measure.agg == "tdigest" { DataType::Binary } else { DataType::Int64 }, measure.agg != "count"))
+        }));
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some("project-b"), Some("project-a")])),
+            Arc::new(TimestampMicrosecondArray::from(vec![2_000_000, 1_000_000]).with_timezone("UTC")),
+        ];
+        columns.extend(spec.dimensions.iter().map(|_| Arc::new(StringArray::from(vec![Some("b"), Some("a")])) as arrow::array::ArrayRef));
+        columns.extend(spec.measures.iter().map(|measure| {
+            if measure.agg == "tdigest" {
+                Arc::new(BinaryArray::from(vec![Some(&[2_u8][..]), Some(&[1_u8][..])])) as arrow::array::ArrayRef
+            } else {
+                Arc::new(Int64Array::from(vec![Some(2), Some(1)])) as arrow::array::ArrayRef
+            }
+        }));
+        let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("cohort aggregate batch");
+        let generations =
+            std::collections::HashMap::from([("project-a".to_string(), "generation-a".to_string()), ("project-b".to_string(), "generation-b".to_string())]);
+        let output = to_rollup_batches_by_project(&spec, SOURCE, "1970-01-01", &generations, &[input]).expect("shape cohort");
+        for (project, generation) in [("project-a", "generation-a"), ("project-b", "generation-b")] {
+            let batch = &output[project][0];
+            let project_ids = batch.column_by_name("project_id").expect("project id").as_any().downcast_ref::<StringViewArray>().expect("utf8 project id");
+            let generations =
+                batch.column_by_name("rollup_generation").expect("generation").as_any().downcast_ref::<StringViewArray>().expect("utf8 generation");
+            assert_eq!(project_ids.value(0), project);
+            assert_eq!(generations.value(0), generation);
+        }
     }
 }

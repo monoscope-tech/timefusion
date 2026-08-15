@@ -697,7 +697,7 @@ impl ExecutionPlan for DmlExec {
             // now superseded. `invalidate_rollup_dml` falls back to the
             // source-wide wipe for exactly that case.
             if !is_version_append(&table_name) || assignments.iter().any(|(column, _)| column == "timestamp") {
-                database.invalidate_rollup_dml(&project_id, &table_name, predicate.as_ref(), &assignments);
+                database.invalidate_rollup_dml(&project_id, &table_name, predicate.as_ref(), &assignments)?;
             }
             let result = match op_type {
                 DmlOperation::Update => {

@@ -2138,6 +2138,14 @@ pub struct MaintenanceConfig {
     /// rewrite.
     #[serde(default = "d_rollup_backfill_concurrency")]
     pub timefusion_rollup_backfill_concurrency: usize,
+    /// Use bounded cohort rollup maintenance and its durable invalidation
+    /// journal. Reads remain governed by the existing rollup read gate.
+    #[serde(default)]
+    pub timefusion_rollup_maintenance_v2: bool,
+    /// Optional comma-separated source allowlist for maintenance V2. Empty
+    /// means every declared rollup source once the V2 master gate is enabled.
+    #[serde(default)]
+    pub timefusion_rollup_maintenance_v2_sources: Option<String>,
     /// Skip the read-side DedupExec (and, since 4ecca05, its key projection) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged
@@ -2300,6 +2308,10 @@ impl MaintenanceConfig {
     /// never gets built.
     pub fn rollup_build_enabled(&self) -> bool {
         self.timefusion_rollup_enabled
+    }
+
+    pub fn rollup_maintenance_v2_enabled_for(&self, source: &str) -> bool {
+        self.timefusion_rollup_maintenance_v2 && Self::selected(source, self.timefusion_rollup_maintenance_v2_sources.as_deref())
     }
 
     pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {

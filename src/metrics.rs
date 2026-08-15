@@ -107,6 +107,24 @@ counter_registry! {
     cache_confirm_timeouts     => "timefusion.cache.confirm_timeouts": "Pre-drain cache confirms that hit their bound and gave up. Best-effort — the commit and the drain proceed; the next query on those files just pays an S3 round-trip",
     rollup_hits                => "timefusion.rollup.hits": "Dashboard aggregates served from the pre-aggregated rollup instead of raw spans",
     rollup_misses              => "timefusion.rollup.misses": "Dashboard aggregates that fell through to a raw scan, labelled by REASON. Without the reason breakdown there is no feedback loop telling us which dimension to add next — a rollup silently serving 20% of traffic looks identical to one serving 90%",
+    rollup_scan_cohorts        => "timefusion.rollup.maintenance.scan_cohorts": "Bounded rollup scan cohorts executed",
+    rollup_scan_projects       => "timefusion.rollup.maintenance.scan_projects": "Projects included in bounded rollup scan cohorts",
+    rollup_scan_estimated_bytes => "timefusion.rollup.maintenance.scan_estimated_bytes": "Estimated decoded input bytes admitted to rollup cohort scans",
+    rollup_cohort_splits       => "timefusion.rollup.maintenance.cohort_splits": "Resource-exhausted rollup cohorts split and retried",
+    rollup_singleton_failures  => "timefusion.rollup.maintenance.singleton_failures": "Rollup projects isolated into backoff after singleton failure",
+    rollup_staged_projects     => "timefusion.rollup.maintenance.staged_projects": "Project replacements staged outside the Delta commit lock",
+    rollup_shared_commits      => "timefusion.rollup.maintenance.shared_commits": "Shared rollup replacement transactions committed",
+    rollup_commit_actions      => "timefusion.rollup.maintenance.commit_actions": "Delta actions included in shared rollup commits",
+    rollup_occ_retries         => "timefusion.rollup.maintenance.occ_retries": "Shared rollup commits retried after OCC conflict",
+    rollup_ambiguous_landings  => "timefusion.rollup.maintenance.ambiguous_landings": "Errored rollup commits confirmed landed by probing",
+    rollup_scan_duration_ms    => "timefusion.rollup.maintenance.scan_duration_ms": "Cumulative rollup scan-wave duration in milliseconds",
+    rollup_staging_duration_ms => "timefusion.rollup.maintenance.staging_duration_ms": "Cumulative rollup file-staging duration in milliseconds",
+    rollup_commit_duration_ms  => "timefusion.rollup.maintenance.commit_duration_ms": "Cumulative shared rollup commit duration in milliseconds",
+    rollup_end_to_end_duration_ms => "timefusion.rollup.maintenance.end_to_end_duration_ms": "Cumulative rollup cohort end-to-end duration in milliseconds",
+    rollup_output_rows         => "timefusion.rollup.maintenance.output_rows": "Rows written by rollup maintenance",
+    rollup_output_files        => "timefusion.rollup.maintenance.output_files": "Parquet files staged by rollup maintenance",
+    rollup_full_hours_rebuilt  => "timefusion.rollup.maintenance.full_hours_rebuilt": "Rollup project-hours rebuilt by full scans",
+    rollup_incremental_hours_rebuilt => "timefusion.rollup.maintenance.incremental_hours_rebuilt": "Rollup project-hours rebuilt from durable dirty masks",
     cache_insert_bypassed      => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
     hot_tier_demote_skipped    => "timefusion.hot_tier.demote_skipped": "Flush groups NOT demoted to the local hot tier because a demotion was already running (the bound that keeps drained batches from piling up off-ledger). Purely a latency miss — those windows are served from Delta. WARN if sustained: the local IPC write is falling behind the flush rate",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
@@ -261,6 +279,17 @@ pub fn init_metrics(
         .u64_observable_gauge("timefusion.runtime.scheduling_lag_max_ms")
         .with_description("Worst scheduling lag this process lifetime; survives the spike so a post-mortem can still see it")
         .with_callback(|obs| obs.observe(RUNTIME_LAG_MAX_MS.load(Relaxed), &[]))
+        .build();
+
+    meter
+        .u64_observable_gauge("timefusion.rollup.maintenance.pending_dirty_partitions")
+        .with_description("Source partitions with durable rollup invalidations awaiting maintenance")
+        .with_callback(|obs| obs.observe(maintenance_stats().rollup_dirty_partitions.load(Relaxed), &[]))
+        .build();
+    meter
+        .u64_observable_gauge("timefusion.rollup.maintenance.oldest_invalidation_age_seconds")
+        .with_description("Age of the oldest durable rollup invalidation")
+        .with_callback(|obs| obs.observe(maintenance_stats().rollup_oldest_invalidation_age_secs.load(Relaxed), &[]))
         .build();
 
     // Index lag: how far behind ingest the newest published tantivy index is.
@@ -666,6 +695,26 @@ atomic_stats! {
     /// enrichment is paying for 24 hours of re-aggregation again.
     rollup_rebuilds_incremental,
     rollup_rebuilds_full,
+    rollup_dirty_partitions,
+    rollup_oldest_invalidation_age_secs,
+    rollup_scan_cohorts,
+    rollup_scan_projects,
+    rollup_scan_estimated_bytes,
+    rollup_cohort_splits,
+    rollup_singleton_failures,
+    rollup_staged_projects,
+    rollup_shared_commits,
+    rollup_commit_actions,
+    rollup_occ_retries,
+    rollup_ambiguous_landings,
+    rollup_scan_duration_ms,
+    rollup_staging_duration_ms,
+    rollup_commit_duration_ms,
+    rollup_end_to_end_duration_ms,
+    rollup_output_rows,
+    rollup_output_files,
+    rollup_full_hours_rebuilt,
+    rollup_incremental_hours_rebuilt,
     /// Aggregates that fell through to a raw scan, plus the breakdown by reason.
     ///
     /// The OTel counter carries the same labels but cannot be read back

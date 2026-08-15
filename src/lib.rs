@@ -30,6 +30,7 @@ pub mod plan_cache;
 pub mod profiling;
 pub mod read_dedup;
 pub mod rollup;
+pub mod rollup_journal;
 pub mod schema_loader;
 pub mod secret_crypto;
 pub mod snapshot_cache;
