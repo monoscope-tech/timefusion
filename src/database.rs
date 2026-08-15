@@ -9084,10 +9084,7 @@ impl Database {
             // of every post-boot replay. Stopping on it would starve the backfill
             // for the first minutes of every restart, and restarts are frequent
             // on this box.
-            if self.maintenance_shutdown.is_cancelled()
-                || !self.dedup_flush_healthy()
-                || matches!(self.light_optimize_brake(), Some(Brake::Stop(_)))
-            {
+            if self.maintenance_shutdown.is_cancelled() || !self.dedup_flush_healthy() || matches!(self.light_optimize_brake(), Some(Brake::Stop(_))) {
                 return;
             }
             attempted.fetch_add(1, Relaxed);
@@ -9155,8 +9152,7 @@ impl Database {
             }
         };
         futures::stream::iter(candidates).map(unit_of).buffer_unordered(concurrency).collect::<()>().await;
-        let (attempted, built, uncertifiable, failed) =
-            (attempted.load(Relaxed), built.load(Relaxed), uncertifiable.load(Relaxed), failed.load(Relaxed));
+        let (attempted, built, uncertifiable, failed) = (attempted.load(Relaxed), built.load(Relaxed), uncertifiable.load(Relaxed), failed.load(Relaxed));
         // Log whenever there was WORK, not only when some of it succeeded. A tick
         // that queues 200 partitions and builds none because every one is
         // uncertifiable used to be byte-identical in the log to a tick with
