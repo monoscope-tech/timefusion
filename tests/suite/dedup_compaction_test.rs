@@ -218,7 +218,7 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
     assert!(built > 0, "the backfill must build an UNCERTIFIED partition — that is the whole point of dropping the gate");
 
     let rolled =
-        scalar(format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"))
+        scalar(format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'"))
             .await?;
     assert_eq!(rolled, deduped_raw, "the rollup must count the DEDUPLICATED rows; counting the physical 4 is the silent-wrong-number failure");
     Ok(())
@@ -277,7 +277,7 @@ async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_ans
     assert!(built > 0, "the backfill must claim TODAY — otherwise this test proves nothing about partial-day coverage");
 
     let rollup_rows: i64 = {
-        let sql = format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'");
+        let sql = format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'");
         let batches = db.query_delta_only(&sql).await?;
         batches
             .iter()
@@ -1866,7 +1866,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
     let total_from_rollup = |db: Arc<Database>, project_id: String| async move {
-        let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'");
+        let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'");
         let batches = db.query_delta_only(&sql).await?;
         let v = batches
             .iter()
@@ -2008,7 +2008,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // from "there was nothing to rewrite to".
     let built: i64 = db
         .query_delta_only(&format!(
-            "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"
+            "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'"
         ))
         .await?
         .iter()
@@ -2055,6 +2055,24 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     assert_eq!(hybrid, raw, "the hybrid rewrite must equal the raw aggregate exactly");
     assert_eq!(hybrid.len(), 2, "both services must survive, including the one that exists only in the raw tail: {hybrid:?}");
     assert_eq!(hybrid.iter().map(|row| row.1).sum::<i64>(), 6, "every fixture row must be counted exactly once: {hybrid:?}");
+
+    // THE SAME WINDOW WITH NO UPPER BOUND — the shape monoscope's 7d and 14d
+    // panels actually send. Until 2026-08-15 the matcher demanded both bounds
+    // and answered `UnboundedTime`, so a fully built window fell back to a raw
+    // scan and timed out at the 60s statement cap.
+    //
+    // Accepting it introduces the opposite failure: `hi` becomes a plan-time
+    // stand-in, and if the trailing raw range closed at it the rewrite would
+    // silently drop the newest rows. This row sits PAST the bounded window, so
+    // only an open tail can reach it — the bounded assertions above still see 6
+    // because it is outside their `hi`.
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("t_open", "checkout", 700, hi + 1_000_000)?], true, None).await?;
+    let open = query.replace(&format!(" AND timestamp < to_timestamp_micros({hi})"), "");
+    let before = hits();
+    let open_rows = rows_of(ctx.sql(&open).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "an open-ended window must route, not fall back to a raw scan (misses +{})", misses() - misses_before);
+    assert_eq!(open_rows, rows_of(db.query_delta_only(&open).await?), "the open-ended rewrite must equal the raw aggregate exactly");
+    assert_eq!(open_rows.iter().map(|row| row.1).sum::<i64>(), 7, "the open tail must reach the row past the bounded window: {open_rows:?}");
 
     // The shape prod's `rollup_declined_shape` log printed for months: a CAST
     // over an aggregate plus `ORDER BY <an aggregate> LIMIT n` optimizes to
@@ -2177,7 +2195,7 @@ async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Re
         async move {
             anyhow::Ok(
                 db.query_delta_only(&format!(
-                    "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"
+                    "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'"
                 ))
                 .await?
                 .iter()

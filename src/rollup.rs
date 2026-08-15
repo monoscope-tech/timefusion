@@ -627,6 +627,12 @@ pub(crate) fn interiors(lo: i64, hi: i64, grain: i64, horizon: i64, covered: &[(
     if total < hi.saturating_sub(lo) / MIN_INTERIOR_FRACTION { Vec::new() } else { ranges }
 }
 
+/// The upper bound of a window the query left open. Chosen as `i64::MAX` so it
+/// compares above every real timestamp and so `complement` needs no special
+/// case: the trailing gap simply runs to it, and `range_sql` renders that one
+/// range without an upper bound.
+pub(crate) const OPEN_END: i64 = i64::MAX;
+
 /// `[lo, hi)` minus `ranges` — the raw leg's share.
 ///
 /// `ranges` must be ascending and disjoint, which `interiors` guarantees. Every
@@ -654,6 +660,11 @@ pub(crate) struct RoutedRollup {
     pub project_id: String,
     pub lo: i64,
     pub hi: i64,
+    /// The query gave no upper bound and `hi` is a plan-time stand-in. The
+    /// interior may use it; the trailing raw range may NOT, or the rewrite
+    /// would drop every row after it — the newest rows, which is precisely what
+    /// a live dashboard is showing.
+    open_end: bool,
     pub grain: i64,
     pub target: String,
     /// The `Aggregate` node this route replaces, verbatim. The caller substitutes
@@ -674,7 +685,15 @@ pub(crate) struct RoutedRollup {
 impl RoutedRollup {
     /// A half-open range predicate. Only `>=`/`<` are ever emitted: an inclusive
     /// bound on either side of a shared boundary double counts a whole bucket.
+    /// `OPEN_END` marks the trailing range of a window the query left unbounded,
+    /// which renders with no upper bound at all rather than at some stand-in
+    /// instant. It is a sentinel and not a real timestamp: `to_timestamp_micros`
+    /// of it is year 294247, so emitting it literally would be both meaningless
+    /// and, at the boundary, wrong.
     fn range_sql(&(start, end): &(i64, i64)) -> String {
+        if end == OPEN_END {
+            return format!("(timestamp >= to_timestamp_micros({start}))");
+        }
         format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))")
     }
 
@@ -734,7 +753,10 @@ impl RoutedRollup {
                 .collect::<Vec<_>>()
                 .join(" OR ")
         );
-        let fringes = complement(self.lo, self.hi, interiors);
+        // An open-ended window's raw leg must run to the sentinel, not to the
+        // stand-in `hi`: `complement` would otherwise stop the tail there and
+        // the rewrite would answer without the newest rows.
+        let fringes = complement(self.lo, if self.open_end { OPEN_END } else { self.hi }, interiors);
         if fringes.is_empty() {
             // Single leg: the rollup rows ARE the partial states, so the merge
             // applies directly to the measure columns.
@@ -1317,7 +1339,17 @@ async fn route_with_spec(
         }
     }
     let project_id = project_id.ok_or(MissReason::MissingProject)?;
-    let (lo, hi) = lo.zip(hi).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
+    // A dashboard panel writes its window as `timestamp >= now() - interval 'N
+    // days'` and stops there. Demanding an upper bound sent every such query —
+    // the wide ones, the only kind worth accelerating — to a full raw scan.
+    // Prod 2026-08-15: a 7d panel timed out past the 60s statement cap and the
+    // same query with `AND timestamp < now()` returned in 5.5s.
+    //
+    // `now` closes the window for the interior arithmetic ONLY. `open_end`
+    // carries the missing bound through to `sql`, which leaves the trailing raw
+    // range unbounded so rows past `now` are still returned.
+    let open_end = hi.is_none();
+    let (lo, hi) = lo.zip(hi.or_else(|| Some(crate::clock::now_micros()))).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
     let grain = spec.grain_micros().ok_or(MissReason::UnsupportedShape)?;
     // A grain too coarse for the window can never yield a usable interior — the
     // aligned span inside it is empty or below the cost floor. Rejecting it here
@@ -1517,6 +1549,7 @@ async fn route_with_spec(
         project_id,
         lo,
         hi,
+        open_end,
         grain,
         target: spec.table_name(table_name),
         matched: datafusion::logical_expr::LogicalPlan::Aggregate(aggregate.clone()),
@@ -1542,6 +1575,40 @@ mod tests {
 
     fn spec() -> RollupSpec {
         crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
+    }
+
+    /// A window with a lower bound and NO upper bound must still route.
+    ///
+    /// Prod 2026-08-15: monoscope's 7d and 14d panels timed out at the 60s
+    /// statement cap. `route_with_spec` demanded BOTH bounds and answered
+    /// `UnboundedTime`, so a window with fully built rollups fell back to a raw
+    /// scan of every row in it. Measured on the demo project: `timestamp >=
+    /// now() - interval '7 days'` timed out past 60s, while the identical query
+    /// plus `AND timestamp < now()` returned in 5.5s.
+    #[tokio::test]
+    async fn an_open_ended_window_routes() {
+        let state = session().await;
+        let sql =
+            format!("SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name");
+        let route = route_for(&state, &sql).await;
+        assert!(route.is_ok(), "an open-ended window must route: {route:?}");
+    }
+
+    /// The open end must reach the raw leg, not be silently closed at plan time.
+    ///
+    /// Substituting a concrete `hi` makes the interior computable, but if that
+    /// same `hi` also closed the trailing fringe the rewrite would DROP every
+    /// row after it — the newest rows, which is exactly what a live dashboard
+    /// is looking at. The last raw range must carry no upper bound.
+    #[tokio::test]
+    async fn an_open_ended_window_keeps_an_open_raw_tail() {
+        let state = session().await;
+        let sql =
+            format!("SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name");
+        let route = route_for(&state, &sql).await.expect("route").expect("a route");
+        let generated = hybrid_sql(&route, crate::clock::now_micros());
+        let tail = generated.rsplit("timestamp >=").next().expect("a trailing range");
+        assert!(!tail.contains("timestamp <"), "the trailing raw range must stay open-ended, got: {generated}");
     }
 
     /// A hint whose own predicate was consumed as a DIMENSION filter must not be
@@ -1744,7 +1811,7 @@ mod tests {
         assert_eq!(Merge::Hll.sql(&["__s0_0".to_string()]), "hll_merge(__s0_0)");
     }
 
-    const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v2";
+    const TARGET: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
     /// Ten grains wide. A window narrower than `MIN_INTERIOR_BUCKETS` grains can
     /// never route — the aligned interior would be at most one bucket — so a
     /// one-minute fixture would exercise the rejection path, not the matcher.
@@ -1950,7 +2017,7 @@ mod tests {
     async fn a_metrics_panel_routes_with_an_in_filter_and_a_digest() {
         let mut ctx = datafusion::prelude::SessionContext::new();
         crate::functions::register_custom_functions(&mut ctx).expect("functions register");
-        for table_name in ["otel_metrics", "otel_metrics_rollup_metrics_1m_v1"] {
+        for table_name in ["otel_metrics", "otel_metrics_rollup_metrics_1m_v2"] {
             let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
                 .expect("empty table");
             ctx.register_table(table_name, Arc::new(table)).expect("register table");
@@ -1967,7 +2034,7 @@ mod tests {
         );
         let original = optimized(&state, &sql).await;
         let route = match_aggregates(&original, &state).await.expect("match").into_iter().next().expect("route");
-        assert_eq!(route.target, "otel_metrics_rollup_metrics_1m_v1");
+        assert_eq!(route.target, "otel_metrics_rollup_metrics_1m_v2");
         let generated = hybrid_sql(&route, WIDE_HORIZON);
         // DataFusion inlines a short `IN` to `OR`s, so this list is deliberately
         // long enough to survive as an `InList` and exercise that branch.
@@ -2013,7 +2080,7 @@ mod tests {
         );
         assert_eq!(
             route_for(&state, &wide).await.expect("match").expect("route").target,
-            "otel_logs_and_spans_rollup_dashboard_1h_v1",
+            "otel_logs_and_spans_rollup_dashboard_1h_v2",
             "a 10-day window bucketed hourly must use the coarse tier"
         );
 
