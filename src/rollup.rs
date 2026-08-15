@@ -1588,8 +1588,9 @@ mod tests {
     #[tokio::test]
     async fn an_open_ended_window_routes() {
         let state = session().await;
-        let sql =
-            format!("SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name");
+        let sql = format!(
+            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name"
+        );
         let route = route_for(&state, &sql).await;
         assert!(route.is_ok(), "an open-ended window must route: {route:?}");
     }
@@ -1603,8 +1604,9 @@ mod tests {
     #[tokio::test]
     async fn an_open_ended_window_keeps_an_open_raw_tail() {
         let state = session().await;
-        let sql =
-            format!("SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name");
+        let sql = format!(
+            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name"
+        );
         let route = route_for(&state, &sql).await.expect("route").expect("a route");
         let generated = hybrid_sql(&route, crate::clock::now_micros());
         let tail = generated.rsplit("timestamp >=").next().expect("a trailing range");
