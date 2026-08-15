@@ -72,7 +72,6 @@ pub struct E2eEnvBuilder {
     hot_tier_retention_hours: u64,
     sort_skip_bytes: Option<usize>,
     light_optimize_target_size: Option<i64>,
-    light_optimize_enabled: bool,
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
     repair_resume: bool,
@@ -98,7 +97,6 @@ impl Default for E2eEnvBuilder {
             hot_tier_retention_hours: 0,
             sort_skip_bytes: None,
             light_optimize_target_size: None,
-            light_optimize_enabled: true,
             wide_scan_max_files: None,
             wide_scan_max_mb: None,
             // Mirror the prod default (on) so the whole e2e suite exercises the
@@ -157,10 +155,6 @@ impl E2eEnvBuilder {
     /// "converged" (>= 7/8 of target) — the state a 265-778MB prod file is in.
     pub fn with_light_optimize_target(mut self, bytes: i64) -> Self {
         self.light_optimize_target_size = Some(bytes);
-        self
-    }
-    pub fn without_light_optimize(mut self) -> Self {
-        self.light_optimize_enabled = false;
         self
     }
     /// Shrink the wide-scan file budget so a test-sized file set trips the
@@ -286,7 +280,6 @@ impl E2eEnvBuilder {
             hot_tier_retention_hours: self.hot_tier_retention_hours,
             sort_skip_bytes: self.sort_skip_bytes,
             light_optimize_target_size: self.light_optimize_target_size,
-            light_optimize_enabled: self.light_optimize_enabled,
             wide_scan_max_files: self.wide_scan_max_files,
             wide_scan_max_mb: self.wide_scan_max_mb,
             page_row_count_limit: self.page_row_count_limit,
@@ -402,7 +395,6 @@ impl E2eEnv {
             hot_tier_retention_hours: self.builder.hot_tier_retention_hours,
             sort_skip_bytes: self.builder.sort_skip_bytes,
             light_optimize_target_size: self.builder.light_optimize_target_size,
-            light_optimize_enabled: self.builder.light_optimize_enabled,
             wide_scan_max_files: self.builder.wide_scan_max_files,
             wide_scan_max_mb: self.builder.wide_scan_max_mb,
             page_row_count_limit: self.builder.page_row_count_limit,
@@ -525,7 +517,6 @@ struct BuildCfgArgs<'a> {
     hot_tier_retention_hours: u64,
     sort_skip_bytes: Option<usize>,
     light_optimize_target_size: Option<i64>,
-    light_optimize_enabled: bool,
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
     repair_resume: bool,
@@ -555,7 +546,6 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.cache.timefusion_foyer_disabled = args.foyer_disabled;
     cfg.parquet.timefusion_checkpoint_interval = args.checkpoint_interval;
     cfg.maintenance.timefusion_optimize_sort_by = args.optimize_sort_by;
-    cfg.maintenance.timefusion_light_optimize_enabled = args.light_optimize_enabled;
     cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;

@@ -118,7 +118,7 @@ fields:
 # grain could not answer them at all.
 rollups:
   - grain: 1m
-    name: metrics_1m_v2
+    name: metrics_1m_v1
     dimensions: [metric_name, resource___service___name]
     measures:
       - { name: point_count, agg: count }
@@ -138,8 +138,8 @@ rollups:
   # it costs a scan of 220k rollup rows instead of a second pass over 1.8M
   # points — every measure here is associative, so the answer is identical.
   - grain: 1h
-    name: metrics_1h_v2
-    derive_from: metrics_1m_v2
+    name: metrics_1h_v1
+    derive_from: metrics_1m_v1
     dimensions: [metric_name, resource___service___name]
     measures:
       - { name: point_count, agg: count }

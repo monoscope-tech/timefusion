@@ -287,7 +287,7 @@ impl StatsTableProvider {
         ];
 
         let m = crate::metrics::maintenance_stats();
-        let mut maintenance = rows![@atomic "maintenance";
+        let maintenance = rows![@atomic "maintenance";
             "checkpoints_created" => m.checkpoints_created,
             "checkpoint_failed" => m.checkpoint_failed,
             "checkpoint_corrupt" => m.checkpoint_corrupt,
@@ -345,26 +345,10 @@ impl StatsTableProvider {
             "rollup_output_files_total" => m.rollup_output_files,
             "rollup_full_hours_rebuilt_total" => m.rollup_full_hours_rebuilt,
             "rollup_incremental_hours_rebuilt_total" => m.rollup_incremental_hours_rebuilt,
-            "tasks_pending" => m.maintenance_tasks_pending,
-            "tasks_running" => m.maintenance_tasks_running,
-            "tasks_retry" => m.maintenance_tasks_retry,
-            "tasks_complete" => m.maintenance_tasks_complete,
-            "backlog_bytes" => m.maintenance_backlog_bytes,
-            "oldest_task_age_seconds" => m.maintenance_oldest_task_age_secs,
-            "eligible_watermark_lag_seconds" => m.maintenance_eligible_watermark_lag_secs,
-            "processed_bytes_total" => m.maintenance_processed_bytes,
-            "processed_bytes_per_second" => m.maintenance_processed_bytes_per_sec,
-            "raw_tail_duration_seconds" => m.maintenance_raw_tail_duration_secs,
-            "sealed_compaction_debt_bytes" => m.sealed_compaction_debt_bytes,
-            "cpu_tokens_used" => m.maintenance_cpu_tokens_used,
-            "decoded_bytes_used" => m.maintenance_decoded_bytes_used,
-            "object_read_tokens_used" => m.maintenance_object_read_tokens_used,
-            "object_write_tokens_used" => m.maintenance_object_write_tokens_used,
             "rollup_misses_total" => m.rollup_misses_total,
             "rollup_miss_not_built_total" => m.rollup_miss_not_built,
             "rollup_miss_stale_coverage_total" => m.rollup_miss_stale_coverage,
             "rollup_miss_tiny_interior_total" => m.rollup_miss_tiny_interior,
-            "rollup_miss_too_many_branches_total" => m.rollup_miss_too_many_branches,
             "rollup_miss_unsupported_total" => m.rollup_miss_unsupported,
             "rollup_miss_incomplete_coverage_total" => m.rollup_miss_incomplete_coverage,
             "rollup_miss_unknown_filter_total" => m.rollup_miss_unknown_filter,
@@ -401,7 +385,6 @@ impl StatsTableProvider {
             "cron_ticks_fired" => m.cron_ticks_fired,
             "cron_ticks_skipped" => m.cron_ticks_skipped,
         ];
-        maintenance.push(("maintenance", "retry_reason".to_owned(), crate::metrics::maintenance_retry_reason()));
 
         let plan_cache = crate::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();
