@@ -15524,6 +15524,12 @@ fn scan_pressure_permits(total: u32) -> u32 {
 const VALVE_ETA_TIER1_SECS: u64 = 90;
 /// Second tier: fully serialize. At this projection nothing else will do.
 const VALVE_ETA_TIER2_SECS: u64 = 30;
+/// The projected tiers apply only from this share of the limit. Below it there
+/// is so much absolute headroom that a short projection means "filling fast
+/// from cold", not "about to hit the wall". At half of a 96 GiB limit there are
+/// still ~48 GiB free, which the measured ~450 MB/s burst takes ~107s to cross
+/// — so the 90s tier still engages with real lead time.
+const VALVE_RATE_FLOOR_PCT: u64 = 50;
 
 /// Sub-divisions of one reader slot in the wide-scan gate.
 ///
@@ -15570,10 +15576,20 @@ fn decode_units(last_batch_bytes: u64) -> u32 {
 /// it is being used. Whichever tier is reached first wins — the absolute
 /// percentages are the backstop for a burst too fast to have been projected,
 /// the projections are what catch a burst early enough to throttle it.
+///
+/// The projection is GATED on [`VALVE_RATE_FLOOR_PCT`] of the limit. A process
+/// that is merely filling from cold grows very fast — prod measured ~1 GB/s
+/// during boot — so its projection to the limit is short while its actual
+/// distance from the limit is enormous, and it will plateau long before
+/// arriving. Without the floor the valve throttled every decode in the system
+/// at 18% of the limit (observed live on d9511ec, 2026-08-14 23:50Z), which is
+/// the same "throttles everything" failure the 70% tier had, arrived at from
+/// the opposite direction.
 fn pressure_permit_claim_at(usage_pct: u64, eta_secs: u64, total: u32) -> u32 {
-    if usage_pct >= 95 || eta_secs <= VALVE_ETA_TIER2_SECS {
+    let projected = usage_pct >= VALVE_RATE_FLOOR_PCT;
+    if usage_pct >= 95 || (projected && eta_secs <= VALVE_ETA_TIER2_SECS) {
         total
-    } else if usage_pct >= 88 || eta_secs <= VALVE_ETA_TIER1_SECS {
+    } else if usage_pct >= 88 || (projected && eta_secs <= VALVE_ETA_TIER1_SECS) {
         (total / 4).max(1)
     } else {
         1
@@ -17421,6 +17437,11 @@ mod tests {
     fn the_valve_fires_on_rate_not_on_a_parked_working_set() {
         // Morning traffic: parked at 70%, going nowhere. Full concurrency.
         assert_eq!(pressure_permit_claim_at(70, u64::MAX, 16), 1, "a steady working set must never be throttled");
+        // Booting: filling caches at ~1 GB/s from near-empty, so the projection
+        // is short but the process is nowhere near the wall and will plateau.
+        // Throttling here throttles every query in the system for no reason.
+        assert_eq!(pressure_permit_claim_at(18, 65, 16), 1, "a cold process filling fast must not engage the valve");
+        assert_eq!(pressure_permit_claim_at(49, 10, 16), 1, "below the floor, even a tiny projection is not evidence");
         // Same 70%, but projected to hit the limit inside a minute. Throttle.
         assert_eq!(pressure_permit_claim_at(70, 60, 16), 4, "a burst must engage the valve well before 88%");
         // And with seconds left, serialize — still from only 70% used.
