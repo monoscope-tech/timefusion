@@ -1611,6 +1611,29 @@ mod tests {
         assert!(!tail.contains("timestamp <"), "the trailing raw range must stay open-ended, got: {generated}");
     }
 
+    /// The partition invariant has to survive the open end.
+    ///
+    /// `complement` is what guarantees the rollup interior and the raw fringes
+    /// cover the window exactly once. A gap is a silently missing row and an
+    /// overlap is a silently doubled one, and no aggregate above can detect
+    /// either. Substituting a stand-in `hi` is only safe while this holds all
+    /// the way out to `OPEN_END`.
+    #[test]
+    fn an_open_ended_window_is_still_partitioned_exactly() {
+        let (grain, lo) = (60_000_000i64, 1_786_500_000_000_000i64);
+        let horizon = lo + grain * 90;
+        let inner = interiors(lo, lo + grain * 100, grain, horizon, &[(lo, horizon)]);
+        assert!(!inner.is_empty(), "the fixture must produce an interior to complement");
+
+        let mut ranges: Vec<(i64, i64)> = inner.iter().chain(complement(lo, OPEN_END, &inner).iter()).copied().collect();
+        ranges.sort_unstable();
+        assert_eq!(ranges.first().expect("ranges").0, lo, "coverage must start at lo");
+        assert_eq!(ranges.last().expect("ranges").1, OPEN_END, "coverage must run to the open end, or the newest rows are dropped");
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "no gap and no overlap between {:?} and {:?}", pair[0], pair[1]);
+        }
+    }
+
     /// A hint whose own predicate was consumed as a DIMENSION filter must not be
     /// left behind in the promotable set. Prod 2026-08-12 showed exactly this:
     /// `kind = 'server'` routed as a dimension filter while
