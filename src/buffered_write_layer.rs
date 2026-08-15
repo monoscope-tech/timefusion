@@ -1515,6 +1515,11 @@ impl BufferedWriteLayer {
         let mut processed_total = 0u64;
         let mut applied_frontiers: std::collections::HashMap<(String, String), ShardHolds> = std::collections::HashMap::new();
         const DECODE_CHUNK_ENTRIES: usize = 64;
+        /// Cap on concurrent decode tasks. Replay must not monopolise a box that
+        /// is also serving the early-bind PGWire responder.
+        const DECODE_MAX_TASKS: usize = 4;
+        /// Below this a chunk decodes inline — the join costs more than it saves.
+        const DECODE_PARALLEL_MIN_ENTRIES: usize = 8;
         const DECODE_CHUNK_BYTES: usize = 32 * 1024 * 1024;
         loop {
             // Prefetch only a small bounded chunk. Each item captures the
@@ -1541,17 +1546,63 @@ impl BufferedWriteLayer {
                 break;
             }
 
-            let ready: Vec<_> = chunk
-                .into_iter()
-                .map(|(entry, shard, pos, frontier)| {
-                    let decoded = (entry.operation == WalOperation::Insert).then(|| {
-                        let started = std::time::Instant::now();
-                        let batch = deserialize_record_batch(&entry.data).map(crate::mem_buffer::compact_batch);
-                        (batch, started.elapsed().as_nanos())
-                    });
-                    (entry, shard, pos, frontier, decoded)
+            // Decode the chunk ACROSS TASKS. This is what the chunking exists
+            // for — `DECODE_CHUNK_BYTES` bounds the payload in flight precisely
+            // so a parallel decode cannot turn 64 large entries into a multi-GiB
+            // boot spike. 66aef24 removed the rayon that did this and left the
+            // bounding behind, so replay decoded serially on one core of a
+            // 48-core box while Arrow decode was 51% of the remaining cost.
+            //
+            // `spawn_blocking`, not `std::thread::scope`: a chunk is 64 entries,
+            // so scoped threads meant ~750 raw spawns over a 6000-entry replay.
+            // Tokio's blocking pool is reused, so this costs no spawns in steady
+            // state. ORDER IS PRESERVED — tasks take disjoint contiguous slices
+            // and are joined in order, so `process_entry` still sees WAL order,
+            // which DML replay depends on.
+            fn decode_one(entry: &WalEntry) -> Option<(Result<RecordBatch, crate::wal::WalError>, u128)> {
+                (entry.operation == WalOperation::Insert).then(|| {
+                    let started = std::time::Instant::now();
+                    let batch = deserialize_record_batch(&entry.data).map(crate::mem_buffer::compact_batch);
+                    (batch, started.elapsed().as_nanos())
                 })
-                .collect();
+            }
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(DECODE_MAX_TASKS);
+            let ready: Vec<_> = if threads > 1 && chunk.len() >= DECODE_PARALLEL_MIN_ENTRIES {
+                let per = chunk.len().div_ceil(threads);
+                let mut slices: Vec<Vec<_>> = Vec::with_capacity(threads);
+                let mut rest = chunk;
+                while !rest.is_empty() {
+                    let tail = rest.split_off(per.min(rest.len()));
+                    slices.push(std::mem::replace(&mut rest, tail));
+                }
+                let handles: Vec<_> = slices
+                    .into_iter()
+                    .map(|slice| {
+                        tokio::task::spawn_blocking(move || {
+                            slice
+                                .into_iter()
+                                .map(|(entry, shard, pos, frontier)| {
+                                    let d = decode_one(&entry);
+                                    (entry, shard, pos, frontier, d)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::new();
+                for h in handles {
+                    out.extend(h.await.expect("WAL decode task panicked"));
+                }
+                out
+            } else {
+                chunk
+                    .into_iter()
+                    .map(|(entry, shard, pos, frontier)| {
+                        let d = decode_one(&entry);
+                        (entry, shard, pos, frontier, d)
+                    })
+                    .collect()
+            };
 
             for (entry, shard, pos, (safe_topic, safe_frontier), decoded) in ready {
                 process_entry(entry, shard, pos, decoded);
@@ -1731,7 +1782,9 @@ impl BufferedWriteLayer {
         // long pole is Arrow decode, MemBuffer apply, or per-entry DML SQL eval.
         let avg_ms = |nanos: u128, n: u64| if n > 0 { nanos as f64 / n as f64 / 1_000_000.0 } else { 0.0 };
         info!(
-            "WAL recovery cost breakdown: insert_decode={}ms ({:.3}ms/ea), insert_apply={}ms ({:.3}ms/ea), \
+            // insert_decode is SUMMED ACROSS DECODE TASKS, so it can exceed the
+            // wall clock — that gap is the parallel speedup, not an error.
+            "WAL recovery cost breakdown: insert_decode={}ms cpu ({:.3}ms/ea), insert_apply={}ms ({:.3}ms/ea), \
              delete={}ms ({:.3}ms/ea), update={}ms ({:.3}ms/ea), insert_payload={}MB (avg {}B/ea)",
             insert_decode_nanos / 1_000_000,
             avg_ms(insert_decode_nanos, entries_replayed),
