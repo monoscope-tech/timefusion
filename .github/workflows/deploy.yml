@@ -199,18 +199,28 @@ jobs:
           probe_dir="$(mktemp -d)"
           probe_stop="$probe_dir/stop"
           probe_result="$probe_dir/max_unready_ms"
+          handoff_result="$probe_dir/query_handoff_ms"
           (
             unready_started_ms=0
             max_unready_ms=0
+            last_old_response_ms="$(date +%s%3N)"
+            query_handoff_ms=0
             while [ ! -e "$probe_stop" ]; do
-              if timeout 1 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
+              attempt_started_ms="$(date +%s%3N)"
+              responding_boot="$(timeout 1 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
+              if [ -n "$responding_boot" ]; then
                 if (( unready_started_ms > 0 )); then
                   interval_ms=$(( $(date +%s%3N) - unready_started_ms ))
                   (( interval_ms > max_unready_ms )) && max_unready_ms=$interval_ms
                   unready_started_ms=0
                 fi
+                if [ "$responding_boot" = "$PREVIOUS_BOOT_MICROS" ]; then
+                  last_old_response_ms="$(date +%s%3N)"
+                elif (( query_handoff_ms == 0 )); then
+                  query_handoff_ms=$(( $(date +%s%3N) - last_old_response_ms ))
+                fi
               elif (( unready_started_ms == 0 )); then
-                unready_started_ms="$(date +%s%3N)"
+                unready_started_ms="$attempt_started_ms"
               fi
               sleep 0.1
             done
@@ -219,6 +229,7 @@ jobs:
               (( interval_ms > max_unready_ms )) && max_unready_ms=$interval_ms
             fi
             echo "$max_unready_ms" > "$probe_result"
+            echo "$query_handoff_ms" > "$handoff_result"
           ) &
           probe_pid=$!
           stop_probe() {
@@ -258,7 +269,9 @@ jobs:
           stop_probe
           trap - EXIT
           observed_unready_ms="$(cat "$probe_result")"
+          query_handoff_ms="$(cat "$handoff_result")"
           echo "observed_unready_ms=$observed_unready_ms" >> "$GITHUB_OUTPUT"
+          echo "query_handoff_ms=$query_handoff_ms" >> "$GITHUB_OUTPUT"
           cat caprover-deploy.log
           (( deploy_status == 0 )) || exit "$deploy_status"
 
@@ -268,6 +281,7 @@ jobs:
           PREVIOUS_BOOT_MICROS: ${{ steps.production_before.outputs.boot_micros }}
           HANDOFF_STARTED_EPOCH_MS: ${{ steps.production_before.outputs.handoff_started_epoch_ms }}
           OBSERVED_UNREADY_MS: ${{ steps.deploy.outputs.observed_unready_ms }}
+          QUERY_HANDOFF_MS: ${{ steps.deploy.outputs.query_handoff_ms }}
           # A planned deploy is pre-flushed. Exact local cursor/tail equality
           # now skips both Delta reconciliation and replay, so minutes-class
           # recovery is a regression, not an expected operating mode.
@@ -292,7 +306,8 @@ jobs:
             if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ] && [[ "$recovery_ms" =~ ^[0-9]+$ ]]; then
               ready_elapsed_ms=$(( $(date +%s%3N) - HANDOFF_STARTED_EPOCH_MS ))
               ready_wait=$(( (ready_elapsed_ms + 999) / 1000 ))
-              echo "rollout measurement: total ${ready_elapsed_ms}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
+              echo "rollout measurement: total ${ready_elapsed_ms}ms; last-old-query to first-new-query ${QUERY_HANDOFF_MS}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
+              [[ "$QUERY_HANDOFF_MS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::rollout probe did not observe the old-to-new query handoff: '$QUERY_HANDOFF_MS'"; exit 1; }
               [[ "$OBSERVED_UNREADY_MS" =~ ^[0-9]+$ ]] || { echo "::error::rollout readiness probe did not produce a valid downtime measurement: '$OBSERVED_UNREADY_MS'"; exit 1; }
               (( OBSERVED_UNREADY_MS <= MAX_READY_WAIT_SECS * 1000 )) || { echo "::error::replacement returned 57P03/not-ready continuously for ${OBSERVED_UNREADY_MS}ms (budget $((MAX_READY_WAIT_SECS * 1000))ms)"; exit 1; }
               # A PLANNED deploy drains the WAL first, so recovery is 0ms and this

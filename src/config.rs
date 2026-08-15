@@ -908,7 +908,6 @@ const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_rollup_backfill_schedule: String = "0 */10 * * * *");
-const_default!(d_rollup_backfill_units: usize = 4);
 const_default!(d_rollup_backfill_concurrency: usize = 3);
 const_default!(d_footer_repair_schedule: String = "0 30 * * * *");
 const_default!(d_footer_repair_budget_secs: u64 = 8640);
@@ -2118,11 +2117,6 @@ pub struct MaintenanceConfig {
     pub timefusion_rollup_backfill_days: u16,
     #[serde(default = "d_rollup_backfill_schedule")]
     pub timefusion_rollup_backfill_schedule: String,
-    /// Units attempted per tick AFTER the first. The first always runs to
-    /// completion: a day-sized aggregate cannot be split, so a budget check
-    /// before it would make a slow day produce NOTHING, forever.
-    #[serde(default = "d_rollup_backfill_units")]
-    pub timefusion_rollup_backfill_units_per_tick: usize,
     /// Backfill units in flight at once.
     ///
     /// Serial units were the binding constraint on convergence: prod 2026-08-15
@@ -2138,14 +2132,6 @@ pub struct MaintenanceConfig {
     /// rewrite.
     #[serde(default = "d_rollup_backfill_concurrency")]
     pub timefusion_rollup_backfill_concurrency: usize,
-    /// Use bounded cohort rollup maintenance and its durable invalidation
-    /// journal. Reads remain governed by the existing rollup read gate.
-    #[serde(default)]
-    pub timefusion_rollup_maintenance_v2: bool,
-    /// Optional comma-separated source allowlist for maintenance V2. Empty
-    /// means every declared rollup source once the V2 master gate is enabled.
-    #[serde(default)]
-    pub timefusion_rollup_maintenance_v2_sources: Option<String>,
     /// Skip the read-side DedupExec (and, since 4ecca05, its key projection) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged
@@ -2308,10 +2294,6 @@ impl MaintenanceConfig {
     /// never gets built.
     pub fn rollup_build_enabled(&self) -> bool {
         self.timefusion_rollup_enabled
-    }
-
-    pub fn rollup_maintenance_v2_enabled_for(&self, source: &str) -> bool {
-        self.timefusion_rollup_maintenance_v2 && Self::selected(source, self.timefusion_rollup_maintenance_v2_sources.as_deref())
     }
 
     pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {

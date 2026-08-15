@@ -214,13 +214,6 @@ pub(crate) fn dirty_ranges(day_start: i64, hours: u32) -> Vec<(i64, i64)> {
     ranges
 }
 
-/// True when whole rollup buckets nest inside an hour, which is what lets an
-/// hour be rebuilt without splitting one. A grain that does not divide an hour
-/// would leave a bucket half-rebuilt and half-carried-forward.
-pub(crate) fn grain_fits_hours(spec: &RollupSpec) -> bool {
-    spec.grain_micros().is_some_and(|grain| grain > 0 && HOUR_MICROS % grain == 0)
-}
-
 pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, project_id: &str, date: &str) -> anyhow::Result<String> {
     build_partition_sql_ranges(spec, source, from, "", project_id, date, &[])
 }
@@ -295,7 +288,7 @@ pub(crate) fn build_partition_sql_ranges(
 }
 
 /// Aggregate one disjoint time range for a bounded set of projects. Unlike the
-/// legacy incremental SQL this never carries target rows forward: four calls
+/// per-project incremental SQL this never carries target rows forward: four calls
 /// cover the day and their staged union is the complete replacement.
 pub(crate) fn build_cohort_sql_range(
     spec: &RollupSpec, source: &str, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64),

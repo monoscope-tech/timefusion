@@ -202,18 +202,10 @@ Treat ingestion-time aggregation as a separate future design. It requires
 durable source-commit identities, idempotent state application, and explicit
 merge-on-read semantics.
 
-## Rollout controls
+## Activation
 
-Add internal configuration with safe defaults:
-
-```text
-TIMEFUSION_ROLLUP_MAINTENANCE_V2=false
-TIMEFUSION_ROLLUP_MAINTENANCE_V2_SOURCES=
-```
-
-The source allowlist permits independent rollout. An empty allowlist enables no
-source while V2 is disabled; define and test the enabled-with-empty behavior
-explicitly before deployment to avoid an accidental global rollout.
+Bounded cohort maintenance is the only rollup builder. It applies to every
+source that declares rollups and requires no rollout-specific configuration.
 
 ## Observability
 
@@ -275,13 +267,8 @@ Measure two independent axes:
 
 ## Deployment
 
-Deploy with reads unchanged and V2 disabled. Enable V2 first for `otel_metrics`
-and validate parity, memory bounds, commit counts, and convergence. Then enable
-`otel_logs_and_spans`.
-
-Rollback disables V2 only. The existing builder can safely replace the same
-generated tables because generations, coverage, fingerprints, and read-ticket
-validation remain unchanged.
+Deploy with reads unchanged. Rollback uses the previous application image; the
+generated table schemas and read behavior remain unchanged.
 
 ## Assumptions
 

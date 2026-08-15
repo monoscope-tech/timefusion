@@ -3699,6 +3699,15 @@ impl Database {
                             Ok(built) => info!(source, built, "rollup backfill built sealed partitions"),
                             Err(error) => warn!(source, %error, "rollup backfill tick failed"),
                         }
+                        let custom_projects: Vec<_> =
+                            db.custom_storage_keys().await.into_iter().filter_map(|(project_id, table)| (table == source).then_some(project_id)).collect();
+                        for project_id in custom_projects {
+                            match db.rollup_backfill_tick_for(&project_id, &source).await {
+                                Ok(0) => {}
+                                Ok(built) => info!(source, project_id, built, "rollup backfill built custom-storage partitions"),
+                                Err(error) => warn!(source, project_id, %error, "custom-storage rollup backfill tick failed"),
+                            }
+                        }
                     }
                 }
             }
@@ -8540,16 +8549,10 @@ impl Database {
         let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         self.rollup_invalidated_at.entry(source_key.clone()).or_insert_with(crate::certification_store::now_unix_ms);
-        if self.config.maintenance.rollup_maintenance_v2_enabled_for(source) {
-            // V2 records every invalidation. An absent entry means prior changes
-            // are unknown, so establish a conservative full-day marker rather
-            // than claiming the current batch's precise hours are complete.
-            self.rollup_dirty.entry(source_key.clone()).and_modify(|dirty| *dirty |= hours).or_insert(crate::rollup::ALL_HOURS);
-        } else if let Some(mut dirty) = self.rollup_dirty.get_mut(&source_key) {
-            // Legacy incremental repair can widen only an already-established
-            // clean claim.
-            *dirty |= hours;
-        }
+        // An absent entry means prior changes are unknown, so establish a
+        // conservative full-day marker rather than claiming this batch's exact
+        // hours are complete.
+        self.rollup_dirty.entry(source_key.clone()).and_modify(|dirty| *dirty |= hours).or_insert(crate::rollup::ALL_HOURS);
         self.rollup_source_epochs.entry(source_key).and_modify(|epoch| *epoch = epoch.saturating_add(1)).or_insert(1);
         if let Some(schema) = get_schema(source) {
             for spec in &schema.rollups {
@@ -8558,9 +8561,7 @@ impl Database {
                 self.rollup_backoff.remove(&key);
             }
         }
-        if self.config.maintenance.rollup_maintenance_v2_enabled_for(source) {
-            self.persist_rollup_journal()?;
-        }
+        self.persist_rollup_journal()?;
         Ok(())
     }
 
@@ -8655,21 +8656,12 @@ impl Database {
             self.rollup_source_epochs.iter().filter(|entry| entry.key().0 == project_id && entry.key().1 == source).map(|entry| entry.key().clone()).collect();
         for key in &keys {
             self.rollup_source_epochs.entry(key.clone()).and_modify(|epoch| *epoch = epoch.saturating_add(1));
-            if self.config.maintenance.rollup_maintenance_v2_enabled_for(source) {
-                self.rollup_dirty.insert(key.clone(), crate::rollup::ALL_HOURS);
-                self.rollup_invalidated_at.entry(key.clone()).or_insert_with(crate::certification_store::now_unix_ms);
-            }
+            self.rollup_dirty.insert(key.clone(), crate::rollup::ALL_HOURS);
+            self.rollup_invalidated_at.entry(key.clone()).or_insert_with(crate::certification_store::now_unix_ms);
         }
         self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source);
         self.rollup_backoff.retain(|(project, table, _, _), _| project != project_id || table != source);
-        // A wipe means we no longer know WHAT changed, only that something did.
-        // Dropping the claim is what stops the next repair carrying stale
-        // buckets forward.
-        if !self.config.maintenance.rollup_maintenance_v2_enabled_for(source) {
-            self.rollup_dirty.retain(|(project, table, _), _| project != project_id || table != source);
-        } else {
-            self.persist_rollup_journal()?;
-        }
+        self.persist_rollup_journal()?;
         Ok(())
     }
 
@@ -8717,117 +8709,13 @@ impl Database {
     /// Takes the SAME `table` guard the caller will scan/sum from, so the
     /// fingerprint verdict and the data read share one snapshot (no
     /// check-then-use window; 2026-07-05 review hardening).
-    /// Recompute one certified partition's rollup buckets.
-    ///
-    /// Best-effort by design: a failure here must never fail the dedup sweep
-    /// that certified the partition, because the sweep's own result (a
-    /// duplicate-free partition) is correct and useful without the rollup. A
-    /// missing bucket costs a raw scan — the same thing every query did before
-    /// this table existed — so `route` simply finds nothing to serve.
-    /// Rebuilds EVERY rollup declared on `source`, so adding one is a schema
-    /// change and nothing here needs editing.
-    async fn replace_rollup_partition(&self, project_id: &str, target: &str, date: &str, batches: Vec<RecordBatch>) -> Result<()> {
-        use deltalake::{
-            kernel::{Action, transaction::TableReference},
-            protocol::{DeltaOperation, SaveMode},
-            writer::DeltaWriter,
-        };
-
-        let table_ref = self.get_or_create_table(project_id, target).await?;
-        let schema = get_schema(target).ok_or_else(|| anyhow::anyhow!("rollup target `{target}` is not registered"))?;
-        let (batches, sorted) = self.sort_flush_group(schema, batches, UnsortedFallback::Forbid).await?;
-        let staging_table = table_ref.read().await.clone();
-        let stage_store = staging_table.log_store().object_store(None);
-        let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
-            .map_err(|error| anyhow::anyhow!("rollup writer: {error}"))?
-            .with_writer_properties(self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted));
-        let target_schema = writer.arrow_schema();
-        let mut staged = Vec::new();
-        for batch in batches {
-            let batch = batch?;
-            writer.write(deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?).await?;
-            if writer.buffer_len() >= self.config.maintenance.timefusion_writer_max_file_bytes {
-                staged.extend(writer.flush().await?.into_iter().map(Action::Add));
-            }
-        }
-        staged.extend(writer.flush().await?.into_iter().map(Action::Add));
-
-        let commit_lock = self.commit_lock(project_id, target).await;
-        for attempt in 0..5 {
-            let commit_guard = commit_lock.lock().await;
-            let _ = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
-            let mut table = table_ref.read().await.clone();
-            let target_paths: std::collections::HashSet<_> =
-                dedup_partition_paths(table.snapshot()?.log_data().iter().map(|add| add.path().to_string()), project_id, date).into_iter().collect();
-            let targets: Vec<_> = table.snapshot()?.log_data().iter().filter(|add| target_paths.contains(add.path().as_ref())).collect();
-            if targets.is_empty() && staged.is_empty() {
-                return Ok(());
-            }
-            let removes = targets.into_iter().map(|add| Action::Remove(add.remove_action(true)));
-            let adds = staged.clone().into_iter().map(|action| match action {
-                Action::Add(mut add) => {
-                    add.data_change = true;
-                    Action::Add(add)
-                }
-                action => action,
-            });
-            let actions = removes.chain(adds).collect();
-            let pre_uris = table.get_file_uris()?.collect::<std::collections::HashSet<_>>();
-            let snapshot = table.snapshot()?;
-            let result =
-                deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                    .with_actions(actions)
-                    .build(
-                        Some(snapshot as &dyn TableReference),
-                        table.log_store(),
-                        DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(schema.partitions.clone()), predicate: None },
-                    )
-                    .await;
-            match result {
-                Ok(finalized) => {
-                    table.state = Some(finalized.snapshot());
-                    drop(commit_guard);
-                    let no_dirty: &[(String, i64)] = &[];
-                    self.record_committed_write(&table_ref, &[(project_id, no_dirty)], target, table, &pre_uris, false).await;
-                    return Ok(());
-                }
-                Err(error) if is_occ_conflict_err(&error.to_string()) && attempt < 4 => {
-                    drop(commit_guard);
-                    tokio::time::sleep(occ_backoff(attempt)).await;
-                }
-                // Non-OCC error: delta-rs also returns Err when a post-commit
-                // hook or snapshot refresh fails AFTER N.json is durably
-                // written. Deleting the staged parquet then leaves the newest
-                // version pointing at objects that no longer exist (the
-                // 2026-07-09 dangling-Add incident), so probe before cleaning up
-                // — exactly what the staged flush path does.
-                Err(error) => {
-                    drop(commit_guard);
-                    match self.probe_commit_landed_bounded(&table_ref, &staged).await {
-                        CommitProbe::Landed => {
-                            warn!(project_id, target, date, %error, "rollup partition replace reported an error but LANDED");
-                            return Ok(());
-                        }
-                        CommitProbe::NotLanded => {
-                            Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
-                            return Err(anyhow::anyhow!("rollup partition replace failed: {error}"));
-                        }
-                        CommitProbe::Inconclusive => {
-                            return Err(anyhow::anyhow!("rollup partition replace failed (landing unconfirmed, staged parquet kept): {error}"));
-                        }
-                    }
-                }
-            }
-        }
-        Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
-        anyhow::bail!("rollup partition replace exhausted retries")
-    }
-
-    async fn stage_rollup_wave(&self, source: &str, target: &str, date: &str, inputs: Vec<RollupStageInput>) -> Result<RollupCommitWave> {
+    async fn stage_rollup_wave(
+        &self, storage_project: &str, source: &str, target: &str, date: &str, inputs: Vec<RollupStageInput>,
+    ) -> Result<RollupCommitWave> {
         use deltalake::{kernel::Action, writer::DeltaWriter};
         let started = std::time::Instant::now();
 
-        let table_ref = self.get_or_create_table("default", target).await?;
+        let table_ref = self.get_or_create_table(storage_project, target).await?;
         let schema = get_schema(target).ok_or_else(|| anyhow::anyhow!("rollup target `{target}` is not registered"))?;
         let staging_table = table_ref.read().await.clone();
         let stage_store = staging_table.log_store().object_store(None);
@@ -8921,6 +8809,7 @@ impl Database {
         };
 
         let started = std::time::Instant::now();
+        let commit_project = wave.units.first().map_or(String::new(), |unit| unit.project_id.clone());
         let mut changed = Vec::new();
         let mut current = Vec::new();
         for unit in wave.units {
@@ -8935,7 +8824,7 @@ impl Database {
         if current.is_empty() {
             return Ok(Vec::new());
         }
-        let commit_lock = self.commit_lock("", &wave.target).await;
+        let commit_lock = self.commit_lock(&commit_project, &wave.target).await;
         for attempt in 0..5 {
             let commit_guard = commit_lock.lock().await;
             let _ = refresh_table_snapshot(&wave.table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
@@ -9030,7 +8919,9 @@ impl Database {
         Ok(landed)
     }
 
-    async fn stage_and_commit_rollup_inputs(&self, source: &str, target: &str, date: &str, inputs: Vec<RollupStageInput>) -> Result<Vec<RollupReplaceUnit>> {
+    async fn stage_and_commit_rollup_inputs(
+        &self, storage_project: &str, source: &str, target: &str, date: &str, inputs: Vec<RollupStageInput>,
+    ) -> Result<Vec<RollupReplaceUnit>> {
         let mut inputs = inputs.into_iter();
         let mut pending: Option<(RollupCommitWave, std::time::Instant)> = None;
         let mut landed = Vec::new();
@@ -9044,7 +8935,7 @@ impl Database {
             if chunk.is_empty() {
                 break;
             }
-            let staged = self.stage_rollup_wave(source, target, date, chunk).await?;
+            let staged = self.stage_rollup_wave(storage_project, source, target, date, chunk).await?;
             let staged_at = std::time::Instant::now();
             let staged_actions: usize = staged.units.iter().map(|unit| unit.removes.len().saturating_add(unit.adds.len())).sum();
             let must_flush = pending.as_ref().is_some_and(|(wave, _)| {
@@ -9066,170 +8957,7 @@ impl Database {
         Ok(landed)
     }
 
-    /// `certified_fp` proves the partition was swept clean; it is NOT what
-    /// coverage is keyed on. Certification speaks in file identity (that exact
-    /// file set was probed) while coverage speaks in DATA identity, so the build
-    /// recomputes the latter — otherwise every build would store a fingerprint
-    /// the read path could never match.
-    async fn rebuild_rollup_partition(&self, source: &str, project_id: &str, date: &str, _certified_fp: u64) -> Result<()> {
-        if !self.config.maintenance.rollup_build_enabled() {
-            return Ok(());
-        }
-        let _permit = self.rollup_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
-        self.rebuild_rollup_partition_holding_permit(source, project_id, date).await
-    }
-
-    /// `rebuild_rollup_partition`, for a caller that ALREADY holds a
-    /// `maintenance_rewrite_sem` permit.
-    ///
-    /// The backfill acquires its own so that queueing for the permit happens
-    /// outside its unit deadline — with several units in flight against a
-    /// smaller rewrite pool, a unit could otherwise burn its whole budget
-    /// waiting and be abandoned having done no work. Re-acquiring here instead
-    /// would deadlock: two units each holding one of two permits, each waiting
-    /// for the other's.
-    async fn rebuild_rollup_partition_holding_permit(&self, source: &str, project_id: &str, date: &str) -> Result<()> {
-        let Some(schema) = get_schema(source) else { return Ok(()) };
-        let source_key = (project_id.to_string(), source.to_string(), date.to_string());
-        // How far up this build may CLAIM to have read.
-        //
-        // Everything below the oldest still-buffered row is already in Delta, so
-        // the aggregate over `query_delta_only` has it; at or above that point
-        // the buffer may still hold rows this build cannot see. A sealed day has
-        // nothing buffered and claims the whole partition, exactly as before.
-        //
-        // Claiming LESS than was aggregated is always safe — it only hands more
-        // of the window to the raw leg. Claiming more is the silent-wrong-number
-        // failure, so this is deliberately the conservative side.
-        let day_bounds = date_start_micros(date).map(|start| (start, start + DAY_MICROS));
-        let build_bound = day_bounds
-            .map_or(i64::MAX, |(start, end)| self.buffered_layer().and_then(|layer| layer.min_buffered_micros(project_id, source, start, end)).unwrap_or(end));
-        let source_fp = self.rollup_source_fingerprint(project_id, source, date, build_bound).await?;
-        let source_epoch = self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
-
-        // Rebuild only the hours that changed, when we can prove which those
-        // are. `rollup_dirty` holds a claim ONLY while every change since the
-        // last successful build was observed; absent, or widened to the whole
-        // day, and this falls back to the full rebuild. Anything else would
-        // carry forward buckets aggregated from source rows that have since
-        // moved — a silently wrong number, which is the one failure mode none of
-        // the read-side guards can catch.
-        let dirty = self.rollup_dirty.get(&source_key).map(|entry| *entry.value()).filter(|hours| *hours != crate::rollup::ALL_HOURS);
-        let day_start = date_start_micros(date);
-        // A build is the only thing that can establish the claim, and a failed
-        // one leaves the partition in an unknown state — so drop it up front and
-        // re-insert only on success.
-        self.rollup_dirty.remove(&source_key);
-
-        // Base specs first: a derived tier re-aggregates the finer one's rows, so
-        // it must not run before that tier has been replaced for this partition.
-        let mut specs: Vec<&crate::schema_loader::RollupSpec> = schema.rollups.iter().collect();
-        specs.sort_by_key(|spec| spec.derive_from.is_some());
-        for spec in specs {
-            let target = spec.table_name(source);
-            let coverage_key = (project_id.to_string(), source.to_string(), target.clone(), date.to_string());
-            self.rollup_coverage.remove(&coverage_key);
-            let from = spec
-                .derive_from
-                .as_ref()
-                .and_then(|base| schema.rollups.iter().find(|candidate| candidate.name.as_deref() == Some(base.as_str())))
-                .map_or_else(|| source.to_string(), |base| base.table_name(source));
-            // Whole rollup buckets must nest inside an hour, or one bucket
-            // would be half-rebuilt and half-carried-forward.
-            let hours_fit = crate::rollup::grain_fits_hours(spec);
-            // The range-sets this rebuild executes IN SEQUENCE, each one a
-            // separate scan + commit.
-            //
-            // * an incremental rebuild: exactly the dirty hours, as before;
-            // * a full rebuild whose grain nests in an hour: CHUNKED, so the
-            //   peak is a quarter of the day rather than all of it. Each chunk
-            //   rebuilds its own hours and carries the rest forward from the
-            //   target, so after the last one the partition holds the whole day.
-            //   A whale partition could not be built at all otherwise — one
-            //   scan of a busy day exceeded both the unit deadline and the
-            //   memory the box has (prod 2026-08-13);
-            // * anything else: one whole-day rebuild, the original behaviour.
-            let plans: Vec<Vec<(i64, i64)>> = match (dirty.zip(day_start).filter(|_| hours_fit), day_start.filter(|_| hours_fit)) {
-                (Some((hours, day_start)), _) => vec![crate::rollup::dirty_ranges(day_start, hours)],
-                (None, Some(day_start)) => crate::rollup::build_chunk_masks(crate::rollup::BUILD_CHUNK_HOURS)
-                    .into_iter()
-                    .map(|mask| crate::rollup::dirty_ranges(day_start, mask))
-                    .collect(),
-                (None, None) => vec![Vec::new()],
-            };
-            let incremental = dirty.is_some() && hours_fit;
-            let generation = crate::rollup::generation_id(spec, source, project_id, date, source_fp);
-            let chunked = plans.len() > 1;
-            let mut row_count = 0;
-            for (index, ranges) in plans.iter().enumerate() {
-                // Bail as soon as the source moves, not after every chunk has
-                // been scanned AND committed. The check below is what decides
-                // whether this build counts, so once the source has moved the
-                // remaining chunks are known-wasted work — and they are not
-                // cheap: each is a scan plus a Delta commit on the rollup table.
-                //
-                // TODAY's partition loses this race essentially always, because
-                // it is being written continuously. Prod 2026-08-15 logged four
-                // `source changed while rebuilding … /2026-08-15` in twenty
-                // seconds, each having committed all four chunks first. That is
-                // rollup-table churn and, worse, it holds a rollup permit that
-                // the sealed-day backfill needs — the partitions that actually
-                // decide whether a 7-day window routes. Sealed days in the same
-                // window built fine, so this bounds the loss rather than
-                // changing which dates are eligible; today is served by the raw
-                // realtime tail either way.
-                if index > 0 && self.rollup_source_changed(project_id, source, date, source_fp, source_epoch, build_bound).await? {
-                    anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
-                }
-                let rows = self.query_delta_only(&crate::rollup::build_partition_sql_ranges(spec, source, &from, &target, project_id, date, ranges)?).await?;
-                let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
-                // Each commit REPLACES the partition with (this chunk's hours,
-                // freshly aggregated) UNION (every other hour, carried forward),
-                // so the last one's row count is the partition's.
-                row_count = batches.iter().map(|batch| batch.num_rows() as u64).sum();
-                self.replace_rollup_partition(project_id, &target, date, batches).await?;
-                // INFO, not debug. A chunked whale build runs for many minutes
-                // and prod logs at info, so at debug the only signal would be
-                // the final `rollup_partition_built` — leaving a build in
-                // flight indistinguishable from a wedged one. That silence is
-                // exactly what hid this subsystem being broken for four days
-                // (2026-08-13); one line per chunk is a cheap price for knowing
-                // a long build is progressing.
-                if chunked {
-                    info!(project_id, date, target, chunk = index + 1, chunks = plans.len(), rows = row_count, event = "rollup_chunk_committed");
-                }
-            }
-            if self.rollup_source_changed(project_id, source, date, source_fp, source_epoch, build_bound).await? {
-                anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
-            }
-            self.rollup_coverage.insert(coverage_key, RollupCoverage { source_fp, source_epoch, generation, rows: row_count, covered_through: build_bound });
-            let counter = if incremental {
-                &crate::metrics::maintenance_stats().rollup_rebuilds_incremental
-            } else {
-                &crate::metrics::maintenance_stats().rollup_rebuilds_full
-            };
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            info!(project_id, date, target, rows = row_count, chunks = plans.len(), incremental, event = "rollup_partition_built");
-        }
-        self.clear_rollup_backoff(project_id, source, date);
-        // Every spec is now current for this source state, so from here on the
-        // dirty set is complete by construction.
-        {
-            let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.rollup_dirty.insert(source_key, 0);
-            self.rollup_invalidated_at.remove(&(project_id.to_string(), source.to_string(), date.to_string()));
-            // Target data is committed before the clear. A failed journal write
-            // leaves the prior dirty state durable and merely repeats work.
-            if self.config.maintenance.rollup_maintenance_v2_enabled_for(source)
-                && let Err(error) = self.persist_rollup_journal()
-            {
-                warn!(project_id, source, date, %error, "failed to clear durable rollup invalidation");
-            }
-        }
-        Ok(())
-    }
-
-    async fn rebuild_rollup_cohort(&self, source: &str, date: &str, cohort: crate::rollup::RollupScanCohort) -> Result<Vec<String>> {
+    async fn rebuild_rollup_cohort(&self, storage_project: &str, source: &str, date: &str, cohort: crate::rollup::RollupScanCohort) -> Result<Vec<String>> {
         let scan_started = std::time::Instant::now();
         let stats = crate::metrics::maintenance_stats();
         stats.rollup_scan_cohorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9338,7 +9066,7 @@ impl Database {
                     (project.clone(), *fp, *epoch, generations[project].clone(), *bound, shaped.remove(project).unwrap_or_default())
                 })
                 .collect();
-            let landed = self.stage_and_commit_rollup_inputs(source, &target, date, inputs).await?;
+            let landed = self.stage_and_commit_rollup_inputs(storage_project, source, &target, date, inputs).await?;
             let mut current_landed = Vec::new();
             for unit in landed {
                 if self.rollup_source_changed(&unit.project_id, source, date, unit.source_fp, unit.source_epoch, unit.covered_through).await.unwrap_or(true) {
@@ -9378,14 +9106,7 @@ impl Database {
                         metrics.rollup_full_hours_rebuilt.add(hours, &[]);
                     }
                 }
-                info!(
-                    project_id = unit.project_id,
-                    date,
-                    target,
-                    rows = unit.rows,
-                    cohort_projects = cohort.projects.len(),
-                    event = "rollup_partition_built_v2"
-                );
+                info!(project_id = unit.project_id, date, target, rows = unit.rows, cohort_projects = cohort.projects.len(), event = "rollup_partition_built");
                 current_landed.push(unit.project_id);
             }
             active = current_landed;
@@ -9417,12 +9138,12 @@ impl Database {
         Ok(active)
     }
 
-    async fn rebuild_rollup_cohorts(&self, source: &str, date: &str, cohorts: Vec<crate::rollup::RollupScanCohort>) -> usize {
+    async fn rebuild_rollup_cohorts(&self, storage_project: &str, source: &str, date: &str, cohorts: Vec<crate::rollup::RollupScanCohort>) -> usize {
         let mut queue: std::collections::VecDeque<_> = cohorts.into();
         let mut built = 0;
         while let Some(cohort) = queue.pop_front() {
             let projects: Vec<_> = cohort.projects.iter().map(|project| project.project_id.clone()).collect();
-            match self.rebuild_rollup_cohort(source, date, cohort.clone()).await {
+            match self.rebuild_rollup_cohort(storage_project, source, date, cohort.clone()).await {
                 Ok(landed) => {
                     built += landed.len();
                     for project in projects.iter().filter(|project| !landed.contains(project)) {
@@ -9695,13 +9416,19 @@ impl Database {
     /// dashboards actually read, and an oldest-first pass spends a whole process
     /// lifetime on data nobody queries.
     pub async fn rollup_backfill_tick(&self, source: &str) -> Result<usize> {
+        self.rollup_backfill_tick_for("default", source).await
+    }
+
+    async fn rollup_backfill_tick_for(&self, storage_project: &str, source: &str) -> Result<usize> {
         let horizon = self.config.maintenance.timefusion_rollup_backfill_days;
         if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
             return Ok(0);
         }
-        let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
-        let table_ref = self.resolve_table("default", source).await?;
-        let (fingerprints, decoded_estimates) = {
+        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
+            return Ok(0);
+        }
+        let table_ref = self.resolve_table(storage_project, source).await?;
+        let (mut fingerprints, mut decoded_estimates) = {
             let table = table_ref.read().await;
             let fingerprints = Self::partition_fingerprints(&table, tiebreak_of(source))?;
             let mut estimates: HashMap<(String, String), u64> = HashMap::new();
@@ -9719,6 +9446,10 @@ impl Database {
             }
             (fingerprints, estimates)
         };
+        if storage_project != "default" {
+            fingerprints = fingerprints.into_iter().map(|((_, date), fingerprint)| ((storage_project.to_string(), date), fingerprint)).collect();
+            decoded_estimates = decoded_estimates.into_iter().map(|((_, date), bytes)| ((storage_project.to_string(), date), bytes)).collect();
+        }
 
         let today = Utc::now().date_naive();
         // TODAY is claimed too, now that a build records the bound it read to
@@ -9788,200 +9519,41 @@ impl Database {
             info!(source, pool, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
         }
 
-        if self.config.maintenance.rollup_maintenance_v2_enabled_for(source) {
-            let mut by_date: std::collections::BTreeMap<chrono::NaiveDate, Vec<crate::rollup::RollupScanProject>> = std::collections::BTreeMap::new();
-            for (project_id, date) in candidates {
-                let estimated_decoded_bytes = decoded_estimates.get(&(project_id.clone(), date.to_string())).copied().unwrap_or(0);
-                by_date.entry(date).or_default().push(crate::rollup::RollupScanProject { project_id, estimated_decoded_bytes });
-            }
-            let mut built = 0;
-            for (date, projects) in by_date.into_iter().rev() {
-                let (oversized, projects): (Vec<_>, Vec<_>) =
-                    projects.into_iter().partition(|project| project.estimated_decoded_bytes > crate::rollup::ROLLUP_COHORT_MAX_DECODED_BYTES);
-                for project in oversized {
-                    crate::metrics::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(metrics) = crate::metrics::registry() {
-                        metrics.rollup_singleton_failures.add(1, &[]);
-                    }
-                    self.record_rollup_failure(&project.project_id, source, &date.to_string());
-                    warn!(
-                        source,
-                        date = %date,
-                        project_id = project.project_id,
-                        estimated_bytes = project.estimated_decoded_bytes,
-                        event = "rollup_cohort_singleton_oversized",
-                        "rollup project exceeds the cohort decoded-input cap"
-                    );
-                }
-                let scan_cohorts = crate::rollup::pack_scan_cohorts(projects);
-                let cohorts = scan_cohorts
-                    .chunks(crate::rollup::ROLLUP_WAVE_MAX_PROJECTS / crate::rollup::ROLLUP_COHORT_MAX_PROJECTS)
-                    .map(|cohorts| {
-                        let projects = cohorts.iter().flat_map(|cohort| cohort.projects.iter().cloned()).collect::<Vec<_>>();
-                        crate::rollup::RollupScanCohort {
-                            estimated_decoded_bytes: projects.iter().map(|project| project.estimated_decoded_bytes).sum(),
-                            projects,
-                        }
-                    })
-                    .collect();
-                let _permit = self.rollup_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
-                built += self.rebuild_rollup_cohorts(source, &date.to_string(), cohorts).await;
-            }
-            return Ok(built);
+        let mut by_date: std::collections::BTreeMap<chrono::NaiveDate, Vec<crate::rollup::RollupScanProject>> = std::collections::BTreeMap::new();
+        for (project_id, date) in candidates {
+            let estimated_decoded_bytes = decoded_estimates.get(&(project_id.clone(), date.to_string())).copied().unwrap_or(0);
+            by_date.entry(date).or_default().push(crate::rollup::RollupScanProject { project_id, estimated_decoded_bytes });
         }
-
-        let budget = self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_rollup_backfill_schedule));
-        // A single unit may outrun the tick budget — overlapping cron ticks are
-        // skipped, so a run is allowed to exceed its period — but not the process
-        // lifetime, which is what actually decides whether the commit lands.
-        let unit_budget = budget * BACKFILL_UNIT_BUDGET_MULTIPLE;
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-        let started = std::time::Instant::now();
-        let (built, uncertifiable, failed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
-        let attempted = AtomicUsize::new(0);
-        let queued = candidates.len();
-        // Units run CONCURRENTLY. Serially, one unit that ran to its deadline and
-        // committed nothing consumed the whole tick — prod 2026-08-15 sustained
-        // ~3 partitions an hour against `queued=355`, which never converges
-        // because coverage is invalidated faster than that. Peak Arrow stays
-        // bounded by `rollup_rewrite_sem`, which each unit takes BEFORE arming
-        // its deadline, so a unit is never abandoned for time it spent queueing.
-        let concurrency = self.config.maintenance.timefusion_rollup_backfill_concurrency.max(1);
-        // PER SLOT. The knob was sized for a loop that ran one unit at a time,
-        // so read literally it would cap a 3-wide tick at the same total work a
-        // 1-wide tick did and give back everything the concurrency buys. The
-        // wall-clock `budget` is the real bound; this only stops a tick that is
-        // finishing units unusually fast from running away.
-        let units_per_tick = self.config.maintenance.timefusion_rollup_backfill_units_per_tick.saturating_mul(concurrency);
-        let (attempted, built, uncertifiable, failed) = (&attempted, &built, &uncertifiable, &failed);
-        let unit_of = move |(project_id, date): (String, chrono::NaiveDate)| async move {
-            // Re-checked per unit, not once per tick: with units in flight the
-            // budget can be spent while this one waits for a slot, and starting
-            // work the tick has no time left for is what stacks cron runs.
-            if backfill_tick_exhausted(attempted.load(Relaxed), built.load(Relaxed), units_per_tick, started.elapsed(), budget) {
-                return;
+        let mut built = 0;
+        for (date, projects) in by_date.into_iter().rev() {
+            let (oversized, projects): (Vec<_>, Vec<_>) =
+                projects.into_iter().partition(|project| project.estimated_decoded_bytes > crate::rollup::ROLLUP_COHORT_MAX_DECODED_BYTES);
+            for project in oversized {
+                crate::metrics::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(metrics) = crate::metrics::registry() {
+                    metrics.rollup_singleton_failures.add(1, &[]);
+                }
+                self.record_rollup_failure(&project.project_id, source, &date.to_string());
+                warn!(
+                    source,
+                    date = %date,
+                    project_id = project.project_id,
+                    estimated_bytes = project.estimated_decoded_bytes,
+                    event = "rollup_cohort_singleton_oversized",
+                    "rollup project exceeds the cohort decoded-input cap"
+                );
             }
-            // Checked BEFORE counting the attempt. The serial loop could `break`
-            // here; a stream cannot, so a braked tick would otherwise walk every
-            // remaining candidate, return instantly from each, and log
-            // `attempted=355 built=0` — which reads like 355 failures rather
-            // than "we were not allowed to start". Leaving `attempted` at 0 also
-            // preserves the first-attempt exemption for when the brake lifts.
-            //
-            // The memory brake gates this too. It did not before, which was
-            // survivable while units ran one at a time and mattered less than
-            // the brake misreading its own input; with three in flight against a
-            // box that OOM-kills at ~100 GB anon it is not. `Brake::Stop` is
-            // "start no more work", so an in-flight unit still finishes.
-            //
-            // `Degrade` is deliberately NOT honoured: it means "keep going, but
-            // serially", and it is raised by WAL backlog — a sustained property
-            // of every post-boot replay. Stopping on it would starve the backfill
-            // for the first minutes of every restart, and restarts are frequent
-            // on this box.
-            if self.maintenance_shutdown.is_cancelled() || !self.dedup_flush_healthy() || matches!(self.light_optimize_brake(), Some(Brake::Stop(_))) {
-                return;
-            }
-            attempted.fetch_add(1, Relaxed);
-            let date_key = date.to_string();
-            // NO CERTIFICATION PASS. It used to run a full `dedup_partition`
-            // here, on the reasoning that "a rollup over a partition that still
-            // holds duplicates is simply wrong". That reasoning predates
-            // read-side dedup and is now false: the build reads through
-            // `query_delta_only`, which deduplicates exactly like a routed scan
-            // (pinned by `query_delta_only_deduplicates_so_a_rollup_build_needs
-            // _no_certification`), so the aggregate is already computed over
-            // deduplicated rows.
-            //
-            // The gate was not merely redundant, it was THE blocker for every
-            // large tenant. Certification requires a zero-drop pass over an
-            // UNCHANGED file set (`record_certification`), and a busy sealed
-            // partition offers neither: the first pass drops duplicates so never
-            // certifies, its own rewrite moves the file set, and compaction keeps
-            // moving it. Prod 2026-08-15 measured the result exactly — 08-13
-            // coverage existed for the default project and five small tenants
-            // (43/31/24/19/6/1 rows) and was ABSENT for precisely the two large
-            // ones, shipbubble and the whale, whose ticks read
-            // `attempted=4 built=0 uncertifiable=2 failed=2` in 24 minutes.
-            //
-            // Coverage stays sound without it: it is keyed on the DATA
-            // fingerprint (rows, min/max ts, max stamp), so a later physical
-            // dedup that removes rows moves the fingerprint and invalidates the
-            // rollup, exactly as any other change to the source would.
-            //
-            // DEADLINE on the unit, not just on the loop. The loop's budget check
-            // exempts the first attempt because a day-sized aggregate cannot be
-            // split — but an unbounded first attempt is how the whole job starved:
-            // prod 2026-08-13 logged a run "still in progress" across six
-            // consecutive 600s warnings, produced no tick record at all, and was
-            // killed by the ~50min process restart, over and over. Nothing gives
-            // a unit more time than `BACKFILL_UNIT_BUDGET_MULTIPLE` tick budgets,
-            // so one that needs more can never be built by this path — and
-            // letting it try consumes every process lifetime. Abandon it, record
-            // the failure so `rollup_retry_allowed` backs it off, and let the
-            // partitions that DO fit get built.
-            //
-            // Cancelling mid-build is safe: the Delta commit is the last step, so
-            // a dropped future leaves no partial state — only wasted work.
-            // The permit is taken OUTSIDE the deadline below: with units in
-            // flight against a smaller rewrite pool, time spent queueing is not
-            // this unit's to be judged on.
-            let permit = match self.rollup_rewrite_sem.acquire().await {
-                Ok(permit) => permit,
-                Err(error) => {
-                    warn!(project_id, date = %date, source, %error, "rollup rewrite semaphore closed");
-                    return;
-                }
-            };
-            let unit = async { self.rebuild_rollup_partition_holding_permit(source, &project_id, &date_key).await.map(|()| Some(())) };
-            let outcome = tokio::time::timeout(unit_budget, unit).await;
-            drop(permit);
-            match outcome {
-                Err(_elapsed) => {
-                    self.record_rollup_failure(&project_id, source, &date_key);
-                    failed.fetch_add(1, Relaxed);
-                    warn!(
-                        project_id,
-                        date = %date,
-                        source,
-                        budget_secs = unit_budget.as_secs(),
-                        "rollup backfill unit exceeded its deadline and was abandoned; it cannot be built by this path"
-                    );
-                }
-                Ok(Ok(Some(()))) => {
-                    built.fetch_add(1, Relaxed);
-                }
-                Ok(Ok(None)) => {
-                    uncertifiable.fetch_add(1, Relaxed);
-                    debug!(project_id, date = %date, source, "rollup backfill: partition not certifiable yet");
-                }
-                Ok(Err(error)) => {
-                    self.record_rollup_failure(&project_id, source, &date_key);
-                    failed.fetch_add(1, Relaxed);
-                    warn!(project_id, date = %date, source, %error, "rollup backfill unit failed (certification or build)");
-                }
-            }
-        };
-        futures::stream::iter(candidates).map(unit_of).buffer_unordered(concurrency).collect::<()>().await;
-        let (attempted, built, uncertifiable, failed) = (attempted.load(Relaxed), built.load(Relaxed), uncertifiable.load(Relaxed), failed.load(Relaxed));
-        // Log whenever there was WORK, not only when some of it succeeded. A tick
-        // that queues 200 partitions and builds none because every one is
-        // uncertifiable used to be byte-identical in the log to a tick with
-        // nothing to do — which is how a frozen backfill hides.
-        if queued > 0 {
-            info!(
-                source,
-                pool,
-                queued,
-                attempted,
-                built,
-                uncertifiable,
-                failed,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                event = "rollup_backfill_tick"
-            );
+            let scan_cohorts = crate::rollup::pack_scan_cohorts(projects);
+            let cohorts = scan_cohorts
+                .chunks(crate::rollup::ROLLUP_WAVE_MAX_PROJECTS / crate::rollup::ROLLUP_COHORT_MAX_PROJECTS)
+                .map(|cohorts| {
+                    let projects = cohorts.iter().flat_map(|cohort| cohort.projects.iter().cloned()).collect::<Vec<_>>();
+                    crate::rollup::RollupScanCohort { estimated_decoded_bytes: projects.iter().map(|project| project.estimated_decoded_bytes).sum(), projects }
+                })
+                .collect();
+            let _permit = self.rollup_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
+            built += self.rebuild_rollup_cohorts(storage_project, source, &date.to_string(), cohorts).await;
         }
-        let _ = schema;
         Ok(built)
     }
 
@@ -10304,18 +9876,6 @@ impl Database {
             let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
             let current_fp = partition_file_fp(cur_files.clone());
             if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().fp) == Some(current_fp) {
-                if self.config.maintenance.rollup_build_enabled()
-                        && self.rollup_retry_allowed(pid, table_name, &date.to_string())
-                        && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
-                        // Coverage is keyed on DATA identity, not on this file
-                        // fingerprint — asking with the wrong one would report
-                        // every partition stale and rebuild it on every tick.
-                        && !self.rollup_coverage_current(pid, table_name, &date.to_string(), self.rollup_source_fingerprint(pid, table_name, &date.to_string(), i64::MAX).await.unwrap_or_default())
-                        && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), current_fp).await
-                {
-                    self.record_rollup_failure(pid, table_name, &date.to_string());
-                    warn!(project_id = pid, date = %date, table_name, %error, "rollup retry failed; leaving the partition on raw scans");
-                }
                 continue;
             }
             let backoff_key = format!("{dedup_key}:{pid}:{date}");
@@ -10362,27 +9922,7 @@ impl Database {
                     // Any concurrent commit (flush/compaction) changes
                     // the set → don't mark; a >0 pass marks nothing (the
                     // NEXT 0-drop pass confirms the rewrite held).
-                    let certified = self.record_certification(table_ref, table_name, pid, date, cur_files, (d, complete)).await?;
-                    if let Some(fp_post) = certified {
-                        // Rollup buckets are built HERE and nowhere else: a
-                        // bucket computed over a bin that is later deduped is
-                        // simply wrong, so the build trigger is the
-                        // certification signal rather than a timer. The
-                        // rewrite is idempotent (`rollup::bucket_id` is
-                        // deterministic in bucket+dimensions), so re-running
-                        // it for an already-built partition replaces its rows
-                        // instead of doubling every measure.
-                        // Any table that DECLARES rollups gets them rebuilt
-                        // at its certification point — no table name is
-                        // special-cased here any more.
-                        if get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty())
-                            && self.rollup_retry_allowed(pid, table_name, &date.to_string())
-                            && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), fp_post).await
-                        {
-                            self.record_rollup_failure(pid, table_name, &date.to_string());
-                            warn!(project_id = pid, date = %date, table_name, %error, "rollup build failed; leaving the partition on raw scans");
-                        }
-                    }
+                    self.record_certification(table_ref, table_name, pid, date, cur_files, (d, complete)).await?;
                 }
                 Err(e) => {
                     // Exponential backoff, 10min doubling to a 6h cap —
@@ -15038,19 +14578,6 @@ fn rotation_seed() -> usize {
     usize::try_from(crate::clock::now_micros().unsigned_abs() / 1_000_000).unwrap_or(0)
 }
 
-/// A backfill unit's deadline, as a multiple of the tick budget.
-///
-/// The tick budget alone (0.8 x a 10-minute cron = 8 min) is too tight: a
-/// partition needing 15 minutes would be abandoned even though prod's ~50-minute
-/// process lifetime affords it easily, and abandoning it means it is NEVER
-/// built. Unbounded is worse — that is the starvation this exists to stop, one
-/// unit burning 60+ minutes and dying on the restart with nothing committed.
-///
-/// 3x (24 min) sits between: comfortably inside the observed process lifetime,
-/// comfortably outside a normal day-sized aggregate. Raise it only alongside
-/// evidence that the process lives longer.
-const BACKFILL_UNIT_BUDGET_MULTIPLE: u32 = 3;
-
 /// How many of the newest candidates share the one overrun-allowed slot.
 ///
 /// Rotating the WHOLE list would walk 200+ candidates before returning to the
@@ -15068,22 +14595,6 @@ fn rotate_head_window<T>(candidates: &mut [T], cursor: usize) {
     let window = candidates.len().min(BACKFILL_ROTATION_WINDOW);
     let head = &mut candidates[..window];
     head.rotate_left(sweep_resume_offset(window, cursor));
-}
-
-/// Should a rollup backfill tick stop before ATTEMPTING another partition?
-///
-/// The first attempt is always exempt: a day-sized aggregate is indivisible, so
-/// checking the budget before it would let a slow day produce nothing on every
-/// tick, forever.
-///
-/// The exemption keys on attempts, not successes. Guarding on `built` meant a
-/// tick whose partitions were all uncertifiable or failing never enforced its
-/// budget at all — the counter stayed 0, so every unit inherited the first
-/// unit's exemption and the loop ran the entire candidate list. Prod 2026-08-13
-/// logged one tick still running across four consecutive 600s warnings,
-/// committing nothing, until the process restarted under it.
-const fn backfill_tick_exhausted(attempted: usize, built: usize, units_per_tick: usize, elapsed: std::time::Duration, budget: std::time::Duration) -> bool {
-    attempted > 0 && (built >= units_per_tick || elapsed.as_nanos() >= budget.as_nanos())
 }
 
 /// Where a deadline-truncated dedup sweep resumes: the served-item cursor
@@ -19525,43 +19036,6 @@ mod tests {
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
     }
 
-    /// A unit that cannot finish inside one tick budget must be ABANDONED, not
-    /// allowed to run forever.
-    ///
-    /// The loop's budget check exempts the first attempt, because a day-sized
-    /// aggregate cannot be split. Prod 2026-08-13 showed what an unbounded first
-    /// attempt actually costs: a run logged "still in progress" across six
-    /// consecutive 600s warnings, emitted NO tick record at all, and was killed
-    /// by the ~50min process restart — repeatedly, for days. Nothing ever gives
-    /// a unit more time than a tick budget, so a unit that needs more can never
-    /// be built by this path and must not consume every process lifetime trying.
-    #[tokio::test(start_paused = true)]
-    async fn a_unit_that_outlasts_the_tick_budget_is_abandoned() {
-        // The deadline must sit between a normal day-sized aggregate and the
-        // process lifetime. Too tight and a partition that WOULD commit is
-        // abandoned forever (backoff, never retried by a path with more time);
-        // unbounded is the starvation this exists to stop.
-        let tick = std::time::Duration::from_secs(480); // 0.8 x the 10-minute cron
-        let unit_budget = tick * super::BACKFILL_UNIT_BUDGET_MULTIPLE;
-        assert!(unit_budget >= std::time::Duration::from_secs(15 * 60), "a 15-minute partition must still be allowed to finish: {unit_budget:?}");
-        assert!(unit_budget <= std::time::Duration::from_secs(40 * 60), "the deadline must land inside the ~50min process lifetime: {unit_budget:?}");
-
-        let budget = unit_budget;
-        // Stands in for certify+build on a partition too big for this path.
-        let forever = async {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            Ok::<_, ()>(Some(()))
-        };
-        assert!(tokio::time::timeout(budget, forever).await.is_err(), "an over-budget unit must time out rather than run to completion");
-
-        // A unit that fits still completes untouched.
-        let quick = async {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            Ok::<_, ()>(Some(()))
-        };
-        assert_eq!(tokio::time::timeout(budget, quick).await, Ok(Ok(Some(()))));
-    }
-
     /// Rotation must survive a RESTART, not merely a tick.
     ///
     /// The cursors used to start at 0 on every construction. With prod's ~30-min
@@ -19738,29 +19212,6 @@ mod tests {
         for source in sources {
             assert!(served.contains(&source), "`{source}` never got to run first across {} runs: {served:?}", sources.len());
         }
-    }
-
-    /// The rollup backfill's budget must bind even when NOTHING is being built.
-    ///
-    /// Prod 2026-08-13: the backfill tick ran past four consecutive 600s
-    /// "still in progress" warnings and committed nothing, then the process
-    /// restarted under it — for four days, so 08-12 has no rollup at all and
-    /// every dashboard query fell back to a raw scan (8-24s instead of ~40ms).
-    /// The exemption that lets the first indivisible unit overrun was keyed on
-    /// `built`, which stays 0 for a tick whose partitions are all uncertifiable
-    /// or failing — so every unit inherited it and the loop ran unbounded.
-    #[test]
-    fn a_backfill_tick_that_builds_nothing_still_honours_its_budget() {
-        let budget = std::time::Duration::from_secs(240);
-        let (over, under) = (std::time::Duration::from_secs(3600), std::time::Duration::from_secs(1));
-        // The bug, stated directly: nothing built, an hour spent, keep going.
-        assert!(super::backfill_tick_exhausted(1, 0, 8, over, budget), "a tick building nothing must still stop at its budget");
-        assert!(!super::backfill_tick_exhausted(9, 0, 8, under, budget), "under budget with units left, it must keep trying");
-        // The first unit is still exempt, or an indivisible day-sized aggregate
-        // that outlasts one budget never runs at all.
-        assert!(!super::backfill_tick_exhausted(0, 0, 8, over, budget), "the first attempt must never be pre-empted");
-        // Unit cap and deadline both bind once something has been attempted.
-        assert!(super::backfill_tick_exhausted(1, 8, 8, under, budget), "the per-tick unit cap must bind");
     }
 
     /// The dedup tick's two halves run in SEQUENCE, so one shared deadline is
@@ -20649,28 +20100,6 @@ mod tests {
         let ctx1 = Arc::new(db.clone()).create_session_context();
         let ctx2 = Arc::new(db.clone()).create_session_context();
         assert!(Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()), "contexts must share one RuntimeEnv/memory pool");
-        Ok(())
-    }
-
-    /// The backfill runs units concurrently and takes the heavy rewrite permit
-    /// ITSELF, before arming each unit's deadline, so that time spent queueing
-    /// is not charged to the unit. That only works while the inner build does
-    /// not re-acquire: two units each holding one of two permits, each waiting
-    /// on the other's, is a deadlock that would freeze the backfill outright.
-    ///
-    /// So: with every heavy permit held, the permit-holding entry point must
-    /// still run to completion.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_backfill_build_entry_point_does_not_retake_the_rewrite_permit() -> Result<()> {
-        let db = Database::with_config(create_test_config("rollup-permit-split")).await?;
-        let _held = db.rollup_rewrite_sem.clone().acquire_many_owned(db.rollup_rewrite_sem.available_permits() as u32).await?;
-        assert_eq!(db.rollup_rewrite_sem.available_permits(), 0, "every rollup permit is held");
-        assert!(!std::sync::Arc::ptr_eq(&db.rollup_rewrite_sem, &db.maintenance_rewrite_sem), "rollup builds must not contend with compaction rewrites");
-
-        // An unknown source short-circuits before any IO, so this measures the
-        // acquisition and nothing else.
-        let build = db.rebuild_rollup_partition_holding_permit("no_such_table", "p", "2026-08-10");
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), build).await.is_ok(), "the permit-holding path must not block on the semaphore");
         Ok(())
     }
 

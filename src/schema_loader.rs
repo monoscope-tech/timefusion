@@ -261,7 +261,7 @@ impl RollupSpec {
             time_column: Some("timestamp".into()),
             // NO read-time dedup. A bucket is identified by time + dimension
             // tuple hashed into `id`, but duplicates are impossible by
-            // construction: `replace_rollup_partition` commits Remove actions
+            // construction: rollup waves commit Remove actions
             // for every existing file in the (project, date) partition together
             // with the new ones, so a partition only ever holds one build, and
             // reads additionally pin `rollup_generation`.
