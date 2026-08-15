@@ -8976,25 +8976,6 @@ impl Database {
         Ok(None)
     }
 
-    /// Dedup one partition and certify it if the pass proves it clean.
-    ///
-    /// The sweep never reaches past its lookback, so a sealed day has never been
-    /// certified and the backfill has to do it before it may roll the day up.
-    async fn certify_partition(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate) -> Result<Option<u64>> {
-        let pre = {
-            let table = table_ref.read().await;
-            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()
-        };
-        // Already proved clean and untouched since — no need to re-probe.
-        let key = (project_id.to_string(), table_name.to_string(), date.to_string());
-        let fp_pre = partition_file_fp(pre.clone());
-        if !pre.is_empty() && self.dedup_clean_fp.get(&key).map(|entry| entry.value().fp) == Some(fp_pre) {
-            return Ok(Some(fp_pre));
-        }
-        let outcome = self.dedup_partition(table_ref, table_name, project_id, date).await?;
-        self.record_certification(table_ref, table_name, project_id, date, &pre, outcome).await
-    }
-
     /// Build rollups for sealed past days, newest-first, until the unit budget
     /// is spent.
     ///
@@ -9086,7 +9067,6 @@ impl Database {
         // finishing units unusually fast from running away.
         let units_per_tick = self.config.maintenance.timefusion_rollup_backfill_units_per_tick.saturating_mul(concurrency);
         let (attempted, built, uncertifiable, failed) = (&attempted, &built, &uncertifiable, &failed);
-        let table_ref = &table_ref;
         let unit_of = move |(project_id, date): (String, chrono::NaiveDate)| async move {
             // Re-checked per unit, not once per tick: with units in flight the
             // budget can be spent while this one waits for a slot, and starting
@@ -9117,8 +9097,30 @@ impl Database {
             }
             attempted.fetch_add(1, Relaxed);
             let date_key = date.to_string();
-            // A rollup over a partition that still holds duplicates is simply
-            // wrong, so certify first — the sweep never reaches this far back.
+            // NO CERTIFICATION PASS. It used to run a full `dedup_partition`
+            // here, on the reasoning that "a rollup over a partition that still
+            // holds duplicates is simply wrong". That reasoning predates
+            // read-side dedup and is now false: the build reads through
+            // `query_delta_only`, which deduplicates exactly like a routed scan
+            // (pinned by `query_delta_only_deduplicates_so_a_rollup_build_needs
+            // _no_certification`), so the aggregate is already computed over
+            // deduplicated rows.
+            //
+            // The gate was not merely redundant, it was THE blocker for every
+            // large tenant. Certification requires a zero-drop pass over an
+            // UNCHANGED file set (`record_certification`), and a busy sealed
+            // partition offers neither: the first pass drops duplicates so never
+            // certifies, its own rewrite moves the file set, and compaction keeps
+            // moving it. Prod 2026-08-15 measured the result exactly — 08-13
+            // coverage existed for the default project and five small tenants
+            // (43/31/24/19/6/1 rows) and was ABSENT for precisely the two large
+            // ones, shipbubble and the whale, whose ticks read
+            // `attempted=4 built=0 uncertifiable=2 failed=2` in 24 minutes.
+            //
+            // Coverage stays sound without it: it is keyed on the DATA
+            // fingerprint (rows, min/max ts, max stamp), so a later physical
+            // dedup that removes rows moves the fingerprint and invalidates the
+            // rollup, exactly as any other change to the source would.
             //
             // DEADLINE on the unit, not just on the loop. The loop's budget check
             // exempts the first attempt because a day-sized aggregate cannot be
@@ -9144,13 +9146,7 @@ impl Database {
                     return;
                 }
             };
-            let unit = async {
-                let clean_fp = self.certify_partition(table_ref, source, &project_id, date).await?;
-                match clean_fp {
-                    Some(_) => self.rebuild_rollup_partition_holding_permit(source, &project_id, &date_key).await.map(|()| Some(())),
-                    None => Ok(None),
-                }
-            };
+            let unit = async { self.rebuild_rollup_partition_holding_permit(source, &project_id, &date_key).await.map(|()| Some(())) };
             let outcome = tokio::time::timeout(unit_budget, unit).await;
             drop(permit);
             match outcome {

@@ -100,6 +100,126 @@ async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
     Ok(())
 }
 
+/// Does the path a ROLLUP BUILD reads through deduplicate?
+///
+/// This decides how expensive rollup coverage has to be. `rollup_backfill_tick`
+/// certifies a partition duplicate-free — a full `dedup_partition` pass — before
+/// it may build, and on 2026-08-15 that gate was what stopped every LARGE tenant
+/// from ever getting coverage: certification needs a zero-drop pass over an
+/// UNCHANGED file set, which a busy partition never offers while compaction is
+/// draining. Small tenants had rollups; shipbubble and the whale had none.
+///
+/// If `query_delta_only` (what `rebuild_rollup_partition` reads through) already
+/// collapsed duplicates, the gate would be redundant and could simply be
+/// dropped. `dup_across_flush_is_deduped_on_read` deliberately says "routed scan
+/// (NOT query_delta_only)", so pin the actual behaviour rather than infer it —
+/// the answer is the difference between a one-line fix and a redesign, and
+/// guessing wrong ships silently wrong dashboard numbers.
+#[serial]
+#[tokio::test]
+async fn query_delta_only_deduplicates_so_a_rollup_build_needs_no_certification() -> Result<()> {
+    let cfg = TestConfigBuilder::new("rollup_read_dedup_premise").with_buffer_mode(BufferMode::Enabled).build();
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]) };
+    // Two independent commits → one physical duplicate, no sweep run.
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+
+    let count = |sql: String| {
+        let db = Arc::clone(&db);
+        async move {
+            let batches = db.query_delta_only(&sql).await?;
+            anyhow::Ok(
+                batches
+                    .iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .filter_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|c| c.value(0)))
+                    .next()
+                    .unwrap_or(0),
+            )
+        }
+    };
+
+    let via_delta_only = count(format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'")).await?;
+
+    // The routed scan is the deduplicated reference.
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let routed_sql = format!("SELECT COUNT(*) AS cnt FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'");
+    let routed = ctx.sql(&routed_sql).await?.collect().await?[0].column(0).as_primitive::<Int64Type>().value(0);
+    assert_eq!(routed, 1, "precondition: the routed scan deduplicates");
+
+    assert_eq!(
+        via_delta_only, routed,
+        "query_delta_only must deduplicate exactly like the routed scan. The rollup build reads through it, so \
+         this is what makes a build over an UNCERTIFIED partition correct — and therefore what makes the \
+         certification gate redundant. If this ever regresses to 2, restore the gate or every rollup over an \
+         undeduped partition silently double-counts."
+    );
+    Ok(())
+}
+
+/// END-TO-END proof that dropping the certification gate is safe: a sealed
+/// partition that still holds PHYSICAL DUPLICATES and was never certified must
+/// still roll up to the deduplicated answer.
+///
+/// This is the test that licenses the change. `rollup_backfill_tick` used to run
+/// a full `dedup_partition` per partition before building, which no large tenant
+/// could ever satisfy (see the comment at its call site), so shipbubble and the
+/// whale had zero coverage and every 7-day query fell back to raw scans. The
+/// gate is redundant because the build reads through `query_delta_only`, which
+/// deduplicates — but "redundant" is a claim about NUMBERS, and a wrong rollup
+/// is silently wrong, so assert the numbers.
+#[serial]
+#[tokio::test]
+async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_deduped_answer() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("rollup_no_cert").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    // The backfill is off by default (0 = disabled); this test is about it.
+    cfg.maintenance.timefusion_rollup_backfill_days = 4;
+    let cfg = Arc::new(cfg);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    // A SEALED day, so the backfill (not the sweep) owns it.
+    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(2);
+    let ts = day.and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    // Three distinct spans, one of which is written TWICE in separate commits →
+    // a physical duplicate in a partition nothing ever certifies.
+    for (id, name) in [("a", "first"), ("b", "first"), ("dup", "first"), ("dup", "second")] {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, name, &project_id, ts)])?], true, None).await?;
+    }
+
+    let scalar = |sql: String| {
+        let db = Arc::clone(&db);
+        async move {
+            let batches = db.query_delta_only(&sql).await?;
+            anyhow::Ok(
+                batches
+                    .iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .filter_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|c| c.value(0)))
+                    .next()
+                    .unwrap_or(0),
+            )
+        }
+    };
+
+    let deduped_raw = scalar(format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
+    assert_eq!(deduped_raw, 3, "precondition: 4 physical rows, 3 distinct ids");
+
+    let built = db.rollup_backfill_tick("otel_logs_and_spans").await?;
+    assert!(built > 0, "the backfill must build an UNCERTIFIED partition — that is the whole point of dropping the gate");
+
+    let rolled =
+        scalar(format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'"))
+            .await?;
+    assert_eq!(rolled, deduped_raw, "the rollup must count the DEDUPLICATED rows; counting the physical 4 is the silent-wrong-number failure");
+    Ok(())
+}
+
 /// Regression for the LIMIT-pushdown-undercount bug found in code review: a pushed
 /// `LIMIT N` must not be forwarded into the underlying Delta scan, because that
 /// truncates to N rows *before* DedupExec drops duplicates — so the deduped union
