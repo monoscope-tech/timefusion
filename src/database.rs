@@ -8904,11 +8904,7 @@ impl Database {
         let now = crate::clock::now_micros();
         let task = {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let task = journal.claim_next(Operation::Dedup, now);
-            if task.is_some() {
-                journal.checkpoint()?;
-            }
-            task
+            journal.claim_next(Operation::Dedup, now)
         };
         let Some(task) = task else { return Ok(false) };
         let key = task.key.clone();
@@ -8973,11 +8969,7 @@ impl Database {
 
         let task = {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let task = journal.claim_next(operation, crate::clock::now_micros());
-            if task.is_some() {
-                journal.checkpoint()?;
-            }
-            task
+            journal.claim_next(operation, crate::clock::now_micros())
         };
         let Some(task) = task else { return Ok(false) };
         let key = task.key.clone();
@@ -9371,11 +9363,7 @@ impl Database {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources, TaskLease, TaskState};
         let task = {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let task = journal.claim_next(operation, crate::clock::now_micros());
-            if task.is_some() {
-                journal.checkpoint()?;
-            }
-            task
+            journal.claim_next(operation, crate::clock::now_micros())
         };
         let Some(task) = task else { return Ok(false) };
         let key = task.key.clone();
