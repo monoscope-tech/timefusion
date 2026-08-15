@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 
 pub const NORMAL_SLICE_MICROS: i64 = 10 * 60 * 1_000_000;
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
-pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const TAG_SOURCE: &str = "timefusion.source";
@@ -71,16 +70,11 @@ impl TimeSlice {
     }
 
     pub fn normal_units(start_micros: i64, end_micros: i64) -> anyhow::Result<Vec<Self>> {
-        Self::fixed_units(start_micros, end_micros, NORMAL_SLICE_MICROS)
-    }
-
-    fn fixed_units(start_micros: i64, end_micros: i64, width_micros: i64) -> anyhow::Result<Vec<Self>> {
         let whole = Self::new(start_micros, end_micros)?;
-        anyhow::ensure!(width_micros > 0, "maintenance slice width must be positive");
         let mut result = Vec::new();
         let mut start = whole.start_micros;
         while start < whole.end_micros {
-            let end = start.saturating_add(width_micros).min(whole.end_micros);
+            let end = start.saturating_add(NORMAL_SLICE_MICROS).min(whole.end_micros);
             result.push(Self { start_micros: start, end_micros: end });
             start = end;
         }
@@ -263,57 +257,7 @@ impl TaskJournal {
                 }
             }
         }
-        let mut journal = Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() };
-        if journal.migrate_derived_slices() != 0 {
-            journal.checkpoint()?;
-        }
-        Ok(journal)
-    }
-
-    /// Early coordinator builds journaled the one-hour tier in ten-minute
-    /// units. Supersede those unpublished fragments and replace them with one
-    /// aligned hour task; completed tagged publications remain available for
-    /// metadata recovery and are not rewritten by this migration.
-    fn migrate_derived_slices(&mut self) -> usize {
-        let malformed = self
-            .snapshot
-            .tasks
-            .iter()
-            .filter(|task| {
-                task.key.operation == Operation::DerivedRollup
-                    && task.key.slice.width() != DERIVED_SLICE_MICROS
-                    && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if malformed.is_empty() {
-            return 0;
-        }
-        let mut replacements: HashMap<TaskKey, (i64, u64, u64)> = HashMap::new();
-        for task in &malformed {
-            let start = task.key.slice.start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            let mut key = task.key.clone();
-            key.slice = TimeSlice { start_micros: start, end_micros: start.saturating_add(DERIVED_SLICE_MICROS) };
-            replacements
-                .entry(key)
-                .and_modify(|(deadline, estimate, created)| {
-                    *deadline = (*deadline).min(task.deadline_micros);
-                    *estimate = estimate.saturating_add(task.estimated_decoded_bytes);
-                    *created = (*created).min(task.created_unix_ms);
-                })
-                .or_insert((task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms));
-        }
-        for task in malformed {
-            if let Some(current) = self.snapshot.tasks.iter_mut().find(|current| current.key == task.key) {
-                current.state = TaskState::Superseded;
-                current.retry_reason = Some("migrated_to_aligned_hour_slice".to_owned());
-                self.dirty_tasks.insert(current.key.clone());
-            }
-        }
-        for (key, (deadline, estimate, created)) in replacements {
-            self.enqueue(key, deadline, estimate, created);
-        }
-        self.dirty_tasks.len()
+        Ok(Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() })
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
@@ -357,20 +301,8 @@ impl TaskJournal {
         let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived } = invalidation;
         let deadline_micros = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
         let created_unix_ms = u64::try_from(observed_at_micros.div_euclid(1_000)).unwrap_or_default();
-        let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
-        let rollup_slices = if derived {
-            let aligned_start = start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            let aligned_end = end_micros.saturating_add(DERIVED_SLICE_MICROS - 1).div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            TimeSlice::fixed_units(aligned_start, aligned_end, DERIVED_SLICE_MICROS)?
-        } else {
-            normal_slices.clone()
-        };
-        for (operation, slices) in [
-            (Operation::Dedup, normal_slices.as_slice()),
-            (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices.as_slice()),
-            (Operation::HotPacking, normal_slices.as_slice()),
-        ] {
-            for &slice in slices {
+        for slice in TimeSlice::normal_units(start_micros, end_micros)? {
+            for operation in [Operation::Dedup, if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, Operation::HotPacking] {
                 let key = TaskKey {
                     physical_table: match operation {
                         Operation::Dedup | Operation::HotPacking => source_table,
@@ -455,10 +387,7 @@ impl TaskJournal {
 
     fn dependencies_complete(&self, task: &MaintenanceTask) -> bool {
         let required = match task.key.operation {
-            // Base publication performs its own bounded complete-key/tiebreak
-            // dedup before aggregation. Physical source consolidation is
-            // independent debt and must not block exact rollup coverage.
-            Operation::BaseRollup => None,
+            Operation::BaseRollup => Some(Operation::Dedup),
             Operation::DerivedRollup => Some(Operation::BaseRollup),
             _ => None,
         };
@@ -724,7 +653,7 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// class so an overdue historical shadow build cannot extend the live raw tail.
 /// Minute buckets absorb insignificant enqueue/checkpoint skew between projects.
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
-    const RECENT_WINDOW_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+    const RECENT_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
     const DEADLINE_BUCKET_MICROS: i64 = 60 * 1_000_000;
     let recency = u8::from(task.key.slice.end_micros < now_micros.saturating_sub(RECENT_WINDOW_MICROS));
     (recency, task.deadline_micros.div_euclid(DEADLINE_BUCKET_MICROS))
@@ -901,47 +830,11 @@ mod tests {
 
     #[test]
     fn recent_slices_precede_overdue_historical_work() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let now = 3 * 24 * 60 * 60 * 1_000_000;
         let old = task("old", 0, MIN_SLICE_MICROS, Operation::Dedup);
         let recent = task("recent", now - MIN_SLICE_MICROS, now, Operation::BaseRollup);
         let ready = fair_ready_tasks([&old, &recent], now);
         assert_eq!(ready.first().expect("ready task").key.project_id, "recent");
-    }
-
-    #[test]
-    fn derived_invalidations_use_one_aligned_hour() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        journal
-            .invalidate(Invalidation {
-                source_table: "source",
-                rollup_table: "derived",
-                source: "source",
-                project_id: "p",
-                start_micros: NORMAL_SLICE_MICROS,
-                end_micros: 2 * NORMAL_SLICE_MICROS,
-                observed_at_micros: 0,
-                derived: true,
-            })
-            .expect("invalidate");
-        let derived = journal.tasks().find(|task| task.key.operation == Operation::DerivedRollup).expect("derived task");
-        assert_eq!(derived.key.slice.width(), DERIVED_SLICE_MICROS);
-        assert_eq!(derived.key.slice.start_micros % DERIVED_SLICE_MICROS, 0);
-        assert!(journal.tasks().filter(|task| task.key.operation == Operation::Dedup).all(|task| task.key.slice.width() == NORMAL_SLICE_MICROS));
-    }
-
-    #[test]
-    fn restart_migrates_unpublished_derived_fragments_to_hours() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        journal.upsert(task("p", 0, NORMAL_SLICE_MICROS, Operation::DerivedRollup));
-        journal.checkpoint().expect("old checkpoint");
-
-        let journal = TaskJournal::load(dir.path()).expect("migrated journal");
-        assert!(journal.tasks().any(|task| task.key.operation == Operation::DerivedRollup && task.key.slice.width() == DERIVED_SLICE_MICROS));
-        assert!(journal.tasks().any(|task| task.key.operation == Operation::DerivedRollup
-            && task.key.slice.width() == NORMAL_SLICE_MICROS
-            && task.state == TaskState::Superseded));
     }
 
     #[test]
@@ -1099,21 +992,16 @@ mod tests {
     }
 
     #[test]
-    fn derived_rollup_claim_waits_for_complete_base_hour() {
+    fn rollup_claim_waits_for_its_slice_dependency() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut base_keys = Vec::new();
-        for start in (0..DERIVED_SLICE_MICROS).step_by(NORMAL_SLICE_MICROS as usize) {
-            let base = task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup);
-            base_keys.push(base.key.clone());
-            journal.upsert(base);
-        }
-        journal.upsert(task("p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
-        assert!(journal.claim_next(Operation::DerivedRollup, 0).is_none());
-        for key in base_keys {
-            journal.complete(&key);
-        }
-        assert!(journal.claim_next(Operation::DerivedRollup, 0).is_some());
+        let dedup = task("p", 0, MIN_SLICE_MICROS, Operation::Dedup);
+        let dedup_key = dedup.key.clone();
+        journal.upsert(dedup);
+        journal.upsert(task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
+        assert!(journal.claim_next(Operation::BaseRollup, 0).is_none());
+        journal.complete(&dedup_key);
+        assert!(journal.claim_next(Operation::BaseRollup, 0).is_some());
     }
 
     #[test]
