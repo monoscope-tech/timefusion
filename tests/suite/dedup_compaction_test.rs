@@ -182,8 +182,12 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
     let cfg = Arc::new(cfg);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    // A SEALED day, so the backfill (not the sweep) owns it.
-    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(2);
+    // YESTERDAY, deliberately: it is the boundary of what the backfill claims.
+    // It used to be excluded as "the sweep's job", but the sweep only builds at
+    // its certification point and large tenants never certify — so yesterday
+    // stayed uncovered for exactly them, and a rolling 7-day window (the only
+    // shape a dashboard sends) paid a full raw day for it.
+    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
     let ts = day.and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
 
     // Three distinct spans, one of which is written TWICE in separate commits →

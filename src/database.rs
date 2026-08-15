@@ -9001,9 +9001,24 @@ impl Database {
         };
 
         let today = Utc::now().date_naive();
-        // Skip today and the dedup lookback: those are the sweep's job, and
-        // today's fingerprint moves on every flush anyway.
-        let sealed_from = self.config.maintenance.timefusion_dedup_lookback_days as i64 + 1;
+        // Skip TODAY only. Today's fingerprint moves on every flush, so a build
+        // of it loses the race essentially always and is served by the raw
+        // realtime tail anyway.
+        //
+        // The dedup lookback used to be skipped too, as "the sweep's job". But
+        // the sweep builds a rollup only at its CERTIFICATION point, and
+        // certification is exactly what large tenants can never reach — so
+        // yesterday stayed uncovered for them however long the process ran.
+        // Measured 2026-08-15 after the certification gate came off here:
+        // shipbubble had 08-08..08-13 covered and a 6-day query answered in
+        // 0.35s, while the rolling 7-day window still took 21.3s — all of it the
+        // raw fringe over the ONE uncovered day, yesterday. A rolling window is
+        // the only shape a dashboard sends, so leaving yesterday to a path that
+        // cannot build it forfeits the whole benefit.
+        //
+        // Yesterday is sealed for writes, so its fingerprint is stable; and a
+        // build that does lose the race now aborts at its first chunk.
+        let sealed_from = 1i64;
         let mut candidates: Vec<(String, chrono::NaiveDate)> = (sealed_from..=sealed_from + horizon as i64)
             .map(|back| today - chrono::Duration::days(back))
             .flat_map(|date| {
