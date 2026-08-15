@@ -2306,6 +2306,19 @@ pub struct Database {
     /// The hot-tail WAVE engine deliberately does NOT share this semaphore —
     /// see [`Self::light_rewrite_sem`].
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// Caps concurrent rollup partition builds — and nothing else. SEPARATE
+    /// from `maintenance_rewrite_sem` for the same reason `light_rewrite_sem`
+    /// is (prod 2026-07-30): sharing made two independently-bounded engines
+    /// serialize against each other for no gain.
+    ///
+    /// Here it was mutual. Prod runs the heavy pool at 2, so the backfill could
+    /// never build more than two partitions at once however wide it fanned out
+    /// — against a 355-partition queue draining at ~3/hour — and every permit
+    /// it did take was one compaction could not have, on a box where light
+    /// compaction was already being cut off mid-round. A rollup chunk's peak is
+    /// a 6-hour aggregate, well under a compaction bin rewrite, so it does not
+    /// belong in the pool sized for those.
+    rollup_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent hot-tail WAVE staging (`stage_hot_bin`) — and nothing
     /// else. SEPARATE from `maintenance_rewrite_sem` on purpose: prod
     /// 2026-07-30, one dedup dirty-bin drain held the shared rewrite permits
@@ -2794,6 +2807,7 @@ impl Database {
 
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.derived.rewrite_permits().max(1);
+        let rollup_rewrite_permits = cfg.maintenance.timefusion_rollup_backfill_concurrency.max(1);
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         // In UNITS, not polls: one reader slot is `DECODE_UNITS_PER_READER`
@@ -2856,6 +2870,7 @@ impl Database {
             repair_failures: Arc::new(dashmap::DashMap::new()),
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
+            rollup_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(rollup_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
@@ -8628,7 +8643,7 @@ impl Database {
         if !self.config.maintenance.rollup_build_enabled() {
             return Ok(());
         }
-        let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
+        let _permit = self.rollup_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
         self.rebuild_rollup_partition_holding_permit(source, project_id, date).await
     }
 
@@ -9029,15 +9044,19 @@ impl Database {
         let (built, uncertifiable, failed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
         let attempted = AtomicUsize::new(0);
         let queued = candidates.len();
-        let units_per_tick = self.config.maintenance.timefusion_rollup_backfill_units_per_tick;
         // Units run CONCURRENTLY. Serially, one unit that ran to its deadline and
         // committed nothing consumed the whole tick — prod 2026-08-15 sustained
         // ~3 partitions an hour against `queued=355`, which never converges
-        // because coverage is invalidated faster than that. Concurrency does not
-        // raise peak Arrow: the heavy rewrite stays behind
-        // `maintenance_rewrite_sem`, which each unit takes BEFORE arming its
-        // deadline, so a unit is never abandoned for time it spent queueing.
+        // because coverage is invalidated faster than that. Peak Arrow stays
+        // bounded by `rollup_rewrite_sem`, which each unit takes BEFORE arming
+        // its deadline, so a unit is never abandoned for time it spent queueing.
         let concurrency = self.config.maintenance.timefusion_rollup_backfill_concurrency.max(1);
+        // PER SLOT. The knob was sized for a loop that ran one unit at a time,
+        // so read literally it would cap a 3-wide tick at the same total work a
+        // 1-wide tick did and give back everything the concurrency buys. The
+        // wall-clock `budget` is the real bound; this only stops a tick that is
+        // finishing units unusually fast from running away.
+        let units_per_tick = self.config.maintenance.timefusion_rollup_backfill_units_per_tick.saturating_mul(concurrency);
         let (attempted, built, uncertifiable, failed) = (&attempted, &built, &uncertifiable, &failed);
         let table_ref = &table_ref;
         let unit_of = move |(project_id, date): (String, chrono::NaiveDate)| async move {
@@ -9047,10 +9066,31 @@ impl Database {
             if backfill_tick_exhausted(attempted.load(Relaxed), built.load(Relaxed), units_per_tick, started.elapsed(), budget) {
                 return;
             }
-            attempted.fetch_add(1, Relaxed);
-            if self.maintenance_shutdown.is_cancelled() || !self.dedup_flush_healthy() {
+            // Checked BEFORE counting the attempt. The serial loop could `break`
+            // here; a stream cannot, so a braked tick would otherwise walk every
+            // remaining candidate, return instantly from each, and log
+            // `attempted=355 built=0` — which reads like 355 failures rather
+            // than "we were not allowed to start". Leaving `attempted` at 0 also
+            // preserves the first-attempt exemption for when the brake lifts.
+            //
+            // The memory brake gates this too. It did not before, which was
+            // survivable while units ran one at a time and mattered less than
+            // the brake misreading its own input; with three in flight against a
+            // box that OOM-kills at ~100 GB anon it is not. `Brake::Stop` is
+            // "start no more work", so an in-flight unit still finishes.
+            //
+            // `Degrade` is deliberately NOT honoured: it means "keep going, but
+            // serially", and it is raised by WAL backlog — a sustained property
+            // of every post-boot replay. Stopping on it would starve the backfill
+            // for the first minutes of every restart, and restarts are frequent
+            // on this box.
+            if self.maintenance_shutdown.is_cancelled()
+                || !self.dedup_flush_healthy()
+                || matches!(self.light_optimize_brake(), Some(Brake::Stop(_)))
+            {
                 return;
             }
+            attempted.fetch_add(1, Relaxed);
             let date_key = date.to_string();
             // A rollup over a partition that still holds duplicates is simply
             // wrong, so certify first — the sweep never reaches this far back.
@@ -9072,7 +9112,7 @@ impl Database {
             // The permit is taken OUTSIDE the deadline below: with units in
             // flight against a smaller rewrite pool, time spent queueing is not
             // this unit's to be judged on.
-            let permit = match self.maintenance_rewrite_sem.acquire().await {
+            let permit = match self.rollup_rewrite_sem.acquire().await {
                 Ok(permit) => permit,
                 Err(error) => {
                     warn!(project_id, date = %date, source, %error, "rollup rewrite semaphore closed");
@@ -19780,8 +19820,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_backfill_build_entry_point_does_not_retake_the_rewrite_permit() -> Result<()> {
         let db = Database::with_config(create_test_config("rollup-permit-split")).await?;
-        let _held = db.maintenance_rewrite_sem.clone().acquire_many_owned(db.maintenance_rewrite_sem.available_permits() as u32).await?;
-        assert_eq!(db.maintenance_rewrite_sem.available_permits(), 0, "every heavy permit is held");
+        let _held = db.rollup_rewrite_sem.clone().acquire_many_owned(db.rollup_rewrite_sem.available_permits() as u32).await?;
+        assert_eq!(db.rollup_rewrite_sem.available_permits(), 0, "every rollup permit is held");
+        assert!(!std::sync::Arc::ptr_eq(&db.rollup_rewrite_sem, &db.maintenance_rewrite_sem), "rollup builds must not contend with compaction rewrites");
 
         // An unknown source short-circuits before any IO, so this measures the
         // acquisition and nothing else.
