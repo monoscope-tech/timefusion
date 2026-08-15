@@ -6,8 +6,8 @@
 //! a unit whose decoded-byte reservation fits the configured ceiling.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    fs::{self, OpenOptions},
+    collections::{BTreeMap, HashMap, VecDeque},
+    fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -26,7 +26,6 @@ pub const TAG_SLICE_END: &str = "timefusion.slice_end_micros";
 pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
 pub const TAG_GENERATION: &str = "timefusion.generation";
 const JOURNAL_VERSION: u32 = 1;
-const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 static THROUGHPUT_SAMPLE: std::sync::OnceLock<Mutex<(i64, u64)>> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -170,23 +169,13 @@ struct Snapshot {
     source_cursors: BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum JournalRecord {
-    Task(MaintenanceTask),
-    SourceCursor { source: String, delta_version: u64 },
-}
-
 /// Crash-safe task journal. `checkpoint` uses the same fsync + atomic rename
 /// primitive as WAL metadata; a failed completion checkpoint therefore causes
 /// redundant work, never missing work.
 #[derive(Debug)]
 pub struct TaskJournal {
     path: PathBuf,
-    wal_path: PathBuf,
     snapshot: Snapshot,
-    dirty_tasks: HashSet<TaskKey>,
-    dirty_cursors: HashSet<String>,
 }
 
 /// Ensures a claimed task cannot remain stuck in `Running` when its worker
@@ -229,38 +218,16 @@ pub struct Invalidation<'a> {
 impl TaskJournal {
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::wal::meta_path(data_dir, "maintenance_tasks.json");
-        let wal_path = crate::wal::meta_path(data_dir, "maintenance_tasks.wal");
-        let mut snapshot = match fs::read(&path) {
+        let snapshot = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<Snapshot>(&bytes)?,
             Err(error) if error.kind() == ErrorKind::NotFound => Snapshot { version: JOURNAL_VERSION, ..Snapshot::default() },
             Err(error) => return Err(error.into()),
         };
         anyhow::ensure!(snapshot.version == JOURNAL_VERSION, "unsupported maintenance task journal version {}", snapshot.version);
-        // Every record ends in a newline. Ignore only a torn final record; all
-        // earlier records were fsynced before the caller acknowledged the
-        // invalidation or publication that produced them.
-        if let Ok(bytes) = fs::read(&wal_path) {
-            for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-                if !line.ends_with(b"\n") {
-                    break;
-                }
-                let record = serde_json::from_slice::<JournalRecord>(&line[..line.len() - 1])?;
-                match record {
-                    JournalRecord::Task(task) => match snapshot.tasks.iter_mut().find(|current| current.key == task.key) {
-                        Some(current) => *current = task,
-                        None => snapshot.tasks.push(task),
-                    },
-                    JournalRecord::SourceCursor { source, delta_version } => {
-                        snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
-                    }
-                }
-            }
-        }
-        Ok(Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new() })
+        Ok(Self { path, snapshot })
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
-        self.dirty_tasks.insert(task.key.clone());
         match self.snapshot.tasks.iter_mut().find(|current| current.key == task.key) {
             Some(current) => *current = task,
             None => self.snapshot.tasks.push(task),
@@ -268,7 +235,6 @@ impl TaskJournal {
     }
 
     pub fn enqueue(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) {
-        self.dirty_tasks.insert(key.clone());
         if let Some(task) = self.snapshot.tasks.iter_mut().find(|task| task.key == key) {
             if task.state != TaskState::Running {
                 task.state = TaskState::Pending;
@@ -320,7 +286,7 @@ impl TaskJournal {
                     task.publication = None;
                 } else {
                     self.snapshot.tasks.push(MaintenanceTask {
-                        key: key.clone(),
+                        key,
                         state: TaskState::Pending,
                         deadline_micros,
                         estimated_decoded_bytes: 0,
@@ -332,7 +298,6 @@ impl TaskJournal {
                         publication: None,
                     });
                 }
-                self.dirty_tasks.insert(key);
             }
         }
         Ok(())
@@ -399,7 +364,6 @@ impl TaskJournal {
         crate::metrics::set_maintenance_retry_reason(&reason);
         task.retry_reason = Some(reason);
         task.deadline_micros = not_before_micros;
-        self.dirty_tasks.insert(key.clone());
         true
     }
 
@@ -407,7 +371,6 @@ impl TaskJournal {
         let Some(task) = self.snapshot.tasks.iter_mut().find(|task| &task.key == key) else { return false };
         task.state = TaskState::Complete;
         task.retry_reason = None;
-        self.dirty_tasks.insert(key.clone());
         true
     }
 
@@ -416,7 +379,6 @@ impl TaskJournal {
         task.state = TaskState::Complete;
         task.retry_reason = None;
         task.publication = Some(publication);
-        self.dirty_tasks.insert(key.clone());
         true
     }
 
@@ -433,7 +395,6 @@ impl TaskJournal {
         if let Some(task) = self.snapshot.tasks.iter_mut().find(|task| &task.key == key) {
             task.state = TaskState::Superseded;
             task.retry_reason = Some("split_into_smaller_slices".to_owned());
-            self.dirty_tasks.insert(key.clone());
         }
         for mut child in children {
             child.state = TaskState::Pending;
@@ -454,7 +415,6 @@ impl TaskJournal {
                 task.state = TaskState::Retry;
                 task.deadline_micros = now_micros;
                 task.retry_reason = Some("coordinator_restart".to_owned());
-                self.dirty_tasks.insert(task.key.clone());
                 count += 1;
             }
         }
@@ -494,41 +454,15 @@ impl TaskJournal {
     }
 
     pub fn set_source_cursor(&mut self, source: String, delta_version: u64) {
-        let cursor = self.snapshot.source_cursors.entry(source.clone()).or_default();
-        if delta_version > *cursor {
-            *cursor = delta_version;
-            self.dirty_cursors.insert(source);
-        }
+        self.snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
     }
 
-    pub fn checkpoint(&mut self) -> anyhow::Result<()> {
-        if let Some(parent) = self.wal_path.parent() {
+    pub fn checkpoint(&self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        if !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() {
-            let mut wal = OpenOptions::new().create(true).append(true).open(&self.wal_path)?;
-            let mut records = Vec::new();
-            for key in self.dirty_tasks.drain() {
-                if let Some(task) = self.snapshot.tasks.iter().find(|task| task.key == key) {
-                    serde_json::to_writer(&mut records, &JournalRecord::Task(task.clone()))?;
-                    records.push(b'\n');
-                }
-            }
-            for source in self.dirty_cursors.drain() {
-                if let Some(delta_version) = self.snapshot.source_cursors.get(&source).copied() {
-                    serde_json::to_writer(&mut records, &JournalRecord::SourceCursor { source, delta_version })?;
-                    records.push(b'\n');
-                }
-            }
-            wal.write_all(&records)?;
-            wal.sync_all()?;
-        }
-        if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
-            let bytes = serde_json::to_vec(&self.snapshot)?;
-            crate::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
-            let wal = OpenOptions::new().write(true).truncate(true).open(&self.wal_path)?;
-            wal.sync_all()?;
-        }
+        let bytes = serde_json::to_vec(&self.snapshot)?;
+        crate::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
         self.publish_statistics();
         Ok(())
     }
@@ -837,15 +771,14 @@ mod tests {
         assert_eq!(recovered.state(&key), Some(TaskState::Pending));
         assert!(recovered.published_rollups("source", "table").is_empty());
 
-        // Rollup staging / target-commit-before-coverage checkpoint: claims are
-        // deliberately transient, so restart sees the last durable Pending
-        // state directly. An already-landed target commit is safely replaced
-        // by that redundant retry without a full-journal claim checkpoint.
+        // Rollup staging / target-commit-before-coverage checkpoint: Running is
+        // a durable non-claim and is retried after restart. An already-landed
+        // target commit is safely replaced by that redundant retry.
         assert!(recovered.mark_running(&key));
         recovered.checkpoint().expect("running checkpoint");
         let mut recovered = TaskJournal::load(dir.path()).expect("recover after staging");
-        assert_eq!(recovered.requeue_running(100), 0);
-        assert_eq!(recovered.state(&key), Some(TaskState::Pending));
+        assert_eq!(recovered.requeue_running(100), 1);
+        assert_eq!(recovered.state(&key), Some(TaskState::Retry));
 
         // Coverage checkpoint is the only boundary that makes the slice
         // readable after restart, including an empty output.
