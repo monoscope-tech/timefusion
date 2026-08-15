@@ -1,3 +1,4 @@
+mod dedup_needs_ordered_input;
 mod defer_expensive_projection;
 mod exists_in_projection;
 mod ordered_union_for_topk;
@@ -16,6 +17,7 @@ use datafusion::{
     prelude::col,
     scalar::ScalarValue,
 };
+pub use dedup_needs_ordered_input::DedupNeedsOrderedInput;
 pub use defer_expensive_projection::DeferExpensiveProjection;
 pub use exists_in_projection::ExistsInProjection;
 pub use ordered_union_for_topk::{OrderedUnionForTopK, ordered_children};
