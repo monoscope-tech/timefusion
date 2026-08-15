@@ -86,26 +86,24 @@ jobs:
         run: |
           docker pull "$IMAGE_URL"
           set +e
-          docker run --rm \
+          docker run -d \
             -e TIMEFUSION_ALLOW_INSECURE_AUTH=true \
             -e AWS_S3_BUCKET=smoke -e AWS_REGION=us-east-1 \
             -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
             -e RUST_LOG=info \
-            --name tf-smoke "$IMAGE_URL" &
-          PID=$!
+            --name tf-smoke "$IMAGE_URL"
+          trap 'docker rm -f tf-smoke >/dev/null 2>&1 || true' EXIT
           # Give it 12s to reach the PGWire listen log; then kill.
           for i in $(seq 1 12); do
-            if docker logs tf-smoke 2>&1 | grep -q "Listening on 0.0.0.0:5432"; then
+            if docker logs tf-smoke 2>&1 | grep -Eq \
+              "(Listening on|Bound PGWire listener on) 0.0.0.0:5432"; then
               echo "smoke: PGWire listening, image OK"
-              docker kill tf-smoke >/dev/null 2>&1 || true
-              wait $PID 2>/dev/null || true
               exit 0
             fi
             sleep 1
           done
           echo "smoke: binary never reached PGWire listen — last logs:"
           docker logs tf-smoke 2>&1 | tail -40
-          docker kill tf-smoke >/dev/null 2>&1 || true
           exit 1
 
       # Install the same CLI used by caprover/deploy-from-github@v1.1.2 before
