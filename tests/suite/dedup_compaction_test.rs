@@ -224,6 +224,87 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
     Ok(())
 }
 
+/// TODAY may be rolled up to the buffer boundary, and the answer must still
+/// equal the raw one.
+///
+/// Sealed history already answers a 7-day window in ~0.3s on prod, but a ROLLING
+/// window pays a raw scan for today at roughly a second per elapsed hour, so by
+/// evening today dominates and the window misses its budget. Covering today up
+/// to the oldest still-buffered row leaves only the last few minutes raw.
+///
+/// The danger is claiming MORE than the build read: buckets above the bound
+/// would be served from a rollup that never aggregated them, which is the
+/// silent-wrong-number failure no read-side guard can catch. So this asserts
+/// (a) today really is covered — otherwise the test passes vacuously by falling
+/// back to raw — and (b) the aggregate equals the same aggregate over raw rows.
+#[serial]
+#[tokio::test]
+async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_answer() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("rollup_today").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    cfg.maintenance.timefusion_rollup_backfill_days = 2;
+    let cfg = Arc::new(cfg);
+    // A REAL buffered layer: without one `min_buffered_micros` is always None,
+    // the bound degenerates to the day end, and the partial-day case this test
+    // exists for is never exercised.
+    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let row = |id: &str, duration: i64, ts: i64| -> Result<_> {
+        json_to_batch(vec![serde_json::json!({
+            "timestamp": ts, "id": id, "name": "op", "project_id": project_id, "hashes": [], "summary": ["today rollup fixture"],
+            "date": today.to_string(), "duration": duration, "kind": "server", "status_code": "OK",
+            "resource___service___name": "cart",
+        })])
+    };
+
+    // SETTLED: early rows, flushed to Delta so a build can aggregate them.
+    for (i, offset) in [60_000_000i64, 120_000_000, 3_600_000_000].iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("s{i}"), 100 + i as i64, midnight + offset)?], true, None).await?;
+    }
+    layer.flush_all_now().await?;
+
+    // STILL BUFFERED: later rows, deliberately not flushed. These sit at or
+    // above the bound, so the build cannot see them and must not claim them.
+    for (i, offset) in [7_200_000_000i64, 7_260_000_000].iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("b{i}"), 900 + i as i64, midnight + offset)?], true, None).await?;
+    }
+
+    let built = db.rollup_backfill_tick("otel_logs_and_spans").await?;
+    assert!(built > 0, "the backfill must claim TODAY — otherwise this test proves nothing about partial-day coverage");
+
+    let rollup_rows: i64 = {
+        let sql = format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v2 WHERE project_id = '{project_id}'");
+        let batches = db.query_delta_only(&sql).await?;
+        batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .filter_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|c| c.value(0)))
+            .next()
+            .unwrap_or(0)
+    };
+    assert!(rollup_rows > 0, "today must actually have rollup buckets, not just an empty partition");
+
+    // The whole of today, through the routed path (rollup interior + raw tail).
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let day_end = midnight + 86_400_000_000i64;
+    let agg = format!(
+        "SELECT COUNT(*) AS n, SUM(duration) AS total FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+         AND timestamp >= to_timestamp_micros({midnight}) AND timestamp < to_timestamp_micros({day_end})"
+    );
+    let routed = ctx.sql(&agg).await?.collect().await?;
+    let (n, total) = (routed[0].column(0).as_primitive::<Int64Type>().value(0), routed[0].column(1).as_primitive::<Int64Type>().value(0));
+
+    // Every row written, whatever leg served it: 3 settled + 2 buffered.
+    assert_eq!(n, 5, "the union must return every row — a bound that over-claims drops the buffered tail");
+    assert_eq!(total, 100 + 101 + 102 + 900 + 901, "durations must match exactly; a wrong interior shows up here as a wrong SUM");
+    Ok(())
+}
+
 /// Regression for the LIMIT-pushdown-undercount bug found in code review: a pushed
 /// `LIMIT N` must not be forwarded into the underlying Delta scan, because that
 /// truncates to N rows *before* DedupExec drops duplicates — so the deduped union
