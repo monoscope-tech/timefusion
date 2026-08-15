@@ -73,7 +73,6 @@ jobs:
             ${{ env.IMAGE_LATEST }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          debug: true
 
       # Pull the published image and verify the binary actually starts.
       # We previously shipped images that exited at the dynamic linker

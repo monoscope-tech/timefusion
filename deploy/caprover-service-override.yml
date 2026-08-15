@@ -33,8 +33,11 @@
 #   clobbered down to it. 120 GiB of the host's 188 GB leaves room for monoscope
 #   and the collectors.
 # - Reservations 32 GiB: scheduling floor, unchanged.
-# - stop-first on both UpdateConfig and RollbackConfig: a start-first
-#   replacement deadlocks against the predecessor's exclusive WAL lock.
+# - start-first updates: the drained predecessor serves reads while the new
+#   task pulls, starts, and requests WAL takeover. The deep health check keeps
+#   the replacement out of the VIP until takeover and recovery complete.
+# - stop-first rollback: the conservative path does not depend on a newer
+#   binary understanding the takeover protocol.
 #
 # No EndpointSpec here on purpose: TCP 50051 is published by the app's own port
 # mapping, and 5432 belongs to the stable srv-timefusion-pgwire-proxy service.
@@ -59,7 +62,7 @@
   },
   "UpdateConfig": {
     "Parallelism": 1,
-    "Order": "stop-first",
+    "Order": "start-first",
     "Delay": 100000000,
     "FailureAction": "pause",
     "Monitor": 15000000000,
