@@ -8365,6 +8365,17 @@ impl Database {
             .unwrap_or_default())
     }
 
+    /// Has the source partition moved out from under an in-flight rebuild?
+    ///
+    /// Both halves matter: the fingerprint catches rows appearing or leaving,
+    /// the epoch catches a DML invalidation that happens to preserve it.
+    async fn rollup_source_changed(
+        &self, project_id: &str, source: &str, date: &str, source_key: &(String, String, String), source_fp: u64, source_epoch: u64,
+    ) -> Result<bool> {
+        Ok(self.rollup_source_fingerprint(project_id, source, date).await? != source_fp
+            || self.rollup_source_epochs.get(source_key).map_or(0, |entry| *entry.value()) != source_epoch)
+    }
+
     /// Invalidate a whole date. Every caller that cannot name the hours it
     /// changed lands here, so the conservative answer is the DEFAULT rather than
     /// something a future caller has to remember to pass.
@@ -8717,6 +8728,25 @@ impl Database {
             let chunked = plans.len() > 1;
             let mut row_count = 0;
             for (index, ranges) in plans.iter().enumerate() {
+                // Bail as soon as the source moves, not after every chunk has
+                // been scanned AND committed. The check below is what decides
+                // whether this build counts, so once the source has moved the
+                // remaining chunks are known-wasted work — and they are not
+                // cheap: each is a scan plus a Delta commit on the rollup table.
+                //
+                // TODAY's partition loses this race essentially always, because
+                // it is being written continuously. Prod 2026-08-15 logged four
+                // `source changed while rebuilding … /2026-08-15` in twenty
+                // seconds, each having committed all four chunks first. That is
+                // rollup-table churn and, worse, it holds a rollup permit that
+                // the sealed-day backfill needs — the partitions that actually
+                // decide whether a 7-day window routes. Sealed days in the same
+                // window built fine, so this bounds the loss rather than
+                // changing which dates are eligible; today is served by the raw
+                // realtime tail either way.
+                if index > 0 && self.rollup_source_changed(project_id, source, date, &source_key, source_fp, source_epoch).await? {
+                    anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
+                }
                 let rows = self.query_delta_only(&crate::rollup::build_partition_sql_ranges(spec, source, &from, &target, project_id, date, ranges)?).await?;
                 let batches = crate::rollup::to_rollup_batches(spec, source, project_id, date, &generation, &rows)?;
                 // Each commit REPLACES the partition with (this chunk's hours,
@@ -8735,9 +8765,7 @@ impl Database {
                     info!(project_id, date, target, chunk = index + 1, chunks = plans.len(), rows = row_count, event = "rollup_chunk_committed");
                 }
             }
-            if self.rollup_source_fingerprint(project_id, source, date).await? != source_fp
-                || self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value()) != source_epoch
-            {
+            if self.rollup_source_changed(project_id, source, date, &source_key, source_fp, source_epoch).await? {
                 anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
             }
             self.rollup_coverage.insert(coverage_key, RollupCoverage { source_fp, source_epoch, generation, rows: row_count });
