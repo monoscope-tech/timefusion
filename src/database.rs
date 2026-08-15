@@ -2358,7 +2358,6 @@ pub struct Database {
     maintenance_tasks: Arc<std::sync::Mutex<crate::maintenance_coordinator::TaskJournal>>,
     maintenance_admission: crate::maintenance_coordinator::AdmissionController,
     maintenance_debt_planned_at: Arc<std::sync::atomic::AtomicI64>,
-    maintenance_schedule_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Bounded exponential retry state for failed source-partition rollup builds.
     rollup_backoff: Arc<dashmap::DashMap<RollupCoverageKey, (u32, std::time::Instant)>>,
     /// Exact merge-on-read count partitions. Query threads use only the
@@ -2997,7 +2996,6 @@ impl Database {
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
             maintenance_admission,
             maintenance_debt_planned_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
-            maintenance_schedule_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rollup_backoff: Arc::new(dashmap::DashMap::new()),
             logical_count_cache,
             logical_count_building: Arc::new(dashmap::DashSet::new()),
@@ -9467,41 +9465,22 @@ impl Database {
                 info!(planned, event = "maintenance_compaction_debt_planned");
             }
         }
-        // Interleave dependent publication with dedup instead of draining the
-        // entire historical dedup backlog first. Dedup/base receive three
-        // slots each; derived and file work each receive one. `claim_next`
-        // still applies deadline, recent-slice, dependency, and project fairness.
-        const CYCLE: [Operation; 10] = [
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::DerivedRollup,
-            Operation::HotPacking,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::SealedConsolidation,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::Repair,
-        ];
-        let start = self.maintenance_schedule_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % CYCLE.len();
-        let mut attempted = [false; 6];
-        for offset in 0..CYCLE.len() {
-            let operation = CYCLE[(start + offset) % CYCLE.len()];
-            let index = operation as usize;
-            if attempted[index] {
-                continue;
-            }
-            attempted[index] = true;
-            let completed = match operation {
-                Operation::Dedup => self.run_coordinator_dedup_once().await?,
-                Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await?,
-                Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await?,
-            };
-            if completed {
-                return Ok(true);
-            }
+        if self.run_coordinator_dedup_once().await? {
+            return Ok(true);
         }
-        Ok(false)
+        if self.run_coordinator_rollup_once(Operation::BaseRollup).await? {
+            return Ok(true);
+        }
+        if self.run_coordinator_rollup_once(Operation::DerivedRollup).await? {
+            return Ok(true);
+        }
+        if self.run_coordinator_compaction_once(Operation::HotPacking).await? {
+            return Ok(true);
+        }
+        if self.run_coordinator_compaction_once(Operation::SealedConsolidation).await? {
+            return Ok(true);
+        }
+        self.run_coordinator_compaction_once(Operation::Repair).await
     }
 
     /// Drive a bounded number of already-eligible durable maintenance units.
