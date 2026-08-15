@@ -1,45 +1,75 @@
-# Apply in CapRover's "Service Update Override" for TimeFusion.
+# The LIVE contents of the TimeFusion CapRover app's "Service Update Override".
 #
-# Safe only after every running task uses a binary that implements both HANDOFF
-# and the WAL takeover.request protocol. TCP 5432 is deliberately absent here:
-# the stable srv-timefusion-pgwire-proxy service owns the host-mode port. The
-# new task remains unhealthy while its early PGWire responder returns 57P03;
-# once it requests the shared WAL lock, the drained predecessor exits and the
-# real PGWire server becomes healthy.
-EndpointSpec:
-  Ports:
-    - Protocol: tcp
-      TargetPort: 50051
-      PublishedPort: 50051
-      PublishMode: ingress
-TaskTemplate:
-  # The cgroup limit is TimeFusion's ONLY memory knob: the self-sizing budget
-  # tree derives every pool from it at startup (`detected_limit_gb`), so setting
-  # it by hand after a deploy is not a tuning detail, it is the whole config.
-  #
-  # It lives HERE because a deploy rewrites the service spec and clobbers any
-  # limit set with `docker service update`. That has now happened repeatedly —
-  # most recently 2026-08-14, when a deploy reset it from 120G to 96G and the
-  # box OOM-looped for twelve hours at a ceiling nobody had chosen.
-  #
-  # 120 GiB of the host's 188 GB, leaving room for monoscope and the collectors.
-  Resources:
-    Limits:
-      MemoryBytes: 128849018880
-    Reservations:
-      MemoryBytes: 34359738368
-UpdateConfig:
-  Parallelism: 1
-  Delay: 100000000
-  FailureAction: pause
-  Monitor: 15000000000
-  MaxFailureRatio: 0.15
-  Order: start-first
-RollbackConfig:
-  Parallelism: 1
-  FailureAction: pause
-  Monitor: 15000000000
-  MaxFailureRatio: 0.15
-  # A failed replacement has not necessarily received HANDOFF. Stop it first
-  # so the rollback task can acquire the WAL lock without waiting for SIGKILL.
-  Order: stop-first
+# This file is documentation of a value that lives in CapRover, not something
+# any pipeline applies. Keep it byte-equivalent to what is actually set, and
+# re-read the live value before editing:
+#
+#   TOKEN=$(curl -s -X POST https://captain.s.past3.tech/api/v2/login \
+#     -H 'Content-Type: application/json' -H 'x-namespace: captain' \
+#     -d '{"password":"<admin>"}' | jq -r .data.token)
+#   curl -s https://captain.s.past3.tech/api/v2/user/apps/appDefinitions \
+#     -H "x-captain-auth: $TOKEN" -H 'x-namespace: captain' \
+#     | jq -r '.data.appDefinitions[] | select(.appName=="timefusion") | .serviceUpdateOverride'
+#
+# Write it back by POSTing the whole app definition (with only this field
+# changed) to /api/v2/user/apps/appDefinitions/update. The caprover CLI is the
+# documented route but is broken under Node 25 — `caprover api` dies with
+# `ERR_USE_AFTER_CLOSE: readline was closed` immediately after authenticating,
+# with or without a TTY. The HTTP API above is what the CLI calls anyway.
+#
+# EVERY KEY HERE IS LOAD-BEARING. An earlier version of this file was written
+# from memory rather than from the live value, and applying it would have
+# reverted `UpdateConfig.Order` to `start-first` — the exact swarm/WAL-lock
+# deploy wedge that `stop-first` exists to fix — and dropped StopGracePeriod and
+# Seccomp. Do not paste a hand-written version of this.
+#
+# - StopGracePeriod 90s: the drain + WAL handoff needs it; a shorter grace means
+#   SIGKILL mid-drain.
+# - Seccomp unconfined: required by the jemalloc/pprof profiling paths.
+# - Limits.MemoryBytes 120 GiB: the cgroup limit is TimeFusion's ONLY memory
+#   knob — the self-sizing budget tree derives every pool from `detected_limit_gb`
+#   at startup. It was 96 GiB (103079215104) until 2026-08-15 09:15Z, which is
+#   where the OOM-loop's ceiling came from; it was CONFIGURED at 96, not
+#   clobbered down to it. 120 GiB of the host's 188 GB leaves room for monoscope
+#   and the collectors.
+# - Reservations 32 GiB: scheduling floor, unchanged.
+# - stop-first on both UpdateConfig and RollbackConfig: a start-first
+#   replacement deadlocks against the predecessor's exclusive WAL lock.
+#
+# No EndpointSpec here on purpose: TCP 50051 is published by the app's own port
+# mapping, and 5432 belongs to the stable srv-timefusion-pgwire-proxy service.
+{
+  "TaskTemplate": {
+    "ContainerSpec": {
+      "StopGracePeriod": 90000000000,
+      "Privileges": {
+        "Seccomp": {
+          "Mode": "unconfined"
+        }
+      }
+    },
+    "Resources": {
+      "Limits": {
+        "MemoryBytes": 128849018880
+      },
+      "Reservations": {
+        "MemoryBytes": 34359738368
+      }
+    }
+  },
+  "UpdateConfig": {
+    "Parallelism": 1,
+    "Order": "stop-first",
+    "Delay": 100000000,
+    "FailureAction": "pause",
+    "Monitor": 15000000000,
+    "MaxFailureRatio": 0.15
+  },
+  "RollbackConfig": {
+    "Parallelism": 1,
+    "FailureAction": "pause",
+    "Monitor": 15000000000,
+    "MaxFailureRatio": 0.15,
+    "Order": "stop-first"
+  }
+}
