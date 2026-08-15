@@ -33,9 +33,11 @@
 #   clobbered down to it. 120 GiB of the host's 188 GB leaves room for monoscope
 #   and the collectors.
 # - Reservations 32 GiB: scheduling floor, unchanged.
-# - stop-first updates and rollback until every deployed binary's liveness
-#   probe accepts the intentional startup 57P03 responder. Otherwise Swarm
-#   restarts the predecessor while the replacement waits for its WAL lock.
+# - start-first updates: every deployed binary's liveness probe accepts only
+#   the intentional startup 57P03 responder, allowing WAL takeover to complete
+#   while the external SQL probe still counts that interval as unavailable.
+# - stop-first rollback: older binaries might not implement that liveness and
+#   takeover contract, so rollback stays conservative.
 #
 # No EndpointSpec here on purpose: TCP 50051 is published by the app's own port
 # mapping, and 5432 belongs to the stable srv-timefusion-pgwire-proxy service.
@@ -60,7 +62,7 @@
   },
   "UpdateConfig": {
     "Parallelism": 1,
-    "Order": "stop-first",
+    "Order": "start-first",
     "Delay": 100000000,
     "FailureAction": "pause",
     "Monitor": 15000000000,
