@@ -9554,7 +9554,32 @@ impl Database {
                 debug!("dedup sweep: {} in failure backoff, skipping", backoff_key);
                 continue;
             }
-            match self.dedup_partition(table_ref, table_name, pid, date).await {
+            // BOUND the partition by what is left of the sweep, exactly as the
+            // drain bounds each bin (`stage_deadline.min(remaining)`). The
+            // deadline check above only gates ADMISSION: without this, a single
+            // slow partition runs unbounded past it, and because
+            // `spawn_cron_job` drops overlapping ticks that wedges the WHOLE
+            // dedup job — including the dirty-bin drain, which runs before the
+            // sweep and so never gets another tick.
+            //
+            // Prod 2026-08-15 measured exactly that: "Dedup job run still in
+            // progress after 600s" while `dirty_bin_processed_total` sat frozen
+            // at 27 for 30 minutes and 58 more bins were enqueued behind it.
+            // Light compaction committed 47 bins in the same window, so the box
+            // was not busy — only this job was stuck.
+            //
+            // A partition abandoned here is simply re-swept next tick: the pass
+            // is idempotent and `record_certification` only certifies a pass
+            // that ran to completion, so a truncated one certifies nothing.
+            let partition_budget = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+            let swept = match partition_budget {
+                Some(budget) => match tokio::time::timeout(budget, self.dedup_partition(table_ref, table_name, pid, date)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!("dedup of {pid}/{date} exceeded the sweep's remaining {budget:?}")),
+                },
+                None => self.dedup_partition(table_ref, table_name, pid, date).await,
+            };
+            match swept {
                 Ok((d, complete)) => {
                     self.dedup_backoff.remove(&backoff_key);
                     total_dropped += d;
