@@ -77,6 +77,7 @@ impl PhysicalOptimizerRule for DedupNeedsOrderedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::compute::SortOptions;
     use datafusion::{
         arrow::{
             array::{Int64Array, RecordBatch},
@@ -85,7 +86,6 @@ mod tests {
         datasource::{memory::MemorySourceConfig, source::DataSourceExec},
         physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column},
     };
-    use datafusion::arrow::compute::SortOptions;
 
     fn ts_ordering() -> LexOrdering {
         LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("ts", 0)), SortOptions { descending: true, nulls_first: false })]).unwrap()
@@ -94,13 +94,8 @@ mod tests {
     /// Two ordered partitions, so a coalesce over them is legal but interleaving.
     fn ordered_source() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false), Field::new("id", DataType::Int64, false)]));
-        let batch = |a: i64| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![a])), Arc::new(Int64Array::from(vec![a]))]).unwrap()
-        };
-        let cfg = MemorySourceConfig::try_new(&[vec![batch(2)], vec![batch(1)]], schema, None)
-            .unwrap()
-            .try_with_sort_information(vec![ts_ordering()])
-            .unwrap();
+        let batch = |a: i64| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![a])), Arc::new(Int64Array::from(vec![a]))]).unwrap();
+        let cfg = MemorySourceConfig::try_new(&[vec![batch(2)], vec![batch(1)]], schema, None).unwrap().try_with_sort_information(vec![ts_ordering()]).unwrap();
         Arc::new(DataSourceExec::new(Arc::new(cfg)))
     }
 
