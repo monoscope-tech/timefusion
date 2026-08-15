@@ -1606,6 +1606,7 @@ impl BufferedWriteLayer {
                 }
             }
         }
+        let (iter_read_nanos, iter_envelope_nanos) = (iter.read_nanos, iter.envelope_nanos);
         // The drain mutates the hold/orphan state the cursor parking below
         // reads, and its airborne commit must land (or fail into a restore /
         // orphan) before positions are parked — await it, don't abort it.
@@ -1742,6 +1743,16 @@ impl BufferedWriteLayer {
             avg_ms(update_nanos, updates_replayed),
             insert_bytes / (1024 * 1024),
             if entries_replayed > 0 { insert_bytes / entries_replayed } else { 0 },
+        );
+        // The two costs UPSTREAM of the Arrow decode, which together were 71%
+        // of replay wall-clock when first measured (2026-08-15) and are invisible
+        // in the breakdown above.
+        info!(
+            "WAL recovery read path: walrus_read={}ms ({:.3}ms/ea), envelope_decode={}ms ({:.3}ms/ea)",
+            iter_read_nanos / 1_000_000,
+            avg_ms(iter_read_nanos, entries_replayed),
+            iter_envelope_nanos / 1_000_000,
+            avg_ms(iter_envelope_nanos, entries_replayed),
         );
 
         // Quarantine must never be a quiet outcome. Re-drive runs as a paced,
@@ -6176,30 +6187,49 @@ mod replay_cost_probe {
         let entries: usize = std::env::var("REPLAY_ENTRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
         let rows_per_entry: usize = std::env::var("REPLAY_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
 
-        let dir = tempdir().unwrap();
-        let cfg = crate::config::AppConfig::default();
-        let mut cfg = cfg;
-        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
-        // Never flush during the build or the replay: we are timing replay, not IO.
-        cfg.buffer.timefusion_flush_interval_secs = 86_400;
-        cfg.buffer.timefusion_buffer_max_memory_mb = 64_000;
-        let cfg = Arc::new(cfg);
+        // Comparing optimisations needs IDENTICAL input, so the corpus is built
+        // once into REPLAY_BUILD_DIR (if set) and each run replays a COPY of it.
+        // Replay consumes cursors, so replaying the original in place would make
+        // the second run measure an empty log.
+        let scratch = tempdir().unwrap();
+        let build_dir = std::env::var("REPLAY_BUILD_DIR").ok().map(std::path::PathBuf::from);
+        let corpus = build_dir.clone().unwrap_or_else(|| scratch.path().join("corpus"));
+        let topics: usize = std::env::var("REPLAY_TOPICS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
 
-        let layer = Arc::new(test_layer(Arc::clone(&cfg)).unwrap());
-        let batch = json_to_batch((0..rows_per_entry).map(|i| test_span(&format!("id{i}"), &format!("span{i}"), "probe-project")).collect()).unwrap();
+        let mk_cfg = |data_dir: std::path::PathBuf| {
+            let mut cfg = crate::config::AppConfig::default();
+            cfg.core.timefusion_data_dir = data_dir;
+            // Never flush during build or replay: we are timing replay, not IO.
+            cfg.buffer.timefusion_flush_interval_secs = 86_400;
+            cfg.buffer.timefusion_buffer_max_memory_mb = 64_000;
+            Arc::new(cfg)
+        };
 
-        let t_build = std::time::Instant::now();
-        for _ in 0..entries {
-            layer.insert("probe-project", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
+        if !corpus.join("wal").exists() {
+            std::fs::create_dir_all(&corpus).unwrap();
+            let layer = Arc::new(test_layer(mk_cfg(corpus.clone())).unwrap());
+            let batch = json_to_batch((0..rows_per_entry).map(|i| test_span(&format!("id{i}"), &format!("span{i}"), "probe-project")).collect()).unwrap();
+            let t_build = std::time::Instant::now();
+            for i in 0..entries {
+                // Spread across `topics` (project, table) pairs to exercise the
+                // cross-topic path; 1 keeps the original single-topic shape.
+                let project = format!("probe-project-{}", i % topics);
+                layer.insert(&project, "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
+            }
+            let build_ms = t_build.elapsed().as_millis();
+            println!(
+                "\n== built {entries} entries x {rows_per_entry} rows across {topics} topic(s) in {build_ms}ms; wal dir {}MB ==",
+                walkdir_size(&corpus) / (1024 * 1024)
+            );
+            drop(layer);
+        } else {
+            println!("\n== reusing corpus at {} ({}MB) ==", corpus.display(), walkdir_size(&corpus) / (1024 * 1024));
         }
-        let build_ms = t_build.elapsed().as_millis();
-        let wal_bytes: u64 = walkdir_size(dir.path());
-        println!("\n== built {entries} entries x {rows_per_entry} rows in {build_ms}ms; wal dir {}MB ==", wal_bytes / (1024 * 1024));
 
-        // Fresh layer over the SAME data dir: its cursors are at zero, so the
-        // whole log is unread and replay has to do real work.
-        drop(layer);
-        let replayer = Arc::new(test_layer(cfg).unwrap());
+        // Replay a COPY so the corpus stays pristine for the next variant.
+        let run_dir = scratch.path().join("run");
+        copy_dir(&corpus, &run_dir);
+        let replayer = Arc::new(test_layer(mk_cfg(run_dir)).unwrap());
         let t = std::time::Instant::now();
         let stats = replayer.recover_from_wal().await.unwrap();
         println!(
@@ -6208,6 +6238,18 @@ mod replay_cost_probe {
             t.elapsed().as_millis(),
             t.elapsed().as_secs_f64() * 1000.0 / stats.entries_replayed.max(1) as f64
         );
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let (src, dst) = (e.path(), to.join(e.file_name()));
+            if e.metadata().unwrap().is_dir() {
+                copy_dir(&src, &dst);
+            } else {
+                std::fs::copy(&src, &dst).unwrap();
+            }
+        }
     }
 
     fn walkdir_size(p: &std::path::Path) -> u64 {

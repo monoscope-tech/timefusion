@@ -177,7 +177,13 @@ pub struct WalEntry {
     pub project_id: String,
     pub table_name: String,
     pub operation: WalOperation,
-    #[bincode(with_serde)]
+    /// NOT `#[bincode(with_serde)]`. Serde encodes a `Vec<u8>` as a SEQUENCE,
+    /// so decode ran a per-element loop: 2.7ms to decode one 86KB payload
+    /// (~31 MB/s), which was 58% of all WAL replay wall-clock (2026-08-15).
+    /// bincode's native impl decodes the same bytes in 3-4us — 700-880x — and
+    /// `compare_vec_u8_encodings` asserts the two encodings are BYTE-IDENTICAL,
+    /// so this is a pure speedup: no on-disk format change, no version bump,
+    /// and logs written by either binary read back under the other.
     pub data: Vec<u8>,
 }
 
@@ -636,31 +642,50 @@ impl WalManager {
             cur_topic: None,
             total: 0,
             errors: 0,
+            read_nanos: 0,
+            envelope_nanos: 0,
         })
     }
 
     /// Read the next entry from a shard, skipping corrupted ones. Returns
     /// `None` at end of stream. Shared by `WalReplayIter`'s k-way merge.
     fn next_from_shard(wal: &Walrus, key: &str, checkpoint: bool, persist_checkpoint: bool, errors: &mut usize) -> Option<(WalEntry, WalPosition)> {
+        Self::next_from_shard_timed(wal, key, checkpoint, persist_checkpoint, errors, &mut 0, &mut 0)
+    }
+
+    /// As `next_from_shard`, but attributes its wall clock to the walrus read
+    /// and the envelope decode separately — replay's long pole was neither the
+    /// Arrow decode nor the MemBuffer apply (2026-08-15), and guessing which of
+    /// these two it is instead would repeat that mistake.
+    fn next_from_shard_timed(
+        wal: &Walrus, key: &str, checkpoint: bool, persist_checkpoint: bool, errors: &mut usize, read_nanos: &mut u128, envelope_nanos: &mut u128,
+    ) -> Option<(WalEntry, WalPosition)> {
         loop {
+            let t_read = std::time::Instant::now();
             let next = if checkpoint && !persist_checkpoint { wal.read_next_volatile_with_position(key) } else { wal.read_next_with_position(key, checkpoint) };
+            *read_nanos += t_read.elapsed().as_nanos();
             match next {
-                Ok(Some((d, pos))) => match deserialize_wal_entry(&d.data) {
-                    Ok(entry) => return Some((entry, pos)),
-                    Err(e @ WalError::UnsupportedVersion { .. }) => {
-                        error!(
-                            "WAL on-disk version mismatch on shard {} ({e}); IN-FLIGHT DATA WILL BE LOST. \
+                Ok(Some((d, pos))) => {
+                    let t_env = std::time::Instant::now();
+                    let decoded = deserialize_wal_entry(&d.data);
+                    *envelope_nanos += t_env.elapsed().as_nanos();
+                    match decoded {
+                        Ok(entry) => return Some((entry, pos)),
+                        Err(e @ WalError::UnsupportedVersion { .. }) => {
+                            error!(
+                                "WAL on-disk version mismatch on shard {} ({e}); IN-FLIGHT DATA WILL BE LOST. \
                              Wipe ${{TIMEFUSION_DATA_DIR}}/wal to start fresh, or roll back to a binary \
                              that wrote the existing entries.",
-                            key
-                        );
-                        *errors += 1;
+                                key
+                            );
+                            *errors += 1;
+                        }
+                        Err(e) => {
+                            error!("WAL CORRUPTION on shard {}: undeserializable entry: {}", key, e);
+                            *errors += 1;
+                        }
                     }
-                    Err(e) => {
-                        error!("WAL CORRUPTION on shard {}: undeserializable entry: {}", key, e);
-                        *errors += 1;
-                    }
-                },
+                }
                 Ok(None) => return None,
                 Err(e) => {
                     error!("I/O error reading WAL shard {}: {}", key, e);
@@ -1217,6 +1242,11 @@ pub struct WalReplayIter<'a> {
     pub total: u64,
     /// Corrupt/unreadable entries skipped so far.
     pub errors: usize,
+    /// Wall-clock inside the walrus read (I/O + the copy out of the block).
+    pub read_nanos: u128,
+    /// Wall-clock decoding the WAL envelope — the bincode step that allocates
+    /// and copies `WalEntry::data` before the Arrow decode ever sees it.
+    pub envelope_nanos: u128,
 }
 
 impl WalReplayIter<'_> {
@@ -1238,7 +1268,15 @@ impl WalReplayIter<'_> {
         // Recovery owns a durable rewind marker and explicitly parks every
         // cursor before removing it, so persisting walrus's index for every
         // prefetched entry is redundant and costs one fsync per entry.
-        if let Some(next) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, false, &mut self.errors) {
+        if let Some(next) = WalManager::next_from_shard_timed(
+            &self.wal.wal,
+            &self.shard_keys[shard],
+            true,
+            false,
+            &mut self.errors,
+            &mut self.read_nanos,
+            &mut self.envelope_nanos,
+        ) {
             self.heap.push(std::cmp::Reverse((next.0.timestamp_micros, shard)));
             self.pending[shard] = Some(next);
         }
@@ -2568,5 +2606,61 @@ mod tests {
         let (deleted, bytes_freed) = gc_wal_files(&missing, std::time::Duration::ZERO, None).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(bytes_freed, 0);
+    }
+}
+#[cfg(test)]
+mod wal_payload_encoding {
+    use bincode::{Decode, Encode};
+    const CFG: bincode::config::Configuration = bincode::config::standard();
+
+    #[derive(Encode, Decode)]
+    struct ViaSerde {
+        #[bincode(with_serde)]
+        data: Vec<u8>,
+    }
+    #[derive(Encode, Decode)]
+    struct Native {
+        data: Vec<u8>,
+    }
+
+    /// `WalEntry::data` must NOT carry `#[bincode(with_serde)]`, and this is
+    /// the guard that makes removing it safe: serde encodes a `Vec<u8>` as a
+    /// sequence, and bincode's native impl produces the SAME BYTES while
+    /// decoding ~700x faster (2.7ms vs 4us for one 86KB payload). Byte
+    /// identity is what makes it a drop-in: no on-disk format change, no WAL
+    /// version bump, and a log written by either binary reads back under the
+    /// other. If a future bincode/serde upgrade breaks that equality, this
+    /// fails and the change needs a version bump instead.
+    #[test]
+    fn wal_payload_encoding_is_identical_with_and_without_serde() {
+        // Arrow IPC-like: uniformly random bytes, so ~50% are >= 128.
+        let payload: Vec<u8> = (0..86_408u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let s = bincode::encode_to_vec(ViaSerde { data: payload.clone() }, CFG).unwrap();
+        let n = bincode::encode_to_vec(Native { data: payload.clone() }, CFG).unwrap();
+        println!(
+            "\npayload={}B  with_serde={}B ({:.2}x)  native={}B ({:.2}x)",
+            payload.len(),
+            s.len(),
+            s.len() as f64 / payload.len() as f64,
+            n.len(),
+            n.len() as f64 / payload.len() as f64
+        );
+
+        let iters = 200;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _: (ViaSerde, _) = bincode::decode_from_slice(&s, CFG).unwrap();
+        }
+        let serde_us = t.elapsed().as_micros() / iters;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _: (Native, _) = bincode::decode_from_slice(&n, CFG).unwrap();
+        }
+        let native_us = t.elapsed().as_micros() / iters;
+        println!("decode: with_serde={}us  native={}us  speedup={:.1}x", serde_us, native_us, serde_us as f64 / native_us.max(1) as f64);
+        // THE question: if the bytes are identical, dropping the attribute is a
+        // pure speedup with no on-disk format change and no version bump.
+        println!("bytes identical: {}\n", s == n);
+        assert_eq!(s, n, "wire format must be unchanged for this to be a safe swap");
     }
 }
