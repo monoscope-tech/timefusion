@@ -126,11 +126,11 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 
 EXPOSE 80 5432
 
-# Keep the early 57P03 responder out of Swarm's VIP. The probe speaks just
-# enough PostgreSQL to require an AuthenticationRequest from the real server;
-# it becomes healthy within one startup probe interval of WAL-owner handoff
-# completing. After the first success, probe less often and tolerate transient
-# host/load stalls so Swarm never recycles an otherwise healthy database task.
+# The probe speaks enough PostgreSQL to distinguish the intentional startup
+# 57P03 from other failures. It accepts that responder as live so Swarm can
+# advance a start-first update; the external SQL probe still counts 57P03 as
+# unavailable. After startup, probe less often and tolerate transient host/load
+# stalls so Swarm never recycles an otherwise healthy database task.
 #
 # timeout 2s->5s, retries 3->5 (prod 2026-08-08). The old budget replaced a
 # HEALTHY task: the handshake was measured at 0.896s under ordinary load with no

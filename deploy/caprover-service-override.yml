@@ -33,11 +33,9 @@
 #   clobbered down to it. 120 GiB of the host's 188 GB leaves room for monoscope
 #   and the collectors.
 # - Reservations 32 GiB: scheduling floor, unchanged.
-# - start-first updates: the drained predecessor serves reads while the new
-#   task pulls, starts, and requests WAL takeover. The deep health check keeps
-#   the replacement out of the VIP until takeover and recovery complete.
-# - stop-first rollback: the conservative path does not depend on a newer
-#   binary understanding the takeover protocol.
+# - stop-first updates and rollback until every deployed binary's liveness
+#   probe accepts the intentional startup 57P03 responder. Otherwise Swarm
+#   restarts the predecessor while the replacement waits for its WAL lock.
 #
 # No EndpointSpec here on purpose: TCP 50051 is published by the app's own port
 # mapping, and 5432 belongs to the stable srv-timefusion-pgwire-proxy service.
@@ -62,7 +60,7 @@
   },
   "UpdateConfig": {
     "Parallelism": 1,
-    "Order": "start-first",
+    "Order": "stop-first",
     "Delay": 100000000,
     "FailureAction": "pause",
     "Monitor": 15000000000,

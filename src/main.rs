@@ -122,10 +122,10 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Docker readiness probe that distinguishes the early 57P03 responder from
-/// the real PGWire server. A PostgreSQL AuthenticationRequest (`R`) proves the
-/// request reached the real handler; the early responder returns ErrorResponse
-/// (`E`) with SQLSTATE 57P03 and therefore stays out of a start-first VIP.
+/// Docker liveness probe. The intentional early ErrorResponse with SQLSTATE
+/// 57P03 is alive enough for Swarm to advance a start-first update; clients and
+/// the deployment availability probe still treat it as unavailable. Any other
+/// PGWire error remains unhealthy.
 fn run_pgwire_healthcheck() -> anyhow::Result<()> {
     let port = std::env::var("TIMEFUSION_PGWIRE_PORT").or_else(|_| std::env::var("PGWIRE_PORT")).ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(5432);
     pgwire_ready_at(([127, 0, 0, 1], port).into())
@@ -197,8 +197,20 @@ fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
         println!("probe connect_ms={connect_ms} write_ms={write_ms} auth_ms={auth_ms} total_ms={total_ms} result=ok tag={}", tag[0] as char);
     }
     read?;
-    anyhow::ensure!(tag[0] == b'R', "PGWire is bound but not ready (response tag {:?})", tag[0] as char);
-    Ok(())
+    if tag[0] == b'R' {
+        return Ok(());
+    }
+    if tag[0] == b'E' {
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length)?;
+        let payload_len = u32::from_be_bytes(length).saturating_sub(4) as usize;
+        anyhow::ensure!(payload_len <= 64 * 1024, "PGWire ErrorResponse is unreasonably large");
+        let mut payload = vec![0; payload_len];
+        stream.read_exact(&mut payload)?;
+        anyhow::ensure!(payload.windows(7).any(|field| field == b"C57P03\0"), "PGWire returned a non-startup error");
+        return Ok(());
+    }
+    anyhow::bail!("PGWire returned unexpected response tag {:?}", tag[0] as char)
 }
 
 fn init_cli_tracing() {
@@ -943,7 +955,7 @@ async fn reconcile_tantivy(db: &Database, table: &str) {
 mod healthcheck_tests {
     use super::pgwire_ready_at;
 
-    fn one_response(tag: u8) -> std::net::SocketAddr {
+    fn one_response(response: Vec<u8>) -> std::net::SocketAddr {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -954,15 +966,25 @@ mod healthcheck_tests {
             let remaining = u32::from_be_bytes(length).saturating_sub(4) as usize;
             let mut startup = vec![0u8; remaining];
             stream.read_exact(&mut startup).unwrap();
-            stream.write_all(&[tag]).unwrap();
+            stream.write_all(&response).unwrap();
         });
         addr
     }
 
     #[test]
-    fn readiness_accepts_authentication_and_rejects_early_error() {
-        assert!(pgwire_ready_at(one_response(b'R')).is_ok());
-        assert!(pgwire_ready_at(one_response(b'E')).is_err());
+    fn liveness_accepts_authentication_and_startup_error_only() {
+        assert!(pgwire_ready_at(one_response(vec![b'R'])).is_ok());
+        let error = |code: &[u8]| {
+            let mut payload = vec![b'C'];
+            payload.extend_from_slice(code);
+            payload.extend_from_slice(&[0, 0]);
+            let mut response = vec![b'E'];
+            response.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+            response.extend_from_slice(&payload);
+            response
+        };
+        assert!(pgwire_ready_at(one_response(error(b"57P03"))).is_ok());
+        assert!(pgwire_ready_at(one_response(error(b"XX000"))).is_err());
     }
 
     /// The probe and the Dockerfile are one budget split across two files, and
