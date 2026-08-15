@@ -449,10 +449,23 @@ struct RollupCoverage {
     source_epoch: u64,
     generation: String,
     rows: u64,
+    /// Exclusive upper bound on the source timestamps this build actually
+    /// aggregated. `day_start + DAY_MICROS` for a sealed day — the whole
+    /// partition — and less than that only for a day still being written.
+    ///
+    /// Stored rather than recomputed because it is TIME-VARYING for today: the
+    /// build, the read and the ticket re-check all have to agree on the same
+    /// bound, and two of them computing it a minute apart would disagree and
+    /// invalidate perfectly good coverage on every query.
+    covered_through: i64,
 }
 
 #[derive(Debug)]
-pub(crate) struct RollupReadTicket(Vec<(RollupCoverageKey, u64, u64, String)>);
+/// (coverage key, source fingerprint, source epoch, generation, the BOUND the
+/// fingerprint was taken to). The bound travels with the ticket because it is
+/// the build's, not something the re-check may recompute — see
+/// `RollupCoverage::covered_through`.
+pub(crate) struct RollupReadTicket(Vec<(RollupCoverageKey, u64, u64, String, i64)>);
 
 /// A matched query's rollup substitute: the SQL to plan, the `Aggregate` node it
 /// is substituted for, and the coverage ticket to re-check before it is used.
@@ -3204,7 +3217,16 @@ impl Database {
         let fingerprints = {
             let table = self.resolve_table(&route.project_id, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
             let table = table.read().await;
-            Self::partition_fingerprints(&table, tiebreak_of(&route.source)).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
+            // Each date is fingerprinted to the bound ITS coverage was built to,
+            // so a day still being written is compared on the part the build
+            // actually read. A date with no coverage gets the whole-partition
+            // question and simply fails to match below.
+            Self::partition_fingerprints_bounded(&table, tiebreak_of(&route.source), &|date| {
+                self.rollup_coverage
+                    .get(&(route.project_id.clone(), route.source.clone(), route.target.clone(), date.to_string()))
+                    .map_or(i64::MAX, |coverage| coverage.covered_through)
+            })
+            .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         let mut generations = Vec::with_capacity(dates.len());
         let mut ticket = Vec::with_capacity(dates.len());
@@ -3243,12 +3265,21 @@ impl Database {
             debug!(project_id = %route.project_id, source = %route.source, target = %route.target, date, rows = coverage.rows, "rollup coverage selected");
             // Merge with the previous run when the dates are adjacent, so a
             // contiguous span costs one range predicate rather than one per day.
+            // The build's OWN bound, not the day end. They are the same for a
+            // sealed partition; for a day still being written the build stops
+            // short, and reading past that point would serve buckets the rollup
+            // never aggregated — the silent-wrong-number failure.
+            let end = coverage.covered_through.min(day_start + DAY_MICROS);
+            if end <= day_start {
+                miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
+                continue;
+            }
             match covered.last_mut() {
-                Some(last) if last.1 == day_start => last.1 = day_start + DAY_MICROS,
-                _ => covered.push((day_start, day_start + DAY_MICROS)),
+                Some(last) if last.1 == day_start => last.1 = end,
+                _ => covered.push((day_start, end)),
             }
             generations.push((date.clone(), coverage.generation.clone()));
-            ticket.push((key, source_fp, source_epoch, coverage.generation.clone()));
+            ticket.push((key, source_fp, source_epoch, coverage.generation.clone(), coverage.covered_through));
         }
         // A buffered row is missing from EVERY rollup partition, whichever dates
         // are certified, so this caps the whole set rather than trimming a tail.
@@ -3282,7 +3313,7 @@ impl Database {
     }
 
     pub(crate) async fn rollup_ticket_current(&self, ticket: &RollupReadTicket) -> bool {
-        for ((project_id, source, target, date), source_fp, source_epoch, generation) in &ticket.0 {
+        for ((project_id, source, target, date), source_fp, source_epoch, generation, bound) in &ticket.0 {
             if self
                 .rollup_coverage
                 .get(&(project_id.clone(), source.clone(), target.clone(), date.clone()))
@@ -3293,7 +3324,7 @@ impl Database {
             if self.rollup_source_epochs.get(&(project_id.clone(), source.clone(), date.clone())).map_or(0, |epoch| *epoch.value()) != *source_epoch {
                 return false;
             }
-            if self.rollup_source_fingerprint(project_id, source, date).await.map_or(true, |fingerprint| fingerprint != *source_fp) {
+            if self.rollup_source_fingerprint(project_id, source, date, *bound).await.map_or(true, |fingerprint| fingerprint != *source_fp) {
                 return false;
             }
         }
@@ -8361,10 +8392,14 @@ impl Database {
     /// a row; that made every routed query miss shortly after any Consolidate
     /// pass. See `partition_fingerprints` for why row count plus timestamp span
     /// is the right question to ask.
-    async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str) -> Result<u64> {
+    /// `bound` is the exclusive upper bound the coverage was built to; pass
+    /// `i64::MAX` for a whole-partition question. It must be the bound STORED
+    /// with the coverage, never one recomputed here — for a day still being
+    /// written the two would differ and invalidate good coverage every query.
+    async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str, bound: i64) -> Result<u64> {
         let table = self.resolve_table(project_id, source).await?;
         let table = table.read().await;
-        let mut fingerprints = Self::partition_fingerprints(&table, tiebreak_of(source))?;
+        let mut fingerprints = Self::partition_fingerprints_bounded(&table, tiebreak_of(source), &|_| bound)?;
         Ok(fingerprints
             .remove(&(project_id.to_string(), date.to_string()))
             .or_else(|| fingerprints.remove(&("default".to_string(), date.to_string())))
@@ -8375,11 +8410,10 @@ impl Database {
     ///
     /// Both halves matter: the fingerprint catches rows appearing or leaving,
     /// the epoch catches a DML invalidation that happens to preserve it.
-    async fn rollup_source_changed(
-        &self, project_id: &str, source: &str, date: &str, source_key: &(String, String, String), source_fp: u64, source_epoch: u64,
-    ) -> Result<bool> {
-        Ok(self.rollup_source_fingerprint(project_id, source, date).await? != source_fp
-            || self.rollup_source_epochs.get(source_key).map_or(0, |entry| *entry.value()) != source_epoch)
+    async fn rollup_source_changed(&self, project_id: &str, source: &str, date: &str, source_fp: u64, source_epoch: u64, bound: i64) -> Result<bool> {
+        let key = (project_id.to_string(), source.to_string(), date.to_string());
+        Ok(self.rollup_source_fingerprint(project_id, source, date, bound).await? != source_fp
+            || self.rollup_source_epochs.get(&key).map_or(0, |entry| *entry.value()) != source_epoch)
     }
 
     /// Invalidate a whole date. Every caller that cannot name the hours it
@@ -8675,8 +8709,21 @@ impl Database {
     /// for the other's.
     async fn rebuild_rollup_partition_holding_permit(&self, source: &str, project_id: &str, date: &str) -> Result<()> {
         let Some(schema) = get_schema(source) else { return Ok(()) };
-        let source_fp = self.rollup_source_fingerprint(project_id, source, date).await?;
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
+        // How far up this build may CLAIM to have read.
+        //
+        // Everything below the oldest still-buffered row is already in Delta, so
+        // the aggregate over `query_delta_only` has it; at or above that point
+        // the buffer may still hold rows this build cannot see. A sealed day has
+        // nothing buffered and claims the whole partition, exactly as before.
+        //
+        // Claiming LESS than was aggregated is always safe — it only hands more
+        // of the window to the raw leg. Claiming more is the silent-wrong-number
+        // failure, so this is deliberately the conservative side.
+        let day_bounds = date_start_micros(date).map(|start| (start, start + DAY_MICROS));
+        let build_bound = day_bounds
+            .map_or(i64::MAX, |(start, end)| self.buffered_layer().and_then(|layer| layer.min_buffered_micros(project_id, source, start, end)).unwrap_or(end));
+        let source_fp = self.rollup_source_fingerprint(project_id, source, date, build_bound).await?;
         let source_epoch = self.rollup_source_epochs.get(&source_key).map_or(0, |entry| *entry.value());
 
         // Rebuild only the hours that changed, when we can prove which those
@@ -8750,7 +8797,7 @@ impl Database {
                 // window built fine, so this bounds the loss rather than
                 // changing which dates are eligible; today is served by the raw
                 // realtime tail either way.
-                if index > 0 && self.rollup_source_changed(project_id, source, date, &source_key, source_fp, source_epoch).await? {
+                if index > 0 && self.rollup_source_changed(project_id, source, date, source_fp, source_epoch, build_bound).await? {
                     anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
                 }
                 let rows = self.query_delta_only(&crate::rollup::build_partition_sql_ranges(spec, source, &from, &target, project_id, date, ranges)?).await?;
@@ -8771,10 +8818,10 @@ impl Database {
                     info!(project_id, date, target, chunk = index + 1, chunks = plans.len(), rows = row_count, event = "rollup_chunk_committed");
                 }
             }
-            if self.rollup_source_changed(project_id, source, date, &source_key, source_fp, source_epoch).await? {
+            if self.rollup_source_changed(project_id, source, date, source_fp, source_epoch, build_bound).await? {
                 anyhow::bail!("source changed while rebuilding {source}/{project_id}/{date}");
             }
-            self.rollup_coverage.insert(coverage_key, RollupCoverage { source_fp, source_epoch, generation, rows: row_count });
+            self.rollup_coverage.insert(coverage_key, RollupCoverage { source_fp, source_epoch, generation, rows: row_count, covered_through: build_bound });
             let counter = if incremental {
                 &crate::metrics::maintenance_stats().rollup_rebuilds_incremental
             } else {
@@ -8815,7 +8862,24 @@ impl Database {
     /// rollup served across that would be a silently wrong dashboard number.
     /// The stamp only ever increases, so any append moves it; compaction rewrites
     /// the same rows and leaves it alone, which is the whole point.
+    /// Whole-partition fingerprints — every file folded in, whatever its
+    /// timestamps. This is the right question for a SEALED partition, and the
+    /// only one the sweep, the backfill's candidate scan and recovery ask.
     fn partition_fingerprints(table: &DeltaTable, tiebreak: Option<&str>) -> Result<HashMap<(String, String), u64>> {
+        Self::partition_fingerprints_bounded(table, tiebreak, &|_| i64::MAX)
+    }
+
+    /// `bound_for` gives, per date, an EXCLUSIVE upper bound on the row
+    /// timestamps a file may contain to be folded in. Files entirely at or above
+    /// it are ignored.
+    ///
+    /// This is what lets a day still being written hold stable coverage. Its
+    /// whole-day fingerprint moves on every flush, so coverage keyed on it is
+    /// invalid within minutes; bounded to the part the build actually read, new
+    /// files landing ABOVE the bound change nothing, while a rewrite or a late
+    /// file BELOW it still moves the fingerprint and correctly invalidates —
+    /// which is the only direction that can serve a wrong number.
+    fn partition_fingerprints_bounded(table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str) -> i64) -> Result<HashMap<(String, String), u64>> {
         use std::hash::{Hash, Hasher};
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
@@ -8859,6 +8923,11 @@ impl Database {
             let Some(date) = string_at(&dates, row) else { continue };
             // Custom-project tables carry no `project_id` partition; the sweep
             // groups those under "default", so match it exactly.
+            // A file whose rows all sit at or above this date's bound is not part
+            // of what was aggregated, so it must not perturb the fingerprint.
+            if max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))).is_some_and(|hi| hi >= bound_for(&date)) {
+                continue;
+            }
             let key = (string_at(&projects, row).unwrap_or_else(|| "default".to_string()), date);
             let entry = by_partition.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN));
             entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
@@ -8927,9 +8996,20 @@ impl Database {
                         continue;
                     }
                     let epoch = self.rollup_source_epochs.get(&(project_id.clone(), source.to_string(), date.clone())).map_or(0, |entry| *entry.value());
+                    let covered_through = date_start_micros(&date).map_or(i64::MIN, |start| start + DAY_MICROS);
                     self.rollup_coverage.insert(
                         (project_id, source.to_string(), target.clone(), date),
-                        RollupCoverage { source_fp, source_epoch: epoch, generation, rows: rows as u64 },
+                        RollupCoverage {
+                            source_fp,
+                            source_epoch: epoch,
+                            generation,
+                            rows: rows as u64,
+                            // Only a WHOLE-partition build is re-adoptable: the
+                            // generation is re-proved against the whole-day
+                            // fingerprint, which a short-bounded build does not
+                            // carry. A partial day is simply rebuilt.
+                            covered_through,
+                        },
                     );
                     recovered += 1;
                 }
@@ -9007,9 +9087,19 @@ impl Database {
         };
 
         let today = Utc::now().date_naive();
-        // Skip TODAY only. Today's fingerprint moves on every flush, so a build
-        // of it loses the race essentially always and is served by the raw
-        // realtime tail anyway.
+        // TODAY is claimed too, now that a build records the bound it read to
+        // (`RollupCoverage::covered_through`) and is fingerprinted only below
+        // that bound. A flush lands files ABOVE the bound, which no longer moves
+        // the fingerprint, so today's coverage survives the flush that used to
+        // invalidate it within minutes.
+        //
+        // This is the whole point: sealed history already answers a 7-day window
+        // in ~0.3s, but a ROLLING window pays a raw scan for today at roughly a
+        // second per elapsed hour, so by evening it dominates. Covering today up
+        // to the buffer boundary leaves only the last few minutes raw.
+        //
+        // `interiors` clips every covered range at the buffered horizon anyway,
+        // so a partial day needs no special handling on the read side.
         //
         // The dedup lookback used to be skipped too, as "the sweep's job". But
         // the sweep builds a rollup only at its CERTIFICATION point, and
@@ -9024,7 +9114,7 @@ impl Database {
         //
         // Yesterday is sealed for writes, so its fingerprint is stable; and a
         // build that does lose the race now aborts at its first chunk.
-        let sealed_from = 1i64;
+        let sealed_from = 0i64;
         let mut candidates: Vec<(String, chrono::NaiveDate)> = (sealed_from..=sealed_from + horizon as i64)
             .map(|back| today - chrono::Duration::days(back))
             .flat_map(|date| {
@@ -9544,7 +9634,7 @@ impl Database {
                         // Coverage is keyed on DATA identity, not on this file
                         // fingerprint — asking with the wrong one would report
                         // every partition stale and rebuild it on every tick.
-                        && !self.rollup_coverage_current(pid, table_name, &date.to_string(), self.rollup_source_fingerprint(pid, table_name, &date.to_string()).await.unwrap_or_default())
+                        && !self.rollup_coverage_current(pid, table_name, &date.to_string(), self.rollup_source_fingerprint(pid, table_name, &date.to_string(), i64::MAX).await.unwrap_or_default())
                         && let Err(error) = self.rebuild_rollup_partition(table_name, pid, &date.to_string(), current_fp).await
                 {
                     self.record_rollup_failure(pid, table_name, &date.to_string());
