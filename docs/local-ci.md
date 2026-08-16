@@ -92,6 +92,28 @@ certificates — it surfaced as `variant_column` and `variant_functions` failing
 neither of which touches TLS. Linux CI is unaffected (native roots work there and
 the bundle lives at a different path), so this only ever fires locally.
 
+## One test is sensitive to a busy machine
+
+`database::tests::test_batch_queue_under_load` has a 30-second internal deadline.
+Run on its own it finishes in ~10s; run as part of the full local suite (918
+tests at `num-cpus` threads) it can exceed 30s and fail, twice in a row, with
+
+```
+Error: Test timed out after 30 seconds
+```
+
+That is contention, not a regression — confirm with
+
+```bash
+cargo nextest run -E 'test(test_batch_queue_under_load)'
+```
+
+CI does not hit it today only because it splits the suite across two runners, so
+each box carries half the load. That makes it latent there too: a slower runner
+or a heavier suite would trip it. The durable fix is a deadline that scales with
+available parallelism rather than a fixed 30s, but that is a change to the test
+and is left to whoever owns it.
+
 ## Knobs
 
 | Variable | Effect |
