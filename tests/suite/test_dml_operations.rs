@@ -679,9 +679,10 @@ mod tests {
         Ok(())
     }
 
-    /// A source larger than the join-key IN-list pushdown cap (4096 rows) must
-    /// skip the pushdown and still update exactly the matching rows — the cap
-    /// branch degrades to the plain join, never to wrong results.
+    /// A source larger than one join-key IN-list bound (4096 rows) is split
+    /// into bounded scans and still updates exactly the matching rows. This is
+    /// the production whale-enrichment shape: falling back to one plain join
+    /// made a tiny update decode and globally deduplicate its whole time range.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_source_beyond_key_pushdown_cap() -> Result<()> {
@@ -711,7 +712,7 @@ mod tests {
         );
         let r = ctx.sql(&sql).await?.collect().await?;
         let n = r[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(n, 2, "over-cap source must still match exactly Bob and Alice via the plain join");
+        assert_eq!(n, 2, "over-bound source chunks must still match exactly Bob and Alice");
         Ok(())
     }
 

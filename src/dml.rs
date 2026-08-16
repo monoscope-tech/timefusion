@@ -39,6 +39,10 @@ use crate::{
 /// Beyond this we error rather than blowing memory; the caller must page or pre-aggregate.
 const MAX_UPDATE_SOURCE_ROWS: usize = 1_000_000;
 const SLOW_DML_PHASE_US: u64 = 1_000_000;
+/// Maximum source rows in one merge-on-read scan. Each chunk becomes bounded
+/// IN-lists on the complete join key, so a large enrichment UPDATE never falls
+/// back to decoding and deduplicating its whole target time window.
+const MOR_KEY_PUSHDOWN_ROWS: usize = 4_096;
 
 /// Emit the shared `dml.slow_phase` line when `started` has exceeded the threshold.
 fn log_slow_phase(phase: &'static str, table_name: &str, project_id: &str, started: Instant, rows: Option<u64>) {
@@ -962,8 +966,7 @@ async fn perform_version_append(
         // window, all columns" to the matched pages. Sound: join-key target
         // columns are identity columns, never version-mutable. Skipped above
         // a cap so a giant source can't build a pathological expression.
-        const KEY_PUSHDOWN_CAP: usize = 4096;
-        if src.batch.num_rows() <= KEY_PUSHDOWN_CAP {
+        if src.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS {
             for (t, s) in &src.join_keys {
                 let idx = src.schema.index_of(s)?;
                 let arr = src.batch.column(idx);
@@ -1069,9 +1072,16 @@ async fn perform_update_with_buffer(
         };
         let mut total = 0u64;
         for round in rounds {
-            total += perform_version_append(database, buffered_layer, table_name, project_id, predicate.clone(), &assignments, round.as_ref(), false, &session)
-                .instrument(append_span.clone())
-                .await?;
+            // `split_source_rounds` preserves successive applications for
+            // duplicate keys. Keys are disjoint within each round, so bounded
+            // sequential chunks preserve semantics and keep pushdown enabled.
+            let chunks = round.map_or_else(|| vec![None], |source| bounded_mor_source_chunks(source).into_iter().map(Some).collect());
+            for chunk in chunks {
+                total +=
+                    perform_version_append(database, buffered_layer, table_name, project_id, predicate.clone(), &assignments, chunk.as_ref(), false, &session)
+                        .instrument(append_span.clone())
+                        .await?;
+            }
         }
         return Ok(total);
     }
@@ -1119,6 +1129,28 @@ async fn perform_update_with_buffer(
             |delta_pred| perform_delta_update(database, table_name, project_id, delta_pred, assignments.clone(), session).instrument(update_span),
         )
         .await
+}
+
+fn bounded_mor_source_chunks(source: UpdateSource) -> Vec<UpdateSource> {
+    let rows = source.batch.num_rows();
+    if rows <= MOR_KEY_PUSHDOWN_ROWS {
+        return vec![source];
+    }
+    info!(
+        event = "dml.mor_source_chunked",
+        source_rows = rows,
+        chunk_rows = MOR_KEY_PUSHDOWN_ROWS,
+        chunks = rows.div_ceil(MOR_KEY_PUSHDOWN_ROWS),
+        "bounded merge-on-read source to preserve complete-key pushdown"
+    );
+    (0..rows)
+        .step_by(MOR_KEY_PUSHDOWN_ROWS)
+        .map(|offset| UpdateSource {
+            batch: source.batch.slice(offset, (rows - offset).min(MOR_KEY_PUSHDOWN_ROWS)),
+            schema: source.schema.clone(),
+            join_keys: source.join_keys.clone(),
+        })
+        .collect()
 }
 
 async fn perform_delete_with_buffer(
@@ -1521,6 +1553,10 @@ pub async fn perform_delta_merge_update(
 
 #[cfg(test)]
 mod session_tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::{array::StringArray, record_batch::RecordBatch};
+
     /// The DML session must decode the wide otel schema at the same batch size
     /// as every other session that reads it.
     ///
@@ -1542,6 +1578,20 @@ mod session_tests {
         assert!(base.config().options().execution.batch_size > want, "DataFusion's default is the wider batch this fix exists to override");
         let session = super::delta_session_from(&base);
         assert_eq!(session.config().options().execution.batch_size, want, "a DML rewrite must not decode at a wider batch than a query does");
+    }
+
+    #[test]
+    fn large_mor_sources_stay_inside_the_key_pushdown_bound() {
+        let rows = super::MOR_KEY_PUSHDOWN_ROWS * 2 + 17;
+        let batch = RecordBatch::try_from_iter(vec![("span_id", Arc::new(StringArray::from_iter_values((0..rows).map(|i| format!("span-{i}")))) as _)])
+            .expect("source batch");
+        let schema = batch.schema();
+        let chunks = super::bounded_mor_source_chunks(super::UpdateSource { batch, schema, join_keys: vec![("context___span_id".into(), "span_id".into())] });
+
+        assert_eq!(chunks.iter().map(|chunk| chunk.batch.num_rows()).sum::<usize>(), rows);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.batch.num_rows() <= super::MOR_KEY_PUSHDOWN_ROWS));
+        assert_eq!(chunks[2].batch.num_rows(), 17);
     }
 }
 
