@@ -239,8 +239,9 @@ pub struct Invalidation<'a> {
 impl TaskJournal {
     // v1 removed the original bootstrap expansion, but the then-current
     // reconciliation immediately recreated it before advancing its cursor.
-    // v2 runs once after commit-range reconciliation is installed.
-    const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v2";
+    // v2 removed it in memory but did not force an on-disk snapshot rewrite.
+    // v3 runs once with commit-range reconciliation and forced compaction.
+    const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v3";
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
@@ -670,12 +671,26 @@ impl TaskJournal {
             wal.sync_all()?;
         }
         if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
-            let bytes = serde_json::to_vec(&self.snapshot)?;
-            crate::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
-            let wal = OpenOptions::new().write(true).truncate(true).open(&self.wal_path)?;
-            wal.sync_all()?;
+            self.compact()?;
         }
         self.publish_statistics();
+        Ok(())
+    }
+
+    /// Rewrite the authoritative snapshot even when the WAL is below its
+    /// normal size threshold. Migrations that remove tasks cannot represent
+    /// those deletions as append-only WAL records, so they must force this
+    /// compaction before startup continues.
+    pub fn compact(&mut self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(&self.snapshot)?;
+        crate::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
+        let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
+        wal.sync_all()?;
+        self.dirty_tasks.clear();
+        self.dirty_cursors.clear();
         Ok(())
     }
 
@@ -953,6 +968,7 @@ mod tests {
         // Production already carries the v1 marker. It must not suppress the
         // corrective cleanup after commit-range reconciliation ships.
         journal.set_source_cursor("__maintenance_bootstrap_backlog_v1".to_owned(), 1);
+        journal.set_source_cursor("__maintenance_bootstrap_backlog_v2".to_owned(), 1);
         journal.upsert(task("pending-a", 0, 1, Operation::Dedup));
         journal.upsert(task("pending-b", 1, 2, Operation::BaseRollup));
         let mut complete = task("published", 2, 3, Operation::BaseRollup);
@@ -962,6 +978,10 @@ mod tests {
         assert_eq!(journal.migrate_bootstrap_backlog_with_limit(2), Some(2));
         assert_eq!(journal.snapshot.tasks, vec![complete]);
         assert_eq!(journal.migrate_bootstrap_backlog_with_limit(0), None, "migration marker makes cleanup one-shot");
+        journal.compact().expect("migration snapshot");
+        let reloaded = TaskJournal::load(dir.path()).expect("reloaded journal");
+        assert_eq!(reloaded.snapshot.tasks.len(), 1, "removed bootstrap tasks must not resurrect after restart");
+        assert_eq!(reloaded.snapshot.tasks[0].key.project_id, "published");
     }
 
     #[test]

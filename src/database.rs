@@ -3583,7 +3583,9 @@ impl Database {
                             let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             let discarded = journal.migrate_bootstrap_backlog();
                             let migrated = journal.migrate_derived_slices();
-                            if discarded.is_some() || migrated != 0 {
+                            if discarded.is_some_and(|count| count != 0) {
+                                journal.compact()?;
+                            } else if discarded.is_some() || migrated != 0 {
                                 journal.checkpoint()?;
                             }
                             Ok((discarded.unwrap_or_default(), migrated))
