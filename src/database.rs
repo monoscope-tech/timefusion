@@ -3036,13 +3036,29 @@ impl Database {
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         // This is a single-node foreground database, not a detached worker
-        // fleet. Admit one rewrite at a time: DataFusion can still parallelize
-        // inside that bounded unit, but dedup, rollup, and compaction must not
-        // each start their own object-store stream and saturate PGWire/ingest.
-        // Production 2026-08-16 proved that exposing all 48 CPUs here released
-        // four 230 MiB source scans together immediately after preload.
-        let maintenance_admission =
-            crate::maintenance_coordinator::AdmissionController::new(1, u64::try_from(cfg.derived.memory_limit_bytes).unwrap_or(u64::MAX), 1, 1);
+        // fleet, so admission stays narrow: DataFusion still parallelizes inside
+        // each bounded unit, and the point is that dedup, rollup, and compaction
+        // cannot each start their own object-store stream and saturate
+        // PGWire/ingest. Production 2026-08-16 proved that exposing all 48 CPUs
+        // here released four 230 MiB source scans together right after preload.
+        //
+        // Narrow is not the same as serial, which is what this was until the
+        // evening of 2026-08-16: hard-coded `(1, mem, 1, 1)`. One unit at a time
+        // held `decoded_bytes_used` at a single 512 MiB reservation against a
+        // ~64 GiB budget while the queue reached 20.3 TB / 18,397 tasks and
+        // dedup committed nothing — which is also why nothing was ever
+        // certified, and therefore why rollups served zero queries. Size it from
+        // the box now; each unit is capped at `MAX_DECODED_BYTES`, so the memory
+        // term is exact. Object I/O is latency-bound rather than memory-bound,
+        // so it gets more slots than CPU.
+        let coordinator_jobs = cfg.derived.coordinator_jobs();
+        let coordinator_io_slots = u32::try_from(coordinator_jobs.saturating_mul(2)).unwrap_or(u32::MAX);
+        let maintenance_admission = crate::maintenance_coordinator::AdmissionController::new(
+            u32::try_from(coordinator_jobs).unwrap_or(1),
+            u64::try_from(cfg.derived.memory_limit_bytes).unwrap_or(u64::MAX),
+            coordinator_io_slots,
+            coordinator_io_slots,
+        );
         let logical_count_cache = Arc::new(crate::logical_count_index::LogicalCountCache::new(
             cfg.core.timefusion_data_dir.join("logical_count"),
             cfg.derived.logical_count_memory_bytes(),
@@ -3645,11 +3661,12 @@ impl Database {
         // five consecutive 1.5s deadlines while maintenance was being polled.
         // Resource tokens bound memory and I/O; this runtime boundary reserves
         // executor progress for ingest, queries, and liveness.
-        // Two runtime threads keep timers, cancellation, and object-store I/O
-        // progressing while the single admitted job is polled. Job concurrency
-        // is deliberately one; see the admission controller initialization.
-        let coordinator_runtime_workers = (self.config.derived.cores / 8).clamp(2, 4);
-        const COORDINATOR_JOB_WORKERS: usize = 1;
+        // Runtime threads keep timers, cancellation, and object-store I/O
+        // progressing while admitted jobs are polled, so there must be headroom
+        // beyond the jobs themselves — sizing the pool to exactly the job count
+        // lets a blocking decode stall the timers that cancel it.
+        let coordinator_job_workers = self.config.derived.coordinator_jobs();
+        let coordinator_runtime_workers = (self.config.derived.cores / 8).clamp(2, 4).max(coordinator_job_workers + 2);
         db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
         {
             let db = Arc::clone(&db);
@@ -3702,7 +3719,7 @@ impl Database {
                                     requeued_dirty_partitions,
                                     migrated_tasks,
                                     runtime_workers = coordinator_runtime_workers,
-                                    job_workers = COORDINATOR_JOB_WORKERS,
+                                    job_workers = coordinator_job_workers,
                                     event = "maintenance_runtime_started"
                                 );
                             }
@@ -3716,7 +3733,7 @@ impl Database {
                             }
                         }
 
-                        for worker in 0..COORDINATOR_JOB_WORKERS {
+                        for worker in 0..coordinator_job_workers {
                             let db = Arc::clone(&db);
                             let cancel = cancel.clone();
                             tokio::spawn(async move {
@@ -19385,19 +19402,30 @@ mod tests {
         assert_eq!(Database::maintenance_partition_from_action("part-000.parquet", None), None);
     }
 
-    /// A single node must not launch independent dedup/rollup/compaction object
-    /// streams together. One admitted unit may use bounded internal DataFusion
-    /// parallelism; the next unit waits in the durable journal.
+    /// Maintenance admission is bounded by the configured job count, and every
+    /// token is returned when a job finishes.
+    ///
+    /// This asserted "exactly one" until 2026-08-16. Serializing a single node
+    /// does stop dedup/rollup/compaction from each opening their own
+    /// object-store stream, but one 512 MiB unit at a time against a ~64 GiB
+    /// decode budget left the queue 20.3 TB and 18,397 tasks deep with zero
+    /// dedup commits — so nothing was ever certified, `DedupExec` stayed in
+    /// every plan, rollups served zero queries, and 30d queries timed out. The
+    /// invariant worth pinning is that admission is *bounded and returned*, not
+    /// that it is serial.
     #[tokio::test]
-    async fn database_admits_only_one_maintenance_job_at_a_time() -> Result<()> {
+    async fn database_bounds_concurrent_maintenance_jobs() -> Result<()> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources};
 
-        let db = Database::with_config(create_test_config("single-maintenance-job")).await?;
+        let db = Database::with_config(create_test_config("bounded-maintenance-jobs")).await?;
+        let jobs = db.config.derived.coordinator_jobs();
         let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 };
-        let first = db.maintenance_admission.try_acquire(request).expect("first bounded job is admitted");
-        assert!(db.maintenance_admission.try_acquire(request).is_none(), "a second source rewrite must remain queued");
-        drop(first);
-        assert!(db.maintenance_admission.try_acquire(request).is_some(), "dropping the job returns every admission token");
+
+        let permits: Vec<_> =
+            (0..jobs).map(|i| db.maintenance_admission.try_acquire(request).unwrap_or_else(|| panic!("job {i} of {jobs} must be admitted"))).collect();
+        assert!(db.maintenance_admission.try_acquire(request).is_none(), "admission must stop at the configured job count, not run unbounded");
+        drop(permits);
+        assert!(db.maintenance_admission.try_acquire(request).is_some(), "dropping the jobs returns every admission token");
         Ok(())
     }
 

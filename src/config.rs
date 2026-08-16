@@ -458,6 +458,31 @@ impl DerivedBudget {
         mem_bound.min(cpu_bound).min(hot_project_count).max(1)
     }
 
+    /// Concurrently admitted maintenance coordinator units.
+    ///
+    /// Held at a hard-coded 1 through 2026-08-16, alongside admission tokens of
+    /// `(cpu 1, reads 1, writes 1)`. That serialization is what put the queue
+    /// 20.3 TB and 18,397 tasks deep with `decoded_bytes_used` pinned at one
+    /// 512 MiB unit against a ~64 GiB decode budget — 99% idle — and it is the
+    /// root cause of the dead rollups, not a separate problem: no dedup commits
+    /// means `record_certification` never fires, and an uncertified partition
+    /// both keeps `DedupExec` in every plan and denies rollup routing its
+    /// contiguous certified prefix.
+    ///
+    /// What made the cap necessary was maintenance sharing Tokio workers with
+    /// pgwire and starving health checks. That is fixed properly by the
+    /// dedicated maintenance runtime, so bound this by the box instead: each
+    /// unit reserves at most `MAX_DECODED_BYTES` (512 MiB), so the memory term
+    /// is exact. `TIMEFUSION_COORDINATOR_JOB_WORKERS=1` restores the old
+    /// serialized behavior exactly.
+    pub fn coordinator_jobs(&self) -> usize {
+        std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or_else(|| {
+            let mem_bound = self.maintenance_pool_bytes / (512 * 1024 * 1024);
+            let cpu_bound = self.cores / 8;
+            mem_bound.min(cpu_bound).clamp(1, 6)
+        })
+    }
+
     /// Wall-clock budget for one maintenance tick: 80% of the cron period.
     /// Formerly `TIMEFUSION_LIGHT_OPTIMIZE_TICK_BUDGET_SECS`.
     /// K unbounded by project count (memory x CPU terms only) — sizes the
@@ -2610,6 +2635,30 @@ mod tests {
         // 4 x 2 GiB lands exactly on the original 8 GiB envelope).
         assert_eq!(b.rewrite_permits(), 4);
         assert_eq!(b.optimize_merge_tasks(), 2);
+    }
+
+    /// Maintenance must not be serialized on a box with room to spare.
+    ///
+    /// Through 2026-08-16 this was a hard-coded 1, and one 512 MiB unit at a
+    /// time against a ~64 GiB decode budget is what let the queue reach 20.3 TB
+    /// and 18,397 tasks with zero dedup commits — and therefore zero
+    /// certifications, `DedupExec` in every plan, and zero rollup hits. A
+    /// regression here is not a throughput nit; it silently turns 30d queries
+    /// back into timeouts, so assert the prod shape explicitly.
+    #[test]
+    fn coordinator_jobs_scale_with_the_box() {
+        // Only meaningful when the operator has not pinned the override.
+        if std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").is_ok() {
+            return;
+        }
+        // Prod: 80 GiB / 48 cores.
+        let prod = DerivedBudget::from_limits(80 * GIB, 48);
+        assert!(prod.coordinator_jobs() > 1, "prod-shaped box must run maintenance in parallel, got {}", prod.coordinator_jobs());
+        // Every admitted unit reserves at most MAX_DECODED_BYTES, so the
+        // concurrent decode reservation must still fit the maintenance pool.
+        assert!(prod.coordinator_jobs() * 512 * 1024 * 1024 <= prod.maintenance_pool_bytes(), "concurrent 512 MiB units must fit the maintenance pool");
+        // Small boxes degrade to serial rather than thrashing.
+        assert_eq!(DerivedBudget::from_limits(16 * GIB, 4).coordinator_jobs(), 1);
     }
 
     // Small box (16 GiB / 4 cores): degrades to K=1, nothing underflows/zeroes.
