@@ -237,7 +237,10 @@ pub struct Invalidation<'a> {
 }
 
 impl TaskJournal {
-    const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v1";
+    // v1 removed the original bootstrap expansion, but the then-current
+    // reconciliation immediately recreated it before advancing its cursor.
+    // v2 runs once after commit-range reconciliation is installed.
+    const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v2";
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
@@ -947,6 +950,9 @@ mod tests {
     fn bootstrap_backlog_migration_keeps_publications_and_runs_once() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Production already carries the v1 marker. It must not suppress the
+        // corrective cleanup after commit-range reconciliation ships.
+        journal.set_source_cursor("__maintenance_bootstrap_backlog_v1".to_owned(), 1);
         journal.upsert(task("pending-a", 0, 1, Operation::Dedup));
         journal.upsert(task("pending-b", 1, 2, Operation::BaseRollup));
         let mut complete = task("published", 2, 3, Operation::BaseRollup);

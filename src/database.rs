@@ -3590,13 +3590,33 @@ impl Database {
                         })
                         .await
                         {
-                            Ok(Ok((discarded_bootstrap_tasks, migrated_tasks))) => info!(
-                                discarded_bootstrap_tasks,
-                                migrated_tasks,
-                                runtime_workers = coordinator_runtime_workers,
-                                job_workers = COORDINATOR_JOB_WORKERS,
-                                event = "maintenance_runtime_started"
-                            ),
+                            Ok(Ok((discarded_bootstrap_tasks, migrated_tasks))) => {
+                                // The cleanup removes only unpublished work.
+                                // Recreate the small, authoritative set of
+                                // invalidations persisted in rollup_journal so
+                                // they still converge instead of remaining on
+                                // the correctness-safe raw fallback forever.
+                                let mut requeued_dirty_partitions = 0usize;
+                                if discarded_bootstrap_tasks != 0 {
+                                    for entry in db.rollup_dirty.iter() {
+                                        let ((project, source, date), hours) = (entry.key(), *entry.value());
+                                        if hours != 0 {
+                                            match db.enqueue_maintenance_hours(project, source, date, hours) {
+                                                Ok(()) => requeued_dirty_partitions = requeued_dirty_partitions.saturating_add(1),
+                                                Err(error) => warn!(%error, project, source, date, event = "maintenance_dirty_partition_requeue_failed"),
+                                            }
+                                        }
+                                    }
+                                }
+                                info!(
+                                    discarded_bootstrap_tasks,
+                                    requeued_dirty_partitions,
+                                    migrated_tasks,
+                                    runtime_workers = coordinator_runtime_workers,
+                                    job_workers = COORDINATOR_JOB_WORKERS,
+                                    event = "maintenance_runtime_started"
+                                );
+                            }
                             Ok(Err(error)) => {
                                 warn!(%error, event = "maintenance_task_journal_migration_failed");
                                 return;
