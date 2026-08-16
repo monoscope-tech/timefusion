@@ -360,18 +360,27 @@ impl TaskJournal {
     }
 
     pub fn enqueue(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) {
-        self.dirty_tasks.insert(key.clone());
         if let Some(index) = self.task_indices.get(&key).copied() {
             let task = &mut self.snapshot.tasks[index];
             if task.state != TaskState::Running {
-                task.state = TaskState::Pending;
-                task.deadline_micros = task.deadline_micros.min(deadline_micros);
-                task.estimated_decoded_bytes = estimated_decoded_bytes;
-                task.retry_reason = None;
-                task.publication = None;
+                let new_deadline = task.deadline_micros.min(deadline_micros);
+                let changed = task.state != TaskState::Pending
+                    || task.deadline_micros != new_deadline
+                    || task.estimated_decoded_bytes != estimated_decoded_bytes
+                    || task.retry_reason.is_some()
+                    || task.publication.is_some();
+                if changed {
+                    task.state = TaskState::Pending;
+                    task.deadline_micros = new_deadline;
+                    task.estimated_decoded_bytes = estimated_decoded_bytes;
+                    task.retry_reason = None;
+                    task.publication = None;
+                    self.dirty_tasks.insert(key);
+                }
             }
             return;
         }
+        self.dirty_tasks.insert(key.clone());
         let index = self.snapshot.tasks.len();
         self.task_indices.insert(key.clone(), index);
         self.snapshot.tasks.push(MaintenanceTask {
@@ -982,6 +991,24 @@ mod tests {
         let reloaded = TaskJournal::load(dir.path()).expect("reloaded journal");
         assert_eq!(reloaded.snapshot.tasks.len(), 1, "removed bootstrap tasks must not resurrect after restart");
         assert_eq!(reloaded.snapshot.tasks[0].key.project_id, "published");
+    }
+
+    #[test]
+    fn repeated_pending_invalidation_does_not_rewrite_the_wal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = task("customer", 0, 1, Operation::BaseRollup).key;
+        journal.enqueue(key.clone(), 10, 512, 1);
+        journal.checkpoint().expect("first checkpoint");
+        let first_size = fs::metadata(&journal.wal_path).expect("wal").len();
+
+        journal.enqueue(key.clone(), 20, 512, 2);
+        journal.checkpoint().expect("idempotent checkpoint");
+        assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_size);
+
+        journal.enqueue(key, 5, 512, 3);
+        journal.checkpoint().expect("earlier deadline checkpoint");
+        assert!(fs::metadata(&journal.wal_path).expect("wal").len() > first_size);
     }
 
     #[test]
