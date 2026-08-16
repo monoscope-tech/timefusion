@@ -110,6 +110,47 @@ def load_rows(limit: int | None = None) -> list[dict]:
     return rows
 
 
+def synthetic_rows(count: int) -> list[dict]:
+    """Build deterministic wide rows when a production sample is unavailable.
+
+    Keep the same 88-column INSERT path as production.  The payload distribution
+    deliberately includes JSON and text fields used by dashboard filters, while
+    leaving nullable fields unset.  This makes the benchmark reproducible in CI
+    and on developer machines without granting either access to production.
+    """
+    now = datetime.now(timezone.utc)
+    rows: list[dict] = []
+    for i in range(count):
+        ts = now - timedelta(seconds=count - i)
+        row = dict.fromkeys(COLUMNS)
+        row.update({
+            "timestamp": ts.isoformat(),
+            "observed_timestamp": ts.isoformat(),
+            "start_time": ts.isoformat(),
+            "end_time": (ts + timedelta(milliseconds=i % 500)).isoformat(),
+            "id": f"synthetic-{i}",
+            "hashes": [f"hash-{i % 97}"],
+            "name": ("GET /checkout" if i % 7 == 0 else "GET /products"),
+            "kind": ("server" if i % 3 else "client"),
+            "status_code": ("ERROR" if i % 101 == 0 else "OK"),
+            "level": ("ERROR" if i % 101 == 0 else "INFO"),
+            "body": json.dumps({"message": f"synthetic event {i}", "iteration": i}),
+            "duration": i % 500_000_000,
+            "context": json.dumps({"trace_id": f"{i:032x}"}),
+            "context___trace_id": f"{i:032x}",
+            "context___span_id": f"{i:016x}",
+            "attributes": json.dumps({"http.route": "/products", "bench.bucket": i % 16}),
+            "resource": json.dumps({"service.name": f"service-{i % 12}"}),
+            "resource___service___name": f"service-{i % 12}",
+            "project_id": "synthetic-template",
+            "summary": ["synthetic", f"service-{i % 12}"],
+            "date": ts.date().isoformat(),
+            "message_size_bytes": 700 + i % 900,
+        })
+        rows.append(row)
+    return rows
+
+
 def shift_for_project(rows: list[dict], project_id: str, shift: timedelta) -> list[dict]:
     """Re-stamp rows for a synthetic project. Returns shallow copies (cheap)."""
     out: list[dict] = []
@@ -138,20 +179,24 @@ class Stats:
         self.query_errors: list[str] = []
 
 
-def writer(stop: threading.Event, pid: str, rows: list[dict], batch_size: int, stats: Stats, rows_per_sec: float):
+def writer(stop: threading.Event, project_rows: list[tuple[str, list[dict]]], batch_size: int, stats: Stats, rows_per_sec: float):
     placeholders = "(" + ", ".join(["%s"] * len(COLUMNS)) + ")"
     base_sql = f"INSERT INTO otel_logs_and_spans ({', '.join(COLUMNS)}) VALUES "
     per_batch_sleep = batch_size / rows_per_sec if rows_per_sec > 0 else 0.0
 
     with psycopg.connect(LOCAL_URL, autocommit=True) as conn, conn.cursor() as cur:
-        idx = 0
+        indexes = {pid: 0 for pid, _ in project_rows}
+        project_idx = 0
         next_send = time.perf_counter()
         while not stop.is_set():
+            pid, rows = project_rows[project_idx]
+            project_idx = (project_idx + 1) % len(project_rows)
+            idx = indexes[pid]
             batch = rows[idx:idx+batch_size]
             if not batch:
-                idx = 0
+                indexes[pid] = 0
                 continue
-            idx += batch_size
+            indexes[pid] = idx + batch_size
             flat: list[Any] = []
             for r in batch:
                 for c in COLUMNS:
@@ -218,34 +263,41 @@ def pct(xs: list[float], p: float) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--writers", type=int, default=5, help="concurrent writer threads / projects")
+    ap.add_argument("--projects", type=int, help="tenant count (default: same as --writers)")
     ap.add_argument("--readers", type=int, default=4, help="concurrent reader threads")
     ap.add_argument("--duration", type=int, default=60, help="seconds to run")
     ap.add_argument("--batch", type=int, default=30, help="rows per INSERT (prod-shape: ~30)")
     ap.add_argument("--row-limit", type=int, default=80000, help="max rows preloaded per project")
+    ap.add_argument("--synthetic", action="store_true",
+                    help="generate deterministic production-shaped rows; do not require bench/data/sample.jsonl.gz")
     ap.add_argument("--budget-ms", type=float, default=100.0, help="read latency budget for PASS")
     ap.add_argument("--writer-rate", type=float, default=0,
                     help="per-writer ingest rate cap in rows/sec (default 0 = unlimited)")
     args = ap.parse_args()
+    project_count = args.projects or args.writers
+    if project_count < args.writers:
+        sys.exit("--projects must be greater than or equal to --writers")
 
-    if not DUMP.exists():
+    if not args.synthetic and not DUMP.exists():
         sys.exit(f"missing dump at {DUMP} — run replay_prod_load.py download first")
 
-    print(f"loading dump (limit {args.row_limit} rows per writer)…", flush=True)
-    raw = load_rows(args.row_limit)
+    source = "synthetic rows" if args.synthetic else "dump"
+    print(f"loading {source} (limit {args.row_limit} rows per writer)…", flush=True)
+    raw = synthetic_rows(args.row_limit) if args.synthetic else load_rows(args.row_limit)
     if not raw: sys.exit("dump is empty")
 
     # Shift so the LATEST original row lands at now() for each project
     max_ts = max(datetime.fromisoformat(r["timestamp"]) for r in raw)
     base_shift = datetime.now(timezone.utc) - max_ts
 
-    pids = [f"bench-{i:02d}-{uuid.uuid4().hex[:8]}" for i in range(args.writers)]
+    pids = [f"bench-{i:04d}-{uuid.uuid4().hex[:8]}" for i in range(project_count)]
     per_project: dict[str, list[dict]] = {}
     for pid in pids:
         # Tiny per-project jitter on the shift so projects aren't synchronised
         jitter = timedelta(seconds=random.uniform(-30, 30))
         per_project[pid] = shift_for_project(raw, pid, base_shift + jitter)
 
-    print(f"projects={len(pids)} rows/project={len(raw)} duration={args.duration}s "
+    print(f"projects={len(pids)} writers={args.writers} rows/project={len(raw)} duration={args.duration}s "
           f"readers={args.readers} batch={args.batch}", flush=True)
 
     stats = Stats()
@@ -254,8 +306,11 @@ def main():
     t0 = time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=args.writers + args.readers) as ex:
-        for pid in pids:
-            ex.submit(writer, stop, pid, per_project[pid], args.batch, stats, args.writer_rate)
+        assignments = [[] for _ in range(args.writers)]
+        for i, pid in enumerate(pids):
+            assignments[i % args.writers].append((pid, per_project[pid]))
+        for assignment in assignments:
+            ex.submit(writer, stop, assignment, args.batch, stats, args.writer_rate)
         for _ in range(args.readers):
             ex.submit(reader, stop, pids, stats)
         # Snapshot stats every 15s so it's visible mid-run
@@ -325,6 +380,17 @@ def main():
     if post.get('mem_buffer.total_rows', 0) > 0:
         bpr = post.get('mem_buffer.estimated_bytes_approx', 0) / post['mem_buffer.total_rows']
         print(f"  bytes/row (end)           {bpr:>10.0f}   target <2048")
+
+    print("\n# maintenance safety")
+    safety = [
+        ("decoded reservation", post.get("maintenance.decoded_bytes_used", 0), 512 * 1024 * 1024, "<= 512 MiB"),
+        ("singleton failures delta", diff("maintenance.rollup_singleton_failures_total"), 0, "= 0"),
+        ("memory charged", post.get("memory.charged_pct", 0), 75, "<= 75%"),
+    ]
+    for name, value, ceiling, target in safety:
+        ok = value <= ceiling
+        overall_pass &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name:26s} {value:,.0f}  target {target}")
 
     print(f"\n# overall: {'PASS' if overall_pass else 'FAIL'}")
     sys.exit(0 if overall_pass else 1)
