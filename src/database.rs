@@ -3579,17 +3579,19 @@ impl Database {
                 .spawn(move || {
                     runtime.block_on(async move {
                         let journal = Arc::clone(&db.maintenance_tasks);
-                        match tokio::task::spawn_blocking(move || -> Result<usize> {
+                        match tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
                             let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let discarded = journal.migrate_bootstrap_backlog();
                             let migrated = journal.migrate_derived_slices();
-                            if migrated != 0 {
+                            if discarded.is_some() || migrated != 0 {
                                 journal.checkpoint()?;
                             }
-                            Ok(migrated)
+                            Ok((discarded.unwrap_or_default(), migrated))
                         })
                         .await
                         {
-                            Ok(Ok(migrated_tasks)) => info!(
+                            Ok(Ok((discarded_bootstrap_tasks, migrated_tasks))) => info!(
+                                discarded_bootstrap_tasks,
                                 migrated_tasks,
                                 runtime_workers = coordinator_runtime_workers,
                                 job_workers = COORDINATOR_JOB_WORKERS,

@@ -237,6 +237,9 @@ pub struct Invalidation<'a> {
 }
 
 impl TaskJournal {
+    const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v1";
+    const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
+
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::wal::meta_path(data_dir, "maintenance_tasks.json");
         let wal_path = crate::wal::meta_path(data_dir, "maintenance_tasks.wal");
@@ -309,6 +312,36 @@ impl TaskJournal {
             self.enqueue(key, deadline, estimate, created);
         }
         migrated
+    }
+
+    /// Remove the one-time global backlog produced by the original cursor
+    /// bootstrap. That implementation expanded every retained partition into
+    /// dedup, rollup, and packing work and produced 730k journal entries in
+    /// production. Keeping completed publications preserves recoverable
+    /// coverage; dropping unfinished entries is correctness-safe because they
+    /// remain uncovered and reads use raw data until normal planners or new
+    /// invalidations enqueue bounded work.
+    pub fn migrate_bootstrap_backlog(&mut self) -> Option<usize> {
+        self.migrate_bootstrap_backlog_with_limit(Self::BOOTSTRAP_BACKLOG_LIMIT)
+    }
+
+    fn migrate_bootstrap_backlog_with_limit(&mut self, limit: usize) -> Option<usize> {
+        if self.snapshot.source_cursors.get(Self::BOOTSTRAP_BACKLOG_MIGRATION).copied().unwrap_or_default() >= 1 {
+            return None;
+        }
+        let mut removed = 0;
+        if self.snapshot.tasks.len() > limit {
+            self.snapshot.tasks.retain(|task| {
+                let keep = task.state == TaskState::Complete;
+                removed += usize::from(!keep);
+                keep
+            });
+            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
+            self.dirty_tasks.clear();
+        }
+        self.snapshot.source_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned(), 1);
+        self.dirty_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned());
+        Some(removed)
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
@@ -908,6 +941,21 @@ mod tests {
         }
         assert_eq!(journal.claim_next(Operation::Dedup, 0).expect("first").key.project_id, "a");
         assert_eq!(journal.claim_next(Operation::Dedup, 0).expect("second").key.project_id, "b");
+    }
+
+    #[test]
+    fn bootstrap_backlog_migration_keeps_publications_and_runs_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        journal.upsert(task("pending-a", 0, 1, Operation::Dedup));
+        journal.upsert(task("pending-b", 1, 2, Operation::BaseRollup));
+        let mut complete = task("published", 2, 3, Operation::BaseRollup);
+        complete.state = TaskState::Complete;
+        journal.upsert(complete.clone());
+
+        assert_eq!(journal.migrate_bootstrap_backlog_with_limit(2), Some(2));
+        assert_eq!(journal.snapshot.tasks, vec![complete]);
+        assert_eq!(journal.migrate_bootstrap_backlog_with_limit(0), None, "migration marker makes cleanup one-shot");
     }
 
     #[test]
