@@ -3538,14 +3538,42 @@ impl Database {
         db.load_verified_sorted();
 
         // Snapshot discovery can take minutes for production-sized catalogs.
-        // Keep it off the readiness path: coverage is conservative until this
-        // completes, so queries fall back to raw rather than seeing stale
-        // aggregates. Workers start only after cursor reconciliation has
-        // durably queued every discovered partition.
+        // Keep it off both the readiness AND worker paths: the journal loaded
+        // above is already durable work and must start draining while discovery
+        // appends more tasks. Coverage remains conservative until publication,
+        // so queries fall back to raw rather than seeing stale aggregates.
         let coordinator_workers = (self.config.derived.cores / 4).clamp(1, 8);
-        {
+        db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
+        for worker in 0..coordinator_workers {
             let db = Arc::clone(&db);
             let cancel = cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    match db.run_maintenance_coordinator_once().await {
+                        Ok(true) => tokio::task::yield_now().await,
+                        Ok(false) => {
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                        }
+                        Err(error) => {
+                            warn!(worker, %error, event = "maintenance_coordinator_error");
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        {
+            let db = Arc::clone(&db);
             tokio::spawn(async move {
                 match db.reconcile_maintenance_task_cursors().await {
                     Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
@@ -3560,37 +3588,6 @@ impl Database {
                         info!(planned_compaction_tasks, event = "maintenance_compaction_debt_planned");
                     }
                     Err(error) => warn!(%error, event = "maintenance_compaction_debt_plan_failed"),
-                }
-
-                // Durable coordinator workers claim journaled work instead of
-                // waiting on a shared semaphore. Admission rejects a unit
-                // unless all resource tokens are available at once.
-                for worker in 0..coordinator_workers {
-                    let db = Arc::clone(&db);
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            if cancel.is_cancelled() {
-                                return;
-                            }
-                            match db.run_maintenance_coordinator_once().await {
-                                Ok(true) => tokio::task::yield_now().await,
-                                Ok(false) => {
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => return,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                                    }
-                                }
-                                Err(error) => {
-                                    warn!(worker, %error, event = "maintenance_coordinator_error");
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => return,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                                    }
-                                }
-                            }
-                        }
-                    });
                 }
             });
         }
