@@ -2310,6 +2310,14 @@ pub struct Database {
     /// disjoint entry points today, but a second call must not double the
     /// boot-time S3 warm burst.
     preload_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-table single-flight gates for cold Delta loads. Startup preload and
+    /// maintenance reconciliation intentionally run concurrently; without a
+    /// keyed gate they both replay the same large Delta log and warm the same
+    /// file set before either can populate `unified_tables`.
+    table_load_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Handle for CPU/I/O-heavy startup and coordinator work. Foreground
+    /// PGWire tasks never execute on this runtime.
+    maintenance_executor: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
     config_pool: Option<PgPool>,
     storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
     /// Monotonic deadline (nanos since process start) for when the next
@@ -2977,6 +2985,8 @@ impl Database {
             maintenance_shutdown: Arc::new(maintenance_shutdown),
             _maintenance_cancel_guard: Some(maintenance_cancel_guard),
             preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            table_load_locks: Arc::new(dashmap::DashMap::new()),
+            maintenance_executor: Arc::new(std::sync::OnceLock::new()),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
             storage_configs_next_refresh_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3539,101 +3549,107 @@ impl Database {
         // re-clearing them. See `load_verified_sorted`.
         db.load_verified_sorted();
 
-        // Snapshot discovery can take minutes for production-sized catalogs.
-        // Keep it off both the readiness AND worker paths: the journal loaded
-        // above is already durable work and must start draining while discovery
-        // appends more tasks. Coverage remains conservative until publication,
-        // so queries fall back to raw rather than seeing stale aggregates.
-        let coordinator_workers = (self.config.derived.cores / 4).clamp(1, 8);
+        // Coordinator planning and DataFusion execution must not share Tokio
+        // workers with PGWire. In production the old arrangement accepted the
+        // health-check TCP connection but starved its authentication future for
+        // five consecutive 1.5s deadlines while maintenance was being polled.
+        // Resource tokens bound memory and I/O; this runtime boundary reserves
+        // executor progress for ingest, queries, and liveness.
+        let coordinator_workers = (self.config.derived.cores / 8).clamp(1, 4);
         db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
         {
             let db = Arc::clone(&db);
             let cancel = cancel.clone();
-            tokio::spawn(async move {
-                let journal = Arc::clone(&db.maintenance_tasks);
-                let migration = tokio::task::spawn_blocking(move || -> Result<usize> {
-                    let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let migrated = journal.migrate_derived_slices();
-                    if migrated != 0 {
-                        journal.checkpoint()?;
-                    }
-                    Ok(migrated)
-                })
-                .await;
-                match migration {
-                    Ok(Ok(migrated_tasks)) => info!(migrated_tasks, event = "maintenance_task_journal_migrated"),
-                    Ok(Err(error)) => {
-                        warn!(%error, event = "maintenance_task_journal_migration_failed");
-                        return;
-                    }
-                    Err(error) => {
-                        warn!(%error, event = "maintenance_task_journal_migration_panicked");
-                        return;
-                    }
-                }
-                for worker in 0..coordinator_workers {
-                    let db = Arc::clone(&db);
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            if cancel.is_cancelled() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(coordinator_workers)
+                .thread_name("maintenance-worker")
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow::anyhow!("failed to build maintenance runtime: {error}"))?;
+            db.maintenance_executor.set(runtime.handle().clone()).map_err(|_| anyhow::anyhow!("maintenance runtime already started"))?;
+            std::thread::Builder::new()
+                .name("maintenance-runtime".to_owned())
+                .spawn(move || {
+                    runtime.block_on(async move {
+                        let journal = Arc::clone(&db.maintenance_tasks);
+                        match tokio::task::spawn_blocking(move || -> Result<usize> {
+                            let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let migrated = journal.migrate_derived_slices();
+                            if migrated != 0 {
+                                journal.checkpoint()?;
+                            }
+                            Ok(migrated)
+                        })
+                        .await
+                        {
+                            Ok(Ok(migrated_tasks)) => info!(migrated_tasks, workers = coordinator_workers, event = "maintenance_runtime_started"),
+                            Ok(Err(error)) => {
+                                warn!(%error, event = "maintenance_task_journal_migration_failed");
                                 return;
                             }
-                            match db.run_maintenance_coordinator_once().await {
-                                Ok(true) => tokio::task::yield_now().await,
-                                Ok(false) => {
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => return,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                                    }
-                                }
-                                Err(error) => {
-                                    warn!(worker, %error, event = "maintenance_coordinator_error");
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => return,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                                    }
-                                }
+                            Err(error) => {
+                                warn!(%error, event = "maintenance_task_journal_migration_panicked");
+                                return;
                             }
                         }
+
+                        for worker in 0..coordinator_workers {
+                            let db = Arc::clone(&db);
+                            let cancel = cancel.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    if cancel.is_cancelled() {
+                                        return;
+                                    }
+                                    match db.run_maintenance_coordinator_once().await {
+                                        Ok(true) => tokio::task::yield_now().await,
+                                        Ok(false) => tokio::select! {
+                                            _ = cancel.cancelled() => return,
+                                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                        },
+                                        Err(error) => {
+                                            warn!(worker, %error, event = "maintenance_coordinator_error");
+                                            tokio::select! {
+                                                _ = cancel.cancelled() => return,
+                                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        let reconcile_db = Arc::clone(&db);
+                        tokio::spawn(async move {
+                            match reconcile_db.reconcile_maintenance_task_cursors().await {
+                                Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
+                                Err(error) => {
+                                    warn!(%error, event = "maintenance_task_reconcile_failed");
+                                    return;
+                                }
+                            }
+                            match reconcile_db.plan_compaction_debt().await {
+                                Ok(planned_compaction_tasks) => {
+                                    reconcile_db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
+                                    info!(planned_compaction_tasks, event = "maintenance_compaction_debt_planned");
+                                }
+                                Err(error) => warn!(%error, event = "maintenance_compaction_debt_plan_failed"),
+                            }
+                        });
+
+                        let coverage_db = Arc::clone(&db);
+                        tokio::spawn(async move {
+                            for source in crate::schema_loader::registry().list_tables() {
+                                if let Err(error) = coverage_db.recover_rollup_coverage(&source).await {
+                                    warn!(source, %error, "rollup coverage recovery failed; those partitions stay on raw scans");
+                                }
+                            }
+                        });
+
+                        cancel.cancelled().await;
                     });
-                }
-            });
-        }
-
-        {
-            let db = Arc::clone(&db);
-            tokio::spawn(async move {
-                match db.reconcile_maintenance_task_cursors().await {
-                    Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
-                    Err(error) => {
-                        warn!(%error, event = "maintenance_task_reconcile_failed");
-                        return;
-                    }
-                }
-                match db.plan_compaction_debt().await {
-                    Ok(planned_compaction_tasks) => {
-                        db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
-                        info!(planned_compaction_tasks, event = "maintenance_compaction_debt_planned");
-                    }
-                    Err(error) => warn!(%error, event = "maintenance_compaction_debt_plan_failed"),
-                }
-            });
-        }
-
-        // Re-adopt rollup coverage from the rollup tables themselves. Spawned,
-        // not awaited: it reads object storage, and a slow probe must not delay
-        // every other scheduler behind it. Until it lands, reads simply miss and
-        // fall back to raw scans — the same thing they did before rollups.
-        {
-            let db = db.clone();
-            tokio::spawn(async move {
-                for source in crate::schema_loader::registry().list_tables() {
-                    if let Err(error) = db.recover_rollup_coverage(&source).await {
-                        warn!(source, %error, "rollup coverage recovery failed; those partitions stay on raw scans");
-                    }
-                }
-            });
+                })
+                .map_err(|error| anyhow::anyhow!("failed to start maintenance runtime: {error}"))?;
         }
 
         // Always-on pressure sampling. `scan_pressure_permits` samples lazily
@@ -4685,6 +4701,20 @@ impl Database {
             }
         }
 
+        // Reconciliation and preload start together. Serialize only callers
+        // loading THIS table, then recheck the cache. The old double-check
+        // prevented duplicate insertion but still allowed duplicate multi-GB
+        // Delta-log replay and cache warming during startup.
+        let load_key = format!("unified:{table_name}");
+        let load_gate = self.table_load_locks.entry(load_key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+        let _load_guard = load_gate.lock().await;
+        {
+            let tables = self.unified_tables.read().await;
+            if let Some(table) = tables.get(table_name) {
+                return Ok(Arc::clone(table));
+            }
+        }
+
         let Some(ref bucket) = self.default_s3_bucket else {
             return Err(anyhow::anyhow!("No default S3 bucket configured for unified table '{}'", table_name));
         };
@@ -4726,6 +4756,16 @@ impl Database {
     )]
     pub async fn get_or_create_custom_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
         // Check cache first
+        {
+            let tables = self.custom_project_tables.read().await;
+            if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
+                return Ok(Arc::clone(table));
+            }
+        }
+
+        let load_key = format!("custom:{project_id}:{table_name}");
+        let load_gate = self.table_load_locks.entry(load_key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+        let _load_guard = load_gate.lock().await;
         {
             let tables = self.custom_project_tables.read().await;
             if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
@@ -5178,7 +5218,7 @@ impl Database {
         let db = Arc::clone(self);
         let shutdown = self.maintenance_shutdown.clone();
         let concurrency = self.config.maintenance.timefusion_warm_concurrency.max(1);
-        tokio::spawn(async move {
+        let preload = async move {
             let preload_all = futures::stream::iter(crate::schema_loader::registry().list_tables()).for_each_concurrent(concurrency, |table_name| {
                 let db = Arc::clone(&db);
                 async move {
@@ -5211,7 +5251,14 @@ impl Database {
                 _ = shutdown.cancelled() => {}
                 _ = preload_all => {}
             }
-        });
+        };
+        if let Some(executor) = self.maintenance_executor.get() {
+            executor.spawn(preload);
+        } else {
+            // Test/CLI callers can preload without starting schedulers. The
+            // production server always has the isolated executor by this point.
+            tokio::spawn(preload);
+        }
     }
 
     /// Atomically swap a freshly-optimized `new_table` in under the write lock,
@@ -8866,6 +8913,14 @@ impl Database {
                 }
             }
             for ((project_id, date), files) in partitions {
+                // Future event timestamps are neither hot nor sealed. Treating
+                // them as sealed debt lets maintenance rewrite a partition as
+                // soon as it appears, racing foreground repair/DML and wasting
+                // resources on malformed clocks. They become eligible normally
+                // when their UTC date arrives.
+                if date > today {
+                    continue;
+                }
                 let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid compaction date"))?.and_utc().timestamp_micros();
                 let slice = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS))?;
                 let small_target = if date == today { 256 * 1024 * 1024 } else { 512 * 1024 * 1024 };
@@ -18791,6 +18846,37 @@ mod tests {
         // a test config may leave it 0, meaning DataFusion's own core-count
         // default. Either way the maintenance scan must be strictly smaller.
         assert!(scan < query, "the whole point is fewer concurrent decoders: {scan} vs {query} (configured {query_partitions})");
+        Ok(())
+    }
+
+    /// Production accepted the health-check socket but missed five auth-read
+    /// deadlines because coordinator futures and PGWire shared Tokio workers.
+    /// A non-yielding maintenance poll must no longer prevent foreground work
+    /// from being scheduled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_cpu_work_cannot_starve_the_foreground_runtime() -> Result<()> {
+        let db = Database::with_config(create_test_config("maintenance-runtime-isolation")).await?.start_maintenance_schedulers().await?;
+        let executor = db.maintenance_executor.get().expect("scheduler installs the isolated runtime").clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        executor.spawn(async move {
+            let _ = started_tx.send(());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            let mut value = 1_u64;
+            while std::time::Instant::now() < deadline {
+                value = std::hint::black_box(value.wrapping_mul(6364136223846793005).wrapping_add(1));
+            }
+        });
+        started_rx.await.expect("maintenance hog started");
+
+        tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("foreground executor was starved by maintenance");
+        db.cancel_maintenance();
         Ok(())
     }
 
