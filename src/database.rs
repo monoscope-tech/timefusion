@@ -3546,57 +3546,30 @@ impl Database {
         // so queries fall back to raw rather than seeing stale aggregates.
         let coordinator_workers = (self.config.derived.cores / 4).clamp(1, 8);
         db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
-        {
+        for worker in 0..coordinator_workers {
             let db = Arc::clone(&db);
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                let journal = Arc::clone(&db.maintenance_tasks);
-                let migration = tokio::task::spawn_blocking(move || -> Result<usize> {
-                    let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let migrated = journal.migrate_derived_slices();
-                    if migrated != 0 {
-                        journal.checkpoint()?;
-                    }
-                    Ok(migrated)
-                })
-                .await;
-                match migration {
-                    Ok(Ok(migrated_tasks)) => info!(migrated_tasks, event = "maintenance_task_journal_migrated"),
-                    Ok(Err(error)) => {
-                        warn!(%error, event = "maintenance_task_journal_migration_failed");
+                loop {
+                    if cancel.is_cancelled() {
                         return;
                     }
-                    Err(error) => {
-                        warn!(%error, event = "maintenance_task_journal_migration_panicked");
-                        return;
-                    }
-                }
-                for worker in 0..coordinator_workers {
-                    let db = Arc::clone(&db);
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            if cancel.is_cancelled() {
-                                return;
-                            }
-                            match db.run_maintenance_coordinator_once().await {
-                                Ok(true) => tokio::task::yield_now().await,
-                                Ok(false) => {
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => return,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                                    }
-                                }
-                                Err(error) => {
-                                    warn!(worker, %error, event = "maintenance_coordinator_error");
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => return,
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                                    }
-                                }
+                    match db.run_maintenance_coordinator_once().await {
+                        Ok(true) => tokio::task::yield_now().await,
+                        Ok(false) => {
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                             }
                         }
-                    });
+                        Err(error) => {
+                            warn!(worker, %error, event = "maintenance_coordinator_error");
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                        }
+                    }
                 }
             });
         }
