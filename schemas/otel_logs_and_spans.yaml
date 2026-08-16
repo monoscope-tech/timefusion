@@ -396,7 +396,7 @@ fields:
     nullable: true
 
 # Continuous-aggregate rollups derived from this table. The rollup's own table
-# (`otel_logs_and_spans_rollup_dashboard_1m_v2`) is SYNTHESIZED from this spec plus the field
+# (`otel_logs_and_spans_rollup_dashboard_1m_v3`) is SYNTHESIZED from this spec plus the field
 # definitions below, so a measure's type cannot drift from the column it
 # aggregates and adding a rollup needs no second schema file.
 #
@@ -407,7 +407,7 @@ fields:
 # filter cannot be applied after aggregation.
 rollups:
   - grain: 1m
-    name: dashboard_1m_v2
+    name: dashboard_1m_v3
     dimensions: [resource___service___name, kind, status_code]
     measures:
       - { name: request_count, agg: count }
@@ -431,8 +431,8 @@ rollups:
   # partition a second time — on this table that is the difference between
   # a few hundred thousand rows and hundreds of millions.
   - grain: 1h
-    name: dashboard_1h_v1
-    derive_from: dashboard_1m_v2
+    name: dashboard_1h_v2
+    derive_from: dashboard_1m_v3
     dimensions: [resource___service___name, kind, status_code]
     measures:
          - { name: request_count, agg: count }
