@@ -964,6 +964,44 @@ const REPAIR_SORT_RESERVATION_BYTES: usize = 512 * 1024 * 1024;
 const STARTUP_REPAIR_DELAY: std::time::Duration = std::time::Duration::from_secs(180);
 const COORDINATOR_OWNS_SLICE_MAINTENANCE: bool = true;
 
+/// Maximum wall time for one ordinary coordinator unit.
+///
+/// Dedup and rollup source windows split recursively, so they retain the old
+/// five-minute fairness bound even though file rewrites need a longer deadline.
+const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Maximum wall time for one coordinator file-rewrite unit.
+///
+/// Dedup and rollup units normally finish inside five minutes because their
+/// source windows split recursively. File packing is different: it must create
+/// runs near 256 MiB or the sealed-file-count invariant can never converge.
+/// Production 2026-08-16 showed a 511 MiB sealed merge being cancelled at the
+/// old five-minute ceiling and then selected again unchanged. A 15-minute
+/// ceiling lets the conservative measured rewrite floor (460 KB/s) finish one
+/// 256 MiB run with commit margin, while the 512 MiB spill pool remains the
+/// hard decoded-memory bound.
+const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Last-resort guard around planning plus one operation-specific unit. The
+/// operation itself has the tighter bound above; this catches a wedged planner
+/// or dispatcher without racing the file-rewrite timeout at the same instant.
+const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
+
+fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Operation) -> std::time::Duration {
+    use crate::maintenance_coordinator::Operation;
+    match operation {
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => COORDINATOR_FILE_REWRITE_TIMEOUT,
+        Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup => COORDINATOR_STANDARD_UNIT_TIMEOUT,
+    }
+}
+
+/// Physical run targets for coordinator packing. Sealed consolidation used to
+/// target 512 MiB even though the coordinator's five-minute deadline could not
+/// land that unit in production. Keeping both tiers at 256 MiB makes each
+/// rewrite deadline-safe and still satisfies the final sealed-file bound.
+const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+
 /// Rows per decode batch for any session that reads the wide otel schema.
 ///
 /// Every per-partition, per-query parquet decode buffer costs
@@ -3656,8 +3694,7 @@ impl Database {
                                     if cancel.is_cancelled() {
                                         return;
                                     }
-                                    const UNIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-                                    match tokio::time::timeout(UNIT_TIMEOUT, db.run_maintenance_coordinator_once()).await {
+                                    match tokio::time::timeout(COORDINATOR_LOOP_TIMEOUT, db.run_maintenance_coordinator_once()).await {
                                         Ok(Ok(true)) => tokio::task::yield_now().await,
                                         Ok(Ok(false)) => tokio::select! {
                                             _ = cancel.cancelled() => return,
@@ -3676,7 +3713,11 @@ impl Database {
                                             // every admission token. A whale or wedged object
                                             // read therefore costs one bounded turn instead of
                                             // freezing maintenance for every project forever.
-                                            warn!(worker, timeout_seconds = UNIT_TIMEOUT.as_secs(), event = "maintenance_coordinator_unit_timed_out");
+                                            warn!(
+                                                worker,
+                                                timeout_seconds = COORDINATOR_LOOP_TIMEOUT.as_secs(),
+                                                event = "maintenance_coordinator_loop_timed_out"
+                                            );
                                         }
                                     }
                                 }
@@ -9055,7 +9096,7 @@ impl Database {
                 }
                 let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid compaction date"))?.and_utc().timestamp_micros();
                 let slice = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS))?;
-                let small_target = if date == today { 256 * 1024 * 1024 } else { 512 * 1024 * 1024 };
+                let small_target = if date == today { COORDINATOR_HOT_TARGET_BYTES } else { COORDINATOR_SEALED_TARGET_BYTES };
                 let small = files.iter().filter(|file| file.size < small_target || !file.sorted).collect::<Vec<_>>();
                 if small.len() >= 2 || small.iter().any(|file| !file.sorted) {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
@@ -9610,8 +9651,8 @@ impl Database {
             return Ok(candidates.into_iter().filter(|add| !self.repair_verified_sorted.contains(&add.path)).take(1).map(|add| add.path).collect());
         }
         let target = match key.operation {
-            Operation::HotPacking => 256 * 1024 * 1024,
-            Operation::SealedConsolidation => 512 * 1024 * 1024,
+            Operation::HotPacking => COORDINATOR_HOT_TARGET_BYTES,
+            Operation::SealedConsolidation => COORDINATOR_SEALED_TARGET_BYTES,
             _ => return Ok(Vec::new()),
         };
         Ok(select_coordinator_compaction_candidates(candidates, target))
@@ -9750,10 +9791,23 @@ impl Database {
                 continue;
             }
             attempted[index] = true;
-            let completed = match operation {
-                Operation::Dedup => self.run_coordinator_dedup_once().await?,
-                Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await?,
-                Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await?,
+            let timeout = coordinator_operation_timeout(operation);
+            let work = async {
+                match operation {
+                    Operation::Dedup => self.run_coordinator_dedup_once().await,
+                    Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await,
+                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await,
+                }
+            };
+            let completed = match tokio::time::timeout(timeout, work).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    // Dropping the operation future drops its TaskLease. The
+                    // claimed unit is durably requeued and all resource tokens
+                    // are released before another project gets a turn.
+                    warn!(?operation, timeout_seconds = timeout.as_secs(), event = "maintenance_coordinator_unit_timed_out");
+                    return Ok(true);
+                }
             };
             if completed {
                 return Ok(true);
@@ -20009,6 +20063,40 @@ mod tests {
         assert_eq!(super::coordinator_slice_target(TailPass::Pack, 1, 40 * MB), Some(16 * MB));
         assert_eq!(super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB), None);
         assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(super::REPAIR_SLICE_TARGET_BYTES));
+    }
+
+    /// Prod 2026-08-16 repeatedly selected 511 MiB of sealed sorted runs and
+    /// cancelled the rewrite at 300 seconds. The old 512 MiB target therefore
+    /// made zero durable progress. A physical run must still be at least
+    /// 256 MiB to meet the sealed-file-count contract, so reduce the unit and
+    /// give the conservative 460 KB/s rewrite floor enough time to commit it.
+    #[test]
+    fn coordinator_sealed_units_fit_their_deadline_and_file_count_contract() {
+        const MIB: i64 = 1024 * 1024;
+        assert_eq!(super::COORDINATOR_SEALED_TARGET_BYTES, 256 * MIB);
+        assert_eq!(super::COORDINATOR_HOT_TARGET_BYTES, 256 * MIB);
+
+        let estimated_rewrite_seconds = (super::COORDINATOR_SEALED_TARGET_BYTES + super::INPUT_BYTES_PER_SEC - 1) / super::INPUT_BYTES_PER_SEC;
+        assert!(
+            estimated_rewrite_seconds + 120 <= super::COORDINATOR_FILE_REWRITE_TIMEOUT.as_secs() as i64,
+            "one sealed run needs {estimated_rewrite_seconds}s at the measured floor plus commit margin"
+        );
+        assert_eq!(
+            super::coordinator_operation_timeout(crate::maintenance_coordinator::Operation::Dedup),
+            super::COORDINATOR_STANDARD_UNIT_TIMEOUT,
+            "a longer packing deadline must not widen dedup's fairness bound"
+        );
+        assert_eq!(
+            super::coordinator_operation_timeout(crate::maintenance_coordinator::Operation::SealedConsolidation),
+            super::COORDINATOR_FILE_REWRITE_TIMEOUT
+        );
+
+        let run = |name: &str, mib: i64| super::TailAdd { path: name.into(), size: mib * MIB, is_sorted_run: true, event_range: None };
+        assert_eq!(
+            super::select_coordinator_compaction_candidates(vec![run("a", 128), run("b", 128), run("c", 128)], super::COORDINATOR_SEALED_TARGET_BYTES),
+            vec!["a", "b"],
+            "selection must stop at one independently committable physical run"
+        );
     }
 
     /// A repair pass rewrites the NEWEST poisoned file, not the oldest.
