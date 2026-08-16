@@ -1871,7 +1871,9 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
+    timefusion::clock::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
     assert!(db.run_maintenance_units(1024).await? > 0, "eligible slice tasks must be drained");
 
     let total_from_rollup = |db: Arc<Database>, project_id: String| async move {
@@ -1913,7 +1915,9 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("span_late", "op", &project_id, late)])?], true, None)
         .await?;
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
+    timefusion::clock::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
     assert!(db.run_maintenance_units(1024).await? > 0, "late slice tasks must be drained");
     assert_eq!(
         total_from_rollup(Arc::clone(&db), project_id.clone()).await?,
@@ -1983,7 +1987,9 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
+    timefusion::clock::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
     assert!(db.run_maintenance_units(1024).await? > 0, "eligible yesterday slices must be drained");
 
     // Written AFTER certification: today has no coverage, so these are reachable
