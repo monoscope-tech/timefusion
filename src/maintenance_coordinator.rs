@@ -187,7 +187,6 @@ pub struct TaskJournal {
     snapshot: Snapshot,
     dirty_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
-    fair_cursors: HashMap<Operation, String>,
 }
 
 /// Ensures a claimed task cannot remain stuck in `Running` when its worker
@@ -257,7 +256,7 @@ impl TaskJournal {
                 }
             }
         }
-        Ok(Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() })
+        Ok(Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new() })
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
@@ -350,37 +349,10 @@ impl TaskJournal {
     }
 
     pub fn claim_next(&mut self, operation: Operation, now_micros: i64) -> Option<MaintenanceTask> {
-        let candidates = fair_ready_tasks(self.snapshot.tasks.iter(), now_micros)
+        let key = fair_ready_tasks(self.snapshot.tasks.iter(), now_micros)
             .into_iter()
             .find(|task| task.key.operation == operation && self.dependencies_complete(task))
-            .map(|task| scheduling_class(task, now_micros));
-        let class = candidates?;
-        let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
-        let mut fallback: Option<&MaintenanceTask> = None;
-        let mut next: Option<&MaintenanceTask> = None;
-        for task in self.snapshot.tasks.iter().filter(|task| {
-            task.key.operation == operation
-                && matches!(task.state, TaskState::Pending | TaskState::Retry)
-                && task.deadline_micros <= now_micros
-                && scheduling_class(task, now_micros) == class
-                && self.dependencies_complete(task)
-        }) {
-            if fallback.is_none_or(|current| {
-                (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
-            }) {
-                fallback = Some(task);
-            }
-            if task.key.project_id.as_str() > cursor
-                && next.is_none_or(|current| {
-                    (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
-                })
-            {
-                next = Some(task);
-            }
-        }
-        let selected = next.or(fallback)?;
-        let key = selected.key.clone();
-        self.fair_cursors.insert(operation, key.project_id.clone());
+            .map(|task| task.key.clone())?;
         self.mark_running(&key);
         self.snapshot.tasks.iter().find(|task| task.key == key).cloned()
     }
@@ -622,11 +594,10 @@ impl TaskJournal {
 /// Deadline ordering with round-robin selection among projects at the same
 /// operation priority. This prevents one whale from consuming an entire pass.
 pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> Vec<&'a MaintenanceTask> {
-    let mut groups: BTreeMap<(u8, u8, i64), HashMap<&str, VecDeque<&MaintenanceTask>>> = BTreeMap::new();
+    let mut groups: BTreeMap<(u8, i64), HashMap<&str, VecDeque<&MaintenanceTask>>> = BTreeMap::new();
     for task in tasks {
         if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
-            let (recency, deadline) = scheduling_class(task, now_micros);
-            groups.entry((recency, task.key.operation.priority(), deadline)).or_default().entry(&task.key.project_id).or_default().push_back(task);
+            groups.entry((task.key.operation.priority(), task.deadline_micros)).or_default().entry(&task.key.project_id).or_default().push_back(task);
         }
     }
     let mut ready = Vec::new();
@@ -647,16 +618,6 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
         }
     }
     ready
-}
-
-/// Deadline-equivalent tasks rotate fairly, but recent slices form the urgent
-/// class so an overdue historical shadow build cannot extend the live raw tail.
-/// Minute buckets absorb insignificant enqueue/checkpoint skew between projects.
-fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
-    const RECENT_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
-    const DEADLINE_BUCKET_MICROS: i64 = 60 * 1_000_000;
-    let recency = u8::from(task.key.slice.end_micros < now_micros.saturating_sub(RECENT_WINDOW_MICROS));
-    (recency, task.deadline_micros.div_euclid(DEADLINE_BUCKET_MICROS))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -813,28 +774,6 @@ mod tests {
             [task("a", 0, 1, Operation::Dedup), task("a", 1, 2, Operation::Dedup), task("b", 0, 1, Operation::Dedup), task("b", 1, 2, Operation::Dedup)];
         let order: Vec<_> = fair_ready_tasks(&tasks, 0).into_iter().map(|task| task.key.project_id.as_str()).collect();
         assert_eq!(order, ["a", "b", "a", "b"]);
-    }
-
-    #[test]
-    fn journal_claims_rotate_projects_instead_of_restarting_at_first() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        for input in
-            [task("a", 0, 1, Operation::Dedup), task("a", 1, 2, Operation::Dedup), task("b", 0, 1, Operation::Dedup), task("b", 1, 2, Operation::Dedup)]
-        {
-            journal.upsert(input);
-        }
-        assert_eq!(journal.claim_next(Operation::Dedup, 0).expect("first").key.project_id, "a");
-        assert_eq!(journal.claim_next(Operation::Dedup, 0).expect("second").key.project_id, "b");
-    }
-
-    #[test]
-    fn recent_slices_precede_overdue_historical_work() {
-        let now = 3 * 24 * 60 * 60 * 1_000_000;
-        let old = task("old", 0, MIN_SLICE_MICROS, Operation::Dedup);
-        let recent = task("recent", now - MIN_SLICE_MICROS, now, Operation::BaseRollup);
-        let ready = fair_ready_tasks([&old, &recent], now);
-        assert_eq!(ready.first().expect("ready task").key.project_id, "recent");
     }
 
     #[test]
