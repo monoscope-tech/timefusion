@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     path::PathBuf,
     sync::Arc,
@@ -2648,6 +2648,28 @@ fn sort_backfill_uris_newest_first(uris: &mut [String]) {
     uris.sort_by(|a, b| b.cmp(a));
 }
 
+type TantivyBackfillWork = (String, String, String); // project, relative parquet, absolute URI
+
+fn fair_tantivy_backfill_work(mut queues: Vec<(String, VecDeque<(String, String)>)>) -> Vec<TantivyBackfillWork> {
+    // HashMap iteration is deliberately unstable. Pin project order so repair
+    // is reproducible, then take one newest file from every project per round.
+    queues.sort_by(|a, b| a.0.cmp(&b.0));
+    let capacity = queues.iter().map(|(_, q)| q.len()).sum();
+    let mut work = Vec::with_capacity(capacity);
+    loop {
+        let mut added = false;
+        for (project, queue) in &mut queues {
+            if let Some((rel, uri)) = queue.pop_front() {
+                work.push((project.clone(), rel, uri));
+                added = true;
+            }
+        }
+        if !added {
+            return work;
+        }
+    }
+}
+
 impl Database {
     /// Get the config for this database instance
     pub fn config(&self) -> &AppConfig {
@@ -3333,6 +3355,7 @@ impl Database {
                 }
             }
             let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
+            let mut queues = Vec::with_capacity(by_pid.len());
             for (pid, mut uris) in by_pid {
                 let m = manifest::load(svc.object_store.as_ref(), table_name, &pid).await?;
                 let covered: std::collections::HashSet<&String> =
@@ -3352,18 +3375,19 @@ impl Database {
                 // terabyte of legacy history must not stand in front of the
                 // last seven days after a migration.
                 sort_backfill_uris_newest_first(&mut uris);
-                let work: Vec<(String, String)> = uris.iter().filter_map(|uri| Some((parquet_rel_of_uri(uri)?.to_string(), uri.clone()))).collect();
-                let table_owned = table_name.to_string();
-                let mut jobs = futures::stream::iter(work.into_iter().map(|(rel, uri)| {
-                    let (svc, store, pid, table) = (svc.clone(), delta_store.clone(), pid.clone(), table_owned.clone());
-                    async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
-                }))
-                .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
-                while let Some(r) = jobs.next().await {
-                    match r {
-                        Ok(()) => built += 1,
-                        Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
-                    }
+                let queue = uris.into_iter().filter_map(|uri| Some((parquet_rel_of_uri(&uri)?.to_string(), uri))).collect::<VecDeque<_>>();
+                queues.push((pid, queue));
+            }
+            let table_owned = table_name.to_string();
+            let mut jobs = futures::stream::iter(fair_tantivy_backfill_work(queues).into_iter().map(|(pid, rel, uri)| {
+                let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
+                async move { (pid.clone(), svc.build_index_for_file(&table, &pid, &rel, &uri, store).await) }
+            }))
+            .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
+            while let Some((pid, result)) = jobs.next().await {
+                match result {
+                    Ok(()) => built += 1,
+                    Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
                 }
             }
         }
@@ -19157,6 +19181,18 @@ mod tests {
         assert!(uris[0].contains("date=2026-08-16") && uris[1].contains("date=2026-08-16"));
         assert!(uris[2].contains("date=2025-06-10"));
         assert!(uris[3].contains("date=2024-01-01"));
+    }
+
+    #[test]
+    fn tantivy_backfill_rotates_projects_before_their_history() {
+        let queue = |items: &[&str]| items.iter().map(|item| (format!("rel/{item}"), format!("uri/{item}"))).collect::<VecDeque<_>>();
+        let work = super::fair_tantivy_backfill_work(vec![
+            ("whale".to_string(), queue(&["whale-new", "whale-mid", "whale-old"])),
+            ("small".to_string(), queue(&["small-new"])),
+        ]);
+        let scheduled: Vec<_> = work.iter().map(|(project, _, uri)| (project.as_str(), uri.as_str())).collect();
+
+        assert_eq!(scheduled, vec![("small", "uri/small-new"), ("whale", "uri/whale-new"), ("whale", "uri/whale-mid"), ("whale", "uri/whale-old"),]);
     }
 
     /// The merge-on-read gate: `keep_greatest_ordering` yields the lead sort key
