@@ -681,6 +681,21 @@ impl SchemaRegistry {
                 panic!("rollup table `{name}` collides with a hand-written schema file of the same name");
             }
         }
+        // Migration aliases remain queryable while v3/v2 slice generations
+        // shadow-build and canary. They are read-only schema aliases: source
+        // rollup declarations point only at the new targets, so maintenance
+        // cannot accidentally keep writing the retired generations.
+        for (current, legacy) in [
+            ("otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1m_v2"),
+            ("otel_logs_and_spans_rollup_dashboard_1h_v2", "otel_logs_and_spans_rollup_dashboard_1h_v1"),
+            ("otel_metrics_rollup_metrics_1m_v2", "otel_metrics_rollup_metrics_1m_v1"),
+            ("otel_metrics_rollup_metrics_1h_v2", "otel_metrics_rollup_metrics_1h_v1"),
+        ] {
+            if let Some(mut schema) = schemas.get(current).cloned() {
+                schema.table_name = legacy.to_owned();
+                schemas.entry(legacy.to_owned()).or_insert(schema);
+            }
+        }
         Self { schemas }
     }
 
@@ -806,6 +821,18 @@ mod tests {
         let rollup = spec.synthesize(source).expect("valid rollup");
         assert_eq!(rollup.field_def("rollup_generation"), Some((ArrowDataType::Utf8View, false)));
         assert_eq!(rollup.field_def("digest"), Some((ArrowDataType::Binary, true)));
+    }
+
+    #[test]
+    fn legacy_rollup_generations_remain_readable_during_migration() {
+        for name in [
+            "otel_logs_and_spans_rollup_dashboard_1m_v2",
+            "otel_logs_and_spans_rollup_dashboard_1h_v1",
+            "otel_metrics_rollup_metrics_1m_v1",
+            "otel_metrics_rollup_metrics_1h_v1",
+        ] {
+            assert!(get_schema(name).is_some(), "legacy rollup schema {name} must remain registered during canary");
+        }
     }
 
     /// An `hll` measure stores a sketch, exactly as `tdigest` does, and unlike

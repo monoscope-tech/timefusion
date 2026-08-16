@@ -45,6 +45,10 @@ async fn deep_but_well_pruned_scan_is_not_gated_while_a_many_file_scan_still_is(
     let env = E2eEnv::builder()
         .with_bucket_duration(Duration::from_secs(bucket_secs))
         .with_retention(Duration::from_secs(60 * 60))
+        // Preserve the deliberately fragmented 12-file fixture. Source
+        // compaction has its own coordinator tests; this test isolates scan
+        // admission and must inspect the pre-compaction plan.
+        .without_light_optimize()
         .with_wide_scan_max_files(8)
         .start()
         .await?;

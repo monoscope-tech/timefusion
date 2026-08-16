@@ -18,11 +18,23 @@
 
 use std::{
     sync::{
-        OnceLock, Weak,
+        Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
 };
+
+static MAINTENANCE_RETRY_REASON: OnceLock<Mutex<String>> = OnceLock::new();
+
+pub fn set_maintenance_retry_reason(reason: &str) {
+    let mut current = MAINTENANCE_RETRY_REASON.get_or_init(|| Mutex::new(String::new())).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    current.clear();
+    current.push_str(reason);
+}
+
+pub fn maintenance_retry_reason() -> String {
+    MAINTENANCE_RETRY_REASON.get_or_init(|| Mutex::new(String::new())).lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
 
 use opentelemetry::{
     KeyValue,
@@ -541,6 +553,7 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
         R::NotBuilt => &stats.rollup_miss_not_built,
         R::StaleCoverage => &stats.rollup_miss_stale_coverage,
         R::TinyInterior => &stats.rollup_miss_tiny_interior,
+        R::TooManyBranches => &stats.rollup_miss_too_many_branches,
         R::UnsupportedShape => &stats.rollup_miss_unsupported,
         R::IncompleteCoverage => &stats.rollup_miss_incomplete_coverage,
         R::UnknownFilter => &stats.rollup_miss_unknown_filter,
@@ -715,6 +728,21 @@ atomic_stats! {
     rollup_output_files,
     rollup_full_hours_rebuilt,
     rollup_incremental_hours_rebuilt,
+    maintenance_tasks_pending,
+    maintenance_tasks_running,
+    maintenance_tasks_retry,
+    maintenance_tasks_complete,
+    maintenance_backlog_bytes,
+    maintenance_oldest_task_age_secs,
+    maintenance_eligible_watermark_lag_secs,
+    maintenance_processed_bytes,
+    maintenance_processed_bytes_per_sec,
+    maintenance_raw_tail_duration_secs,
+    sealed_compaction_debt_bytes,
+    maintenance_cpu_tokens_used,
+    maintenance_decoded_bytes_used,
+    maintenance_object_read_tokens_used,
+    maintenance_object_write_tokens_used,
     /// Aggregates that fell through to a raw scan, plus the breakdown by reason.
     ///
     /// The OTel counter carries the same labels but cannot be read back
@@ -727,6 +755,7 @@ atomic_stats! {
     rollup_miss_not_built,
     rollup_miss_stale_coverage,
     rollup_miss_tiny_interior,
+    rollup_miss_too_many_branches,
     rollup_miss_unsupported,
     rollup_miss_incomplete_coverage,
     rollup_miss_unknown_filter,
