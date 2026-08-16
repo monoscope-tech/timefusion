@@ -1955,6 +1955,10 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let mut cfg = (*TestConfigBuilder::new("rollup_hybrid").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     cfg.maintenance.timefusion_rollup_realtime_tail = true;
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    // This test publishes selected coverage explicitly below. A background
+    // coordinator can race that fixture and change the routing counters being
+    // asserted, so isolate the routing behavior under test.
+    db.cancel_maintenance();
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     let today = chrono::Utc::now().date_naive();
@@ -2129,10 +2133,23 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // only an open tail can reach it — the bounded assertions above still see 6
     // because it is outside their `hi`.
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("t_open", "checkout", 700, hi + 1_000_000)?], true, None).await?;
+    // Keep the open-ended plan-time upper bound deterministic. If this test
+    // inherits the wall clock late in the UTC day, the same six-hour covered
+    // interior falls below the 20% hybrid cost threshold and the assertion
+    // becomes time-of-day dependent.
+    timefusion::clock::set_micros(hi + 3_600_000_000);
     let open = query.replace(&format!(" AND timestamp < to_timestamp_micros({hi})"), "");
     let before = hits();
+    let open_reasons_before = miss_snapshot();
     let open_rows = rows_of(ctx.sql(&open).await?.collect().await?);
-    assert_eq!(hits(), before + 1, "an open-ended window must route, not fall back to a raw scan (misses +{})", misses() - misses_before);
+    let open_reasons_after = miss_snapshot();
+    let open_reason_delta = std::array::from_fn::<_, 5, _>(|index| open_reasons_after[index] - open_reasons_before[index]);
+    assert_eq!(
+        hits(),
+        before + 1,
+        "an open-ended window must route, not fall back to a raw scan (misses +{}, reason delta [not_built, stale, tiny, branches, incomplete] = {open_reason_delta:?})",
+        misses() - misses_before
+    );
     assert_eq!(open_rows, rows_of(db.query_delta_only(&open).await?), "the open-ended rewrite must equal the raw aggregate exactly");
     assert_eq!(open_rows.iter().map(|row| row.1).sum::<i64>(), 12, "the open tail must reach the row past the bounded window: {open_rows:?}");
 

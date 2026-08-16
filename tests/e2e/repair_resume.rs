@@ -118,6 +118,7 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
         .with_repair_resume()
         .start()
         .await?;
+    env.db().cancel_maintenance();
 
     let before = footerless_partition(&env).await?;
     let rows_before: i64 = {
@@ -142,6 +143,7 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
 
     // The restart the deploy/healthcheck used to make fatal.
     env.restart().await?;
+    env.db().cancel_maintenance();
 
     let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     env.db().optimize_table_light(&table_ref, TABLE, TailPass::Pack).await?;
@@ -193,6 +195,7 @@ async fn a_staged_bin_whose_inputs_were_rewritten_is_declined_and_reclaimed() ->
         .with_repair_resume()
         .start()
         .await?;
+    env.db().cancel_maintenance();
 
     let before = footerless_partition(&env).await?;
     let first = abandon_one_bin(&env).await?;
@@ -200,6 +203,7 @@ async fn a_staged_bin_whose_inputs_were_rewritten_is_declined_and_reclaimed() ->
     assert_eq!(first, second, "the planner must re-select the same bin, or these are not same-input twins");
     let staged = staged_outputs(&backdate_manifest(&env)?);
     env.restart().await?;
+    env.db().cancel_maintenance();
 
     let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     env.db().optimize_table_light(&table_ref, TABLE, TailPass::Pack).await?;
@@ -232,6 +236,7 @@ async fn resume_is_a_no_op_while_the_kill_switch_is_off() -> anyhow::Result<()> 
         .with_light_optimize_target(1024)
         .start()
         .await?;
+    env.db().cancel_maintenance();
 
     footerless_partition(&env).await?;
     abandon_one_bin(&env).await?;

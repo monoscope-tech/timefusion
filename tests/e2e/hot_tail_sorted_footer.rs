@@ -40,6 +40,10 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
         .with_sort_skip_bytes(0)
         .start()
         .await?;
+    // This test invokes light optimize directly and asserts that call's
+    // rewrite. Keep the background coordinator from consuming or racing the
+    // same fixture files.
+    env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
     // The hot tail only considers TODAY's partition and only files whose EVENT
@@ -128,6 +132,7 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
         .with_light_optimize_target(1024)
         .start()
         .await?;
+    env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
     let sec = 1_000_000i64;
@@ -220,6 +225,7 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
         .with_light_optimize_target(1024)
         .start()
         .await?;
+    env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
     // Four separate flushes -> four untagged suspects in one sealed partition.
@@ -281,6 +287,7 @@ async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool
         .with_light_optimize_target(1024)
         .start()
         .await?;
+    env.db().cancel_maintenance();
     let client = env.pg_client().await?;
     for b in 0..4i64 {
         for i in 0..3i64 {

@@ -8076,14 +8076,18 @@ impl Database {
     async fn dedup_partition_range(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>,
     ) -> Result<(u64, bool)> {
-        self.dedup_partition_range_limited(table_ref, table_name, project_id, date, bin, None).await
+        let slice = bin.map(|bin| crate::maintenance_coordinator::TimeSlice {
+            start_micros: bin.saturating_mul(crate::maintenance_coordinator::NORMAL_SLICE_MICROS),
+            end_micros: bin.saturating_add(1).saturating_mul(crate::maintenance_coordinator::NORMAL_SLICE_MICROS),
+        });
+        self.dedup_partition_range_limited(table_ref, table_name, project_id, date, slice, None).await
     }
 
     async fn dedup_partition_range_limited(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>,
-        limits: Option<DedupExecutionLimits>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
+        slice: Option<crate::maintenance_coordinator::TimeSlice>, limits: Option<DedupExecutionLimits>,
     ) -> Result<(u64, bool)> {
-        let options = DedupRangeOptions { bin, dirty_key: None, limits };
+        let options = DedupRangeOptions { slice, dirty_key: None, limits };
         let (units, complete) = self.stage_dedup_partition_range(table_ref, table_name, project_id, date, options).await?;
         if units.is_empty() {
             return Ok((0, complete));
@@ -8210,7 +8214,7 @@ impl Database {
     async fn stage_dedup_partition_range(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, options: DedupRangeOptions,
     ) -> Result<(Vec<StagedBin>, bool)> {
-        let DedupRangeOptions { bin, dirty_key: key, limits } = options;
+        let DedupRangeOptions { slice, dirty_key: key, limits } = options;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
             return Ok((Vec::new(), true));
@@ -8229,10 +8233,11 @@ impl Database {
         // `partition_filter` silently kept only ten minutes from a multi-bin
         // parquet file and dropped the rest (prod 2026-08-03).
         let partition_filter = format!("project_id = '{}' AND date = DATE '{}'", safe_pid, date_str);
-        let filter = if let Some(bin) = bin {
-            const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
-            let start = chrono::DateTime::from_timestamp_micros(bin * BIN_MICROS).ok_or_else(|| anyhow::anyhow!("invalid dedup bin {bin}"))?;
-            let end = start + chrono::Duration::minutes(10);
+        let filter = if let Some(slice) = slice {
+            let start = chrono::DateTime::from_timestamp_micros(slice.start_micros)
+                .ok_or_else(|| anyhow::anyhow!("invalid dedup slice start {}", slice.start_micros))?;
+            let end =
+                chrono::DateTime::from_timestamp_micros(slice.end_micros).ok_or_else(|| anyhow::anyhow!("invalid dedup slice end {}", slice.end_micros))?;
             format!(
                 "{partition_filter} AND \"timestamp\" >= TIMESTAMP '{}' AND \"timestamp\" < TIMESTAMP '{}'",
                 start.format("%Y-%m-%d %H:%M:%S"),
@@ -8272,12 +8277,33 @@ impl Database {
             // rewritten; newer dupes clear on a later sweep.
             let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
             let mut skipped_unsealed = 0usize;
-            let built: Vec<_> = Self::dup_bin_starts(&ctx, &filter, &keys_csv)
-                .await?
+            // A one-minute whale cannot be split further in time. Bound the
+            // key GROUP BY used by the duplicate probe with the same complete-
+            // key hash partitioning as the rewrite. Each pass may reread the
+            // selected files, but no pass can accumulate the whale's full key
+            // cardinality in memory.
+            let probe_shards = limits.map_or(1, |limits| limits.probe_hash_shards.max(1));
+            let mut duplicate_starts = Vec::new();
+            for shard in 0..probe_shards {
+                let shard_filter = if probe_shards == 1 {
+                    filter.clone()
+                } else {
+                    let keys_varchar = schema.dedup_keys.iter().map(|key| format!("CAST(\"{key}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
+                    let bucket_expr = format!("substr(md5(concat_ws(chr(31), {keys_varchar})), 1, 2)");
+                    let lo = u64::try_from(shard).unwrap_or(u64::MAX).saturating_mul(DEDUP_BUCKET_COUNT) / u64::try_from(probe_shards).unwrap_or(1);
+                    let hi = u64::try_from(shard + 1).unwrap_or(u64::MAX).saturating_mul(DEDUP_BUCKET_COUNT) / u64::try_from(probe_shards).unwrap_or(1);
+                    let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < '{hi:02x}'") } else { String::new() };
+                    format!("{filter} AND {bucket_expr} >= '{lo:02x}'{upper}")
+                };
+                duplicate_starts.extend(Self::dup_bin_starts(&ctx, &shard_filter, &keys_csv).await?);
+            }
+            duplicate_starts.sort_unstable();
+            duplicate_starts.dedup();
+            let built: Vec<_> = duplicate_starts
                 .into_iter()
                 .filter_map(|start| {
                     let end = start + chrono::Duration::minutes(10);
-                    if bin.is_none() && end > sealed_before {
+                    if slice.is_none() && end > sealed_before {
                         debug!("dedup: skipping unsealed chunk starting {start} (cleared on a later sweep)");
                         skipped_unsealed += 1;
                         return None;
@@ -9112,11 +9138,6 @@ impl Database {
             retry("source_not_flushed".to_owned(), std::time::Duration::from_secs(5))?;
             return Ok(true);
         }
-        let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 })
-        else {
-            retry("resource_admission".to_owned(), std::time::Duration::from_secs(1))?;
-            return Ok(true);
-        };
         let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive()) else {
             retry("invalid_slice_timestamp".to_owned(), std::time::Duration::from_secs(3_600))?;
             return Ok(true);
@@ -9128,9 +9149,67 @@ impl Database {
                 return Ok(true);
             }
         };
-        let bin = key.slice.start_micros.div_euclid(crate::maintenance_coordinator::NORMAL_SLICE_MICROS);
-        let limits = DedupExecutionLimits { max_decoded_bytes: MAX_DECODED_BYTES, max_concurrent_shards: 1 };
-        match self.dedup_partition_range_limited(&table, &key.source, &key.project_id, date, Some(bin), Some(limits)).await {
+        // Journal invalidations intentionally start with no byte estimate: the
+        // acknowledged write does not have a Delta snapshot yet. Estimate the
+        // narrow dedup projection now, from files whose timestamp statistics
+        // overlap this exact slice. Without this preflight a whale project's
+        // ordinary no-duplicate probe occupied one worker for 235 seconds in
+        // production while still reporting `estimated_decoded_bytes=0`.
+        let estimated_bytes = {
+            let schema = get_schema(&key.source).unwrap_or_else(get_default_schema);
+            let required_columns = 3usize.saturating_add(schema.dedup_keys.len()).saturating_add(usize::from(schema.dedup_tiebreak.is_some()));
+            let projected_numerator = u64::try_from(required_columns).unwrap_or(u64::MAX);
+            let projected_denominator = u64::try_from(schema.fields.len().max(1)).unwrap_or(u64::MAX);
+            let table = table.read().await;
+            let date_string = date.to_string();
+            let partition_paths = dedup_partition_paths(table.snapshot()?.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .filter(|file| partition_paths.contains(file.path().as_ref()))
+                .filter_map(|file| {
+                    #[allow(deprecated)]
+                    let add = file.add_action();
+                    if let Ok(Some(stats)) = add.get_stats()
+                        && let (Some(min), Some(max)) = (
+                            stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+                            stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+                        )
+                        && (min >= key.slice.end_micros || max < key.slice.start_micros)
+                    {
+                        return None;
+                    }
+                    let decoded = u64::try_from(add.size.max(0)).unwrap_or(0).saturating_mul(12);
+                    Some(decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator))
+                })
+                .fold(0u64, u64::saturating_add)
+        };
+        if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
+            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if journal.split_time_task(&key, estimated_bytes) {
+                journal.checkpoint()?;
+                info!(
+                    table = %key.physical_table,
+                    project_id = %key.project_id,
+                    slice_start = key.slice.start_micros,
+                    slice_end = key.slice.end_micros,
+                    estimated_decoded_bytes = estimated_bytes,
+                    event = "maintenance_dedup_task_split"
+                );
+                return Ok(true);
+            }
+        }
+        let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 })
+        else {
+            retry("resource_admission".to_owned(), std::time::Duration::from_secs(1))?;
+            return Ok(true);
+        };
+        let probe_hash_shards = usize::try_from(estimated_bytes.div_ceil(MAX_DECODED_BYTES).clamp(1, DEDUP_BUCKET_COUNT)).unwrap_or(1);
+        let limits = DedupExecutionLimits { max_decoded_bytes: MAX_DECODED_BYTES, max_concurrent_shards: 1, probe_hash_shards };
+        match self.dedup_partition_range_limited(&table, &key.source, &key.project_id, date, Some(key.slice), Some(limits)).await {
             Ok((_, true)) => {
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 journal.complete(&key);
@@ -11504,7 +11583,14 @@ impl Database {
                             table_name,
                             &project_id,
                             parsed,
-                            DedupRangeOptions { bin: Some(bin), dirty_key: Some(key.clone()), limits: None },
+                            DedupRangeOptions {
+                                slice: Some(crate::maintenance_coordinator::TimeSlice {
+                                    start_micros: bin.saturating_mul(crate::maintenance_coordinator::NORMAL_SLICE_MICROS),
+                                    end_micros: bin.saturating_add(1).saturating_mul(crate::maintenance_coordinator::NORMAL_SLICE_MICROS),
+                                }),
+                                dirty_key: Some(key.clone()),
+                                limits: None,
+                            },
                         ),
                     )
                     .await
@@ -14100,11 +14186,12 @@ type StagedShard = (Vec<deltalake::kernel::Action>, anyhow::Result<(usize, usize
 struct DedupExecutionLimits {
     max_decoded_bytes: u64,
     max_concurrent_shards: usize,
+    probe_hash_shards: usize,
 }
 
 #[derive(Clone)]
 struct DedupRangeOptions {
-    bin: Option<i64>,
+    slice: Option<crate::maintenance_coordinator::TimeSlice>,
     dirty_key: Option<DirtyBinKey>,
     limits: Option<DedupExecutionLimits>,
 }
