@@ -6,7 +6,7 @@ on:
       image:
         description: Fully qualified previously proven image
         required: true
-        default: ghcr.io/monoscope-tech/timefusion:7374a2b
+        default: ghcr.io/monoscope-tech/timefusion:b5f9924
 
 jobs:
   rollback:
