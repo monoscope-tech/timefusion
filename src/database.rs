@@ -1052,6 +1052,18 @@ where
     F: Fn() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
+    spawn_cron_job_on(name, schedule, cancel, None, job);
+}
+
+/// Schedule like [`spawn_cron_job`], but execute each job body on `executor`.
+/// The lightweight wall-clock timer remains on the caller's runtime so shutdown
+/// and tick accounting retain one owner; CPU and I/O polling for the job itself
+/// stay off the foreground PGWire runtime.
+fn spawn_cron_job_on<F, Fut>(name: &'static str, schedule: &str, cancel: Arc<CancellationToken>, executor: Option<tokio::runtime::Handle>, job: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     if schedule.trim().is_empty() {
         info!("{name} job scheduling skipped - empty schedule");
         return;
@@ -1115,7 +1127,11 @@ where
                     }
                     crate::metrics::maintenance_stats().cron_ticks_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     running_since = Some(std::time::Instant::now());
-                    running = Some(tokio::spawn(job()));
+                    let future = job();
+                    running = Some(match &executor {
+                        Some(handle) => handle.spawn(future),
+                        None => tokio::spawn(future),
+                    });
                 }
             }
         }
@@ -3854,7 +3870,7 @@ impl Database {
         // cron, decoupled from hot compaction above. Keeps the job_sem so it stays
         // serialized against the full optimize job (the other job_sem holder).
         // spawn_cron_job skips overlapping ticks.
-        spawn_cron_job("Dedup", &self.config.maintenance.timefusion_dedup_schedule, cancel.clone(), {
+        spawn_cron_job_on("Dedup", &self.config.maintenance.timefusion_dedup_schedule, cancel.clone(), self.maintenance_executor.get().cloned(), {
             let db = db.clone();
             move || {
                 let db = db.clone();
@@ -19280,6 +19296,26 @@ mod tests {
         let after_cancel = count.load(Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert_eq!(count.load(Ordering::SeqCst), after_cancel, "no fires after cancel");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_cron_job_on_runs_body_on_the_selected_runtime() {
+        let isolated =
+            tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("cron-isolated").enable_all().build().expect("isolated runtime");
+        let cancel = Arc::new(CancellationToken::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_cron_job_on("isolated-test", "* * * * * *", cancel.clone(), Some(isolated.handle().clone()), move || {
+            let tx = tx.clone();
+            async move {
+                let name = std::thread::current().name().unwrap_or("unnamed").to_owned();
+                let _ = tx.send(name);
+            }
+        });
+
+        let thread_name = tokio::time::timeout(std::time::Duration::from_millis(2500), rx.recv()).await.expect("cron fired").expect("sender alive");
+        cancel.cancel();
+        assert!(thread_name.starts_with("cron-isolated"), "job ran on {thread_name}, not the isolated executor");
+        isolated.shutdown_background();
     }
 
     /// A wedged job body must not freeze the cron loop: later ticks are skipped
