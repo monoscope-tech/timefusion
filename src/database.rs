@@ -2310,11 +2310,11 @@ pub struct Database {
     /// disjoint entry points today, but a second call must not double the
     /// boot-time S3 warm burst.
     preload_started: Arc<std::sync::atomic::AtomicBool>,
-    /// Per-table single-flight gates for cold Delta loads. Startup preload and
-    /// maintenance reconciliation intentionally run concurrently; without a
-    /// keyed gate they both replay the same large Delta log and warm the same
-    /// file set before either can populate `unified_tables`.
-    table_load_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Set only after startup table discovery and footer warming finish.
+    /// Maintenance waits for this barrier so it can never become the first
+    /// caller to cold-load a source table needed by foreground reads/ingest.
+    preload_complete: Arc<std::sync::atomic::AtomicBool>,
+    preload_complete_notify: Arc<tokio::sync::Notify>,
     /// Handle for CPU/I/O-heavy startup and coordinator work. Foreground
     /// PGWire tasks never execute on this runtime.
     maintenance_executor: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
@@ -2985,7 +2985,8 @@ impl Database {
             maintenance_shutdown: Arc::new(maintenance_shutdown),
             _maintenance_cancel_guard: Some(maintenance_cancel_guard),
             preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            table_load_locks: Arc::new(dashmap::DashMap::new()),
+            preload_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            preload_complete_notify: Arc::new(tokio::sync::Notify::new()),
             maintenance_executor: Arc::new(std::sync::OnceLock::new()),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
@@ -3597,6 +3598,9 @@ impl Database {
                             let db = Arc::clone(&db);
                             let cancel = cancel.clone();
                             tokio::spawn(async move {
+                                if !db.wait_for_preload(&cancel).await {
+                                    return;
+                                }
                                 loop {
                                     if cancel.is_cancelled() {
                                         return;
@@ -3620,7 +3624,11 @@ impl Database {
                         }
 
                         let reconcile_db = Arc::clone(&db);
+                        let reconcile_cancel = cancel.clone();
                         tokio::spawn(async move {
+                            if !reconcile_db.wait_for_preload(&reconcile_cancel).await {
+                                return;
+                            }
                             match reconcile_db.reconcile_maintenance_task_cursors().await {
                                 Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
                                 Err(error) => {
@@ -3637,7 +3645,11 @@ impl Database {
                         });
 
                         let coverage_db = Arc::clone(&db);
+                        let coverage_cancel = cancel.clone();
                         tokio::spawn(async move {
+                            if !coverage_db.wait_for_preload(&coverage_cancel).await {
+                                return;
+                            }
                             for source in crate::schema_loader::registry().list_tables() {
                                 if let Err(error) = coverage_db.recover_rollup_coverage(&source).await {
                                     warn!(source, %error, "rollup coverage recovery failed; those partitions stay on raw scans");
@@ -4700,20 +4712,6 @@ impl Database {
             }
         }
 
-        // Reconciliation and preload start together. Serialize only callers
-        // loading THIS table, then recheck the cache. The old double-check
-        // prevented duplicate insertion but still allowed duplicate multi-GB
-        // Delta-log replay and cache warming during startup.
-        let load_key = format!("unified:{table_name}");
-        let load_gate = self.table_load_locks.entry(load_key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
-        let _load_guard = load_gate.lock().await;
-        {
-            let tables = self.unified_tables.read().await;
-            if let Some(table) = tables.get(table_name) {
-                return Ok(Arc::clone(table));
-            }
-        }
-
         let Some(ref bucket) = self.default_s3_bucket else {
             return Err(anyhow::anyhow!("No default S3 bucket configured for unified table '{}'", table_name));
         };
@@ -4755,16 +4753,6 @@ impl Database {
     )]
     pub async fn get_or_create_custom_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
         // Check cache first
-        {
-            let tables = self.custom_project_tables.read().await;
-            if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
-                return Ok(Arc::clone(table));
-            }
-        }
-
-        let load_key = format!("custom:{project_id}:{table_name}");
-        let load_gate = self.table_load_locks.entry(load_key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
-        let _load_guard = load_gate.lock().await;
         {
             let tables = self.custom_project_tables.read().await;
             if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
@@ -5246,9 +5234,14 @@ impl Database {
             });
             // Abandon warming on shutdown so in-flight S3 calls can't slow
             // a fast restart during initial boot.
-            tokio::select! {
-                _ = shutdown.cancelled() => {}
-                _ = preload_all => {}
+            let completed = tokio::select! {
+                _ = shutdown.cancelled() => false,
+                _ = preload_all => true,
+            };
+            if completed {
+                db.preload_complete.store(true, std::sync::atomic::Ordering::Release);
+                db.preload_complete_notify.notify_waiters();
+                info!(event = "table_preload_complete");
             }
         };
         if let Some(executor) = self.maintenance_executor.get() {
@@ -5257,6 +5250,25 @@ impl Database {
             // Test/CLI callers can preload without starting schedulers. The
             // production server always has the isolated executor by this point.
             tokio::spawn(preload);
+        }
+    }
+
+    /// Wait until preload has published all discoverable table handles. The
+    /// atomic closes the `Notify` check/subscribe race and also makes late
+    /// subscribers return immediately.
+    async fn wait_for_preload(&self, cancel: &CancellationToken) -> bool {
+        loop {
+            if self.preload_complete.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+            let notified = self.preload_complete_notify.notified();
+            if self.preload_complete.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return false,
+                _ = notified => {}
+            }
         }
     }
 
@@ -8843,15 +8855,10 @@ impl Database {
     /// A crash before the cursor checkpoint repeats work; a crash after it is
     /// safe because every task checkpoint happened first.
     async fn reconcile_maintenance_task_cursors(&self) -> Result<usize> {
-        // Scheduler startup precedes the asynchronous table preload. Resolve
-        // declared sources here so a process upgrading an existing Delta table
-        // cannot observe an empty `all_tables()` set, advance no cursor, and
-        // leave the new rollup generation without shadow-build work forever.
-        for source in crate::schema_loader::registry().list_tables() {
-            if get_schema(&source).is_some_and(|schema| !schema.rollups.is_empty()) {
-                self.get_or_create_unified_table(&source).await?;
-            }
-        }
+        // The caller waits for preload. Reconciliation must inspect cached
+        // handles only: cold-loading a source here previously put every
+        // foreground reader and ingest writer behind a multi-minute Delta-log
+        // replay while Docker health checks remained green.
         let mut queued = 0usize;
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { continue };
@@ -18876,6 +18883,20 @@ mod tests {
         .await
         .expect("foreground executor was starved by maintenance");
         db.cancel_maintenance();
+        Ok(())
+    }
+
+    /// Reconciliation runs after preload and must be metadata-only over the
+    /// handles preload published. If it cold-resolves a declared source, it can
+    /// replay a large Delta log ahead of foreground ingest and recreate the
+    /// production startup stall while health checks remain green.
+    #[tokio::test]
+    async fn maintenance_reconciliation_never_cold_loads_a_source() -> Result<()> {
+        let db = Database::with_config(create_test_config("reconcile-cached-tables-only")).await?;
+
+        assert!(db.unified_tables.read().await.is_empty());
+        assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
+        assert!(db.unified_tables.read().await.is_empty(), "reconciliation must not resolve a source table");
         Ok(())
     }
 
