@@ -20,6 +20,7 @@ pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
+const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 pub const TAG_SOURCE: &str = "timefusion.source";
 pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
@@ -402,7 +403,15 @@ impl TaskJournal {
     /// made pending again and its quiet-period deadline moves forward.
     pub fn invalidate(&mut self, invalidation: Invalidation<'_>) -> anyhow::Result<()> {
         let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived } = invalidation;
-        let deadline_micros = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
+        // Round up, never down: a bucket can delay eligibility slightly but
+        // can never publish before the full quiet period. High-rate ingest
+        // then journals one deadline extension per bucket rather than one full
+        // task record per event batch.
+        let deadline = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
+        let deadline_micros = deadline
+            .saturating_add(INVALIDATION_DEADLINE_BUCKET_MICROS - 1)
+            .div_euclid(INVALIDATION_DEADLINE_BUCKET_MICROS)
+            .saturating_mul(INVALIDATION_DEADLINE_BUCKET_MICROS);
         let created_unix_ms = u64::try_from(observed_at_micros.div_euclid(1_000)).unwrap_or_default();
         let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
         let rollup_slices = if derived {
@@ -431,10 +440,16 @@ impl TaskJournal {
                 };
                 if let Some(index) = self.task_indices.get(&key).copied() {
                     let task = &mut self.snapshot.tasks[index];
-                    task.state = TaskState::Pending;
-                    task.deadline_micros = task.deadline_micros.max(deadline_micros);
-                    task.retry_reason = None;
-                    task.publication = None;
+                    let new_deadline = task.deadline_micros.max(deadline_micros);
+                    let changed =
+                        task.state != TaskState::Pending || task.deadline_micros != new_deadline || task.retry_reason.is_some() || task.publication.is_some();
+                    if changed {
+                        task.state = TaskState::Pending;
+                        task.deadline_micros = new_deadline;
+                        task.retry_reason = None;
+                        task.publication = None;
+                        self.dirty_tasks.insert(key);
+                    }
                 } else {
                     let index = self.snapshot.tasks.len();
                     self.task_indices.insert(key.clone(), index);
@@ -450,8 +465,8 @@ impl TaskJournal {
                         retry_reason: None,
                         publication: None,
                     });
+                    self.dirty_tasks.insert(key);
                 }
-                self.dirty_tasks.insert(key);
             }
         }
         Ok(())
@@ -1175,6 +1190,8 @@ mod tests {
                 derived: false,
             })
             .expect("invalidate");
+        journal.checkpoint().expect("first invalidation checkpoint");
+        let first_wal_size = fs::metadata(&journal.wal_path).expect("wal").len();
         journal
             .invalidate(Invalidation {
                 source_table: "source",
@@ -1187,9 +1204,23 @@ mod tests {
                 derived: false,
             })
             .expect("invalidate again");
+        journal.checkpoint().expect("same-bucket checkpoint");
+        assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_wal_size, "same deadline bucket must not rewrite tasks");
+        journal
+            .invalidate(Invalidation {
+                source_table: "source",
+                rollup_table: "rollup",
+                source: "source",
+                project_id: "p",
+                start_micros: 0,
+                end_micros: NORMAL_SLICE_MICROS,
+                observed_at_micros: INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+                derived: false,
+            })
+            .expect("invalidate in next bucket");
         assert_eq!(journal.tasks().count(), 3);
         assert!(journal.tasks().any(|task| task.key.operation == Operation::HotPacking));
-        assert!(journal.tasks().all(|task| task.deadline_micros == 20 + FINALIZATION_DELAY_MICROS));
+        assert!(journal.tasks().all(|task| task.deadline_micros == FINALIZATION_DELAY_MICROS + 2 * INVALIDATION_DEADLINE_BUCKET_MICROS));
     }
 
     #[test]
