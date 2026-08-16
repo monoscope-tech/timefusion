@@ -31,6 +31,10 @@ use crate::{
 pub const INDEX_PREFIX: &str = "indexes";
 pub const INDEX_VERSION: &str = "v1";
 pub const BLOB_SUFFIX: &str = ".tantivy.tar.zst";
+/// Decoded Arrow batches allowed between the parquet reader and Tantivy
+/// writer. Backpressure at two bounds source-row memory independent of file
+/// size while keeping decode and indexing overlapped.
+pub const PARQUET_INDEX_BATCH_WINDOW: usize = 2;
 
 /// Object-store path for a given parquet file's index blob.
 pub fn blob_path(table: &str, project_id: &str, file_uuid: &str) -> ObjPath {
@@ -60,18 +64,43 @@ pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
     Some(format!("{stem}.parquet"))
 }
 
-/// Read a parquet file (path relative to the Delta table root) back into Arrow
-/// RecordBatches via the object store. Powers indexing a file that's already
-/// committed (post-optimize reindex, reconcile, backfill) — unlike the flush
-/// path it has no live in-memory batches to consume.
-pub async fn read_parquet_batches(store: Arc<dyn ObjectStore>, parquet_rel: &str) -> Result<Vec<RecordBatch>> {
+/// Stream one committed parquet through a bounded two-batch channel into the
+/// on-disk Tantivy writer, then pack and verify the completed index. This is the
+/// memory-bounded counterpart to [`build_and_pack`], retained for flush-time
+/// in-memory batches.
+pub async fn build_parquet_and_pack(
+    store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, level: i32, merge: MergeMode,
+) -> Result<(Bytes, IndexBuildStats)> {
     use deltalake::datafusion::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
     use futures::TryStreamExt;
+
     let path = ObjPath::from(parquet_rel);
     let meta = store.head(&path).await.with_context(|| format!("head {parquet_rel}"))?;
     let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
-    let stream = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?.build().context("build parquet stream")?;
-    stream.try_collect::<Vec<_>>().await.context("collect parquet batches")
+    let mut stream = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?.build().context("build parquet stream")?;
+    let tmp = tempfile::tempdir().context("build_parquet_and_pack: tempdir")?;
+    let dir = tmp.path().to_owned();
+    let (tx, rx) = tokio::sync::mpsc::channel(PARQUET_INDEX_BATCH_WINDOW);
+    let build = tokio::task::spawn_blocking(move || crate::tantivy_index::builder::build_stream_to_dir(table, &dir, rx, merge));
+
+    let decode = async {
+        while let Some(batch) = stream.try_next().await.context("decode parquet batch")? {
+            tx.send(batch).await.map_err(|_| anyhow!("tantivy streaming writer stopped before parquet decode completed"))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(tx);
+    let built = build.await.context("join streaming tantivy build")?;
+    decode?;
+    let (_built, stats) = built?;
+    tokio::task::spawn_blocking(move || {
+        let blob = pack_dir(tmp.path(), level)?;
+        verify_blob(&blob).context("verify packed blob")?;
+        Ok::<_, anyhow::Error>((blob, stats))
+    })
+    .await
+    .context("join tantivy pack")?
 }
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot, then

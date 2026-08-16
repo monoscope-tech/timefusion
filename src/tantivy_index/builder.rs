@@ -102,6 +102,36 @@ pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatc
     let mut stats = IndexBuildStats::default();
     batches.iter().try_for_each(|batch| index_batch(built, &mut writer, batch, &mut stats))?;
     stats.batches = batches.len() as u32;
+    finish_writer(index, writer, stats, merge)
+}
+
+/// Build a committed-file index from a bounded channel of decoded parquet
+/// batches. The reader and Tantivy writer run concurrently, so only the
+/// channel's small window remains live; the old committed-file path collected
+/// the entire wide parquet into Arrow before indexing and a sub-512 MiB file
+/// OOM-killed a 12 GiB repair cgroup in production.
+///
+/// Must run on a blocking thread: `IndexWriter` is CPU/blocking work and
+/// `blocking_recv` intentionally keeps it off Tokio's async workers.
+pub fn build_stream_to_dir(
+    table: &TableSchema, dir: &std::path::Path, mut batches: tokio::sync::mpsc::Receiver<RecordBatch>, merge: MergeMode,
+) -> Result<(BuiltSchema, IndexBuildStats)> {
+    let built = build_for_table(table);
+    let mmap_dir = tantivy::directory::MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
+    let index = Index::create(mmap_dir, built.schema.clone(), Default::default()).map_err(|e| anyhow!("create disk index: {e}"))?;
+    crate::tantivy_index::schema::register_tokenizers(&index);
+    let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    let mut stats = IndexBuildStats::default();
+    while let Some(batch) = batches.blocking_recv() {
+        index_batch(&built, &mut writer, &batch, &mut stats)?;
+        stats.batches = stats.batches.saturating_add(1);
+    }
+    let stats = finish_writer(&index, writer, stats, merge)?;
+    Ok((built, stats))
+}
+
+fn finish_writer(index: &Index, mut writer: IndexWriter, mut stats: IndexBuildStats, merge: MergeMode) -> Result<IndexBuildStats> {
     writer.commit().context("tantivy commit")?;
     let segment_ids = index.searchable_segment_ids().map_err(|e| anyhow!("list segments: {e}"))?;
     stats.segments = segment_ids.len();
@@ -381,5 +411,27 @@ mod tests {
 
         // Merging is semantically invisible: same hits, same ts/id/ordinals.
         assert_eq!(error_hits(&index, &built), unmerged);
+    }
+
+    #[test]
+    fn committed_file_build_consumes_a_bounded_batch_stream() {
+        assert_eq!(crate::tantivy_index::store::PARQUET_INDEX_BATCH_WINDOW, 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::tantivy_index::store::PARQUET_INDEX_BATCH_WINDOW);
+        std::thread::scope(|scope| {
+            let dir = tmp.path();
+            let table = table();
+            let build = scope.spawn(move || build_stream_to_dir(&table, dir, rx, MergeMode::Now).unwrap());
+            for n in 0..3 {
+                tx.blocking_send(batch(n)).unwrap();
+            }
+            drop(tx);
+            let (built, stats) = build.join().unwrap();
+            assert_eq!(stats.batches, 3);
+            assert_eq!(stats.rows, 3);
+            assert_eq!(stats.segments, 1);
+            let index = crate::tantivy_index::store::open_index(tmp.path()).unwrap();
+            assert_eq!(error_hits(&index, &built).len(), 1);
+        });
     }
 }

@@ -13077,7 +13077,8 @@ impl Database {
                     // WARM BEFORE EVICT: a wave swaps K bins at once, so
                     // evicting first would cold-start the hottest query window
                     // every wave (the 2026-07-21 cache-thrash lesson).
-                    self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
+                    let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
+                    self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                     Self::record_wave_landed(&fresh, data_change);
                     return WaveResult { landed: concat_landed(carried, fresh), failed };
                 }
@@ -13105,7 +13106,8 @@ impl Database {
                         CommitProbe::Landed => {
                             warn!("{engine} wave for '{}' reported an error but LANDED (post-commit hook failed): {}", table_name, e);
                             let post = { table_ref.read().await.clone() };
-                            self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
+                            let live_uris = self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
+                            self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                             self.clear_bin_intents(&fresh);
                             Self::record_wave_landed(&fresh, data_change);
                             return WaveResult { landed: concat_landed(carried, fresh), failed };
@@ -13144,6 +13146,42 @@ impl Database {
             }
         }
         WaveResult { landed: carried, failed }
+    }
+
+    /// Publish search sidecars for every file a coordinator/dedup wave just
+    /// committed. The legacy optimize path already did this; `commit_wave`
+    /// did not, so every coordinator rewrite created a fresh coverage hole and
+    /// queries fell back to a multi-gigabyte raw leg until the nightly global
+    /// reconcile. Awaiting publication keeps a successfully returned wave
+    /// covered. Failure remains correctness-safe (hybrid reads use raw data)
+    /// and is visible for the reconcile retry path.
+    async fn reindex_wave_outputs(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, bins: &[StagedBin], live_uris: &[String]) {
+        let Some(svc) = self.tantivy_indexer().cloned().filter(|svc| svc.config.is_table_indexed(table_name)) else {
+            return;
+        };
+        let files = wave_added_parquet(bins, live_uris);
+        if files.is_empty() {
+            return;
+        }
+        let store = { table_ref.read().await.log_store().object_store(None) };
+        let table = table_name.to_owned();
+        let mut jobs = futures::stream::iter(files.into_iter().map(|(project, rel, uri)| {
+            let (svc, store, table) = (svc.clone(), store.clone(), table.clone());
+            async move { svc.build_index_for_file(&table, &project, &rel, &uri, store).await }
+        }))
+        .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
+        let mut built = 0usize;
+        let mut failed = 0usize;
+        while let Some(result) = jobs.next().await {
+            match result {
+                Ok(()) => built += 1,
+                Err(error) => {
+                    failed += 1;
+                    warn!(table_name, %error, event = "tantivy_wave_reindex_failed");
+                }
+            }
+        }
+        info!(table_name, built, failed, event = "tantivy_wave_reindex_complete");
     }
 
     /// Per-engine counters for a landed wave. Dedup's dropped-row accounting is
@@ -15059,6 +15097,27 @@ impl StagedBin {
 struct WaveResult {
     landed: Vec<StagedBin>,
     failed: Vec<StagedBin>,
+}
+
+/// Match a wave's committed Add actions to the absolute URIs from the exact
+/// post-commit snapshot. Index manifests store absolute URIs for coverage,
+/// while the Add action and Delta object store use table-relative paths; keep
+/// that conversion in one pure, testable boundary.
+fn wave_added_parquet(bins: &[StagedBin], live_uris: &[String]) -> Vec<(String, String, String)> {
+    let by_rel: HashMap<&str, &str> =
+        live_uris.iter().filter_map(|uri| crate::tantivy_index::service::parquet_rel_of_uri(uri).map(|rel| (rel, uri.as_str()))).collect();
+    bins.iter()
+        .flat_map(|bin| {
+            bin.adds.iter().filter_map(|action| {
+                let deltalake::kernel::Action::Add(add) = action else {
+                    return None;
+                };
+                let rel = add.path.as_str();
+                let uri = by_rel.get(rel)?;
+                Some((bin.project_id.clone(), rel.to_owned(), (*uri).to_owned()))
+            })
+        })
+        .collect()
 }
 
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
@@ -20325,6 +20384,29 @@ mod tests {
             stage_store: Arc::new(object_store::memory::InMemory::new()),
             dedup,
         }
+    }
+
+    #[test]
+    fn committed_wave_adds_map_to_exact_live_tantivy_uris() {
+        let mut alpha = staged_unit("alpha", &["old-a.parquet"], None);
+        let mut beta = staged_unit("beta", &["old-b.parquet"], None);
+        let alpha_rel = "project_id=alpha/date=2026-08-16/alpha-new.parquet";
+        let beta_rel = "project_id=beta/date=2026-08-16/beta-new.parquet";
+        if let deltalake::kernel::Action::Add(add) = &mut alpha.adds[0] {
+            add.path = alpha_rel.into();
+        }
+        if let deltalake::kernel::Action::Add(add) = &mut beta.adds[0] {
+            add.path = beta_rel.into();
+        }
+        let alpha_uri = format!("s3://bucket/table/{alpha_rel}");
+        let beta_uri = format!("s3://bucket/table/{beta_rel}");
+        let unrelated = "s3://bucket/table/project_id=gamma/date=2026-08-16/other.parquet".to_owned();
+
+        assert_eq!(
+            super::wave_added_parquet(&[alpha, beta], &[unrelated, beta_uri.clone(), alpha_uri.clone()]),
+            vec![("alpha".into(), alpha_rel.into(), alpha_uri), ("beta".into(), beta_rel.into(), beta_uri)],
+            "only this wave's live Adds become committed-file index jobs"
+        );
     }
 
     fn dedup_unit(date: &str, before: u64, after: u64) -> super::DedupUnit {
