@@ -8863,8 +8863,8 @@ impl Database {
     }
 
     /// Reconcile the durable task cursor with each live Delta snapshot. This is
-    /// intentionally metadata-only and conservative: if any commit landed
-    /// after the cursor, every currently-active source partition is queued.
+    /// intentionally metadata-only and conservative: commits after the cursor
+    /// contribute only the partitions named by data-changing Add/Remove actions.
     /// A crash before the cursor checkpoint repeats work; a crash after it is
     /// safe because every task checkpoint happened first.
     async fn reconcile_maintenance_task_cursors(&self) -> Result<usize> {
@@ -8875,9 +8875,9 @@ impl Database {
         let mut queued = 0usize;
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { continue };
-            let version = {
+            let (version, log_store) = {
                 let table = table_ref.read().await;
-                table.version().unwrap_or_default()
+                (table.version().unwrap_or_default(), table.log_store())
             };
             let cursor_key = format!("{storage_project}:{source}");
             let current_cursor = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).source_cursor(&cursor_key);
@@ -8896,10 +8896,28 @@ impl Database {
             if current_cursor.is_some_and(|cursor| cursor >= version) {
                 continue;
             }
-            let partitions = {
-                let table = table_ref.read().await;
-                Self::partition_fingerprints(&table, tiebreak_of(&source))?.into_keys().collect::<Vec<_>>()
-            };
+            let cursor = current_cursor.expect("missing cursor handled above");
+            let mut partitions = HashSet::new();
+            for commit_version in cursor.saturating_add(1)..=version {
+                let bytes = log_store
+                    .read_commit_entry(commit_version)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("source commit {commit_version} is unavailable for {cursor_key}; cursor remains at {cursor}"))?;
+                for action in deltalake::logstore::get_actions(commit_version, &bytes)? {
+                    let changed = match action {
+                        deltalake::kernel::Action::Add(add) if add.data_change => {
+                            Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values))
+                        }
+                        deltalake::kernel::Action::Remove(remove) if remove.data_change => {
+                            Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref())
+                        }
+                        _ => None,
+                    };
+                    if let Some(partition) = changed {
+                        partitions.insert(partition);
+                    }
+                }
+            }
             for (partition_project, date) in partitions {
                 let project = if storage_project.is_empty() { partition_project } else { storage_project.clone() };
                 self.enqueue_maintenance_hours(&project, &source, &date, crate::rollup::ALL_HOURS)?;
@@ -8910,6 +8928,14 @@ impl Database {
             journal.checkpoint()?;
         }
         Ok(queued)
+    }
+
+    fn maintenance_partition_from_action(path: &str, partition_values: Option<&HashMap<String, Option<String>>>) -> Option<(String, String)> {
+        let value = |name: &str| partition_values.and_then(|values| values.get(name)).and_then(Option::as_deref).map(str::to_owned);
+        let path_value = |name: &str| path.split('/').find_map(|segment| segment.strip_prefix(&format!("{name}="))).map(str::to_owned);
+        let date = value("date").or_else(|| path_value("date"))?;
+        let project = value("project_id").or_else(|| path_value("project_id")).unwrap_or_else(|| "default".to_owned());
+        Some((project, date))
     }
 
     async fn plan_compaction_debt(&self) -> Result<usize> {
@@ -18906,6 +18932,26 @@ mod tests {
         assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
         assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), Some(version));
         Ok(())
+    }
+
+    #[test]
+    fn maintenance_reconciliation_extracts_only_the_changed_partition() {
+        let values = HashMap::from([("project_id".to_owned(), Some("customer-a".to_owned())), ("date".to_owned(), Some("2026-08-16".to_owned()))]);
+        assert_eq!(Database::maintenance_partition_from_action("ignored.parquet", Some(&values)), Some(("customer-a".to_owned(), "2026-08-16".to_owned())));
+
+        // Older writers may omit partitionValues on Remove. The file path is
+        // still sufficient, so a delete cannot advance the cursor without
+        // invalidating the affected slice.
+        assert_eq!(
+            Database::maintenance_partition_from_action("project_id=customer-b/date=2026-08-15/part-000.parquet", None,),
+            Some(("customer-b".to_owned(), "2026-08-15".to_owned()))
+        );
+
+        assert_eq!(
+            Database::maintenance_partition_from_action("date=2026-08-14/part-000.parquet", None),
+            Some(("default".to_owned(), "2026-08-14".to_owned()))
+        );
+        assert_eq!(Database::maintenance_partition_from_action("part-000.parquet", None), None);
     }
 
     /// A single node must not launch independent dedup/rollup/compaction object
