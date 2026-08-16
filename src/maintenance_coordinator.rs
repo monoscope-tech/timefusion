@@ -21,6 +21,8 @@ pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
+const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
 pub const TAG_SOURCE: &str = "timefusion.source";
 pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
@@ -727,8 +729,8 @@ impl TaskJournal {
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
         let mut oldest_created = u64::MAX;
+        let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let now_micros = crate::clock::now_micros();
-        let mut oldest_eligible_deadline = i64::MAX;
         for task in &self.snapshot.tasks {
             let index = match task.state {
                 TaskState::Pending => 0,
@@ -741,13 +743,11 @@ impl TaskJournal {
             if !matches!(task.state, TaskState::Complete | TaskState::Superseded) {
                 backlog_bytes = backlog_bytes.saturating_add(task.estimated_decoded_bytes);
                 oldest_created = oldest_created.min(task.created_unix_ms);
-                if task.deadline_micros <= now_micros {
-                    oldest_eligible_deadline = oldest_eligible_deadline.min(task.deadline_micros);
-                }
                 if task.key.operation == Operation::SealedConsolidation {
                     sealed_debt_bytes = sealed_debt_bytes.saturating_add(task.estimated_decoded_bytes);
                 }
             }
+            track_latest_frontier_rollup(&mut latest_frontier_rollup, task, now_micros);
         }
         stats.maintenance_tasks_pending.store(counts[0], Relaxed);
         stats.maintenance_tasks_running.store(counts[1], Relaxed);
@@ -755,11 +755,7 @@ impl TaskJournal {
         stats.maintenance_tasks_complete.store(counts[3], Relaxed);
         stats.maintenance_backlog_bytes.store(backlog_bytes, Relaxed);
         stats.sealed_compaction_debt_bytes.store(sealed_debt_bytes, Relaxed);
-        let eligible_lag_secs = if oldest_eligible_deadline == i64::MAX {
-            0
-        } else {
-            u64::try_from(now_micros.saturating_sub(oldest_eligible_deadline).div_euclid(1_000_000)).unwrap_or_default()
-        };
+        let eligible_lag_secs = frontier_lag_secs(latest_frontier_rollup.values().copied(), now_micros);
         stats.maintenance_eligible_watermark_lag_secs.store(eligible_lag_secs, Relaxed);
         stats
             .maintenance_raw_tail_duration_secs
@@ -784,8 +780,8 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
     let mut groups: BTreeMap<(u8, u8, i64), HashMap<&str, VecDeque<&MaintenanceTask>>> = BTreeMap::new();
     for task in tasks {
         if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
-            let (recency, deadline) = scheduling_class(task, now_micros);
-            groups.entry((recency, task.key.operation.priority(), deadline)).or_default().entry(&task.key.project_id).or_default().push_back(task);
+            let (class, order_key) = scheduling_class(task, now_micros);
+            groups.entry((class, task.key.operation.priority(), order_key)).or_default().entry(&task.key.project_id).or_default().push_back(task);
         }
     }
     let mut ready = Vec::new();
@@ -808,14 +804,62 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
     ready
 }
 
-/// Deadline-equivalent tasks rotate fairly, but recent slices form the urgent
-/// class so an overdue historical shadow build cannot extend the live raw tail.
-/// Minute buckets absorb insignificant enqueue/checkpoint skew between projects.
+/// Keep the live finalized frontier ahead of historical debt. Within the
+/// frontier, newest eligible slices run first so sustained backfill cannot make
+/// the raw tail grow without bound; tasks in the same minute still rotate by
+/// project in `claim_next`. Once the frontier is caught up, historical work
+/// returns to oldest-deadline order.
+///
+/// This is intentionally based on event time, not mutation deadline. A late
+/// correction to old data is a bounded historical hole; treating its recent
+/// mutation as live-tail work would let backfill displace current coverage.
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
-    const RECENT_WINDOW_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
-    const DEADLINE_BUCKET_MICROS: i64 = 60 * 1_000_000;
-    let recency = u8::from(task.key.slice.end_micros < now_micros.saturating_sub(RECENT_WINDOW_MICROS));
-    (recency, task.deadline_micros.div_euclid(DEADLINE_BUCKET_MICROS))
+    if is_live_frontier(task.key.slice, now_micros) {
+        // Smaller tuples run first. Negating makes the newest minute the most
+        // urgent while keeping all projects in that minute deadline-equivalent.
+        (0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+    } else {
+        (1, task.deadline_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+    }
+}
+
+fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
+    slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && slice.start_micros <= now_micros
+}
+
+fn track_latest_frontier_rollup<'a>(latest: &mut HashMap<(&'a str, &'a str, &'a str), &'a MaintenanceTask>, task: &'a MaintenanceTask, now_micros: i64) {
+    if task.key.operation != Operation::BaseRollup || !is_live_frontier(task.key.slice, now_micros) {
+        return;
+    }
+    let stream = (task.key.source.as_str(), task.key.project_id.as_str(), task.key.physical_table.as_str());
+    let active = u8::from(!matches!(task.state, TaskState::Complete | TaskState::Superseded));
+    if latest.get(&stream).is_none_or(|current| {
+        let current_active = u8::from(!matches!(current.state, TaskState::Complete | TaskState::Superseded));
+        (task.key.slice.end_micros, active, task.deadline_micros) > (current.key.slice.end_micros, current_active, current.deadline_micros)
+    }) {
+        latest.insert(stream, task);
+    }
+}
+
+fn frontier_lag_secs<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> u64 {
+    tasks
+        .into_iter()
+        .filter(|task| !matches!(task.state, TaskState::Complete | TaskState::Superseded) && task.deadline_micros <= now_micros)
+        .map(|task| u64::try_from(now_micros.saturating_sub(task.deadline_micros).div_euclid(1_000_000)).unwrap_or_default())
+        .max()
+        .unwrap_or_default()
+}
+
+/// Additional delay beyond the 15-minute quiet-period watermark for the live
+/// rollup frontier. Historical holes remain visible through backlog and oldest
+/// task age, but do not inflate the raw-tail gauge.
+#[cfg(test)]
+fn live_frontier_lag_secs<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> u64 {
+    let mut latest: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
+    for task in tasks {
+        track_latest_frontier_rollup(&mut latest, task, now_micros);
+    }
+    frontier_lag_secs(latest.values().copied(), now_micros)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1035,6 +1079,88 @@ mod tests {
         let recent = task("recent", now - MIN_SLICE_MICROS, now, Operation::BaseRollup);
         let ready = fair_ready_tasks([&old, &recent], now);
         assert_eq!(ready.first().expect("ready task").key.project_id, "recent");
+    }
+
+    #[test]
+    fn newest_eligible_frontier_slice_precedes_older_frontier_debt() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let older_start = now - 12 * 60 * 60 * 1_000_000;
+        let older = task("older", older_start, older_start + MIN_SLICE_MICROS, Operation::BaseRollup);
+        let newest = task("newest", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
+        let ready = fair_ready_tasks([&older, &newest], now);
+        assert_eq!(ready.first().expect("ready task").key.project_id, "newest");
+    }
+
+    #[test]
+    fn frontier_minute_rotates_fairly_across_projects() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let start = now - 2 * MIN_SLICE_MICROS;
+        let a = task("a", start, start + MIN_SLICE_MICROS, Operation::BaseRollup);
+        let b = task("b", start, start + MIN_SLICE_MICROS, Operation::BaseRollup);
+        let c = task("c", start, start + MIN_SLICE_MICROS, Operation::BaseRollup);
+        let ready = fair_ready_tasks([&c, &a, &b], now);
+        assert_eq!(ready.iter().map(|task| task.key.project_id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn recently_mutated_historical_hole_does_not_displace_frontier() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let mut correction = task("correction", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
+        correction.deadline_micros = now - 1;
+        let mut frontier = task("frontier", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
+        frontier.deadline_micros = now - 60 * 1_000_000;
+        let ready = fair_ready_tasks([&correction, &frontier], now);
+        assert_eq!(ready.first().expect("ready task").key.project_id, "frontier");
+    }
+
+    #[test]
+    fn future_clock_slice_does_not_displace_live_frontier() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let future = task("future", now + 24 * 60 * 60 * 1_000_000, now + 24 * 60 * 60 * 1_000_000 + MIN_SLICE_MICROS, Operation::BaseRollup);
+        let frontier = task("frontier", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
+        let ready = fair_ready_tasks([&future, &frontier], now);
+        assert_eq!(ready.first().expect("ready task").key.project_id, "frontier");
+    }
+
+    #[test]
+    fn historical_debt_remains_oldest_deadline_first() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let mut older_deadline = task("a", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
+        older_deadline.deadline_micros = now - 2 * 60 * 1_000_000;
+        let mut newer_deadline = task("b", MIN_SLICE_MICROS, 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
+        newer_deadline.deadline_micros = now - 60 * 1_000_000;
+        let ready = fair_ready_tasks([&newer_deadline, &older_deadline], now);
+        assert_eq!(ready.first().expect("ready task").key.project_id, "a");
+    }
+
+    #[test]
+    fn live_frontier_lag_ignores_historical_holes() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let mut historical = task("project", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
+        historical.deadline_micros = now - 4 * 60 * 60 * 1_000_000;
+        assert_eq!(live_frontier_lag_secs([&historical], now), 0);
+    }
+
+    #[test]
+    fn live_frontier_lag_tracks_only_each_streams_newest_slice() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let mut older = task("project", now - 3 * MIN_SLICE_MICROS, now - 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
+        older.deadline_micros = now - 10 * 60 * 1_000_000;
+        let mut newest = task("project", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
+        newest.deadline_micros = now - 2 * 60 * 1_000_000;
+        assert_eq!(live_frontier_lag_secs([&older, &newest], now), 2 * 60);
+        newest.state = TaskState::Complete;
+        assert_eq!(live_frontier_lag_secs([&older, &newest], now), 0, "an older hole is not the raw tail once newer coverage landed");
+    }
+
+    #[test]
+    fn live_frontier_lag_reports_the_slowest_project() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let mut fast = task("fast", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
+        fast.deadline_micros = now - 60 * 1_000_000;
+        let mut slow = task("slow", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
+        slow.deadline_micros = now - 5 * 60 * 1_000_000;
+        assert_eq!(live_frontier_lag_secs([&fast, &slow], now), 5 * 60);
     }
 
     #[test]
@@ -1301,6 +1427,19 @@ mod tests {
         assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES));
         assert_eq!(journal.tasks().filter(|task| task.state == TaskState::Pending).count(), 2);
         assert_eq!(journal.state(&key), Some(TaskState::Superseded));
+    }
+
+    #[test]
+    fn live_frontier_lag_prefers_pending_split_child_over_superseded_parent() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut input = task("p", now - NORMAL_SLICE_MICROS, now, Operation::BaseRollup);
+        input.deadline_micros = now - 2 * 60 * 1_000_000;
+        let key = input.key.clone();
+        journal.upsert(input);
+        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES));
+        assert_eq!(live_frontier_lag_secs(journal.tasks(), now), 2 * 60);
     }
 
     #[test]
