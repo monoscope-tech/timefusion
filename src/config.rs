@@ -478,8 +478,19 @@ impl DerivedBudget {
     pub fn coordinator_jobs(&self) -> usize {
         std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or_else(|| {
             let mem_bound = self.maintenance_pool_bytes / (512 * 1024 * 1024);
-            let cpu_bound = self.cores / 8;
-            mem_bound.min(cpu_bound).clamp(1, 6)
+            // cores/8 (cap 6) was the first step off the hard-coded 1, chosen
+            // conservatively because nothing had been measured yet. Six hours on
+            // prod since then: 6 jobs held ~3 GiB of tracked decode with RSS at
+            // 12% of the cgroup, zero OCC conflicts, zero restarts, and the live
+            // frontier keeping up (`eligible_watermark_lag_seconds` 0) — while
+            // the 8 TB sealed-compaction debt did not drain at all and
+            // `oldest_task_age_seconds` kept climbing. The box is not the
+            // constraint; the clamp is. cores/4 (cap 12) is 6 GiB of tracked
+            // decode against 85.9 GiB, still far below the 48-way exposure that
+            // starved health checks on 2026-08-16, and the dedicated maintenance
+            // runtime is what protects liveness either way.
+            let cpu_bound = self.cores / 4;
+            mem_bound.min(cpu_bound).clamp(1, 12)
         })
     }
 
