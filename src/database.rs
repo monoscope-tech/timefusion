@@ -3656,18 +3656,27 @@ impl Database {
                                     if cancel.is_cancelled() {
                                         return;
                                     }
-                                    match db.run_maintenance_coordinator_once().await {
-                                        Ok(true) => tokio::task::yield_now().await,
-                                        Ok(false) => tokio::select! {
+                                    const UNIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+                                    match tokio::time::timeout(UNIT_TIMEOUT, db.run_maintenance_coordinator_once()).await {
+                                        Ok(Ok(true)) => tokio::task::yield_now().await,
+                                        Ok(Ok(false)) => tokio::select! {
                                             _ = cancel.cancelled() => return,
                                             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                                         },
-                                        Err(error) => {
+                                        Ok(Err(error)) => {
                                             warn!(worker, %error, event = "maintenance_coordinator_error");
                                             tokio::select! {
                                                 _ = cancel.cancelled() => return,
                                                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                                             }
+                                        }
+                                        Err(_) => {
+                                            // Dropping the future drops its TaskLease, which
+                                            // durably requeues the claimed unit and releases
+                                            // every admission token. A whale or wedged object
+                                            // read therefore costs one bounded turn instead of
+                                            // freezing maintenance for every project forever.
+                                            warn!(worker, timeout_seconds = UNIT_TIMEOUT.as_secs(), event = "maintenance_coordinator_unit_timed_out");
                                         }
                                     }
                                 }
@@ -9089,6 +9098,8 @@ impl Database {
         };
         let Some(task) = task else { return Ok(false) };
         let key = task.key.clone();
+        info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
         let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
             let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
@@ -9154,6 +9165,8 @@ impl Database {
         };
         let Some(task) = task else { return Ok(false) };
         let key = task.key.clone();
+        info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
         let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
             let delay = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
@@ -9548,6 +9561,8 @@ impl Database {
         };
         let Some(task) = task else { return Ok(false) };
         let key = task.key.clone();
+        info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, seconds: u64| -> Result<()> {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

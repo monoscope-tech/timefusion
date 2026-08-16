@@ -218,7 +218,9 @@ impl Drop for TaskLease {
     fn drop(&mut self) {
         let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if journal.state(&self.key) == Some(TaskState::Running) {
-            journal.retry(&self.key, "worker_error".to_owned(), crate::clock::now_micros().saturating_add(1_000_000));
+            let attempts = journal.task_indices.get(&self.key).and_then(|index| journal.snapshot.tasks.get(*index)).map_or(1, |task| task.attempts).min(8);
+            let delay_micros = i64::try_from((1u64 << attempts).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+            journal.retry(&self.key, "worker_error".to_owned(), crate::clock::now_micros().saturating_add(delay_micros));
             if let Err(error) = journal.checkpoint() {
                 tracing::error!(error = %error, task = ?self.key, "failed to checkpoint maintenance task lease recovery");
             }
@@ -1134,9 +1136,15 @@ mod tests {
         assert!(journal.mark_running(&key));
         journal.checkpoint().expect("running checkpoint");
         let journal = Arc::new(Mutex::new(journal));
+        let before_drop = crate::clock::now_micros();
         drop(TaskLease::new(Arc::clone(&journal), key.clone()));
 
-        assert_eq!(journal.lock().expect("lock").state(&key), Some(TaskState::Retry));
+        let journal_guard = journal.lock().expect("lock");
+        assert_eq!(journal_guard.state(&key), Some(TaskState::Retry));
+        let task = journal_guard.snapshot.tasks.iter().find(|task| task.key == key).expect("requeued task");
+        assert_eq!(task.retry_reason.as_deref(), Some("worker_error"));
+        assert!(task.deadline_micros >= before_drop + 2_000_000, "first failed attempt must use the same exponential backoff as explicit worker errors");
+        drop(journal_guard);
         let loaded = TaskJournal::load(dir.path()).expect("load checkpoint");
         assert_eq!(loaded.state(&key), Some(TaskState::Retry));
     }
