@@ -819,7 +819,22 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
         // urgent while keeping all projects in that minute deadline-equivalent.
         (0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     } else {
-        (1, task.deadline_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        // Newest slice first here too, for the same reason the dedup drain and
+        // the rollup backfill are newest-first: recent days are what dashboards
+        // read, and history is debt nobody is querying.
+        //
+        // This was `deadline_micros` ascending — oldest-FIRST — which is the
+        // opposite. Prod 2026-08-17, over 84 task starts: 74 went to the live
+        // frontier (correct), and every one of the other 10 landed on
+        // 2026-08-01, 07-22, 07-16, 07-15, 06-29, 06-15, 06-02, 06-01, 05-28.
+        // All of the historical capacity was spent on data months old while the
+        // last 30 days — the window a 30d dashboard query actually needs
+        // certified and rolled up — was never reached. Coverage sat at two days.
+        //
+        // Eligibility is still deadline-gated in `claim_next`
+        // (`deadline_micros <= now`), so retry backoff is unaffected; this only
+        // orders the tasks that are already runnable.
+        (1, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     }
 }
 
@@ -1122,15 +1137,31 @@ mod tests {
         assert_eq!(ready.first().expect("ready task").key.project_id, "frontier");
     }
 
+    /// Historical debt runs newest SLICE first, not oldest deadline first.
+    ///
+    /// This asserted the opposite until 2026-08-17, with no stated reason.
+    /// Oldest-first is FIFO-fair, but it spends the whole non-frontier budget on
+    /// the oldest data in the store — which is the data nobody queries. Prod,
+    /// over 84 task starts: 74 went to the live frontier (correct) and every one
+    /// of the other 10 landed on 2026-08-01, 07-22, 07-16, 07-15, 06-29, 06-15,
+    /// 06-02, 06-01, 05-28. Meanwhile rollup coverage for a live tenant sat at
+    /// two days and every 7d/14d/30d query fell back to a raw scan.
+    ///
+    /// Newest-first does not starve old debt: frontier work is rate-limited by
+    /// ingest and recent slices are finite, so once the recent window drains the
+    /// ordering walks backward on its own. What it guarantees is that the window
+    /// a dashboard actually reads is reached FIRST.
     #[test]
-    fn historical_debt_remains_oldest_deadline_first() {
+    fn historical_debt_runs_newest_slice_first() {
         let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let mut older_deadline = task("a", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
-        older_deadline.deadline_micros = now - 2 * 60 * 1_000_000;
-        let mut newer_deadline = task("b", MIN_SLICE_MICROS, 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
-        newer_deadline.deadline_micros = now - 60 * 1_000_000;
-        let ready = fair_ready_tasks([&newer_deadline, &older_deadline], now);
-        assert_eq!(ready.first().expect("ready task").key.project_id, "a");
+        // Older slice, and the older deadline too — under the previous ordering
+        // this ran first purely because it had been waiting longest.
+        let mut older_slice = task("a", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
+        older_slice.deadline_micros = now - 2 * 60 * 1_000_000;
+        let mut newer_slice = task("b", MIN_SLICE_MICROS, 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
+        newer_slice.deadline_micros = now - 60 * 1_000_000;
+        let ready = fair_ready_tasks([&older_slice, &newer_slice], now);
+        assert_eq!(ready.first().expect("ready task").key.project_id, "b", "the more recent slice is the one a dashboard query needs");
     }
 
     #[test]
