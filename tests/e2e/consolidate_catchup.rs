@@ -38,6 +38,10 @@ async fn explain(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<S
 async fn a_sealed_partition_converges_through_durable_bounded_tasks() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
     let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
+    // This test drives the durable coordinator explicitly below. Stop its
+    // background consumer so the assertion observes only those bounded ticks,
+    // independent of whether the configured worker count is one or many.
+    env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
     // Build a fragmented partition on a day that is already sealed once the
