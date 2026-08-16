@@ -1972,9 +1972,14 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
             "resource___service___name": service,
         })])
     };
-    // Yesterday, spread over several 1m buckets and starting mid-bucket so the
-    // left fringe is non-empty too.
-    for (i, offset) in [17i64, 61_000_000, 130_000_000, 610_000_000].iter().enumerate() {
+    // Yesterday, spread over six genuinely touched hours and starting
+    // mid-bucket so the left fringe is non-empty too. The hybrid cost guard
+    // intentionally declines a rollup covering less than 20% of the requested
+    // window; keeping these rows in one hour made this test depend on the old
+    // first-write bug manufacturing full-day empty coverage.
+    for (i, offset) in
+        [17i64, 61_000_000, 130_000_000, 610_000_000, 3_661_000_000, 7_330_000_000, 10_810_000_000, 14_410_000_000, 18_010_000_000].iter().enumerate()
+    {
         db.insert_records_batch(
             &project_id,
             "otel_logs_and_spans",
@@ -2030,7 +2035,32 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
         .filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0)))
         .next()
         .unwrap_or(0);
-    assert_eq!(built, 4, "certification must have rolled up all four of yesterday's spans");
+    assert_eq!(built, 9, "certification must have rolled up all nine of yesterday's spans");
+    let base_target = db.unified_tables().read().await.get("otel_logs_and_spans_rollup_dashboard_1m_v3").expect("base rollup table created").clone();
+    let tagged_files = base_target
+        .read()
+        .await
+        .snapshot()?
+        .log_data()
+        .iter()
+        .filter(|file| {
+            #[allow(deprecated)]
+            let action = file.add_action();
+            action.tags.as_ref().is_some_and(|tags| tags.contains_key(timefusion::maintenance_coordinator::TAG_SLICE_START))
+        })
+        .count();
+    assert!(tagged_files >= 6, "every independently published slice must retain its Delta Add tags");
+    let derived_built: i64 = db
+        .query_delta_only(&format!(
+            "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1h_v2 WHERE project_id = '{project_id}'"
+        ))
+        .await?
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0)))
+        .next()
+        .unwrap_or(0);
+    assert_eq!(derived_built, 9, "derived coverage must merge every independently published base slice");
 
     let rows_of = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
         batches
@@ -2086,7 +2116,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 
     assert_eq!(hybrid, raw, "the hybrid rewrite must equal the raw aggregate exactly");
     assert_eq!(hybrid.len(), 2, "both services must survive, including the one that exists only in the raw tail: {hybrid:?}");
-    assert_eq!(hybrid.iter().map(|row| row.1).sum::<i64>(), 6, "every fixture row must be counted exactly once: {hybrid:?}");
+    assert_eq!(hybrid.iter().map(|row| row.1).sum::<i64>(), 11, "every fixture row must be counted exactly once: {hybrid:?}");
 
     // THE SAME WINDOW WITH NO UPPER BOUND — the shape monoscope's 7d and 14d
     // panels actually send. Until 2026-08-15 the matcher demanded both bounds
@@ -2104,7 +2134,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let open_rows = rows_of(ctx.sql(&open).await?.collect().await?);
     assert_eq!(hits(), before + 1, "an open-ended window must route, not fall back to a raw scan (misses +{})", misses() - misses_before);
     assert_eq!(open_rows, rows_of(db.query_delta_only(&open).await?), "the open-ended rewrite must equal the raw aggregate exactly");
-    assert_eq!(open_rows.iter().map(|row| row.1).sum::<i64>(), 7, "the open tail must reach the row past the bounded window: {open_rows:?}");
+    assert_eq!(open_rows.iter().map(|row| row.1).sum::<i64>(), 12, "the open tail must reach the row past the bounded window: {open_rows:?}");
 
     // The shape prod's `rollup_declined_shape` log printed for months: a CAST
     // over an aggregate plus `ORDER BY <an aggregate> LIMIT n` optimizes to
@@ -2154,7 +2184,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let before = hits();
     let after_update = rows_of(ctx.sql(&query).await?.collect().await?);
     assert_eq!(hits(), before + 1, "a DML confined to today must leave yesterday's coverage intact (misses +{})", misses() - misses_before);
-    assert_eq!(after_update.iter().map(|row| row.1).sum::<i64>(), 6, "the enrichment must not change the counted rows: {after_update:?}");
+    assert_eq!(after_update.iter().map(|row| row.1).sum::<i64>(), 11, "the enrichment must not change the counted rows: {after_update:?}");
 
     // monoscope's Golden Signals row filter, which is exactly the predicate the
     // server_* measures declare. Unit tests pass this on a bare MemTable session;
@@ -2183,7 +2213,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let before = hits();
     let after_by_id = rows_of(ctx.sql(&query).await?.collect().await?);
     assert_eq!(hits(), before + 1, "an id-scoped DML on today's row must leave yesterday's coverage intact (misses +{})", misses() - misses_before);
-    assert_eq!(after_by_id.iter().map(|row| row.1).sum::<i64>(), 6, "the id-scoped update must not change the counted rows: {after_by_id:?}");
+    assert_eq!(after_by_id.iter().map(|row| row.1).sum::<i64>(), 11, "the id-scoped update must not change the counted rows: {after_by_id:?}");
     Ok(())
 }
 
