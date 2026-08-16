@@ -943,6 +943,9 @@ const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
 const_default!(d_sort_skip_bytes: usize = 2 * GIB);
 const_default!(d_flush_sort_pool_mb: u64 = 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
+// Matches d_dedup_lookback_days: certification and rollup coverage must span
+// the same horizon, or a day is certified but never rolled up (or vice versa).
+const_default!(d_rollup_backfill_days: u16 = 35);
 const_default!(d_rollup_backfill_schedule: String = "0 */10 * * * *");
 const_default!(d_rollup_backfill_concurrency: usize = 3);
 const_default!(d_footer_repair_schedule: String = "0 30 * * * *");
@@ -2165,9 +2168,21 @@ pub struct MaintenanceConfig {
     /// lookback, and routing needs a contiguous certified prefix from the start
     /// of the window — so a 7d or 30d query, the only kind expensive enough to
     /// be worth accelerating, can never route no matter how long the process
-    /// runs. Conservative by default: the first pass certifies each sealed day,
-    /// which is real work on a busy table.
-    #[serde(default)]
+    /// runs.
+    ///
+    /// That paragraph was written as a warning and then left true: this was
+    /// `#[serde(default)]` — 0, disabled — while the only implementation
+    /// (`rollup_backfill_tick`) had been orphaned by the coordinator redesign
+    /// and was reachable solely from tests. Prod 2026-08-17 confirmed it exactly:
+    /// `otel_logs_and_spans_rollup_dashboard_1m_v3` held rows for two dates
+    /// against 30+ days of source data, and every 7d/14d/30d query was refused
+    /// with `not_built`.
+    ///
+    /// 35 matches the dedup certification window so the two horizons cannot
+    /// drift apart. `plan_rollup_backfill` consumes this and is bounded per
+    /// pass, so a wide horizon converges over hours instead of burying the
+    /// journal in one go. Set 0 to disable.
+    #[serde(default = "d_rollup_backfill_days")]
     pub timefusion_rollup_backfill_days: u16,
     #[serde(default = "d_rollup_backfill_schedule")]
     pub timefusion_rollup_backfill_schedule: String,

@@ -9204,6 +9204,128 @@ impl Database {
         Ok(count)
     }
 
+    /// Enqueue rollup work for sealed days that have source data but no rollup
+    /// output yet.
+    ///
+    /// Nothing else does this, which is the whole reason it exists.
+    /// `reconcile_maintenance_task_cursors` only enqueues partitions named by
+    /// commits *after* its durable cursor, and DML invalidation only covers what
+    /// it touched. A day written before rollups could reach it is therefore
+    /// never enqueued by anything, and its rollup is never built. The old
+    /// `rollup_backfill_tick` covered exactly this case; the coordinator
+    /// redesign retired its cron without replacing it, leaving that function
+    /// reachable only from tests.
+    ///
+    /// Measured on prod 2026-08-17:
+    /// `otel_logs_and_spans_rollup_dashboard_1m_v3` held rows for exactly two
+    /// dates (08-15, 08-16) against 30+ days of source data, so every
+    /// 7d/14d/30d query was — correctly — refused with `not_built`. No amount
+    /// of maintenance throughput fixes that, because no task was ever queued.
+    ///
+    /// Bounded on purpose: newest-first, and at most `BACKFILL_PARTITIONS_PER_PASS`
+    /// partitions per pass. A whole horizon at once would add tens of thousands
+    /// of invalidations to a journal that is already ~18k deep, and the point is
+    /// to converge steadily without burying the live frontier.
+    pub async fn plan_rollup_backfill(&self) -> Result<usize> {
+        /// Newest-first per pass; the pass repeats on the same 60s cadence as
+        /// compaction-debt planning, so the horizon fills in over hours.
+        const BACKFILL_PARTITIONS_PER_PASS: usize = 8;
+
+        let horizon = i64::from(self.config.maintenance.timefusion_rollup_backfill_days);
+        if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
+            return Ok(0);
+        }
+        let today = crate::clock::today_utc();
+        let earliest = today - chrono::Duration::days(horizon);
+        let mut queued = 0usize;
+
+        for (storage_project, source, table_ref) in self.all_tables().await {
+            let Some(schema) = get_schema(&source) else { continue };
+            if schema.rollups.is_empty() {
+                continue;
+            }
+            // Metadata only — the Delta log already names every partition, so
+            // this never touches parquet.
+            let partitions_of = |table: &DeltaTable| -> Result<HashSet<(String, chrono::NaiveDate)>> {
+                Ok(table
+                    .snapshot()?
+                    .log_data()
+                    .iter()
+                    .filter_map(|file| {
+                        let path = file.path();
+                        let date =
+                            path.split('/').find_map(|segment| segment.strip_prefix("date=")).and_then(|value| value.parse::<chrono::NaiveDate>().ok())?;
+                        let project = path
+                            .split('/')
+                            .find_map(|segment| segment.strip_prefix("project_id="))
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| if storage_project.is_empty() { "default".to_owned() } else { storage_project.clone() });
+                        Some((project, date))
+                    })
+                    .collect())
+            };
+
+            let mut want: Vec<(String, chrono::NaiveDate)> = {
+                let table = table_ref.read().await;
+                partitions_of(&table)?
+            }
+            .into_iter()
+            // Today is the live frontier's job; only sealed days are backfill.
+            .filter(|(_, date)| *date < today && *date >= earliest)
+            .collect();
+
+            // Covered by EVERY declared tier, not just one: a date present in
+            // the 1m tier but missing from the 1h tier still refuses a 30d
+            // panel, which reads the coarse tier.
+            for spec in &schema.rollups {
+                let target = spec.table_name(&source);
+                let Ok(target_ref) = self.resolve_table(&storage_project, &target).await else { continue };
+                let covered = {
+                    let table = target_ref.read().await;
+                    partitions_of(&table)?
+                };
+                want.retain(|key| !covered.contains(key));
+            }
+            // Skip any day that already has rollup work queued. `invalidate`
+            // takes `deadline.max(new_deadline)`, so re-invalidating a day that
+            // already has an eligible task pushes that task's deadline OUT by a
+            // full finalization delay. A planner running every 60s would then
+            // hold the live frontier permanently just out of reach — the suite
+            // caught exactly that: two rollup-parity tests went from correct
+            // totals to building nothing at all.
+            //
+            // "Nothing has touched it" is the actual precondition of a backfill,
+            // so make it literal.
+            {
+                let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let queued: HashSet<(String, chrono::NaiveDate)> = journal
+                    .tasks()
+                    .filter(|task| task.key.source == source && task.state != crate::maintenance_coordinator::TaskState::Complete)
+                    .filter_map(|task| {
+                        chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| (task.key.project_id.clone(), time.date_naive()))
+                    })
+                    .collect();
+                want.retain(|key| !queued.contains(key));
+            }
+            if want.is_empty() {
+                continue;
+            }
+            // Newest first: recent days are what dashboards actually read, and
+            // an oldest-first pass spends the whole horizon on data nobody has
+            // queried yet.
+            want.sort_by(|(pa, da), (pb, db)| db.cmp(da).then_with(|| pa.cmp(pb)));
+            let total = want.len();
+            want.truncate(BACKFILL_PARTITIONS_PER_PASS);
+            for (project_id, date) in &want {
+                self.enqueue_maintenance_hours(project_id, &source, &date.to_string(), crate::rollup::ALL_HOURS)?;
+                queued = queued.saturating_add(1);
+            }
+            // Never let a bounded pass read as "covered everything".
+            info!(source, queued = want.len(), remaining = total - want.len(), horizon_days = horizon, event = "rollup_backfill_planned");
+        }
+        Ok(queued)
+    }
+
     async fn run_coordinator_dedup_once(&self) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources};
         use std::sync::atomic::Ordering::Relaxed;
@@ -9836,6 +9958,13 @@ impl Database {
             let planned = self.plan_compaction_debt().await?;
             if planned != 0 {
                 info!(planned, event = "maintenance_compaction_debt_planned");
+            }
+            // Same 60s cadence, same reason: this is historical debt nothing
+            // else will ever queue. Without it the rollup horizon never grows
+            // past the live frontier and long-window queries stay unroutable.
+            let backfilled = self.plan_rollup_backfill().await?;
+            if backfilled != 0 {
+                info!(backfilled, event = "maintenance_rollup_backfill_planned");
             }
         }
         // Interleave dependent publication with dedup instead of draining the

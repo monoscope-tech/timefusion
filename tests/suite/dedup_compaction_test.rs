@@ -177,7 +177,8 @@ async fn query_delta_only_deduplicates_so_a_rollup_build_needs_no_certification(
 #[tokio::test]
 async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_deduped_answer() -> Result<()> {
     let mut cfg = (*TestConfigBuilder::new("rollup_no_cert").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    // The backfill is off by default (0 = disabled); this test is about it.
+    // Pinned to 4 to keep this fixture's horizon small and explicit; the
+    // shipped default is 35 (it was 0/disabled until 2026-08-17).
     cfg.maintenance.timefusion_rollup_backfill_days = 4;
     let cfg = Arc::new(cfg);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
@@ -221,6 +222,58 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
         scalar(format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'"))
             .await?;
     assert_eq!(rolled, deduped_raw, "the rollup must count the DEDUPLICATED rows; counting the physical 4 is the silent-wrong-number failure");
+    Ok(())
+}
+
+/// The rollup backfill must not disturb work that is already queued.
+///
+/// Backfill exists because nothing else queues an untouched sealed day:
+/// `reconcile_maintenance_task_cursors` enqueues only partitions named by
+/// commits after its durable cursor, and DML invalidation only covers what it
+/// touched. Prod 2026-08-17 had rollup rows for exactly two dates against 30+
+/// days of source data, so every 7d/14d/30d query was refused with `not_built`.
+///
+/// But the enqueue path it reuses, `invalidate`, takes
+/// `deadline.max(new_deadline)`. So re-invalidating a day that ALREADY has an
+/// eligible task pushes that task's deadline out by a full finalization delay,
+/// and a planner running every 60s holds the live frontier permanently just out
+/// of reach. That is not hypothetical: the first version of this planner did
+/// exactly that, and two rollup-parity tests went from correct totals to
+/// building nothing at all.
+///
+/// So the precondition of a backfill — "nothing has touched this day" — has to
+/// be literal. This pins it, and pins the horizon switch that turns the whole
+/// thing off.
+#[serial]
+#[tokio::test]
+async fn rollup_backfill_leaves_already_queued_days_alone() -> Result<()> {
+    let base = TestConfigBuilder::new("rollup_coordinator_backfill").with_buffer_mode(BufferMode::Enabled).with_rollups().build();
+    assert!(base.maintenance.timefusion_rollup_backfill_days >= 30, "the shipped default must cover a 30d query; 0 disables the backfill entirely");
+
+    let db = Arc::new(Database::with_config(Arc::clone(&base)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Writing the day queues rollup work for it through the normal path.
+    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+    let ts = day.and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
+    for id in ["a", "b", "c"] {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, "op", &project_id, ts)])?], true, None).await?;
+    }
+    if let Some(layer) = db.buffered_layer() {
+        layer.flush_all_now().await?;
+    }
+
+    assert_eq!(
+        db.plan_rollup_backfill().await?,
+        0,
+        "a day that already has queued rollup work must not be re-invalidated; doing so pushes its deadline out every pass and starves the live frontier"
+    );
+
+    // The horizon switch must still turn it off, or there is no way back.
+    let mut off = (*base).clone();
+    off.maintenance.timefusion_rollup_backfill_days = 0;
+    let db_off = Arc::new(Database::with_config(Arc::new(off)).await?);
+    assert_eq!(db_off.plan_rollup_backfill().await?, 0, "horizon 0 must disable the backfill entirely");
     Ok(())
 }
 
