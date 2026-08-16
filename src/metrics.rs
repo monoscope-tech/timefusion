@@ -545,6 +545,15 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
 /// arm, so `missing_project`, `unbounded_time`, `non_decomposable` and
 /// `rewrite_schema_mismatch` were indistinguishable in prod — 29 misses that
 /// could not be diagnosed without a deploy.
+/// True once every `ROLLUP_MISS_SAMPLE` misses, for logging one refused plan
+/// with context. Misses run at several per second on a busy node, so the
+/// counter is what you alert on and this is what you diagnose with.
+pub fn sample_rollup_miss() -> bool {
+    const ROLLUP_MISS_SAMPLE: u64 = 512;
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(ROLLUP_MISS_SAMPLE)
+}
+
 pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
     use crate::rollup::MissReason as R;
     let stats = maintenance_stats();
