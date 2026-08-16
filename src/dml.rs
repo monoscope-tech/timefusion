@@ -259,7 +259,24 @@ impl QueryPlanner for DmlQueryPlanner {
                 }
             }
             Ok(None) => {}
-            Err(reason) => crate::metrics::record_rollup_miss(reason),
+            Err(reason) => {
+                crate::metrics::record_rollup_miss(reason);
+                // A miss counter alone cannot be acted on. Prod 2026-08-17 sat at
+                // ~2.7 MissingProject misses/second with rollup_hits at 0, and
+                // there was no way to tell from outside whether the refused plans
+                // were monoscope's parameterized dashboards or ad-hoc literal
+                // queries — the two need opposite fixes. Sampled so a
+                // multiple-per-second rate cannot flood the log, and the plan is
+                // only rendered when a sample is actually taken.
+                if crate::metrics::sample_rollup_miss() {
+                    warn!(
+                        reason = reason.label(),
+                        plan = %fmt_capped(&logical_plan.display_indent().to_string(), 1200),
+                        event = "rollup_miss_sampled",
+                        "rollup routing refused; falling back to the raw plan"
+                    );
+                }
+            }
         }
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
