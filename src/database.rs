@@ -16594,7 +16594,8 @@ impl ProjectRoutingTable {
     #[allow(clippy::too_many_arguments)]
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
-        exclude_files: Option<&std::collections::HashSet<String>>, row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
+        include_files: Option<&std::collections::HashSet<String>>, exclude_files: Option<&std::collections::HashSet<String>>,
+        row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Extract project_id from filters for the provider cache key.
         // Falls back to table_name-only key if absent (multi-project queries).
@@ -16607,14 +16608,14 @@ impl ProjectRoutingTable {
         // query-specific). Bail to the unrestricted path unless EVERY
         // surviving live file maps to a table-relative path — a restriction
         // that silently missed an unmappable file would drop its rows.
-        let file_selection: Option<Vec<String>> = exclude_files.filter(|e| !e.is_empty()).and_then(|exclude| {
+        let file_selection: Option<Vec<String>> = include_files.or_else(|| exclude_files.filter(|e| !e.is_empty())).and_then(|_selection| {
             // Scoped so the (non-Send) file-view iterator drops before any await.
             // `collect::<Option<_>>` reproduces the bail-the-whole-selection
             // semantics: one unmappable URI aborts the restriction entirely.
             table
                 .get_file_uris()
                 .ok()?
-                .filter(|u| u.ends_with(".parquet") && !exclude.contains(u))
+                .filter(|u| u.ends_with(".parquet") && include_files.map_or_else(|| !exclude_files.is_some_and(|e| e.contains(u)), |files| files.contains(u)))
                 .map(|u| crate::tantivy_index::service::parquet_rel_of_uri(&u).map(str::to_string))
                 .collect::<Option<Vec<String>>>()
         });
@@ -16782,6 +16783,59 @@ impl ProjectRoutingTable {
         }
 
         self.scan_via_provider(provider, state, projection, filters, limit).await
+    }
+
+    /// Build one Delta leg for complete/no Tantivy coverage, or two disjoint
+    /// legs when sidecar coverage is partial. The covered leg is narrowed by
+    /// the Tantivy id set; the uncovered leg evaluates the original filters.
+    /// Both selections come from the exact snapshot held by `table`, so a
+    /// concurrent compaction can at worst make the query use the older
+    /// snapshot—it cannot move a file between the two legs or drop it.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_delta_with_tantivy(
+        &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>, id_filter: Option<&Expr>,
+        covered_files: Option<&std::collections::HashSet<String>>, zero_hit_files: Option<&std::collections::HashSet<String>>,
+        row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>, query_time_range: Option<(i64, i64)>,
+    ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
+        let Some(covered) = covered_files else {
+            let mut narrowed = filters.to_vec();
+            narrowed.extend(id_filter.cloned());
+            return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?]);
+        };
+
+        let (lo, hi) = query_time_range.unwrap_or((i64::MIN, i64::MAX));
+        let live = table
+            .get_file_uris()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi));
+        let (mut indexed, raw): (std::collections::HashSet<String>, std::collections::HashSet<String>) = live.partition(|uri| covered.contains(uri));
+        // Complete coverage keeps the established single-provider fast path.
+        // The split is only needed when the exact snapshot has raw debt.
+        if raw.is_empty() && !indexed.is_empty() {
+            let mut narrowed = filters.to_vec();
+            narrowed.extend(id_filter.cloned());
+            return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?]);
+        }
+        if let Some(zero) = zero_hit_files {
+            indexed.retain(|uri| !zero.contains(uri));
+        }
+
+        let mut plans = Vec::with_capacity(2);
+        if !indexed.is_empty() {
+            let mut narrowed = filters.to_vec();
+            narrowed.extend(id_filter.cloned());
+            plans.push(self.scan_delta_table(table, state, projection, &narrowed, limit, Some(&indexed), None, row_selections).await?);
+        }
+        if !raw.is_empty() {
+            plans.push(self.scan_delta_table(table, state, projection, filters, limit, Some(&raw), None, None).await?);
+        }
+        // A time window can be wholly outside the snapshot's partition dates.
+        // Keep the provider path available as a conservative fallback rather
+        // than manufacturing an empty plan with a subtly different schema.
+        if plans.is_empty() {
+            plans.push(self.scan_delta_table(table, state, projection, filters, limit, None, None, None).await?);
+        }
+        Ok(plans)
     }
 
     /// Shared tail of the Delta scan: projection-index translation into the
@@ -17027,27 +17081,6 @@ impl ProjectRoutingTable {
             .collect();
 
         Ok(Arc::new(ProjectionExec::try_new(cast_exprs, plan)?))
-    }
-
-    /// Read-side coverage gate for the tantivy prefilter. Returns `true` iff
-    /// every live Delta file whose `date=` partition overlaps the query window
-    /// is present in `covered` (the union of successful indexes' covered files).
-    ///
-    /// Sound at day granularity even though search time-prunes at microsecond
-    /// granularity: any divergence (a file the gate counts in-window but whose
-    /// covering index search pruned, or an uncovered out-of-window file) only
-    /// concerns rows the query's own timestamp filter already excludes. If the
-    /// table can't be resolved, returns `false` (fail safe — skip the prefilter
-    /// rather than risk dropping rows).
-    async fn prefilter_coverage_complete(&self, project_id: &str, window: Option<(i64, i64)>, covered: &std::collections::HashSet<String>) -> bool {
-        let Ok(table_ref) = self.database.resolve_table(project_id, &self.table_name).await else {
-            return false;
-        };
-        let Ok(uris) = ({ table_ref.read().await.get_file_uris().map(|it| it.collect::<Vec<String>>()) }) else {
-            return false;
-        };
-        let (lo, hi) = window.unwrap_or((i64::MIN, i64::MAX));
-        uris.into_iter().filter(|u| u.ends_with(".parquet") && uri_date_in_window(u, lo, hi)).all(|u| covered.contains(&u))
     }
 
     /// Read-side dedup skip (`timefusion_read_dedup_skip_swept`): true iff
@@ -17779,6 +17812,12 @@ impl TableProvider for ProjectRoutingTable {
         // watermark check below.
         let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
         let mut tantivy_id_filter: Option<Expr> = None;
+        // When index coverage is partial, the indexed and raw files are read
+        // as separate Delta legs. Only the indexed leg receives the narrowing
+        // id-set; uncovered files retain the original predicate and therefore
+        // cannot lose rows. This turns coverage lag into bounded raw debt
+        // instead of making one missing sidecar poison the whole query window.
+        let mut tantivy_covered_files: Option<std::collections::HashSet<String>> = None;
         // Files the prefilter proved hold no matches (zero-hit covering
         // index) — excluded from the Delta scan when file pruning is on.
         let mut tantivy_exclude: Option<std::collections::HashSet<String>> = None;
@@ -17850,15 +17889,6 @@ impl TableProvider for ProjectRoutingTable {
                         // "covered", so the IN-list would drop its rows — skip.
                         crate::metrics::record_tantivy_prefilter_skipped();
                         debug!("Tantivy prefilter skipped for {}/{}: field_coverage_gap", project_id, self.table_name);
-                    } else if !self.prefilter_coverage_complete(&project_id, query_time_range, &delta_covered).await {
-                        // Coverage gate (correctness): `id IN (hits)` intersects,
-                        // so a live file overlapping the window that ISN'T covered
-                        // by a successful index would have its matching rows
-                        // silently dropped. If any in-window live file is
-                        // uncovered (compacted, external write, failed build),
-                        // skip the prefilter — the original predicate full-scans.
-                        crate::metrics::record_tantivy_prefilter_skipped();
-                        debug!("Tantivy prefilter skipped for {}/{}: incomplete_coverage", project_id, self.table_name);
                     } else {
                         crate::metrics::record_tantivy_prefilter_used();
                         tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
@@ -17866,10 +17896,17 @@ impl TableProvider for ProjectRoutingTable {
                             list: ids.into_iter().map(lit).collect(),
                             negated: false,
                         }));
-                        // File pruning is only sound once every gate above
-                        // passed (coverage complete, no field gap): a
-                        // zero-hit covering index then proves its files hold
-                        // no matches for the routed predicates. NEVER on a
+                        // Partition the exact snapshot at scan construction,
+                        // not a separately resolved snapshot here. A flush or
+                        // compaction can commit between index search and table
+                        // resolution; carrying the coverage set forward makes
+                        // the later split race-free.
+                        tantivy_covered_files = Some(delta_covered);
+                        // A zero-hit covering index proves its own files hold
+                        // no matches. Complete coverage excludes those files
+                        // from the single Delta leg; partial coverage excludes
+                        // them only from the indexed leg while uncovered files
+                        // scan raw. NEVER on a
                         // version_append table — a "hitless" file may hold
                         // the NEWEST version of a key whose match lives only
                         // in an older version (mutable column), and dropping
@@ -18143,9 +18180,6 @@ impl TableProvider for ProjectRoutingTable {
             // No buffered layer, query Delta directly
             debug!("No buffered layer, querying Delta only");
             let mut delta_only_filters = optimized_filters.clone();
-            if let Some(f) = tantivy_id_filter.clone() {
-                delta_only_filters.push(f);
-            }
             // The augmented key columns a skip leaves behind are projected away by
             // `project_indices` in the plan builder above, so a restore is no obstacle.
             let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
@@ -18186,8 +18220,19 @@ impl TableProvider for ProjectRoutingTable {
             // Restoring the pushed limit is only sound when nothing above the
             // scan drops rows — the tombstone filter does, regardless of dedup.
             let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
-            let plan = self
-                .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+            let plans = self
+                .scan_delta_with_tantivy(
+                    &table,
+                    state,
+                    projection,
+                    &delta_only_filters,
+                    eff_limit,
+                    tantivy_id_filter.as_ref(),
+                    tantivy_covered_files.as_ref(),
+                    tantivy_exclude.as_ref(),
+                    tantivy_row_selections.as_ref(),
+                    query_time_range,
+                )
                 .await?;
             // This leg IS the Delta read, and until now it said so to nobody:
             // `record_scan` gates every dedup counter on `has_delta`, so a
@@ -18196,7 +18241,7 @@ impl TableProvider for ProjectRoutingTable {
             // 2026-08-11 measurement was unaffected — but `query_delta_only`
             // (bypass_buffer) takes this path, so tests measured nothing at all.
             tag_shape(&|s| s.has_delta = true);
-            return wrap_result(vec![(plan, crate::read_dedup::LegKind::Delta)]);
+            return wrap_result(plans.into_iter().map(|plan| (plan, crate::read_dedup::LegKind::Delta)).collect());
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -18272,10 +18317,7 @@ impl TableProvider for ProjectRoutingTable {
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
         if mem_partitions.is_empty() && hot_plan.is_none() && hot_ranges.is_empty() {
             debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
-            let mut delta_only_filters = optimized_filters.clone();
-            if let Some(f) = tantivy_id_filter.clone() {
-                delta_only_filters.push(f);
-            }
+            let delta_only_filters = optimized_filters.clone();
             tag_shape(&|s| s.has_delta = true);
             let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
             let table = delta_table.read().await;
@@ -18295,10 +18337,21 @@ impl TableProvider for ProjectRoutingTable {
             // Restoring the pushed limit is only sound when nothing above the
             // scan drops rows — the tombstone filter does, regardless of dedup.
             let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
-            let plan = self
-                .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+            let plans = self
+                .scan_delta_with_tantivy(
+                    &table,
+                    state,
+                    projection,
+                    &delta_only_filters,
+                    eff_limit,
+                    tantivy_id_filter.as_ref(),
+                    tantivy_covered_files.as_ref(),
+                    tantivy_exclude.as_ref(),
+                    tantivy_row_selections.as_ref(),
+                    query_time_range,
+                )
                 .await?;
-            return wrap_result(vec![(plan, crate::read_dedup::LegKind::Delta)]);
+            return wrap_result(plans.into_iter().map(|plan| (plan, crate::read_dedup::LegKind::Delta)).collect());
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
@@ -18367,10 +18420,6 @@ impl TableProvider for ProjectRoutingTable {
                 _ => outside,
             });
         }
-        if let Some(f) = tantivy_id_filter.clone() {
-            delta_filters.push(f);
-        }
-
         // Execute Delta query — fast path skips the 3 tokio RwLock `.await`s
         // when we've already resolved this (project, table) pair before.
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
@@ -18385,8 +18434,20 @@ impl TableProvider for ProjectRoutingTable {
             }
         };
         let table = delta_table.read().await;
-        let delta_plan =
-            self.scan_delta_table(&table, state, projection, &delta_filters, limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref()).await?;
+        let delta_plans = self
+            .scan_delta_with_tantivy(
+                &table,
+                state,
+                projection,
+                &delta_filters,
+                limit,
+                tantivy_id_filter.as_ref(),
+                tantivy_covered_files.as_ref(),
+                tantivy_exclude.as_ref(),
+                tantivy_row_selections.as_ref(),
+                query_time_range,
+            )
+            .await?;
         tag_shape(&|s| s.has_delta = true);
 
         // Union the legs in recency order — mem, then hot tier, then Delta — so
@@ -18397,8 +18458,9 @@ impl TableProvider for ProjectRoutingTable {
         // Identity travels WITH the plan, so the flatten cannot desynchronise it
         // from the sortability it implies (see `wrap_result`).
         use crate::read_dedup::LegKind;
-        let legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> =
-            [mem_plan.map(|p| (p, LegKind::Mem)), hot_plan.map(|p| (p, LegKind::Hot)), Some((delta_plan, LegKind::Delta))].into_iter().flatten().collect();
+        let mut legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> =
+            [mem_plan.map(|p| (p, LegKind::Mem)), hot_plan.map(|p| (p, LegKind::Hot))].into_iter().flatten().collect();
+        legs.extend(delta_plans.into_iter().map(|p| (p, LegKind::Delta)));
         wrap_result(legs)
     }
 
