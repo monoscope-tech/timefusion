@@ -13,8 +13,8 @@
 //! never got there and stayed at ~3000. That is not cosmetic — file count arms
 //! the wide-scan gate (see wide_scan_gate.rs) and drives untracked decode heap.
 //!
-//! The durable maintenance coordinator does the same work in bounded slices,
-//! so progress accrues across restarts without a whole-date cron owner.
+//! `consolidate_catchup` does the same work in a bounded slice off the frequent
+//! hot-compaction tick, so progress accrues across restarts.
 
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ async fn explain(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<S
 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_sealed_partition_converges_through_durable_bounded_tasks() -> anyhow::Result<()> {
+async fn a_sealed_partition_the_daily_sweep_missed_converges_on_the_frequent_tick() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
     let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
     let client = env.pg_client().await?;
@@ -62,40 +62,40 @@ async fn a_sealed_partition_converges_through_durable_bounded_tasks() -> anyhow:
         let t = table_ref.read().await;
         t.snapshot()?.log_data().iter().count()
     };
-    assert!(before >= 1, "fixture must publish source files");
-    let physical_before = delta_physical_row_count(&table_ref).await?;
-    assert!(
-        (31..=40).contains(&physical_before),
-        "the coordinator may already have collapsed retry versions while the fixture was flushing, got {physical_before} rows"
-    );
+    assert!(before >= 5, "fixture must leave a fragmented partition, got {before} file(s)");
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 40, "fixture must contain ten physical copies of the retry key");
 
     // Seal the day: move the clock into the NEXT UTC day so the partition is
     // cold (cold_optimize_after_days = 1). This is the state prod was in.
     clock::set_micros(day_start + 86_400 * sec + 6 * 3_600 * sec);
 
-    // Drain the same durable units background workers execute. Repeated calls
-    // are safe and stand in for progress resumed across process restarts.
+    // Bounded slices, exactly as the hot-compaction tick calls it. Several
+    // ticks stand in for "the process restarted a few times".
     for _ in 0..8 {
-        let _ = env.db().run_maintenance_units(128).await?;
+        env.db().consolidate_catchup(&table_ref, "otel_logs_and_spans", 4).await?;
     }
 
     let after = {
         let t = table_ref.read().await;
         t.snapshot()?.log_data().iter().count()
     };
-    assert!(after <= before, "bounded coordinator work must never increase active-file debt. before={before} after={after}");
+    assert!(
+        after * 2 <= before,
+        "a sealed, fragmented partition must converge from the frequent tick alone — the daily cron is exactly what \
+         prod does not survive. Measured 10 -> 1 locally. before={before} after={after}"
+    );
 
     // Convergence must be a fixed point, not a rewrite loop: once packed, more
     // ticks must not keep rewriting (that would burn IO and lose OCC races).
     let settled = {
         for _ in 0..3 {
-            let _ = env.db().run_maintenance_units(128).await?;
+            env.db().consolidate_catchup(&table_ref, "otel_logs_and_spans", 4).await?;
         }
         let t = table_ref.read().await;
         t.snapshot()?.log_data().iter().count()
     };
     assert_eq!(settled, after, "catch-up must reach a fixed point, not rewrite the same files every tick");
-    assert!(delta_physical_row_count(&table_ref).await? <= physical_before, "data-preserving packing must not create additional physical versions");
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 31, "sorted consolidation must physically collapse the cross-file retry versions");
 
     let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
     assert_eq!(count, 31, "consolidation must preserve every logical row exactly once");

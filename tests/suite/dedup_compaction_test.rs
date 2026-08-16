@@ -1850,13 +1850,6 @@ async fn an_uncertified_window_still_hides_the_superseded_row_from_a_mutable_pre
 #[serial]
 #[tokio::test]
 async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggregate() -> Result<()> {
-    struct ClockGuard;
-    impl Drop for ClockGuard {
-        fn drop(&mut self) {
-            timefusion::clock::unfreeze();
-        }
-    }
-    let _clock_guard = ClockGuard;
     let cfg = TestConfigBuilder::new("rollup_build_parity").with_buffer_mode(BufferMode::Enabled).with_rollups().build();
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -1871,8 +1864,6 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
-    assert!(db.run_maintenance_units(1024).await? > 0, "eligible slice tasks must be drained");
 
     let total_from_rollup = |db: Arc<Database>, project_id: String| async move {
         let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}'");
@@ -1906,15 +1897,25 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     let after_rebuild = total_from_rollup(Arc::clone(&db), project_id.clone()).await?;
     assert_eq!(after_rebuild, raw_total, "a second certification must REPLACE the buckets, not double every measure");
 
-    // A second independently replaceable slice must leave the first slice
-    // untouched. If slice replacement drops or duplicates the earlier state,
-    // the total moves and no read-side guard can repair it.
+    // An INCREMENTAL rebuild must equal a full one. Writing into hour 20 leaves
+    // hour 12's buckets to be carried forward untouched, so if the carry-forward
+    // drops or duplicates them the total moves — which no read-side guard could
+    // catch, because the partition still looks like a complete day.
+    let counters = || {
+        let m = timefusion::metrics::maintenance_stats();
+        (m.rollup_rebuilds_incremental.load(std::sync::atomic::Ordering::Relaxed), m.rollup_rebuilds_full.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    let (incremental_before, full_before) = counters();
     let late = day.and_hms_opt(20, 30, 0).unwrap().and_utc().timestamp_micros();
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("span_late", "op", &project_id, late)])?], true, None)
         .await?;
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
-    assert!(db.run_maintenance_units(1024).await? > 0, "late slice tasks must be drained");
+
+    let (incremental_after, full_after) = counters();
+    assert!(
+        incremental_after > incremental_before,
+        "the rebuild must have been scoped to the changed hours (incremental {incremental_before}->{incremental_after}, full {full_before}->{full_after})"
+    );
     assert_eq!(
         total_from_rollup(Arc::clone(&db), project_id.clone()).await?,
         raw_total + 1,
@@ -1941,13 +1942,6 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 #[serial]
 #[tokio::test]
 async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer() -> Result<()> {
-    struct ClockGuard;
-    impl Drop for ClockGuard {
-        fn drop(&mut self) {
-            timefusion::clock::unfreeze();
-        }
-    }
-    let _clock_guard = ClockGuard;
     let mut cfg = (*TestConfigBuilder::new("rollup_hybrid").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     cfg.maintenance.timefusion_rollup_realtime_tail = true;
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
@@ -1983,8 +1977,6 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
-    assert!(db.run_maintenance_units(1024).await? > 0, "eligible yesterday slices must be drained");
 
     // Written AFTER certification: today has no coverage, so these are reachable
     // only through the raw leg.
@@ -2052,27 +2044,9 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // always shows the raw scan even when the real one routes.
     let hits = || timefusion::metrics::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
     let misses = || timefusion::metrics::maintenance_stats().rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
-    let miss_snapshot = || {
-        let stats = timefusion::metrics::maintenance_stats();
-        [
-            stats.rollup_miss_not_built.load(std::sync::atomic::Ordering::Relaxed),
-            stats.rollup_miss_stale_coverage.load(std::sync::atomic::Ordering::Relaxed),
-            stats.rollup_miss_tiny_interior.load(std::sync::atomic::Ordering::Relaxed),
-            stats.rollup_miss_too_many_branches.load(std::sync::atomic::Ordering::Relaxed),
-            stats.rollup_miss_incomplete_coverage.load(std::sync::atomic::Ordering::Relaxed),
-        ]
-    };
     let (before, misses_before) = (hits(), misses());
-    let reasons_before = miss_snapshot();
     let hybrid = rows_of(ctx.sql(&query).await?.collect().await?);
-    let reasons_after = miss_snapshot();
-    let reason_delta = std::array::from_fn::<_, 5, _>(|index| reasons_after[index] - reasons_before[index]);
-    assert_eq!(
-        hits(),
-        before + 1,
-        "the query must be served from the rollup as a hybrid union, not a raw scan (misses +{}, reason delta [not_built, stale, tiny, branches, incomplete] = {reason_delta:?})",
-        misses() - misses_before
-    );
+    assert_eq!(hits(), before + 1, "the query must be served from the rollup as a hybrid union, not a raw scan (misses +{})", misses() - misses_before);
 
     // `query_delta_only` bypasses both the rollup and the buffer, so it is the
     // authority: every fixture row was written straight to Delta.
