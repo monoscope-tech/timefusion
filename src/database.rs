@@ -8751,15 +8751,6 @@ impl Database {
     /// A crash before the cursor checkpoint repeats work; a crash after it is
     /// safe because every task checkpoint happened first.
     async fn reconcile_maintenance_task_cursors(&self) -> Result<usize> {
-        // Scheduler startup precedes the asynchronous table preload. Resolve
-        // declared sources here so a process upgrading an existing Delta table
-        // cannot observe an empty `all_tables()` set, advance no cursor, and
-        // leave the new rollup generation without shadow-build work forever.
-        for source in crate::schema_loader::registry().list_tables() {
-            if get_schema(&source).is_some_and(|schema| !schema.rollups.is_empty()) {
-                self.get_or_create_unified_table(&source).await?;
-            }
-        }
         let mut queued = 0usize;
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { continue };
