@@ -191,6 +191,9 @@ pub struct TaskJournal {
     path: PathBuf,
     wal_path: PathBuf,
     snapshot: Snapshot,
+    /// Stable indices into `snapshot.tasks`. Tasks are never removed, so point
+    /// updates and WAL replay stay O(1) even with a production-sized backlog.
+    task_indices: HashMap<TaskKey, usize>,
     dirty_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
     fair_cursors: HashMap<Operation, String>,
@@ -246,6 +249,7 @@ impl TaskJournal {
         // Every record ends in a newline. Ignore only a torn final record; all
         // earlier records were fsynced before the caller acknowledged the
         // invalidation or publication that produced them.
+        let mut task_indices = snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect::<HashMap<_, _>>();
         if let Ok(bytes) = fs::read(&wal_path) {
             for line in bytes.split_inclusive(|byte| *byte == b'\n') {
                 if !line.ends_with(b"\n") {
@@ -253,17 +257,22 @@ impl TaskJournal {
                 }
                 let record = serde_json::from_slice::<JournalRecord>(&line[..line.len() - 1])?;
                 match record {
-                    JournalRecord::Task(task) => match snapshot.tasks.iter_mut().find(|current| current.key == task.key) {
-                        Some(current) => *current = task,
-                        None => snapshot.tasks.push(task),
-                    },
+                    JournalRecord::Task(task) => {
+                        if let Some(index) = task_indices.get(&task.key).copied() {
+                            snapshot.tasks[index] = task;
+                        } else {
+                            let index = snapshot.tasks.len();
+                            task_indices.insert(task.key.clone(), index);
+                            snapshot.tasks.push(task);
+                        }
+                    }
                     JournalRecord::SourceCursor { source, delta_version } => {
                         snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
                     }
                 }
             }
         }
-        Ok(Self { path, wal_path, snapshot, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() })
+        Ok(Self { path, wal_path, snapshot, task_indices, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() })
     }
 
     /// Early coordinator builds journaled the one-hour tier in ten-minute
@@ -271,22 +280,15 @@ impl TaskJournal {
     /// aligned hour task; completed tagged publications remain available for
     /// metadata recovery and are not rewritten by this migration.
     pub fn migrate_derived_slices(&mut self) -> usize {
-        let malformed = self
-            .snapshot
-            .tasks
-            .iter()
-            .filter(|task| {
-                task.key.operation == Operation::DerivedRollup
-                    && task.key.slice.width() != DERIVED_SLICE_MICROS
-                    && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if malformed.is_empty() {
-            return 0;
-        }
         let mut replacements: HashMap<TaskKey, (i64, u64, u64)> = HashMap::new();
-        for task in &malformed {
+        let mut migrated = 0usize;
+        for task in &mut self.snapshot.tasks {
+            if !(task.key.operation == Operation::DerivedRollup
+                && task.key.slice.width() != DERIVED_SLICE_MICROS
+                && !matches!(task.state, TaskState::Complete | TaskState::Superseded))
+            {
+                continue;
+            }
             let start = task.key.slice.start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
             let mut key = task.key.clone();
             key.slice = TimeSlice { start_micros: start, end_micros: start.saturating_add(DERIVED_SLICE_MICROS) };
@@ -298,31 +300,32 @@ impl TaskJournal {
                     *created = (*created).min(task.created_unix_ms);
                 })
                 .or_insert((task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms));
-        }
-        for task in malformed {
-            if let Some(current) = self.snapshot.tasks.iter_mut().find(|current| current.key == task.key) {
-                current.state = TaskState::Superseded;
-                current.retry_reason = Some("migrated_to_aligned_hour_slice".to_owned());
-                self.dirty_tasks.insert(current.key.clone());
-            }
+            task.state = TaskState::Superseded;
+            task.retry_reason = Some("migrated_to_aligned_hour_slice".to_owned());
+            self.dirty_tasks.insert(task.key.clone());
+            migrated = migrated.saturating_add(1);
         }
         for (key, (deadline, estimate, created)) in replacements {
             self.enqueue(key, deadline, estimate, created);
         }
-        self.dirty_tasks.len()
+        migrated
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
         self.dirty_tasks.insert(task.key.clone());
-        match self.snapshot.tasks.iter_mut().find(|current| current.key == task.key) {
-            Some(current) => *current = task,
-            None => self.snapshot.tasks.push(task),
+        if let Some(index) = self.task_indices.get(&task.key).copied() {
+            self.snapshot.tasks[index] = task;
+        } else {
+            let index = self.snapshot.tasks.len();
+            self.task_indices.insert(task.key.clone(), index);
+            self.snapshot.tasks.push(task);
         }
     }
 
     pub fn enqueue(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) {
         self.dirty_tasks.insert(key.clone());
-        if let Some(task) = self.snapshot.tasks.iter_mut().find(|task| task.key == key) {
+        if let Some(index) = self.task_indices.get(&key).copied() {
+            let task = &mut self.snapshot.tasks[index];
             if task.state != TaskState::Running {
                 task.state = TaskState::Pending;
                 task.deadline_micros = task.deadline_micros.min(deadline_micros);
@@ -332,6 +335,8 @@ impl TaskJournal {
             }
             return;
         }
+        let index = self.snapshot.tasks.len();
+        self.task_indices.insert(key.clone(), index);
         self.snapshot.tasks.push(MaintenanceTask {
             key,
             state: TaskState::Pending,
@@ -378,12 +383,15 @@ impl TaskJournal {
                     slice,
                     operation,
                 };
-                if let Some(task) = self.snapshot.tasks.iter_mut().find(|task| task.key == key) {
+                if let Some(index) = self.task_indices.get(&key).copied() {
+                    let task = &mut self.snapshot.tasks[index];
                     task.state = TaskState::Pending;
                     task.deadline_micros = task.deadline_micros.max(deadline_micros);
                     task.retry_reason = None;
                     task.publication = None;
                 } else {
+                    let index = self.snapshot.tasks.len();
+                    self.task_indices.insert(key.clone(), index);
                     self.snapshot.tasks.push(MaintenanceTask {
                         key: key.clone(),
                         state: TaskState::Pending,
@@ -404,7 +412,8 @@ impl TaskJournal {
     }
 
     pub fn mark_running(&mut self, key: &TaskKey) -> bool {
-        let Some(task) = self.snapshot.tasks.iter_mut().find(|task| &task.key == key) else { return false };
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let task = &mut self.snapshot.tasks[index];
         if !matches!(task.state, TaskState::Pending | TaskState::Retry) {
             return false;
         }
@@ -446,7 +455,7 @@ impl TaskJournal {
         let key = selected.key.clone();
         self.fair_cursors.insert(operation, key.project_id.clone());
         self.mark_running(&key);
-        self.snapshot.tasks.iter().find(|task| task.key == key).cloned()
+        self.task_indices.get(&key).map(|index| self.snapshot.tasks[*index].clone())
     }
 
     fn dependencies_complete(&self, task: &MaintenanceTask) -> bool {
@@ -489,7 +498,8 @@ impl TaskJournal {
     }
 
     pub fn retry(&mut self, key: &TaskKey, reason: String, not_before_micros: i64) -> bool {
-        let Some(task) = self.snapshot.tasks.iter_mut().find(|task| &task.key == key) else { return false };
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let task = &mut self.snapshot.tasks[index];
         task.state = TaskState::Retry;
         crate::metrics::set_maintenance_retry_reason(&reason);
         task.retry_reason = Some(reason);
@@ -499,7 +509,8 @@ impl TaskJournal {
     }
 
     pub fn complete(&mut self, key: &TaskKey) -> bool {
-        let Some(task) = self.snapshot.tasks.iter_mut().find(|task| &task.key == key) else { return false };
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let task = &mut self.snapshot.tasks[index];
         task.state = TaskState::Complete;
         task.retry_reason = None;
         self.dirty_tasks.insert(key.clone());
@@ -507,7 +518,8 @@ impl TaskJournal {
     }
 
     pub fn publish(&mut self, key: &TaskKey, publication: Publication) -> bool {
-        let Some(task) = self.snapshot.tasks.iter_mut().find(|task| &task.key == key) else { return false };
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let task = &mut self.snapshot.tasks[index];
         task.state = TaskState::Complete;
         task.retry_reason = None;
         task.publication = Some(publication);
@@ -520,12 +532,14 @@ impl TaskJournal {
     /// stay inside a one-minute task because `TaskKey` identifies logical
     /// slice work; the worker merges all shard states before publication.
     pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64) -> bool {
-        let Some(parent) = self.snapshot.tasks.iter().find(|task| &task.key == key).cloned() else { return false };
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let parent = self.snapshot.tasks[index].clone();
         let children = byte_bounded_units(&parent, observed_bytes);
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
             return false;
         }
-        if let Some(task) = self.snapshot.tasks.iter_mut().find(|task| &task.key == key) {
+        if let Some(index) = self.task_indices.get(key).copied() {
+            let task = &mut self.snapshot.tasks[index];
             task.state = TaskState::Superseded;
             task.retry_reason = Some("split_into_smaller_slices".to_owned());
             self.dirty_tasks.insert(key.clone());
@@ -561,7 +575,7 @@ impl TaskJournal {
     }
 
     pub fn state(&self, key: &TaskKey) -> Option<TaskState> {
-        self.snapshot.tasks.iter().find(|task| &task.key == key).map(|task| task.state)
+        self.task_indices.get(key).map(|index| self.snapshot.tasks[*index].state)
     }
 
     pub fn rollup_slice_complete(&self, source: &str, project_id: &str, target: &str, slice: TimeSlice) -> bool {
@@ -604,7 +618,8 @@ impl TaskJournal {
             let mut wal = OpenOptions::new().create(true).append(true).open(&self.wal_path)?;
             let mut records = Vec::new();
             for key in self.dirty_tasks.drain() {
-                if let Some(task) = self.snapshot.tasks.iter().find(|task| task.key == key) {
+                if let Some(index) = self.task_indices.get(&key).copied() {
+                    let task = &self.snapshot.tasks[index];
                     serde_json::to_writer(&mut records, &JournalRecord::Task(task.clone()))?;
                     records.push(b'\n');
                 }
@@ -954,6 +969,27 @@ mod tests {
         let loaded = TaskJournal::load(dir.path()).expect("load checkpoint");
         assert_eq!(loaded.tasks().count(), 1);
         assert_eq!(loaded.source_cursor("source"), Some(9));
+    }
+
+    #[test]
+    fn production_sized_wal_replay_updates_tasks_without_quadratic_scans() {
+        const TASKS: i64 = 20_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("new journal");
+        for index in 0..TASKS {
+            journal.upsert(task("large-project", index, index + 1, Operation::Dedup));
+        }
+        journal.checkpoint().expect("initial backlog checkpoint");
+        for index in 0..TASKS {
+            let key = task("large-project", index, index + 1, Operation::Dedup).key;
+            assert!(journal.retry(&key, "restart_test".to_owned(), index));
+        }
+        journal.checkpoint().expect("updated backlog checkpoint");
+
+        let loaded = TaskJournal::load(dir.path()).expect("replay large journal");
+        assert_eq!(loaded.tasks().count(), usize::try_from(TASKS).expect("positive task count"));
+        let last = task("large-project", TASKS - 1, TASKS, Operation::Dedup).key;
+        assert_eq!(loaded.state(&last), Some(TaskState::Retry));
     }
 
     #[test]
