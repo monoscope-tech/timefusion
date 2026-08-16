@@ -1,0 +1,29 @@
+name: Emergency production image rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Fully qualified previously proven image
+        required: true
+        default: ghcr.io/monoscope-tech/timefusion:7374a2b
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pinned CapRover client
+        run: npm install --global caprover@2.3.1
+      - name: Deploy proven image
+        env:
+          CAPROVER_SERVER: ${{ secrets.CAPTAINROVER_SERVER }}
+          CAPROVER_APP: ${{ secrets.CAPTAINROVER_APP_NAME }}
+          CAPROVER_TOKEN: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          caprover deploy \
+            --caproverUrl "$CAPROVER_SERVER" \
+            --appToken "$CAPROVER_TOKEN" \
+            --appName "$CAPROVER_APP" \
+            --imageName "$IMAGE"
