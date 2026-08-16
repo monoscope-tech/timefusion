@@ -1903,6 +1903,20 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     assert_eq!(rolled, raw_total, "rollup request_count must sum to the raw row count, or every Traffic panel is silently wrong");
     assert!(raw_total > 0, "precondition: the fixture actually wrote rows");
 
+    // The publication counters must move on the COORDINATOR path, not only on
+    // the retired cohort path (`stage_rollup_wave`) they were originally wired
+    // to. Prod 2026-08-16 reported rollup_output_rows_total = 0 and
+    // rollup_staged_projects_total = 0 while this very table held 1,220 rows for
+    // a live project — a metric reading zero while the system works is worse
+    // than no metric, and it cost a full diagnosis pass chasing a rollup outage
+    // that was not happening. nextest gives each test its own process, so these
+    // process-global counters are this test's alone.
+    let stats = timefusion::metrics::maintenance_stats();
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    assert!(stats.rollup_output_rows.load(ordering) > 0, "the coordinator published rollup rows but rollup_output_rows_total stayed 0");
+    assert!(stats.rollup_staged_projects.load(ordering) > 0, "the coordinator published a slice but rollup_staged_projects_total stayed 0");
+    assert!(stats.rollup_commit_actions.load(ordering) > 0, "the coordinator committed Delta actions but rollup_commit_actions_total stayed 0");
+
     // Certify again: the build must replace, not append.
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
     let after_rebuild = total_from_rollup(Arc::clone(&db), project_id.clone()).await?;

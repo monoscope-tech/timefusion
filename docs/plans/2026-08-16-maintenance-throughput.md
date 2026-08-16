@@ -336,6 +336,66 @@ Only meaningful once WS-2 produces certified prefixes.
 **Verification.** shipbubble 14d and 30d complete in ~1s, served by rollups; the
 same for the other projects; `rollup_hits_*` > 0.
 
+**RESULT after WS-2 (`12009ab`), measured 2026-08-17 ~00:30Z.**
+
+The certification window worked, and it is the largest read-path win so far:
+
+| metric | before WS-2 | after WS-2 |
+|---|---|---|
+| `scan.dedup_skipped_pct` | **0.4%** (3 / 710) | **65.4%** (595 / 910) |
+
+`DedupExec` is now out of roughly two thirds of query plans.
+
+Latency, however, has NOT reached the goal. shipbubble still times out past 60s
+at 7d/14d/30d, including for a rollup-routable dashboard shape
+(`time_bucket(...) ... GROUP BY 1`). The 1d number is noisy across restarts
+(41s → 17s after WS-1 → 32s on a cold process mid-backlog-drain) and should be
+re-measured on a warm process once the backlog settles.
+
+**Two counters proved actively misleading, and both cost real diagnosis time:**
+
+1. `rollup_output_rows_total` / `rollup_staged_projects_total` /
+   `rollup_scan_*` were wired ONLY to the retired cohort path
+   (`rebuild_rollup_cohort` -> `stage_and_commit_rollup_inputs` ->
+   `stage_rollup_wave`). The coordinator publishes through its own path and
+   incremented none of them, so they read 0 while the rollup table held 1,220
+   real rows for shipbubble. I concluded "rollups publish nothing" from this and
+   was wrong. Fixed by instrumenting the coordinator publish path, guarded by a
+   test that fails without the wiring.
+2. `cert_granted_total` counts only *fresh* grants — a certification reloaded
+   from disk at boot takes the `prior.is_some()` branch. It therefore reads 0
+   on a healthy, fully certified system. `dedup_skipped_pct` is the honest
+   signal; prefer it.
+
+**Open: rollup routing is still refused.** `rollup_hits_full/hybrid` remain 0,
+and `rollup_miss_missing_project_total` is ~99% of all misses. `MissingProject`
+means the matcher found no `project_id = <string literal>` among the collected
+predicates. But the optimized plan plainly carries it:
+
+```
+TableScan: otel_logs_and_spans projection=[timestamp],
+  full_filters=[otel_logs_and_spans.project_id = Utf8View("28f62f01-…")],
+  partial_filters=[otel_logs_and_spans.timestamp >= TimestampMicrosecond(…)]
+```
+
+and `source_and_filters` does extend from `scan.filters`, `string_literal`
+accepts `Utf8View`, and `column_name` compares unqualified. So the obvious
+explanations are all ruled out. Two candidates remain:
+
+- the matcher is also invoked on inner/per-leg plans (mem, hot, delta) where
+  `ProjectRoutingTable` has already consumed the project predicate, and those
+  inner calls are what the counter is dominated by; or
+- the misses are dominated by monoscope's own prepared-statement traffic, where
+  `project_id` arrives as a placeholder rather than a literal and `eq_literal`
+  cannot match it.
+
+The two are distinguishable by attribution, not by reading more code, and the
+per-reason counters do not sum to `rollup_misses_total` (a 180s idle sample
+moved the total by 230 with only 10 attributed), so the counters cannot settle
+it either. Next step is a reproduction against a provider that claims **Exact**
+pushdown like `ProjectRoutingTable` does — the in-module tests use a `MemTable`,
+which does not, and so cannot reproduce prod's plan shape at all.
+
 ### WS-4 — Tantivy index repair, in-process and bounded
 
 - Move reconcile/backfill **into the coordinator** as a task `Operation`, so it
