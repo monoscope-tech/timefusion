@@ -130,6 +130,45 @@ Fixing throughput is therefore not one of three parallel workstreams. It is the
 **precondition** for the other two. This is the single most important
 conclusion in this document, and it changes the order of work.
 
+### 1.5a Correction — throughput is necessary but provably not sufficient
+
+Added after WS-1 was written, on closer reading of the certification path.
+
+`record_certification` is called from exactly one place (`database.rs:11323`),
+inside `dedup_sweep`. That sweep's scope is:
+
+```rust
+let lookback = self.config.maintenance.timefusion_dedup_lookback_days as i64;
+let dates = (0..=lookback).rev().map(|d| today - Duration::days(d));
+```
+
+and `d_dedup_lookback_days` defaults to **1** (`config.rs:1016`) — chosen to
+catch a late DLQ replay crossing midnight UTC, not to support long windows.
+
+So certification can only ever cover **today and yesterday**. A 14d or 30d
+window can therefore *never* hold a fully certified prefix, at any throughput.
+WS-1 is still required — at zero dedup commits even today is uncertified — but
+WS-1 alone cannot deliver the 1s goal. Scope, not just speed, is a blocker.
+
+Two further observations that shape WS-3:
+
+- Certifications are durable: they are loaded at boot
+  (`dedup_certifications_loaded`, `database.rs:2985`) and keyed by
+  `partition_file_fp`. A **sealed** past partition whose fingerprint has not
+  moved is therefore re-certifiable by a metadata-only comparison — no rescan.
+  That is what makes a 30-day certification window affordable; the expensive
+  part is only the *first* dedup pass over a day that has never had one.
+- Rollup builds explicitly do **not** need certification (there is a test named
+  `query_delta_only_deduplicates_so_a_rollup_build_needs_no_certification`), so
+  building history and certifying it are independent and can proceed in
+  parallel.
+- Rollups are close to inert on the read side rather than losing on coverage:
+  `rollup_misses_total` is only **5** in ~an hour, and none of the miss reasons
+  are coverage-related (`filter_not_eligible` 2, `missing_project` 3; every
+  `not_built` / `incomplete_coverage` / `stale_coverage` counter is 0). Almost
+  no query consults the rollup matcher at all. Diagnose that before assuming
+  more coverage would be used.
+
 ### 1.6 Tantivy index repair
 
 Three reconcile containers were OOM-killed today
@@ -207,6 +246,26 @@ Instrument as `maintenance_admission_braked_total`.
 512 MiB; `processed_bytes_per_second` > 0; `dedup_bins_committed_total` rising;
 pgwire p99 not regressing; no health-check failures; no exit-137.
 
+**RESULT — shipped as #101 (`9d5d6d7`), measured 24s after rollout:**
+
+| metric | before | after |
+|---|---|---|
+| `cpu_tokens_used` | 1 | **6** |
+| `object_read_tokens_used` | 1 | **6** |
+| `decoded_bytes_used` | 512 MiB | **3.0 GiB** |
+| `tasks_running` | 1 | **4** |
+| `processed_bytes_per_second` | **0** | **78.3 MB/s** |
+| `process_rss_mb` | 7,960 | 6,129 |
+| `memory.charged_pct` | 10 | 7 |
+| `dml.occ_conflicts_total` | 0 | 0 |
+
+~8x the previous ~10 MB/s, with memory *lower* and no OCC conflicts. The old
+container exited 0 — a clean handover, no crash. At 78 MB/s the 20.26 TB
+backlog is ~72 h of drain, so this is convergence rather than an instant fix.
+
+Note `cert_granted_total` stayed 0, as predicted by 1.5a: throughput alone
+cannot certify past yesterday. That is WS-2.
+
 ### WS-2 — Drain the 20.3 TB backlog to a steady state
 
 With WS-1 landed, the queue drains, but 20.3 TB will not clear in one pass and
@@ -221,8 +280,39 @@ must not be attempted in one pass.
   the frontier.
 - **Certification-first ordering.** Order work so that whole partitions become
   certifiable as early as possible: a partially deduped date grants no
-  certification and therefore buys zero query latency. This is a scheduling
-  change with an outsized payoff.
+  certification and therefore buys zero query latency. Note that class-1
+  (non-frontier) work is currently ordered by `deadline_micros` ascending —
+  effectively oldest-first — which contradicts the newest-first principle the
+  codebase argues for elsewhere. Class 0 (live frontier) is already
+  newest-minute-first and correct.
+- **Extend the certification window to the query-relevant retention (~35d).**
+  Per 1.5a this is the blocker that throughput cannot fix.
+
+  On reading `dedup_sweep` closely, the machinery this needs is **already
+  there** — the window value is the only thing holding it to 2 days:
+
+  - The per-partition metadata-only skip already exists: a partition whose
+    `dedup_clean_fp` entry matches its current `partition_file_fp` is skipped
+    without a probe, "keeping the sweep O(partitions-changed)". So steady-state
+    cost is proportional to *changed* partitions, not to window length.
+  - The work list is already sorted **newest-date-first** (`db.cmp(da)`).
+  - Truncation is already handled by `deadline` + `dedup_sweep_cursor`
+    rotation, so a long first pass cannot wedge the tick.
+  - Certifications are already durable across restarts.
+
+  So the change is small: raise `d_dedup_lookback_days` from 1 to ~35 (aligning
+  with the existing `d_repair_lookback_days = 31` and leaving margin over a 30d
+  query). The recurring cost is the work-list build — `partition_files_by_pid`
+  per date, metadata only, ~36 dates x ~11 projects — plus a real dedup pass
+  only for days never certified. That first-time cost *is* the backlog drain,
+  and it is exactly what WS-1's throughput is for.
+
+  This ordering matters: raising the window without WS-1 would add 35x the work
+  list to a queue that already commits nothing.
+- **Bound the drain by what queries read.** 8.05 TB of the 20.26 TB is sealed
+  historical debt. Anything older than the retention window is background debt
+  that must never compete with the 35-day certification target. This is what
+  converts an unbounded 20 TB problem into a bounded one.
 
 **Verification.** `backlog_bytes` monotonically decreasing across a sustained
 window; `oldest_task_age_seconds` falling; `cert_granted_total` > 0 and rising;

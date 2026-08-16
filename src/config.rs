@@ -1013,7 +1013,25 @@ const_default!(d_dml_merge_concurrency: usize = 1);
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
 // Arbitrarily-late replays still need read-side dedup — see the parity plan.
-const_default!(d_dedup_lookback_days: u64 = 1);
+//
+// 35 since 2026-08-16, because this window is not only about late replays: the
+// sweep is the ONLY caller of `record_certification`, so it is also what decides
+// how far back a partition can be certified duplicate-free. At 1, certification
+// could never reach past yesterday, and since rollup routing needs a contiguous
+// certified prefix across the whole query window, no 7d/14d/30d query could ever
+// route — measured on prod as `never_certified_pct = 100.0`, `rollup_hits = 0`,
+// and shipbubble taking 41s at 1d and timing out past 60s at 7d and beyond.
+//
+// This is affordable because the sweep is already O(partitions-changed), not
+// O(window): a partition whose `dedup_clean_fp` still matches its live file
+// fingerprint is skipped without a probe, the work list is already sorted
+// newest-date-first, and `deadline` + `dedup_sweep_cursor` rotation bound and
+// resume a truncated tick. The one-off cost is the first pass over each day that
+// has never been certified, which is precisely the backlog the coordinator's
+// job concurrency (2026-08-16, #101) exists to drain — do NOT raise this on a
+// build without that change, or the 35x work list lands on a queue that commits
+// nothing. 35 covers a 30d query with margin and matches `d_repair_lookback_days`.
+const_default!(d_dedup_lookback_days: u64 = 35);
 const_default!(d_query_partitions: usize = 0);
 // Wide-scan admission guard. 16 concurrent Parquet decoders bounds untracked
 // decode heap well under the 25 GB pool on the 188 GB/48-core box (48-way was
@@ -2635,6 +2653,21 @@ mod tests {
         // 4 x 2 GiB lands exactly on the original 8 GiB envelope).
         assert_eq!(b.rewrite_permits(), 4);
         assert_eq!(b.optimize_merge_tasks(), 2);
+    }
+
+    /// Certification must reach back far enough to serve a 30d query.
+    ///
+    /// `dedup_sweep` is the only caller of `record_certification`, and its scope
+    /// is `today - d_dedup_lookback_days ..= today`. Rollup routing needs a
+    /// contiguous certified prefix across the whole query window, so this value
+    /// is a hard ceiling on the longest window that can ever route. At the
+    /// former default of 1 nothing past yesterday could be certified, which is
+    /// why prod measured `never_certified_pct = 100.0` and `rollup_hits = 0`
+    /// while 30d queries timed out. Dropping it back below 30 silently
+    /// reintroduces that, with no failing behavior anywhere nearer the change.
+    #[test]
+    fn certification_window_covers_a_thirty_day_query() {
+        assert!(super::d_dedup_lookback_days() >= 30, "the dedup sweep is what certifies partitions; below 30d no 30d query can ever route to a rollup");
     }
 
     /// Maintenance must not be serialized on a box with room to spare.

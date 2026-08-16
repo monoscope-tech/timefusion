@@ -11245,12 +11245,21 @@ impl Database {
                 false => work.extend(files_by_pid.into_iter().map(|(pid, files)| (date, pid, files))),
             }
         }
-        // Stable order, then rotate: a truncated tick must not re-serve the same
-        // prefix on the next one (the starvation `light_optimize_cursor` fixes
-        // for packing).
+        // Stable order (newest date first), then rotate: a truncated tick must
+        // not re-serve the same prefix on the next one (the starvation
+        // `light_optimize_cursor` fixes for packing).
         work.sort_by(|(da, pa, _), (db, pb, _)| db.cmp(da).then_with(|| pa.cmp(pb)));
         let total_work = work.len();
-        work.rotate_left(sweep_resume_offset(total_work, self.dedup_sweep_cursor.load(std::sync::atomic::Ordering::Relaxed)));
+        // Today never rotates out. Rotation exists so a deadline-truncated tick
+        // resumes into UNSEEN sealed work, but today is re-dirtied by every
+        // flush and is what the hot queries read, so it has to be swept on every
+        // tick — not once per full rotation. That distinction did not matter
+        // while the window was today+1 (two dates, nothing to starve); at a 35d
+        // certification window the list is ~36 dates x projects, and first-time
+        // passes over never-certified sealed days truncate ticks often, which is
+        // exactly when today would be rotated past.
+        let sealed_from = work.partition_point(|(date, _, _)| *date >= today);
+        rotate_sealed_tail(&mut work, sealed_from, self.dedup_sweep_cursor.load(std::sync::atomic::Ordering::Relaxed));
         for (swept, (date, pid, cur_files)) in work.iter().enumerate() {
             let (date, pid) = (*date, pid);
             // Bail promptly on shutdown — a mid-sweep tick must not run
@@ -11260,7 +11269,11 @@ impl Database {
                 return Ok(());
             }
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                self.dedup_sweep_cursor.fetch_add(swept, std::sync::atomic::Ordering::Relaxed);
+                // Advance by the SEALED items covered, since only the sealed
+                // tail rotates. Counting today's un-rotated prefix here would
+                // walk the cursor a whole prefix-length per tick and skip sealed
+                // work that was never swept.
+                self.dedup_sweep_cursor.fetch_add(swept.saturating_sub(sealed_from), std::sync::atomic::Ordering::Relaxed);
                 info!(table_name, swept, remaining = total_work - swept, event = "dedup_sweep_truncated");
                 break;
             }
@@ -16162,6 +16175,23 @@ fn sweep_resume_offset(len: usize, cursor: usize) -> usize {
     if len == 0 { 0 } else { cursor % len }
 }
 
+/// Rotate only the sealed tail of a sweep work list, leaving the first
+/// `sealed_from` items (today) pinned at the front.
+///
+/// Rotation exists so a deadline-truncated tick resumes into sealed work it has
+/// not seen. Today must be exempt: it is re-dirtied by every flush and is what
+/// the hot queries read, so it has to be swept on every tick rather than once
+/// per full rotation. Harmless while the window was today+1; load-bearing at a
+/// 35-day certification window, where first-time passes over never-certified
+/// days truncate ticks often — precisely when today would rotate out.
+fn rotate_sealed_tail<T>(work: &mut Vec<T>, sealed_from: usize, cursor: usize) {
+    let sealed_from = sealed_from.min(work.len());
+    let mut sealed = work.split_off(sealed_from);
+    let offset = sweep_resume_offset(sealed.len(), cursor);
+    sealed.rotate_left(offset);
+    work.append(&mut sealed);
+}
+
 /// Decrement-on-drop gauge, so a bin that times out or panics still clears its
 /// slot rather than reading as permanently busy.
 struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicU64);
@@ -19400,6 +19430,35 @@ mod tests {
             Some(("default".to_owned(), "2026-08-14".to_owned()))
         );
         assert_eq!(Database::maintenance_partition_from_action("part-000.parquet", None), None);
+    }
+
+    /// Today is swept on every tick; only the sealed tail rotates.
+    ///
+    /// The 35-day certification window makes the work list ~36 dates x projects,
+    /// and first-time passes over never-certified days truncate ticks often. A
+    /// whole-list rotation would then visit today once per full rotation, which
+    /// silently stops certifying the partition the hot queries actually read —
+    /// with nothing failing anywhere near the change.
+    #[test]
+    fn sweep_rotation_never_rotates_today_out() {
+        // [today_a, today_b, sealed0, sealed1, sealed2, sealed3]
+        let sealed_from = 2;
+        for cursor in 0..12 {
+            let mut work = vec![100, 101, 0, 1, 2, 3];
+            super::rotate_sealed_tail(&mut work, sealed_from, cursor);
+            assert_eq!(&work[..2], &[100, 101], "today must stay at the front at cursor {cursor}");
+            let mut tail = work[2..].to_vec();
+            tail.sort_unstable();
+            assert_eq!(tail, vec![0, 1, 2, 3], "rotation must preserve the sealed set at cursor {cursor}");
+            assert_eq!(work[2], cursor % 4, "the sealed tail must resume at the cursor");
+        }
+        // Degenerate shapes must not panic.
+        let mut only_today = vec![1, 2];
+        super::rotate_sealed_tail(&mut only_today, 5, 3);
+        assert_eq!(only_today, vec![1, 2]);
+        let mut empty: Vec<i32> = vec![];
+        super::rotate_sealed_tail(&mut empty, 0, 7);
+        assert!(empty.is_empty());
     }
 
     /// Maintenance admission is bounded by the configured job count, and every
