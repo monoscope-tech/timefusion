@@ -277,6 +277,14 @@ test_env() {
          TIMEFUSION_FOYER_METADATA_MEMORY_MB=10 TIMEFUSION_FOYER_METADATA_DISK_MB=50 \
          TIMEFUSION_FOYER_SHARDS=2 \
          CARGO_TERM_COLOR=always RUST_BACKTRACE=1 CARGO_INCREMENTAL=0
+  # macOS: the AWS SDK's rustls provider reads native roots from the keychain and
+  # can fail to parse any, panicking with "TrustStore configured to enable native
+  # roots but no valid root certificates parsed!" — from inside TLS setup, so the
+  # test that dies looks unrelated to certificates (it was variant_column and
+  # variant_functions, which touch neither). Point rustls at the system bundle
+  # instead. Guarded on the file existing and the var being unset, so Linux CI —
+  # where native roots work and the path is ca-certificates.crt — is untouched.
+  if [ -z "${SSL_CERT_FILE:-}" ] && [ -f /etc/ssl/cert.pem ]; then export SSL_CERT_FILE=/etc/ssl/cert.pem; fi
 }
 
 run_body() { # <check>

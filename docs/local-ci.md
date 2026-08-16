@@ -77,6 +77,21 @@ Two differences worth knowing:
   Docker and is capped at two threads. It is the slowest check by far; `make ci
   CHECKS="fmt clippy test"` is the usual pre-push sweep.
 
+## macOS: root certificates
+
+`make ci` exports `SSL_CERT_FILE=/etc/ssl/cert.pem` when it is unset and that
+file exists. Without it the AWS SDK's rustls provider reads native roots from the
+keychain, fails to parse any, and panics:
+
+```
+TrustStore configured to enable native roots but no valid root certificates parsed!
+```
+
+The panic comes from inside TLS setup, so the test that dies looks unrelated to
+certificates — it surfaced as `variant_column` and `variant_functions` failing,
+neither of which touches TLS. Linux CI is unaffected (native roots work there and
+the bundle lives at a different path), so this only ever fires locally.
+
 ## Knobs
 
 | Variable | Effect |
