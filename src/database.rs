@@ -9699,15 +9699,19 @@ impl Database {
     fn invalidate_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
         let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
-        // The first mutation observed for a partition cannot prove the rest of
-        // that day clean. Queue the full day once so empty slices acquire
-        // durable coverage too; otherwise sparse projects leave large raw gaps
-        // forever and wide queries can never reach the hybrid route.
-        let affected_hours = if self.rollup_dirty.contains_key(&source_key) { hours } else { crate::rollup::ALL_HOURS };
+        // The mutation tells us exactly which hours became dirty. Expanding a
+        // project's first observed hour to the full day creates 456 durable
+        // units for the dashboard rollups (144 dedup + 144 base + 144 packing
+        // + 24 derived), including future and empty slices. At 1,000 projects
+        // that is 456,000 urgent tasks from a single ingest wave. Uncovered
+        // intervals already use the exact raw fallback, so enqueue only work
+        // whose source rows can actually have changed. Historical discovery
+        // and source-wide DML continue to pass ALL_HOURS explicitly.
+        let affected_hours = hours;
         self.rollup_invalidated_at.entry(source_key.clone()).or_insert_with(crate::certification_store::now_unix_ms);
-        // An absent entry means prior changes are unknown, so establish a
-        // conservative full-day marker rather than claiming this batch's exact
-        // hours are complete.
+        // This path is called with a precise timestamp-derived mask. Unknown
+        // or source-wide changes use `invalidate_rollup_source` and pass
+        // `ALL_HOURS` instead.
         self.rollup_dirty.entry(source_key.clone()).and_modify(|dirty| *dirty |= affected_hours).or_insert(affected_hours);
         self.rollup_source_epochs.entry(source_key).and_modify(|epoch| *epoch = epoch.saturating_add(1)).or_insert(1);
         if let Some(schema) = get_schema(source) {
@@ -18969,6 +18973,29 @@ mod tests {
 
         assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
         assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), Some(version));
+        Ok(())
+    }
+
+    /// A tenant's first write must not manufacture a full day of empty and
+    /// future maintenance debt. One dirty hour is six ten-minute source units
+    /// plus one derived hour; dedup and packing are shared by both rollup specs.
+    #[tokio::test]
+    async fn first_rollup_invalidation_enqueues_only_the_touched_hour() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+
+        let db = Database::with_config(create_test_config("first-rollup-invalidation-is-sparse")).await?;
+        db.invalidate_rollup_hours("customer-a", "otel_logs_and_spans", "2026-08-16", 1 << 7)?;
+
+        let journal = db.maintenance_tasks.lock().unwrap();
+        let counts = journal.tasks().fold(HashMap::<Operation, usize>::new(), |mut counts, task| {
+            *counts.entry(task.key.operation).or_default() += 1;
+            counts
+        });
+        assert_eq!(counts.get(&Operation::Dedup), Some(&6));
+        assert_eq!(counts.get(&Operation::BaseRollup), Some(&6));
+        assert_eq!(counts.get(&Operation::DerivedRollup), Some(&1));
+        assert_eq!(counts.get(&Operation::HotPacking), Some(&6));
+        assert_eq!(journal.tasks().count(), 19, "one touched hour, not 456 full-day tasks");
         Ok(())
     }
 
