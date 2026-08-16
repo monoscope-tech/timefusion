@@ -45,6 +45,7 @@ fn cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
     c.tantivy = TantivyConfig {
         timefusion_tantivy_compression_level: 3,
         timefusion_tantivy_route_equality: true, // exercise the P0 `=` routing path
+        timefusion_tantivy_prefilter_min_selectivity_pct: 50,
         ..Default::default()
     };
     Arc::new(c)
@@ -531,10 +532,10 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
     Ok(())
 }
 
-/// Read-side coverage gate: when a live Delta file overlapping the query window
-/// is NOT covered by a successful index (compacted away, external write, failed
-/// build), the `id IN (hits)` prefilter would silently drop that file's rows.
-/// The gate must detect the gap and skip the prefilter (full scan) so the
+/// Read-side hybrid coverage: when a live Delta file overlapping the query
+/// window is NOT covered by a successful index (compacted away, external
+/// write, failed build), the `id IN (hits)` prefilter may only narrow the
+/// covered file. The uncovered file must remain a separate raw leg so the
 /// result still equals the baseline. Reproduces the landmine: two flushes →
 /// two live parquet files; we neuter one manifest entry (index=None) leaving
 /// its file live-but-uncovered, then confirm `text_match` still returns BOTH
@@ -542,7 +543,7 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
 /// file's hits and the other file's matching row vanishes.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn uncovered_live_file_skips_prefilter_not_rows() -> Result<()> {
+async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Result<()> {
     use timefusion::tantivy_index::manifest;
 
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -552,21 +553,50 @@ async fn uncovered_live_file_skips_prefilter_not_rows() -> Result<()> {
     let svc = svc.expect("tantivy enabled");
 
     // Two separate flushes → two parquet files, each with its own index entry.
-    for (db_x, rows) in [(&db, ("c1", "login alpha")), (&db2, ("c1", "login alpha"))] {
-        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![(rows.0, "n", rows.1)])], false, None).await?;
+    let first = vec![
+        ("c1", "n", "login alpha"),
+        ("d11", "n", "ordinary"),
+        ("d12", "n", "ordinary"),
+        ("d13", "n", "ordinary"),
+        ("d14", "n", "ordinary"),
+        ("d15", "n", "ordinary"),
+        ("d16", "n", "ordinary"),
+        ("d17", "n", "ordinary"),
+        ("d18", "n", "ordinary"),
+        ("d19", "n", "ordinary"),
+    ];
+    for db_x in [&db, &db2] {
+        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, first.clone())], false, None).await?;
         db_x.buffered_layer().cloned().unwrap().flush_all_now().await?;
     }
-    for (db_x, rows) in [(&db, ("c2", "login beta")), (&db2, ("c2", "login beta"))] {
-        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![(rows.0, "n", rows.1)])], false, None).await?;
+    let second = vec![
+        ("c2", "n", "login beta"),
+        ("d21", "n", "ordinary"),
+        ("d22", "n", "ordinary"),
+        ("d23", "n", "ordinary"),
+        ("d24", "n", "ordinary"),
+        ("d25", "n", "ordinary"),
+        ("d26", "n", "ordinary"),
+        ("d27", "n", "ordinary"),
+        ("d28", "n", "ordinary"),
+        ("d29", "n", "ordinary"),
+    ];
+    for db_x in [&db, &db2] {
+        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, second.clone())], false, None).await?;
         db_x.buffered_layer().cloned().unwrap().flush_all_now().await?;
     }
     let store = svc.object_store.clone();
     let m = wait_for_manifest_entries(store.as_ref(), &p, 2).await?;
     assert_eq!(m.entries.len(), 2, "two flushes → two entries");
 
-    // Baseline: both rows match `login` before we break coverage.
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND text_match(status_message, 'login')");
-    assert_eq!(collect_ids(&ctx, &q).await?, vec!["c1".to_string(), "c2".to_string()]);
+    // Baseline: both rows match. Do not query the enabled context yet: that
+    // would populate its five-second manifest cache before we mutate coverage
+    // and turn this into a false-positive test of the old manifest.
+    // Match the production point-lookup shape: a completely routable OR of
+    // exact/raw and substring predicates. The analyzer adds text_match leaves
+    // while preserving these originals as the final correctness filter.
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND (id = 'c1' OR status_message LIKE '%login%')");
+    assert_eq!(collect_ids(&ctx2, &q).await?, vec!["c1".to_string(), "c2".to_string()]);
 
     // Neuter exactly one entry: its parquet stays LIVE in Delta but is now
     // uncovered (index=None). The other entry remains valid + returns hits.
@@ -577,10 +607,30 @@ async fn uncovered_live_file_skips_prefilter_not_rows() -> Result<()> {
     e.error = Some("simulated uncovered file".into());
     manifest::save(store.as_ref(), TABLE, &p, &m2).await?;
 
-    // With one live file uncovered, the prefilter must be skipped (gate trips),
-    // so the full scan still returns BOTH rows — equal to the tantivy-off
-    // baseline. A prefilter that ignored coverage would drop the uncovered
-    // file's row.
+    // With one live file uncovered, the covered file uses Tantivy and the
+    // uncovered file scans raw. Their disjoint union must still return BOTH
+    // rows. Applying the covered file's id set globally would drop one.
+    let direct = db
+        .tantivy_search()
+        .expect("search service")
+        .search_with_stats(
+            TABLE,
+            &p,
+            &timefusion::tantivy_index::udf::PredNode::Leaf(timefusion::tantivy_index::udf::TextMatchPred {
+                column: "status_message".into(),
+                query: "login".into(),
+            }),
+            1000,
+            None,
+        )
+        .await?
+        .expect("one usable covered index");
+    assert_eq!(direct.covered_files.len(), 1, "the fixture must have exactly one covered and one uncovered file");
+    assert_eq!(direct.hits.len(), 1, "the covered index must be selective enough to engage the prefilter");
+    assert_eq!(direct.indexed_rows, 10);
+    let explain = ctx.sql(&format!("EXPLAIN {q}")).await?.collect().await?;
+    let rendered = datafusion::arrow::util::pretty::pretty_format_batches(&explain)?.to_string();
+    assert!(rendered.contains("UnionExec"), "partial coverage must produce indexed+raw Delta legs, not a global full-scan fallback:\n{rendered}");
     let r_on = collect_ids(&ctx, &q).await?;
     let r_off = collect_ids(&ctx2, &q).await?;
     assert_eq!(r_on, r_off, "uncovered live file must not drop rows from the prefilter");
