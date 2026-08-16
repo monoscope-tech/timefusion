@@ -3625,16 +3625,15 @@ impl Database {
                                 Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
                                 Err(error) => {
                                     warn!(%error, event = "maintenance_task_reconcile_failed");
-                                    return;
                                 }
                             }
-                            match reconcile_db.plan_compaction_debt().await {
-                                Ok(planned_compaction_tasks) => {
-                                    reconcile_db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
-                                    info!(planned_compaction_tasks, event = "maintenance_compaction_debt_planned");
-                                }
-                                Err(error) => warn!(%error, event = "maintenance_compaction_debt_plan_failed"),
-                            }
+                            // Do not discover fresh file-rewrite debt in the
+                            // boot burst. Durable journal work is already being
+                            // drained above; the coordinator's normal 60-second
+                            // planner tick discovers new debt after preload and
+                            // PGWire handoff have settled. Planning here raced
+                            // repair/resume staging and recreated the exact
+                            // startup contention this runtime isolates.
                         });
 
                         let coverage_db = Arc::clone(&db);
