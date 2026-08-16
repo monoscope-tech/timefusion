@@ -10407,11 +10407,6 @@ impl Database {
         if !self.config.maintenance.timefusion_rollup_enabled {
             return Ok(0);
         }
-        let fingerprints = {
-            let table = self.resolve_table("default", source).await?;
-            let table = table.read().await;
-            Self::partition_fingerprints(&table, tiebreak_of(source))?
-        };
         let mut recovered = 0;
         for spec in &schema.rollups {
             let target = spec.table_name(source);
@@ -10485,42 +10480,12 @@ impl Database {
             if !published.is_empty() {
                 continue;
             }
-            // One grouped probe over the whole rollup table. It is small by
-            // construction. This compatibility path is retained only for old
-            // generations written before Add tags existed.
-            let sql = format!("SELECT project_id, date::TEXT AS d, rollup_generation, COUNT(*)::BIGINT AS n FROM {target} GROUP BY 1, 2, 3");
-            let Ok(batches) = self.query_delta_only(&sql).await else { continue };
-            for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
-                for row in 0..batch.num_rows() {
-                    let value = |index: usize| crate::test_utils::test_helpers::array_get_str(batch.column(index).as_ref(), row);
-                    let (project_id, date, generation) = (value(0), value(1), value(2));
-                    let Some(rows) = arrow::array::AsArray::as_primitive_opt::<arrow::datatypes::Int64Type>(batch.column(3).as_ref()).map(|c| c.value(row))
-                    else {
-                        continue;
-                    };
-                    let Some(&source_fp) = fingerprints.get(&(project_id.clone(), date.clone())) else { continue };
-                    if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
-                        continue;
-                    }
-                    let epoch = self.rollup_source_epochs.get(&(project_id.clone(), source.to_string(), date.clone())).map_or(0, |entry| *entry.value());
-                    let covered_through = date_start_micros(&date).map_or(i64::MIN, |start| start + DAY_MICROS);
-                    self.rollup_coverage.insert(
-                        (project_id, source.to_string(), target.clone(), date),
-                        RollupCoverage {
-                            source_fp,
-                            source_epoch: epoch,
-                            generation,
-                            rows: rows as u64,
-                            // Only a WHOLE-partition build is re-adoptable: the
-                            // generation is re-proved against the whole-day
-                            // fingerprint, which a short-bounded build does not
-                            // carry. A partial day is simply rebuilt.
-                            covered_through,
-                        },
-                    );
-                    recovered += 1;
-                }
-            }
+            // Untagged legacy generations cannot be recovered safely without
+            // scanning rollup data.  A production restart showed that even a
+            // single 230 MiB compatibility GROUP BY starved PGWire for 19s.
+            // Leave those intervals uncovered so reads use exact raw data;
+            // the coordinator will replace them with tagged slices whose
+            // coverage is recoverable from Delta metadata alone.
         }
         info!(source, recovered, event = "rollup_coverage_recovered");
         Ok(recovered)
