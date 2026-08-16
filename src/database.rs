@@ -2642,6 +2642,12 @@ pub struct Database {
     repair_pass_permit: Arc<tokio::sync::Semaphore>,
 }
 
+fn sort_backfill_uris_newest_first(uris: &mut [String]) {
+    // Partition paths contain `date=YYYY-MM-DD`, so reverse lexical order is
+    // chronological newest-first.
+    uris.sort_by(|a, b| b.cmp(a));
+}
+
 impl Database {
     /// Get the config for this database instance
     pub fn config(&self) -> &AppConfig {
@@ -3189,7 +3195,7 @@ impl Database {
 
     /// Startup backfill (gated on `timefusion_tantivy_backfill`): build
     /// partition-mirrored indexes for live parquet files that no successful
-    /// manifest entry covers, oldest partition first. Every covered file
+    /// manifest entry covers, newest partition first. Every covered file
     /// widens the windows where the coverage gate lets the prefilter engage
     /// (pre-tantivy history, failed builds, pre-reindex compactions).
     pub fn spawn_tantivy_backfill(&self) {
@@ -3342,7 +3348,10 @@ impl Database {
                         warn!(table_name, project_id = %pid, skipped, "tantivy backfill skipped files over TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB");
                     }
                 }
-                uris.sort(); // lexical == chronological for date= partitions
+                // Dashboard acceptance is governed by recent windows; a
+                // terabyte of legacy history must not stand in front of the
+                // last seven days after a migration.
+                sort_backfill_uris_newest_first(&mut uris);
                 let work: Vec<(String, String)> = uris.iter().filter_map(|uri| Some((parquet_rel_of_uri(uri)?.to_string(), uri.clone()))).collect();
                 let table_owned = table_name.to_string();
                 let mut jobs = futures::stream::iter(work.into_iter().map(|(rel, uri)| {
@@ -19133,6 +19142,21 @@ mod tests {
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
     fn far_future() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
+    #[test]
+    fn tantivy_backfill_prioritizes_recent_partitions() {
+        let mut uris = vec![
+            "project_id=p/date=2024-01-01/old.parquet".to_string(),
+            "project_id=p/date=2026-08-16/new-b.parquet".to_string(),
+            "project_id=p/date=2025-06-10/middle.parquet".to_string(),
+            "project_id=p/date=2026-08-16/new-a.parquet".to_string(),
+        ];
+        super::sort_backfill_uris_newest_first(&mut uris);
+
+        assert!(uris[0].contains("date=2026-08-16") && uris[1].contains("date=2026-08-16"));
+        assert!(uris[2].contains("date=2025-06-10"));
+        assert!(uris[3].contains("date=2024-01-01"));
     }
 
     /// The merge-on-read gate: `keep_greatest_ordering` yields the lead sort key
