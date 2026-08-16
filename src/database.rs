@@ -8873,17 +8873,31 @@ impl Database {
         let mut queued = 0usize;
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { continue };
-            let (version, partitions) = {
+            let version = {
                 let table = table_ref.read().await;
-                let version = table.version().unwrap_or_default();
-                let partitions = Self::partition_fingerprints(&table, tiebreak_of(&source))?.into_keys().collect::<Vec<_>>();
-                (version, partitions)
+                table.version().unwrap_or_default()
             };
             let cursor_key = format!("{storage_project}:{source}");
             let current_cursor = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).source_cursor(&cursor_key);
+            // The first coordinator start has no durable cursor. Establish a
+            // baseline at the already-loaded snapshot instead of expanding the
+            // complete table history into thousands of urgent tasks. Existing
+            // journal invalidations remain intact, and normal fair backfill
+            // discovers historical debt. Production showed the old bootstrap
+            // path monopolizing CPU for 21.9s immediately after preload.
+            if current_cursor.is_none() {
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.set_source_cursor(cursor_key, version);
+                journal.checkpoint()?;
+                continue;
+            }
             if current_cursor.is_some_and(|cursor| cursor >= version) {
                 continue;
             }
+            let partitions = {
+                let table = table_ref.read().await;
+                Self::partition_fingerprints(&table, tiebreak_of(&source))?.into_keys().collect::<Vec<_>>()
+            };
             for (partition_project, date) in partitions {
                 let project = if storage_project.is_empty() { partition_project } else { storage_project.clone() };
                 self.enqueue_maintenance_hours(&project, &source, &date, crate::rollup::ALL_HOURS)?;
@@ -18873,6 +18887,22 @@ mod tests {
         assert!(db.unified_tables.read().await.is_empty());
         assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
         assert!(db.unified_tables.read().await.is_empty(), "reconciliation must not resolve a source table");
+        Ok(())
+    }
+
+    /// The first cursor is a baseline, not a request to turn the full retained
+    /// history into urgent startup work. Historical debt is discovered by the
+    /// fair planner after foreground service has settled.
+    #[tokio::test]
+    async fn maintenance_reconciliation_baselines_a_new_source_cursor() -> Result<()> {
+        let db = Database::with_config(create_test_config("reconcile-first-cursor-baseline")).await?;
+        let table = db.get_or_create_unified_table("otel_logs_and_spans").await?;
+        let version = table.read().await.version().unwrap_or_default();
+        let cursor_key = ":otel_logs_and_spans";
+        assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), None);
+
+        assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
+        assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), Some(version));
         Ok(())
     }
 
