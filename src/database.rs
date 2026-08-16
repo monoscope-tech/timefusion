@@ -8866,6 +8866,14 @@ impl Database {
                 }
             }
             for ((project_id, date), files) in partitions {
+                // Future event timestamps are neither hot nor sealed. Treating
+                // them as sealed debt lets maintenance rewrite a partition as
+                // soon as it appears, racing foreground repair/DML and wasting
+                // resources on malformed clocks. They become eligible normally
+                // when their UTC date arrives.
+                if date > today {
+                    continue;
+                }
                 let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid compaction date"))?.and_utc().timestamp_micros();
                 let slice = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS))?;
                 let small_target = if date == today { 256 * 1024 * 1024 } else { 512 * 1024 * 1024 };
