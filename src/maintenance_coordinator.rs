@@ -729,6 +729,7 @@ impl TaskJournal {
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
         let mut oldest_created = u64::MAX;
+        let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let now_micros = crate::clock::now_micros();
         for task in &self.snapshot.tasks {
             let index = match task.state {
@@ -746,6 +747,7 @@ impl TaskJournal {
                     sealed_debt_bytes = sealed_debt_bytes.saturating_add(task.estimated_decoded_bytes);
                 }
             }
+            track_latest_frontier_rollup(&mut latest_frontier_rollup, task, now_micros);
         }
         stats.maintenance_tasks_pending.store(counts[0], Relaxed);
         stats.maintenance_tasks_running.store(counts[1], Relaxed);
@@ -753,7 +755,7 @@ impl TaskJournal {
         stats.maintenance_tasks_complete.store(counts[3], Relaxed);
         stats.maintenance_backlog_bytes.store(backlog_bytes, Relaxed);
         stats.sealed_compaction_debt_bytes.store(sealed_debt_bytes, Relaxed);
-        let eligible_lag_secs = live_frontier_lag_secs(self.snapshot.tasks.iter(), now_micros);
+        let eligible_lag_secs = frontier_lag_secs(latest_frontier_rollup.values().copied(), now_micros);
         stats.maintenance_eligible_watermark_lag_secs.store(eligible_lag_secs, Relaxed);
         stats
             .maintenance_raw_tail_duration_secs
@@ -812,7 +814,7 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// correction to old data is a bounded historical hole; treating its recent
 /// mutation as live-tail work would let backfill displace current coverage.
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
-    if task.key.slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && task.key.slice.start_micros <= now_micros {
+    if is_live_frontier(task.key.slice, now_micros) {
         // Smaller tuples run first. Negating makes the newest minute the most
         // urgent while keeping all projects in that minute deadline-equivalent.
         (0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
@@ -821,33 +823,43 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
     }
 }
 
-/// Additional delay beyond the 15-minute quiet-period watermark for the live
-/// rollup frontier. Historical holes remain visible through backlog and oldest
-/// task age, but do not inflate the raw-tail gauge.
-fn live_frontier_lag_secs<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> u64 {
-    let mut latest: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
-    for task in tasks {
-        if task.key.operation != Operation::BaseRollup
-            || task.key.slice.end_micros < now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS)
-            || task.key.slice.start_micros > now_micros
-        {
-            continue;
-        }
-        let stream = (task.key.source.as_str(), task.key.project_id.as_str(), task.key.physical_table.as_str());
-        let active = u8::from(!matches!(task.state, TaskState::Complete | TaskState::Superseded));
-        if latest.get(&stream).is_none_or(|current| {
-            let current_active = u8::from(!matches!(current.state, TaskState::Complete | TaskState::Superseded));
-            (task.key.slice.end_micros, active, task.deadline_micros) > (current.key.slice.end_micros, current_active, current.deadline_micros)
-        }) {
-            latest.insert(stream, task);
-        }
+fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
+    slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && slice.start_micros <= now_micros
+}
+
+fn track_latest_frontier_rollup<'a>(latest: &mut HashMap<(&'a str, &'a str, &'a str), &'a MaintenanceTask>, task: &'a MaintenanceTask, now_micros: i64) {
+    if task.key.operation != Operation::BaseRollup || !is_live_frontier(task.key.slice, now_micros) {
+        return;
     }
-    latest
-        .values()
+    let stream = (task.key.source.as_str(), task.key.project_id.as_str(), task.key.physical_table.as_str());
+    let active = u8::from(!matches!(task.state, TaskState::Complete | TaskState::Superseded));
+    if latest.get(&stream).is_none_or(|current| {
+        let current_active = u8::from(!matches!(current.state, TaskState::Complete | TaskState::Superseded));
+        (task.key.slice.end_micros, active, task.deadline_micros) > (current.key.slice.end_micros, current_active, current.deadline_micros)
+    }) {
+        latest.insert(stream, task);
+    }
+}
+
+fn frontier_lag_secs<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> u64 {
+    tasks
+        .into_iter()
         .filter(|task| !matches!(task.state, TaskState::Complete | TaskState::Superseded) && task.deadline_micros <= now_micros)
         .map(|task| u64::try_from(now_micros.saturating_sub(task.deadline_micros).div_euclid(1_000_000)).unwrap_or_default())
         .max()
         .unwrap_or_default()
+}
+
+/// Additional delay beyond the 15-minute quiet-period watermark for the live
+/// rollup frontier. Historical holes remain visible through backlog and oldest
+/// task age, but do not inflate the raw-tail gauge.
+#[cfg(test)]
+fn live_frontier_lag_secs<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> u64 {
+    let mut latest: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
+    for task in tasks {
+        track_latest_frontier_rollup(&mut latest, task, now_micros);
+    }
+    frontier_lag_secs(latest.values().copied(), now_micros)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
