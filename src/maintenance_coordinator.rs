@@ -20,6 +20,7 @@ pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
+pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 pub const TAG_SOURCE: &str = "timefusion.source";
 pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
@@ -237,6 +238,13 @@ pub struct Invalidation<'a> {
 }
 
 impl TaskJournal {
+    // v1 removed the original bootstrap expansion, but the then-current
+    // reconciliation immediately recreated it before advancing its cursor.
+    // v2 removed it in memory but did not force an on-disk snapshot rewrite.
+    // v3 runs once with commit-range reconciliation and forced compaction.
+    const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v3";
+    const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
+
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::wal::meta_path(data_dir, "maintenance_tasks.json");
         let wal_path = crate::wal::meta_path(data_dir, "maintenance_tasks.wal");
@@ -311,6 +319,36 @@ impl TaskJournal {
         migrated
     }
 
+    /// Remove the one-time global backlog produced by the original cursor
+    /// bootstrap. That implementation expanded every retained partition into
+    /// dedup, rollup, and packing work and produced 730k journal entries in
+    /// production. Keeping completed publications preserves recoverable
+    /// coverage; dropping unfinished entries is correctness-safe because they
+    /// remain uncovered and reads use raw data until normal planners or new
+    /// invalidations enqueue bounded work.
+    pub fn migrate_bootstrap_backlog(&mut self) -> Option<usize> {
+        self.migrate_bootstrap_backlog_with_limit(Self::BOOTSTRAP_BACKLOG_LIMIT)
+    }
+
+    fn migrate_bootstrap_backlog_with_limit(&mut self, limit: usize) -> Option<usize> {
+        if self.snapshot.source_cursors.get(Self::BOOTSTRAP_BACKLOG_MIGRATION).copied().unwrap_or_default() >= 1 {
+            return None;
+        }
+        let mut removed = 0;
+        if self.snapshot.tasks.len() > limit {
+            self.snapshot.tasks.retain(|task| {
+                let keep = task.state == TaskState::Complete;
+                removed += usize::from(!keep);
+                keep
+            });
+            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
+            self.dirty_tasks.clear();
+        }
+        self.snapshot.source_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned(), 1);
+        self.dirty_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned());
+        Some(removed)
+    }
+
     pub fn upsert(&mut self, task: MaintenanceTask) {
         self.dirty_tasks.insert(task.key.clone());
         if let Some(index) = self.task_indices.get(&task.key).copied() {
@@ -323,18 +361,27 @@ impl TaskJournal {
     }
 
     pub fn enqueue(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) {
-        self.dirty_tasks.insert(key.clone());
         if let Some(index) = self.task_indices.get(&key).copied() {
             let task = &mut self.snapshot.tasks[index];
             if task.state != TaskState::Running {
-                task.state = TaskState::Pending;
-                task.deadline_micros = task.deadline_micros.min(deadline_micros);
-                task.estimated_decoded_bytes = estimated_decoded_bytes;
-                task.retry_reason = None;
-                task.publication = None;
+                let new_deadline = task.deadline_micros.min(deadline_micros);
+                let changed = task.state != TaskState::Pending
+                    || task.deadline_micros != new_deadline
+                    || task.estimated_decoded_bytes != estimated_decoded_bytes
+                    || task.retry_reason.is_some()
+                    || task.publication.is_some();
+                if changed {
+                    task.state = TaskState::Pending;
+                    task.deadline_micros = new_deadline;
+                    task.estimated_decoded_bytes = estimated_decoded_bytes;
+                    task.retry_reason = None;
+                    task.publication = None;
+                    self.dirty_tasks.insert(key);
+                }
             }
             return;
         }
+        self.dirty_tasks.insert(key.clone());
         let index = self.snapshot.tasks.len();
         self.task_indices.insert(key.clone(), index);
         self.snapshot.tasks.push(MaintenanceTask {
@@ -356,7 +403,15 @@ impl TaskJournal {
     /// made pending again and its quiet-period deadline moves forward.
     pub fn invalidate(&mut self, invalidation: Invalidation<'_>) -> anyhow::Result<()> {
         let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived } = invalidation;
-        let deadline_micros = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
+        // Round up, never down: a bucket can delay eligibility slightly but
+        // can never publish before the full quiet period. High-rate ingest
+        // then journals one deadline extension per bucket rather than one full
+        // task record per event batch.
+        let deadline = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
+        let deadline_micros = deadline
+            .saturating_add(INVALIDATION_DEADLINE_BUCKET_MICROS - 1)
+            .div_euclid(INVALIDATION_DEADLINE_BUCKET_MICROS)
+            .saturating_mul(INVALIDATION_DEADLINE_BUCKET_MICROS);
         let created_unix_ms = u64::try_from(observed_at_micros.div_euclid(1_000)).unwrap_or_default();
         let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
         let rollup_slices = if derived {
@@ -385,10 +440,16 @@ impl TaskJournal {
                 };
                 if let Some(index) = self.task_indices.get(&key).copied() {
                     let task = &mut self.snapshot.tasks[index];
-                    task.state = TaskState::Pending;
-                    task.deadline_micros = task.deadline_micros.max(deadline_micros);
-                    task.retry_reason = None;
-                    task.publication = None;
+                    let new_deadline = task.deadline_micros.max(deadline_micros);
+                    let changed =
+                        task.state != TaskState::Pending || task.deadline_micros != new_deadline || task.retry_reason.is_some() || task.publication.is_some();
+                    if changed {
+                        task.state = TaskState::Pending;
+                        task.deadline_micros = new_deadline;
+                        task.retry_reason = None;
+                        task.publication = None;
+                        self.dirty_tasks.insert(key);
+                    }
                 } else {
                     let index = self.snapshot.tasks.len();
                     self.task_indices.insert(key.clone(), index);
@@ -404,8 +465,8 @@ impl TaskJournal {
                         retry_reason: None,
                         publication: None,
                     });
+                    self.dirty_tasks.insert(key);
                 }
-                self.dirty_tasks.insert(key);
             }
         }
         Ok(())
@@ -634,12 +695,26 @@ impl TaskJournal {
             wal.sync_all()?;
         }
         if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
-            let bytes = serde_json::to_vec(&self.snapshot)?;
-            crate::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
-            let wal = OpenOptions::new().write(true).truncate(true).open(&self.wal_path)?;
-            wal.sync_all()?;
+            self.compact()?;
         }
         self.publish_statistics();
+        Ok(())
+    }
+
+    /// Rewrite the authoritative snapshot even when the WAL is below its
+    /// normal size threshold. Migrations that remove tasks cannot represent
+    /// those deletions as append-only WAL records, so they must force this
+    /// compaction before startup continues.
+    pub fn compact(&mut self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(&self.snapshot)?;
+        crate::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
+        let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
+        wal.sync_all()?;
+        self.dirty_tasks.clear();
+        self.dirty_cursors.clear();
         Ok(())
     }
 
@@ -911,6 +986,47 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_backlog_migration_keeps_publications_and_runs_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Production already carries the v1 marker. It must not suppress the
+        // corrective cleanup after commit-range reconciliation ships.
+        journal.set_source_cursor("__maintenance_bootstrap_backlog_v1".to_owned(), 1);
+        journal.set_source_cursor("__maintenance_bootstrap_backlog_v2".to_owned(), 1);
+        journal.upsert(task("pending-a", 0, 1, Operation::Dedup));
+        journal.upsert(task("pending-b", 1, 2, Operation::BaseRollup));
+        let mut complete = task("published", 2, 3, Operation::BaseRollup);
+        complete.state = TaskState::Complete;
+        journal.upsert(complete.clone());
+
+        assert_eq!(journal.migrate_bootstrap_backlog_with_limit(2), Some(2));
+        assert_eq!(journal.snapshot.tasks, vec![complete]);
+        assert_eq!(journal.migrate_bootstrap_backlog_with_limit(0), None, "migration marker makes cleanup one-shot");
+        journal.compact().expect("migration snapshot");
+        let reloaded = TaskJournal::load(dir.path()).expect("reloaded journal");
+        assert_eq!(reloaded.snapshot.tasks.len(), 1, "removed bootstrap tasks must not resurrect after restart");
+        assert_eq!(reloaded.snapshot.tasks[0].key.project_id, "published");
+    }
+
+    #[test]
+    fn repeated_pending_invalidation_does_not_rewrite_the_wal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = task("customer", 0, 1, Operation::BaseRollup).key;
+        journal.enqueue(key.clone(), 10, 512, 1);
+        journal.checkpoint().expect("first checkpoint");
+        let first_size = fs::metadata(&journal.wal_path).expect("wal").len();
+
+        journal.enqueue(key.clone(), 20, 512, 2);
+        journal.checkpoint().expect("idempotent checkpoint");
+        assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_size);
+
+        journal.enqueue(key, 5, 512, 3);
+        journal.checkpoint().expect("earlier deadline checkpoint");
+        assert!(fs::metadata(&journal.wal_path).expect("wal").len() > first_size);
+    }
+
+    #[test]
     fn recent_slices_precede_overdue_historical_work() {
         let now = 10 * 24 * 60 * 60 * 1_000_000;
         let old = task("old", 0, MIN_SLICE_MICROS, Operation::Dedup);
@@ -1074,6 +1190,8 @@ mod tests {
                 derived: false,
             })
             .expect("invalidate");
+        journal.checkpoint().expect("first invalidation checkpoint");
+        let first_wal_size = fs::metadata(&journal.wal_path).expect("wal").len();
         journal
             .invalidate(Invalidation {
                 source_table: "source",
@@ -1086,9 +1204,23 @@ mod tests {
                 derived: false,
             })
             .expect("invalidate again");
+        journal.checkpoint().expect("same-bucket checkpoint");
+        assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_wal_size, "same deadline bucket must not rewrite tasks");
+        journal
+            .invalidate(Invalidation {
+                source_table: "source",
+                rollup_table: "rollup",
+                source: "source",
+                project_id: "p",
+                start_micros: 0,
+                end_micros: NORMAL_SLICE_MICROS,
+                observed_at_micros: INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+                derived: false,
+            })
+            .expect("invalidate in next bucket");
         assert_eq!(journal.tasks().count(), 3);
         assert!(journal.tasks().any(|task| task.key.operation == Operation::HotPacking));
-        assert!(journal.tasks().all(|task| task.deadline_micros == 20 + FINALIZATION_DELAY_MICROS));
+        assert!(journal.tasks().all(|task| task.deadline_micros == FINALIZATION_DELAY_MICROS + 2 * INVALIDATION_DEADLINE_BUCKET_MICROS));
     }
 
     #[test]

@@ -45,6 +45,9 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
         .with_page_row_count_limit(50)
         .start()
         .await?;
+    // The test invokes `compact_date` itself and asserts that call's actions.
+    // Do not let the background coordinator consume the same files first.
+    env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
     // 600 rows spanning ~10 minutes (1s apart), flushed in chunks so several

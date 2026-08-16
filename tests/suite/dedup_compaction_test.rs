@@ -1871,7 +1871,9 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
+    timefusion::clock::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
     assert!(db.run_maintenance_units(1024).await? > 0, "eligible slice tasks must be drained");
 
     let total_from_rollup = |db: Arc<Database>, project_id: String| async move {
@@ -1913,7 +1915,9 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("span_late", "op", &project_id, late)])?], true, None)
         .await?;
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
+    timefusion::clock::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
     assert!(db.run_maintenance_units(1024).await? > 0, "late slice tasks must be drained");
     assert_eq!(
         total_from_rollup(Arc::clone(&db), project_id.clone()).await?,
@@ -1983,7 +1987,9 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + 1);
+    timefusion::clock::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
     assert!(db.run_maintenance_units(1024).await? > 0, "eligible yesterday slices must be drained");
 
     // Written AFTER certification: today has no coverage, so these are reachable
@@ -2186,12 +2192,12 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 /// query could never route no matter how long the process ran, while a 24h one
 /// could. That asymmetry is the whole reason the expensive queries stayed slow.
 ///
-/// Also pins that coverage survives a restart. `rollup_generation` used to be a
-/// random UUID held only in memory, so a deploy made the rollup rows already on
-/// S3 permanently unreadable — and prod redeploys constantly.
+/// Also pins that untagged whole-day output is not scanned and re-adopted at
+/// restart. Only coordinator slice publications carry enough Add-tag identity
+/// for metadata-only recovery; legacy output safely falls back to raw reads.
 #[serial]
 #[tokio::test]
-async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Result<()> {
+async fn backfill_covers_sealed_days_and_legacy_coverage_falls_back_after_restart() -> Result<()> {
     let mut cfg = (*TestConfigBuilder::new("rollup_backfill").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     cfg.maintenance.timefusion_rollup_realtime_tail = true;
     cfg.maintenance.timefusion_rollup_backfill_days = 7;
@@ -2238,11 +2244,13 @@ async fn backfill_covers_sealed_days_and_the_coverage_survives_a_restart() -> Re
     assert_eq!(built, 2, "the backfill must certify and build both sealed days");
     assert_eq!(covered(Arc::clone(&db)).await?, 2, "both sealed spans must be rolled up");
 
-    // Restart over the SAME config (same storage prefix): a fresh Database has
-    // an empty coverage map, and must re-adopt it from the rollup table itself.
+    // Restart over the SAME config (same storage prefix). This legacy writer
+    // did not attach slice identity Add tags, so recovery must not issue a
+    // grouped data scan. Exact reads remain on raw data until tagged slices are
+    // published by the coordinator.
     let restarted = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let recovered = restarted.recover_rollup_coverage("otel_logs_and_spans").await?;
-    assert!(recovered >= 2, "coverage must be re-provable from the rollup table after a restart, got {recovered}");
+    assert_eq!(recovered, 0, "untagged legacy coverage must remain unproved after restart");
     Ok(())
 }
 

@@ -2953,12 +2953,14 @@ impl Database {
         let flush_sort_permits = flush_sort_permits(cfg.maintenance.flush_sort_pool_bytes());
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
-        let maintenance_admission = crate::maintenance_coordinator::AdmissionController::new(
-            u32::try_from(cfg.derived.cores.max(1)).unwrap_or(u32::MAX),
-            u64::try_from(cfg.derived.memory_limit_bytes).unwrap_or(u64::MAX),
-            u32::try_from(cfg.derived.cores.max(1) * 2).unwrap_or(u32::MAX),
-            u32::try_from(cfg.derived.cores.max(1)).unwrap_or(u32::MAX),
-        );
+        // This is a single-node foreground database, not a detached worker
+        // fleet. Admit one rewrite at a time: DataFusion can still parallelize
+        // inside that bounded unit, but dedup, rollup, and compaction must not
+        // each start their own object-store stream and saturate PGWire/ingest.
+        // Production 2026-08-16 proved that exposing all 48 CPUs here released
+        // four 230 MiB source scans together immediately after preload.
+        let maintenance_admission =
+            crate::maintenance_coordinator::AdmissionController::new(1, u64::try_from(cfg.derived.memory_limit_bytes).unwrap_or(u64::MAX), 1, 1);
         let logical_count_cache = Arc::new(crate::logical_count_index::LogicalCountCache::new(
             cfg.core.timefusion_data_dir.join("logical_count"),
             cfg.derived.logical_count_memory_bytes(),
@@ -3556,13 +3558,17 @@ impl Database {
         // five consecutive 1.5s deadlines while maintenance was being polled.
         // Resource tokens bound memory and I/O; this runtime boundary reserves
         // executor progress for ingest, queries, and liveness.
-        let coordinator_workers = (self.config.derived.cores / 8).clamp(1, 4);
+        // Two runtime threads keep timers, cancellation, and object-store I/O
+        // progressing while the single admitted job is polled. Job concurrency
+        // is deliberately one; see the admission controller initialization.
+        let coordinator_runtime_workers = (self.config.derived.cores / 8).clamp(2, 4);
+        const COORDINATOR_JOB_WORKERS: usize = 1;
         db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
         {
             let db = Arc::clone(&db);
             let cancel = cancel.clone();
             let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(coordinator_workers)
+                .worker_threads(coordinator_runtime_workers)
                 .thread_name("maintenance-worker")
                 .enable_all()
                 .build()
@@ -3573,17 +3579,46 @@ impl Database {
                 .spawn(move || {
                     runtime.block_on(async move {
                         let journal = Arc::clone(&db.maintenance_tasks);
-                        match tokio::task::spawn_blocking(move || -> Result<usize> {
+                        match tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
                             let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let discarded = journal.migrate_bootstrap_backlog();
                             let migrated = journal.migrate_derived_slices();
-                            if migrated != 0 {
+                            if discarded.is_some_and(|count| count != 0) {
+                                journal.compact()?;
+                            } else if discarded.is_some() || migrated != 0 {
                                 journal.checkpoint()?;
                             }
-                            Ok(migrated)
+                            Ok((discarded.unwrap_or_default(), migrated))
                         })
                         .await
                         {
-                            Ok(Ok(migrated_tasks)) => info!(migrated_tasks, workers = coordinator_workers, event = "maintenance_runtime_started"),
+                            Ok(Ok((discarded_bootstrap_tasks, migrated_tasks))) => {
+                                // The cleanup removes only unpublished work.
+                                // Recreate the small, authoritative set of
+                                // invalidations persisted in rollup_journal so
+                                // they still converge instead of remaining on
+                                // the correctness-safe raw fallback forever.
+                                let mut requeued_dirty_partitions = 0usize;
+                                if discarded_bootstrap_tasks != 0 {
+                                    for entry in db.rollup_dirty.iter() {
+                                        let ((project, source, date), hours) = (entry.key(), *entry.value());
+                                        if hours != 0 {
+                                            match db.enqueue_maintenance_hours(project, source, date, hours) {
+                                                Ok(()) => requeued_dirty_partitions = requeued_dirty_partitions.saturating_add(1),
+                                                Err(error) => warn!(%error, project, source, date, event = "maintenance_dirty_partition_requeue_failed"),
+                                            }
+                                        }
+                                    }
+                                }
+                                info!(
+                                    discarded_bootstrap_tasks,
+                                    requeued_dirty_partitions,
+                                    migrated_tasks,
+                                    runtime_workers = coordinator_runtime_workers,
+                                    job_workers = COORDINATOR_JOB_WORKERS,
+                                    event = "maintenance_runtime_started"
+                                );
+                            }
                             Ok(Err(error)) => {
                                 warn!(%error, event = "maintenance_task_journal_migration_failed");
                                 return;
@@ -3594,7 +3629,7 @@ impl Database {
                             }
                         }
 
-                        for worker in 0..coordinator_workers {
+                        for worker in 0..COORDINATOR_JOB_WORKERS {
                             let db = Arc::clone(&db);
                             let cancel = cancel.clone();
                             tokio::spawn(async move {
@@ -8850,8 +8885,8 @@ impl Database {
     }
 
     /// Reconcile the durable task cursor with each live Delta snapshot. This is
-    /// intentionally metadata-only and conservative: if any commit landed
-    /// after the cursor, every currently-active source partition is queued.
+    /// intentionally metadata-only and conservative: commits after the cursor
+    /// contribute only the partitions named by data-changing Add/Remove actions.
     /// A crash before the cursor checkpoint repeats work; a crash after it is
     /// safe because every task checkpoint happened first.
     async fn reconcile_maintenance_task_cursors(&self) -> Result<usize> {
@@ -8862,16 +8897,48 @@ impl Database {
         let mut queued = 0usize;
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { continue };
-            let (version, partitions) = {
+            let (version, log_store) = {
                 let table = table_ref.read().await;
-                let version = table.version().unwrap_or_default();
-                let partitions = Self::partition_fingerprints(&table, tiebreak_of(&source))?.into_keys().collect::<Vec<_>>();
-                (version, partitions)
+                (table.version().unwrap_or_default(), table.log_store())
             };
             let cursor_key = format!("{storage_project}:{source}");
             let current_cursor = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).source_cursor(&cursor_key);
+            // The first coordinator start has no durable cursor. Establish a
+            // baseline at the already-loaded snapshot instead of expanding the
+            // complete table history into thousands of urgent tasks. Existing
+            // journal invalidations remain intact, and normal fair backfill
+            // discovers historical debt. Production showed the old bootstrap
+            // path monopolizing CPU for 21.9s immediately after preload.
+            if current_cursor.is_none() {
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.set_source_cursor(cursor_key, version);
+                journal.checkpoint()?;
+                continue;
+            }
             if current_cursor.is_some_and(|cursor| cursor >= version) {
                 continue;
+            }
+            let cursor = current_cursor.expect("missing cursor handled above");
+            let mut partitions = HashSet::new();
+            for commit_version in cursor.saturating_add(1)..=version {
+                let bytes = log_store
+                    .read_commit_entry(commit_version)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("source commit {commit_version} is unavailable for {cursor_key}; cursor remains at {cursor}"))?;
+                for action in deltalake::logstore::get_actions(commit_version, &bytes)? {
+                    let changed = match action {
+                        deltalake::kernel::Action::Add(add) if add.data_change => {
+                            Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values))
+                        }
+                        deltalake::kernel::Action::Remove(remove) if remove.data_change => {
+                            Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref())
+                        }
+                        _ => None,
+                    };
+                    if let Some(partition) = changed {
+                        partitions.insert(partition);
+                    }
+                }
             }
             for (partition_project, date) in partitions {
                 let project = if storage_project.is_empty() { partition_project } else { storage_project.clone() };
@@ -8883,6 +8950,14 @@ impl Database {
             journal.checkpoint()?;
         }
         Ok(queued)
+    }
+
+    fn maintenance_partition_from_action(path: &str, partition_values: Option<&HashMap<String, Option<String>>>) -> Option<(String, String)> {
+        let value = |name: &str| partition_values.and_then(|values| values.get(name)).and_then(Option::as_deref).map(str::to_owned);
+        let path_value = |name: &str| path.split('/').find_map(|segment| segment.strip_prefix(&format!("{name}="))).map(str::to_owned);
+        let date = value("date").or_else(|| path_value("date"))?;
+        let project = value("project_id").or_else(|| path_value("project_id")).unwrap_or_else(|| "default".to_owned());
+        Some((project, date))
     }
 
     async fn plan_compaction_debt(&self) -> Result<usize> {
@@ -10396,11 +10471,6 @@ impl Database {
         if !self.config.maintenance.timefusion_rollup_enabled {
             return Ok(0);
         }
-        let fingerprints = {
-            let table = self.resolve_table("default", source).await?;
-            let table = table.read().await;
-            Self::partition_fingerprints(&table, tiebreak_of(source))?
-        };
         let mut recovered = 0;
         for spec in &schema.rollups {
             let target = spec.table_name(source);
@@ -10474,42 +10544,12 @@ impl Database {
             if !published.is_empty() {
                 continue;
             }
-            // One grouped probe over the whole rollup table. It is small by
-            // construction. This compatibility path is retained only for old
-            // generations written before Add tags existed.
-            let sql = format!("SELECT project_id, date::TEXT AS d, rollup_generation, COUNT(*)::BIGINT AS n FROM {target} GROUP BY 1, 2, 3");
-            let Ok(batches) = self.query_delta_only(&sql).await else { continue };
-            for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
-                for row in 0..batch.num_rows() {
-                    let value = |index: usize| crate::test_utils::test_helpers::array_get_str(batch.column(index).as_ref(), row);
-                    let (project_id, date, generation) = (value(0), value(1), value(2));
-                    let Some(rows) = arrow::array::AsArray::as_primitive_opt::<arrow::datatypes::Int64Type>(batch.column(3).as_ref()).map(|c| c.value(row))
-                    else {
-                        continue;
-                    };
-                    let Some(&source_fp) = fingerprints.get(&(project_id.clone(), date.clone())) else { continue };
-                    if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
-                        continue;
-                    }
-                    let epoch = self.rollup_source_epochs.get(&(project_id.clone(), source.to_string(), date.clone())).map_or(0, |entry| *entry.value());
-                    let covered_through = date_start_micros(&date).map_or(i64::MIN, |start| start + DAY_MICROS);
-                    self.rollup_coverage.insert(
-                        (project_id, source.to_string(), target.clone(), date),
-                        RollupCoverage {
-                            source_fp,
-                            source_epoch: epoch,
-                            generation,
-                            rows: rows as u64,
-                            // Only a WHOLE-partition build is re-adoptable: the
-                            // generation is re-proved against the whole-day
-                            // fingerprint, which a short-bounded build does not
-                            // carry. A partial day is simply rebuilt.
-                            covered_through,
-                        },
-                    );
-                    recovered += 1;
-                }
-            }
+            // Untagged legacy generations cannot be recovered safely without
+            // scanning rollup data.  A production restart showed that even a
+            // single 230 MiB compatibility GROUP BY starved PGWire for 19s.
+            // Leave those intervals uncovered so reads use exact raw data;
+            // the coordinator will replace them with tagged slices whose
+            // coverage is recoverable from Delta metadata alone.
         }
         info!(source, recovered, event = "rollup_coverage_recovered");
         Ok(recovered)
@@ -18897,6 +18937,58 @@ mod tests {
         assert!(db.unified_tables.read().await.is_empty());
         assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
         assert!(db.unified_tables.read().await.is_empty(), "reconciliation must not resolve a source table");
+        Ok(())
+    }
+
+    /// The first cursor is a baseline, not a request to turn the full retained
+    /// history into urgent startup work. Historical debt is discovered by the
+    /// fair planner after foreground service has settled.
+    #[tokio::test]
+    async fn maintenance_reconciliation_baselines_a_new_source_cursor() -> Result<()> {
+        let db = Database::with_config(create_test_config("reconcile-first-cursor-baseline")).await?;
+        let table = db.get_or_create_unified_table("otel_logs_and_spans").await?;
+        let version = table.read().await.version().unwrap_or_default();
+        let cursor_key = ":otel_logs_and_spans";
+        assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), None);
+
+        assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
+        assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), Some(version));
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_reconciliation_extracts_only_the_changed_partition() {
+        let values = HashMap::from([("project_id".to_owned(), Some("customer-a".to_owned())), ("date".to_owned(), Some("2026-08-16".to_owned()))]);
+        assert_eq!(Database::maintenance_partition_from_action("ignored.parquet", Some(&values)), Some(("customer-a".to_owned(), "2026-08-16".to_owned())));
+
+        // Older writers may omit partitionValues on Remove. The file path is
+        // still sufficient, so a delete cannot advance the cursor without
+        // invalidating the affected slice.
+        assert_eq!(
+            Database::maintenance_partition_from_action("project_id=customer-b/date=2026-08-15/part-000.parquet", None,),
+            Some(("customer-b".to_owned(), "2026-08-15".to_owned()))
+        );
+
+        assert_eq!(
+            Database::maintenance_partition_from_action("date=2026-08-14/part-000.parquet", None),
+            Some(("default".to_owned(), "2026-08-14".to_owned()))
+        );
+        assert_eq!(Database::maintenance_partition_from_action("part-000.parquet", None), None);
+    }
+
+    /// A single node must not launch independent dedup/rollup/compaction object
+    /// streams together. One admitted unit may use bounded internal DataFusion
+    /// parallelism; the next unit waits in the durable journal.
+    #[tokio::test]
+    async fn database_admits_only_one_maintenance_job_at_a_time() -> Result<()> {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources};
+
+        let db = Database::with_config(create_test_config("single-maintenance-job")).await?;
+        let request = Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 };
+        let first = db.maintenance_admission.try_acquire(request).expect("first bounded job is admitted");
+        assert!(db.maintenance_admission.try_acquire(request).is_none(), "a second source rewrite must remain queued");
+        drop(first);
+        assert!(db.maintenance_admission.try_acquire(request).is_some(), "dropping the job returns every admission token");
         Ok(())
     }
 
