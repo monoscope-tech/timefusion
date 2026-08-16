@@ -42,7 +42,12 @@ const SLOW_DML_PHASE_US: u64 = 1_000_000;
 /// Maximum source rows in one merge-on-read scan. Each chunk becomes bounded
 /// IN-lists on the complete join key, so a large enrichment UPDATE never falls
 /// back to decoding and deduplicating its whole target time window.
-const MOR_KEY_PUSHDOWN_ROWS: usize = 4_096;
+// Keep this well below the depth that DataFusion's expression optimizer can
+// safely visit on a Tokio worker stack. Production aborted at 4,096 rows
+// while optimizing the two complete-key IN lists (SIGABRT: stack overflow).
+// 256 bounds both decoded work and optimizer recursion without relying on a
+// larger process/thread stack.
+const MOR_KEY_PUSHDOWN_ROWS: usize = 256;
 
 /// Emit the shared `dml.slow_phase` line when `started` has exceeded the threshold.
 fn log_slow_phase(phase: &'static str, table_name: &str, project_id: &str, started: Instant, rows: Option<u64>) {

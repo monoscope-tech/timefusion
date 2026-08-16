@@ -66,6 +66,22 @@ use timefusion::{
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
+/// Stack size for every Tokio worker.
+///
+/// Tokio's default is 2 MiB, and on 2026-08-16 that was not enough to plan a
+/// merge-on-read UPDATE: recursing over the wide otel schema joined against the
+/// key-pushdown IN-lists overflowed a worker mid-optimize, and a stack overflow
+/// aborts the *process*, not the task — production restart-looped on exit 134.
+/// Capping the pushdown (`dml::MOR_KEY_PUSHDOWN_ROWS`) shortens that recursion
+/// but cannot bound it, because plan depth also follows schema width and the
+/// shape of the user's predicate. This is the bound that does not depend on
+/// guessing how deep the deepest plan gets. Worker stacks are reserved lazily,
+/// so the untouched pages cost address space rather than RSS against the cgroup.
+const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
+// Planning depth follows schema width and predicate shape, not just the
+// pushdown cap, so keep real headroom over Tokio's 2 MiB default.
+const _: () = assert!(WORKER_STACK_BYTES >= 8 * 2 * 1024 * 1024);
+
 fn main() -> anyhow::Result<()> {
     // Initialize environment before any threads spawn
     dotenv().ok();
@@ -98,7 +114,7 @@ fn main() -> anyhow::Result<()> {
     // (No WALRUS_DATA_DIR here any more: `WalManager` passes `cfg.core.wal_dir()`
     // to `Walrus::with_root`, so the WAL location is a parameter rather than a
     // process-global. Same on-disk path, minus the global.)
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(WORKER_STACK_BYTES).build()?;
     match subcommand.as_deref() {
         Some("redrive-dml") => rt.block_on(run_redrive_dml_cli(cfg)),
         Some("optimize") => rt.block_on(run_optimize_cli(cfg)),
@@ -1009,5 +1025,16 @@ mod healthcheck_tests {
             "the probe can take up to {worst_case:?} but Docker kills it at {docker_timeout:?} — raise --timeout or lower PROBE_OP_TIMEOUT"
         );
         assert!(flag("--retries=") >= 5, "3 consecutive misses inside 15s is 'busy', not 'dead' (prod 2026-08-08)");
+    }
+
+    /// Workers must not run on Tokio's default stack.
+    ///
+    /// A stack overflow in a worker aborts the process, so this is a restart
+    /// loop rather than a failed query — that is exactly how prod fell over on
+    /// 2026-08-16 while planning a merge-on-read UPDATE. The builder call is one
+    /// token to lose in a refactor and nothing else would notice, so pin it.
+    #[test]
+    fn workers_get_more_than_the_default_stack() {
+        assert!(include_str!("main.rs").contains(".thread_stack_size(WORKER_STACK_BYTES)"), "the runtime must actually be built with WORKER_STACK_BYTES");
     }
 }
