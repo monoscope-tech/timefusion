@@ -964,6 +964,44 @@ const REPAIR_SORT_RESERVATION_BYTES: usize = 512 * 1024 * 1024;
 const STARTUP_REPAIR_DELAY: std::time::Duration = std::time::Duration::from_secs(180);
 const COORDINATOR_OWNS_SLICE_MAINTENANCE: bool = true;
 
+/// Maximum wall time for one ordinary coordinator unit.
+///
+/// Dedup and rollup source windows split recursively, so they retain the old
+/// five-minute fairness bound even though file rewrites need a longer deadline.
+const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Maximum wall time for one coordinator file-rewrite unit.
+///
+/// Dedup and rollup units normally finish inside five minutes because their
+/// source windows split recursively. File packing is different: it must create
+/// runs near 256 MiB or the sealed-file-count invariant can never converge.
+/// Production 2026-08-16 showed a 511 MiB sealed merge being cancelled at the
+/// old five-minute ceiling and then selected again unchanged. A 15-minute
+/// ceiling lets the conservative measured rewrite floor (460 KB/s) finish one
+/// 256 MiB run with commit margin, while the 512 MiB spill pool remains the
+/// hard decoded-memory bound.
+const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Last-resort guard around planning plus one operation-specific unit. The
+/// operation itself has the tighter bound above; this catches a wedged planner
+/// or dispatcher without racing the file-rewrite timeout at the same instant.
+const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
+
+fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Operation) -> std::time::Duration {
+    use crate::maintenance_coordinator::Operation;
+    match operation {
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => COORDINATOR_FILE_REWRITE_TIMEOUT,
+        Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup => COORDINATOR_STANDARD_UNIT_TIMEOUT,
+    }
+}
+
+/// Physical run targets for coordinator packing. Sealed consolidation used to
+/// target 512 MiB even though the coordinator's five-minute deadline could not
+/// land that unit in production. Keeping both tiers at 256 MiB makes each
+/// rewrite deadline-safe and still satisfies the final sealed-file bound.
+const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+
 /// Rows per decode batch for any session that reads the wide otel schema.
 ///
 /// Every per-partition, per-query parquet decode buffer costs
@@ -3656,8 +3694,7 @@ impl Database {
                                     if cancel.is_cancelled() {
                                         return;
                                     }
-                                    const UNIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-                                    match tokio::time::timeout(UNIT_TIMEOUT, db.run_maintenance_coordinator_once()).await {
+                                    match tokio::time::timeout(COORDINATOR_LOOP_TIMEOUT, db.run_maintenance_coordinator_once()).await {
                                         Ok(Ok(true)) => tokio::task::yield_now().await,
                                         Ok(Ok(false)) => tokio::select! {
                                             _ = cancel.cancelled() => return,
@@ -3676,7 +3713,11 @@ impl Database {
                                             // every admission token. A whale or wedged object
                                             // read therefore costs one bounded turn instead of
                                             // freezing maintenance for every project forever.
-                                            warn!(worker, timeout_seconds = UNIT_TIMEOUT.as_secs(), event = "maintenance_coordinator_unit_timed_out");
+                                            warn!(
+                                                worker,
+                                                timeout_seconds = COORDINATOR_LOOP_TIMEOUT.as_secs(),
+                                                event = "maintenance_coordinator_loop_timed_out"
+                                            );
                                         }
                                     }
                                 }
@@ -9055,7 +9096,7 @@ impl Database {
                 }
                 let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid compaction date"))?.and_utc().timestamp_micros();
                 let slice = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS))?;
-                let small_target = if date == today { 256 * 1024 * 1024 } else { 512 * 1024 * 1024 };
+                let small_target = if date == today { COORDINATOR_HOT_TARGET_BYTES } else { COORDINATOR_SEALED_TARGET_BYTES };
                 let small = files.iter().filter(|file| file.size < small_target || !file.sorted).collect::<Vec<_>>();
                 if small.len() >= 2 || small.iter().any(|file| !file.sorted) {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
@@ -9610,8 +9651,8 @@ impl Database {
             return Ok(candidates.into_iter().filter(|add| !self.repair_verified_sorted.contains(&add.path)).take(1).map(|add| add.path).collect());
         }
         let target = match key.operation {
-            Operation::HotPacking => 256 * 1024 * 1024,
-            Operation::SealedConsolidation => 512 * 1024 * 1024,
+            Operation::HotPacking => COORDINATOR_HOT_TARGET_BYTES,
+            Operation::SealedConsolidation => COORDINATOR_SEALED_TARGET_BYTES,
             _ => return Ok(Vec::new()),
         };
         Ok(select_coordinator_compaction_candidates(candidates, target))
@@ -9750,10 +9791,23 @@ impl Database {
                 continue;
             }
             attempted[index] = true;
-            let completed = match operation {
-                Operation::Dedup => self.run_coordinator_dedup_once().await?,
-                Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await?,
-                Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await?,
+            let timeout = coordinator_operation_timeout(operation);
+            let work = async {
+                match operation {
+                    Operation::Dedup => self.run_coordinator_dedup_once().await,
+                    Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await,
+                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await,
+                }
+            };
+            let completed = match tokio::time::timeout(timeout, work).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    // Dropping the operation future drops its TaskLease. The
+                    // claimed unit is durably requeued and all resource tokens
+                    // are released before another project gets a turn.
+                    warn!(?operation, timeout_seconds = timeout.as_secs(), event = "maintenance_coordinator_unit_timed_out");
+                    return Ok(true);
+                }
             };
             if completed {
                 return Ok(true);
@@ -13023,7 +13077,8 @@ impl Database {
                     // WARM BEFORE EVICT: a wave swaps K bins at once, so
                     // evicting first would cold-start the hottest query window
                     // every wave (the 2026-07-21 cache-thrash lesson).
-                    self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
+                    let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
+                    self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                     Self::record_wave_landed(&fresh, data_change);
                     return WaveResult { landed: concat_landed(carried, fresh), failed };
                 }
@@ -13051,7 +13106,8 @@ impl Database {
                         CommitProbe::Landed => {
                             warn!("{engine} wave for '{}' reported an error but LANDED (post-commit hook failed): {}", table_name, e);
                             let post = { table_ref.read().await.clone() };
-                            self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
+                            let live_uris = self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
+                            self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                             self.clear_bin_intents(&fresh);
                             Self::record_wave_landed(&fresh, data_change);
                             return WaveResult { landed: concat_landed(carried, fresh), failed };
@@ -13090,6 +13146,42 @@ impl Database {
             }
         }
         WaveResult { landed: carried, failed }
+    }
+
+    /// Publish search sidecars for every file a coordinator/dedup wave just
+    /// committed. The legacy optimize path already did this; `commit_wave`
+    /// did not, so every coordinator rewrite created a fresh coverage hole and
+    /// queries fell back to a multi-gigabyte raw leg until the nightly global
+    /// reconcile. Awaiting publication keeps a successfully returned wave
+    /// covered. Failure remains correctness-safe (hybrid reads use raw data)
+    /// and is visible for the reconcile retry path.
+    async fn reindex_wave_outputs(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, bins: &[StagedBin], live_uris: &[String]) {
+        let Some(svc) = self.tantivy_indexer().cloned().filter(|svc| svc.config.is_table_indexed(table_name)) else {
+            return;
+        };
+        let files = wave_added_parquet(bins, live_uris);
+        if files.is_empty() {
+            return;
+        }
+        let store = { table_ref.read().await.log_store().object_store(None) };
+        let table = table_name.to_owned();
+        let mut jobs = futures::stream::iter(files.into_iter().map(|(project, rel, uri)| {
+            let (svc, store, table) = (svc.clone(), store.clone(), table.clone());
+            async move { svc.build_index_for_file(&table, &project, &rel, &uri, store).await }
+        }))
+        .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
+        let mut built = 0usize;
+        let mut failed = 0usize;
+        while let Some(result) = jobs.next().await {
+            match result {
+                Ok(()) => built += 1,
+                Err(error) => {
+                    failed += 1;
+                    warn!(table_name, %error, event = "tantivy_wave_reindex_failed");
+                }
+            }
+        }
+        info!(table_name, built, failed, event = "tantivy_wave_reindex_complete");
     }
 
     /// Per-engine counters for a landed wave. Dedup's dropped-row accounting is
@@ -15005,6 +15097,27 @@ impl StagedBin {
 struct WaveResult {
     landed: Vec<StagedBin>,
     failed: Vec<StagedBin>,
+}
+
+/// Match a wave's committed Add actions to the absolute URIs from the exact
+/// post-commit snapshot. Index manifests store absolute URIs for coverage,
+/// while the Add action and Delta object store use table-relative paths; keep
+/// that conversion in one pure, testable boundary.
+fn wave_added_parquet(bins: &[StagedBin], live_uris: &[String]) -> Vec<(String, String, String)> {
+    let by_rel: HashMap<&str, &str> =
+        live_uris.iter().filter_map(|uri| crate::tantivy_index::service::parquet_rel_of_uri(uri).map(|rel| (rel, uri.as_str()))).collect();
+    bins.iter()
+        .flat_map(|bin| {
+            bin.adds.iter().filter_map(|action| {
+                let deltalake::kernel::Action::Add(add) = action else {
+                    return None;
+                };
+                let rel = add.path.as_str();
+                let uri = by_rel.get(rel)?;
+                Some((bin.project_id.clone(), rel.to_owned(), (*uri).to_owned()))
+            })
+        })
+        .collect()
 }
 
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
@@ -20073,6 +20186,40 @@ mod tests {
         assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(super::REPAIR_SLICE_TARGET_BYTES));
     }
 
+    /// Prod 2026-08-16 repeatedly selected 511 MiB of sealed sorted runs and
+    /// cancelled the rewrite at 300 seconds. The old 512 MiB target therefore
+    /// made zero durable progress. A physical run must still be at least
+    /// 256 MiB to meet the sealed-file-count contract, so reduce the unit and
+    /// give the conservative 460 KB/s rewrite floor enough time to commit it.
+    #[test]
+    fn coordinator_sealed_units_fit_their_deadline_and_file_count_contract() {
+        const MIB: i64 = 1024 * 1024;
+        assert_eq!(super::COORDINATOR_SEALED_TARGET_BYTES, 256 * MIB);
+        assert_eq!(super::COORDINATOR_HOT_TARGET_BYTES, 256 * MIB);
+
+        let estimated_rewrite_seconds = (super::COORDINATOR_SEALED_TARGET_BYTES + super::INPUT_BYTES_PER_SEC - 1) / super::INPUT_BYTES_PER_SEC;
+        assert!(
+            estimated_rewrite_seconds + 120 <= super::COORDINATOR_FILE_REWRITE_TIMEOUT.as_secs() as i64,
+            "one sealed run needs {estimated_rewrite_seconds}s at the measured floor plus commit margin"
+        );
+        assert_eq!(
+            super::coordinator_operation_timeout(crate::maintenance_coordinator::Operation::Dedup),
+            super::COORDINATOR_STANDARD_UNIT_TIMEOUT,
+            "a longer packing deadline must not widen dedup's fairness bound"
+        );
+        assert_eq!(
+            super::coordinator_operation_timeout(crate::maintenance_coordinator::Operation::SealedConsolidation),
+            super::COORDINATOR_FILE_REWRITE_TIMEOUT
+        );
+
+        let run = |name: &str, mib: i64| super::TailAdd { path: name.into(), size: mib * MIB, is_sorted_run: true, event_range: None };
+        assert_eq!(
+            super::select_coordinator_compaction_candidates(vec![run("a", 128), run("b", 128), run("c", 128)], super::COORDINATOR_SEALED_TARGET_BYTES),
+            vec!["a", "b"],
+            "selection must stop at one independently committable physical run"
+        );
+    }
+
     /// A repair pass rewrites the NEWEST poisoned file, not the oldest.
     ///
     /// The poison is all-or-nothing over a query window: the most recent
@@ -20299,6 +20446,29 @@ mod tests {
             stage_store: Arc::new(object_store::memory::InMemory::new()),
             dedup,
         }
+    }
+
+    #[test]
+    fn committed_wave_adds_map_to_exact_live_tantivy_uris() {
+        let mut alpha = staged_unit("alpha", &["old-a.parquet"], None);
+        let mut beta = staged_unit("beta", &["old-b.parquet"], None);
+        let alpha_rel = "project_id=alpha/date=2026-08-16/alpha-new.parquet";
+        let beta_rel = "project_id=beta/date=2026-08-16/beta-new.parquet";
+        if let deltalake::kernel::Action::Add(add) = &mut alpha.adds[0] {
+            add.path = alpha_rel.into();
+        }
+        if let deltalake::kernel::Action::Add(add) = &mut beta.adds[0] {
+            add.path = beta_rel.into();
+        }
+        let alpha_uri = format!("s3://bucket/table/{alpha_rel}");
+        let beta_uri = format!("s3://bucket/table/{beta_rel}");
+        let unrelated = "s3://bucket/table/project_id=gamma/date=2026-08-16/other.parquet".to_owned();
+
+        assert_eq!(
+            super::wave_added_parquet(&[alpha, beta], &[unrelated, beta_uri.clone(), alpha_uri.clone()]),
+            vec![("alpha".into(), alpha_rel.into(), alpha_uri), ("beta".into(), beta_rel.into(), beta_uri)],
+            "only this wave's live Adds become committed-file index jobs"
+        );
     }
 
     fn dedup_unit(date: &str, before: u64, after: u64) -> super::DedupUnit {

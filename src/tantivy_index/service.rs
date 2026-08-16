@@ -41,18 +41,12 @@ enum IndexSource {
     /// order ≠ parquet row order and ordinals must not drive row selection.
     /// Merging is deferred to keep it off the ingest path.
     Flush,
-    /// Read back from the committed parquet in row order (post-optimize
-    /// reindex, startup backfill, post-WAL-recovery reindex) — ordinals are
-    /// valid parquet row indexes, and since every such caller is already a
-    /// maintenance task, this rebuild IS the merge the flush path deferred.
-    Committed,
 }
 
 impl IndexSource {
     fn ordinals_and_merge(self) -> (bool, MergeMode) {
         match self {
             Self::Flush => (false, MergeMode::Deferred),
-            Self::Committed => (true, MergeMode::Now),
         }
     }
 }
@@ -121,12 +115,10 @@ impl TantivyIndexService {
     pub async fn build_index_for_file(
         &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>,
     ) -> Result<()> {
-        let batches = store::read_parquet_batches(delta_store, parquet_rel).await?;
-        if batches.is_empty() {
-            return Ok(());
-        }
         let path = store::index_path_for_parquet(table_name, parquet_rel);
-        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], batches, IndexSource::Committed).await
+        let table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
+        let result = store::build_parquet_and_pack(delta_store, parquet_rel, table, self.config.compression_level(), MergeMode::Now).await;
+        self.publish_built_index(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], true, result).await
     }
 
     /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
@@ -152,7 +144,15 @@ impl TantivyIndexService {
         })
         .await
         .context("join build")?;
-        let (blob, stats) = match pack_result {
+        self.publish_built_index(table_name, project_id, manifest_key, blob_path, covered_files, ordinals_valid, pack_result).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_built_index(
+        &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>, ordinals_valid: bool,
+        result: Result<(bytes::Bytes, crate::tantivy_index::builder::IndexBuildStats)>,
+    ) -> Result<()> {
+        let (blob, stats) = match result {
             Ok(v) => v,
             Err(e) => {
                 let entry = ManifestEntry::failed(format!("build failed: {e}"), covered_files);
