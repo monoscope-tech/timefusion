@@ -9625,6 +9625,16 @@ impl Database {
         let mut actions = replaced.iter().map(|add| Action::Remove(remove_for_add(add, true))).collect::<Vec<_>>();
         actions.extend(adds.iter().cloned());
 
+        // Counted before the commit consumes `actions`, and published below only
+        // if this unit actually lands. The rollup_* stats were wired ONLY to the
+        // retired cohort path (`stage_rollup_wave`), so on prod they read
+        // rollup_output_rows_total = 0 / rollup_staged_projects_total = 0 while
+        // the coordinator was publishing real rows — the rollup table held 1,220
+        // rows for a project the counters called empty. A metric that reads zero
+        // while the system works is worse than no metric: it cost a whole
+        // diagnosis pass chasing a rollup outage that was not happening.
+        let (action_count, output_files) = (actions.len() as u64, adds.len() as u64);
+
         let still_running = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).state(&key) == Some(TaskState::Running);
         if !still_running {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
@@ -9662,7 +9672,19 @@ impl Database {
             );
             journal.publish(&key, crate::maintenance_coordinator::Publication { source_fingerprint: source_fp, generation: generation.clone(), rows });
             journal.checkpoint()?;
-            crate::metrics::maintenance_stats().maintenance_processed_bytes.fetch_add(estimated_bytes, Relaxed);
+            let stats = crate::metrics::maintenance_stats();
+            stats.maintenance_processed_bytes.fetch_add(estimated_bytes, Relaxed);
+            stats.rollup_output_rows.fetch_add(rows, Relaxed);
+            stats.rollup_output_files.fetch_add(output_files, Relaxed);
+            stats.rollup_commit_actions.fetch_add(action_count, Relaxed);
+            // One coordinator unit is one (project, slice) publication, which is
+            // what "staged project" counts on the cohort path too.
+            stats.rollup_staged_projects.fetch_add(1, Relaxed);
+            if derived {
+                stats.rollup_rebuilds_incremental.fetch_add(1, Relaxed);
+            } else {
+                stats.rollup_rebuilds_full.fetch_add(1, Relaxed);
+            }
         }
         Ok(true)
     }
