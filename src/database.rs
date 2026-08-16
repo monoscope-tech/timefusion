@@ -9535,22 +9535,7 @@ impl Database {
             Operation::SealedConsolidation => 512 * 1024 * 1024,
             _ => return Ok(Vec::new()),
         };
-        let mut bytes = 0i64;
-        let mut selected = Vec::new();
-        for add in candidates {
-            if add.size >= target && add.is_sorted_run {
-                continue;
-            }
-            if !selected.is_empty() && bytes.saturating_add(add.size) > target {
-                break;
-            }
-            bytes = bytes.saturating_add(add.size);
-            selected.push(add);
-        }
-        if selected.len() < 2 && selected.iter().all(|add| add.is_sorted_run) {
-            return Ok(Vec::new());
-        }
-        Ok(selected.into_iter().map(|add| add.path).collect())
+        Ok(select_coordinator_compaction_candidates(candidates, target))
     }
 
     async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
@@ -12501,28 +12486,29 @@ impl Database {
             // footer declaration is then honest by construction.
             let order_by = schema_order_by_clause(schema);
             let sorted = !order_by.is_empty();
-            // SLICE a repair rewrite by event time, so no single sort has to fit
-            // the whole file. See `REPAIR_SLICE_TARGET_BYTES` for why no
-            // partition count can do this instead.
+            // SLICE a repair rewrite, or one individually oversized L0 file,
+            // by event time so no single sort has to fit the whole file. See
+            // `REPAIR_SLICE_TARGET_BYTES` for why no partition count can do
+            // this instead.
             //
             // The slices are emitted in the output's OWN sort direction and
             // appended to one writer, so the concatenation is globally sorted
             // and every footer stays honest — the same property the
             // `max_file_bytes` cut below already relies on.
             //
-            // Declined (single whole-file sort, i.e. today's behaviour) unless
-            // every precondition holds: this is a repair, the table sorts on a
-            // leading timestamp, and the bin has a usable non-null range. A
-            // NULL timestamp would sort outside every slice and silently drop
-            // rows, so its presence declines slicing outright rather than being
-            // handled — and `rows_staged` is verified against the input count
-            // before anything commits regardless.
+            // Declined unless every precondition holds: this is a repair or a
+            // single oversized L0 input, the table sorts on a leading
+            // timestamp, and the bin has a usable non-null range. A NULL
+            // timestamp would sort outside every slice and silently drop rows,
+            // so its presence declines slicing outright; `rows_staged` is
+            // verified against the input count before anything commits.
             let lead = schema.sorting_columns.first();
-            let slice_col = lead.filter(|_| pass == TailPass::Repair && sorted).map(|c| c.name.clone());
+            let slice_target = coordinator_slice_target(pass, targets.len(), bytes_in);
+            let slice_col = lead.filter(|_| sorted && slice_target.is_some()).map(|c| c.name.clone());
             let slices: Vec<String> = match slice_col {
                 None => Vec::new(),
                 Some(col) => {
-                    let want = (bytes_in / REPAIR_SLICE_TARGET_BYTES).max(0) as usize + 1;
+                    let want = (bytes_in / slice_target.expect("slice column requires a target")).max(0) as usize + 1;
                     let probe = format!(
                         "SELECT min(\"{col}\") AS lo, max(\"{col}\") AS hi, sum(CASE WHEN \"{col}\" IS NULL THEN 1 ELSE 0 END) AS nulls FROM {bin_table}"
                     );
@@ -15172,6 +15158,12 @@ const REPAIR_VERIFY_CONCURRENCY: usize = 16;
 /// walk is newest-first and the recent tail is what the next pass will re-probe.
 const REPAIR_VERIFIED_PERSIST_CAP: usize = 200_000;
 
+/// Compressed input admitted to one coordinator L0 sort. Production zstd
+/// expansion is about 17x, so 16 MiB leaves room in the 512 MiB decoded pool
+/// without turning every flush-file rewrite into a multi-gigabyte spill.
+/// Sorted runs are merged separately toward the 256/512 MiB physical targets.
+const COORDINATOR_L0_SORT_TARGET_BYTES: i64 = 16 * 1024 * 1024;
+
 const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
 
 fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
@@ -15214,6 +15206,43 @@ impl TailAdd {
     fn from_stats(path: String, size: i64, is_sorted_run: bool, stats: Option<&str>) -> Self {
         let range = stats.and_then(Database::event_time_range_from_stats);
         Self { path, size, is_sorted_run, event_range: range }
+    }
+}
+
+/// Select one coordinator compaction unit in two levels: first turn unsorted
+/// L0 files into small sorted runs, then merge only sorted runs toward the
+/// physical target. Mixing the two levels forces a full sort of the entire
+/// 256/512 MiB group; in production those units either exhausted the 512 MiB
+/// pool or timed out after five minutes and made no durable progress.
+fn select_coordinator_compaction_candidates(candidates: Vec<TailAdd>, target: i64) -> Vec<String> {
+    let has_unsorted = candidates.iter().any(|add| !add.is_sorted_run);
+    let limit = if has_unsorted { COORDINATOR_L0_SORT_TARGET_BYTES } else { target };
+    let mut bytes = 0i64;
+    let mut selected = Vec::new();
+    for add in candidates {
+        if has_unsorted && add.is_sorted_run {
+            continue;
+        }
+        if !has_unsorted && add.size >= target {
+            continue;
+        }
+        if !selected.is_empty() && bytes.saturating_add(add.size) > limit {
+            break;
+        }
+        bytes = bytes.saturating_add(add.size);
+        selected.push(add);
+    }
+    if !has_unsorted && selected.len() < 2 {
+        return Vec::new();
+    }
+    selected.into_iter().map(|add| add.path).collect()
+}
+
+fn coordinator_slice_target(pass: TailPass, input_files: usize, bytes_in: i64) -> Option<i64> {
+    match pass {
+        TailPass::Repair => Some(REPAIR_SLICE_TARGET_BYTES),
+        TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => Some(COORDINATOR_L0_SORT_TARGET_BYTES),
+        TailPass::Pack => None,
     }
 }
 
@@ -19867,6 +19896,32 @@ mod tests {
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
         let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None }, f("a", 10, false, 1, 2)];
         assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new());
+    }
+
+    #[test]
+    fn coordinator_compaction_sorts_small_l0_units_before_merging_sorted_runs() {
+        const MB: i64 = 1024 * 1024;
+        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None };
+
+        let mixed = vec![f("l0-a", 20, false), f("sorted", 10, true), f("l0-b", 20, false)];
+        assert_eq!(super::select_coordinator_compaction_candidates(mixed, 256 * MB), vec!["l0-a"]);
+
+        let small_l0 = vec![f("a", 8, false), f("b", 8, false), f("c", 8, false), f("d", 8, false)];
+        assert_eq!(super::select_coordinator_compaction_candidates(small_l0, 256 * MB), vec!["a", "b"]);
+
+        let runs = vec![f("a", 100, true), f("b", 100, true), f("c", 100, true)];
+        assert_eq!(super::select_coordinator_compaction_candidates(runs, 256 * MB), vec!["a", "b"]);
+        assert!(super::select_coordinator_compaction_candidates(vec![f("done", 100, true)], 256 * MB).is_empty());
+
+        assert_eq!(
+            super::select_coordinator_compaction_candidates(vec![f("legacy", 40, false)], 256 * MB),
+            vec!["legacy"],
+            "an individually oversized L0 file remains progressable and is time-sliced by staging"
+        );
+
+        assert_eq!(super::coordinator_slice_target(TailPass::Pack, 1, 40 * MB), Some(16 * MB));
+        assert_eq!(super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB), None);
+        assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(super::REPAIR_SLICE_TARGET_BYTES));
     }
 
     /// A repair pass rewrites the NEWEST poisoned file, not the oldest.
