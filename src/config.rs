@@ -496,8 +496,15 @@ impl DerivedBudget {
             // conflicts at 0, and 12 of 48 cores in use. Throughput, not the
             // split between frontier and sealed work, is what bounds rollup
             // coverage. 24 jobs is ~12 GiB of tracked decode against 85.9 GiB.
-            let cpu_bound = self.cores / 2;
-            mem_bound.min(cpu_bound).clamp(1, 24)
+            // Back to cores/4 (cap 12) after measuring 24 on prod. Coordinator
+            // jobs are NOT the innermost limit: an admitted unit still waits on
+            // the much smaller rewrite/sort permit pools (HEAVY_REWRITE_PERMITS
+            // is 4). At 24 jobs those slots filled with units blocked on a
+            // permit — permit_wait_ms reached 271,692 (4.5 min), 10 units timed
+            // out, and completions collapsed from ~0.6/s to 0.035/s. Wider than
+            // the inner pool only converts coordinator slots into queueing.
+            let cpu_bound = self.cores / 4;
+            mem_bound.min(cpu_bound).clamp(1, 12)
         })
     }
 
