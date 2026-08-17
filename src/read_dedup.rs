@@ -1424,11 +1424,8 @@ mod tests {
             Field::new("tb", DataType::Int64, true),
         ]));
         let sliced = |off: usize| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(parent_id.slice(off, 2)), Arc::new(parent_ts.slice(off, 2)), Arc::new(parent_tb.slice(off, 2))],
-            )
-            .unwrap()
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(parent_id.slice(off, 2)), Arc::new(parent_ts.slice(off, 2)), Arc::new(parent_tb.slice(off, 2))])
+                .unwrap()
         };
         let batches: Vec<RecordBatch> = (0..8).map(|i| sliced(i * 2)).collect();
         let owned: usize = batches.iter().map(|b| b.num_rows()).sum();
