@@ -908,9 +908,19 @@ fn build_optimize_session_state_tuned(
 /// Minimised rather than averaged, because one uncovered project is a customer
 /// whose dashboard is slow. Counts from YESTERDAY: today is the live frontier's
 /// job, not the backfill's, so an incomplete today is not a coverage hole.
-fn min_contiguous_days(covered: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate) -> u64 {
-    let projects: HashSet<&str> = covered.iter().map(|(project, _)| project.as_str()).collect();
-    projects
+///
+/// Minimised over ACTIVE projects only. A project that stopped ingesting can
+/// never have yesterday, so including it pins the whole metric at 0 forever and
+/// makes it useless — which is exactly what happened on prod 2026-08-17:
+/// `edb04135` last wrote on 08-03, and held the gauge at 0 while every project
+/// anyone actually queries had yesterday in both tiers.
+///
+/// `active_projects` is derived from the SOURCE table's partitions, never from
+/// the rollup tier. A project whose ROLLUP is broken still has recent source
+/// partitions, so it stays counted; asking the tier instead would let the very
+/// failure this metric exists to catch exclude itself from it.
+fn min_contiguous_days(covered: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&str>) -> u64 {
+    active_projects
         .iter()
         .map(|project| {
             (1u64..)
@@ -9435,14 +9445,23 @@ impl Database {
                     .collect())
             };
 
-            let mut want: Vec<(String, chrono::NaiveDate)> = {
+            let source_partitions = {
                 let table = table_ref.read().await;
                 partitions_of(&table)?
-            }
-            .into_iter()
-            // Today is the live frontier's job; only sealed days are backfill.
-            .filter(|(_, date)| *date < today && *date >= earliest)
-            .collect();
+            };
+            // Projects still ingesting into THIS source. Taken from the source
+            // rather than from the tier, deliberately: a project whose rollup is
+            // broken still has recent source partitions, so it stays counted —
+            // whereas asking the tier would let exactly the failure this metric
+            // exists to catch hide itself.
+            let active_projects: HashSet<&str> =
+                source_partitions.iter().filter(|(_, date)| *date >= today - chrono::Duration::days(1)).map(|(project, _)| project.as_str()).collect();
+            let mut want: Vec<(String, chrono::NaiveDate)> = source_partitions
+                .clone()
+                .into_iter()
+                // Today is the live frontier's job; only sealed days are backfill.
+                .filter(|(_, date)| *date < today && *date >= earliest)
+                .collect();
 
             // Covered by EVERY declared tier, not just one: a date present in
             // the 1m tier but missing from the 1h tier still refuses a 30d
@@ -9461,7 +9480,7 @@ impl Database {
                 // the window sends it to a raw scan — which is why `MIN(date)`
                 // and `tasks_pending` both read as progress on 2026-08-17 while
                 // 14d/30d queries stayed unroutable.
-                let contiguous = min_contiguous_days(&covered, today);
+                let contiguous = min_contiguous_days(&covered, today, &active_projects);
                 let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
                 let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
                 // Every tier folds into one number, so take the worst; reset
@@ -20187,20 +20206,34 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).expect("date");
         let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
         let covered = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day(*d))).collect::<HashSet<_>>();
+        let active = |names: &[&'static str]| names.iter().copied().collect::<HashSet<&str>>();
 
         // 08-16, 08-15, 08-14 unbroken back from yesterday.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), today), 3);
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), today, &active(&["a"])), 3);
 
         // Prod's actual shape: plenty of days, but a hole right after yesterday.
         // Everything behind it is unreachable to a 30d panel, so it must not count.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), today), 1);
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), today, &active(&["a"])), 1);
 
         // Today is the frontier's job — covering it must not extend the run.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 17)]), today), 0, "yesterday missing is zero coverage however complete today is");
+        assert_eq!(min_contiguous_days(&covered(&[("a", 17)]), today, &active(&["a"])), 0, "yesterday missing is zero coverage however complete today is");
 
         // One starved project drags the fleet number down; averaging would hide it.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), today), 1, "the worst project is the number that matters");
-        assert_eq!(min_contiguous_days(&HashSet::new(), today), 0);
+        assert_eq!(
+            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), today, &active(&["a", "b"])),
+            1,
+            "the worst project is the number that matters"
+        );
+        assert_eq!(min_contiguous_days(&HashSet::new(), today, &active(&["a"])), 0);
+
+        // A project that stopped ingesting can never have yesterday. Counting it
+        // pinned the gauge at 0 forever on prod (`edb04135`, last wrote 08-03)
+        // while every project anyone queries was fully covered.
+        assert_eq!(
+            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("dormant", 3)]), today, &active(&["a"])),
+            2,
+            "a project that no longer ingests must not pin the fleet number at zero"
+        );
     }
 
     #[test]
