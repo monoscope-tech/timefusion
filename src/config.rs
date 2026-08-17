@@ -526,8 +526,17 @@ impl DerivedBudget {
             // permit — permit_wait_ms reached 271,692 (4.5 min), 10 units timed
             // out, and completions collapsed from ~0.6/s to 0.035/s. Wider than
             // the inner pool only converts coordinator slots into queueing.
-            let cpu_bound = self.cores / 4;
-            mem_bound.min(cpu_bound).clamp(1, 12)
+            // cores/3 (cap 16) since 2026-08-17, once HEAVY_REWRITE_PERMITS went
+            // 4 -> 10. Jobs are only useful up to the inner permit pool: at
+            // 12 jobs / 4 permits the ratio was 3:1 and `permit_wait_ms` p50 was
+            // 2 minutes, which is why 24 jobs had to be reverted. 16 jobs
+            // against 10 permits is 1.6:1 — headroom for the operations that do
+            // not take a rewrite permit at all, without rebuilding the queue.
+            //
+            // Memory term stays exact: 16 x MAX_DECODED_BYTES = 8 GiB against a
+            // ~16.6 GiB maintenance pool, asserted below.
+            let cpu_bound = self.cores / 3;
+            mem_bound.min(cpu_bound).clamp(1, 16)
         })
     }
 
