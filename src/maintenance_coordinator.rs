@@ -956,10 +956,14 @@ impl TaskJournal {
     }
 }
 
+/// `(class, operation priority, -width, -recency)` -> project -> that project's
+/// queue. Ordered so smaller tuples run first; see `scheduling_class`.
+type ReadyGroups<'a> = BTreeMap<(u8, u8, i64, i64), HashMap<&'a str, VecDeque<&'a MaintenanceTask>>>;
+
 /// Deadline ordering with round-robin selection among projects at the same
 /// operation priority. This prevents one whale from consuming an entire pass.
 pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> Vec<&'a MaintenanceTask> {
-    let mut groups: BTreeMap<(u8, u8, i64, i64), HashMap<&str, VecDeque<&MaintenanceTask>>> = BTreeMap::new();
+    let mut groups: ReadyGroups<'_> = BTreeMap::new();
     for task in tasks {
         if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
             let (class, width_key, order_key) = scheduling_class(task, now_micros);
