@@ -919,16 +919,21 @@ fn build_optimize_session_state_tuned(
 /// the rollup tier. A project whose ROLLUP is broken still has recent source
 /// partitions, so it stays counted; asking the tier instead would let the very
 /// failure this metric exists to catch exclude itself from it.
-fn min_contiguous_days(covered: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&str>) -> u64 {
+fn min_contiguous_days<'a>(
+    covered: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&'a str>,
+) -> (u64, Option<&'a str>) {
     active_projects
         .iter()
         .map(|project| {
-            (1u64..)
+            let days = (1u64..)
                 .take_while(|back| today.checked_sub_days(chrono::Days::new(*back)).is_some_and(|date| covered.contains(&((*project).to_owned(), date))))
-                .count() as u64
+                .count() as u64;
+            (days, Some(*project))
         })
-        .min()
-        .unwrap_or(0)
+        // Tie-break on the name so the reported laggard is stable across sweeps
+        // rather than flipping between equally-bad projects.
+        .min_by_key(|(days, project)| (*days, *project))
+        .unwrap_or((0, None))
 }
 
 /// Parallelism cap for every maintenance session. Each partition's
@@ -9480,13 +9485,26 @@ impl Database {
                 // the window sends it to a raw scan — which is why `MIN(date)`
                 // and `tasks_pending` both read as progress on 2026-08-17 while
                 // 14d/30d queries stayed unroutable.
-                let contiguous = min_contiguous_days(&covered, today, &active_projects);
+                let (contiguous, worst_project) = min_contiguous_days(&covered, today, &active_projects);
                 let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
                 let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
                 // Every tier folds into one number, so take the worst; reset
                 // when this sweep starts over at the first tier of the first source.
                 gauge.store(if first_tier_of_sweep { contiguous } else { previous.min(contiguous) }, std::sync::atomic::Ordering::Relaxed);
                 first_tier_of_sweep = false;
+                // The gauge alone is not actionable: it folds every (project,
+                // tier) into one number, so a zero says the fleet is short
+                // without saying where. Finding that the zero came from ONE
+                // project cost a manual sweep of every project across two
+                // sources on 2026-08-17. Name it instead.
+                info!(
+                    source,
+                    tier = %target,
+                    contiguous_days = contiguous,
+                    worst_project = worst_project.unwrap_or("none"),
+                    active_projects = active_projects.len(),
+                    event = "rollup_coverage_contiguity"
+                );
 
                 want.retain(|key| !covered.contains(key));
             }
@@ -20231,28 +20249,28 @@ mod tests {
         let active = |names: &[&'static str]| names.iter().copied().collect::<HashSet<&str>>();
 
         // 08-16, 08-15, 08-14 unbroken back from yesterday.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), today, &active(&["a"])), 3);
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), today, &active(&["a"])).0, 3);
 
         // Prod's actual shape: plenty of days, but a hole right after yesterday.
         // Everything behind it is unreachable to a 30d panel, so it must not count.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), today, &active(&["a"])), 1);
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), today, &active(&["a"])).0, 1);
 
         // Today is the frontier's job — covering it must not extend the run.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 17)]), today, &active(&["a"])), 0, "yesterday missing is zero coverage however complete today is");
+        assert_eq!(min_contiguous_days(&covered(&[("a", 17)]), today, &active(&["a"])).0, 0, "yesterday missing is zero coverage however complete today is");
 
         // One starved project drags the fleet number down; averaging would hide it.
         assert_eq!(
-            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), today, &active(&["a", "b"])),
+            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), today, &active(&["a", "b"])).0,
             1,
             "the worst project is the number that matters"
         );
-        assert_eq!(min_contiguous_days(&HashSet::new(), today, &active(&["a"])), 0);
+        assert_eq!(min_contiguous_days(&HashSet::new(), today, &active(&["a"])).0, 0);
 
         // A project that stopped ingesting can never have yesterday. Counting it
         // pinned the gauge at 0 forever on prod (`edb04135`, last wrote 08-03)
         // while every project anyone queries was fully covered.
         assert_eq!(
-            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("dormant", 3)]), today, &active(&["a"])),
+            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("dormant", 3)]), today, &active(&["a"])).0,
             2,
             "a project that no longer ingests must not pin the fleet number at zero"
         );
