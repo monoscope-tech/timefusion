@@ -343,6 +343,8 @@ impl StatsTableProvider {
             "rollup_end_to_end_duration_ms_total" => m.rollup_end_to_end_duration_ms,
             "rollup_output_rows_total" => m.rollup_output_rows,
             "rollup_output_files_total" => m.rollup_output_files,
+            "tantivy_uncovered_files" => m.tantivy_uncovered_files,
+            "tantivy_oversized_skipped" => m.tantivy_oversized_skipped,
             "rollup_full_hours_rebuilt_total" => m.rollup_full_hours_rebuilt,
             "rollup_incremental_hours_rebuilt_total" => m.rollup_incremental_hours_rebuilt,
             "tasks_pending" => m.maintenance_tasks_pending,
