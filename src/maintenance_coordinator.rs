@@ -602,11 +602,29 @@ impl TaskJournal {
         } else {
             normal_slices.clone()
         };
-        for (operation, slices) in [
-            (Operation::Dedup, normal_slices.as_slice()),
-            (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices.as_slice()),
-            (Operation::HotPacking, normal_slices.as_slice()),
-        ] {
+        // HotPacking is deliberately NOT here. File hygiene is planned by DEBT,
+        // not by the calendar: `plan_compaction_debt` scans the actual file list
+        // per (project, date) every 60s and mints ONE day-wide unit when the
+        // partition really has small or unsorted files
+        // (`small.len() >= 2 || any !sorted`) — HotPacking for today,
+        // SealedConsolidation once the day seals.
+        //
+        // Minting one per ten-minute slice here duplicated that with 144 units
+        // per project per day whose count tracked ingest rather than
+        // fragmentation. It was 5,367 pending on prod 2026-08-17 — 22% of the
+        // whole journal — for an operation that produces no rollup coverage,
+        // and it is a third of everything the live frontier creates. The
+        // frontier wanted ~7.8 units/min against a total drain of ~11.6.
+        //
+        // The rest of the codebase already treated these as waste:
+        // `migrate_fine_grained_backfill` and `coarsen_sealed_slices` both list
+        // HotPacking as coarsenable, and the comment on the former names it in
+        // the "~450 durable tasks per (project, date)" expansion that coarse
+        // planning exists to undo. This stops minting them rather than
+        // collapsing them afterwards.
+        for (operation, slices) in
+            [(Operation::Dedup, normal_slices.as_slice()), (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices.as_slice())]
+        {
             for &slice in slices {
                 let key = TaskKey {
                     physical_table: match operation {
@@ -1935,8 +1953,16 @@ mod tests {
                 derived: false,
             })
             .expect("invalidate in next bucket");
-        assert_eq!(journal.tasks().count(), 3);
-        assert!(journal.tasks().any(|task| task.key.operation == Operation::HotPacking));
+        // Two, not three: Dedup and the rollup. HotPacking is planned by DEBT
+        // in `plan_compaction_debt` (one day-wide unit per project, only when
+        // the partition really has small or unsorted files), never per slice —
+        // minting it here made file hygiene 22% of the journal with a count
+        // that tracked ingest rather than fragmentation.
+        assert_eq!(journal.tasks().count(), 2);
+        assert!(
+            journal.tasks().all(|task| task.key.operation != Operation::HotPacking),
+            "ingest must not mint file-hygiene work per slice; the debt planner owns it"
+        );
         assert!(journal.tasks().all(|task| task.deadline_micros == FINALIZATION_DELAY_MICROS + 2 * INVALIDATION_DEADLINE_BUCKET_MICROS));
     }
 

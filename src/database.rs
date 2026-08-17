@@ -20017,7 +20017,13 @@ mod tests {
 
     /// A tenant's first write must not manufacture a full day of empty and
     /// future maintenance debt. One dirty hour is six ten-minute source units
-    /// plus one derived hour; dedup and packing are shared by both rollup specs.
+    /// plus one derived hour; dedup is shared by both rollup specs.
+    ///
+    /// No HotPacking: file hygiene is planned by DEBT in `plan_compaction_debt`
+    /// (one day-wide unit per project, and only when the partition really has
+    /// small or unsorted files), never per slice. Minting it per ten-minute
+    /// slice made it 22% of the prod journal with a count that tracked ingest
+    /// rather than fragmentation.
     #[tokio::test]
     async fn first_rollup_invalidation_enqueues_only_the_touched_hour() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
@@ -20033,8 +20039,8 @@ mod tests {
         assert_eq!(counts.get(&Operation::Dedup), Some(&6));
         assert_eq!(counts.get(&Operation::BaseRollup), Some(&6));
         assert_eq!(counts.get(&Operation::DerivedRollup), Some(&1));
-        assert_eq!(counts.get(&Operation::HotPacking), Some(&6));
-        assert_eq!(journal.tasks().count(), 19, "one touched hour, not 456 full-day tasks");
+        assert_eq!(counts.get(&Operation::HotPacking), None, "ingest must not mint file-hygiene work; the debt planner owns it");
+        assert_eq!(journal.tasks().count(), 13, "one touched hour, not 456 full-day tasks");
         Ok(())
     }
 
