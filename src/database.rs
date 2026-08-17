@@ -9865,6 +9865,7 @@ impl Database {
         }
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
+        let mut untagged_inputs = 0u64;
         let (snapshot, log_store, selected, estimated_bytes) = {
             let table = from_table.read().await;
             let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
@@ -9909,10 +9910,18 @@ impl Database {
                     // (`timestamp >= slice.start AND timestamp < slice.end`),
                     // and rebuilt generations are removed from the snapshot, so
                     // no row is counted twice.
+                    // A base file with no readable slice tags is invisible to
+                    // the coarse tier FOREVER — the unit publishes rows=0 and is
+                    // marked complete, which reads exactly like "this slice is
+                    // genuinely empty". Counted separately so the two are
+                    // distinguishable: #139 fixed day-tagged files being
+                    // unselectable, and if any tier still comes back empty this
+                    // is the number that says whether tags are the reason.
                     let (Some(start), Some(end)) = (
                         tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
                         tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
                     ) else {
+                        untagged_inputs = untagged_inputs.saturating_add(1);
                         continue;
                     };
                     if tag(crate::maintenance_coordinator::TAG_PROJECT) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
@@ -9925,6 +9934,17 @@ impl Database {
             }
             (snapshot, table.log_store(), selected, estimated)
         };
+        if untagged_inputs > 0 {
+            crate::metrics::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                table = %key.physical_table,
+                project_id = %key.project_id,
+                slice_start = key.slice.start_micros,
+                untagged_inputs,
+                event = "maintenance_rollup_untagged_input",
+                "base files carry no slice tags; their rows can never reach this tier"
+            );
+        }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if journal.split_time_task(&key, estimated_bytes) {

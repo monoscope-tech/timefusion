@@ -722,6 +722,11 @@ atomic_stats! {
     /// file already covered them. Expected to be rare; if it is not, a late row
     /// inside an already-published day may be going stale in the coarse tier.
     rollup_skipped_covered_by_wider,
+    /// Base rollup files a derived unit could not read because they carry no
+    /// parseable slice tags. Such a file is invisible to the coarse tier
+    /// forever, and the unit publishes rows=0 and completes — indistinguishable
+    /// from a genuinely empty slice unless this is counted.
+    rollup_untagged_inputs,
     /// Contiguous sealed days of rollup coverage, counting back from yesterday,
     /// minimised over every (project, declared tier).
     ///
