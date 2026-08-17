@@ -2331,6 +2331,38 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let after_by_id = rows_of(ctx.sql(&query).await?.collect().await?);
     assert_eq!(hits(), before + 1, "an id-scoped DML on today's row must leave yesterday's coverage intact (misses +{})", misses() - misses_before);
     assert_eq!(after_by_id.iter().map(|row| row.1).sum::<i64>(), 11, "the id-scoped update must not change the counted rows: {after_by_id:?}");
+
+    // LAST, because it writes a new row and would move every count above it.
+    //
+    // A derived slice that cannot publish — a wider live file already covers it
+    // — must REOPEN that covering slice rather than quietly complete.
+    // `invalidate` mints derived work at DERIVED_SLICE_MICROS, so late rows for
+    // one hour inside an already-published day arrive as an hour-wide unit, and
+    // dropping it leaves that hour permanently stale in the coarse tier: a wrong
+    // number, not a slow one. Prod confirmed the branch is reachable —
+    // `rollup_skipped_covered_by_wider` moved to 5 within an hour of shipping
+    // the counter (#145), which is the condition that PR set for doing this.
+    let derived_of = |db: Arc<Database>, project_id: String| async move {
+        let batches = db
+            .query_delta_only(&format!(
+                "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1h_v2 WHERE project_id = '{project_id}'"
+            ))
+            .await?;
+        Ok::<i64, anyhow::Error>(
+            batches.iter().filter(|b| b.num_rows() > 0).filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0))).next().unwrap_or(0),
+        )
+    };
+    let derived_before = derived_of(Arc::clone(&db), project_id.clone()).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("y-late", "cart", 999, yesterday_noon + 90_000_000)?], true, None).await?;
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    timefusion::clock::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
+    // Twice: the first drain may escalate, the second rebuilds the covering slice.
+    db.run_maintenance_units(1024).await?;
+    db.run_maintenance_units(1024).await?;
+    let derived_after = derived_of(Arc::clone(&db), project_id.clone()).await?;
+    assert!(derived_after > derived_before, "a late row inside an already-published day must reach the 1h tier (was {derived_before}, now {derived_after})");
     Ok(())
 }
 
