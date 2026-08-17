@@ -718,6 +718,10 @@ atomic_stats! {
     rollup_rebuilds_incremental,
     rollup_rebuilds_full,
     rollup_dirty_partitions,
+    /// Derived slices completed WITHOUT publishing because a strictly wider live
+    /// file already covered them. Expected to be rare; if it is not, a late row
+    /// inside an already-published day may be going stale in the coarse tier.
+    rollup_skipped_covered_by_wider,
     /// Contiguous sealed days of rollup coverage, counting back from yesterday,
     /// minimised over every (project, declared tier).
     ///

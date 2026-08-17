@@ -10059,6 +10059,21 @@ impl Database {
                     && end >= key.slice.end_micros
             });
         if covered_by_wider {
+            // Counted because this branch has a hazard we cannot currently
+            // observe. `invalidate` mints derived work at DERIVED_SLICE_MICROS,
+            // so late rows for ONE HOUR inside an already-published day arrive
+            // as an hour-wide unit — and completing it without publishing would
+            // leave that hour stale in the coarse tier, which is a wrong number
+            // rather than a slow one.
+            //
+            // Not "fixed" by reopening the covering slice, because the failure
+            // could not be reproduced: in the one test that builds this shape
+            // the late row lands outside the covering file, and master behaves
+            // identically. Rebuilding a whole day on every hour invalidation is
+            // a real cost to pay against a hazard that may not occur, so
+            // measure first. If this counter moves on prod, the staleness is
+            // reachable and escalation is the fix.
+            crate::metrics::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             journal.complete(&key);
             journal.checkpoint()?;
