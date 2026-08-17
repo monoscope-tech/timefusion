@@ -901,9 +901,7 @@ fn min_contiguous_days(covered: &HashSet<(String, chrono::NaiveDate)>, today: ch
         .iter()
         .map(|project| {
             (1u64..)
-                .take_while(|back| {
-                    today.checked_sub_days(chrono::Days::new(*back)).is_some_and(|date| covered.contains(&((*project).to_owned(), date)))
-                })
+                .take_while(|back| today.checked_sub_days(chrono::Days::new(*back)).is_some_and(|date| covered.contains(&((*project).to_owned(), date))))
                 .count() as u64
         })
         .min()
