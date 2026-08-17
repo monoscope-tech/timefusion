@@ -39,6 +39,41 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // (70 cgroup kills over 08-01/02, ~hourly under dashboard load) and the 00:45Z
 // kill was 125GB of pure anon — a regime the 07-31 dumps never covered. Flip
 // back to false once the current eater is named.
+// `dirty_decay_ms:10000` since 2026-08-18, from 0 — the A/B below asked for.
+//
+// decay 0 madvise(MADV_DONTNEED)s every freed page back to the kernel
+// immediately. The note below accepted that cost on the explicit premise that
+// "this box is IO-bound, not CPU-bound", and asked for a re-run under
+// maintenance load before raising it. This is that measurement: `perf record`
+// on the live process, 83,399 samples, 2026-08-18, with 23 of 48 cores busy on
+// maintenance threads:
+//
+//   5.41%  native_queued_spin_lock_slowpath   (mmap_lock / page-table locks)
+//   3.97%  clear_page_erms                    (re-faulting what we just freed)
+//   3.60%  smp_call_function_many_cond        (TLB shootdown IPIs, 48 cores)
+//   1.96%  flush_tlb_func
+//   1.36%  do_anonymous_page
+//   1.01%  __handle_mm_fault
+//
+// ~18% of all CPU in the fault/shootdown cycle decay 0 creates, and
+// `clear_page_erms` traces to `DeltaScanStream::poll_next` — Arrow scan buffers
+// freed and immediately re-faulted. The premise has inverted: the box IS
+// CPU-bound now, and the memory pressure that justified decay 0 is gone (RSS
+// 12.6 GB against a 120 GB cgroup, where 2026-08-03 was ~125 GB at the kill,
+// because the actual eaters were since named and fixed — unbounded query scans
+// and DedupExec charging whole parquet column chunks).
+//
+// 10s, not unbounded: long enough to reuse buffers across a scan, short enough
+// that idle memory still returns. The 85% maintenance brake remains the
+// backstop, and RSS is the metric to watch on rollback.
+//
+// `prof_active:false` again: it was re-armed 2026-08-03 to name "the current
+// eater", and that attribution is done. Sampling every 512 KB costs CPU on the
+// hottest allocation path in the process and had written 2.7 GB of dumps onto
+// the volume that has twice filled with maintenance spill. `prof:true` stays,
+// so it re-arms at runtime via the `prof.active` mallctl with no rebuild.
+//
+// HISTORICAL, the reasoning this replaces:
 // `dirty_decay_ms:0` since 2026-08-03: return freed dirty pages to the OS
 // IMMEDIATELY. Six cgroup OOM kills tonight at anon-rss ~125GB were, per the
 // 2026-07-31 attribution ratio (live 31GB vs RSS 82GB) and tonight's clean
@@ -48,7 +83,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // paused, RSS held ~30GB at 45min where every prior boot hit 60-100GB. The
 // madvise cost is real but this box is IO-bound, not CPU-bound; do NOT raise
 // this back without re-running that A/B under maintenance load.
-pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0\0";
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
 
 use std::sync::Arc;
 
