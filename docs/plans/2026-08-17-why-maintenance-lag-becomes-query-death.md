@@ -1,25 +1,71 @@
 # One chain from "maintenance lags" to "the server dies"
 
-Status: **two links fixed (#136, #137). The rest is measured and written down
-here.** This is the answer to "with each spill or any random thing queries get
-slow cos maintenance lags" — it is one causal chain, not several problems.
+Status: **fixed — #136, #137, #139, #141.** This is the answer to "with each
+spill or any random thing queries get slow cos maintenance lags". It is one
+causal chain, not several problems.
+
+> **Correction.** The first draft of this document blamed step 3 on coverage
+> holes left by failing units. That mechanism is real but it was NOT what
+> emptied the coarse tier. The actual cause was a file-selection predicate
+> (below), found after this was first written. The chain is corrected here;
+> the wrong version is not preserved because it would mislead.
 
 ## The chain
 
 ```
-1. A base rollup / dedup unit fails on memory
-2. -> it is requeued UNCHANGED, so it fails identically forever      [#137]
-3. -> that (project, day) keeps a hole in 1m base coverage
-4. -> the 1h DERIVED tier for that day can never build
-        (DerivedRollup requires CONTIGUOUS complete BaseRollup coverage)
+1. A derived (1h) unit selects base files by CONTAINMENT of their slice tags
+2. -> a base file tagged with a DAY can never fit an HOUR-wide derived slice
+3. -> the unit reads nothing, publishes rows=0, and is marked Complete   [#139]
+4. -> the 1h tier is "built" and EMPTY for every backfilled day
 5. -> a 14d/30d query finds no 1h rollup: rollup_miss_not_built
 6. -> it falls back to a raw scan of 14-30 days
 7. -> anon-rss 125 GB, oom-killer, exit 137 — every query dies, not just this one
 ```
 
-Every step is measured below.
+Independently, and also fixed: a unit that failed on memory was requeued
+unchanged and so failed identically forever (#137), and `DedupExec` charged the
+parquet reader's whole column-chunk blocks, failing customer UPDATEs after 16.9 s
+(#136).
 
-## Step 2 — the retry loop (fixed, #137)
+## Steps 1-4 — why the coarse tier was empty (fixed, #139)
+
+A base rollup file is tagged with the slice of the UNIT that wrote it, and that
+width is unrelated to the derived unit reading it. The backfill writes base units
+a whole DAY wide; derived units are an HOUR. The filter demanded containment:
+
+```rust
+tag(SLICE_START) >= slice.start && tag(SLICE_END) <= slice.end
+```
+
+`day_end <= hour_end` is never true, so an hour-wide derived unit could never
+select a day-tagged base file.
+
+Measured, prod 2026-08-17:
+
+- project `87576849` holds **17,705 rows** in the 1m tier for 08-03, and its 1h
+  unit for 08-03 published **rows=0**
+- every `dashboard_1h_v2` / `metrics_1h_v2` publication in a 12-minute window:
+  `rows=0`, while base published 33,628 / 7,269 / 1,426 rows
+- derived slices measured at exactly 3,600,000,000 micros — one hour
+- the only days with a real 1h tier (08-15..08-17) are those whose base files
+  came from the LIVE FRONTIER in ten-minute units — the one width that fits
+  inside an hour
+
+Fixing the read exposed a latent double-count: slice width is not stable for a
+range (`split_time_task` cuts a published day into children,
+`coarsen_sealed_slices` fuses them back), and the publish replace-set matched
+only the IDENTICAL slice, so a day-wide file and an hour-wide file inside it both
+stayed live and a dashboard SUMmed both. Also fixed in #139.
+
+## The dependency that is NOT the bug
+
+`dependencies_complete` requires a DerivedRollup slice to have contiguous,
+complete BaseRollup coverage. That is correct and must not be relaxed: a 1h
+rollup silently missing an hour is a wrong answer, which is worse than a slow
+one. It was a red herring here — the units were passing this check and then
+reading nothing.
+
+## The retry loop (fixed, #137)
 
 ```
 tasks_retry = 50
@@ -33,34 +79,25 @@ never finished — while each pass burned a worker and 50-80 s of object-store
 work. #137 shrinks the unit on a repeat instead, the argument `abandon_running`
 already makes for wall-clock overruns.
 
-## Step 4 — one hole blocks a whole day
-
-`dependencies_complete` requires, for a DerivedRollup slice, that BaseRollup
-tasks covering it are `Complete` and **contiguous**. The backfill enqueues
-**day-wide** slices, while the live frontier mints ten-minute ones, so a day is
-typically assembled from many fine units. **One permanently-failing base unit
-blocks that day's entire 1h tier.**
-
-This dependency is CORRECT and should not be relaxed: a 1h rollup silently
-missing an hour is a wrong answer, which is worse than a slow one. The defect
-is upstream, at step 2.
+## What the tiers actually looked like
 
 Measured, project `6297304f` (busiest), 2026-08-17:
 
 ```
 1h tier (dashboard_1h_v2):  3 days only — 08-15, 08-16, 08-17  (12, 57, 5 rows)
-1m tier (dashboard_1m_v3):  8 days, HOLEY — 08-17,16,15,13,08,02,01, 07-31
-                            missing 08-14, 08-09..08-12, 08-03..08-07
+1m tier (dashboard_1m_v3):  8 days, holey — 08-17,16,15,13,08,02,01, 07-31
 ```
 
-The asymmetry is the point: the fine tier is 8 days deep and the coarse tier —
-the one 14d/30d queries actually need — is 3 days deep, because the coarse tier
-is gated on the fine tier being *perfect*.
+The asymmetry is the point, and it is the fingerprint of the containment bug:
+the fine tier is 8 days deep while the coarse tier — the one 14d/30d queries
+actually read — is 3 days deep, and those 3 days are exactly the ones the live
+frontier wrote in ten-minute units.
 
-**This also means `MIN(date)` is a misleading progress metric.** It advanced
-08-01 -> 07-31 -> 07-30 during this session while the middle stayed full of
-holes. Coverage should be tracked as contiguous-days-from-today, not as an
-oldest date.
+**`MIN(date)` is a misleading progress metric.** It advanced 08-01 -> 07-31 ->
+07-30 during this session while the coarse tier stayed at 3 days. It reaches
+further back while the middle stays holey, and a 30d panel needs 30 CONTIGUOUS
+days in the tier it reads. Tracked properly by `rollup_min_contiguous_days`
+(#140).
 
 ## Step 5 — confirmed by counter, not by inference
 
