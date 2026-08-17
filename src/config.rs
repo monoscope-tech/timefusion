@@ -1211,7 +1211,7 @@ pub struct AppConfig {
     pub derived: DerivedBudget,
 }
 
-const_default!(d_tantivy_backfill_max_file_mb: u64 = 512);
+const_default!(d_tantivy_backfill_max_file_mb: u64 = 4096);
 const_default!(d_tantivy_max_index_mb: u64 = 64);
 // Sized against a working set, not a wish: the reaper only evicts what no
 // query has opened recently, and every eviction costs a blob re-download on
@@ -1289,8 +1289,26 @@ pub struct TantivyConfig {
     /// Backfill/reconcile skips parquet files larger than this (MB). 0 = no
     /// limit. Memory-tight runners (8 GB k8s nodes) OOM decoding+indexing
     /// 1 GB files; with a cap they repair everything else and log the skips.
-    /// Defaults to 512 so the in-server nightly reconcile never index-builds
-    /// gigabyte whale parquets (~6 GB transient heap each) beside live queries.
+    ///
+    /// 4096 since 2026-08-17, from 512. The "~6 GB transient heap each" that
+    /// justified 512 was the WHOLE-FILE path (`build_and_pack`, which takes a
+    /// materialised `Vec<RecordBatch>`). Backfill and reconcile do not use it:
+    /// they call `build_index_for_file` -> `build_parquet_and_pack`, which
+    /// STREAMS, and whose peak is fixed by construction —
+    /// `PARQUET_INDEX_BATCH_WINDOW` = 2 batches in flight, a
+    /// `WRITER_HEAP_BYTES` = 64 MiB writer, and an `MmapDirectory` so the index
+    /// is built on DISK. Nothing there scales with parquet size.
+    ///
+    /// The cap was therefore excluding files for a cost this path stopped
+    /// paying, and it is why the reindex could not finish: prod 2026-08-17 held
+    /// `tantivy_oversized_skipped` = 917 permanently, with
+    /// `tantivy_uncovered_files` still RISING (2,077).
+    ///
+    /// Not removed outright, because one step does still track file size: the
+    /// final `pack_dir` builds the tar.zst blob in memory, sized by the
+    /// COMPRESSED INDEX rather than by the parquet. 4096 clears the largest
+    /// files this codebase has recorded (~2.34 GB) with margin, while keeping a
+    /// bound on that one term.
     #[serde(default = "d_tantivy_backfill_max_file_mb")]
     pub timefusion_tantivy_backfill_max_file_mb: u64,
     /// File-level scan pruning: when the prefilter engages, files whose
