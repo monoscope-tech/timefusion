@@ -9102,9 +9102,11 @@ impl Database {
                                 );
                                 let mut stream = ctx.sql(&sql).await?.execute_stream().await?;
                                 let mut shard_after = 0usize;
+                                let mut decoded_bytes = 0usize;
                                 while let Some(batch) = stream.next().await {
                                     let batch = cast_variant_columns_to_binary(batch?)?;
                                     shard_after = shard_after.saturating_add(batch.num_rows());
+                                    decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
                                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
                                     if writer.buffer_len() >= max_file_bytes {
@@ -9113,11 +9115,46 @@ impl Database {
                                         );
                                     }
                                 }
+                                // The coordinator takes this streaming branch, so the
+                                // collecting branch's identical probe below would never fire in
+                                // production. Post-dedup rows, so this UNDER-states the input
+                                // volume — a ratio at or above the estimate is therefore
+                                // conclusive, one below it is not.
+                                if shard == 0 {
+                                    info!(
+                                        shards,
+                                        rows = shard_after,
+                                        actual_decoded_mb = decoded_bytes / (1 << 20),
+                                        predicted_decoded_mb = (est_decoded_bytes / shards.max(1)) / (1 << 20),
+                                        event = "dedup_shard_decoded",
+                                        stage = "streamed",
+                                        "what one dedup shard decoded to, against what the estimate predicted"
+                                    );
+                                }
                                 (shard_before, shard_after)
                             } else {
                                 let batches: Vec<RecordBatch> =
                                     ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|batch| drop_batch_column(batch, DEDUP_FILE_COL)).collect();
                                 let shard_before = batches.iter().map(RecordBatch::num_rows).sum();
+                                // K is driven entirely by `est_decoded_bytes`, and every 2x of
+                                // over-estimate is a whole extra pass over the data. Neither
+                                // `bytes_per_row = 4096` nor `inflation = 12` has ever been
+                                // checked against a real decoded-vs-compressed ratio, so log
+                                // what this shard ACTUALLY decoded to next to what was
+                                // predicted for it. One shard, not all K, so a 256-way rewrite
+                                // cannot flood the log.
+                                if shard == 0 {
+                                    let actual: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+                                    info!(
+                                        shards,
+                                        rows = shard_before,
+                                        actual_decoded_mb = actual / (1 << 20),
+                                        predicted_decoded_mb = (est_decoded_bytes / shards.max(1)) / (1 << 20),
+                                        event = "dedup_shard_decoded",
+                                        stage = "collected",
+                                        "what one dedup shard decoded to, against what the estimate predicted"
+                                    );
+                                }
                                 if shard_before == 0 {
                                     return Ok((0, 0));
                                 }
