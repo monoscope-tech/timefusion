@@ -2800,6 +2800,33 @@ mod tests {
             b.rewrite_permits() * PER_SORT_BUDGET_BYTES < b.memory_limit_bytes() / 2,
             "the fan-in envelope must stay well under the cgroup, whatever the permit count"
         );
+        // The cgroup is the wrong denominator for the assertion above, and it is
+        // why the envelope could go to 20 GiB unnoticed: heavy sorts do not run
+        // in the cgroup, they run in `heavy_share_bytes()`, which on prod is
+        // ~4.98 GiB (16.6 GiB pool, less a 4.15 GiB coordinator quarter, x 0.40).
+        // 10 x 2 GiB against 4.98 GiB passes the cgroup test by 2x while
+        // over-committing the real pool by 4x.
+        //
+        // What actually has to hold is that a FairSpillPool slice still clears
+        // the allocations a sort cannot avoid: one indivisible `batch_size`
+        // batch (2048 wide otel rows reach ~150 MB) plus `ExternalSorterMerge`'s
+        // 32 MB floor, which cannot spill. Below that a unit FAILS instead of
+        // spilling — prod 2026-08-17 logged exactly that at a 512 MB
+        // coordinator pool, and again at 3.4 GiB heavy.
+        //
+        // Stated as a floor per concurrent sort rather than as an envelope, so
+        // raising permits is only safe if the share grows with them.
+        const WIDEST_BATCH_BYTES: usize = 150 * 1024 * 1024;
+        const UNSPILLABLE_MERGE_FLOOR_BYTES: usize = 32 * 1024 * 1024;
+        let per_sort_slice = b.heavy_share_bytes() / b.rewrite_permits();
+        assert!(
+            per_sort_slice >= WIDEST_BATCH_BYTES + UNSPILLABLE_MERGE_FLOOR_BYTES,
+            "each of {} concurrent heavy sorts gets {} MB of the {} MB heavy share, below the {} MB a sort cannot spill below — it will fail rather than spill",
+            b.rewrite_permits(),
+            per_sort_slice / 1024 / 1024,
+            b.heavy_share_bytes() / 1024 / 1024,
+            (WIDEST_BATCH_BYTES + UNSPILLABLE_MERGE_FLOOR_BYTES) / 1024 / 1024,
+        );
         assert_eq!(b.optimize_merge_tasks(), 2);
     }
 
