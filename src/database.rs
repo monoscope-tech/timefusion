@@ -883,6 +883,31 @@ fn build_optimize_session_state_tuned(
     SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build()
 }
 
+/// Days of rollup coverage counting back from yesterday with NO hole, minimised
+/// over the projects present in `covered`.
+///
+/// A 30d panel reads the coarse tier and needs 30 CONTIGUOUS days in it, so one
+/// gap anywhere in the window sends the query to a raw scan. Neither `MIN(date)`
+/// nor `tasks_pending` sees that: on 2026-08-17 both read as progress
+/// (`MIN(date)` advanced 08-01 -> 07-30) while the coarse tier held 3 days and
+/// every 14d/30d query was unroutable.
+///
+/// Minimised rather than averaged, because one uncovered project is a customer
+/// whose dashboard is slow. Counts from YESTERDAY: today is the live frontier's
+/// job, not the backfill's, so an incomplete today is not a coverage hole.
+fn min_contiguous_days(covered: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate) -> u64 {
+    let projects: HashSet<&str> = covered.iter().map(|(project, _)| project.as_str()).collect();
+    projects
+        .iter()
+        .map(|project| {
+            (1u64..)
+                .take_while(|back| today.checked_sub_days(chrono::Days::new(*back)).is_some_and(|date| covered.contains(&((*project).to_owned(), date))))
+                .count() as u64
+        })
+        .min()
+        .unwrap_or(0)
+}
+
 /// Parallelism cap for every maintenance session. Each partition's
 /// `ExternalSorter` reserves `sort_spill_reservation_bytes` up-front from the
 /// bounded maintenance pool, so the query-derived count (≈ CPU cores) exhausts it
@@ -9366,6 +9391,10 @@ impl Database {
         let today = crate::clock::today_utc();
         let earliest = today - chrono::Duration::days(horizon);
         let mut queued = 0usize;
+        // `rollup_min_contiguous_days` folds every (source, tier) into one
+        // worst-case number, so the first tier of a sweep seeds it and the rest
+        // minimise into it.
+        let mut first_tier_of_sweep = true;
 
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source) else { continue };
@@ -9412,6 +9441,21 @@ impl Database {
                     let table = target_ref.read().await;
                     partitions_of(&table)?
                 };
+                // The goal metric, computed from the set this planner already
+                // built: how many days back from yesterday are covered with NO
+                // hole, minimised over projects. A 30d panel reads the coarse
+                // tier and needs 30 contiguous days there, so a gap anywhere in
+                // the window sends it to a raw scan — which is why `MIN(date)`
+                // and `tasks_pending` both read as progress on 2026-08-17 while
+                // 14d/30d queries stayed unroutable.
+                let contiguous = min_contiguous_days(&covered, today);
+                let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+                let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
+                // Every tier folds into one number, so take the worst; reset
+                // when this sweep starts over at the first tier of the first source.
+                gauge.store(if first_tier_of_sweep { contiguous } else { previous.min(contiguous) }, std::sync::atomic::Ordering::Relaxed);
+                first_tier_of_sweep = false;
+
                 want.retain(|key| !covered.contains(key));
             }
             // Skip any day that already has ROLLUP work queued. `invalidate`
@@ -20076,6 +20120,30 @@ mod tests {
             assert!(at_cap || parts * k * 2 <= cores, "packing may take at most half the box across its {k} bins");
             assert!(at_cap || parts * k * 4 * 33_554_432 <= pool_gib * GIB, "reservations may take at most a quarter of the pack pool");
         }
+    }
+
+    /// The metric exists because the two we had both read as progress while
+    /// 14d/30d queries were unroutable. It must report the CONTIGUOUS run, and
+    /// must be dragged down by the worst project.
+    #[test]
+    fn contiguous_coverage_ignores_days_stranded_behind_a_hole() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).expect("date");
+        let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
+        let covered = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day(*d))).collect::<HashSet<_>>();
+
+        // 08-16, 08-15, 08-14 unbroken back from yesterday.
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), today), 3);
+
+        // Prod's actual shape: plenty of days, but a hole right after yesterday.
+        // Everything behind it is unreachable to a 30d panel, so it must not count.
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), today), 1);
+
+        // Today is the frontier's job — covering it must not extend the run.
+        assert_eq!(min_contiguous_days(&covered(&[("a", 17)]), today), 0, "yesterday missing is zero coverage however complete today is");
+
+        // One starved project drags the fleet number down; averaging would hide it.
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), today), 1, "the worst project is the number that matters");
+        assert_eq!(min_contiguous_days(&HashSet::new(), today), 0);
     }
 
     #[test]
