@@ -326,6 +326,7 @@ impl StatsTableProvider {
             "rollup_rebuilds_incremental_total" => m.rollup_rebuilds_incremental,
             "rollup_rebuilds_full_total" => m.rollup_rebuilds_full,
             "rollup_dirty_partitions" => m.rollup_dirty_partitions,
+            "rollup_skipped_covered_by_wider" => m.rollup_skipped_covered_by_wider,
             "rollup_min_contiguous_days" => m.rollup_min_contiguous_days,
             "rollup_oldest_invalidation_age_seconds" => m.rollup_oldest_invalidation_age_secs,
             "rollup_scan_cohorts_total" => m.rollup_scan_cohorts,
