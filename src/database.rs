@@ -249,6 +249,19 @@ pub struct ScanMetrics {
     pub provider_scan_total: std::sync::atomic::AtomicU64,
     pub bounded_otel_scan_candidates: std::sync::atomic::AtomicU64,
     pub bounded_otel_scan_rejections: std::sync::atomic::AtomicU64,
+    /// Wide scans whose SELECTED file bytes exceeded
+    /// [`WIDE_SCAN_OVERSIZE_BYTES`]. Observation only — nothing is refused.
+    ///
+    /// Neither existing guard bounds one scan's heap:
+    /// `bounded_otel_scan_reason` checks query SHAPE (a 30-day lower bound
+    /// satisfies it exactly as a 5-minute one does) and `gate_if_wide` bounds
+    /// CONCURRENCY. So a single unroutable dashboard query is admitted and then
+    /// decodes without limit — 2026-08-17 that reached anon-rss 125 GB and
+    /// oom-killed the process, taking every other query with it.
+    ///
+    /// Refusing a customer's dashboard query is a product decision, so this
+    /// measures first: how much real traffic would a size limit actually catch?
+    pub wide_scan_oversize_total: std::sync::atomic::AtomicU64,
     pub mem_plan_us_total: std::sync::atomic::AtomicU64,
     pub mem_plan_total: std::sync::atomic::AtomicU64,
     pub hot_plan_us_total: std::sync::atomic::AtomicU64,
@@ -17545,6 +17558,17 @@ impl ProjectRoutingTable {
         }
     }
 
+    /// Selected file bytes above which one scan is worth recording as a
+    /// process-risk candidate. Not a limit: nothing is refused at this size.
+    ///
+    /// Sized as roughly an order of magnitude above the release threshold
+    /// (`timefusion_wide_scan_max_mb`, 64 MB) so it names the genuinely large
+    /// scans rather than every dashboard that misses the fast path. A real one
+    /// measured 1.8 GB of selected files for a ONE-MINUTE window on an
+    /// uncompacted partition (prod 2026-08-17, shipbubble), which is the shape
+    /// that later reached anon-rss 125 GB on a 14-30 day window.
+    const WIDE_SCAN_OVERSIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
     /// Wrap a "wide" Delta scan — one reaching further back than the configured
     /// lookback, or with no lower time bound at all, where a one-sided
     /// `timestamp >= cutoff` can't prune files past the date cut and every
@@ -17566,11 +17590,29 @@ impl ProjectRoutingTable {
         // already run. Only ever *releases* a scan the depth rule would gate —
         // nothing becomes newly gated — so the guard's ceiling is unchanged.
         // `None` = no readable file groups, so fall back to depth alone.
-        if let Some((files, bytes)) = selected_file_work(&plan)
+        let selected = selected_file_work(&plan);
+        if let Some((files, bytes)) = selected
             && files <= mem.timefusion_wide_scan_max_files
             && bytes <= mem.timefusion_wide_scan_max_mb.saturating_mul(1 << 20)
         {
             return plan;
+        }
+        // Observation only, nothing is refused — see `wide_scan_oversize_total`.
+        // The gate below bounds how MANY wide scans decode at once, never how
+        // much any one of them decodes, so this is the only place that can see
+        // a single query large enough to take the process down.
+        if let Some((files, bytes)) = selected
+            && bytes > Self::WIDE_SCAN_OVERSIZE_BYTES
+        {
+            self.database.scan_metrics.wide_scan_oversize_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                event = "wide_scan_oversize",
+                table.name = %self.table_name,
+                selected_files = files,
+                selected_mb = bytes / (1 << 20),
+                threshold_mb = Self::WIDE_SCAN_OVERSIZE_BYTES / (1 << 20),
+                "wide scan selected more than the oversize threshold; admitted anyway"
+            );
         }
         // Two thresholds over one measure, not two notions of "wide": the gate
         // bounds decode HEAP and must fire early (hours), while the cache
