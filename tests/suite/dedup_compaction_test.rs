@@ -2143,7 +2143,17 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
             action.tags.as_ref().is_some_and(|tags| tags.contains_key(timefusion::maintenance_coordinator::TAG_SLICE_START))
         })
         .count();
-    assert!(tagged_files >= 6, "every independently published slice must retain its Delta Add tags");
+    // Every published file must carry its slice tags — a derived unit selects
+    // its input by them, so an untagged file is invisible to the coarse tier.
+    // Counted as "all of them", not ">= 6": that literal encoded the
+    // pre-coarsening slice granularity, and `coarsen_sealed_slices` (#134) now
+    // collapses a sealed day's fine units into one, so a correct run publishes
+    // ONE day-wide tagged file. The invariant is that none is untagged.
+    let total_files = base_target.read().await.snapshot()?.log_data().iter().count();
+    assert!(
+        tagged_files > 0 && tagged_files == total_files,
+        "every published slice must retain its Delta Add tags (got {tagged_files} tagged of {total_files})"
+    );
     let derived_built: i64 = db
         .query_delta_only(&format!(
             "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1h_v2 WHERE project_id = '{project_id}'"

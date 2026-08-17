@@ -9734,14 +9734,31 @@ impl Database {
                 }
                 if derived {
                     let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
-                    let contained_slice = tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
-                        && tag(crate::maintenance_coordinator::TAG_SLICE_START)
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .is_some_and(|start| start >= key.slice.start_micros)
-                        && tag(crate::maintenance_coordinator::TAG_SLICE_END)
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .is_some_and(|end| end <= key.slice.end_micros);
-                    if !contained_slice {
+                    // OVERLAP, not containment. A base file is tagged with the
+                    // slice of the UNIT that wrote it, and that unit's width is
+                    // unrelated to this one's: the backfill writes day-wide base
+                    // units while derived units are an hour. Containment made a
+                    // day-tagged file impossible to select from an hour-wide
+                    // derived slice (`day_end <= hour_end` is never true), so
+                    // every backfilled day published rows=0 and was then marked
+                    // complete — prod 2026-08-17: project 87576849 had 17,705
+                    // rows in the 1m tier for 08-03 and its 1h unit for 08-03
+                    // produced nothing. Only days written by the live frontier
+                    // (ten-minute units, which DO fit an hour) ever had a 1h
+                    // tier, which is why 14d/30d queries never routed.
+                    //
+                    // Reading a wider file is safe because the aggregation
+                    // already bounds rows exactly
+                    // (`timestamp >= slice.start AND timestamp < slice.end`),
+                    // and rebuilt generations are removed from the snapshot, so
+                    // no row is counted twice.
+                    let (Some(start), Some(end)) = (
+                        tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                        tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                    ) else {
+                        continue;
+                    };
+                    if tag(crate::maintenance_coordinator::TAG_PROJECT) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
                         continue;
                     }
                 }
@@ -9928,12 +9945,68 @@ impl Database {
             .iter()
             .filter(|add| {
                 let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
+                // OVERLAP, not exact equality. Slice WIDTH is not stable for a
+                // given range: `split_time_task` cuts a day into children and
+                // `coarsen_sealed_slices` (#134) fuses them back, so the same
+                // hours get published at different widths over time. Matching
+                // only the identical slice let a day-wide file and an hour-wide
+                // file inside it both stay live, and a dashboard SUMmed both —
+                // the test caught 10 where 9 was right.
+                //
+                // Removing a file WIDER than this slice is safe because a unit
+                // is only superseded by children that tile its whole range, so
+                // the rest is republished; until it is, the coverage check sees
+                // an incomplete tier and the query falls back to raw rather
+                // than reading a hole.
+                let (Some(start), Some(end)) = (
+                    tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                    tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                ) else {
+                    return false;
+                };
                 tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
-                    && tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()) == Some(key.slice.start_micros)
-                    && tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()) == Some(key.slice.end_micros)
+                    && start >= key.slice.start_micros
+                    && end <= key.slice.end_micros
             })
             .cloned()
             .collect::<Vec<_>>();
+        // A slice already covered by a STRICTLY WIDER live publication must not
+        // publish: both files would stay live (the replace-set only removes what
+        // this slice contains, and removing a wider file would drop the range
+        // outside this one), and a dashboard SUMs every live file — the test
+        // caught 10 rows where 9 was right, from a day-wide file and an
+        // hour-wide file inside it.
+        //
+        // Widths are not stable for a range: `split_time_task` cuts a published
+        // day into children and `coarsen_sealed_slices` (#134) fuses them back,
+        // so this ordering is normal, not a corruption. The wider file already
+        // holds these rows, so the unit is complete with nothing to write.
+        // DERIVED only. A base slice must always publish: it is the tier that
+        // absorbs late-arriving rows, and skipping it because a wider file
+        // overlaps drops them ("an incremental rebuild must carry the untouched
+        // hours forward exactly once"). A derived slice has no such role — it is
+        // a pure re-aggregation of the base tier, so a wider derived file
+        // already holds these rows.
+        let covered_by_wider = derived
+            && live_adds.iter().any(|add| {
+                let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
+                let (Some(start), Some(end)) = (
+                    tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                    tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                ) else {
+                    return false;
+                };
+                tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
+                    && (start, end) != (key.slice.start_micros, key.slice.end_micros)
+                    && start <= key.slice.start_micros
+                    && end >= key.slice.end_micros
+            });
+        if covered_by_wider {
+            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            journal.complete(&key);
+            journal.checkpoint()?;
+            return Ok(true);
+        }
         let target_paths = replaced.iter().map(|add| add.path.clone()).collect::<Vec<_>>();
         let mut actions = replaced.iter().map(|add| Action::Remove(remove_for_add(add, true))).collect::<Vec<_>>();
         actions.extend(adds.iter().cloned());

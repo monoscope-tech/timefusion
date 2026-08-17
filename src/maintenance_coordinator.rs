@@ -84,6 +84,13 @@ impl TimeSlice {
         self.end_micros - self.start_micros
     }
 
+    /// Half-open intersection. The rollup pipeline asks this in two places —
+    /// which base TASKS cover a derived slice, and which base FILES a derived
+    /// unit must read — and the two must agree, so they share this.
+    pub const fn overlaps(self, start_micros: i64, end_micros: i64) -> bool {
+        end_micros > self.start_micros && start_micros < self.end_micros
+    }
+
     pub fn normal_units(start_micros: i64, end_micros: i64) -> anyhow::Result<Vec<Self>> {
         Self::fixed_units(start_micros, end_micros, NORMAL_SLICE_MICROS)
     }
@@ -771,8 +778,7 @@ impl TaskJournal {
                         && candidate.key.project_id == task.key.project_id
                         && candidate.key.operation == required
                         && candidate.state == TaskState::Complete
-                        && candidate.key.slice.end_micros > task.key.slice.start_micros
-                        && candidate.key.slice.start_micros < task.key.slice.end_micros
+                        && task.key.slice.overlaps(candidate.key.slice.start_micros, candidate.key.slice.end_micros)
                 })
                 .map(|candidate| candidate.key.slice)
                 .collect::<Vec<_>>();
@@ -2060,6 +2066,38 @@ mod tests {
             journal.retry_or_split(&key, "dedup: object not found".to_owned(), i64::from(attempts), attempts);
             assert_eq!(journal.state(&key), Some(TaskState::Retry), "attempt {attempts} must not split");
         }
+    }
+
+    /// A derived unit must read the base files that hold its rows, whatever
+    /// width the unit that WROTE them happened to use.
+    ///
+    /// Prod 2026-08-17, exact numbers: derived units are one hour wide, while
+    /// the backfill writes base units a whole day wide and tags each file with
+    /// its own slice. The old test was CONTAINMENT — `file_end <= slice_end` —
+    /// which a day-tagged file can never satisfy against an hour, so every
+    /// backfilled day published rows=0 and was marked complete. Project
+    /// 87576849 had 17,705 rows in the 1m tier for 08-03 while its 1h unit for
+    /// 08-03 produced nothing, and 14d/30d queries never routed as a result.
+    #[test]
+    fn a_day_wide_base_file_feeds_every_hour_wide_derived_slice_inside_it() {
+        const DAY: i64 = 1_785_628_800_000_000; // 2026-08-02T00:00Z
+        const HOUR: i64 = 3_600_000_000;
+        let day_file = (DAY, DAY + 86_400_000_000);
+
+        for hour in 0..24 {
+            let slice = TimeSlice::new(DAY + hour * HOUR, DAY + (hour + 1) * HOUR).expect("slice");
+            assert!(slice.overlaps(day_file.0, day_file.1), "hour {hour} must read the day-wide base file that holds its rows");
+            // The rule this replaced, stated so the regression is unmistakable.
+            let contained = day_file.0 >= slice.start_micros && day_file.1 <= slice.end_micros;
+            assert!(!contained, "containment is what broke: hour {hour} could never select a day-tagged file");
+        }
+
+        // Overlap must still EXCLUDE what it should: neighbouring days.
+        let slice = TimeSlice::new(DAY, DAY + HOUR).expect("slice");
+        assert!(!slice.overlaps(DAY - 86_400_000_000, DAY), "the previous day ends exactly at the boundary and must not be read");
+        assert!(!slice.overlaps(DAY + 86_400_000_000, DAY + 2 * 86_400_000_000), "a later day must not be read");
+        // Ten-minute frontier files — the only shape that ever worked — still do.
+        assert!(slice.overlaps(DAY, DAY + 600_000_000));
     }
 
     #[test]
