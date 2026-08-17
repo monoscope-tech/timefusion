@@ -9619,8 +9619,11 @@ impl Database {
             }
             Ok((_, false)) => retry("dedup_incomplete".to_owned(), std::time::Duration::from_secs(30))?,
             Err(error) => {
-                let attempts = task.attempts.min(8);
-                retry(format!("dedup: {error:#}"), std::time::Duration::from_secs(1u64 << attempts))?;
+                let delay = std::time::Duration::from_secs(1u64 << task.attempts.min(8));
+                let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.retry_or_split(&key, format!("dedup: {error:#}"), crate::clock::now_micros().saturating_add(delay_micros), task.attempts);
+                journal.checkpoint()?;
             }
         }
         Ok(true)
@@ -10130,7 +10133,9 @@ impl Database {
             Ok(BinOutcome::Converged) => true,
             Ok(BinOutcome::Retry) => false,
             Err(error) => {
-                retry(format!("compaction: {error:#}"), 30)?;
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.retry_or_split(&key, format!("compaction: {error:#}"), crate::clock::now_micros().saturating_add(30 * 1_000_000), task.attempts);
+                journal.checkpoint()?;
                 return Ok(true);
             }
         };
