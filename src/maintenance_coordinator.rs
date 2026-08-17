@@ -535,7 +535,19 @@ impl TaskJournal {
         // back to any class whenever the operation being claimed has no eligible
         // sealed task — and rollup work sits behind its own dedup. Raising the
         // share is the direct lever on how fast coverage walks backward.
-        let sealed_turn = self.claim_tick.is_multiple_of(2);
+        // Three claims in four, not one in two. Measured 2026-08-17 with the
+        // per-operation gauges (#120): of 127,798 pending tasks, 118,794 are
+        // sealed AND eligible right now — including 39,072 eligible BaseRollup —
+        // while only ~9,000 are frontier. Yet the frontier was taking ~90% of
+        // claims, because class 0 is strict priority and ingest regenerates it
+        // continuously. A one-in-two reservation delivered ~10% sealed starts in
+        // practice, so rollup coverage sat frozen at 2026-08-11 for hours with
+        // 39k claimable rollup tasks queued behind a much smaller frontier.
+        //
+        // The frontier is small in volume, so one claim in four still clears it;
+        // if it stops keeping up, `eligible_watermark_lag_seconds` says so and
+        // this is the dial to turn back.
+        let sealed_turn = !self.claim_tick.is_multiple_of(4);
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64)> {
             let mut class: Option<(u8, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| {
@@ -1303,14 +1315,29 @@ mod tests {
         let sealed = key(0, MIN_SLICE_MICROS);
         journal.enqueue(sealed.clone(), now - 1, 1, 1);
 
+        // Enough sealed slices that the share, not the supply, is what limits
+        // sealed claims — mirroring prod, where 118,794 of 127,798 pending tasks
+        // were sealed and eligible while the frontier took ~90% of claims.
+        let sealed_slices: Vec<TimeSlice> = (1..20).map(|k| TimeSlice::new(k * MIN_SLICE_MICROS, (k + 1) * MIN_SLICE_MICROS).expect("sealed slice")).collect();
+        for slice in &sealed_slices {
+            journal.enqueue(key(slice.start_micros, slice.end_micros), now - 1, 1, 1);
+        }
+
         let mut sealed_claims = 0;
-        for _ in 0..9 {
+        for _ in 0..12 {
             let claimed = journal.claim_next(Operation::BaseRollup, now).expect("a task is always available");
-            if claimed.key.slice == sealed.slice {
+            if !is_live_frontier(claimed.key.slice, now) {
                 sealed_claims += 1;
             }
         }
-        assert!(sealed_claims > 0, "sealed work never ran while the frontier stayed busy — long-window queries can never become routable");
+        // "> 0" would pass at any share, including one too small to ever drain a
+        // backlog — which is exactly what shipped first and left coverage frozen
+        // for hours. Assert sealed work is the MAJORITY when it is the majority
+        // of the queue.
+        assert!(
+            sealed_claims >= 7,
+            "sealed work got only {sealed_claims}/12 claims; at that share a 118k-task sealed backlog never drains and long windows stay unroutable"
+        );
     }
 
     #[test]
