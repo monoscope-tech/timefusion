@@ -462,3 +462,105 @@ regression unattributable.
 | WS-1 job concurrency | `TIMEFUSION_COORDINATOR_JOB_WORKERS=1` | today's serialized behavior |
 | WS-1 admission sizing | same variable drives token counts | today's `(1,1,1)` |
 | WS-4 in-process repair | disable the repair `Operation` | no index repair, no sibling containers |
+
+---
+
+# Outcome, 2026-08-16 evening → 2026-08-17 morning
+
+Everything below is measured on production, not projected.
+
+## What shipped
+
+| PR | change |
+|---|---|
+| #100 | 32 MiB Tokio worker stacks — ended an exit-134 crashloop |
+| #101 / #106 / #113 | coordinator job concurrency 1 → 12 (24 tried and reverted, see below) |
+| #102 | dedup/certification window 1 → 35 days |
+| #104 | rollup publication counters wired to the coordinator path |
+| #105 | sampled logging of refused rollup routes |
+| #107 / #109 | rollup backfill planner for untouched sealed days, with backpressure |
+| #108 | historical debt ordered newest-slice-first |
+| #110 | `claim_next` picks its class by streaming min instead of a full sort |
+| #111 / #112 | a reserved share of claims for sealed work |
+| #114 / #115 | Tantivy remaining-work gauges + a 15-minute census |
+| #116 | replay harness fans across N synthetic projects (10x acceptance) |
+
+## Measured effect
+
+| signal | before | after |
+|---|---|---|
+| `scan.dedup_skipped_pct` | **0.4%** | **88.6%** peak, 65-80% steady |
+| shipbubble 1d (warm) | **41.0 s** | **13.7 s** |
+| oldest rollup date, global | 2026-08-15 | **2026-08-11** |
+| sealed share of task starts | **0%** | ~11% |
+| Tantivy remaining work | *not measurable* | 1,795 uncovered / 917 size-blocked |
+| restarts / OCC conflicts | crashlooping | **0 / 0** |
+
+Not yet met: 14d/30d in ~1s. Those need rollup coverage 30 days deep, and
+coverage is walking backward at roughly a day per hour per project.
+
+## The remaining lever: `HEAVY_REWRITE_PERMITS`
+
+This is the binding constraint, and the codebase already says so — the
+`HEAVY_MIN_SHARE` comment notes heavy maintenance concurrency is "bounded by the
+rewrite permits rather than by bytes".
+
+Evidence it is binding: raising coordinator jobs to 24 (#112) did NOT increase
+throughput. The extra slots filled with units *waiting on a rewrite permit* —
+`permit_wait_ms` p50 4,195 / max 271,692, ten unit timeouts — and it was
+reverted in #113. Coordinator jobs cannot exceed the inner pool usefully.
+
+Evidence the memory headroom exists: RSS held **7-12% of the 85.9 GiB cgroup**
+all night at 12 jobs, OCC conflicts stayed 0, and heavy share is 0.40 x ~16.6 GiB
+= ~6.6 GiB against a `PER_SORT_BUDGET_BYTES` of 4 GiB — so sorts already spill,
+by design ("a spill THRESHOLD, not a hard requirement"), with the 85% memory
+brake as backstop.
+
+**Deliberately not shipped unattended.** `HEAVY_REWRITE_PERMITS` carries a
+documented 2026-07-04 fan-in OOM history and an explicit "do NOT bump further
+without shrinking the per-shard budget again". The failure mode is taking prod
+down. It wants someone watching.
+
+Suggested first step, smallest useful move:
+
+```rust
+// config.rs
+const HEAVY_REWRITE_PERMITS: usize = 6;   // from 4
+const PER_SORT_BUDGET_BYTES: usize = 3 * GIB;  // from 4, keeps ~the same envelope
+```
+
+Watch on deploy: `permit_wait_ms` (should fall), sealed share of task starts
+(should rise above ~11%), RSS against the 85% brake, `occ_conflicts_total`,
+and `eligible_watermark_lag_seconds`. Revert if RSS approaches the brake.
+
+## Measurement traps found the hard way
+
+Four separate metrics read green while the system was not making progress:
+
+- `rollup_output_rows_total` and friends were wired only to the retired cohort
+  path, so they read 0 while the coordinator published real rows.
+- `cert_granted_total` counts only *fresh* grants, so it reads 0 on a healthy,
+  fully certified system. `dedup_skipped_pct` is the honest signal.
+- `eligible_watermark_lag_seconds` was 0 for hours while sealed work made
+  literally zero progress. A healthy frontier says nothing about coverage.
+- `maintenance.tasks_complete` is a **gauge**, not a counter — the journal
+  prunes completed tasks, so it can decrease. Throughput derived from its delta
+  is unsound.
+
+Also: `rollup_miss_missing_project_total` running at ~99% of misses is **not a
+bug** — it is monoscope's `SELECT DISTINCT project_id` discovery query, which
+legitimately carries no `project_id =` filter.
+
+## Tantivy
+
+The in-process backfill needs no redesign: newest-first, fair project rotation,
+bounded concurrency, reserved memory, and it warns rather than silently skipping.
+It only lacked a scoreboard, which is why it was being chased by hand from
+sibling containers (three OOM-killed on 2026-08-16).
+
+Of 2,712 files needing work, **917 are blocked purely on size** — they exceed
+`TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB` (512 MB). Do not raise that limit;
+that is what the OOM-killed containers were doing. Coordinator compaction targets
+256 MiB, so those files become indexable once compaction rewrites them. Reindex
+completion is therefore **gated on sealed compaction**, and
+`tantivy_oversized_skipped` falling is the signal that it is progressing.
