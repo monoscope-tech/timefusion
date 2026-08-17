@@ -936,6 +936,35 @@ fn min_contiguous_days<'a>(
         .unwrap_or((0, None))
 }
 
+/// Which declared tiers each candidate day is MISSING.
+///
+/// The single set this replaced was subtracted per tier with
+/// `want.retain(|key| !covered.contains(key))`, which removes the days covered
+/// by ANY tier — the UNION — while the intent (stated in the comment above it)
+/// was the days not covered by EVERY tier, the INTERSECTION. A day present in
+/// the 1m tier but missing from the 1h tier was therefore dropped by the 1m
+/// pass and never enqueued, so the coarse tier could never be backfilled for a
+/// day the fine tier already had. Prod 2026-08-17: 1m held 22-32 days per
+/// project against 2-6 in 1h, and 1h only ever gained days 1m was also missing.
+///
+/// Returning WHICH tiers are missing, rather than just that one is, is what
+/// lets the caller enqueue only the absent tier: a derived tier reads the base
+/// TIER, so a day missing only its derived tier needs no raw source scan and no
+/// dedup at all.
+fn tiers_missing_per_day(
+    candidates: &[(String, chrono::NaiveDate)], covered_per_tier: &[(usize, HashSet<(String, chrono::NaiveDate)>)],
+) -> HashMap<(String, chrono::NaiveDate), Vec<usize>> {
+    let mut missing: HashMap<(String, chrono::NaiveDate), Vec<usize>> = HashMap::new();
+    for (index, covered) in covered_per_tier {
+        for key in candidates {
+            if !covered.contains(key) {
+                missing.entry(key.clone()).or_default().push(*index);
+            }
+        }
+    }
+    missing
+}
+
 /// Parallelism cap for every maintenance session. Each partition's
 /// `ExternalSorter` reserves `sort_spill_reservation_bytes` up-front from the
 /// bounded maintenance pool, so the query-derived count (≈ CPU cores) exhausts it
@@ -9461,17 +9490,36 @@ impl Database {
             // exists to catch hide itself.
             let active_projects: HashSet<&str> =
                 source_partitions.iter().filter(|(_, date)| *date >= today - chrono::Duration::days(1)).map(|(project, _)| project.as_str()).collect();
-            let mut want: Vec<(String, chrono::NaiveDate)> = source_partitions
+            let candidates: Vec<(String, chrono::NaiveDate)> = source_partitions
                 .clone()
                 .into_iter()
                 // Today is the live frontier's job; only sealed days are backfill.
                 .filter(|(_, date)| *date < today && *date >= earliest)
                 .collect();
+            // Which TIERS each day is missing, not merely whether it is missing
+            // one. Two bugs lived in the single `want` set this replaces.
+            //
+            // 1. `want.retain(|key| !covered.contains(key))` per tier subtracts
+            //    the UNION, so `want` ended up as the days covered by NO tier —
+            //    while the comment above it asks for the days not covered by
+            //    EVERY tier. A day present in the 1m tier but missing from the
+            //    1h tier was removed by the 1m pass and never enqueued, so the
+            //    coarse tier could never be backfilled for any day the fine tier
+            //    already had. Prod 2026-08-17: 1m held 22-32 days per project
+            //    while 1h held 2-6, and 1h only ever gained days that 1m was
+            //    ALSO missing.
+            //
+            // 2. Enqueueing every tier for a day that only lacks one re-reads
+            //    the raw source to rebuild a rollup that already exists. A
+            //    derived tier reads the BASE TIER, not raw, so a day missing
+            //    only its derived tier needs no source scan at all — and no
+            //    Dedup, which is the other full-day raw read.
+            let mut covered_per_tier: Vec<(usize, HashSet<(String, chrono::NaiveDate)>)> = Vec::new();
 
             // Covered by EVERY declared tier, not just one: a date present in
             // the 1m tier but missing from the 1h tier still refuses a 30d
             // panel, which reads the coarse tier.
-            for spec in &schema.rollups {
+            for (index, spec) in schema.rollups.iter().enumerate() {
                 let target = spec.table_name(&source);
                 let Ok(target_ref) = self.resolve_table(&storage_project, &target).await else { continue };
                 let covered = {
@@ -9506,8 +9554,10 @@ impl Database {
                     event = "rollup_coverage_contiguity"
                 );
 
-                want.retain(|key| !covered.contains(key));
+                covered_per_tier.push((index, covered));
             }
+            let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
+            let mut want: Vec<(String, chrono::NaiveDate)> = missing_tiers.keys().cloned().collect();
             // Skip any day that already has ROLLUP work queued. `invalidate`
             // takes `deadline.max(new_deadline)`, so re-invalidating a day that
             // already has an eligible task pushes that task's deadline OUT by a
@@ -9589,8 +9639,21 @@ impl Database {
                             created_unix_ms,
                         );
                     };
-                    enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup);
-                    for spec in &schema.rollups {
+                    // Only the tiers this day is actually missing. Enqueueing
+                    // every tier for a day that lacks one re-reads the whole raw
+                    // partition to rebuild a rollup that already exists.
+                    let missing = missing_tiers.get(&(project_id.clone(), *date)).cloned().unwrap_or_default();
+                    let needs_source_scan = missing.iter().any(|index| schema.rollups[*index].derive_from.is_none());
+                    // Dedup only when something must read RAW anyway. A derived
+                    // tier aggregates the base TIER, so a day missing only its
+                    // derived tier needs no source scan and no dedup — which is
+                    // the common case here: 1m is 22-32 days deep while 1h is
+                    // 2-6, so most queued days need the coarse tier alone.
+                    if needs_source_scan {
+                        enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup);
+                    }
+                    for index in missing {
+                        let spec = &schema.rollups[index];
                         let operation = if spec.derive_from.is_some() {
                             crate::maintenance_coordinator::Operation::DerivedRollup
                         } else {
@@ -20242,6 +20305,35 @@ mod tests {
             assert!(at_cap || parts * k * 2 <= cores, "packing may take at most half the box across its {k} bins");
             assert!(at_cap || parts * k * 4 * 33_554_432 <= pool_gib * GIB, "reservations may take at most a quarter of the pack pool");
         }
+    }
+
+    /// A day the FINE tier already has but the COARSE tier does not must still
+    /// be queued — and queued for the coarse tier ALONE.
+    ///
+    /// The single set this replaced subtracted each tier in turn with
+    /// `want.retain(|k| !covered.contains(k))`, which is the UNION, so such a
+    /// day was removed by the fine tier's pass and never enqueued. Prod
+    /// 2026-08-17: the 1m tier held 22-32 days per project while 1h held 2-6,
+    /// and 1h only ever gained days that 1m was ALSO missing — the coarse tier
+    /// could not be backfilled at all for a day the fine tier already had.
+    #[test]
+    fn a_day_missing_only_the_coarse_tier_is_queued_for_that_tier_alone() {
+        let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
+        let candidates: Vec<(String, chrono::NaiveDate)> = (14..=16).map(|d| ("p".to_owned(), day(d))).collect();
+        let set = |days: &[u32]| days.iter().map(|d| ("p".to_owned(), day(*d))).collect::<HashSet<_>>();
+        // Tier 0 (fine) has all three days; tier 1 (coarse) has only 08-16.
+        let covered = vec![(0usize, set(&[14, 15, 16])), (1usize, set(&[16]))];
+
+        let missing = tiers_missing_per_day(&candidates, &covered);
+        assert_eq!(missing.get(&("p".to_owned(), day(16))), None, "a day both tiers have needs nothing");
+        assert_eq!(
+            missing.get(&("p".to_owned(), day(15))).map(Vec::as_slice),
+            Some([1usize].as_slice()),
+            "a day the fine tier has but the coarse tier lacks must be queued for the COARSE tier only — \
+             queueing the fine tier too re-reads the whole raw partition to rebuild a rollup that exists"
+        );
+        assert_eq!(missing.get(&("p".to_owned(), day(14))).map(Vec::as_slice), Some([1usize].as_slice()));
+        assert_eq!(missing.len(), 2, "only the days actually missing a tier");
     }
 
     /// The metric exists because the two we had both read as progress while
