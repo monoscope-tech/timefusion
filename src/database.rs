@@ -9229,11 +9229,29 @@ impl Database {
     pub async fn plan_rollup_backfill(&self) -> Result<usize> {
         /// Newest-first per pass; the pass repeats on the same 60s cadence as
         /// compaction-debt planning, so the horizon fills in over hours.
-        const BACKFILL_PARTITIONS_PER_PASS: usize = 8;
+        /// One partition expands to ~450 durable tasks (a day of slices x
+        /// Dedup/BaseRollup/HotPacking x each declared tier), so this is not
+        /// "8 tasks" — it is thousands. Shipped at 8 and the journal went from
+        /// 18.5k to 92k pending in ~25 minutes.
+        const BACKFILL_PARTITIONS_PER_PASS: usize = 2;
+        /// Stop queueing more history while the queue is already deep. Every
+        /// `claim_next` scans the task set, so an over-full journal taxes the
+        /// live frontier to buy work that cannot start for hours anyway. The
+        /// backfill is a convergence process, not a one-shot: backing off and
+        /// refilling later costs nothing.
+        const BACKFILL_PENDING_CEILING: usize = 25_000;
 
         let horizon = i64::from(self.config.maintenance.timefusion_rollup_backfill_days);
         if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
             return Ok(0);
+        }
+        {
+            let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = journal.tasks().filter(|task| task.state != crate::maintenance_coordinator::TaskState::Complete).count();
+            if pending >= BACKFILL_PENDING_CEILING {
+                debug!(pending, ceiling = BACKFILL_PENDING_CEILING, event = "rollup_backfill_deferred");
+                return Ok(0);
+            }
         }
         let today = crate::clock::today_utc();
         let earliest = today - chrono::Duration::days(horizon);
