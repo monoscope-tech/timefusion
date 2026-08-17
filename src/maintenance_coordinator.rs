@@ -20,6 +20,15 @@ pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Frontier lag the sealed reservation is still affordable at.
+///
+/// Above this, `claim_next` stops reserving a share for sealed work until the
+/// live frontier catches up. Ten minutes is one `NORMAL_SLICE_MICROS`: a
+/// frontier that is a whole slice behind is not keeping up, and every hybrid
+/// query is paying for it through `raw_tail_duration_secs`
+/// (`FINALIZATION_DELAY + lag`).
+pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
+
 /// Whether a failure means "this did not fit" rather than "this went wrong".
 ///
 /// Matched on the message, not the type: these errors originate in DataFusion,
@@ -221,6 +230,11 @@ pub struct TaskJournal {
     /// Rotates so a fixed share of claims is reserved for sealed work. Runtime
     /// only — never journalled; losing it across a restart costs nothing.
     claim_tick: u64,
+    /// Last observed `eligible_watermark_lag_seconds`, republished by
+    /// `publish_statistics`. Read by `claim_next` to decide whether the sealed
+    /// reservation can still be afforded. Atomic because `publish_statistics`
+    /// takes `&self`; runtime only, never journalled.
+    frontier_lag_secs: std::sync::atomic::AtomicU64,
 }
 
 /// Ensures a claimed task cannot remain stuck in `Running` when its worker
@@ -313,6 +327,7 @@ impl TaskJournal {
             dirty_cursors: HashSet::new(),
             fair_cursors: HashMap::new(),
             claim_tick: 0,
+            frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -712,7 +727,23 @@ impl TaskJournal {
         // One in two ran ~6h without an OOM. Raising it again needs the per-sort
         // budget cut to pay for it (the documented 2026-07-04 pairing), not just
         // a bigger share.
-        let sealed_turn = self.claim_tick.is_multiple_of(2);
+        // ...and give it up entirely while the frontier is behind. The comment
+        // above names `eligible_watermark_lag_seconds` as the dial to turn when
+        // the frontier stops keeping up; this turns it automatically, in both
+        // directions, instead of waiting for someone to notice.
+        //
+        // Frontier lag is not just staleness, it is a per-query cost:
+        // `raw_tail_duration_secs` is `FINALIZATION_DELAY + lag`, and EVERY
+        // hybrid rollup query scans that tail. Prod 2026-08-17 sat at 62
+        // minutes of raw tail, so each query paid an hour of raw scan no matter
+        // how good the rollup coverage was.
+        //
+        // Safe in the direction that matters: the 3-in-4 sealed share
+        // OOM-killed prod at 124.9 GB because sealed partitions are far larger
+        // than frontier slices. This moves share AWAY from sealed, so it cannot
+        // reproduce that. And it is self-limiting — the frontier is small in
+        // volume, so it drains quickly, the lag falls, and sealed resumes.
+        let sealed_turn = self.claim_tick.is_multiple_of(2) && self.frontier_lag_secs.load(std::sync::atomic::Ordering::Relaxed) <= FRONTIER_LAG_BUDGET_SECS;
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64, i64)> {
             let mut class: Option<(u8, i64, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| {
@@ -1064,6 +1095,7 @@ impl TaskJournal {
         stats.sealed_compaction_debt_bytes.store(sealed_debt_bytes, Relaxed);
         let eligible_lag_secs = frontier_lag_secs(latest_frontier_rollup.values().copied(), now_micros);
         stats.maintenance_eligible_watermark_lag_secs.store(eligible_lag_secs, Relaxed);
+        self.frontier_lag_secs.store(eligible_lag_secs, Relaxed);
         stats
             .maintenance_raw_tail_duration_secs
             .store(u64::try_from(FINALIZATION_DELAY_MICROS / 1_000_000).unwrap_or_default().saturating_add(eligible_lag_secs), Relaxed);
@@ -1980,6 +2012,48 @@ mod tests {
     /// Prod 2026-08-17, 65 rollup starts in 25 minutes: 46 on today, 18 on
     /// yesterday, ZERO on any older day, while 7d/14d queries were refused for
     /// want of exactly those older days.
+    /// The sealed reservation is affordable only while the frontier keeps up.
+    ///
+    /// It exists because strict class-0 priority let the frontier take ~90% of
+    /// claims and froze rollup coverage. But frontier lag is a per-query cost —
+    /// `raw_tail_duration_secs` is `FINALIZATION_DELAY + lag` and every hybrid
+    /// query scans that tail — and prod 2026-08-17 reached 62 minutes of it.
+    /// So the reservation yields while the frontier is behind, and returns on
+    /// its own once it is not.
+    #[test]
+    fn the_sealed_reservation_yields_while_the_frontier_is_behind() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let now = 10 * DAY_MICROS;
+        let claims = |lag: u64| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            // One frontier slice (ends at `now`) and one sealed day, both eligible.
+            let frontier = task("p", now - 600_000_000, now, Operation::BaseRollup).key.clone();
+            let sealed = task("p", now - 5 * DAY_MICROS, now - 4 * DAY_MICROS, Operation::BaseRollup).key.clone();
+            journal.enqueue(frontier, 0, 0, 0);
+            journal.enqueue(sealed, 0, 0, 0);
+            journal.frontier_lag_secs.store(lag, std::sync::atomic::Ordering::Relaxed);
+            let mut sealed_claims = 0;
+            for _ in 0..8 {
+                let Some(claimed) = journal.claim_next(Operation::BaseRollup, now) else { continue };
+                if !is_live_frontier(claimed.key.slice, now) {
+                    sealed_claims += 1;
+                }
+                journal.complete(&claimed.key);
+                // Re-open both so every tick has a choice to make.
+                journal.enqueue(claimed.key.clone(), 0, 0, 0);
+            }
+            sealed_claims
+        };
+
+        assert!(claims(0) > 0, "a keeping-up frontier must still leave sealed work its reserved share");
+        assert_eq!(
+            claims(FRONTIER_LAG_BUDGET_SECS + 1),
+            0,
+            "past the lag budget every claim must go to the frontier, because each hybrid query is paying for that lag"
+        );
+    }
+
     #[test]
     fn sealed_backfill_units_outrank_yesterdays_fine_slices() {
         const DAY_MICROS: i64 = 86_400_000_000;
