@@ -116,3 +116,67 @@ Not by `tasks_pending` alone — it moves for many reasons. The test is:
 - `maintenance_sealed_slices_coarsened` reports a large collapse each day
 - `oldest_task_age_seconds` stops climbing (it was 29.7h)
 - creation-per-project-day, derived from the above, is O(tiers) not O(144 x tiers)
+
+---
+
+## Measured, 2026-08-17 evening
+
+The night's fixes made the pipeline CORRECT (#136, #139, #142, #148) and
+OBSERVABLE (#140, #143, #144, #145, #147, #149). None of them made it BIGGER,
+and the numbers below are why that is now the binding constraint.
+
+### The frontier is not a tail — it is a day
+
+`LIVE_FRONTIER_WINDOW_MICROS` is **24 hours**. The scheduler comment describing
+the frontier as "small in volume, so one claim in four still clears it" is
+wrong at current scale: class 0 covers a full day of ten-minute slices across
+every stream.
+
+```
+streams        ~26   (13 projects x 2 rollup-declared sources)
+per stream     1 slice / 10 min x {Dedup, BaseRollup, HotPacking}
+creation       ~7.8 units/min
+claimed        ~3.8 units/min   (measured: 38 frontier starts in 10 min)
+total drain    ~11.6 units/min
+```
+
+So the frontier alone wants **67% of the entire system's drain rate**, leaving
+33% for a sealed backlog of 24,000. `eligible_watermark_lag_seconds` climbed
+monotonically all evening — 1419 -> 5895 — at close to 1:1 with wall clock.
+
+**This is a prerequisite, not a competing concern.** `rollup_min_contiguous_days`
+counts back from YESTERDAY, so a frontier that never finishes today guarantees
+tomorrow's yesterday is holed and the coverage metric can never leave zero.
+#146 halves the sealed reservation while the frontier is behind, which buys
+headroom but does not change the arithmetic.
+
+### The queue is at its ceiling
+
+```
+tasks_pending          24,629     BACKFILL_PENDING_CEILING = 25,000
+pending_base_rollup     9,364     (4,857 at 16:14 — nearly doubled)
+pending_dedup           6,422
+pending_hot_packing     5,367     produces no coverage
+eligible_sealed_total  14,488
+net drain when backfill backs off   ~230 units/hour
+```
+
+At ~230/hour net, the standing backlog is ~100 hours of work. The ceiling
+behaves as designed (fill, back off, drain, refill) — it is the drain rate, not
+the ceiling, that bounds convergence.
+
+### Query cost is fragmentation, not window width
+
+`wide_scan_oversize_total` reached 300 within an hour of shipping. Every one was
+`otel_logs_and_spans` selecting **~1,301 files / 1.8 GB** — and the same shape
+was measured earlier for a **one-minute** window. These are not wide queries;
+they are narrow queries against unpacked partitions. HotPacking is 22% of the
+queue, produces no coverage, and is exactly what would fix them.
+
+### What this changes about the open questions
+
+Question 1 (does the frontier need durable per-slice units?) is no longer the
+most speculative item on the list — it is the only lever that changes the 7.8
+units/min. Reducing the frontier's per-slice unit count is worth more than any
+further scheduling or memory tuning, because scheduling can only redistribute a
+drain rate that is already fully committed.
