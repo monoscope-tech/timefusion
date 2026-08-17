@@ -19,6 +19,17 @@ pub const NORMAL_SLICE_MICROS: i64 = 10 * 60 * 1_000_000;
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Whether a failure means "this did not fit" rather than "this went wrong".
+///
+/// Matched on the message, not the type: these errors originate in DataFusion,
+/// cross the delta-rs and `anyhow` boundaries on the way back, and arrive
+/// type-erased. The two strings are DataFusion's own — `ResourcesExhausted`'s
+/// `Display` and the `ExternalSorter`'s message — and both are asserted against
+/// verbatim prod text in `capacity_failures_are_recognised_from_prod_text`.
+pub fn is_capacity_failure(message: &str) -> bool {
+    message.contains("Resources exhausted") || message.contains("Not enough memory to continue external sort")
+}
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
@@ -838,6 +849,27 @@ impl TaskJournal {
         }
         let delay_micros = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
         self.retry(key, "worker_error".to_owned(), now_micros.saturating_add(delay_micros));
+    }
+
+    /// A unit that failed because its input did not FIT will fail identically
+    /// on every retry — `retry` re-runs the same slice at the same size, so the
+    /// backoff only decides how slowly it never finishes. This is
+    /// [`Self::abandon_running`]'s argument, and byte-splitting answers it even
+    /// more directly here: what overran was BYTES, which is exactly what
+    /// `byte_bounded_units` divides.
+    ///
+    /// Still tolerate one: the maintenance pool is a FairSpillPool, so a unit
+    /// can be squeezed out by whatever else happened to be running and succeed
+    /// untouched next pass. Only a repeat says the slice itself is too big.
+    ///
+    /// Prod 2026-08-17 held ~5 units in this loop, each burning a worker and
+    /// 50-80s of object-store work per pass, and each guarding a partition that
+    /// stayed uncertified — which keeps `DedupExec` in every query plan over it.
+    pub fn retry_or_split(&mut self, key: &TaskKey, reason: String, when_micros: i64, attempts: u32) {
+        if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1)) {
+            return;
+        }
+        self.retry(key, reason, when_micros);
     }
 
     pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64) -> bool {
@@ -1981,6 +2013,55 @@ mod tests {
     /// task starts fell to 2.2/min and the rollup horizon it was starving sat
     /// days behind. Byte-based splitting cannot catch this — a day-sized slice
     /// with modest bytes still pays one object-store round trip per file.
+    /// Verbatim prod text, 2026-08-17. Classification is string-based because
+    /// the DataFusion error arrives type-erased through delta-rs/anyhow, so the
+    /// strings are the contract and this test is what pins them.
+    #[test]
+    fn capacity_failures_are_recognised_from_prod_text() {
+        assert!(is_capacity_failure(
+            "dedup: Not enough memory to continue external sort. Consider increasing the memory limit config: \
+             'datafusion.runtime.memory_limit', or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'."
+        ));
+        assert!(is_capacity_failure("compaction: Resources exhausted: Additional allocation failed for ExternalSorter[1] with top memory consumers"));
+        for benign in ["dedup: Object at location ... not found", "compaction: transaction failed: version 2667 already exists", "source_not_flushed"] {
+            assert!(!is_capacity_failure(benign), "must not shrink a slice over a fault that has nothing to do with size: {benign}");
+        }
+    }
+
+    /// A slice too big for the pool fails identically every pass. Back off once
+    /// (a FairSpillPool squeeze is transient), then shrink it.
+    #[test]
+    fn a_unit_that_cannot_fit_bisects_instead_of_retrying_at_the_same_size() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = task("whale", 0, DAY_MICROS, Operation::Dedup).key.clone();
+        journal.enqueue(key.clone(), 0, 0, 0);
+        let oom = "dedup: Not enough memory to continue external sort.".to_owned();
+
+        journal.retry_or_split(&key, oom.clone(), 1, 1);
+        assert_eq!(journal.state(&key), Some(TaskState::Retry), "one squeeze may be someone else's fault; retry it whole");
+
+        journal.retry_or_split(&key, oom, 2, 2);
+        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "a repeat says the slice itself does not fit");
+        let widths: Vec<i64> = journal.tasks().filter(|t| t.state != TaskState::Superseded).map(|t| t.key.slice.width()).collect();
+        assert!(!widths.is_empty() && widths.iter().all(|w| *w < DAY_MICROS), "bisection must leave smaller claimable children; got {widths:?}");
+    }
+
+    /// Only capacity failures shrink. A missing object or a commit conflict says
+    /// nothing about size, and splitting on it would shred a healthy slice.
+    #[test]
+    fn an_unrelated_failure_retries_whole_however_often_it_repeats() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = task("steady", 0, 86_400_000_000, Operation::Dedup).key.clone();
+        journal.enqueue(key.clone(), 0, 0, 0);
+        for attempts in 1..6 {
+            journal.retry_or_split(&key, "dedup: object not found".to_owned(), i64::from(attempts), attempts);
+            assert_eq!(journal.state(&key), Some(TaskState::Retry), "attempt {attempts} must not split");
+        }
+    }
+
     #[test]
     fn a_unit_that_keeps_timing_out_bisects_instead_of_retrying_forever() {
         let dir = tempfile::tempdir().expect("temp dir");
