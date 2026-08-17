@@ -746,6 +746,22 @@ atomic_stats! {
     /// on 2026-08-16. `uncovered` trending to 0 IS the definition of done.
     tantivy_uncovered_files,
     tantivy_oversized_skipped,
+    /// Pending (non-Complete) tasks split by operation, and the subset that is
+    /// ELIGIBLE right now (deadline passed). Gauges, republished each checkpoint.
+    ///
+    /// `tasks_pending` alone cannot answer the only question that matters when
+    /// coverage stalls: is the rollup work absent, present-but-not-eligible, or
+    /// present-and-eligible but out-competed? Prod 2026-08-17 sat at ~128k
+    /// pending with rollup coverage frozen for hours, and there was no way to
+    /// tell which of those three it was without guessing.
+    pending_dedup,
+    pending_base_rollup,
+    pending_derived_rollup,
+    pending_hot_packing,
+    pending_sealed_consolidation,
+    pending_repair,
+    eligible_base_rollup,
+    eligible_sealed_total,
     rollup_full_hours_rebuilt,
     rollup_incremental_hours_rebuilt,
     maintenance_tasks_pending,
