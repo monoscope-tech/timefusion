@@ -488,11 +488,36 @@ impl TaskJournal {
     }
 
     pub fn claim_next(&mut self, operation: Operation, now_micros: i64) -> Option<MaintenanceTask> {
-        let candidates = fair_ready_tasks(self.snapshot.tasks.iter(), now_micros)
-            .into_iter()
-            .find(|task| task.key.operation == operation && self.dependencies_complete(task))
-            .map(|task| scheduling_class(task, now_micros));
-        let class = candidates?;
+        // The winning scheduling class, as a streaming minimum.
+        //
+        // This used to call `fair_ready_tasks`, which builds a BTreeMap of every
+        // ready task plus a fully materialised Vec, and then took `.find()` —
+        // discarding all of it to keep one `(class, order_key)` tuple. That is
+        // O(n log n) and two large allocations PER CLAIM, on every worker.
+        // Tolerable at 18k tasks; at 128k (2026-08-17, after the rollup backfill
+        // queued real history) it started showing up as live-frontier lag, and
+        // it scales the wrong way for the 10x-projects target.
+        //
+        // The minimum over the same predicate is identical: groups are ordered
+        // by `(class, operation.priority(), order_key)` and the operation is
+        // fixed here, so the first match `find` returned was exactly the
+        // smallest `(class, order_key)` among eligible tasks for this operation.
+        //
+        // `dependencies_complete` is itself a scan, so it is evaluated ONLY when
+        // a task would actually improve the current best — otherwise this would
+        // be quadratic for `DerivedRollup`.
+        let mut class: Option<(u8, i64)> = None;
+        for task in
+            self.snapshot.tasks.iter().filter(|task| {
+                task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros
+            })
+        {
+            let candidate = scheduling_class(task, now_micros);
+            if class.is_none_or(|best| candidate < best) && self.dependencies_complete(task) {
+                class = Some(candidate);
+            }
+        }
+        let class = class?;
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
         let mut fallback: Option<&MaintenanceTask> = None;
         let mut next: Option<&MaintenanceTask> = None;
