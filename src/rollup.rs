@@ -666,7 +666,11 @@ pub(crate) fn hybrid_branch_count(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> us
 #[derive(Debug)]
 pub(crate) struct RoutedRollup {
     pub source: String,
-    pub project_id: String,
+    /// The project the query pinned with `project_id = '…'`, or `None` when it
+    /// GROUPS BY project_id instead. `None` means the rewrite reads every
+    /// project's rollup rows, so its coverage must hold for every project with
+    /// source data in the window — see `rollup_rewrite_for`.
+    pub project_id: Option<String>,
     pub lo: i64,
     pub hi: i64,
     /// The query gave no upper bound and `hi` is a plan-time stand-in. The
@@ -743,7 +747,14 @@ impl RoutedRollup {
         let ranges = ranges.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR ");
         let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
         let group_by = self.group_by();
-        format!("SELECT {select} FROM {table} WHERE project_id = {} AND ({ranges}){extra}{row_filters}{group_by}", sql_literal(&self.project_id))
+        format!("SELECT {select} FROM {table} WHERE {}({ranges}){extra}{row_filters}{group_by}", self.project_predicate())
+    }
+
+    /// `project_id = '…' AND `, or empty when the query groups by project_id.
+    /// Both legs and the single-leg shape share it so the rollup and raw sides
+    /// can never disagree about which projects they read.
+    fn project_predicate(&self) -> String {
+        self.project_id.as_deref().map_or_else(String::new, |project| format!("project_id = {} AND ", sql_literal(project)))
     }
 
     /// The rewrite. `interior` is the grain-aligned `[a, b)` the rollup leg owns;
@@ -753,12 +764,20 @@ impl RoutedRollup {
     /// When the interior is the whole window this collapses to a single
     /// statement against the rollup table, which is both cheaper and the shape
     /// the aligned fast path has always emitted.
-    pub fn sql(&self, generations: &[(String, String)], interiors: &[(i64, i64)]) -> String {
+    pub fn sql(&self, generations: &[(String, String, String)], interiors: &[(i64, i64)]) -> String {
         let generations = format!(
             " AND ({})",
             generations
                 .iter()
-                .map(|(date, generation)| format!("(date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation)))
+                // A generation id hashes the project, so a cross-project rewrite
+                // cannot name one per date — it must name one per (project,
+                // date) or it would accept another project's generation for the
+                // same day.
+                .map(|(project, date, generation)| match self.project_id {
+                    Some(_) => format!("(date = {} AND rollup_generation = {})", sql_literal(date), sql_literal(generation)),
+                    None =>
+                        format!("(project_id = {} AND date = {} AND rollup_generation = {})", sql_literal(project), sql_literal(date), sql_literal(generation)),
+                })
                 .collect::<Vec<_>>()
                 .join(" OR ")
         );
@@ -780,9 +799,9 @@ impl RoutedRollup {
             let group_by = self.group_by();
             let having = self.guard.as_ref().map_or_else(String::new, |guard| format!(" HAVING {} > 0", guard.merge.sql(&guard.measures)));
             return format!(
-                "SELECT {select} FROM {} WHERE project_id = {} AND ({}){generations}{row_filters}{group_by}{having}",
+                "SELECT {select} FROM {} WHERE {}({}){generations}{row_filters}{group_by}{having}",
                 self.target,
-                sql_literal(&self.project_id),
+                self.project_predicate(),
                 interiors.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR "),
             );
         }
@@ -1347,7 +1366,14 @@ async fn route_with_spec(
             (None, None) => promotable.push(term),
         }
     }
-    let project_id = project_id.ok_or(MissReason::MissingProject)?;
+    // A query that neither pins nor groups by project_id would fold every
+    // tenant into one row, so it stays refused. Grouping by it is answerable:
+    // project_id is a real column on the rollup table, and the coverage check
+    // downstream then has to hold for every project in the window rather than
+    // for one.
+    if project_id.is_none() && !aggregate.group_expr.iter().any(|expr| column_name(expr) == Some("project_id")) {
+        return Err(MissReason::MissingProject);
+    }
     // A dashboard panel writes its window as `timestamp >= now() - interval 'N
     // days'` and stops there. Demanding an upper bound sent every such query —
     // the wide ones, the only kind worth accelerating — to a full raw scan.
@@ -1374,7 +1400,12 @@ async fn route_with_spec(
     if too_narrow && promotable.is_empty() {
         return Err(MissReason::TinyInterior);
     }
-    let configured_filters = measure_filters(session, source, spec, &project_id, lo, hi).await?;
+    // The probe's project literal is scaffolding the canonicalizer strips back
+    // out — it exists only to satisfy the scan admission guard, and the result
+    // is memoized across every caller. A cross-project query has no literal to
+    // give it, and any value satisfies the guard's SHAPE check.
+    let probe_project = project_id.as_deref().unwrap_or("rollup-probe");
+    let configured_filters = measure_filters(session, source, spec, probe_project, lo, hi).await?;
 
     // ROW-FILTER PROMOTION. A residual predicate is normally fatal: the rollup
     // aggregated over every row, so re-aggregating it resurrects the groups the
@@ -1459,7 +1490,10 @@ async fn route_with_spec(
     for (index, expression) in aggregate.group_expr.iter().enumerate() {
         let alias = aggregate.schema.field(index).name();
         let expression = match unaliased(expression) {
-            Expr::Column(column) if spec.dimensions.iter().any(|dimension| dimension == &column.name) => column.name.clone(),
+            // `project_id` is not a declared dimension — it is the partition
+            // column, written on every rollup row by `to_rollup_batches` — but
+            // it groups exactly like one.
+            Expr::Column(column) if column.name == "project_id" || spec.dimensions.iter().any(|dimension| dimension == &column.name) => column.name.clone(),
             Expr::ScalarFunction(function)
                 if function.name().eq_ignore_ascii_case("time_bucket") && function.args.len() == 2 && column_name(&function.args[1]) == Some("timestamp") =>
             {
@@ -1916,14 +1950,14 @@ mod tests {
 
     /// The rewrite when the rollup owns the whole window — the single-leg shape.
     fn generated_sql(route: &RoutedRollup) -> String {
-        route.sql(&[("1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)])
+        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)])
     }
 
     /// The rewrite when only part of the window is certified, so raw fringes and
     /// a live tail are unioned in.
     fn hybrid_sql(route: &RoutedRollup, horizon: i64) -> String {
         let interior = interior(route.lo, route.hi, route.grain, horizon).expect("a routable interior");
-        route.sql(&[("1970-01-01".into(), "generation".into())], &[interior])
+        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[interior])
     }
 
     #[tokio::test]
@@ -1934,8 +1968,43 @@ mod tests {
             .expect("match count")
             .expect("declared rollup route");
         assert_eq!(route.target, TARGET);
-        assert_eq!(route.project_id, "project");
+        assert_eq!(route.project_id.as_deref(), Some("project"));
         assert!(generated_sql(&route).contains("COALESCE(SUM(request_count), 0)"));
+    }
+
+    /// The single largest source of rollup misses in production: monoscope's
+    /// cross-project overview, which GROUPS BY project_id instead of filtering
+    /// on it. 2026-08-18 measured 2,870 of 2,948 misses (97%) as
+    /// `missing_project`, and every sampled plan was this one shape — so it fell
+    /// back to a raw scan of every project's rows roughly 24 times a minute.
+    ///
+    /// `project_id` is a real column on the rollup table (`to_rollup_batches`
+    /// writes it), so grouping by it is answerable; only the demand for an
+    /// equality literal stood in the way.
+    #[tokio::test]
+    async fn a_query_grouping_by_project_id_routes_without_an_equality_filter() {
+        let state = session().await;
+        let sql = format!("SELECT project_id, COUNT(*) FROM {SOURCE} WHERE {WINDOW} GROUP BY 1");
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        assert_eq!(route.project_id, None, "no equality filter pins a project");
+        let generated = generated_sql(&route);
+        assert!(!generated.contains("WHERE project_id ="), "a cross-project rewrite must not pin one project: {generated}");
+        assert!(generated.contains("SELECT project_id AS"), "project_id must survive as a group key: {generated}");
+        // A generation id hashes the project, so the generation predicate must
+        // name one per (project, date) rather than accepting any project's
+        // generation for the day.
+        assert!(generated.contains("(project_id = 'project' AND date = '1970-01-01'"), "generations must be qualified by project: {generated}");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// Grouping by project_id is what makes the query answerable; merely
+    /// omitting the filter does not. Without a group key the rewrite would
+    /// silently fold every project into one row.
+    #[tokio::test]
+    async fn a_query_with_neither_a_project_filter_nor_a_project_group_is_refused() {
+        let state = session().await;
+        let miss = route_for(&state, &format!("SELECT COUNT(*) FROM {SOURCE} WHERE {WINDOW}")).await.expect_err("must be refused");
+        assert!(matches!(miss, MissReason::MissingProject), "expected MissingProject, got {miss:?}");
     }
 
     #[tokio::test]

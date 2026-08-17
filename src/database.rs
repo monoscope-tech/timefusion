@@ -1686,6 +1686,33 @@ fn partition_file_fp(mut files: Vec<String>) -> u64 {
 /// UTC dates covered by a `[lo, hi]` microsecond window, or `None` when the
 /// window is unbounded/invalid/wider than a year (bounds the per-date
 /// fingerprint checks; such queries just keep DedupExec).
+/// Sort and coalesce half-open ranges, merging any that touch or overlap.
+fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.sort_unstable();
+    ranges.into_iter().fold(Vec::<(i64, i64)>::new(), |mut merged, range| {
+        match merged.last_mut() {
+            Some(last) if range.0 <= last.1 => last.1 = last.1.max(range.1),
+            _ => merged.push(range),
+        }
+        merged
+    })
+}
+
+/// The overlap of two coalesced range sets. Both inputs must already be sorted
+/// and disjoint — `merge_ranges` guarantees that — so one linear sweep suffices.
+fn intersect_ranges(left: &[(i64, i64)], right: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < left.len() && j < right.len() {
+        let (start, end) = (left[i].0.max(right[j].0), left[i].1.min(right[j].1));
+        if start < end {
+            out.push((start, end));
+        }
+        // Retire whichever range ends first; the other may still meet the next.
+        if left[i].1 < right[j].1 { i += 1 } else { j += 1 }
+    }
+    out
+}
+
 fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
     let lo_d = chrono::DateTime::from_timestamp_micros(lo)?.date_naive();
     let hi_d = chrono::DateTime::from_timestamp_micros(hi)?.date_naive();
@@ -3598,7 +3625,17 @@ impl Database {
         if routes.is_empty() {
             return Ok(None);
         }
-        if !self.config.maintenance.rollup_read_enabled_for(&routes[0].project_id) {
+        // A cross-project route reads every project at once, so a per-project
+        // allowlist cannot be honoured: it is enabled only when the rollout is on
+        // for everyone.
+        let enabled = match routes[0].project_id.as_deref() {
+            Some(project) => self.config.maintenance.rollup_read_enabled_for(project),
+            None => {
+                let maintenance = &self.config.maintenance;
+                maintenance.timefusion_rollup_enabled && maintenance.timefusion_rollup_read_enabled && maintenance.timefusion_rollup_read_projects.is_none()
+            }
+        };
+        if !enabled {
             return Ok(None);
         }
         // Try every viable tier, best first, and take the first one that is
@@ -3627,26 +3664,62 @@ impl Database {
         // so any row still in the MemBuffer is absent from it. That is a bound on
         // how far the rollup may be trusted, not a reason to refuse: everything
         // at or above it is read raw.
-        let buffered = self.buffered_layer().and_then(|layer| layer.min_buffered_micros(&route.project_id, &route.source, route.lo, end));
         let dates = window_dates(route.lo, end).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
+        // A cross-project route reads the unified table's rollup rows for every
+        // tenant at once, and a project on custom storage lives in a table this
+        // pass never sees — so its coverage would be assumed rather than proved,
+        // and an uncovered day would be served as a silent undercount. Refuse
+        // instead. Custom storage is rare, and the map is tiny.
+        if route.project_id.is_none() && self.custom_storage_keys().await.iter().any(|(_, table)| table == &route.source) {
+            return Err(crate::rollup::MissReason::IncompleteCoverage);
+        }
         // ONE pass over the add actions for the whole window. Asking per date
         // rebuilds the entire add-actions batch each time, which on a table with
         // tens of thousands of files is the dominant cost of planning — a 4-day
         // window paid it four times.
+        let lookup_project = route.project_id.clone().unwrap_or_else(|| "default".to_string());
         let fingerprints = {
-            let table = self.resolve_table(&route.project_id, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
+            let table = self.resolve_table(&lookup_project, &route.source).await.map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?;
             let table = table.read().await;
-            // Each date is fingerprinted to the bound ITS coverage was built to,
-            // so a day still being written is compared on the part the build
-            // actually read. A date with no coverage gets the whole-partition
+            // Each partition is fingerprinted to the bound ITS coverage was built
+            // to, so a day still being written is compared on the part the build
+            // actually read. A partition with no coverage gets the whole-partition
             // question and simply fails to match below.
-            Self::partition_fingerprints_bounded(&table, tiebreak_of(&route.source), &|date| {
+            Self::partition_fingerprints_bounded(&table, tiebreak_of(&route.source), &|project, date| {
                 self.rollup_coverage
-                    .get(&(route.project_id.clone(), route.source.clone(), route.target.clone(), date.to_string()))
+                    .get(&(project.to_string(), route.source.clone(), route.target.clone(), date.to_string()))
                     .map_or(i64::MAX, |coverage| coverage.covered_through)
             })
             .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
+        // Pinned: the one project. Grouped: every project the SOURCE holds data
+        // for in this window — taken from the source, never from the tier, so a
+        // project whose rollup was never built still counts against the coverage
+        // rather than quietly vanishing from the answer.
+        let window_dates: std::collections::HashSet<String> = dates.iter().map(chrono::NaiveDate::to_string).collect();
+        let projects: Vec<String> = match &route.project_id {
+            Some(project) => vec![project.clone()],
+            None => {
+                let mut projects: Vec<String> =
+                    fingerprints.keys().filter(|(_, date)| window_dates.contains(date)).map(|(project, _)| project.clone()).collect();
+                projects.sort_unstable();
+                projects.dedup();
+                projects
+            }
+        };
+        if projects.is_empty() {
+            return Err(crate::rollup::MissReason::NotBuilt);
+        }
+        // A rollup partition is built from Delta files only (`query_delta_only`),
+        // so any row still in the MemBuffer is absent from it. That is a bound on
+        // how far the rollup may be trusted, not a reason to refuse: everything
+        // at or above it is read raw. Across projects the EARLIEST such bound
+        // governs, since one project's buffered rows are missing from the answer
+        // just as surely as another's.
+        let buffered = projects
+            .iter()
+            .filter_map(|project| self.buffered_layer().and_then(|layer| layer.min_buffered_micros(project, &route.source, route.lo, end)))
+            .min();
         let mut generations = Vec::with_capacity(dates.len());
         let mut ticket = Vec::with_capacity(dates.len());
         let mut slice_ticket = Vec::new();
@@ -3657,69 +3730,73 @@ impl Database {
         // The certified SET, not a prefix. A gap in the middle used to discard
         // every later date too, so one stale day made a 7-day query scan 8.4M
         // raw rows while six days sat fully built.
-        let mut covered: Vec<(i64, i64)> = Vec::new();
         let mut miss = None;
-        for date in dates {
-            let date = date.to_string();
-            let key = (route.project_id.clone(), route.source.clone(), route.target.clone(), date.clone());
-            let day_start = date_start_micros(&date).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
-            // `not_built` and `stale_coverage` are the same outcome but opposite
-            // diagnoses: the first says the build never ran, the second says it
-            // ran and the source moved under it. Collapsed into one reason, the
-            // miss histogram cannot tell a missing cron from a churning
-            // partition, which is the only question a rollout has to answer.
-            let Some(coverage) = self.rollup_coverage.get(&key) else {
-                miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
-                continue;
-            };
-            let source_fp = fingerprints
-                .get(&(route.project_id.clone(), date.clone()))
-                .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
-                .copied()
-                .unwrap_or_default();
-            let source_epoch = self.rollup_source_epochs.get(&(route.project_id.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
-            if coverage.source_fp != source_fp || coverage.source_epoch != source_epoch {
-                miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
-                continue;
+        // One project's covered ranges. The rewrite may only read a range EVERY
+        // project has covered, so these are intersected below — a project missing
+        // a day drags that day into the raw leg instead of being silently omitted
+        // from the answer.
+        let mut per_project: Vec<Vec<(i64, i64)>> = Vec::with_capacity(projects.len());
+        for project in &projects {
+            let mut covered: Vec<(i64, i64)> = Vec::new();
+            for date in &dates {
+                let date = date.to_string();
+                let key = (project.clone(), route.source.clone(), route.target.clone(), date.clone());
+                let day_start = date_start_micros(&date).ok_or(crate::rollup::MissReason::IncompleteCoverage)?;
+                // `not_built` and `stale_coverage` are the same outcome but opposite
+                // diagnoses: the first says the build never ran, the second says it
+                // ran and the source moved under it. Collapsed into one reason, the
+                // miss histogram cannot tell a missing cron from a churning
+                // partition, which is the only question a rollout has to answer.
+                let Some(coverage) = self.rollup_coverage.get(&key) else {
+                    miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
+                    continue;
+                };
+                let source_fp = fingerprints
+                    .get(&(project.clone(), date.clone()))
+                    .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
+                    .copied()
+                    .unwrap_or_default();
+                let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
+                if coverage.source_fp != source_fp || coverage.source_epoch != source_epoch {
+                    miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
+                    continue;
+                }
+                debug!(project_id = %project, source = %route.source, target = %route.target, date, rows = coverage.rows, "rollup coverage selected");
+                // Merge with the previous run when the dates are adjacent, so a
+                // contiguous span costs one range predicate rather than one per day.
+                // The build's OWN bound, not the day end. They are the same for a
+                // sealed partition; for a day still being written the build stops
+                // short, and reading past that point would serve buckets the rollup
+                // never aggregated — the silent-wrong-number failure.
+                let end = coverage.covered_through.min(day_start + DAY_MICROS);
+                if end <= day_start {
+                    miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
+                    continue;
+                }
+                match covered.last_mut() {
+                    Some(last) if last.1 == day_start => last.1 = end,
+                    _ => covered.push((day_start, end)),
+                }
+                generations.push((project.clone(), date.clone(), coverage.generation.clone()));
+                ticket.push((key, source_fp, source_epoch, coverage.generation.clone(), coverage.covered_through));
             }
-            debug!(project_id = %route.project_id, source = %route.source, target = %route.target, date, rows = coverage.rows, "rollup coverage selected");
-            // Merge with the previous run when the dates are adjacent, so a
-            // contiguous span costs one range predicate rather than one per day.
-            // The build's OWN bound, not the day end. They are the same for a
-            // sealed partition; for a day still being written the build stops
-            // short, and reading past that point would serve buckets the rollup
-            // never aggregated — the silent-wrong-number failure.
-            let end = coverage.covered_through.min(day_start + DAY_MICROS);
-            if end <= day_start {
-                miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
-                continue;
+            for entry in self.rollup_slice_coverage.iter() {
+                let ((slice_project, source, target, start, end), coverage) = (entry.key(), entry.value());
+                if slice_project != project || source != &route.source || target != &route.target || *start >= route.hi || *end <= route.lo {
+                    continue;
+                }
+                covered.push((*start, *end));
+                if let Some(date) = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()) {
+                    generations.push((project.clone(), date, coverage.generation.clone()));
+                }
+                slice_ticket.push((entry.key().clone(), coverage.source_fp, coverage.generation.clone()));
             }
-            match covered.last_mut() {
-                Some(last) if last.1 == day_start => last.1 = end,
-                _ => covered.push((day_start, end)),
-            }
-            generations.push((date.clone(), coverage.generation.clone()));
-            ticket.push((key, source_fp, source_epoch, coverage.generation.clone(), coverage.covered_through));
+            per_project.push(merge_ranges(covered));
         }
-        for entry in self.rollup_slice_coverage.iter() {
-            let ((project, source, target, start, end), coverage) = (entry.key(), entry.value());
-            if project != &route.project_id || source != &route.source || target != &route.target || *start >= route.hi || *end <= route.lo {
-                continue;
-            }
-            covered.push((*start, *end));
-            if let Some(date) = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()) {
-                generations.push((date, coverage.generation.clone()));
-            }
-            slice_ticket.push((entry.key().clone(), coverage.source_fp, coverage.generation.clone()));
-        }
-        covered.sort_unstable();
-        covered = covered.into_iter().fold(Vec::<(i64, i64)>::new(), |mut merged, range| {
-            match merged.last_mut() {
-                Some(last) if range.0 <= last.1 => last.1 = last.1.max(range.1),
-                _ => merged.push(range),
-            }
-            merged
-        });
+        // The intersection, so a range is read from the rollup only where every
+        // project proved it. For the pinned case there is one element and this is
+        // exactly the old behaviour.
+        let covered = per_project.into_iter().reduce(|left, right| intersect_ranges(&left, &right)).unwrap_or_default();
         generations.sort_unstable();
         generations.dedup();
         // A buffered row is missing from EVERY rollup partition, whichever dates
@@ -3741,7 +3818,7 @@ impl Database {
         // Drop dates no interval actually reads: keeping them in the ticket would
         // let an unrelated partition's churn invalidate a valid plan.
         let reads = |date: &str| interiors.iter().any(|interval| date_intersects(date, *interval));
-        generations.retain(|(date, _)| reads(date));
+        generations.retain(|(_, date, _)| reads(date));
         ticket.retain(|((_, _, _, date), ..)| reads(date));
         slice_ticket.retain(|((_, _, _, start, end), ..)| interiors.iter().any(|(covered_start, covered_end)| *start < *covered_end && *end > *covered_start));
         if generations.is_empty() {
@@ -9157,7 +9234,7 @@ impl Database {
     async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str, bound: i64) -> Result<u64> {
         let table = self.resolve_table(project_id, source).await?;
         let table = table.read().await;
-        let mut fingerprints = Self::partition_fingerprints_bounded(&table, tiebreak_of(source), &|_| bound)?;
+        let mut fingerprints = Self::partition_fingerprints_bounded(&table, tiebreak_of(source), &|_, _| bound)?;
         Ok(fingerprints
             .remove(&(project_id.to_string(), date.to_string()))
             .or_else(|| fingerprints.remove(&("default".to_string(), date.to_string())))
@@ -11254,10 +11331,10 @@ impl Database {
     /// timestamps. This is the right question for a SEALED partition, and the
     /// only one the sweep, the backfill's candidate scan and recovery ask.
     fn partition_fingerprints(table: &DeltaTable, tiebreak: Option<&str>) -> Result<HashMap<(String, String), u64>> {
-        Self::partition_fingerprints_bounded(table, tiebreak, &|_| i64::MAX)
+        Self::partition_fingerprints_bounded(table, tiebreak, &|_, _| i64::MAX)
     }
 
-    /// `bound_for` gives, per date, an EXCLUSIVE upper bound on the row
+    /// `bound_for` gives, per (project, date), an EXCLUSIVE upper bound on the row
     /// timestamps a file may contain to be folded in. Files entirely at or above
     /// it are ignored.
     ///
@@ -11267,7 +11344,9 @@ impl Database {
     /// files landing ABOVE the bound change nothing, while a rewrite or a late
     /// file BELOW it still moves the fingerprint and correctly invalidates —
     /// which is the only direction that can serve a wrong number.
-    fn partition_fingerprints_bounded(table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str) -> i64) -> Result<HashMap<(String, String), u64>> {
+    fn partition_fingerprints_bounded(
+        table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
+    ) -> Result<HashMap<(String, String), u64>> {
         use std::hash::{Hash, Hasher};
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
@@ -11311,12 +11390,13 @@ impl Database {
             let Some(date) = string_at(&dates, row) else { continue };
             // Custom-project tables carry no `project_id` partition; the sweep
             // groups those under "default", so match it exactly.
-            // A file whose rows all sit at or above this date's bound is not part
-            // of what was aggregated, so it must not perturb the fingerprint.
-            if max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))).is_some_and(|hi| hi >= bound_for(&date)) {
+            let project = string_at(&projects, row).unwrap_or_else(|| "default".to_string());
+            // A file whose rows all sit at or above this partition's bound is not
+            // part of what was aggregated, so it must not perturb the fingerprint.
+            if max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))).is_some_and(|hi| hi >= bound_for(&project, &date)) {
                 continue;
             }
-            let key = (string_at(&projects, row).unwrap_or_else(|| "default".to_string()), date);
+            let key = (project, date);
             let entry = by_partition.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN));
             entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
             if let Some(lo) = min_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
@@ -19926,6 +20006,33 @@ mod tests {
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
     fn far_future() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
+    /// The intersection is the whole safety argument for cross-project routing:
+    /// a range one project has not covered must NOT be read from the rollup, or
+    /// that project's rows are silently absent from the answer. An undercount is
+    /// worse than a slow query, and nothing downstream can detect it.
+    #[test]
+    fn a_range_only_one_project_covers_is_not_in_the_intersection() {
+        // Project A covered the whole day; project B only its first half.
+        assert_eq!(intersect_ranges(&[(0, 100)], &[(0, 50)]), vec![(0, 50)]);
+        // Disjoint coverage yields nothing at all — everything goes to the raw leg.
+        assert_eq!(intersect_ranges(&[(0, 40)], &[(60, 100)]), Vec::new());
+        // Touching but not overlapping is still nothing: the ranges are half-open.
+        assert_eq!(intersect_ranges(&[(0, 50)], &[(50, 100)]), Vec::new());
+        // A hole in one side splits the other's single range in two.
+        assert_eq!(intersect_ranges(&[(0, 100)], &[(0, 30), (70, 100)]), vec![(0, 30), (70, 100)]);
+        // One project is the identity case: coverage passes through untouched.
+        assert_eq!(intersect_ranges(&[(10, 20), (30, 40)], &[(10, 20), (30, 40)]), vec![(10, 20), (30, 40)]);
+        // Neither side advances past a range the other still overlaps.
+        assert_eq!(intersect_ranges(&[(0, 100)], &[(10, 20), (30, 40), (90, 200)]), vec![(10, 20), (30, 40), (90, 100)]);
+    }
+
+    #[test]
+    fn merging_ranges_coalesces_what_touches_or_overlaps() {
+        assert_eq!(merge_ranges(vec![(30, 40), (0, 10), (10, 20)]), vec![(0, 20), (30, 40)]);
+        assert_eq!(merge_ranges(vec![(0, 100), (20, 30)]), vec![(0, 100)]);
+        assert_eq!(merge_ranges(Vec::new()), Vec::new());
     }
 
     #[test]
