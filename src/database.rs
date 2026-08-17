@@ -9964,6 +9964,24 @@ impl Database {
             );
             journal.publish(&key, crate::maintenance_coordinator::Publication { source_fingerprint: source_fp, generation: generation.clone(), rows });
             journal.checkpoint()?;
+            // Per-unit outcome, because the counters are process-wide totals and
+            // cannot answer "why has THIS project's coverage not moved". Prod
+            // 2026-08-17: the whale started day-sized BaseRollup units for
+            // 08-08..08-13 at attempt 1 and published nothing for any of them,
+            // while 120k raw rows/hour sat in those partitions — and there was
+            // no way to tell a zero-row publication from a unit that never got
+            // that far.
+            info!(
+                operation = ?key.operation,
+                table = %key.physical_table,
+                project_id = %key.project_id,
+                slice_start = key.slice.start_micros,
+                slice_end = key.slice.end_micros,
+                rows,
+                output_files,
+                estimated_decoded_bytes = estimated_bytes,
+                event = "maintenance_rollup_published"
+            );
             let stats = crate::metrics::maintenance_stats();
             stats.maintenance_processed_bytes.fetch_add(estimated_bytes, Relaxed);
             stats.rollup_output_rows.fetch_add(rows, Relaxed);
