@@ -436,11 +436,28 @@ impl DerivedBudget {
     /// 512 MB sixteen ways, below `ExternalSorterMerge`'s 32 MB floor, so units
     /// FAILED instead of spilling: prod 2026-08-17 logged 72 `Failed to
     /// allocate additional 32.0 MB ... pool_size: 512.0 MB` in 25 minutes.
+    /// Capped at a QUARTER of the maintenance pool, not a half.
+    ///
+    /// `jobs x MAX_DECODED_BYTES` is the ceiling a fully-rollup-loaded
+    /// coordinator could want, but it is not what the coordinator typically
+    /// runs: only its rollup units draw on this pool
+    /// (`bounded_rollup_maintenance_context`), while its DEDUP units sort on
+    /// the heavy share. Letting the ceiling take half the pool starved the
+    /// share doing the sorting — prod 2026-08-17, immediately after the
+    /// over-commit fix sized heavy honestly at 3.4 GiB:
+    ///
+    ///   dedup: Not enough memory to continue external sort ... Failed to
+    ///   allocate additional 637.9 MB ... pool_size: 3.4 GB
+    ///
+    /// A quarter still leaves each of 16 jobs ~260 MB — far above
+    /// `ExternalSorterMerge`'s 32 MB floor, which is the failure that sizing
+    /// this pool by job count was introduced to prevent — and hands the
+    /// difference back to the tiers that were measurably short.
     pub fn coordinator_share_bytes(&self) -> usize {
         match self.profile {
             // The CLI drives engines directly; no coordinator runs.
             BudgetProfile::MaintenanceCli => 0,
-            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes / 2),
+            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes / 4),
         }
     }
 
