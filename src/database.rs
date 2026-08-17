@@ -9989,18 +9989,18 @@ impl Database {
         // already holds these rows.
         let covered_by_wider = derived
             && live_adds.iter().any(|add| {
-            let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
-            let (Some(start), Some(end)) = (
-                tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-            ) else {
-                return false;
-            };
-            tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
-                && (start, end) != (key.slice.start_micros, key.slice.end_micros)
-                && start <= key.slice.start_micros
-                && end >= key.slice.end_micros
-        });
+                let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
+                let (Some(start), Some(end)) = (
+                    tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                    tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                ) else {
+                    return false;
+                };
+                tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
+                    && (start, end) != (key.slice.start_micros, key.slice.end_micros)
+                    && start <= key.slice.start_micros
+                    && end >= key.slice.end_micros
+            });
         if covered_by_wider {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             journal.complete(&key);

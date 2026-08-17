@@ -2150,7 +2150,10 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // collapses a sealed day's fine units into one, so a correct run publishes
     // ONE day-wide tagged file. The invariant is that none is untagged.
     let total_files = base_target.read().await.snapshot()?.log_data().iter().count();
-    assert!(tagged_files > 0 && tagged_files == total_files, "every published slice must retain its Delta Add tags (got {tagged_files} tagged of {total_files})");
+    assert!(
+        tagged_files > 0 && tagged_files == total_files,
+        "every published slice must retain its Delta Add tags (got {tagged_files} tagged of {total_files})"
+    );
     let derived_built: i64 = db
         .query_delta_only(&format!(
             "SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM otel_logs_and_spans_rollup_dashboard_1h_v2 WHERE project_id = '{project_id}'"
