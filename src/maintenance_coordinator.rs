@@ -547,7 +547,22 @@ impl TaskJournal {
         // The frontier is small in volume, so one claim in four still clears it;
         // if it stops keeping up, `eligible_watermark_lag_seconds` says so and
         // this is the dial to turn back.
-        let sealed_turn = !self.claim_tick.is_multiple_of(4);
+        // Back to one in two after an OOM. Prod 2026-08-17 09:39:02:
+        //
+        //   maintenance-wor invoked oom-killer
+        //   Killed process (timefusion) anon-rss: 124,921,780 kB  (124.9 GB)
+        //
+        // RSS was 11.9 GB two minutes earlier, so this was a fan-in spike, not
+        // drift. Three-in-four routes far more SEALED partitions through the
+        // heavy path at once, and historical partitions are much larger than
+        // frontier slices — so the same permit count admits far more bytes.
+        // permits=10 + jobs=16 had run 1.5h clean before this landed; the share
+        // is the variable that changed immediately before the kill.
+        //
+        // One in two ran ~6h without an OOM. Raising it again needs the per-sort
+        // budget cut to pay for it (the documented 2026-07-04 pairing), not just
+        // a bigger share.
+        let sealed_turn = self.claim_tick.is_multiple_of(2);
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64)> {
             let mut class: Option<(u8, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| {
@@ -1334,9 +1349,14 @@ mod tests {
         // backlog — which is exactly what shipped first and left coverage frozen
         // for hours. Assert sealed work is the MAJORITY when it is the majority
         // of the queue.
+        // Was `>= 7` (three in four). Lowered to the one-in-two floor after the
+        // 2026-08-17 OOM: sealed work must still get a real share — "> 0" is the
+        // bug that let an ineffective share ship — but the higher share cost
+        // 124.9 GB of anon RSS and a kill, so the invariant is "a third or
+        // better", not "the majority".
         assert!(
-            sealed_claims >= 7,
-            "sealed work got only {sealed_claims}/12 claims; at that share a 118k-task sealed backlog never drains and long windows stay unroutable"
+            sealed_claims >= 4,
+            "sealed work got only {sealed_claims}/12 claims; below a third, a 118k-task sealed backlog never drains and long windows stay unroutable"
         );
     }
 
