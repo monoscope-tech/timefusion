@@ -3351,6 +3351,8 @@ impl Database {
         let mut roots: Vec<String> = vec!["default".into()];
         roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()));
         let mut built = 0usize;
+        // Coverage gauges for this pass — see `tantivy_uncovered_files`.
+        let (mut uncovered_total, mut oversized_total) = (0u64, 0u64);
         for root in roots {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
@@ -3381,6 +3383,7 @@ impl Database {
                     let before = uris.len();
                     uris.retain(|u| parquet_rel_of_uri(u).and_then(|rel| sizes.get(rel)).is_none_or(|sz| *sz <= max_bytes));
                     let skipped = before - uris.len();
+                    oversized_total = oversized_total.saturating_add(skipped as u64);
                     if skipped > 0 {
                         // No silent caps: oversized files stay uncovered until a
                         // bigger-memory runner reconciles without the limit.
@@ -3390,6 +3393,7 @@ impl Database {
                 // Dashboard acceptance is governed by recent windows; a
                 // terabyte of legacy history must not stand in front of the
                 // last seven days after a migration.
+                uncovered_total = uncovered_total.saturating_add(uris.len() as u64);
                 sort_backfill_uris_newest_first(&mut uris);
                 let queue = uris.into_iter().filter_map(|uri| Some((parquet_rel_of_uri(&uri)?.to_string(), uri))).collect::<VecDeque<_>>();
                 queues.push((pid, queue));
@@ -3407,6 +3411,14 @@ impl Database {
                 }
             }
         }
+        // Gauges, so each pass reports the CURRENT remaining work rather than a
+        // running total. `uncovered` reaching 0 is what "the reindex is done"
+        // means, and nothing reported it before — which is why the reindex was
+        // being chased by hand from sibling containers.
+        let stats = crate::metrics::maintenance_stats();
+        stats.tantivy_uncovered_files.store(uncovered_total.saturating_sub(built as u64), std::sync::atomic::Ordering::Relaxed);
+        stats.tantivy_oversized_skipped.store(oversized_total, std::sync::atomic::Ordering::Relaxed);
+        info!(table_name, built, uncovered_before = uncovered_total, oversized_skipped = oversized_total, event = "tantivy_backfill_pass");
         Ok(built)
     }
 

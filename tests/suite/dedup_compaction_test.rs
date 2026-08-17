@@ -1609,9 +1609,22 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
 
     // Reconcile #1 = backfill: both uncovered live files get indexes under
     // the project-uuid manifest; nothing is stale yet.
+    // A reindex has no visible end state without a remaining-work gauge, which
+    // is why it was being chased by hand from sibling containers (three
+    // OOM-killed on 2026-08-16). Seed a sentinel first: a gauge that is simply
+    // never written also reads 0, so asserting 0 alone would pass vacuously.
+    let tantivy_stats = timefusion::metrics::maintenance_stats();
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    tantivy_stats.tantivy_uncovered_files.store(999, ordering);
+
     let (built, removed, _) = db.tantivy_reconcile_table(TABLE).await?;
     assert!(built >= 2, "expected both uncovered live files indexed, built={built}");
     assert_eq!(removed, 0, "nothing to GC before compaction");
+    assert_eq!(
+        tantivy_stats.tantivy_uncovered_files.load(ordering),
+        0,
+        "the pass must publish remaining work (sentinel not overwritten); 'uncovered -> 0' is the definition of a finished reindex"
+    );
     let m = manifest::load(tantivy_store.as_ref(), TABLE, &project_id).await?;
     assert_eq!(m.entries.len(), 2, "per-uuid manifest covers both files");
 

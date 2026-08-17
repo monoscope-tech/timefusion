@@ -735,6 +735,17 @@ atomic_stats! {
     rollup_end_to_end_duration_ms,
     rollup_output_rows,
     rollup_output_files,
+    /// Live parquet files the Tantivy manifest does NOT cover, as of the last
+    /// reconcile pass, plus the ones skipped for exceeding
+    /// TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB. Gauges, not counters: each pass
+    /// overwrites them.
+    ///
+    /// Without these there is no way to tell whether a reindex is converging or
+    /// how far it has left to run, which is precisely why the reindex was being
+    /// driven by hand from sibling containers — three of which were OOM-killed
+    /// on 2026-08-16. `uncovered` trending to 0 IS the definition of done.
+    tantivy_uncovered_files,
+    tantivy_oversized_skipped,
     rollup_full_hours_rebuilt,
     rollup_incremental_hours_rebuilt,
     maintenance_tasks_pending,
