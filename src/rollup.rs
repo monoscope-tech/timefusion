@@ -1301,9 +1301,53 @@ fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>,
                 _ => return Err(MissReason::UnknownFilter),
             }
         }
+        // `date_trunc(unit, timestamp) = X` bounds the window exactly as
+        // `timestamp >= X AND timestamp < X + width(unit)` does. Left to fall
+        // through it becomes a residual row filter with no declared measure
+        // filter to match, and the whole query is refused — which is how
+        // monoscope's hourly overview stayed a raw scan of every project even
+        // after the cross-project fix landed.
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            let Some((width, start)) = [(&binary.left, &binary.right), (&binary.right, &binary.left)]
+                .into_iter()
+                .find_map(|(truncated, literal)| Some((date_trunc_width(truncated)?, timestamp_literal(literal)?)))
+            else {
+                return Ok(false);
+            };
+            // No timestamp truncates to an unaligned instant, so this is
+            // unsatisfiable rather than a window. Serving `[X, X+width)` for it
+            // would return an hour of rows where the answer is none.
+            if start.rem_euclid(width) != 0 {
+                return Err(MissReason::UnknownFilter);
+            }
+            let end = start.checked_add(width).ok_or(MissReason::UnboundedTime)?;
+            *lo = Some(lo.map_or(start, |current: i64| current.max(start)));
+            *hi = Some(hi.map_or(end, |current: i64| current.min(end)));
+        }
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+/// The fixed width in microseconds of `date_trunc(unit, timestamp)`, or `None`
+/// when the expression is not that.
+///
+/// Only epoch-aligned, constant-width units are listed. `month`/`quarter`/`year`
+/// are not a fixed number of microseconds, and `week` truncates to Monday while
+/// the epoch was a Thursday — so for all of them the alignment test the caller
+/// applies would be wrong, and no `[X, X+width)` rewrite is exact.
+fn date_trunc_width(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
+    let datafusion::logical_expr::Expr::ScalarFunction(function) = unaliased(expr) else { return None };
+    if !function.name().eq_ignore_ascii_case("date_trunc") || function.args.len() != 2 || column_name(&function.args[1]) != Some("timestamp") {
+        return None;
+    }
+    match string_literal(&function.args[0])?.to_ascii_lowercase().as_str() {
+        "second" | "seconds" => Some(1_000_000),
+        "minute" | "minutes" => Some(60_000_000),
+        "hour" | "hours" => Some(3_600_000_000),
+        "day" | "days" => Some(86_400_000_000),
+        _ => None,
+    }
 }
 
 /// The half-open `[lo, hi)` microsecond window `predicate` confines `timestamp`
@@ -1995,6 +2039,46 @@ mod tests {
         // generation for the day.
         assert!(generated.contains("(project_id = 'project' AND date = '1970-01-01'"), "generations must be qualified by project: {generated}");
         assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// `date_trunc(unit, timestamp) = X` is a WINDOW, not a dimension filter.
+    ///
+    /// Treated as a residual it has no declared measure filter to match, so the
+    /// whole query was refused as `filter_not_eligible`. Prod 2026-08-17 caught
+    /// this the moment the cross-project fix landed: monoscope's overview query
+    /// stopped saying `missing_project` at 23:23 and started saying
+    /// `filter_not_eligible` at 23:40 — same query, one step further along, still
+    /// a raw scan of every project.
+    #[tokio::test]
+    async fn a_date_trunc_equality_narrows_the_window_instead_of_being_promoted() {
+        let state = session().await;
+        // A day-wide window plus the hour the panel actually wants — the exact
+        // shape prod sends.
+        let hour = 3_600_000_000i64;
+        let sql = format!(
+            "SELECT project_id, COUNT(*) FROM {SOURCE} \
+             WHERE timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
+             AND date_trunc('hour', timestamp) = to_timestamp_micros({}) GROUP BY 1",
+            2 * hour
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        assert_eq!((route.lo, route.hi), (2 * hour, 3 * hour), "the window must narrow to the truncated hour");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// No timestamp truncates to an unaligned instant, so the predicate is
+    /// unsatisfiable rather than a window. Inventing `[X, X+width)` for it would
+    /// serve an hour of rows for a query that must return none.
+    #[tokio::test]
+    async fn a_date_trunc_equality_against_an_unaligned_literal_is_refused() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT project_id, COUNT(*) FROM {SOURCE} \
+             WHERE timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
+             AND date_trunc('hour', timestamp) = to_timestamp_micros(90061000000) GROUP BY 1"
+        );
+        let miss = route_for(&state, &sql).await.expect_err("an unaligned truncation must be refused");
+        assert!(matches!(miss, MissReason::UnknownFilter), "expected UnknownFilter, got {miss:?}");
     }
 
     /// Grouping by project_id is what makes the query answerable; merely
