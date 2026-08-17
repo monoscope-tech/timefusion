@@ -456,6 +456,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     ctx.register_udaf(AggregateUDF::from(HllAggUDF::default()));
     ctx.register_udaf(create_hll_merge_udaf());
     ctx.register_udf(create_hll_count_udf());
+    ctx.register_udf(hash_bucket_udf());
 
     // text_match(col, 'query') for tantivy-accelerated full-text search. Naive
     // substring fallback keeps correctness when tantivy is disabled or when
@@ -1513,6 +1514,114 @@ fn create_hll_count_udf() -> ScalarUDF {
         }) as ScalarFunctionImplementation,
     )
     .with_aliases(["distinct_count"])
+}
+
+/// `hash_bucket(text, n)` — a stable, evenly-spread bucket in `[0, n)`.
+///
+/// The sharded dedup rewrite used `substr(md5(…), 1, 2)` for this. A live CPU
+/// profile on 2026-08-18 put `md5::compress` at **5.71% of all CPU**, larger
+/// than the ZSTD decompression it exists to serve, because each of K passes
+/// hashes every row to keep 1/K of them. Bucketing needs an even, stable spread
+/// — not a cryptographic digest — so this uses the same non-cryptographic mixer
+/// the HLL sketches already hash with.
+///
+/// NULL hashes as the empty string rather than to NULL: a NULL bucket satisfies
+/// neither `>= lo` nor `< hi`, so such a row would silently fall out of every
+/// shard.
+pub fn hash_bucket_udf() -> ScalarUDF {
+    create_udf(
+        "hash_bucket",
+        vec![DataType::Utf8View, DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| {
+            let [value, buckets] = args else {
+                return Err(DataFusionError::Execution("hash_bucket requires exactly 2 arguments: value and bucket count".to_string()));
+            };
+            let buckets = match buckets {
+                ColumnarValue::Scalar(scalar) => i64::try_from(scalar.clone()).unwrap_or(0),
+                _ => return Err(DataFusionError::Execution("hash_bucket's bucket count must be a literal".to_string())),
+            };
+            let buckets = u64::try_from(buckets).ok().filter(|n| *n > 0).ok_or_else(|| {
+                // A zero count would divide by zero; a negative one is a caller bug.
+                DataFusionError::Execution("hash_bucket's bucket count must be positive".to_string())
+            })?;
+            let array = as_array(value)?;
+            let strings = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| DataFusionError::Execution(format!("hash_bucket expects a Utf8View value, got {}", array.data_type())))?;
+            let buckets: Int64Array =
+                strings.iter().map(|value| Some((crate::hll::hash_bytes(value.unwrap_or_default().as_bytes()) % buckets) as i64)).collect();
+            Ok(ColumnarValue::Array(Arc::new(buckets)))
+        }) as ScalarFunctionImplementation,
+    )
+}
+
+#[cfg(test)]
+mod hash_bucket_tests {
+    use datafusion::prelude::SessionContext;
+
+    /// Bucketing is only correct if it PARTITIONS: every row lands in exactly one
+    /// bucket of `[0, n)`, and equal keys always land together — that is what lets
+    /// the dedup rewrite process one shard at a time without splitting a key's
+    /// copies across passes.
+    #[tokio::test]
+    async fn hash_bucket_partitions_and_keeps_equal_keys_together() {
+        let ctx = SessionContext::new();
+        ctx.register_udf(super::hash_bucket_udf());
+        let one = |sql: &str| {
+            let ctx = ctx.clone();
+            let sql = sql.to_string();
+            async move {
+                let batches = ctx.sql(&sql).await.expect("plan").collect().await.expect("run");
+                datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string()
+            }
+        };
+        // In range, and the same input always gives the same bucket.
+        let rendered = one("SELECT hash_bucket(arrow_cast(v, 'Utf8View'), 256) AS b FROM (VALUES ('a'), ('a'), ('b')) AS t(v)").await;
+        let buckets: Vec<i64> = rendered.lines().filter_map(|line| line.trim_matches(|c: char| c == '|' || c.is_whitespace()).parse::<i64>().ok()).collect();
+        assert_eq!(buckets.len(), 3, "three rows: {rendered}");
+        assert!(buckets.iter().all(|b| (0..256).contains(b)), "every bucket in range: {buckets:?}");
+        assert_eq!(buckets[0], buckets[1], "equal keys must share a bucket");
+        // NULL must not vanish: it buckets as the empty string, not as NULL.
+        let rendered = one("SELECT hash_bucket(arrow_cast(NULL, 'Utf8View'), 256) AS b").await;
+        assert!(!rendered.contains("NULL"), "NULL must bucket, not propagate: {rendered}");
+    }
+
+    /// A row that hashes outside every shard's range is a row the rewrite never
+    /// reads and never rewrites — silent data loss that the conservation checks
+    /// would only catch after the work was done. Spread matters too: a skewed
+    /// bucketing makes one shard carry the memory the split existed to avoid.
+    #[tokio::test]
+    async fn hash_bucket_spreads_evenly_enough_to_shard_on() {
+        let ctx = SessionContext::new();
+        ctx.register_udf(super::hash_bucket_udf());
+        let batches = ctx
+            .sql(
+                "SELECT count(*) AS n, count(DISTINCT hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS distinct_buckets, \
+                 min(hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS lo, max(hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS hi \
+                 FROM (SELECT CAST(i AS VARCHAR) AS v FROM generate_series(1, 5000) AS t(i))",
+            )
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("run");
+        let rendered = datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+        // The one data row renders as `| n | distinct | lo | hi |`; every other
+        // line is a border or the header.
+        let row = rendered
+            .lines()
+            .find_map(|line| {
+                let cells: Vec<i64> = line.split('|').filter_map(|cell| cell.trim().parse::<i64>().ok()).collect();
+                (cells.len() == 4).then_some(cells)
+            })
+            .unwrap_or_else(|| panic!("one four-column data row: {rendered}"));
+        assert_eq!(row[0], 5000, "all rows counted: {rendered}");
+        assert_eq!(row[1], 256, "5000 keys must reach every one of 256 buckets: {rendered}");
+        assert!((0..256).contains(&row[2]) && (0..256).contains(&row[3]), "bounds inside [0, 256): {rendered}");
+    }
 }
 
 #[cfg(test)]
