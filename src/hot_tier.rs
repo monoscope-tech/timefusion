@@ -361,6 +361,23 @@ fn drop_unless(files: &mut BTreeMap<(i64, u64), HotBucketMeta>, keep: impl Fn(&H
     dropped
 }
 
+/// [`drop_unless`], widened so a bucket is always dropped whole.
+///
+/// The files of a twice-drained bucket are only JOINTLY authoritative for its
+/// span, which `plan_leg` enforces by refusing the claim whenever a bucket has
+/// more than one file. Deleting one of them from the index defeats that gate:
+/// the survivor then looks like a single-file bucket and reclaims the whole
+/// span, so its deleted sibling's rows are missing from the hot leg *and*
+/// excluded from the Delta leg that still holds them — a query that silently
+/// under-reports.
+///
+/// Over-deleting is safe in a way under-deleting is not: an extra dropped file
+/// costs one fall-through to Delta, which is always correct.
+fn drop_unless_bucket_atomic(files: &mut BTreeMap<(i64, u64), HotBucketMeta>, keep: impl Fn(&HotBucketMeta) -> bool) -> Vec<HotBucketMeta> {
+    let doomed: std::collections::HashSet<i64> = files.values().filter(|m| !keep(m)).map(|m| m.bucket_id).collect();
+    drop_unless(files, |m| !doomed.contains(&m.bucket_id))
+}
+
 fn parse_meta(path: PathBuf, bytes: u64) -> Option<HotBucketMeta> {
     if path.extension()?.to_str()? != EXT {
         return None;
@@ -760,7 +777,7 @@ impl HotTier {
         let key = table_key(project_id, table_name);
         let paths = {
             let Some(mut entry) = self.index.get_mut(&key) else { return };
-            drop_unless(entry.value_mut(), |m| !overlaps(m.range(), (lo, hi))).into_iter().map(|m| m.path).collect()
+            drop_unless_bucket_atomic(entry.value_mut(), |m| !overlaps(m.range(), (lo, hi))).into_iter().map(|m| m.path).collect()
         };
         self.index.remove_if(&key, |_, v| v.is_empty());
         self.drop_files(&key, paths);
@@ -867,7 +884,7 @@ impl HotTier {
         // Collect under the shard guards but unlink AFTER dropping them — N
         // unlink syscalls inside a write guard block every concurrent query's
         // range lookup for the duration.
-        let dropped: Vec<HotBucketMeta> = self.index.iter_mut().flat_map(|mut e| drop_unless(e.value_mut(), |m| m.end_ts > cutoff)).collect();
+        let dropped: Vec<HotBucketMeta> = self.index.iter_mut().flat_map(|mut e| drop_unless_bucket_atomic(e.value_mut(), |m| m.end_ts > cutoff)).collect();
         self.index.retain(|_, v| !v.is_empty());
         if !dropped.is_empty() {
             let freed: u64 = dropped.iter().map(|m| m.bytes).sum();
@@ -1242,6 +1259,40 @@ mod tests {
         let p = plan_leg(&split, &[(12, 14)], true, true, &|_| true);
         assert_eq!(p.served, vec![0], "the mem-owned half is skipped");
         assert!(p.ranges.is_empty(), "the survivor must NOT claim the bucket's span — it holds half of it");
+    }
+
+    /// Deleting ONE file of a twice-demoted bucket must not restore the
+    /// survivor's claim over the span they only jointly covered.
+    ///
+    /// `plan_leg` withholds the claim while both halves are present
+    /// (`files_per_bucket == 1` is the gate), but GC and ranged invalidation
+    /// delete files from the INDEX — so the survivor is left looking like a
+    /// single-file bucket and reclaims the whole span. Its deleted sibling's
+    /// rows are then absent from the hot leg AND excluded from the Delta leg
+    /// that still holds them, so a query silently under-reports.
+    ///
+    /// Deletion is therefore bucket-atomic: dropping any file of a bucket drops
+    /// the bucket. Over-deleting only costs a fall-through to Delta, which is
+    /// always correct; under-deleting loses rows.
+    #[tokio::test]
+    async fn deleting_one_half_of_a_bucket_must_not_restore_the_others_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        // One bucket, drained twice, with OVERLAPPING spans — late rows landing
+        // inside a window an earlier drain already reported on.
+        tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(8)], min_ts: 0, max_ts: 20, covers_window: true });
+        tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(8)], min_ts: 10, max_ts: 30, covers_window: true });
+        let metas = tier.buckets_in_range("p1", "t", None);
+        assert_eq!(metas.len(), 2, "the bucket must hold both drains");
+        assert!(plan_leg(&metas, &[], false, false, &footer_is_readable).ranges.is_empty(), "neither half may claim the span while both are present");
+
+        // Invalidate a window that touches only the FIRST drain.
+        tier.invalidate_range("p1", "t", 0, 5);
+        let after = tier.buckets_in_range("p1", "t", None);
+        assert!(
+            plan_leg(&after, &[], false, false, &footer_is_readable).ranges.is_empty(),
+            "after one half is deleted the survivor must still claim nothing; it holds only part of the span, and the rest now lives only in Delta"
+        );
     }
 
     /// The claims `plan_leg` makes from metadata are the ones the leg actually
