@@ -3762,7 +3762,13 @@ impl Database {
                             let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             let discarded = journal.migrate_bootstrap_backlog();
                             let migrated = journal.migrate_derived_slices();
-                            if discarded.is_some_and(|count| count != 0) {
+                            // One-shot: collapse the fine-grained sealed backfill
+                            // so the coarse planner can re-derive it day-sized.
+                            let coarsened = journal.migrate_fine_grained_backfill(crate::clock::now_micros()).unwrap_or_default();
+                            if coarsened != 0 {
+                                info!(coarsened, event = "maintenance_coarse_backfill_migrated");
+                            }
+                            if discarded.is_some_and(|count| count != 0) || coarsened != 0 {
                                 journal.compact()?;
                             } else if discarded.is_some() || migrated != 0 {
                                 journal.checkpoint()?;
