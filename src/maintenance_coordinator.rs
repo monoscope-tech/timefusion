@@ -2022,9 +2022,7 @@ mod tests {
             "dedup: Not enough memory to continue external sort. Consider increasing the memory limit config: \
              'datafusion.runtime.memory_limit', or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'."
         ));
-        assert!(is_capacity_failure(
-            "compaction: Resources exhausted: Additional allocation failed for ExternalSorter[1] with top memory consumers"
-        ));
+        assert!(is_capacity_failure("compaction: Resources exhausted: Additional allocation failed for ExternalSorter[1] with top memory consumers"));
         for benign in ["dedup: Object at location ... not found", "compaction: transaction failed: version 2667 already exists", "source_not_flushed"] {
             assert!(!is_capacity_failure(benign), "must not shrink a slice over a fault that has nothing to do with size: {benign}");
         }
