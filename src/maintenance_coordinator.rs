@@ -608,8 +608,8 @@ impl TaskJournal {
         // budget cut to pay for it (the documented 2026-07-04 pairing), not just
         // a bigger share.
         let sealed_turn = self.claim_tick.is_multiple_of(2);
-        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64)> {
-            let mut class: Option<(u8, i64)> = None;
+        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64, i64)> {
+            let mut class: Option<(u8, i64, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| {
                 task.key.operation == operation
                     && matches!(task.state, TaskState::Pending | TaskState::Retry)
@@ -959,11 +959,11 @@ impl TaskJournal {
 /// Deadline ordering with round-robin selection among projects at the same
 /// operation priority. This prevents one whale from consuming an entire pass.
 pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> Vec<&'a MaintenanceTask> {
-    let mut groups: BTreeMap<(u8, u8, i64), HashMap<&str, VecDeque<&MaintenanceTask>>> = BTreeMap::new();
+    let mut groups: BTreeMap<(u8, u8, i64, i64), HashMap<&str, VecDeque<&MaintenanceTask>>> = BTreeMap::new();
     for task in tasks {
         if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
-            let (class, order_key) = scheduling_class(task, now_micros);
-            groups.entry((class, task.key.operation.priority(), order_key)).or_default().entry(&task.key.project_id).or_default().push_back(task);
+            let (class, width_key, order_key) = scheduling_class(task, now_micros);
+            groups.entry((class, task.key.operation.priority(), width_key, order_key)).or_default().entry(&task.key.project_id).or_default().push_back(task);
         }
     }
     let mut ready = Vec::new();
@@ -995,11 +995,12 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// This is intentionally based on event time, not mutation deadline. A late
 /// correction to old data is a bounded historical hole; treating its recent
 /// mutation as live-tail work would let backfill displace current coverage.
-fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
+fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64, i64) {
     if is_live_frontier(task.key.slice, now_micros) {
         // Smaller tuples run first. Negating makes the newest minute the most
         // urgent while keeping all projects in that minute deadline-equivalent.
-        (0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        // Width is not a frontier concern — these are all one slice wide.
+        (0, 0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     } else {
         // Newest slice first here too, for the same reason the dedup drain and
         // the rollup backfill are newest-first: recent days are what dashboards
@@ -1016,7 +1017,20 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
         // Eligibility is still deadline-gated in `claim_next`
         // (`deadline_micros <= now`), so retry backoff is unaffected; this only
         // orders the tasks that are already runnable.
-        (1, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        //
+        // WIDTH outranks recency, though. A day-sized unit comes from the
+        // backfill planner and is the only kind that advances the horizon; a
+        // ten-minute unit is what the live path mints, and a day that has just
+        // sealed carries ~144 of them per project per tier. Newest-first alone
+        // therefore spends every sealed claim on yesterday's leftovers before
+        // reaching the day before it — and midnight mints another day's worth,
+        // so the horizon never moves. Prod 2026-08-17, 65 rollup starts in 25
+        // minutes: 46 on today, 18 on yesterday, ZERO older, while 7d/14d
+        // queries were refused for want of exactly those older days.
+        //
+        // Newest-first still breaks ties, so among backfill units recent
+        // history is still built first.
+        (1, -task.key.slice.width(), -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     }
 }
 
@@ -1770,6 +1784,47 @@ mod tests {
         assert_eq!(claimed.state, TaskState::Running);
         assert_eq!(claimed.attempts, 1);
         assert!(journal.claim_next(Operation::Dedup, 0).is_none());
+    }
+
+    /// Among sealed work, a day-sized unit outranks yesterday's ten-minute
+    /// leftovers even though those are newer.
+    ///
+    /// Day-sized units come from the backfill planner and are the only kind
+    /// that advances the rollup horizon. Ten-minute units are what the live
+    /// path mints, and a day that has just sealed carries ~144 of them per
+    /// project per tier. Ordering sealed work newest-first alone therefore
+    /// grinds all of yesterday before reaching the day before — and midnight
+    /// mints a fresh day's worth, so the horizon can never move.
+    ///
+    /// Prod 2026-08-17, 65 rollup starts in 25 minutes: 46 on today, 18 on
+    /// yesterday, ZERO on any older day, while 7d/14d queries were refused for
+    /// want of exactly those older days.
+    #[test]
+    fn sealed_backfill_units_outrank_yesterdays_fine_slices() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // "Now" well past both, so everything is sealed rather than frontier.
+        let now = 10 * DAY_MICROS;
+
+        // Yesterday's fine-grained leftovers: newer, and far more numerous.
+        for slot in 0..12 {
+            let start = 8 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            let fine = task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup);
+            journal.enqueue(fine.key.clone(), 0, 0, 0);
+        }
+        // An older day, queued whole by the backfill planner.
+        let coarse = task("p", 3 * DAY_MICROS, 4 * DAY_MICROS, Operation::BaseRollup);
+        journal.enqueue(coarse.key.clone(), 0, 0, 0);
+
+        let claimed = journal.claim_next(Operation::BaseRollup, now).expect("a sealed task is claimable");
+        assert_eq!(
+            claimed.key.slice.width(),
+            DAY_MICROS,
+            "the horizon-advancing day unit must be claimed before yesterday's ten-minute slices; got a {}s slice starting {}",
+            claimed.key.slice.width() / 1_000_000,
+            claimed.key.slice.start_micros / DAY_MICROS
+        );
     }
 
     /// A unit that cannot finish inside its deadline must get SMALLER, not be

@@ -5795,10 +5795,16 @@ impl Database {
         self.light_optimize_pool_bytes() - self.pack_pool_bytes()
     }
 
-    /// Heavy maintenance (dedup, recompress, Z-order): the budget left after
-    /// the light-optimize slice.
+    /// Heavy maintenance (dedup, recompress, Z-order).
+    ///
+    /// Deferred to the budget tree rather than derived as "the pool minus
+    /// light". That residual form silently ABSORBED any share the tree carved
+    /// off for someone else: adding the coordinator's slice left heavy holding
+    /// it too, so coordinator + heavy + light came to 24 GiB of a 16 GiB pool.
+    /// A residual definition cannot stay correct across a change to the tree,
+    /// which is the same lesson `light_optimize_pool_bytes` already records.
     fn heavy_pool_bytes(&self) -> usize {
-        self.config.derived.maintenance_pool_bytes() - self.light_optimize_pool_bytes()
+        self.config.derived.heavy_share_bytes()
     }
 
     fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
@@ -22408,10 +22414,18 @@ mod tests {
         let db = Database::with_config(create_test_config("pool-split")).await?;
         assert_eq!(db.pack_pool_bytes() + db.repair_pool_bytes(), db.light_optimize_pool_bytes(), "the split must not grow the maintenance budget");
         assert!(db.pack_pool_bytes() > 0 && db.repair_pool_bytes() > 0, "neither pass may be sized to zero");
-        // The light and heavy pools must TILE the maintenance budget. They had
-        // independent definitions that agreed only while HEAVY_MIN_SHARE was
-        // 0.25, so moving that share silently desynced pools from `light_optimize_k`.
-        assert_eq!(db.light_optimize_pool_bytes() + db.heavy_pool_bytes(), db.config.derived.maintenance_pool_bytes(), "light + heavy must tile the pool");
+        // The coordinator, light and heavy pools must TILE the maintenance
+        // budget. They had independent definitions that agreed only while
+        // HEAVY_MIN_SHARE was 0.25, so moving that share silently desynced
+        // pools from `light_optimize_k`. Heavy was later still derived as "pool
+        // minus light", which ABSORBED the coordinator's new share instead of
+        // shrinking for it — 24 GiB of pools against a 16 GiB budget, the exact
+        // over-commit shape that OOM-killed prod on 2026-08-17.
+        assert_eq!(
+            db.config.derived.coordinator_share_bytes() + db.light_optimize_pool_bytes() + db.heavy_pool_bytes(),
+            db.config.derived.maintenance_pool_bytes(),
+            "coordinator + light + heavy must tile the pool, never over-commit it"
+        );
         assert_eq!(db.heavy_pool_bytes(), db.config.derived.heavy_share_bytes(), "the heavy pool must be the budget tree's heavy share, not a second opinion");
         assert!(!Arc::ptr_eq(&db.light_optimize_runtime_env(), &db.repair_runtime_env()), "sharing one RuntimeEnv is sharing one pool");
 
