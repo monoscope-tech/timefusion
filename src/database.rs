@@ -2420,6 +2420,9 @@ pub struct Database {
     maintenance_tasks: Arc<std::sync::Mutex<crate::maintenance_coordinator::TaskJournal>>,
     maintenance_admission: crate::maintenance_coordinator::AdmissionController,
     maintenance_debt_planned_at: Arc<std::sync::atomic::AtomicI64>,
+    /// Last Tantivy coverage census. Metadata-only, so it is throttled by time
+    /// rather than by admission.
+    tantivy_census_at: Arc<std::sync::atomic::AtomicI64>,
     maintenance_schedule_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Bounded exponential retry state for failed source-partition rollup builds.
     rollup_backoff: Arc<dashmap::DashMap<RollupCoverageKey, (u32, std::time::Instant)>>,
@@ -3108,6 +3111,7 @@ impl Database {
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
             maintenance_admission,
             maintenance_debt_planned_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
+            tantivy_census_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             maintenance_schedule_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rollup_backoff: Arc::new(dashmap::DashMap::new()),
             logical_count_cache,
@@ -3339,6 +3343,65 @@ impl Database {
         }
         let built = self.backfill_table_indexes(&svc, table_name).await?;
         Ok((built, removed, blobs))
+    }
+
+    /// Count live parquet the Tantivy manifest does not cover, without building
+    /// anything.
+    ///
+    /// `backfill_table_indexes` already publishes these gauges, but it only runs
+    /// from the daily reconcile cron — so after a deploy the reindex has no
+    /// reported remaining-work figure for up to 24 hours, which is exactly the
+    /// blind spot that had the reindex being chased by hand from sibling
+    /// containers. This is the same diff, metadata-only: the Delta log names the
+    /// live files and the manifest names the covered ones. No parquet is read
+    /// and no index is built, so it is safe to run far more often than a pass.
+    pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64)> {
+        use crate::tantivy_index::{manifest, service::project_id_of_uri};
+        let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0)) };
+        let (mut uncovered, mut oversized) = (0u64, 0u64);
+        for table_name in svc.config.indexed_tables() {
+            if !svc.config.is_table_indexed(&table_name) {
+                continue;
+            }
+            let mut roots: Vec<String> = vec!["default".into()];
+            roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| *t == table_name).map(|(p, _)| p.clone()));
+            for root in roots {
+                let Ok(table_ref) = self.resolve_table(&root, &table_name).await else { continue };
+                let (uris, sizes) = {
+                    let t = table_ref.read().await;
+                    let sizes: HashMap<String, u64> = match t.snapshot() {
+                        Ok(snapshot) => snapshot.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect(),
+                        Err(_) => HashMap::new(),
+                    };
+                    (t.get_file_uris()?.collect::<Vec<String>>(), sizes)
+                };
+                let mut by_pid: HashMap<String, Vec<String>> = HashMap::new();
+                for uri in uris.into_iter().filter(|uri| uri.ends_with(".parquet")) {
+                    if let Some(pid) = project_id_of_uri(&uri) {
+                        by_pid.entry(pid.to_string()).or_default().push(uri);
+                    }
+                }
+                let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
+                for (pid, mut uris) in by_pid {
+                    let manifest = manifest::load(svc.object_store.as_ref(), &table_name, &pid).await?;
+                    let covered: std::collections::HashSet<&String> =
+                        manifest.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
+                    uris.retain(|uri| !covered.contains(uri));
+                    if max_bytes > 0 {
+                        let before = uris.len();
+                        uris.retain(|uri| {
+                            crate::tantivy_index::service::parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_none_or(|size| *size <= max_bytes)
+                        });
+                        oversized = oversized.saturating_add((before - uris.len()) as u64);
+                    }
+                    uncovered = uncovered.saturating_add(uris.len() as u64);
+                }
+            }
+        }
+        let stats = crate::metrics::maintenance_stats();
+        stats.tantivy_uncovered_files.store(uncovered, std::sync::atomic::Ordering::Relaxed);
+        stats.tantivy_oversized_skipped.store(oversized, std::sync::atomic::Ordering::Relaxed);
+        Ok((uncovered, oversized))
     }
 
     async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy_index::service::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
@@ -9995,6 +10058,20 @@ impl Database {
             let backfilled = self.plan_rollup_backfill().await?;
             if backfilled != 0 {
                 info!(backfilled, event = "maintenance_rollup_backfill_planned");
+            }
+        }
+        // Tantivy coverage census: metadata-only, so it is throttled by wall
+        // clock rather than admission. Every 15 minutes keeps
+        // `tantivy_uncovered_files` meaningful between daily reconcile passes —
+        // without it the reindex reports nothing for up to 24h after a deploy.
+        const TANTIVY_CENSUS_INTERVAL_MICROS: i64 = 15 * 60 * 1_000_000;
+        let census_last = self.tantivy_census_at.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(census_last) >= TANTIVY_CENSUS_INTERVAL_MICROS
+            && self.tantivy_census_at.compare_exchange(census_last, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
+        {
+            match self.tantivy_coverage_census().await {
+                Ok((uncovered, oversized)) => info!(uncovered, oversized, event = "tantivy_coverage_census"),
+                Err(error) => warn!(%error, event = "tantivy_coverage_census_failed"),
             }
         }
         // Interleave dependent publication with dedup instead of draining the
