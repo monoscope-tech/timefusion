@@ -223,9 +223,7 @@ impl Drop for TaskLease {
     fn drop(&mut self) {
         let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if journal.state(&self.key) == Some(TaskState::Running) {
-            let attempts = journal.task_indices.get(&self.key).and_then(|index| journal.snapshot.tasks.get(*index)).map_or(1, |task| task.attempts).min(8);
-            let delay_micros = i64::try_from((1u64 << attempts).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
-            journal.retry(&self.key, "worker_error".to_owned(), crate::clock::now_micros().saturating_add(delay_micros));
+            journal.abandon_running(&self.key, crate::clock::now_micros());
             if let Err(error) = journal.checkpoint() {
                 tracing::error!(error = %error, task = ?self.key, "failed to checkpoint maintenance task lease recovery");
             }
@@ -729,6 +727,32 @@ impl TaskJournal {
     /// parent remains as a completed audit record. Hash shards intentionally
     /// stay inside a one-minute task because `TaskKey` identifies logical
     /// slice work; the worker merges all shard states before publication.
+    /// A worker gave the task back without finishing it — an error, or a
+    /// deadline it could not meet.
+    ///
+    /// Once is a blip: back off and retry it whole. Twice says the slice itself
+    /// does not fit its deadline, and requeueing it unchanged is an infinite
+    /// loop that holds a worker for the full deadline every pass and never
+    /// produces anything — the failure this codebase has hit repeatedly, most
+    /// recently as five Dedup timeouts in twelve minutes permanently occupying
+    /// ~2 of 16 workers while the rollup horizon they starved sat days behind.
+    /// So bisect instead, and let the halves face the same test.
+    ///
+    /// Byte-based splitting does not cover this. It fires on decoded bytes,
+    /// while what overran was WALL TIME — a day-sized slice with modest bytes
+    /// still pays an object-store round trip per file.
+    pub fn abandon_running(&mut self, key: &TaskKey, now_micros: i64) {
+        let attempts = self.task_indices.get(key).and_then(|index| self.snapshot.tasks.get(*index)).map_or(1, |task| task.attempts);
+        // `MAX_DECODED_BYTES + 1` is the smallest input that makes
+        // `byte_bounded_units` bisect: it asks for one split, not a full
+        // recursive shred down to the minimum slice.
+        if attempts >= 2 && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1)) {
+            return;
+        }
+        let delay_micros = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+        self.retry(key, "worker_error".to_owned(), now_micros.saturating_add(delay_micros));
+    }
+
     pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64) -> bool {
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let parent = self.snapshot.tasks[index].clone();
@@ -1746,6 +1770,39 @@ mod tests {
         assert_eq!(claimed.state, TaskState::Running);
         assert_eq!(claimed.attempts, 1);
         assert!(journal.claim_next(Operation::Dedup, 0).is_none());
+    }
+
+    /// A unit that cannot finish inside its deadline must get SMALLER, not be
+    /// requeued unchanged.
+    ///
+    /// The lease requeues whatever the worker abandoned, so a slice too big for
+    /// its deadline times out, requeues identical, times out again — forever,
+    /// holding a worker for the full deadline each time and never producing
+    /// anything. Prod 2026-08-17: five Dedup timeouts in twelve minutes at 300s
+    /// apiece, permanently occupying ~2 of 16 coordinator workers, while total
+    /// task starts fell to 2.2/min and the rollup horizon it was starving sat
+    /// days behind. Byte-based splitting cannot catch this — a day-sized slice
+    /// with modest bytes still pays one object-store round trip per file.
+    #[test]
+    fn a_unit_that_keeps_timing_out_bisects_instead_of_retrying_forever() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let input = task("whale", 0, DAY_MICROS, Operation::Dedup);
+        let key = input.key.clone();
+        journal.enqueue(key.clone(), 0, 0, 0);
+
+        // Two abandoned runs: the first is an ordinary blip and must simply
+        // retry, the second says the slice itself does not fit.
+        for _ in 0..2 {
+            assert!(journal.mark_running(&key));
+            journal.abandon_running(&key, 0);
+        }
+
+        let widths: Vec<i64> = journal.tasks().filter(|t| t.state != TaskState::Superseded).map(|t| t.key.slice.width()).collect();
+        assert!(!widths.is_empty(), "bisection must leave claimable children behind");
+        assert!(widths.iter().all(|width| *width < DAY_MICROS), "a repeatedly-abandoned day must bisect; got widths {widths:?} still at the full day");
+        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "the parent stays as an audit record");
     }
 
     #[test]
