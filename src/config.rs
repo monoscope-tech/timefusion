@@ -2388,7 +2388,7 @@ pub struct MaintenanceConfig {
     #[serde(default = "d_true")]
     pub timefusion_count_pushdown: bool,
     /// Per-shard COMPRESSED-bytes target for a dedup chunk rewrite (`sum(add.size)`).
-    /// The rewrite is split into `ceil(compressed_bytes / this)` md5-bucketed passes
+    /// The rewrite is split into `ceil(compressed_bytes / this)` hash-bucketed passes
     /// so each pass reads ~this much. 0 disables this ceiling's contribution to the
     /// shard count. See `d_dedup_max_rewrite_bytes`.
     #[serde(default = "d_dedup_max_rewrite_bytes")]
@@ -2398,7 +2398,7 @@ pub struct MaintenanceConfig {
     /// Variant/JSON columns, and the `SELECT * … collect()` Arrow buffers are NOT
     /// accounted by DataFusion's memory pool — so a compressed-under-budget chunk
     /// once decoded to tens of GB and OOM-killed the process (prod 2026-07-04, 89GB
-    /// cgroup kill). The rewrite now SHARDS by an md5 hash of the dedup keys into
+    /// cgroup kill). The rewrite now SHARDS by a hash of the dedup keys into
     /// `ceil(est_decoded / this)` passes so each pass materializes ~this much; a
     /// single key group that alone exceeds this is unshardable and skipped (read-side
     /// dedup keeps queries correct). 0 → one shard for this ceiling. See

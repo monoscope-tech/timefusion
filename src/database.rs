@@ -893,7 +893,17 @@ fn build_optimize_session_state_tuned(
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
     // OOM-killing the process, but are isolated from query pressure and can spill.
-    SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build()
+    let mut state = SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build();
+    // `hash_bucket` is ours, not a DataFusion builtin, and the sharded dedup
+    // rewrite and the maintenance slice builder both put it in generated SQL.
+    // These states are built bare — no `register_custom_functions` — so without
+    // this every sharded rewrite fails to PLAN. That is exactly what happened
+    // when the bucketing moved off `md5` (a builtin, so it had worked in every
+    // context): `dedup_shards_over_budget_and_preserves_rows` failed with
+    // "Invalid function 'hash_bucket'". Registered on the one builder every
+    // maintenance context goes through rather than at each call site.
+    datafusion::execution::FunctionRegistry::register_udf(&mut state, Arc::new(crate::functions::hash_bucket_udf())).ok();
+    state
 }
 
 /// Days of rollup coverage counting back from yesterday with NO hole, minimised
@@ -8642,11 +8652,11 @@ impl Database {
                     filter.clone()
                 } else {
                     let keys_varchar = schema.dedup_keys.iter().map(|key| format!("CAST(\"{key}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
-                    let bucket_expr = format!("substr(md5(concat_ws(chr(31), {keys_varchar})), 1, 2)");
+                    let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
                     let lo = u64::try_from(shard).unwrap_or(u64::MAX).saturating_mul(DEDUP_BUCKET_COUNT) / u64::try_from(probe_shards).unwrap_or(1);
                     let hi = u64::try_from(shard + 1).unwrap_or(u64::MAX).saturating_mul(DEDUP_BUCKET_COUNT) / u64::try_from(probe_shards).unwrap_or(1);
-                    let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < '{hi:02x}'") } else { String::new() };
-                    format!("{filter} AND {bucket_expr} >= '{lo:02x}'{upper}")
+                    let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < {hi}") } else { String::new() };
+                    format!("{filter} AND {bucket_expr} >= {lo}{upper}")
                 };
                 duplicate_starts.extend(Self::dup_bin_starts(&ctx, &shard_filter, &keys_csv).await?);
             }
@@ -8868,9 +8878,10 @@ impl Database {
             // 3. Decide the shard count. A dedup `SELECT * … collect()` decodes to
             // Arrow at 5-20× compressed OUTSIDE the memory pool, so an over-budget
             // chunk used to be skipped (dupe left forever). Instead we split the
-            // rewrite into K passes bucketed by an md5 hash of the dedup keys — every
-            // copy of a key hashes to one bucket (never split), and md5 (not `key % K`,
-            // which collides for ms-aligned values) spreads evenly and is NULL-safe.
+            // rewrite into K passes bucketed by a hash of the dedup keys — every
+            // copy of a key hashes to one bucket (never split), and hashing (not
+            // `key % K`, which collides for ms-aligned values) spreads evenly and is
+            // NULL-safe.
             // K = ceil(estimated decoded bytes / budget); the estimate is the
             // row-count-vs-inflation MAX ×2 documented on the config fields.
             let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
@@ -8932,11 +8943,16 @@ impl Database {
                 );
             }
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
-            // Bucket = first byte of md5 over the dedup keys (2 hex chars =
-            // DEDUP_BUCKET_COUNT buckets, evenly spread); chr(31) separates keys so
-            // distinct tuples can't collide. Also the GROUP BY for the skew probe below.
+            // Bucket = `hash_bucket` over the dedup keys, in `[0, DEDUP_BUCKET_COUNT)`
+            // and evenly spread; chr(31) separates keys so distinct tuples can't
+            // collide. Also the GROUP BY for the skew probe below.
+            //
+            // This was `substr(md5(…), 1, 2)` until 2026-08-18, when a live CPU
+            // profile put `md5::compress` at 5.71% of all CPU — larger than the ZSTD
+            // decompression it serves, because each of K passes hashes every row to
+            // keep 1/K of them.
             let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
-            let bucket_expr = format!("substr(md5(concat_ws(chr(31), {keys_varchar})), 1, 2)");
+            let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
             // Independent narrow oracle for the staged output count. The
             // Arrow rewrite below chooses the greatest tiebreak per key, but it
             // must still emit exactly one row per distinct key (tombstones are
@@ -9021,8 +9037,8 @@ impl Database {
                                 // Contiguous bucket range per shard (even ±1); string compare of
                                 // zero-padded lowercase hex == numeric order.
                                 let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
-                                let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < '{hi:02x}'") } else { String::new() };
-                                format!(" AND {bucket_expr} >= '{lo:02x}'{upper}")
+                                let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < {hi}") } else { String::new() };
+                                format!(" AND {bucket_expr} >= {lo}{upper}")
                             } else {
                                 String::new()
                             };
@@ -10072,7 +10088,11 @@ impl Database {
                 std::iter::once("project_id".to_owned()).chain(std::iter::once("timestamp".to_owned())).chain(spec.dimensions.iter().cloned()).collect();
         }
         let shard_key_sql = shard_keys.iter().map(|field| format!("CAST(\"{}\" AS VARCHAR)", field.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
-        let shard_hash = format!("substr(md5(concat_ws(chr(31), {shard_key_sql})), 1, 4)");
+        // Same reasoning as the dedup rewrite's bucketing: an even, stable spread
+        // is all this needs, and a cryptographic digest evaluated per row is not
+        // free — see `hash_bucket`.
+        const MAINTENANCE_SLICE_BUCKETS: u64 = 65_536;
+        let shard_hash = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {shard_key_sql}), 'Utf8View'), {MAINTENANCE_SLICE_BUCKETS})");
         let mut shard_states = Vec::new();
         let mut aggregate = Vec::new();
         for shard in 0..hash_shards {
@@ -10080,10 +10100,10 @@ impl Database {
             let shard_predicate = if hash_shards == 1 {
                 String::new()
             } else {
-                let lo = shard * 65_536 / hash_shards;
-                let hi = (shard + 1) * 65_536 / hash_shards;
-                let upper = if hi < 65_536 { format!(" AND {shard_hash} < '{hi:04x}'") } else { String::new() };
-                format!(" AND {shard_hash} >= '{lo:04x}'{upper}")
+                let lo = shard * MAINTENANCE_SLICE_BUCKETS / hash_shards;
+                let hi = (shard + 1) * MAINTENANCE_SLICE_BUCKETS / hash_shards;
+                let upper = if hi < MAINTENANCE_SLICE_BUCKETS { format!(" AND {shard_hash} < {hi}") } else { String::new() };
+                format!(" AND {shard_hash} >= {lo}{upper}")
             };
             let input_sql = if derived || source_schema.dedup_keys.is_empty() {
                 format!(
@@ -15090,8 +15110,8 @@ fn build_query_runtime_env(
 ///
 /// Footer honesty is tied to the returned bool — never assumed. A single batch
 /// skips the concat copy; an already-ordered batch skips the `take` copy.
-/// Number of md5-prefix buckets the sharded dedup rewrite hashes into — the first
-/// digest byte, i.e. 2 hex chars. Shard count is clamped to this: shards partition
+/// Number of buckets the sharded dedup rewrite hashes into (`hash_bucket`).
+/// Shard count is clamped to this: shards partition
 /// `[0, DEDUP_BUCKET_COUNT)` into contiguous ranges, so more shards than buckets
 /// would leave rows uncovered. Doubles as a runaway-shard-count backstop.
 const DEDUP_BUCKET_COUNT: u64 = 256;
