@@ -200,6 +200,9 @@ pub struct TaskJournal {
     dirty_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
     fair_cursors: HashMap<Operation, String>,
+    /// Rotates so a fixed share of claims is reserved for sealed work. Runtime
+    /// only — never journalled; losing it across a restart costs nothing.
+    claim_tick: u64,
 }
 
 /// Ensures a claimed task cannot remain stuck in `Running` when its worker
@@ -284,7 +287,16 @@ impl TaskJournal {
                 }
             }
         }
-        Ok(Self { path, wal_path, snapshot, task_indices, dirty_tasks: HashSet::new(), dirty_cursors: HashSet::new(), fair_cursors: HashMap::new() })
+        Ok(Self {
+            path,
+            wal_path,
+            snapshot,
+            task_indices,
+            dirty_tasks: HashSet::new(),
+            dirty_cursors: HashSet::new(),
+            fair_cursors: HashMap::new(),
+            claim_tick: 0,
+        })
     }
 
     /// Early coordinator builds journaled the one-hour tier in ten-minute
@@ -506,18 +518,34 @@ impl TaskJournal {
         // `dependencies_complete` is itself a scan, so it is evaluated ONLY when
         // a task would actually improve the current best — otherwise this would
         // be quadratic for `DerivedRollup`.
-        let mut class: Option<(u8, i64)> = None;
-        for task in
-            self.snapshot.tasks.iter().filter(|task| {
-                task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros
-            })
-        {
-            let candidate = scheduling_class(task, now_micros);
-            if class.is_none_or(|best| candidate < best) && self.dependencies_complete(task) {
-                class = Some(candidate);
+        //
+        // One claim in three is also RESERVED for sealed work. Class is strict
+        // priority and ingest generates live-frontier work continuously, so
+        // without a reservation class 1 never runs at all. Prod 2026-08-17, over
+        // 278 consecutive task starts: every one was today or yesterday, not a
+        // single sealed day. Rollup coverage for a live tenant stayed pinned at
+        // two days for hours while the frontier was perfectly healthy
+        // (`eligible_watermark_lag_seconds` 0) — and a 7d/14d/30d query needs
+        // exactly the sealed days that never ran. Falls back to any class when
+        // there is no sealed work, so quiet history never idles a worker.
+        self.claim_tick = self.claim_tick.wrapping_add(1);
+        let sealed_turn = self.claim_tick.is_multiple_of(3);
+        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64)> {
+            let mut class: Option<(u8, i64)> = None;
+            for task in journal.snapshot.tasks.iter().filter(|task| {
+                task.key.operation == operation
+                    && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                    && task.deadline_micros <= now_micros
+                    && !(sealed_only && is_live_frontier(task.key.slice, now_micros))
+            }) {
+                let candidate = scheduling_class(task, now_micros);
+                if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
+                    class = Some(candidate);
+                }
             }
-        }
-        let class = class?;
+            class
+        };
+        let class = if sealed_turn { best_class(self, true).or_else(|| best_class(self, false)) } else { best_class(self, false) }?;
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
         let mut fallback: Option<&MaintenanceTask> = None;
         let mut next: Option<&MaintenanceTask> = None;
@@ -1176,6 +1204,45 @@ mod tests {
     /// ingest and recent slices are finite, so once the recent window drains the
     /// ordering walks backward on its own. What it guarantees is that the window
     /// a dashboard actually reads is reached FIRST.
+    /// Sealed work must get a share of claims even while the frontier is busy.
+    ///
+    /// Class is strict priority and ingest never stops, so before the
+    /// reservation class 1 simply never ran: prod 2026-08-17 went 278
+    /// consecutive task starts without a single sealed day, while rollup
+    /// coverage for a live tenant sat at two days and every 7d/14d/30d query
+    /// fell back to a raw scan. A frontier that is healthy on its own metric
+    /// (`eligible_watermark_lag_seconds` 0) tells you nothing about this.
+    #[test]
+    fn sealed_work_gets_claims_while_the_frontier_is_busy() {
+        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+
+        // Plenty of frontier work — the production condition, where ingest
+        // keeps class 0 permanently non-empty — plus one sealed day.
+        let key = |start: i64, end: i64| TaskKey {
+            physical_table: "t".into(),
+            source: "t".into(),
+            project_id: "p".into(),
+            slice: TimeSlice::new(start, end).expect("slice"),
+            operation: Operation::BaseRollup,
+        };
+        for k in 1..20 {
+            journal.enqueue(key(now - (k + 1) * MIN_SLICE_MICROS, now - k * MIN_SLICE_MICROS), now - 1, 1, 1);
+        }
+        let sealed = key(0, MIN_SLICE_MICROS);
+        journal.enqueue(sealed.clone(), now - 1, 1, 1);
+
+        let mut sealed_claims = 0;
+        for _ in 0..9 {
+            let claimed = journal.claim_next(Operation::BaseRollup, now).expect("a task is always available");
+            if claimed.key.slice == sealed.slice {
+                sealed_claims += 1;
+            }
+        }
+        assert!(sealed_claims > 0, "sealed work never ran while the frontier stayed busy — long-window queries can never become routable");
+    }
+
     #[test]
     fn historical_debt_runs_newest_slice_first() {
         let now = 10 * 24 * 60 * 60 * 1_000_000;
