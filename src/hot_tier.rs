@@ -297,6 +297,20 @@ pub struct HotTier {
     /// own several files: late arrivals into an already-drained bucket flush
     /// again and demote a second, disjoint row set.
     index: DashMap<TableKey, BTreeMap<(i64, u64), HotBucketMeta>>,
+    /// Buckets whose demotion was SKIPPED, so no file of theirs may ever claim
+    /// a window.
+    ///
+    /// `covers_window` says "this file holds every row the bucket carried",
+    /// which is a claim about ONE incarnation — a bucket re-forms when late
+    /// rows arrive after a full drain. `plan_leg` catches multiple incarnations
+    /// by counting a bucket's files, but a skipped demote leaves NO file, so
+    /// the count cannot see it: incarnation A skipped and B demoted looks
+    /// exactly like a single fully-covered drain, and the survivor excludes
+    /// from Delta a window whose earlier rows it never received.
+    ///
+    /// Durable, because the omission is: the rows are in Delta and the file is
+    /// not, and a restart must not turn that back into a claim.
+    uncovered: DashSet<(TableKey, i64)>,
     /// Files served to a scan since boot — the signal for whether demotion paid
     /// off before DML invalidated a file.
     read_files: DashSet<PathBuf>,
@@ -472,6 +486,7 @@ impl HotTier {
     /// to the authoritative Delta leg.
     pub fn finish_open(&self) {
         self.rescan();
+        self.load_uncovered();
         if !self.enabled {
             // Disabled, but still responsible for its own directory: without
             // this a previous run's files sit there forever, unbounded and
@@ -594,8 +609,64 @@ impl HotTier {
     /// window, as query filters report it; `None` = everything. Oldest bucket
     /// first.
     pub fn buckets_in_range(&self, project_id: &str, table_name: &str, query_range: Option<(i64, i64)>) -> Vec<HotBucketMeta> {
-        let Some(entry) = self.index.get(&table_key(project_id, table_name)) else { return Vec::new() };
-        entry.values().filter(|m| query_range.is_none_or(|(lo, hi)| overlaps(m.range(), (lo, hi.saturating_add(1))))).cloned().collect()
+        let key = table_key(project_id, table_name);
+        let Some(entry) = self.index.get(&key) else { return Vec::new() };
+        // The single choke point every reader goes through, so retracting a
+        // skipped bucket's claim here covers all of them. The file still SERVES
+        // its rows; it just may not tell Delta to skip that window.
+        entry
+            .values()
+            .filter(|m| query_range.is_none_or(|(lo, hi)| overlaps(m.range(), (lo, hi.saturating_add(1)))))
+            .map(|m| {
+                let mut m = m.clone();
+                m.covers_window &= !self.uncovered.contains(&(key.clone(), m.bucket_id));
+                m
+            })
+            .collect()
+    }
+
+    /// Record that a bucket's demotion was skipped, so no file of that bucket
+    /// may claim a window again. See the `uncovered` field.
+    ///
+    /// Best-effort persistence: losing the marker on a crash costs correctness,
+    /// so the write happens before the in-memory insert is relied on, but a
+    /// write failure disables the tier's claims for the table rather than
+    /// silently forgetting.
+    pub fn note_demote_skipped(&self, project_id: &str, table_name: &str, bucket_ids: &[i64]) {
+        if !self.enabled || bucket_ids.is_empty() {
+            return;
+        }
+        let key = table_key(project_id, table_name);
+        let mut line = String::new();
+        for id in bucket_ids {
+            self.uncovered.insert((key.clone(), *id));
+            line.push_str(&format!("{project_id}\t{table_name}\t{id}\n"));
+        }
+        if let Err(e) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.uncovered_path())
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+        {
+            warn!(
+                "hot tier could not persist skipped-demote markers for {project_id}/{table_name} ({e}); those windows stay unclaimable this run but a restart would forget"
+            );
+        }
+    }
+
+    fn uncovered_path(&self) -> PathBuf {
+        self.root.join(".uncovered")
+    }
+
+    /// Reload the skipped-demote markers written by earlier runs.
+    fn load_uncovered(&self) {
+        let Ok(text) = std::fs::read_to_string(self.uncovered_path()) else { return };
+        for line in text.lines() {
+            let mut parts = line.split('\t');
+            if let (Some(project), Some(table), Some(Ok(id))) = (parts.next(), parts.next(), parts.next().map(str::parse::<i64>)) {
+                self.uncovered.insert((table_key(project, table), id));
+            }
+        }
     }
 
     /// The scan's hot leg: one batch partition per demoted file, plus the
@@ -1038,37 +1109,63 @@ pub(crate) struct LegPlan {
 /// versions. Both come from the declared schema, not from the files.
 pub(crate) fn plan_leg(metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], versioned: bool, orders: bool, usable: &dyn Fn(&Path) -> bool) -> LegPlan {
     // Counted over ALL metas, not just served ones: a bucket demoted more than
-    // once has several files each holding PART of the span while `min_ts..
-    // end_ts` spans it, so no single one may claim the window. A sibling that
-    // MemBuffer still owns is exactly such a partial file — dropping it from the
-    // count would let the survivor claim a window it only partly holds.
+    // once holds PART of its span in each file, so the set is authoritative
+    // only when every member of it is present AND serving. A sibling MemBuffer
+    // still owns is exactly such a partial file — dropping it from the count
+    // would let the rest claim a window they only partly hold.
     let mut files_per_bucket: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
     for m in metas {
         *files_per_bucket.entry(m.bucket_id).or_default() += 1;
     }
-    metas
-        .iter()
-        .enumerate()
-        // A file MemBuffer still owns, or one that will not read, is skipped
-        // whole — no rows and no exclusion, so the window stays with the tier
-        // that can actually serve it.
-        .filter(|(_, m)| !mem_ranges.iter().any(|r| overlaps(m.range(), *r)) && usable(&m.path))
-        .fold(LegPlan { sorted: orders, ..Default::default() }, |mut plan, (i, m)| {
-            plan.served.push(i);
-            // One unmarked file retracts the claim for the whole leg:
-            // `try_with_sort_information` declares ONE ordering for the source.
-            plan.sorted &= m.sorted;
-            // The gate travels with the ranges it guards, so it is the MIN over
-            // every served file: an unknown stamp drops it to `i64::MIN`, which
-            // admits every stamped Delta row — the safe direction.
-            if versioned {
-                plan.version_gate = Some(plan.version_gate.unwrap_or(i64::MAX).min(m.max_stamp.unwrap_or(i64::MIN)));
-            }
-            if m.covers_window && files_per_bucket.get(&m.bucket_id) == Some(&1) {
-                plan.ranges.push(m.range());
-            }
-            plan
-        })
+    // A file MemBuffer still owns, or one that will not read, is skipped whole
+    // — no rows and no exclusion, so the window stays with the tier that can
+    // actually serve it.
+    let served: Vec<usize> =
+        metas.iter().enumerate().filter(|(_, m)| !mem_ranges.iter().any(|r| overlaps(m.range(), *r)) && usable(&m.path)).map(|(i, _)| i).collect();
+
+    // Which buckets the leg holds ENTIRELY: every file of the bucket is being
+    // served, and every one of them claims to hold its whole drain.
+    //
+    // This used to demand a single file per bucket, which handed every
+    // twice-drained bucket's window back to Delta. Prod 2026-08-17:
+    // `unproven_windows_total` 2286 against `read_hits_total` 3163, and a
+    // one-hour scan read 410K rows to answer 160K because the Delta leg
+    // re-fetched from object storage what was already on local disk.
+    //
+    // Sound only because both ways a file set can be incomplete are now
+    // closed: deletion is bucket-atomic (`drop_unless_bucket_atomic`) and a
+    // skipped demote permanently retracts its bucket's claim (`uncovered`).
+    // Without those, "every file present" did not mean "every file ever
+    // written", and this would exclude windows the tier never held.
+    let mut served_per_bucket: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    let mut marked_per_bucket: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for &i in &served {
+        *served_per_bucket.entry(metas[i].bucket_id).or_default() += 1;
+        *marked_per_bucket.entry(metas[i].bucket_id).or_default() += usize::from(metas[i].covers_window);
+    }
+    let whole = |id: i64| {
+        let total = files_per_bucket.get(&id).copied().unwrap_or(0);
+        total != 0 && served_per_bucket.get(&id).copied().unwrap_or(0) == total && marked_per_bucket.get(&id).copied().unwrap_or(0) == total
+    };
+
+    let mut plan = LegPlan { sorted: orders, ..Default::default() };
+    for &i in &served {
+        let m = &metas[i];
+        plan.served.push(i);
+        // One unmarked file retracts the claim for the whole leg:
+        // `try_with_sort_information` declares ONE ordering for the source.
+        plan.sorted &= m.sorted;
+        // The gate travels with the ranges it guards, so it is the MIN over
+        // every served file: an unknown stamp drops it to `i64::MIN`, which
+        // admits every stamped Delta row — the safe direction.
+        if versioned {
+            plan.version_gate = Some(plan.version_gate.unwrap_or(i64::MAX).min(m.max_stamp.unwrap_or(i64::MIN)));
+        }
+        if whole(m.bucket_id) {
+            plan.ranges.push(m.range());
+        }
+    }
+    plan
 }
 
 /// mmap + validate + decode. `require_alignment` is the arrow-rs knob that
@@ -1237,9 +1334,19 @@ mod tests {
         // more than once holds only PART of its span in each file.
         let partial = vec![meta(1, 0, 10, false, true, Some(7)), full[1].clone()];
         assert_eq!(plan_leg(&partial, &[], true, true, &|_| true).ranges, vec![(20, 30)], "an incomplete drain claims no window");
+        // A bucket's files are JOINTLY authoritative. With every one of them
+        // present, served and marked, the set holds the whole drain and the
+        // span is excluded — the tier serves those rows, so Delta must not.
         let split = vec![meta(1, 0, 10, true, true, Some(7)), meta(1, 0, 10, true, true, Some(8)), full[1].clone()];
         let p = plan_leg(&split, &[], true, true, &|_| true);
-        assert_eq!(p.ranges, vec![(20, 30)], "two files for one bucket: neither may claim the span");
+        assert_eq!(p.served, vec![0, 1, 2], "both halves serve their rows");
+        assert!(p.ranges.contains(&(0, 10)) && p.ranges.contains(&(20, 30)), "a COMPLETE twice-drained bucket claims its span, got {:?}", p.ranges);
+
+        // ...but one unmarked member retracts the whole bucket's claim: that
+        // file does not even hold its own drain, so the set cannot hold the span.
+        let half_marked = vec![meta(1, 0, 10, true, true, Some(7)), meta(1, 0, 10, false, true, Some(8)), full[1].clone()];
+        let p = plan_leg(&half_marked, &[], true, true, &|_| true);
+        assert_eq!(p.ranges, vec![(20, 30)], "one unmarked member retracts its bucket's claim");
         assert_eq!(p.served, vec![0, 1, 2], "...though both still SERVE their rows");
     }
 
@@ -1259,6 +1366,44 @@ mod tests {
         let p = plan_leg(&split, &[(12, 14)], true, true, &|_| true);
         assert_eq!(p.served, vec![0], "the mem-owned half is skipped");
         assert!(p.ranges.is_empty(), "the survivor must NOT claim the bucket's span — it holds half of it");
+    }
+
+    /// A bucket whose demotion was SKIPPED may never claim a window again,
+    /// even from a later incarnation's file — and that must survive a restart.
+    ///
+    /// `covers_window` is a claim about ONE incarnation; a bucket re-forms when
+    /// late rows arrive after a full drain. `plan_leg` catches multiple
+    /// incarnations by counting a bucket's files, but a skipped demote leaves
+    /// NO file to count. Incarnation A skipped and B demoted is therefore
+    /// indistinguishable from a single fully-covered drain, and the survivor
+    /// excludes from Delta a window whose earlier rows it never received.
+    ///
+    /// Prod 2026-08-17 had `demote_skipped_total` = 20 with the queue-limit
+    /// path logging "a permanent coverage hole served from Delta" — which is
+    /// only true if the tier stops claiming those windows.
+    #[tokio::test]
+    async fn a_skipped_demote_permanently_retracts_that_buckets_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        // Incarnation A never reaches the tier (queue full).
+        tier.note_demote_skipped("p1", "t", &[7]);
+        // Incarnation B drains cleanly and claims to hold "every row".
+        tier.demote("p1", "t", Bucket { bucket_id: 7, batches: &[batch(8)], min_ts: 0, max_ts: 20, covers_window: true });
+
+        let metas = tier.buckets_in_range("p1", "t", None);
+        assert_eq!(metas.len(), 1, "only the second incarnation has a file");
+        let plan = plan_leg(&metas, &[], false, false, &footer_is_readable);
+        assert_eq!(plan.served, vec![0], "the file still SERVES its rows");
+        assert!(plan.ranges.is_empty(), "but it must not exclude a window whose earlier rows the tier never received");
+
+        // The omission is durable, so the retraction must be too.
+        let reopened = HotTier::open(dir.path().to_path_buf(), true, limits(u64::MAX));
+        let metas = reopened.buckets_in_range("p1", "t", None);
+        assert_eq!(metas.len(), 1, "the file is still there after a restart");
+        assert!(
+            plan_leg(&metas, &[], false, false, &footer_is_readable).ranges.is_empty(),
+            "a restart must not turn a skipped demote back into a coverage claim"
+        );
     }
 
     /// Deleting ONE file of a twice-demoted bucket must not restore the
@@ -1284,7 +1429,9 @@ mod tests {
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(8)], min_ts: 10, max_ts: 30, covers_window: true });
         let metas = tier.buckets_in_range("p1", "t", None);
         assert_eq!(metas.len(), 2, "the bucket must hold both drains");
-        assert!(plan_leg(&metas, &[], false, false, &footer_is_readable).ranges.is_empty(), "neither half may claim the span while both are present");
+        // Both present, both served, both marked: the set is complete, so it
+        // legitimately claims. That is the state the deletion below destroys.
+        assert!(!plan_leg(&metas, &[], false, false, &footer_is_readable).ranges.is_empty(), "a complete bucket claims its span");
 
         // Invalidate a window that touches only the FIRST drain.
         tier.invalidate_range("p1", "t", 0, 5);
@@ -1779,19 +1926,22 @@ mod tests {
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: true });
         assert_eq!(tier.scan("p1", "t", None, &[], &[], &schema(), None).ranges.len(), 1, "a proven, single-file bucket claims its window");
 
-        // A SECOND drain of the SAME bucket: each file now holds only part of
-        // the span, so neither may claim it — even though both were full drains.
+        // A SECOND drain of the SAME bucket. Each file holds only PART of the
+        // span, but the two are jointly authoritative, and the tier is serving
+        // both — so each claims the window it actually holds. This is only
+        // sound because a file can no longer go missing behind the leg's back:
+        // deletion is bucket-atomic and a skipped demote retracts the bucket.
         tier.demote("p1", "t", Bucket { bucket_id: 1, batches: &[batch(4)], min_ts: 21, max_ts: 30, covers_window: true });
         let leg = tier.scan("p1", "t", None, &[], &[], &schema(), None);
-        assert!(leg.ranges.is_empty(), "multi-file bucket must claim NOTHING: neither file covers the span");
-        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 8, "but both files still SERVE their rows");
+        assert_eq!(leg.ranges.len(), 2, "a COMPLETE twice-drained bucket claims both halves it holds");
+        assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 8, "and both files still SERVE their rows");
 
         // A file from an older binary carries no claim and must not invent one.
         tier.demote("p2", "t", Bucket { bucket_id: 1, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: false });
         let leg = tier.scan("p2", "t", None, &[], &[], &schema(), None);
         assert!(leg.ranges.is_empty(), "unproven coverage ⇒ no exclusion; the window falls through to Delta");
         assert_eq!(served(&leg).await.iter().map(|b| b.num_rows()).sum::<usize>(), 4, "rows are still served");
-        assert!(tier.stats().unproven_windows >= 3);
+        assert!(tier.stats().unproven_windows >= 1, "the unmarked file is still an unproven window");
     }
 
     /// A project/table name that can't round-trip through a path component is

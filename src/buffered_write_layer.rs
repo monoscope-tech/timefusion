@@ -2682,6 +2682,15 @@ impl BufferedWriteLayer {
         if self.demote_queued_bytes.fetch_update(Relaxed, Relaxed, |q| (q + bytes <= self.demote_queue_limit).then_some(q + bytes)).is_err() {
             self.demote_skipped.fetch_add(1, Relaxed);
             crate::metrics::record_hot_tier_demote_skipped();
+            // Tell the tier, or the hole is not merely a hole — it is a WRONG
+            // claim. A bucket re-forms when late rows arrive after a full
+            // drain, and `plan_leg` only catches multiple incarnations by
+            // counting a bucket's files. A skip leaves no file to count, so a
+            // later incarnation's file looks like a single fully-covered drain
+            // and excludes from Delta a window whose earlier rows it never got.
+            for bucket in drained {
+                self.hot_tier.note_demote_skipped(&bucket.project_id, &bucket.table_name, &[bucket.bucket_id]);
+            }
             warn!(
                 "hot tier demotion SKIPPED for {} buckets ({bytes} bytes; {} queued, limit {}) — those windows are a permanent coverage hole served from Delta",
                 drained.len(),
