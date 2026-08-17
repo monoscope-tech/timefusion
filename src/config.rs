@@ -252,12 +252,22 @@ const HEAVY_REWRITE_PERMITS: usize = 10;
 /// Staging is R2-latency-dominated, so more spilling-capable parallel sorts
 /// beat fewer comfortable ones. 4 GiB doubles k; the memory brake (85% of
 /// cgroup) backstops the total.
-/// Kept at 4 GiB while `HEAVY_REWRITE_PERMITS` went 4 -> 10: a spill THRESHOLD
-/// on a FairSpillPool with a dedicated spill dir, so a sort that exceeds it
-/// degrades to bounded disk spill rather than failing. Staging is
+/// 2 GiB since 2026-08-17, HALVED to pay for `HEAVY_REWRITE_PERMITS` 4 -> 10.
+///
+/// Leaving it at 4 GiB while permits went to 10 is what the permits comment
+/// warns against, and prod proved the warning: an OOM kill at anon-rss
+/// 124.9 GB (09:39:02, kernel names `maintenance-wor` as the caller), two
+/// minutes after RSS was 11.9 GB. Reverting the sealed share alone did not hold
+/// — RSS climbed 7.5 -> 15.2 GB within four minutes of that revert deploying,
+/// the same shape as the run-up to the kill.
+///
+/// A spill THRESHOLD on a FairSpillPool, not a reservation: a sort that exceeds
+/// it degrades to bounded disk spill rather than failing, and staging is
 /// object-store-latency-dominated, so more spilling-capable parallel sorts beat
-/// fewer comfortable ones.
-const PER_SORT_BUDGET_BYTES: usize = 4 * GIB;
+/// fewer comfortable ones. Halving keeps the extra concurrency while putting the
+/// fan-in envelope back near where it ran clean for 12 hours: 10 x 2 = 20 GiB,
+/// against the old 4 x 4 = 16 GiB, rather than 40.
+const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// Heavy maintenance keeps at least this share of the maintenance pool.
 ///
 /// 0.40 since 2026-08-13, from 0.25. This is a REBALANCE inside the existing
@@ -2728,13 +2738,14 @@ mod tests {
         // sooner. Asserting the count alone would have to be edited every time
         // the pairing moves, and would not catch the case that actually hurts:
         // permits raised WITHOUT paying for them.
-        // permits x per-sort budget is the fan-in envelope (2026-07-04 OOM). It
-        // is 40 GiB since 2026-08-17 — deliberately expanded on a box running at
-        // 7-13% of an 85.9 GiB cgroup. Pinned so an expansion is always a
-        // conscious edit with a memory argument behind it, never a drift.
+        // permits x per-sort budget is the fan-in envelope (2026-07-04 OOM).
+        // Briefly 40 GiB on 2026-08-17 and it OOM-killed prod at anon-rss
+        // 124.9 GB; now 20 GiB (10 x 2), near the 16 GiB that ran clean for 12
+        // hours. Pinned so a change is always a conscious edit with a memory
+        // argument behind it, never a drift.
         assert_eq!(
             b.rewrite_permits() * PER_SORT_BUDGET_BYTES,
-            40 * GIB,
+            20 * GIB,
             "changing the fan-in envelope must be deliberate: state the memory headroom that pays for it"
         );
         assert!(
