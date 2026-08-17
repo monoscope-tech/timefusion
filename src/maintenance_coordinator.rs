@@ -789,6 +789,8 @@ impl TaskJournal {
         let mut sealed_debt_bytes = 0u64;
         let mut oldest_created = u64::MAX;
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
+        let mut per_operation = [0u64; 6];
+        let (mut eligible_base_rollup, mut eligible_sealed) = (0u64, 0u64);
         let now_micros = crate::clock::now_micros();
         for task in &self.snapshot.tasks {
             let index = match task.state {
@@ -806,8 +808,31 @@ impl TaskJournal {
                     sealed_debt_bytes = sealed_debt_bytes.saturating_add(task.estimated_decoded_bytes);
                 }
             }
+            // Per-operation split, plus what is actually claimable now. When
+            // coverage stalls the question is always: is the rollup work
+            // absent, present-but-not-eligible, or present-and-eligible but
+            // out-competed? Only these three views together answer it.
+            if !matches!(task.state, TaskState::Complete | TaskState::Superseded) {
+                per_operation[task.key.operation as usize] = per_operation[task.key.operation as usize].saturating_add(1);
+                if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
+                    if task.key.operation == Operation::BaseRollup {
+                        eligible_base_rollup = eligible_base_rollup.saturating_add(1);
+                    }
+                    if !is_live_frontier(task.key.slice, now_micros) {
+                        eligible_sealed = eligible_sealed.saturating_add(1);
+                    }
+                }
+            }
             track_latest_frontier_rollup(&mut latest_frontier_rollup, task, now_micros);
         }
+        stats.pending_dedup.store(per_operation[Operation::Dedup as usize], Relaxed);
+        stats.pending_base_rollup.store(per_operation[Operation::BaseRollup as usize], Relaxed);
+        stats.pending_derived_rollup.store(per_operation[Operation::DerivedRollup as usize], Relaxed);
+        stats.pending_hot_packing.store(per_operation[Operation::HotPacking as usize], Relaxed);
+        stats.pending_sealed_consolidation.store(per_operation[Operation::SealedConsolidation as usize], Relaxed);
+        stats.pending_repair.store(per_operation[Operation::Repair as usize], Relaxed);
+        stats.eligible_base_rollup.store(eligible_base_rollup, Relaxed);
+        stats.eligible_sealed_total.store(eligible_sealed, Relaxed);
         stats.maintenance_tasks_pending.store(counts[0], Relaxed);
         stats.maintenance_tasks_running.store(counts[1], Relaxed);
         stats.maintenance_tasks_retry.store(counts[2], Relaxed);
@@ -1218,6 +1243,45 @@ mod tests {
     /// coverage for a live tenant sat at two days and every 7d/14d/30d query
     /// fell back to a raw scan. A frontier that is healthy on its own metric
     /// (`eligible_watermark_lag_seconds` 0) tells you nothing about this.
+    /// Pending work must be reportable per operation, and split by whether it
+    /// is claimable right now.
+    ///
+    /// `tasks_pending` alone cannot distinguish "no rollup work queued" from
+    /// "queued but not eligible" from "eligible but out-competed" — three states
+    /// with three different fixes. Prod 2026-08-17 sat at ~128k pending with
+    /// rollup coverage frozen for hours, and every attempt to tune it was a
+    /// guess because these three were indistinguishable from outside.
+    #[test]
+    fn pending_work_is_reported_per_operation_and_by_eligibility() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // publish_statistics reads the real clock, so eligibility has to be
+        // expressed against it — an epoch-relative `now` makes every deadline
+        // look long past and the eligible/pending distinction vanishes.
+        let now = crate::clock::now_micros();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = |op, start: i64, end: i64| TaskKey {
+            physical_table: "t".into(),
+            source: "t".into(),
+            project_id: "p".into(),
+            slice: TimeSlice::new(start, end).expect("slice"),
+            operation: op,
+        };
+        // One eligible sealed rollup, one sealed rollup not yet due, one repair.
+        // Sealed slices: well before now, so they are not live-frontier.
+        let old_start = now - 30 * 24 * 60 * 60 * 1_000_000;
+        journal.enqueue(key(Operation::BaseRollup, old_start, old_start + MIN_SLICE_MICROS), now - 1, 1, 1);
+        journal.enqueue(key(Operation::BaseRollup, old_start + MIN_SLICE_MICROS, old_start + 2 * MIN_SLICE_MICROS), now + 3_600_000_000, 1, 1);
+        journal.enqueue(key(Operation::Repair, old_start, old_start + MIN_SLICE_MICROS), now - 1, 1, 1);
+        journal.publish_statistics();
+
+        let stats = crate::metrics::maintenance_stats();
+        assert_eq!(stats.pending_base_rollup.load(Relaxed), 2, "both rollup tasks are pending regardless of eligibility");
+        assert_eq!(stats.pending_repair.load(Relaxed), 1);
+        assert_eq!(stats.eligible_base_rollup.load(Relaxed), 1, "only the due rollup is claimable now — this is the distinction tasks_pending cannot make");
+        assert_eq!(stats.eligible_sealed_total.load(Relaxed), 2, "both due sealed tasks (rollup + repair) are claimable");
+    }
+
     #[test]
     fn sealed_work_gets_claims_while_the_frontier_is_busy() {
         let now = 10 * 24 * 60 * 60 * 1_000_000;
