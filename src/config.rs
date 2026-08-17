@@ -225,7 +225,25 @@ const OPTIMIZE_MAX_FILES_PER_BIN: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 /// re-dirties today's bins faster than 3 permits clear them).
 /// Do NOT bump further without shrinking the per-shard budget again: that
 /// is the 2026-07-04-class fan-in OOM.
-const HEAVY_REWRITE_PERMITS: usize = 4;
+/// 10 since 2026-08-17, at the full 4 GiB per-sort budget — a deliberate
+/// EXPANSION of the envelope (4 x 4 GiB -> 10 x 4 GiB), not a re-balance.
+///
+/// Measured on prod at 12 coordinator jobs and 4 permits: `permit_wait_ms` p50
+/// 118,896 (2.0 min) and max 843,330 (14 min), with 13 unit timeouts. Workers
+/// spent most of their wall clock BLOCKED on this semaphore rather than
+/// working, which is why the live frontier fell 2.2h behind, rollup coverage
+/// froze for two hours, and `tasks_pending` sat flat at ~127k while all 12 jobs
+/// read as "running". Raising coordinator jobs cannot help while this is small:
+/// 24 jobs was tried and reverted because it only queued deeper here.
+///
+/// The historical caution ("do not bump without shrinking the per-shard
+/// budget", after the 2026-07-04 fan-in OOM) was written for a far tighter box.
+/// This one runs at 7-13% of an 85.9 GiB cgroup, and `PER_SORT_BUDGET_BYTES` is
+/// a spill THRESHOLD on a FairSpillPool rather than a reservation, so the heavy
+/// share bounds real memory while extra permits buy parallelism and spill.
+/// The 85% memory brake remains the backstop. Watch `permit_wait_ms`, RSS
+/// against that brake, and `occ_conflicts_total`.
+const HEAVY_REWRITE_PERMITS: usize = 10;
 /// Per-sort budget. 8 GiB (from the legacy 5.8 GiB blocking-sort peak) capped
 /// wave concurrency k at 1-2 on prod's 24 GiB pool — hot compact ran serial
 /// on a 48-core box while ticks overran 2-3x (2026-07-30). Sorts run on a
@@ -234,6 +252,11 @@ const HEAVY_REWRITE_PERMITS: usize = 4;
 /// Staging is R2-latency-dominated, so more spilling-capable parallel sorts
 /// beat fewer comfortable ones. 4 GiB doubles k; the memory brake (85% of
 /// cgroup) backstops the total.
+/// Kept at 4 GiB while `HEAVY_REWRITE_PERMITS` went 4 -> 10: a spill THRESHOLD
+/// on a FairSpillPool with a dedicated spill dir, so a sort that exceeds it
+/// degrades to bounded disk spill rather than failing. Staging is
+/// object-store-latency-dominated, so more spilling-capable parallel sorts beat
+/// fewer comfortable ones.
 const PER_SORT_BUDGET_BYTES: usize = 4 * GIB;
 /// Heavy maintenance keeps at least this share of the maintenance pool.
 ///
@@ -2689,9 +2712,26 @@ mod tests {
         // 5 with the 30G post-slack pool (was 8..=11 at 48G): fewer concurrent
         // per-project sorts is the intended trade for not OOMing the box.
         assert!((4..=11).contains(&k), "K={k} outside the expected 4..=11 range");
-        // 4 since 2026-08-03 evening (with the halved per-shard decode budget,
-        // 4 x 2 GiB lands exactly on the original 8 GiB envelope).
-        assert_eq!(b.rewrite_permits(), 4);
+        // The ENVELOPE is the invariant, not the permit count: permits x
+        // per-sort budget must stay put, because that product is what the
+        // 2026-07-04 fan-in OOM was about. 4 x 4 GiB became 8 x 2 GiB on
+        // 2026-08-17 — same 16 GiB, twice the concurrency, each sort spilling
+        // sooner. Asserting the count alone would have to be edited every time
+        // the pairing moves, and would not catch the case that actually hurts:
+        // permits raised WITHOUT paying for them.
+        // permits x per-sort budget is the fan-in envelope (2026-07-04 OOM). It
+        // is 40 GiB since 2026-08-17 — deliberately expanded on a box running at
+        // 7-13% of an 85.9 GiB cgroup. Pinned so an expansion is always a
+        // conscious edit with a memory argument behind it, never a drift.
+        assert_eq!(
+            b.rewrite_permits() * PER_SORT_BUDGET_BYTES,
+            40 * GIB,
+            "changing the fan-in envelope must be deliberate: state the memory headroom that pays for it"
+        );
+        assert!(
+            b.rewrite_permits() * PER_SORT_BUDGET_BYTES < b.memory_limit_bytes() / 2,
+            "the fan-in envelope must stay well under the cgroup, whatever the permit count"
+        );
         assert_eq!(b.optimize_merge_tasks(), 2);
     }
 
