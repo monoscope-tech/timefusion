@@ -10045,38 +10045,60 @@ impl Database {
         // a pure re-aggregation of the base tier, so a wider derived file
         // already holds these rows.
         let covered_by_wider = derived
-            && live_adds.iter().any(|add| {
-                let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
-                let (Some(start), Some(end)) = (
-                    tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                    tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                ) else {
-                    return false;
-                };
-                tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
-                    && (start, end) != (key.slice.start_micros, key.slice.end_micros)
-                    && start <= key.slice.start_micros
-                    && end >= key.slice.end_micros
-            });
-        if covered_by_wider {
-            // Counted because this branch has a hazard we cannot currently
-            // observe. `invalidate` mints derived work at DERIVED_SLICE_MICROS,
-            // so late rows for ONE HOUR inside an already-published day arrive
-            // as an hour-wide unit — and completing it without publishing would
-            // leave that hour stale in the coarse tier, which is a wrong number
-            // rather than a slow one.
+            .then(|| {
+                live_adds.iter().find_map(|add| {
+                    let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
+                    let (Some(start), Some(end)) = (
+                        tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                        tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                    ) else {
+                        return None;
+                    };
+                    (tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
+                        && (start, end) != (key.slice.start_micros, key.slice.end_micros)
+                        && start <= key.slice.start_micros
+                        && end >= key.slice.end_micros)
+                        .then_some((start, end))
+                })
+            })
+            .flatten();
+        if let Some((covering_start, covering_end)) = covered_by_wider {
+            // ESCALATE. This slice cannot publish — two overlapping files would
+            // both stay live and a dashboard would SUM them — but completing it
+            // silently is the other wrong answer: `invalidate` mints derived
+            // work at DERIVED_SLICE_MICROS, so late rows for ONE HOUR inside an
+            // already-published day arrive as an hour-wide unit, and dropping it
+            // leaves that hour STALE in the coarse tier.
             //
-            // Not "fixed" by reopening the covering slice, because the failure
-            // could not be reproduced: in the one test that builds this shape
-            // the late row lands outside the covering file, and master behaves
-            // identically. Rebuilding a whole day on every hour invalidation is
-            // a real cost to pay against a hazard that may not occur, so
-            // measure first. If this counter moves on prod, the staleness is
-            // reachable and escalation is the fix.
+            // #145 shipped this branch as a counter first, because the failure
+            // could not be reproduced in a test and rebuilding a whole day on
+            // every hour invalidation is a real cost. The counter then moved on
+            // prod (`rollup_skipped_covered_by_wider` = 5 within an hour of
+            // deploying), which is the condition that PR named for making this
+            // change — so the cost is now justified by evidence rather than by
+            // argument.
+            //
+            // Reopening the covering slice rebuilds the whole day, which absorbs
+            // the change; its own replace-set then removes everything it
+            // contains. It terminates: the wider unit publishes at its own
+            // width, so it never re-enters this branch.
             crate::metrics::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
+                journal.enqueue(
+                    crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() },
+                    crate::clock::now_micros(),
+                    MAX_DECODED_BYTES,
+                    u64::try_from(crate::clock::now_micros().div_euclid(1_000)).unwrap_or_default(),
+                );
+            }
             journal.complete(&key);
             journal.checkpoint()?;
+            info!(
+                table = %key.physical_table, project_id = %key.project_id,
+                slice_start = key.slice.start_micros, covering_start, covering_end,
+                event = "maintenance_rollup_escalated_to_covering_slice"
+            );
             return Ok(true);
         }
         let target_paths = replaced.iter().map(|add| add.path.clone()).collect::<Vec<_>>();
