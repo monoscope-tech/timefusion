@@ -1617,6 +1617,14 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     let ordering = std::sync::atomic::Ordering::Relaxed;
     tantivy_stats.tantivy_uncovered_files.store(999, ordering);
 
+    // The census must see the uncovered files BEFORE anything is built. The
+    // gauge is otherwise only written by a reconcile pass, i.e. once a day, so a
+    // freshly deployed process reports "0 remaining" for up to 24h whether or
+    // not the reindex is actually finished — the exact blind spot that had this
+    // work being chased by hand from sibling containers.
+    let (uncovered_before, _) = db.tantivy_coverage_census().await?;
+    assert!(uncovered_before >= 2, "census must count uncovered live files before any build, got {uncovered_before}");
+
     let (built, removed, _) = db.tantivy_reconcile_table(TABLE).await?;
     assert!(built >= 2, "expected both uncovered live files indexed, built={built}");
     assert_eq!(removed, 0, "nothing to GC before compaction");
@@ -1625,6 +1633,8 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
         0,
         "the pass must publish remaining work (sentinel not overwritten); 'uncovered -> 0' is the definition of a finished reindex"
     );
+    let (uncovered_after, _) = db.tantivy_coverage_census().await?;
+    assert_eq!(uncovered_after, 0, "after indexing every uncovered file the census must independently agree the reindex is done");
     let m = manifest::load(tantivy_store.as_ref(), TABLE, &project_id).await?;
     assert_eq!(m.entries.len(), 2, "per-uuid manifest covers both files");
 
