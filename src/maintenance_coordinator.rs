@@ -996,6 +996,18 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64) {
     }
 }
 
+/// Does this task mean a day's ROLLUP work is already queued?
+///
+/// The precondition of a backfill is "nothing has rolled this day up yet", and
+/// the planner enqueues exactly `Dedup` + the rollup tiers — so only those may
+/// veto it. Matching every non-complete task on the source instead let
+/// unrelated file debt disqualify a day forever: prod 2026-08-17 had the
+/// whale's Aug 15 `SealedConsolidation` on attempt 370, which alone kept that
+/// day out of every backfill pass.
+pub fn blocks_rollup_backfill(task: &MaintenanceTask) -> bool {
+    matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup) && task.state != TaskState::Complete
+}
+
 fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
     slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && slice.start_micros <= now_micros
 }
@@ -1166,6 +1178,31 @@ mod tests {
             created_unix_ms: 0,
             retry_reason: None,
             publication: None,
+        }
+    }
+
+    /// Only outstanding ROLLUP work may veto a rollup backfill.
+    ///
+    /// This predicate used to be "any non-complete task on the source", so a
+    /// day carrying unrelated file debt was disqualified forever. Prod
+    /// 2026-08-17: the whale's Aug 15 `SealedConsolidation` sat on attempt 370,
+    /// and once the coarse-backfill migration retired the fine-grained
+    /// historical tasks there was nothing left to claim and nothing allowed to
+    /// replace it — every task start for 30 minutes was today's, rollup
+    /// coverage froze at three days, and 7d/14d queries fell back to a full raw
+    /// scan (`rollup_miss_not_built`).
+    #[test]
+    fn only_outstanding_rollup_work_blocks_a_backfill() {
+        for operation in [Operation::SealedConsolidation, Operation::HotPacking, Operation::Repair] {
+            let debt = task("whale", 0, NORMAL_SLICE_MICROS, operation);
+            assert!(!blocks_rollup_backfill(&debt), "{operation:?} is file debt, not rollup coverage; it must not veto a backfill");
+        }
+        for operation in [Operation::Dedup, Operation::BaseRollup, Operation::DerivedRollup] {
+            let outstanding = task("whale", 0, NORMAL_SLICE_MICROS, operation);
+            assert!(blocks_rollup_backfill(&outstanding), "{operation:?} is the work a backfill would queue; re-queueing it pushes its deadline out");
+            let mut done = outstanding;
+            done.state = TaskState::Complete;
+            assert!(!blocks_rollup_backfill(&done), "a completed {operation:?} leaves the day open to backfill again");
         }
     }
 
