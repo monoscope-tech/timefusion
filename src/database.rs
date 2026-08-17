@@ -3762,7 +3762,13 @@ impl Database {
                             let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             let discarded = journal.migrate_bootstrap_backlog();
                             let migrated = journal.migrate_derived_slices();
-                            if discarded.is_some_and(|count| count != 0) {
+                            // One-shot: collapse the fine-grained sealed backfill
+                            // so the coarse planner can re-derive it day-sized.
+                            let coarsened = journal.migrate_fine_grained_backfill(crate::clock::now_micros()).unwrap_or_default();
+                            if coarsened != 0 {
+                                info!(coarsened, event = "maintenance_coarse_backfill_migrated");
+                            }
+                            if discarded.is_some_and(|count| count != 0) || coarsened != 0 {
                                 journal.compact()?;
                             } else if discarded.is_some() || migrated != 0 {
                                 journal.checkpoint()?;
@@ -9409,9 +9415,60 @@ impl Database {
             want.sort_by(|(pa, da), (pb, db)| db.cmp(da).then_with(|| pa.cmp(pb)));
             let total = want.len();
             want.truncate(BACKFILL_PARTITIONS_PER_PASS);
-            for (project_id, date) in &want {
-                self.enqueue_maintenance_hours(project_id, &source, &date.to_string(), crate::rollup::ALL_HOURS)?;
-                queued = queued.saturating_add(1);
+            // DAY-sized units, not the frontier's ten-minute slices.
+            //
+            // `enqueue_maintenance_hours` goes through `invalidate`, which
+            // expands a day into `normal_units` — ~144 slices x
+            // Dedup/BaseRollup/HotPacking x each tier, about 450 durable tasks
+            // per (project, date). Prod 2026-08-17 reached 127k pending that
+            // way, draining ~19 tasks/min because each unit costs 50-80s of
+            // object-store work regardless of how little data it covers. That is
+            // ~7 days to converge, and no amount of concurrency fixes it: the
+            // task COUNT is the problem, not the throughput.
+            //
+            // `plan_compaction_debt` already enqueues day-sized slices for these
+            // same partitions. Do the same here and let the coordinator split on
+            // OBSERVED bytes — `run_coordinator_rollup_once` and
+            // `run_coordinator_dedup_once` both call `split_time_task`, so an
+            // oversized day divides by time and then by hash shard until each
+            // child fits MAX_DECODED_BYTES. Coarse is safe; fine is merely slow.
+            //
+            // HotPacking is also dropped for sealed days: `plan_compaction_debt`
+            // routes those to SealedConsolidation, so the ~41k HotPacking tasks
+            // this used to mint for history were pure waste.
+            let now = crate::clock::now_micros();
+            let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            {
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (project_id, date) in &want {
+                    let Some(day_start) = date.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
+                    let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
+                    let mut enqueue = |physical_table: String, operation| {
+                        journal.enqueue(
+                            crate::maintenance_coordinator::TaskKey {
+                                physical_table,
+                                source: source.clone(),
+                                project_id: project_id.clone(),
+                                slice,
+                                operation,
+                            },
+                            now,
+                            crate::maintenance_coordinator::MAX_DECODED_BYTES,
+                            created_unix_ms,
+                        );
+                    };
+                    enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup);
+                    for spec in &schema.rollups {
+                        let operation = if spec.derive_from.is_some() {
+                            crate::maintenance_coordinator::Operation::DerivedRollup
+                        } else {
+                            crate::maintenance_coordinator::Operation::BaseRollup
+                        };
+                        enqueue(spec.table_name(&source), operation);
+                    }
+                    queued = queued.saturating_add(1);
+                }
+                journal.checkpoint()?;
             }
             // Never let a bounded pass read as "covered everything".
             info!(source, queued = want.len(), remaining = total - want.len(), horizon_days = horizon, event = "rollup_backfill_planned");

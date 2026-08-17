@@ -251,6 +251,7 @@ impl TaskJournal {
     // v3 runs once with commit-range reconciliation and forced compaction.
     const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v3";
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
+    const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -362,6 +363,52 @@ impl TaskJournal {
         }
         self.snapshot.source_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned(), 1);
         self.dirty_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned());
+        Some(removed)
+    }
+
+    /// One-shot: drop the fine-grained SEALED backfill tasks so the coarse
+    /// planner can re-derive them a day at a time.
+    ///
+    /// `plan_rollup_backfill` used to enqueue history through `invalidate`,
+    /// which expands a day into ~144 ten-minute slices x Dedup/BaseRollup/
+    /// HotPacking x each tier — about 450 durable tasks per (project, date).
+    /// Prod 2026-08-17 reached 127,536 pending that way and drained ~19/min,
+    /// because each unit costs 50-80s of snapshot-refresh and commit regardless
+    /// of how little data it covers. That is ~111 hours of pure overhead for
+    /// ~600 GB of actual work, and it is why adding concurrency kept not
+    /// helping — and why pushing concurrency harder ended in an OOM kill.
+    ///
+    /// Changing the planner alone does not help, because the already-enqueued
+    /// tasks still have to drain. So drop them: they are unpublished backfill
+    /// work, and the planner re-derives exactly what is missing from rollup
+    /// COVERAGE, so nothing is lost by forgetting the intent.
+    ///
+    /// Deliberately narrow. Only non-Complete, only sealed slices, and only the
+    /// operations the backfill mints. Frontier work is untouched, and
+    /// SealedConsolidation/Repair are left alone because `plan_compaction_debt`
+    /// already plans those day-sized.
+    pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
+        if self.snapshot.source_cursors.get(Self::COARSE_BACKFILL_MIGRATION).copied().unwrap_or_default() >= 1 {
+            return None;
+        }
+        let mut removed = 0usize;
+        self.snapshot.tasks.retain(|task| {
+            let coarse_planned = matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking);
+            let drop = task.state != TaskState::Complete
+                && coarse_planned
+                && !is_live_frontier(task.key.slice, now_micros)
+                // A day-sized unit is what replaces these; anything already that
+                // wide came from the coarse planner and must survive.
+                && task.key.slice.width() < 24 * 60 * 60 * 1_000_000;
+            removed += usize::from(drop);
+            !drop
+        });
+        if removed != 0 {
+            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
+            self.dirty_tasks.clear();
+        }
+        self.snapshot.source_cursors.insert(Self::COARSE_BACKFILL_MIGRATION.to_owned(), 1);
+        self.dirty_cursors.insert(Self::COARSE_BACKFILL_MIGRATION.to_owned());
         Some(removed)
     }
 
@@ -1307,6 +1354,48 @@ mod tests {
         assert_eq!(stats.pending_repair.load(Relaxed), 1);
         assert_eq!(stats.eligible_base_rollup.load(Relaxed), 1, "only the due rollup is claimable now — this is the distinction tasks_pending cannot make");
         assert_eq!(stats.eligible_sealed_total.load(Relaxed), 2, "both due sealed tasks (rollup + repair) are claimable");
+    }
+
+    /// The coarse-backfill migration must be narrow: fine sealed backfill goes,
+    /// everything else stays.
+    ///
+    /// It exists because ~450 tasks per (project, date) drained at ~19/min on
+    /// prod — 111 hours for ~600 GB of real work. Dropping tasks is safe only
+    /// because `plan_rollup_backfill` re-derives from rollup COVERAGE, but a
+    /// migration that over-reaches would silently cancel live frontier work or
+    /// the separately-planned compaction debt.
+    #[test]
+    fn coarse_backfill_migration_only_drops_fine_sealed_backfill() {
+        let now = crate::clock::now_micros();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let day = 24 * 60 * 60 * 1_000_000i64;
+        let sealed_start = now - 10 * day;
+        let key = |op, start: i64, end: i64| TaskKey {
+            physical_table: "t".into(),
+            source: "t".into(),
+            project_id: "p".into(),
+            slice: TimeSlice::new(start, end).expect("slice"),
+            operation: op,
+        };
+        // Dropped: fine-grained sealed rollup/dedup work.
+        journal.enqueue(key(Operation::BaseRollup, sealed_start, sealed_start + MIN_SLICE_MICROS), now, 1, 1);
+        journal.enqueue(key(Operation::Dedup, sealed_start, sealed_start + MIN_SLICE_MICROS), now, 1, 1);
+        // Kept: live frontier, day-sized (already coarse), and compaction debt.
+        journal.enqueue(key(Operation::BaseRollup, now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS), now, 1, 1);
+        journal.enqueue(key(Operation::BaseRollup, sealed_start, sealed_start + day), now, 1, 1);
+        journal.enqueue(key(Operation::SealedConsolidation, sealed_start, sealed_start + day), now, 1, 1);
+        journal.enqueue(key(Operation::Repair, sealed_start, sealed_start + MIN_SLICE_MICROS), now, 1, 1);
+
+        let removed = journal.migrate_fine_grained_backfill(now).expect("migration runs once");
+        assert_eq!(removed, 2, "only the two fine-grained sealed backfill tasks should go");
+        let kept: Vec<_> = journal.tasks().map(|task| (task.key.operation, task.key.slice.width())).collect();
+        assert_eq!(kept.len(), 4, "frontier, day-sized rollup, consolidation and repair must all survive");
+        assert!(kept.iter().any(|(op, _)| *op == Operation::SealedConsolidation), "compaction debt is planned elsewhere and must not be cancelled");
+        assert!(kept.iter().any(|(op, width)| *op == Operation::BaseRollup && *width == day), "an already-coarse rollup unit must survive");
+
+        // One-shot: a second call must not re-run and drop the coarse re-plan.
+        assert!(journal.migrate_fine_grained_backfill(now).is_none(), "migration must be guarded by its cursor");
     }
 
     #[test]
