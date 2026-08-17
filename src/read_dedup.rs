@@ -1009,12 +1009,23 @@ impl Dedup {
                 None => {
                     // Pool BEFORE buffering: on ResourcesExhausted the query
                     // fails here instead of the cgroup killing the server.
-                    let size = batch.get_array_memory_size();
+                    //
+                    // Compact first, because the run buffer RETAINS what it
+                    // holds. Batches read back by the DML UPDATE path are view
+                    // arrays over the parquet reader's whole column-chunk
+                    // blocks, so buffering one both charges the pool that block
+                    // and keeps it alive — prod 2026-08-17: the enrichment
+                    // UPDATE failed after 16.9s asking for 15.2 GB on a pool
+                    // 1.8 GB into 16 GB, fed by 847 KB and 5 MB of files.
+                    // `compact_batch` returns the batch untouched when there is
+                    // nothing to compact.
+                    let owned = crate::mem_buffer::compact_batch(batch.clone());
+                    let size = owned.get_array_memory_size();
                     if self.bound.is_none() {
                         check_unbounded_growth(g.bytes, size)?;
                     }
                     g.reservation.try_grow(size)?;
-                    g.batches.push(batch.clone());
+                    g.batches.push(owned);
                     g.masks.push(vec![false; batch.num_rows()]);
                     g.bytes += size;
                     let bi = g.batches.len() as u32 - 1;
@@ -1387,6 +1398,51 @@ mod tests {
         }
         let err = err.expect("a 512-byte pool must refuse the run buffer");
         assert!(format!("{err}").contains("Resources exhausted"), "must fail with the pool's error, got: {err}");
+    }
+
+    /// A batch whose columns are slices of a much larger parent must be charged
+    /// for the rows it owns, not for the allocation it borrows from.
+    ///
+    /// Prod 2026-08-17: monoscope's enrichment UPDATE failed after 16.9s with
+    /// `Failed to allocate additional 15.2 GB for DedupExec[keep-greatest]` on
+    /// a pool that was 1.8 GB used of 16 GB, fed by scans reading 847 KB and
+    /// 5 MB of files. Batches from the DML UPDATE path are view arrays over the
+    /// parquet reader's full column-chunk blocks, and `get_array_memory_size`
+    /// charges the whole block — the mechanism `mem_buffer::compact_batch`
+    /// already exists to neutralize.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_slicing_a_big_parent_is_charged_for_its_own_rows() {
+        use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
+        // One 64k-row parent per column; each batch keeps two rows of it.
+        let ids: Vec<String> = (0..65536).map(|i| format!("k{i}")).collect();
+        let parent_id = StringArray::from(ids.iter().map(String::as_str).collect::<Vec<_>>());
+        let parent_ts = Int64Array::from((0..65536i64).collect::<Vec<_>>());
+        let parent_tb = Int64Array::from((0..65536i64).map(Some).collect::<Vec<_>>());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("tb", DataType::Int64, true),
+        ]));
+        let sliced = |off: usize| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(parent_id.slice(off, 2)), Arc::new(parent_ts.slice(off, 2)), Arc::new(parent_tb.slice(off, 2))])
+                .unwrap()
+        };
+        let batches: Vec<RecordBatch> = (0..8).map(|i| sliced(i * 2)).collect();
+        let owned: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let inherited = batches[0].get_array_memory_size();
+        assert!(inherited > 64 * 1024, "a slice of a 64k-row parent must report the parent's buffers, else this test proves nothing");
+
+        // Comfortably above the 16 rows actually retained, far below 8 x the
+        // inherited charge. Only honest accounting fits here.
+        let plan = unbounded_greatest_plan(batches);
+        let runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(inherited))).build_arc().unwrap();
+        let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+        let mut stream = plan.execute(0, ctx).unwrap();
+        let mut rows = 0;
+        while let Some(r) = futures::StreamExt::next(&mut stream).await {
+            rows += r.expect("16 sliced rows must not be charged the whole parent").num_rows();
+        }
+        assert_eq!(rows, owned, "every distinct key must survive");
     }
 
     #[test]
