@@ -489,8 +489,15 @@ impl DerivedBudget {
             // decode against 85.9 GiB, still far below the 48-way exposure that
             // starved health checks on 2026-08-16, and the dedicated maintenance
             // runtime is what protects liveness either way.
-            let cpu_bound = self.cores / 4;
-            mem_bound.min(cpu_bound).clamp(1, 12)
+            // Raised again 2026-08-17 after measuring the actual constraint.
+            // At 12 jobs prod completed ~4,400 tasks/hour (~1.2/s) against ~148k
+            // tasks of genuine backfill work (30 days x 11 projects x ~450 tasks
+            // per partition) — ~34 hours, with RSS at 8% of the cgroup, OCC
+            // conflicts at 0, and 12 of 48 cores in use. Throughput, not the
+            // split between frontier and sealed work, is what bounds rollup
+            // coverage. 24 jobs is ~12 GiB of tracked decode against 85.9 GiB.
+            let cpu_bound = self.cores / 2;
+            mem_bound.min(cpu_bound).clamp(1, 24)
         })
     }
 
@@ -2716,8 +2723,14 @@ mod tests {
         // Every admitted unit reserves at most MAX_DECODED_BYTES, so the
         // concurrent decode reservation must still fit the maintenance pool.
         assert!(prod.coordinator_jobs() * 512 * 1024 * 1024 <= prod.maintenance_pool_bytes(), "concurrent 512 MiB units must fit the maintenance pool");
-        // Small boxes degrade to serial rather than thrashing.
-        assert_eq!(DerivedBudget::from_limits(16 * GIB, 4).coordinator_jobs(), 1);
+        // Small boxes stay modest rather than thrashing. This pinned exactly 1
+        // while the divisor was cores/8; at cores/2 a 4-core box gets 2, which
+        // is still only 1 GiB of concurrent decode. The invariant worth holding
+        // is "does not thrash a small box and still fits its pool", not a
+        // specific number that has to be edited every time the divisor moves.
+        let small = DerivedBudget::from_limits(16 * GIB, 4);
+        assert!(small.coordinator_jobs() <= 2, "a 4-core box must not run maintenance wide, got {}", small.coordinator_jobs());
+        assert!(small.coordinator_jobs() * 512 * 1024 * 1024 <= small.maintenance_pool_bytes(), "concurrent units must fit a small box's pool too");
     }
 
     // Small box (16 GiB / 4 cores): degrades to K=1, nothing underflows/zeroes.

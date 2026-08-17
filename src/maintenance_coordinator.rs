@@ -529,7 +529,13 @@ impl TaskJournal {
         // exactly the sealed days that never ran. Falls back to any class when
         // there is no sealed work, so quiet history never idles a worker.
         self.claim_tick = self.claim_tick.wrapping_add(1);
-        let sealed_turn = self.claim_tick.is_multiple_of(3);
+        // Every OTHER claim, not every third. Measured after the reservation
+        // shipped: sealed work went from 0 of 278 task starts to 8 of 131
+        // (6.1%), far short of the intended third, because a sealed turn falls
+        // back to any class whenever the operation being claimed has no eligible
+        // sealed task — and rollup work sits behind its own dedup. Raising the
+        // share is the direct lever on how fast coverage walks backward.
+        let sealed_turn = self.claim_tick.is_multiple_of(2);
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64)> {
             let mut class: Option<(u8, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| {
