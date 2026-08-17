@@ -8801,6 +8801,30 @@ impl Database {
                 .sum::<u64>()
                 .saturating_mul(2); // RowConverter keyed copy in dedup_batches
             let shards = dedup_shard_count(est_decoded_bytes, rewrite_bytes.max(0) as u64, decoded_budget, compressed_budget);
+            // K is the read/decode AMPLIFICATION of this rewrite, and nothing
+            // logged it. Each shard is an independent query over the SAME files
+            // (`N shards paid N scans + sorts + writes`, below), so the partition
+            // is decoded K times and every row is md5-hashed K times to keep
+            // 1/K of them.
+            //
+            // K = ceil(est_decoded / budget), and `est_decoded` is deliberately
+            // pessimistic — max(rows x bytes_per_row, compressed x inflation) x 2
+            // — so every unit of over-estimate costs a whole extra pass over the
+            // data. A perf profile on 2026-08-18 put `md5::compress` at 5.71% of
+            // all CPU, above ZSTD decompression, which is what this multiplier
+            // looks like from the outside. Log the inputs so the amplification is
+            // visible before anyone tunes the estimate or the budget.
+            if shards > 1 {
+                info!(
+                    table = %table_name,
+                    shards,
+                    est_decoded_mb = est_decoded_bytes / (1 << 20),
+                    compressed_mb = rewrite_bytes.max(0) / (1 << 20),
+                    decoded_budget_mb = decoded_budget / (1 << 20),
+                    files = targets.len(),
+                    event = "dedup_rewrite_sharded"
+                );
+            }
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
             // Bucket = first byte of md5 over the dedup keys (2 hex chars =
             // DEDUP_BUCKET_COUNT buckets, evenly spread); chr(31) separates keys so
