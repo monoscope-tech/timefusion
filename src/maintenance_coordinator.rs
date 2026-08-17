@@ -622,10 +622,9 @@ impl TaskJournal {
         // the "~450 durable tasks per (project, date)" expansion that coarse
         // planning exists to undo. This stops minting them rather than
         // collapsing them afterwards.
-        for (operation, slices) in [
-            (Operation::Dedup, normal_slices.as_slice()),
-            (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices.as_slice()),
-        ] {
+        for (operation, slices) in
+            [(Operation::Dedup, normal_slices.as_slice()), (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices.as_slice())]
+        {
             for &slice in slices {
                 let key = TaskKey {
                     physical_table: match operation {
