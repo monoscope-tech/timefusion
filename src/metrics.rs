@@ -718,6 +718,17 @@ atomic_stats! {
     rollup_rebuilds_incremental,
     rollup_rebuilds_full,
     rollup_dirty_partitions,
+    /// Contiguous sealed days of rollup coverage, counting back from yesterday,
+    /// minimised over every (project, declared tier).
+    ///
+    /// This is the number that governs long-window query latency, and no
+    /// existing metric tracked it. `MIN(date)` reads as progress while the
+    /// middle stays holey — it advanced 08-01 -> 07-30 on 2026-08-17 while the
+    /// coarse tier held only 3 days — and a 30d panel needs 30 CONTIGUOUS days
+    /// in the tier it reads, so one hole anywhere in the window sends it to a
+    /// raw scan. Minimised, not averaged: a single uncovered project is a
+    /// customer whose dashboard is slow.
+    rollup_min_contiguous_days,
     rollup_oldest_invalidation_age_secs,
     rollup_scan_cohorts,
     rollup_scan_projects,
