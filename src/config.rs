@@ -286,6 +286,11 @@ const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// and buy heavy little, since its concurrency is bounded by the rewrite
 /// permits rather than by bytes.
 const HEAVY_MIN_SHARE: f64 = 0.40;
+
+/// Pool slice per in-flight coordinator job. Kept equal to the admission
+/// ceiling so a job that is allowed to decode N bytes has N bytes of pool to
+/// hold them in before it must spill; see `coordinator_share_bytes`.
+const COORDINATOR_JOB_POOL_BYTES: usize = crate::maintenance_coordinator::MAX_DECODED_BYTES as usize;
 /// Floor so a tiny box never zeroes the maintenance pool.
 const MAINTENANCE_FLOOR_BYTES: usize = GIB;
 
@@ -421,6 +426,29 @@ impl DerivedBudget {
         self.maintenance_pool_bytes
     }
 
+    /// The durable coordinator's own pool, carved off before the heavy/light
+    /// split because the coordinator is now the primary maintenance path.
+    ///
+    /// Admission lets each job hold `MAX_DECODED_BYTES`, so the pool they share
+    /// must be that ceiling times the jobs that can be in flight. It used to be
+    /// `MAX_DECODED_BYTES` flat — the admission constant reused as a pool size,
+    /// correct only while `coordinator_jobs` was 1. At 16 jobs FairSpill sliced
+    /// 512 MB sixteen ways, below `ExternalSorterMerge`'s 32 MB floor, so units
+    /// FAILED instead of spilling: prod 2026-08-17 logged 72 `Failed to
+    /// allocate additional 32.0 MB ... pool_size: 512.0 MB` in 25 minutes.
+    pub fn coordinator_share_bytes(&self) -> usize {
+        match self.profile {
+            // The CLI drives engines directly; no coordinator runs.
+            BudgetProfile::MaintenanceCli => 0,
+            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes / 2),
+        }
+    }
+
+    /// What heavy and light divide, once the coordinator has taken its share.
+    fn maintenance_split_bytes(&self) -> usize {
+        self.maintenance_pool_bytes - self.coordinator_share_bytes()
+    }
+
     /// Heavy maintenance (dedup/optimize/recompress) share — at least
     /// `HEAVY_MIN_SHARE` of the maintenance pool.
     pub fn heavy_share_bytes(&self) -> usize {
@@ -429,7 +457,7 @@ impl DerivedBudget {
         // pool — only the active engine ever allocates.
         match self.profile {
             BudgetProfile::MaintenanceCli => ((self.maintenance_pool_bytes as f64) * 0.85) as usize,
-            BudgetProfile::Server => ((self.maintenance_pool_bytes as f64) * HEAVY_MIN_SHARE) as usize,
+            BudgetProfile::Server => ((self.maintenance_split_bytes() as f64) * HEAVY_MIN_SHARE) as usize,
         }
     }
 
@@ -437,7 +465,7 @@ impl DerivedBudget {
     pub fn light_share_bytes(&self) -> usize {
         match self.profile {
             BudgetProfile::MaintenanceCli => self.heavy_share_bytes(),
-            BudgetProfile::Server => self.maintenance_pool_bytes - self.heavy_share_bytes(),
+            BudgetProfile::Server => self.maintenance_split_bytes() - self.heavy_share_bytes(),
         }
     }
 
@@ -631,6 +659,7 @@ pub fn log_derived_budget(b: &DerivedBudget) {
         logical_count_memory_gb = b.logical_count_memory_bytes() / GIB,
         writer_reserve_gb = b.writer_reserve_bytes() / GIB,
         maintenance_pool_gb = b.maintenance_pool_bytes() / GIB,
+        coordinator_share_gb = b.coordinator_share_bytes() / GIB,
         heavy_share_gb = b.heavy_share_bytes() / GIB,
         light_share_gb = b.light_share_bytes() / GIB,
         rewrite_permits = b.rewrite_permits(),
@@ -2611,7 +2640,9 @@ mod tests {
             cli.heavy_share_bytes() / GIB
         );
         assert_eq!(server.maintenance_batch_size(), "2048");
-        assert_eq!(server.light_share_bytes(), server.maintenance_pool_bytes - server.heavy_share_bytes());
+        // Server: coordinator takes its slice first, then heavy/light divide the rest.
+        assert_eq!(server.light_share_bytes(), server.maintenance_pool_bytes - server.coordinator_share_bytes() - server.heavy_share_bytes());
+        assert_eq!(cli.coordinator_share_bytes(), 0, "the CLI drives engines directly; no coordinator competes for the pool");
     }
 
     #[test]
@@ -2798,6 +2829,35 @@ mod tests {
         let small = DerivedBudget::from_limits(16 * GIB, 4);
         assert!(small.coordinator_jobs() <= 2, "a 4-core box must not run maintenance wide, got {}", small.coordinator_jobs());
         assert!(small.coordinator_jobs() * 512 * 1024 * 1024 <= small.maintenance_pool_bytes(), "concurrent units must fit a small box's pool too");
+    }
+
+    /// The coordinator pool must scale with the jobs sharing it, and the three
+    /// maintenance shares must still sum to the pool.
+    ///
+    /// Prod 2026-08-17: the pool was pinned at one `MAX_DECODED_BYTES` while
+    /// jobs went to 16, so FairSpill handed each consumer ~32 MB — right at
+    /// `ExternalSorterMerge`'s allocation floor — and 72 units failed outright
+    /// in 25 minutes instead of spilling.
+    #[test]
+    fn coordinator_pool_scales_with_its_jobs_without_overcommitting() {
+        if std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").is_ok() {
+            return;
+        }
+        for (limit_gb, cores) in [(80, 48), (16, 4), (8, 4)] {
+            let b = DerivedBudget::from_limits(limit_gb * GIB, cores);
+            let per_job = b.coordinator_share_bytes() / b.coordinator_jobs();
+            assert!(
+                per_job >= 32 * 1024 * 1024,
+                "{limit_gb} GiB/{cores}-core: each of {} jobs gets {} MB, below the 32 MB sort floor",
+                b.coordinator_jobs(),
+                per_job / (1024 * 1024)
+            );
+            assert_eq!(
+                b.coordinator_share_bytes() + b.heavy_share_bytes() + b.light_share_bytes(),
+                b.maintenance_pool_bytes(),
+                "{limit_gb} GiB/{cores}-core: maintenance shares must partition the pool, not overcommit it"
+            );
+        }
     }
 
     // Small box (16 GiB / 4 cores): degrades to K=1, nothing underflows/zeroes.

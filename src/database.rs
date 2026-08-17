@@ -5816,9 +5816,7 @@ impl Database {
     }
 
     fn coordinator_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
-        self.coordinator_runtime_env
-            .get_or_init(|| self.build_spill_runtime_env(crate::maintenance_coordinator::MAX_DECODED_BYTES as usize, "coordinator_spill"))
-            .clone()
+        self.coordinator_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.config.derived.coordinator_share_bytes(), "coordinator_spill")).clone()
     }
 
     /// Sort one flush group, picking the strategy by size.
