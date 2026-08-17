@@ -176,6 +176,9 @@ def replay(args):
         shift = datetime.now(timezone.utc) - max_ts
         print(f"[replay] shifting timestamps by {shift} so latest row lands at now (was {max_ts.isoformat()})")
 
+    if args.projects > 1:
+        print(f"[replay] fanning out across {args.projects} synthetic projects "
+              f"({args.projects}x tenants AND {args.projects}x rows)")
     print(f"[replay] target {LOCAL_HOST}:{LOCAL_PORT}  batch={args.batch}  rate={args.rate}/s")
     placeholders = "(" + ", ".join(["%s"] * len(COLUMNS)) + ")"
 
@@ -185,7 +188,7 @@ def replay(args):
     per_batch_delay = args.batch / args.rate if args.rate > 0 else 0
 
     with psycopg.connect(LOCAL_URL, autocommit=True) as conn, conn.cursor() as cur:
-        for batch in _batches(_iter_dump(shift), args.batch):
+        for batch in _batches(_iter_dump(shift, args.projects), args.batch):
             sql = (f"INSERT INTO otel_logs_and_spans ({', '.join(COLUMNS)}) VALUES "
                    + ", ".join([placeholders] * len(batch)))
             flat: list[Any] = []
@@ -211,7 +214,31 @@ def replay(args):
     print(f"[replay] done: inserted={inserted} errs={errors} duration={dur:.1f}s rate={inserted/max(dur,1e-3):,.0f}/s")
 
 
-def _iter_dump(shift: timedelta | None) -> Iterable[dict]:
+# Stable namespace so synthetic tenants are reproducible across runs — the
+# acceptance replay has to be able to query the same fanned-out projects it
+# wrote, and re-deriving them beats persisting a list.
+FANOUT_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+
+
+def fanout_project_ids(base: str, n: int) -> list[str]:
+    """The synthetic tenants a `--projects n` replay writes to.
+
+    n == 1 keeps the dump's own project_id, so a plain replay is unchanged.
+    Deterministic, so `validate` can address them without a side-channel.
+    """
+    if n <= 1:
+        return [base]
+    return [str(uuid.uuid5(FANOUT_NS, f"{base}#{i}")) for i in range(n)]
+
+
+def _iter_dump(shift: timedelta | None, projects: int = 1) -> Iterable[dict]:
+    """Yield dump rows, optionally fanned out across `projects` synthetic tenants.
+
+    Fan-out multiplies BOTH tenant count and ingest volume by `projects`, which
+    is what the 10x acceptance target means: the per-project maintenance work
+    (dedup/rollup/packing slices) scales with tenants, not just with row count,
+    and a rate-only replay never exercises that.
+    """
     with gzip.open(DUMP, "rt") as f:
         for line in f:
             row = json.loads(line)
@@ -220,9 +247,12 @@ def _iter_dump(shift: timedelta | None) -> Iterable[dict]:
                     if row.get(k):
                         row[k] = (datetime.fromisoformat(row[k]) + shift).isoformat()
                 row["date"] = datetime.fromisoformat(row["timestamp"]).date().isoformat()
-            # Force a fresh id so retried replays don't dedupe.
-            row["id"] = str(uuid.uuid4())
-            yield row
+            for pid in fanout_project_ids(row["project_id"], projects):
+                clone = dict(row)
+                clone["project_id"] = pid
+                # Force a fresh id so retried replays don't dedupe.
+                clone["id"] = str(uuid.uuid4())
+                yield clone
 
 
 def _batches(it: Iterable[dict], size: int) -> Iterable[list[dict]]:
@@ -302,12 +332,20 @@ def validate(args):
             passed &= ok
             print(f"  [{'PASS' if ok else 'FAIL'}] {name:24s} = {v:,.1f}   target: {desc}")
 
-        print(f"\n# query latency (pid={pid})")
+        # Acceptance is per-TENANT, not for one lucky tenant: the target is that
+        # popular windows are fast for every project, including the whale. With
+        # --projects N, time each query across the same fanned-out ids the
+        # replay wrote and judge on the WORST one — an average over tenants
+        # hides exactly the tail this work exists to fix.
+        pids = fanout_project_ids(pid, args.projects)
+        print(f"\n# query latency ({len(pids)} project(s), judged on the worst)")
         for name, (q, budget) in QUERIES.items():
-            t = _time_query(cur, q, {"pid": pid})
-            ok = t <= budget
+            times = [_time_query(cur, q, {"pid": p}) for p in pids]
+            worst = max(times)
+            ok = worst <= budget
             passed &= ok
-            print(f"  [{'PASS' if ok else 'FAIL'}] {name:10s} {t*1000:8.1f} ms   budget: {budget*1000:.0f} ms")
+            spread = "" if len(times) == 1 else f"   p50 {sorted(times)[len(times) // 2] * 1000:.1f} ms over {len(times)} tenants"
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name:10s} worst {worst * 1000:8.1f} ms   budget: {budget * 1000:.0f} ms{spread}")
 
     sys.exit(0 if passed else 1)
 
@@ -350,12 +388,21 @@ def main():
     r = sub.add_parser("replay", help="INSERT dump into local TF")
     r.add_argument("--batch", type=int, default=500, help="rows per INSERT (default 500)")
     r.add_argument("--rate", type=float, default=0, help="cap inserts/sec (default unlimited)")
+    r.add_argument("--projects", type=int, default=1,
+                   help="fan each row out across N synthetic projects (default 1). "
+                        "N>1 multiplies BOTH tenant count and ingest volume by N — "
+                        "this is the knob for the 10x acceptance replay, because "
+                        "per-project maintenance work scales with tenants, not rows.")
     r.add_argument("--shift-to-now", action="store_true",
                    help="shift timestamps so first row lands at current time (default off)")
     r.set_defaults(func=replay)
 
     v = sub.add_parser("validate", help="run diagnostic queries + check targets")
     v.add_argument("--project", help="project_id (defaults to first row of dump)")
+    v.add_argument("--projects", type=int, default=1,
+                   help="check the N synthetic projects a `replay --projects N` wrote; "
+                        "latency is judged on the WORST tenant, since the target is "
+                        "every project being fast, not the average")
     v.set_defaults(func=validate)
 
     args = ap.parse_args()
