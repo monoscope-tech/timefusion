@@ -9306,13 +9306,20 @@ impl Database {
     /// of invalidations to a journal that is already ~18k deep, and the point is
     /// to converge steadily without burying the live frontier.
     pub async fn plan_rollup_backfill(&self) -> Result<usize> {
-        /// Newest-first per pass; the pass repeats on the same 60s cadence as
-        /// compaction-debt planning, so the horizon fills in over hours.
-        /// One partition expands to ~450 durable tasks (a day of slices x
-        /// Dedup/BaseRollup/HotPacking x each declared tier), so this is not
-        /// "8 tasks" — it is thousands. Shipped at 8 and the journal went from
-        /// 18.5k to 92k pending in ~25 minutes.
-        const BACKFILL_PARTITIONS_PER_PASS: usize = 2;
+        /// Newest-first per pass, repeating on the same 60s cadence as
+        /// compaction-debt planning.
+        ///
+        /// This was 2 because one partition used to expand to ~450 durable
+        /// tasks (a day of ten-minute slices x Dedup/BaseRollup/HotPacking x
+        /// each tier) — shipping it at 8 took the journal from 18.5k to 92k
+        /// pending in 25 minutes. Day-sized units retired that expansion: a
+        /// partition is now one Dedup plus one task per declared rollup tier,
+        /// about three. Holding the old number kept the enqueue rate ~150x
+        /// below what the queue can absorb, so the 30-day horizon would take
+        /// days to even be QUEUED. At 24 the whole horizon
+        /// (12 projects x 35 days) is queued in under 20 minutes, and
+        /// `BACKFILL_PENDING_CEILING` still bounds the journal.
+        const BACKFILL_PARTITIONS_PER_PASS: usize = 24;
         /// Stop queueing more history while the queue is already deep. Every
         /// `claim_next` scans the task set, so an over-full journal taxes the
         /// live frontier to buy work that cannot start for hours anyway. The
@@ -9383,7 +9390,7 @@ impl Database {
                 };
                 want.retain(|key| !covered.contains(key));
             }
-            // Skip any day that already has rollup work queued. `invalidate`
+            // Skip any day that already has ROLLUP work queued. `invalidate`
             // takes `deadline.max(new_deadline)`, so re-invalidating a day that
             // already has an eligible task pushes that task's deadline OUT by a
             // full finalization delay. A planner running every 60s would then
@@ -9391,13 +9398,22 @@ impl Database {
             // caught exactly that: two rollup-parity tests went from correct
             // totals to building nothing at all.
             //
-            // "Nothing has touched it" is the actual precondition of a backfill,
-            // so make it literal.
+            // Scoped to the operations this planner actually enqueues. It used
+            // to match ANY non-complete task on the source, which quietly made
+            // unrelated file debt veto rollup coverage: a day carrying a stuck
+            // `SealedConsolidation` or an outstanding `HotPacking` could never
+            // be backfilled. Prod 2026-08-17 — the whale's Aug 15
+            // `SealedConsolidation` sat on attempt 370, and after the
+            // coarse-backfill migration retired the fine-grained historical
+            // tasks there was nothing left to claim and nothing allowed to
+            // replace it: every task start for 30 minutes was today's, rollup
+            // coverage froze at three days, and 7d/14d queries fell back to a
+            // full raw scan (`rollup_miss_not_built`).
             {
                 let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let queued: HashSet<(String, chrono::NaiveDate)> = journal
                     .tasks()
-                    .filter(|task| task.key.source == source && task.state != crate::maintenance_coordinator::TaskState::Complete)
+                    .filter(|task| task.key.source == source && crate::maintenance_coordinator::blocks_rollup_backfill(task))
                     .filter_map(|task| {
                         chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| (task.key.project_id.clone(), time.date_naive()))
                     })
