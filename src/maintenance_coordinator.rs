@@ -410,6 +410,93 @@ impl TaskJournal {
         Some(removed)
     }
 
+    /// Collapse a sealed day's leftover ten-minute units into one day unit.
+    ///
+    /// The live path mints a unit per ten-minute slice per project per tier,
+    /// which is right while the day IS the frontier and pure overhead once it
+    /// seals: ~144 units where one would do, each paying the same fixed
+    /// object-store cost regardless of how little it covers. That is the whole
+    /// shape of the backlog — prod 2026-08-17 sat at 18,040 pending with dedup,
+    /// base-rollup and hot-packing each around 5,000, draining at roughly the
+    /// rate the next midnight refills it. At ten times the projects it does not
+    /// merely lag, it diverges.
+    ///
+    /// One-shot migration `migrate_fine_grained_backfill` did this once for the
+    /// historical backlog; this is the recurring form, because every midnight
+    /// creates another day of it.
+    ///
+    /// Anti-loop guard: a day whose day-unit ALREADY exists in any state is
+    /// skipped. `split_time_task` leaves the parent `Superseded` when a unit is
+    /// too big, so without this a whale's day would be split into children,
+    /// coarsened back into a day, split again, forever.
+    pub fn coarsen_sealed_slices(&mut self, now_micros: i64) -> usize {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let day_of = |start: i64| start.div_euclid(DAY_MICROS) * DAY_MICROS;
+        let coarsenable = |task: &MaintenanceTask| {
+            matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
+                && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                && !is_live_frontier(task.key.slice, now_micros)
+                && task.key.slice.width() < DAY_MICROS
+        };
+        // The day units that already exist, in ANY state — the guard above.
+        let existing: HashSet<(String, String, String, Operation, i64)> = self
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.key.slice.width() >= DAY_MICROS)
+            .map(|task| {
+                (task.key.physical_table.clone(), task.key.source.clone(), task.key.project_id.clone(), task.key.operation, day_of(task.key.slice.start_micros))
+            })
+            .collect();
+
+        let mut groups: HashMap<(String, String, String, Operation, i64), u64> = HashMap::new();
+        for task in self.snapshot.tasks.iter().filter(|task| coarsenable(task)) {
+            let group = (
+                task.key.physical_table.clone(),
+                task.key.source.clone(),
+                task.key.project_id.clone(),
+                task.key.operation,
+                day_of(task.key.slice.start_micros),
+            );
+            if existing.contains(&group) {
+                continue;
+            }
+            *groups.entry(group).or_default() += task.estimated_decoded_bytes;
+        }
+        if groups.is_empty() {
+            return 0;
+        }
+        let collapsed = self.snapshot.tasks.len();
+        self.snapshot.tasks.retain(|task| {
+            !coarsenable(task)
+                || !groups.contains_key(&(
+                    task.key.physical_table.clone(),
+                    task.key.source.clone(),
+                    task.key.project_id.clone(),
+                    task.key.operation,
+                    day_of(task.key.slice.start_micros),
+                ))
+        });
+        let collapsed = collapsed - self.snapshot.tasks.len();
+        self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
+        for ((physical_table, source, project_id, operation, day), bytes) in groups {
+            let Ok(slice) = TimeSlice::new(day, day.saturating_add(DAY_MICROS)) else { continue };
+            self.upsert(MaintenanceTask {
+                key: TaskKey { physical_table, source, project_id, slice, operation },
+                state: TaskState::Pending,
+                deadline_micros: now_micros,
+                estimated_decoded_bytes: bytes,
+                hash_shard: 0,
+                hash_shards: 1,
+                attempts: 0,
+                created_unix_ms: u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default(),
+                retry_reason: None,
+                publication: None,
+            });
+        }
+        collapsed
+    }
+
     pub fn upsert(&mut self, task: MaintenanceTask) {
         self.dirty_tasks.insert(task.key.clone());
         if let Some(index) = self.task_indices.get(&task.key).copied() {
@@ -1788,6 +1875,58 @@ mod tests {
         assert_eq!(claimed.state, TaskState::Running);
         assert_eq!(claimed.attempts, 1);
         assert!(journal.claim_next(Operation::Dedup, 0).is_none());
+    }
+
+    /// A sealed day's ten-minute leftovers collapse into one day unit — but
+    /// never one that would undo a split.
+    ///
+    /// The live path mints a unit per ten-minute slice, which is right while
+    /// the day is the frontier and pure overhead once it seals: ~144 units
+    /// where one would do, each paying the same fixed object-store cost. Prod
+    /// 2026-08-17 sat at 18,040 pending, refilled every midnight at about the
+    /// rate it drained. At ten times the projects that diverges.
+    ///
+    /// The guard matters as much as the collapse: `split_time_task` leaves a
+    /// too-big parent `Superseded`, so coarsening its children back into a day
+    /// would split, coarsen, split, forever.
+    #[test]
+    fn a_sealed_days_fine_slices_collapse_but_never_undo_a_split() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+
+        // Day 3: ten-minute leftovers, nothing coarse above them.
+        for slot in 0..6 {
+            let start = 3 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 10, 0);
+        }
+        // Day 5: same, but its day unit was already split into these children.
+        for slot in 0..6 {
+            let start = 5 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 10, 0);
+        }
+        let parent = task("p", 5 * DAY_MICROS, 6 * DAY_MICROS, Operation::BaseRollup).key;
+        journal.enqueue(parent.clone(), 0, 0, 0);
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1));
+        assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "the parent must be superseded for the guard to be exercised");
+
+        let collapsed = journal.coarsen_sealed_slices(now);
+        assert!(collapsed >= 6, "day 3's leftovers must collapse, got {collapsed}");
+
+        let widths = |day: i64| {
+            journal
+                .tasks()
+                .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= day * DAY_MICROS && t.key.slice.start_micros < (day + 1) * DAY_MICROS)
+                .map(|t| t.key.slice.width())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(widths(3), vec![DAY_MICROS], "day 3 is now exactly one day-sized unit");
+        assert!(
+            widths(5).iter().all(|w| *w < DAY_MICROS),
+            "day 5 already had a day unit that was SPLIT; recreating it would loop forever, got {:?}",
+            widths(5)
+        );
     }
 
     /// Among sealed work, a day-sized unit outranks yesterday's ten-minute

@@ -10172,6 +10172,23 @@ impl Database {
             if backfilled != 0 {
                 info!(backfilled, event = "maintenance_rollup_backfill_planned");
             }
+            // Same cadence, and the reason is the same shape: work nothing else
+            // will ever retire. A sealed day's ten-minute units are the live
+            // path's granularity outliving its purpose — ~144 where one would
+            // do — and every midnight mints another day of them. Collapsing
+            // them is what keeps the queue from growing at the rate projects
+            // are added.
+            let collapsed = {
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let collapsed = journal.coarsen_sealed_slices(crate::clock::now_micros());
+                if collapsed != 0 {
+                    journal.checkpoint()?;
+                }
+                collapsed
+            };
+            if collapsed != 0 {
+                info!(collapsed, event = "maintenance_sealed_slices_coarsened");
+            }
         }
         // Tantivy coverage census: metadata-only, so it is throttled by wall
         // clock rather than admission. Every 15 minutes keeps
