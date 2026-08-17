@@ -9734,14 +9734,31 @@ impl Database {
                 }
                 if derived {
                     let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
-                    let contained_slice = tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
-                        && tag(crate::maintenance_coordinator::TAG_SLICE_START)
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .is_some_and(|start| start >= key.slice.start_micros)
-                        && tag(crate::maintenance_coordinator::TAG_SLICE_END)
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .is_some_and(|end| end <= key.slice.end_micros);
-                    if !contained_slice {
+                    // OVERLAP, not containment. A base file is tagged with the
+                    // slice of the UNIT that wrote it, and that unit's width is
+                    // unrelated to this one's: the backfill writes day-wide base
+                    // units while derived units are an hour. Containment made a
+                    // day-tagged file impossible to select from an hour-wide
+                    // derived slice (`day_end <= hour_end` is never true), so
+                    // every backfilled day published rows=0 and was then marked
+                    // complete — prod 2026-08-17: project 87576849 had 17,705
+                    // rows in the 1m tier for 08-03 and its 1h unit for 08-03
+                    // produced nothing. Only days written by the live frontier
+                    // (ten-minute units, which DO fit an hour) ever had a 1h
+                    // tier, which is why 14d/30d queries never routed.
+                    //
+                    // Reading a wider file is safe because the aggregation
+                    // already bounds rows exactly
+                    // (`timestamp >= slice.start AND timestamp < slice.end`),
+                    // and rebuilt generations are removed from the snapshot, so
+                    // no row is counted twice.
+                    let (Some(start), Some(end)) = (
+                        tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                        tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                    ) else {
+                        continue;
+                    };
+                    if tag(crate::maintenance_coordinator::TAG_PROJECT) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
                         continue;
                     }
                 }
