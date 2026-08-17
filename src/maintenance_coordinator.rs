@@ -727,7 +727,7 @@ impl TaskJournal {
         // One in two ran ~6h without an OOM. Raising it again needs the per-sort
         // budget cut to pay for it (the documented 2026-07-04 pairing), not just
         // a bigger share.
-        // ...and give it up entirely while the frontier is behind. The comment
+        // ...and halve it while the frontier is behind. The comment
         // above names `eligible_watermark_lag_seconds` as the dial to turn when
         // the frontier stops keeping up; this turns it automatically, in both
         // directions, instead of waiting for someone to notice.
@@ -741,9 +741,27 @@ impl TaskJournal {
         // Safe in the direction that matters: the 3-in-4 sealed share
         // OOM-killed prod at 124.9 GB because sealed partitions are far larger
         // than frontier slices. This moves share AWAY from sealed, so it cannot
-        // reproduce that. And it is self-limiting — the frontier is small in
-        // volume, so it drains quickly, the lag falls, and sealed resumes.
-        let sealed_turn = self.claim_tick.is_multiple_of(2) && self.frontier_lag_secs.load(std::sync::atomic::Ordering::Relaxed) <= FRONTIER_LAG_BUDGET_SECS;
+        // reproduce that.
+        //
+        // HALVED to one-in-four, not withdrawn. The comment above calls the
+        // frontier "small in volume", but `LIVE_FRONTIER_WINDOW_MICROS` is 24
+        // HOURS — a full day of ten-minute slices across every stream, which on
+        // prod 2026-08-17 was ~7.8 units/min of creation against 3.8 claimed,
+        // hence a lag climbing past 98 minutes. Withdrawing the reservation
+        // entirely would let the frontier catch up fastest but would stop the
+        // sealed backfill that builds 30d coverage, and coverage is the other
+        // half of the same goal. One in four leaves both moving.
+        //
+        // This is not merely a freshness knob: `rollup_min_contiguous_days`
+        // counts back from YESTERDAY, so a frontier that never finishes today
+        // guarantees tomorrow's yesterday is holed, and the coverage metric can
+        // never leave zero. Frontier health is a PREREQUISITE for the coverage
+        // goal, not a competitor to it.
+        let sealed_turn = if self.frontier_lag_secs.load(std::sync::atomic::Ordering::Relaxed) > FRONTIER_LAG_BUDGET_SECS {
+            self.claim_tick.is_multiple_of(4)
+        } else {
+            self.claim_tick.is_multiple_of(2)
+        };
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64, i64)> {
             let mut class: Option<(u8, i64, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| {
@@ -2047,10 +2065,14 @@ mod tests {
         };
 
         assert!(claims(0) > 0, "a keeping-up frontier must still leave sealed work its reserved share");
-        assert_eq!(
-            claims(FRONTIER_LAG_BUDGET_SECS + 1),
-            0,
-            "past the lag budget every claim must go to the frontier, because each hybrid query is paying for that lag"
+        assert!(
+            claims(FRONTIER_LAG_BUDGET_SECS + 1) < claims(0),
+            "past the lag budget the frontier must take a bigger share, because a frontier that never finishes today \
+             guarantees tomorrow's yesterday is holed and coverage can never reach thirty contiguous days"
+        );
+        assert!(
+            claims(FRONTIER_LAG_BUDGET_SECS + 1) > 0,
+            "but sealed must keep SOME share: withdrawing it entirely stops the backfill that builds 30d coverage"
         );
     }
 
