@@ -991,7 +991,25 @@ fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Oper
     use crate::maintenance_coordinator::Operation;
     match operation {
         Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => COORDINATOR_FILE_REWRITE_TIMEOUT,
-        Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup => COORDINATOR_STANDARD_UNIT_TIMEOUT,
+        // Rollup builds get the longer deadline too, because their cost is set
+        // by the INPUT FILE COUNT and narrowing the slice does not reduce it.
+        //
+        // A large tenant's sealed day is not yet compacted, so its files are
+        // unsorted and each spans the whole day: prod 2026-08-17, a ONE-MINUTE
+        // window over the whale read `active_add_files=828`,
+        // `active_add_files_bytes=1803177094`. A day-sized rollup therefore
+        // reads all 828 files whatever its width, cannot finish in 300s, and —
+        // because time-bisection cannot shrink a file set whose every member
+        // spans the day — never converges either. That tenant published no
+        // historical coverage at all while smaller ones reached eleven days.
+        //
+        // Safe to lengthen where dedup is not: a rollup unit takes no rewrite
+        // permit, and its memory is bounded by GROUP CARDINALITY rather than
+        // input size, so a long unit holds a worker but not the heap. The
+        // abandonment bisection still bounds it — a unit that misses even this
+        // deadline twice is split.
+        Operation::BaseRollup | Operation::DerivedRollup => COORDINATOR_FILE_REWRITE_TIMEOUT,
+        Operation::Dedup => COORDINATOR_STANDARD_UNIT_TIMEOUT,
     }
 }
 
@@ -20707,6 +20725,18 @@ mod tests {
             super::COORDINATOR_STANDARD_UNIT_TIMEOUT,
             "a longer packing deadline must not widen dedup's fairness bound"
         );
+        // Rollup builds DO get the longer deadline: their cost tracks the input
+        // file count, which narrowing the slice cannot reduce while a sealed
+        // day's files are still unsorted and each spans it (prod 2026-08-17 —
+        // 828 files for a one-minute whale window). Dedup stays short because
+        // it is the one that rewrites.
+        for operation in [crate::maintenance_coordinator::Operation::BaseRollup, crate::maintenance_coordinator::Operation::DerivedRollup] {
+            assert_eq!(
+                super::coordinator_operation_timeout(operation),
+                super::COORDINATOR_FILE_REWRITE_TIMEOUT,
+                "{operation:?} must outlive the 300s bound a whale day cannot meet"
+            );
+        }
         assert_eq!(
             super::coordinator_operation_timeout(crate::maintenance_coordinator::Operation::SealedConsolidation),
             super::COORDINATOR_FILE_REWRITE_TIMEOUT
