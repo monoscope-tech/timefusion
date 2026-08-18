@@ -1696,6 +1696,26 @@ fn partition_file_fp(mut files: Vec<String>) -> u64 {
 /// UTC dates covered by a `[lo, hi]` microsecond window, or `None` when the
 /// window is unbounded/invalid/wider than a year (bounds the per-date
 /// fingerprint checks; such queries just keep DedupExec).
+/// A partition's identity hash plus the row timestamps its files span.
+#[derive(Clone, Copy)]
+struct PartitionStats {
+    fingerprint: u64,
+    min_ts: i64,
+    max_ts: i64,
+}
+
+impl PartitionStats {
+    /// Whether this partition may hold rows in `[lo, hi)`.
+    ///
+    /// A partition whose files carry no timestamp statistics reports the
+    /// sentinel range (`min > max`) and is treated as OVERLAPPING. Excluding it
+    /// would drop a project from the coverage requirement on the strength of a
+    /// statistic that is not there — the direction that undercounts.
+    fn overlaps(&self, lo: i64, hi: i64) -> bool {
+        self.min_ts > self.max_ts || (self.min_ts < hi && self.max_ts >= lo)
+    }
+}
+
 /// Sort and coalesce half-open ranges, merging any that touch or overlap.
 fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     ranges.sort_unstable();
@@ -3695,23 +3715,36 @@ impl Database {
             // to, so a day still being written is compared on the part the build
             // actually read. A partition with no coverage gets the whole-partition
             // question and simply fails to match below.
-            Self::partition_fingerprints_bounded(&table, tiebreak_of(&route.source), &|project, date| {
+            Self::partition_stats_bounded(&table, tiebreak_of(&route.source), &|project, date| {
                 self.rollup_coverage
                     .get(&(project.to_string(), route.source.clone(), route.target.clone(), date.to_string()))
                     .map_or(i64::MAX, |coverage| coverage.covered_through)
             })
             .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
-        // Pinned: the one project. Grouped: every project the SOURCE holds data
-        // for in this window — taken from the source, never from the tier, so a
+        // Pinned: the one project. Grouped: every project the SOURCE holds rows
+        // for IN THIS WINDOW — taken from the source, never from the tier, so a
         // project whose rollup was never built still counts against the coverage
         // rather than quietly vanishing from the answer.
+        //
+        // The window test is what makes this usable. Asking only "has a partition
+        // on this DATE" pulls in every dormant tenant that wrote a handful of rows
+        // at some other hour, and since coverage is intersected across the set,
+        // one of them with no rollup voids the range for everyone. Prod 2026-08-18:
+        // `missing_project` went to 0 and `not_built` became the whole miss
+        // profile — 13 projects hold tier partitions, and one of them has a single
+        // day with 4 rows. A project with no rows in the window can be dropped
+        // safely: its rollup rows for that range are equally empty, so it
+        // contributes nothing to the leg either way.
         let window_dates: std::collections::HashSet<String> = dates.iter().map(chrono::NaiveDate::to_string).collect();
         let projects: Vec<String> = match &route.project_id {
             Some(project) => vec![project.clone()],
             None => {
-                let mut projects: Vec<String> =
-                    fingerprints.keys().filter(|(_, date)| window_dates.contains(date)).map(|(project, _)| project.clone()).collect();
+                let mut projects: Vec<String> = fingerprints
+                    .iter()
+                    .filter(|((_, date), stats)| window_dates.contains(date) && stats.overlaps(route.lo, route.hi))
+                    .map(|((project, _), _)| project.clone())
+                    .collect();
                 projects.sort_unstable();
                 projects.dedup();
                 projects
@@ -3746,6 +3779,7 @@ impl Database {
         // a day drags that day into the raw leg instead of being silently omitted
         // from the answer.
         let mut per_project: Vec<Vec<(i64, i64)>> = Vec::with_capacity(projects.len());
+        let mut first_uncovered: Option<(String, String)> = None;
         for project in &projects {
             let mut covered: Vec<(i64, i64)> = Vec::new();
             for date in &dates {
@@ -3759,13 +3793,18 @@ impl Database {
                 // partition, which is the only question a rollout has to answer.
                 let Some(coverage) = self.rollup_coverage.get(&key) else {
                     miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
+                    // A miss counter alone cannot be acted on — the same lesson
+                    // `rollup_miss_sampled` exists for. `not_built` folds every
+                    // project into one number, and with coverage intersected
+                    // across the set a SINGLE uncovered project refuses the whole
+                    // query. Name it, or finding it costs a manual sweep.
+                    first_uncovered.get_or_insert_with(|| (project.clone(), date.clone()));
                     continue;
                 };
                 let source_fp = fingerprints
                     .get(&(project.clone(), date.clone()))
                     .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
-                    .copied()
-                    .unwrap_or_default();
+                    .map_or(0, |stats| stats.fingerprint);
                 let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
                 if coverage.source_fp != source_fp || coverage.source_epoch != source_epoch {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
@@ -3813,6 +3852,21 @@ impl Database {
         // are certified, so this caps the whole set rather than trimming a tail.
         let horizon = buffered.unwrap_or(route.hi);
         let realtime = self.config.maintenance.timefusion_rollup_realtime_tail;
+        // Sampled on the same limiter as `rollup_miss_sampled`, so a
+        // multiple-per-second miss rate cannot flood the log.
+        if let Some((project, date)) = &first_uncovered
+            && crate::metrics::sample_rollup_miss()
+        {
+            warn!(
+                project_id = %project,
+                date = %date,
+                source = %route.source,
+                target = %route.target,
+                projects_in_window = projects.len(),
+                event = "rollup_uncovered_project",
+                "a project in the window has no rollup coverage; with coverage intersected across the set this refuses the whole query"
+            );
+        }
         // With the tail off, the pre-fringe contract stands exactly: the rollup
         // answers the whole window or nothing at all.
         if !realtime && (miss.is_some() || horizon < route.hi || route.lo.rem_euclid(route.grain) != 0 || route.hi.rem_euclid(route.grain) != 0) {
@@ -11424,6 +11478,16 @@ impl Database {
     fn partition_fingerprints_bounded(
         table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
     ) -> Result<HashMap<(String, String), u64>> {
+        Ok(Self::partition_stats_bounded(table, tiebreak, bound_for)?.into_iter().map(|(key, stats)| (key, stats.fingerprint)).collect())
+    }
+
+    /// As [`Self::partition_fingerprints_bounded`], but also carrying the row
+    /// timestamps each partition's files span — one pass, since the fingerprint
+    /// already folds those in and the add-actions scan is the dominant cost of
+    /// planning a rollup route.
+    fn partition_stats_bounded(
+        table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
+    ) -> Result<HashMap<(String, String), PartitionStats>> {
         use std::hash::{Hash, Hasher};
         let snapshot = table.snapshot()?.snapshot();
         let actions = snapshot.add_actions_table(true)?;
@@ -11491,7 +11555,7 @@ impl Database {
             .map(|(key, identity)| {
                 let mut hasher = fnv::FnvHasher::default();
                 identity.hash(&mut hasher);
-                (key, hasher.finish())
+                (key, PartitionStats { fingerprint: hasher.finish(), min_ts: identity.1, max_ts: identity.2 })
             })
             .collect())
     }
@@ -20083,6 +20147,31 @@ mod tests {
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
     fn far_future() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
+    /// Which projects the coverage must hold for is decided by this test, and
+    /// coverage is INTERSECTED across them — so pulling in a dormant tenant that
+    /// wrote nothing in the window refuses the query for everyone. Prod
+    /// 2026-08-18: 13 projects hold tier partitions and one has a single day with
+    /// 4 rows, which is why `not_built` became the entire miss profile once
+    /// `missing_project` was fixed.
+    #[test]
+    fn a_partition_outside_the_window_does_not_join_the_coverage_requirement() {
+        let stats = |min_ts, max_ts| PartitionStats { fingerprint: 0, min_ts, max_ts };
+        // Wholly before, wholly after: not in the window.
+        assert!(!stats(0, 50).overlaps(100, 200));
+        assert!(!stats(300, 400).overlaps(100, 200));
+        // Half-open: a row exactly at `hi` is outside, one exactly at `lo` is in.
+        assert!(!stats(200, 250).overlaps(100, 200));
+        assert!(stats(100, 100).overlaps(100, 200));
+        // Straddling either edge, and strictly containing, all overlap.
+        assert!(stats(50, 150).overlaps(100, 200));
+        assert!(stats(150, 250).overlaps(100, 200));
+        assert!(stats(0, 1000).overlaps(100, 200));
+        // No timestamp statistics: the sentinel range must be treated as
+        // OVERLAPPING. Dropping a project on the strength of a statistic that is
+        // not there is the direction that undercounts.
+        assert!(stats(i64::MAX, i64::MIN).overlaps(100, 200));
     }
 
     /// The intersection is the whole safety argument for cross-project routing:
