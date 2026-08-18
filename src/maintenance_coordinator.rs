@@ -588,6 +588,21 @@ impl TaskJournal {
             }
             *groups.entry(group).or_default() += task.estimated_decoded_bytes;
         }
+        // Only fuse a day that will actually FIT. Coarsening is a win because one
+        // day unit does one full-day scan where 144 slices each did the same scan
+        // — but a day unit that cannot finish inside its deadline does none of
+        // them, and that is strictly worse than the slices it replaced.
+        //
+        // Measured after #178 shipped: BaseRollup began timing out at 900s for
+        // the first time (4 in a 10-minute window), and rollup output collapsed
+        // from ~9,000 rows/min to 10 — 469 rows in 46 minutes. The split-on-claim
+        // and abandon-bisect paths were expected to right-size those units and did
+        // not, or not nearly fast enough.
+        //
+        // The children's own estimates are already summed here, so the test is
+        // free. A day over budget keeps its slices: they complete, which beats a
+        // day unit that repeatedly times out and publishes nothing.
+        groups.retain(|_, bytes| *bytes <= MAX_DECODED_BYTES);
         if groups.is_empty() {
             return 0;
         }
@@ -2255,6 +2270,52 @@ mod tests {
     /// query scans that tail — and prod 2026-08-17 reached 62 minutes of it.
     /// So the reservation yields while the frontier is behind, and returns on
     /// its own once it is not.
+    /// Coarsening must not build a day unit that cannot finish. One day unit doing
+    /// one full-day scan beats 144 slices each doing the same scan — but only if
+    /// it completes. A day over the decode budget publishes nothing and times out
+    /// repeatedly, which is strictly worse than the slices it replaced.
+    ///
+    /// Measured after #178: BaseRollup timed out at 900s for the first time (4 in
+    /// a 10-minute window) and rollup output collapsed from ~9,000 rows/min to 10.
+    #[test]
+    fn coarsening_skips_a_day_that_would_not_fit_the_decode_budget() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+
+        // Day 1: six slices whose combined estimate fits comfortably. Must fuse.
+        let small = MAX_DECODED_BYTES / 12;
+        for slot in 0..6 {
+            let start = DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, small, 0);
+        }
+        // Day 4: six slices that together blow the budget. Must stay as slices.
+        let big = MAX_DECODED_BYTES / 2;
+        for slot in 0..6 {
+            let start = 4 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("q", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, big, 0);
+        }
+
+        journal.coarsen_sealed_slices(now);
+
+        let widths = |project: &str, day: i64| {
+            journal
+                .tasks()
+                .filter(|t| {
+                    t.state == TaskState::Pending
+                        && t.key.project_id == project
+                        && t.key.slice.start_micros >= day * DAY_MICROS
+                        && t.key.slice.start_micros < (day + 1) * DAY_MICROS
+                })
+                .map(|t| t.key.slice.width())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(widths("p", 1), vec![DAY_MICROS], "a day that fits must fuse into one unit");
+        assert_eq!(widths("q", 4).len(), 6, "a day over budget must keep its slices — they finish, a too-big day unit never does");
+        assert!(widths("q", 4).iter().all(|w| *w < DAY_MICROS));
+    }
+
     /// A COMPLETE day unit must not block coarsening, or the queue fills with
     /// sub-day slices that can never collapse.
     ///
