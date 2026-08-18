@@ -43,7 +43,34 @@ pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 /// unit hold a slot almost continuously.
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
-        Operation::Dedup => 5 * 60,
+        // Dedup used to get 5 minutes because it held a rewrite permit and its
+        // memory was bounded by INPUT SIZE, unlike a rollup. #161 removed the
+        // hash-sharded passes, so the streaming branch is now a
+        // `BoundedWindowAggExec(mode=Sorted)` over a spillable `SortExec` —
+        // bounded by one key group, not by input — and that argument no longer
+        // holds.
+        //
+        // 5 minutes is also simply below what this class of work costs. Measured
+        // 2026-08-18 with `maintenance_unit_slow`, the comparable file rewrites
+        // complete at 320-440s against their 900s deadline (51-64% headroom):
+        //
+        //     SealedConsolidation  440s, 363s, 335s
+        //     HotPacking           320s
+        //
+        // Dedup over the same window logged 12 timeouts and NOT ONE slow
+        // completion — nothing finished between 75s and 300s. Its units are
+        // bimodal: quick, or past the deadline. And a minimum-width unit cannot
+        // be shrunk to fit: `byte_bounded_units` bisects in time only while the
+        // slice is wider than MIN_SLICE_MICROS, below which it emits hash shards,
+        // which `split_time_task` refuses. So the unit retries whole, forever, at
+        // full cost — the same trap #168 fixed for repair.
+        //
+        // REVERT TRIGGER: if dedup timeouts do not fall, this makes things WORSE,
+        // because the waste per timeout scales with the deadline (12 x 300s ->
+        // 12 x 900s). Watch `maintenance_coordinator_unit_timed_out` with
+        // `operation=Dedup`; if it holds near 12 per 20 minutes, put this back to
+        // 5 * 60 and shrink the units instead.
+        Operation::Dedup => 15 * 60,
         Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
     }
 }
