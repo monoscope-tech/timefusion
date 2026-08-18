@@ -1716,6 +1716,24 @@ impl PartitionStats {
     }
 }
 
+/// Days of contiguous rollup coverage below which the maintenance cycle favours
+/// the rollup chain over independent file debt.
+///
+/// A 14d panel is the most common wide dashboard window and the cheapest useful
+/// target; 30d follows once 14 holds. Set at the goal rather than at 1 so the
+/// weighting does not flap the moment the first day lands.
+const COVERAGE_SHORT_DAYS: u64 = 14;
+
+/// Is contiguous rollup coverage short enough to be worth reweighting for?
+///
+/// Reads the gauge `rollup_coverage_contiguity` publishes — the minimum over
+/// every (project, declared tier) of contiguous sealed days counting back from
+/// yesterday. That is exactly the number a 14d/30d query needs, and it is
+/// already computed once per backfill sweep, so this costs an atomic load.
+fn coverage_is_short() -> bool {
+    crate::metrics::maintenance_stats().rollup_min_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
+}
+
 /// Sort and coalesce half-open ranges, merging any that touch or overlap.
 fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     ranges.sort_unstable();
@@ -10782,10 +10800,38 @@ impl Database {
             Operation::BaseRollup,
             Operation::Repair,
         ];
-        let start = self.maintenance_schedule_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % CYCLE.len();
+        // While contiguous coverage is short, the rollup chain takes the slots.
+        //
+        // `dependencies_complete` makes BaseRollup depend on NOTHING — base
+        // publication does its own bounded dedup before aggregating — so of the
+        // balanced cycle above, six slots in ten go to work that cannot advance
+        // the metric governing 14d/30d latency. Measured 2026-08-18: 15,799
+        // pending base+derived rollup tasks against 19,351 of dedup, packing,
+        // consolidation and repair, with the 1h tier holding 3-6 days per project
+        // and `rollup_min_contiguous_days` at 0.
+        //
+        // The trade is explicit and is the one the goal asks for: deferring dedup
+        // leaves more duplicates for read-side `DedupExec` to collapse, which
+        // costs raw scans time — but a day the rollup covers is not raw-scanned at
+        // all. Every operation keeps at least one slot, so nothing starves, and
+        // this reverts to the balanced cycle by itself once coverage is healthy.
+        const COVERAGE_SHORT_CYCLE: [Operation; 10] = [
+            Operation::BaseRollup,
+            Operation::DerivedRollup,
+            Operation::BaseRollup,
+            Operation::Dedup,
+            Operation::BaseRollup,
+            Operation::DerivedRollup,
+            Operation::HotPacking,
+            Operation::BaseRollup,
+            Operation::SealedConsolidation,
+            Operation::Repair,
+        ];
+        let cycle = if coverage_is_short() { &COVERAGE_SHORT_CYCLE } else { &CYCLE };
+        let start = self.maintenance_schedule_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cycle.len();
         let mut attempted = [false; 6];
-        for offset in 0..CYCLE.len() {
-            let operation = CYCLE[(start + offset) % CYCLE.len()];
+        for offset in 0..cycle.len() {
+            let operation = cycle[(start + offset) % cycle.len()];
             let index = operation as usize;
             if attempted[index] {
                 continue;
@@ -20232,6 +20278,66 @@ mod tests {
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
     fn far_future() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
+    /// The reweighting must move slots to the rollup chain WITHOUT starving
+    /// anything: file debt left at zero is how file counts ran to 2-3k and
+    /// degraded every query (2026-08-01), so each operation keeps a slot.
+    #[test]
+    fn the_coverage_short_cycle_favours_rollup_without_starving_file_work() {
+        use crate::maintenance_coordinator::Operation;
+        // Mirrors the two cycles in `run_coordinator_maintenance_once`. Kept here
+        // as data so the ratios are asserted rather than merely intended.
+        let balanced = [
+            Operation::Dedup,
+            Operation::BaseRollup,
+            Operation::DerivedRollup,
+            Operation::HotPacking,
+            Operation::Dedup,
+            Operation::BaseRollup,
+            Operation::SealedConsolidation,
+            Operation::Dedup,
+            Operation::BaseRollup,
+            Operation::Repair,
+        ];
+        let coverage_short = [
+            Operation::BaseRollup,
+            Operation::DerivedRollup,
+            Operation::BaseRollup,
+            Operation::Dedup,
+            Operation::BaseRollup,
+            Operation::DerivedRollup,
+            Operation::HotPacking,
+            Operation::BaseRollup,
+            Operation::SealedConsolidation,
+            Operation::Repair,
+        ];
+        let count = |cycle: &[Operation; 10], op: Operation| cycle.iter().filter(|candidate| **candidate == op).count();
+        let chain = |cycle: &[Operation; 10]| count(cycle, Operation::BaseRollup) + count(cycle, Operation::DerivedRollup);
+
+        assert_eq!(chain(&balanced), 4, "precondition: the balanced cycle gives the rollup chain 4 of 10");
+        assert_eq!(chain(&coverage_short), 6, "the coverage-short cycle must give the rollup chain 6 of 10");
+        // Nothing starves. Each of these has its own incident behind it.
+        for op in [Operation::Dedup, Operation::HotPacking, Operation::SealedConsolidation, Operation::Repair] {
+            assert!(count(&coverage_short, op) >= 1, "{op:?} must keep at least one slot");
+        }
+        assert_eq!(balanced.len(), coverage_short.len(), "same length, so the rotating cursor behaves identically");
+    }
+
+    /// The reweighting is self-limiting: it must switch off once coverage reaches
+    /// the target, or it becomes a permanent tax on file hygiene.
+    #[test]
+    fn the_reweighting_switches_off_once_coverage_is_healthy() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+        let restore = gauge.load(Relaxed);
+        gauge.store(0, Relaxed);
+        assert!(coverage_is_short(), "zero contiguous days is short");
+        gauge.store(COVERAGE_SHORT_DAYS - 1, Relaxed);
+        assert!(coverage_is_short(), "one day below target is still short");
+        gauge.store(COVERAGE_SHORT_DAYS, Relaxed);
+        assert!(!coverage_is_short(), "at the target the balanced cycle returns");
+        gauge.store(restore, Relaxed);
     }
 
     /// Which projects the coverage must hold for is decided by this test, and
