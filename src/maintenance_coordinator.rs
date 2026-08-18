@@ -945,8 +945,18 @@ impl TaskJournal {
         // nothing. Rollup coverage could not advance behind that no matter how
         // the scheduling cycle was weighted.
         let backoff_micros = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
-        let floor_micros = i64::try_from(operation_deadline_secs(key.operation).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
-        self.retry(key, "worker_error".to_owned(), now_micros.saturating_add(backoff_micros.max(floor_micros)));
+        // The floor applies only after a REPEAT, for the same reason the split
+        // above does: a FairSpillPool can squeeze out a perfectly sized unit that
+        // would succeed untouched next pass, and making that unit wait a full
+        // deadline would be a 15-minute penalty for someone else's memory spike.
+        // A unit that has now failed twice is the one that is actually oversized.
+        let delay_micros = if attempts >= 2 {
+            let floor_micros = i64::try_from(operation_deadline_secs(key.operation).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+            backoff_micros.max(floor_micros)
+        } else {
+            backoff_micros
+        };
+        self.retry(key, "worker_error".to_owned(), now_micros.saturating_add(delay_micros));
     }
 
     /// A unit that failed because its input did not FIT will fail identically
@@ -1453,6 +1463,26 @@ mod tests {
             deadline_micros / 1_000_000,
             (not_before - now) / 1_000_000
         );
+    }
+
+    /// A FIRST abandonment must still come back fast. The pool is a FairSpillPool,
+    /// so a correctly sized unit can be squeezed out by someone else's memory
+    /// spike and succeed untouched next pass — making that wait a full deadline
+    /// would penalise the innocent case. Only a repeat says the unit is oversized,
+    /// which is the same threshold the split above already uses.
+    #[test]
+    fn a_first_abandonment_is_not_floored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut unit = task("p", 0, 1, Operation::Repair);
+        unit.attempts = 1;
+        unit.state = TaskState::Running;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        journal.abandon_running(&key, 0);
+        let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
+        assert_eq!(not_before, 2 * 1_000_000, "one failure retries on plain exponential backoff, not the deadline floor");
     }
 
     /// The floor must not REPLACE exponential backoff, only raise it. A unit that
