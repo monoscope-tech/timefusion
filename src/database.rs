@@ -9839,14 +9839,31 @@ impl Database {
         if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
             return Ok(0);
         }
-        {
+        // Defers the ENQUEUE, not the pass. The ceiling exists because a deep
+        // journal taxes every `claim_next`, which is an argument about minting
+        // MORE work — and this function does three other things that cost the
+        // journal nothing and that nothing else does:
+        //
+        //   * recomputes `rollup_min_contiguous_days`, THE goal gauge, which
+        //     `coverage_is_short()` reads to weight the whole scheduling cycle;
+        //   * proves the base tier for queued derived units (below);
+        //   * logs `rollup_coverage_contiguity`, the only per-project view of
+        //     coverage that exists.
+        //
+        // Returning early took all of that with it. Prod 2026-08-18 23:30 UTC
+        // sat at 61,306 pending against a 25,000 ceiling — and the frontier
+        // alone keeps it there indefinitely — so the pass had not run at all,
+        // the gauge everything reads was a stale 0, and #186's proof could never
+        // fire. A ceiling that is permanently closed is not a safety valve.
+        let defer_enqueue = {
             let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let pending = journal.tasks().filter(|task| task.state != crate::maintenance_coordinator::TaskState::Complete).count();
-            if pending >= BACKFILL_PENDING_CEILING {
-                debug!(pending, ceiling = BACKFILL_PENDING_CEILING, event = "rollup_backfill_deferred");
-                return Ok(0);
+            let defer = pending >= BACKFILL_PENDING_CEILING;
+            if defer {
+                debug!(pending, ceiling = BACKFILL_PENDING_CEILING, event = "rollup_backfill_enqueue_deferred");
             }
-        }
+            defer
+        };
         let today = crate::clock::today_utc();
         let earliest = today - chrono::Duration::days(horizon);
         let mut queued = 0usize;
@@ -10029,7 +10046,7 @@ impl Database {
                     info!(source, proven, event = "rollup_derived_base_tier_proven");
                 }
             }
-            if want.is_empty() {
+            if want.is_empty() || defer_enqueue {
                 continue;
             }
             // Newest first: recent days are what dashboards actually read, and
@@ -20617,6 +20634,60 @@ mod tests {
         // applies, so ordinary frontier work keeps retrying promptly.
         let sealed = TimeSlice::new(0, HOUR).expect("sealed slice");
         assert_eq!(super::buffered_source_retry_delay(sealed, now).as_secs(), 5, "an already-sealed slice keeps the fast retry");
+    }
+
+    /// The backfill ceiling must defer only the ENQUEUE, never the whole pass.
+    ///
+    /// Prod 2026-08-18 23:30 UTC sat at 61,306 pending against the 25,000
+    /// ceiling — and the live frontier alone keeps it above that indefinitely —
+    /// so `plan_rollup_backfill` returned at its first statement every 60s for
+    /// hours. That silently took THREE other things with it, none of which mint
+    /// any work: the `rollup_min_contiguous_days` gauge that `coverage_is_short`
+    /// reads to weight the entire scheduling cycle (stale at 0 the whole time),
+    /// the per-project `rollup_coverage_contiguity` log, and #186's base-tier
+    /// proof for already-queued derived units.
+    #[tokio::test]
+    async fn the_backfill_ceiling_defers_enqueueing_without_stopping_the_pass() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cfg = (*create_test_config("backfill-ceiling-pass")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
+        let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, ts)])?], true, None).await?;
+
+        // Stuff the journal past the ceiling with work unrelated to rollup.
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            for i in 0..25_100i64 {
+                journal.enqueue(
+                    TaskKey {
+                        physical_table: "debt".to_owned(),
+                        source: "debt".to_owned(),
+                        project_id: format!("dummy{i}"),
+                        slice: TimeSlice::new(i * 60_000_000, (i + 1) * 60_000_000)?,
+                        operation: Operation::Repair,
+                    },
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
+        let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+        let restore = gauge.load(Relaxed);
+        // A value the pass cannot legitimately produce for this fixture, so only
+        // a pass that actually RAN can overwrite it.
+        gauge.store(u64::MAX, Relaxed);
+        let queued = db.plan_rollup_backfill().await?;
+        let recomputed = gauge.load(Relaxed);
+        gauge.store(restore, Relaxed);
+
+        assert_eq!(queued, 0, "past the ceiling nothing new is enqueued");
+        assert_ne!(recomputed, u64::MAX, "but the pass still ran and recomputed the goal gauge");
+        Ok(())
     }
 
     /// The debt cap must leave workers for the rollup chain without starving debt
