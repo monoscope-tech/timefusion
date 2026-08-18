@@ -2355,8 +2355,17 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     let derived_before = derived_of(Arc::clone(&db), project_id.clone()).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("y-late", "cart", 999, yesterday_noon + 90_000_000)?], true, None).await?;
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    // Past the live-frontier window too, so the late row's day is SEALED whatever
+    // hour the suite runs at. `yesterday_noon` is only `12 + H` hours old at UTC
+    // hour H, so before noon it falls INSIDE LIVE_FRONTIER_WINDOW_MICROS and takes
+    // the frontier scheduling path rather than the sealed one this asserts on.
+    // That made the test pass at 23:00 UTC and fail at 03:00 UTC on the very same
+    // commit — it failed CI on 2026-08-18 and reproduced identically on master.
     timefusion::clock::advance_micros(
-        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+        timefusion::maintenance_coordinator::LIVE_FRONTIER_WINDOW_MICROS
+            + timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS
+            + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS
+            + 1,
     );
     // Twice: the first drain may escalate, the second rebuilds the covering slice.
     db.run_maintenance_units(1024).await?;
