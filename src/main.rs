@@ -301,10 +301,12 @@ fn run_sim_cli() -> anyhow::Result<()> {
             "--scale" => cfg.duration_scale = value("--scale")?.parse().context("--scale must be a number")?,
             "--seed" => cfg.seed = u64::from_str_radix(value("--seed")?.trim_start_matches("0x"), 16).context("--seed must be hex")?,
             "--restarts-every-hours" => {
-                cfg.restart_every_micros = (value("--restarts-every-hours")?.parse::<f64>().context("--restarts-every-hours must be a number")? * 3_600_000_000.0) as i64
+                cfg.restart_every_micros =
+                    (value("--restarts-every-hours")?.parse::<f64>().context("--restarts-every-hours must be a number")? * 3_600_000_000.0) as i64
             }
             "--restart-at-hours" => {
-                cfg.restart_at_micros = Some((value("--restart-at-hours")?.parse::<f64>().context("--restart-at-hours must be a number")? * 3_600_000_000.0) as i64)
+                cfg.restart_at_micros =
+                    Some((value("--restart-at-hours")?.parse::<f64>().context("--restart-at-hours must be a number")? * 3_600_000_000.0) as i64)
             }
             "--no-mint" => cfg.mint_frontier = false,
             "--json" => json = true,

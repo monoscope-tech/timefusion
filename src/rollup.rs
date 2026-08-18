@@ -1758,7 +1758,6 @@ mod tests {
         assert_eq!(hours_from_stats_json("not json", day_start), None);
     }
 
-
     fn spec() -> RollupSpec {
         crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
     }

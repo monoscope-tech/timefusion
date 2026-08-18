@@ -9622,7 +9622,9 @@ impl Database {
                             let mask = chrono::NaiveDate::parse_from_str(&partition.1, "%Y-%m-%d")
                                 .ok()
                                 .and_then(|date| date.and_hms_opt(0, 0, 0))
-                                .and_then(|day| add.stats.as_deref().and_then(|stats| crate::rollup::hours_from_stats_json(stats, day.and_utc().timestamp_micros())))
+                                .and_then(|day| {
+                                    add.stats.as_deref().and_then(|stats| crate::rollup::hours_from_stats_json(stats, day.and_utc().timestamp_micros()))
+                                })
                                 .unwrap_or(crate::rollup::ALL_HOURS);
                             partitions_with_adds.insert(partition.clone());
                             *partition_hours.entry(partition).or_insert(0) |= mask;
@@ -10169,19 +10171,12 @@ impl Database {
     /// inference. Point TIMEFUSION_DATA_DIR at a scratch dir: the journal must
     /// hold no other claimable work, or the coordinator may claim that first.
     pub async fn run_unit_once(
-        &self,
-        source: &str,
-        project_id: &str,
-        date: chrono::NaiveDate,
-        operation: crate::maintenance_coordinator::Operation,
-        slice_hours: i64,
+        &self, source: &str, project_id: &str, date: chrono::NaiveDate, operation: crate::maintenance_coordinator::Operation, slice_hours: i64,
     ) -> Result<UnitRunReport> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, MaintenanceTask, Operation, TaskKey, TaskState, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
         let schema = get_schema(source).ok_or_else(|| anyhow::anyhow!("unknown source table {source}"))?;
-        let base_table = || {
-            schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name(source))
-        };
+        let base_table = || schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name(source));
         let physical_table = match operation {
             Operation::BaseRollup => base_table().ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?,
             Operation::DerivedRollup => schema

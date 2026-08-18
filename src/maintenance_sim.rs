@@ -69,7 +69,16 @@ pub struct SimConfig {
 
 impl Default for SimConfig {
     fn default() -> Self {
-        Self { workers: 16, horizon_micros: 24 * 60 * 60 * MICROS, mint_frontier: true, streams: None, duration_scale: 1.0, restart_every_micros: 0, restart_at_micros: None, seed: 0x5EED }
+        Self {
+            workers: 16,
+            horizon_micros: 24 * 60 * 60 * MICROS,
+            mint_frontier: true,
+            streams: None,
+            duration_scale: 1.0,
+            restart_every_micros: 0,
+            restart_at_micros: None,
+            seed: 0x5EED,
+        }
     }
 }
 
@@ -193,9 +202,12 @@ impl Coverage {
         for (source, project) in &self.pairs {
             let mut contiguous = 0u64;
             let mut day = yesterday;
-            while self.days.get(&(source.clone(), project.clone())).and_then(|days| days.get(&day)).is_some_and(|widths| {
-                widths[0] >= DAY_MICROS && widths[1] >= DAY_MICROS
-            }) {
+            while self
+                .days
+                .get(&(source.clone(), project.clone()))
+                .and_then(|days| days.get(&day))
+                .is_some_and(|widths| widths[0] >= DAY_MICROS && widths[1] >= DAY_MICROS)
+            {
                 contiguous += 1;
                 day -= DAY_MICROS;
             }
@@ -282,10 +294,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         streams.truncate(target);
     }
 
-    let mut coverage = Coverage {
-        days: HashMap::new(),
-        pairs: streams.iter().map(|s| (s.source.clone(), s.project_id.clone())).collect(),
-    };
+    let mut coverage = Coverage { days: HashMap::new(), pairs: streams.iter().map(|s| (s.source.clone(), s.project_id.clone())).collect() };
     // Seed coverage from already-complete rollup tasks so a fetched journal
     // starts with the coverage prod actually has.
     for task in journal.tasks() {
@@ -294,7 +303,11 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         }
     }
 
-    let mut report = SimReport { hours: cfg.horizon_micros as f64 / 3_600_000_000.0, pending_start: journal.tasks().filter(|t| t.state != TaskState::Complete).count(), ..Default::default() };
+    let mut report = SimReport {
+        hours: cfg.horizon_micros as f64 / 3_600_000_000.0,
+        pending_start: journal.tasks().filter(|t| t.state != TaskState::Complete).count(),
+        ..Default::default()
+    };
     let mut workers = (0..cfg.workers).map(|_| Worker { busy_until: start_micros, current: None, cycle_pos: 0 }).collect::<Vec<_>>();
     let mut next_mint = start_micros + MINT_INTERVAL_MICROS;
     let mut next_restart = match (cfg.restart_at_micros, cfg.restart_every_micros) {
@@ -602,12 +615,7 @@ mod tests {
 
         let cfg_10x = SimConfig { streams: Some(260), ..cfg(2) };
         let report_10x = run(journal_with_streams(13), &cfg_10x, start).unwrap();
-        assert!(
-            report_10x.pending_end > 10 * pending_13.max(1),
-            "10x must diverge: pending {} vs {} at 13 projects",
-            report_10x.pending_end,
-            pending_13
-        );
+        assert!(report_10x.pending_end > 10 * pending_13.max(1), "10x must diverge: pending {} vs {} at 13 projects", report_10x.pending_end, pending_13);
         assert!(report_10x.frontier_lag_secs_max > report_13.frontier_lag_secs_max + 600, "10x lag must clearly exceed the 13-project lag");
     }
 
