@@ -538,6 +538,79 @@ The honest resolution is the one already shipping: for a KNOWN-oversized day,
 the quarantine cap bounds what that lesson costs to two workers instead of
 sixteen. The two changes cover the two cases; neither covers both.
 
+### Measured after #181 shipped (2026-08-18 22:08 UTC, image `c8d3c6b`)
+
+240s window on the new process. The stall is gone:
+
+| metric | before | after |
+|---|---|---|
+| `tasks_complete` | **+0.67/min** | **+13.94/min** |
+| `tasks_pending` | rising | **−1,868/min** |
+| `pending_base_rollup` | +0.33/min (*rising*) | **−1,127/min** |
+| `rollup_output_rows_total` | +5.67/min | **+123,205/min** |
+| `rollup_rebuilds_full_total` | ~0 | +19.17/min |
+| `rollup_hits_full_total` | 0 | 66 (first ever non-zero) |
+| `rollup_hits_hybrid_total` | +9.33/min | +32.61/min |
+
+Caveat, stated because this plan's §12 demands it: the process was 5 minutes old,
+so part of the `pending` drop is boot-time coarsening rather than completion, and
+the ≥2h rule has not been met. `tasks_complete` (+21x) and `rollup_output_rows`
+are the honest throughput numbers; both are unambiguous.
+
+**G2 is NOT yet met.** Immediately after the deploy, shipbubble's 1d / 7d / 30d
+queries all still time out at 60s. Two causes visible in `EXPLAIN`, both
+independent of maintenance throughput:
+
+1. **The query does not route to a rollup at all** — the plan is a raw
+   mem+hot+delta union with no tier leg. Consistent with `rollup_miss_not_built`
+   dominating (+10.5/min).
+2. **`GatedScanExec: permits=0`** — the wide-scan gate is saturated, the exact
+   signature documented at `config.rs:2558` for 2026-08-01 (a query reading ONE
+   file and 8.24 KB paid 40-57s purely queued). A 1-day window is deeper than
+   `timefusion_wide_scan_lookback_hours`, so it is gated, and nothing is
+   available. The hot leg for that query also carries **430 file groups** for a
+   single day — the fragmentation above, seen from the read side.
+
+This confirms §3's claim that latency has two independent halves, and locates
+the second half precisely: it is the gate plus file count, not coverage depth.
+
+### Where the coverage actually is (ground truth, Phase 1.3 — done)
+
+Read directly from the tier tables rather than the gauge:
+
+| project | 1m tier days | 1h tier days |
+|---|---|---|
+| 94c5dc1f | 33 | 17 |
+| 98fdd4f3 | 33 | 10 |
+| be87ebc1 | 33 | 9 |
+| 8100121c | 33 | — |
+| shipbubble `28f62f01` | 14 | **6** (08-15..18, plus stale 07-25/26) |
+
+Two things follow, and both correct this plan:
+
+- **`rollup_min_contiguous_days` = 0 is an artifact**, again. The minimum is
+  dragged to zero by dormant tenants (`d828e6d5` has one day; `edb04135` stops
+  at 2026-08-03). It is a fleet MINIMUM, so one abandoned project pins
+  `coverage_is_short()` true forever — which currently biases the scheduler in a
+  direction we happen to want, but is not a signal anyone should trust or tune
+  against. **G1 must be restated per-project, not as a fleet minimum.**
+- **The gap is the DERIVED (1h) tier, not the base.** The base 1m tier is 33 days
+  deep on most projects while 1h sits at 9-17. Derived units need no raw scan —
+  they aggregate the base tier — so this is the cheapest work in the system and
+  the closest to the 30d goal. Yet `pending_derived_rollup` barely moves
+  (780 → 757, −5.7/min) while base drains at −1,127/min.
+
+**That makes derived-rollup throughput the next thing to attribute.** The
+candidate mechanism is `dependencies_complete`: a `DerivedRollup` is claimable
+only when COMPLETE `BaseRollup` *journal tasks* contiguously cover its slice —
+journal bookkeeping, not the base tier's actual coverage. A historical day whose
+1m tier exists but whose base journal records do not would be permanently
+unclaimable, and `claim_next` skips it silently, with no counter. That would be
+the sixth silent refusal in this family (#155, #159, #166, #169, and #180's
+guard above). **Not yet proven** — starvation alone could explain the old
+numbers. The discriminator is now available and cheap: with workers free, if
+`pending_derived_rollup` stays flat, it is the dependency gate.
+
 ---
 
 ## 6. Phase 2 — aim the backfill at the goal (enqueue control)
