@@ -533,12 +533,42 @@ impl TaskJournal {
                 && !is_live_frontier(task.key.slice, now_micros)
                 && task.key.slice.width() < DAY_MICROS
         };
-        // The day units that already exist, in ANY state — the guard above.
+        // Every day unit EXCEPT a completed one. In-flight units must still block,
+        // to avoid duplicating claimed work; a SUPERSEDED one must block too, and
+        // that is load-bearing — `split_time_task` supersedes a day unit when it
+        // is too big and replaces it with children, so re-coarsening those would
+        // rebuild the oversized parent and split/coarsen forever
+        // (`coarsen_sealed_slices` has a test that pins exactly this).
+        //
+        // A COMPLETE day unit is different: it is not evidence the day is too big,
+        // only that it was built once. Blocking on it is what let the queue fill
+        // with sub-day slices that can never be collapsed.
+        //
+        // Once a day had been rolled up once, its day unit stayed in the journal
+        // as Complete forever, so every later invalidation for that day minted a
+        // ten-minute slice that hit `continue` here and was processed alone. And
+        // a slice is not cheaper than the day: an uncompacted sealed partition's
+        // files each span the WHOLE day, so timestamp-stat pruning cannot skip
+        // any of them and a ten-minute slice reads the same ~828 files a day unit
+        // would. Prod 2026-08-18 measured the consequence directly, via the phase
+        // timing from #174:
+        //
+        //     scan_ms=481682  stage_ms=30  commit_ms=961  rows=142
+        //
+        // Eight minutes of scanning to produce 142 rows, 99.8% of it in the read,
+        // and 144 of those per day where one would do. Meanwhile
+        // `maintenance_sealed_slices_coarsened` logged ZERO in 30 minutes against
+        // 37,065 pending base rollups.
+        //
+        // Re-coarsening a completed day is not lost work: `upsert` replaces the
+        // Complete day task with a Pending one, which is correct — the day is
+        // dirty again, that is why the slices exist — and rebuilding it as one
+        // unit costs one scan instead of 144.
         let existing: HashSet<(String, String, String, Operation, i64)> = self
             .snapshot
             .tasks
             .iter()
-            .filter(|task| task.key.slice.width() >= DAY_MICROS)
+            .filter(|task| task.key.slice.width() >= DAY_MICROS && task.state != TaskState::Complete)
             .map(|task| {
                 (task.key.physical_table.clone(), task.key.source.clone(), task.key.project_id.clone(), task.key.operation, day_of(task.key.slice.start_micros))
             })
@@ -2225,6 +2255,59 @@ mod tests {
     /// query scans that tail — and prod 2026-08-17 reached 62 minutes of it.
     /// So the reservation yields while the frontier is behind, and returns on
     /// its own once it is not.
+    /// A COMPLETE day unit must not block coarsening, or the queue fills with
+    /// sub-day slices that can never collapse.
+    ///
+    /// Once a day was rolled up once, its day task stayed in the journal as
+    /// Complete forever, so every later invalidation minted a ten-minute slice
+    /// that was skipped here and processed alone. A slice is not cheaper than the
+    /// day: an uncompacted sealed partition's files each span the WHOLE day, so a
+    /// ten-minute slice reads the same files a day unit would. Prod 2026-08-18,
+    /// via the phase timing from #174:
+    ///
+    ///     scan_ms=481682  stage_ms=30  commit_ms=961  rows=142
+    ///
+    /// Eight minutes of scanning for 142 rows, 144 times a day where once would
+    /// do, while `maintenance_sealed_slices_coarsened` logged ZERO against 37,065
+    /// pending base rollups.
+    #[test]
+    fn a_completed_day_unit_does_not_block_coarsening_but_a_superseded_one_does() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+
+        // Day 2: a day unit that already ran to completion, plus fresh slices
+        // minted by a later invalidation. These MUST collapse.
+        let done = task("p", 2 * DAY_MICROS, 3 * DAY_MICROS, Operation::BaseRollup).key;
+        journal.enqueue(done.clone(), 0, 0, 0);
+        journal.complete(&done);
+        assert_eq!(journal.state(&done), Some(TaskState::Complete), "precondition");
+        for slot in 0..6 {
+            let start = 2 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 10, 0);
+        }
+
+        // Day 6: a day unit SPLIT because it was too big. Its children must NOT
+        // collapse, or the split is undone and the two fight forever.
+        let parent = task("p", 6 * DAY_MICROS, 7 * DAY_MICROS, Operation::BaseRollup).key;
+        journal.enqueue(parent.clone(), 0, 0, 0);
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1));
+        assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "precondition");
+
+        journal.coarsen_sealed_slices(now);
+
+        let widths = |day: i64| {
+            journal
+                .tasks()
+                .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= day * DAY_MICROS && t.key.slice.start_micros < (day + 1) * DAY_MICROS)
+                .map(|t| t.key.slice.width())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(widths(2), vec![DAY_MICROS], "a completed day must re-coarsen to one day unit, not stay as slices");
+        assert!(widths(6).iter().all(|w| *w < DAY_MICROS), "a SPLIT day's children must stay split — recoarsening them loops forever");
+    }
+
     #[test]
     fn the_sealed_reservation_yields_while_the_frontier_is_behind() {
         const DAY_MICROS: i64 = 86_400_000_000;

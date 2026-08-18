@@ -2129,6 +2129,26 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
         .filter_map(|b| b.column(0).as_primitive_opt::<Int64Type>().map(|c| c.value(0)))
         .next()
         .unwrap_or(0);
+    // On failure ONLY, print what the tier actually holds. This assertion has
+    // failed intermittently in CI (`left: 10, right: 9`) while passing 6/6 locally
+    // in isolation and 985/985 in a full local suite — it reproduces only under
+    // the concurrency of a loaded shard, so it cannot be caught by re-running it.
+    //
+    // Nine spans are inserted, so a sum of TEN is a double count, not an extra
+    // row. The dump distinguishes the two shapes that produce it — one bucket
+    // with `request_count = 2`, versus two live `rollup_generation`s covering the
+    // same bucket (the #139 shape, where a wider file and a narrower one both
+    // stay live and a SUM counts both). Those want opposite fixes, and the
+    // counter alone cannot tell them apart.
+    if built != 9 {
+        let rows = db
+            .query_delta_only(&format!(
+                "SELECT CAST(date AS VARCHAR), CAST(timestamp AS VARCHAR), request_count, rollup_generation \
+                 FROM otel_logs_and_spans_rollup_dashboard_1m_v3 WHERE project_id = '{project_id}' ORDER BY 2"
+            ))
+            .await?;
+        println!("rollup tier contents at the failing assertion:\n{}", datafusion::arrow::util::pretty::pretty_format_batches(&rows).unwrap());
+    }
     assert_eq!(built, 9, "certification must have rolled up all nine of yesterday's spans");
     let base_target = db.unified_tables().read().await.get("otel_logs_and_spans_rollup_dashboard_1m_v3").expect("base rollup table created").clone();
     let tagged_files = base_target
