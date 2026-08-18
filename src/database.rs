@@ -10297,6 +10297,19 @@ impl Database {
         // This session registers the mergeable aggregate-state UDFs used by
         // HLL and t-digest measures. The source itself is still replaced with
         // the direct, byte-pruned provider below.
+        // Phase timings for the LIVE coordinator unit. The existing
+        // `rollup_*_duration_ms` counters were only ever written by
+        // `stage_rollup_wave` / `commit_rollup_wave`, which belong to the older
+        // cohort path that no longer runs — so in production all four read 0
+        // while `rollup_commit_actions` was non-zero, and the unit that actually
+        // costs the time was completely un-instrumented.
+        //
+        // That time is the number every throughput conclusion depends on:
+        // 16 concurrent slots at 2.0 completions/min means the average unit takes
+        // ~8 minutes, and nobody has ever known which phase owns it. Scheduling
+        // was reweighted on the assumption it was queueing (#167) and moved
+        // throughput zero, because the constraint is per-unit cost.
+        let unit_started = std::time::Instant::now();
         let ctx = self.bounded_rollup_maintenance_context()?;
         let provider = TableProviderBuilder::default()
             .with_log_store(log_store)
@@ -10409,6 +10422,10 @@ impl Database {
         )?;
         let batches = by_project.remove(&key.project_id).unwrap_or_default();
         let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
+        // Everything above is read + aggregate: the source scan, the per-shard
+        // aggregates and the merge. Everything below is write.
+        let scan_ms = unit_started.elapsed().as_millis() as u64;
+        let stage_started = std::time::Instant::now();
 
         let target_ref = self.get_or_create_table(&key.project_id, &key.physical_table).await?;
         let staging_table = target_ref.read().await.clone();
@@ -10424,6 +10441,8 @@ impl Database {
             writer.write(deltalake::kernel::schema::cast_record_batch(&batch?, arrow_schema.clone(), true, true)?).await?;
         }
         let mut adds = writer.flush().await?.into_iter().map(Action::Add).collect::<Vec<_>>();
+        let stage_ms = stage_started.elapsed().as_millis() as u64;
+        let commit_started = std::time::Instant::now();
         for action in &mut adds {
             let Action::Add(add) = action else { continue };
             add.data_change = true;
@@ -10627,6 +10646,35 @@ impl Database {
             stats.rollup_output_rows.fetch_add(rows, Relaxed);
             stats.rollup_output_files.fetch_add(output_files, Relaxed);
             stats.rollup_commit_actions.fetch_add(action_count, Relaxed);
+            // The four counters that read 0 in production despite this path
+            // running constantly. Totals, so the per-phase SHARE is what to read:
+            // scan/(scan+stage+commit) says whether the ~8 minutes is the source
+            // scan or the write.
+            let commit_ms = commit_started.elapsed().as_millis() as u64;
+            let unit_ms = unit_started.elapsed().as_millis() as u64;
+            stats.rollup_scan_duration_ms.fetch_add(scan_ms, Relaxed);
+            stats.rollup_staging_duration_ms.fetch_add(stage_ms, Relaxed);
+            stats.rollup_commit_duration_ms.fetch_add(commit_ms, Relaxed);
+            stats.rollup_end_to_end_duration_ms.fetch_add(unit_ms, Relaxed);
+            // Totals cannot show a SLOW unit — one 8-minute unit and a hundred
+            // fast ones sum the same as a hundred mediocre ones. Log the outliers
+            // individually, with the phase split, so the expensive shape can be
+            // named rather than inferred.
+            if unit_ms >= 60_000 {
+                warn!(
+                    operation = ?key.operation,
+                    table = %key.physical_table,
+                    project_id = %key.project_id,
+                    rows,
+                    output_files,
+                    scan_ms,
+                    stage_ms,
+                    commit_ms,
+                    unit_ms,
+                    event = "maintenance_rollup_slow_unit",
+                    "a rollup unit took over a minute; phase split attached"
+                );
+            }
             // One coordinator unit is one (project, slice) publication, which is
             // what "staged project" counts on the cohort path too.
             stats.rollup_staged_projects.fetch_add(1, Relaxed);
