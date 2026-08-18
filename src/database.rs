@@ -2702,6 +2702,34 @@ pub struct Database {
     /// against 850s-per-packing, attempt share and slot-time share are different
     /// by two orders of magnitude.
     maintenance_debt_slots: Arc<tokio::sync::Semaphore>,
+    /// Caps how many workers may sit inside a unit that has ALREADY PROVEN it
+    /// cannot fit its deadline (`TaskJournal::QUARANTINE_ATTEMPTS` timeouts).
+    ///
+    /// #176 established that occupancy — not attempt share, not the scheduling
+    /// cycle — is the binding scarcity, and capped DEBT occupancy. That does
+    /// not reach the actual sink. Prod 2026-08-18 21:00 UTC, 60 min of logs:
+    ///
+    ///     timed out   47 units   BaseRollup 24, HotPacking 12, Sealed 11
+    ///     deadline    900s each  = 42,300 of 57,600 worker-seconds (73%)
+    ///
+    /// spent committing nothing, while ~40,000 pending BaseRollup units — the
+    /// one that completed measured 812ms — could not get a slot. Over 180s
+    /// `tasks_complete` rose by 2 with `tasks_running` pinned at 16 and
+    /// `eligible_watermark_lag_seconds` tracking wall clock exactly 1:1.
+    ///
+    /// Half those timeouts are BaseRollup, which the debt cap deliberately
+    /// exempts because rollup advances coverage — true of a rollup unit that
+    /// COMPLETES, and the exemption silently assumed they all do. Rollup units
+    /// are bimodal: `maintenance_unit_slow` fires above a quarter of the
+    /// deadline and logged not one BaseRollup in the same hour, so they either
+    /// finish inside 225s or not at all.
+    ///
+    /// This bounds the cost of a doomed unit rather than its frequency, which
+    /// is all `abandon_running`'s backoff can do — and its bisection actively
+    /// worsens the total, because halving a slice cannot halve a per-file cost
+    /// (~3.2s per parquet file, measured the same day); it only doubles the
+    /// number of units paying it.
+    maintenance_quarantine_slots: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the
     /// time-windowed target to hash-join keys; ungated bursts starve reads on a
     /// CPU-throttled box (prod 2026-07-19). Permits = `timefusion_dml_merge_concurrency`.
@@ -3333,6 +3361,12 @@ impl Database {
             // own outage (2026-08-01, files at 2-3k degrading every query), and
             // debt still holds the large majority of capacity.
             maintenance_debt_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs * 3 / 4).max(1))),
+            // An eighth, so 16 workers keep 14 for work that can still finish.
+            // Not zero: a unit that timed out under transient pressure must
+            // still get turns, and a partition whose rollup is genuinely
+            // expensive is the one the 30d goal needs most. Two workers at 900s
+            // is 1,800 of 57,600 worker-seconds — 3% — against the measured 73%.
+            maintenance_quarantine_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs / 8).max(1))),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -9984,16 +10018,30 @@ impl Database {
         Ok(queued)
     }
 
+    /// Claim one unit, bounding occupancy by units that have proven they cannot
+    /// fit their deadline. See `maintenance_quarantine_slots` for the measurement.
+    ///
+    /// The permit is taken BEFORE the claim, because whether a unit is
+    /// quarantined is a property of the task and only knowable once selected;
+    /// it is released immediately when the claim turns out to be ordinary work,
+    /// so the cap costs nothing in the common case.
+    fn claim_coordinator_task(
+        &self, operation: crate::maintenance_coordinator::Operation,
+    ) -> Option<(crate::maintenance_coordinator::MaintenanceTask, Option<tokio::sync::OwnedSemaphorePermit>)> {
+        let permit = Arc::clone(&self.maintenance_quarantine_slots).try_acquire_owned().ok();
+        let task = {
+            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            journal.claim_next(operation, crate::clock::now_micros(), permit.is_some())?
+        };
+        let quarantined = task.attempts >= crate::maintenance_coordinator::TaskJournal::QUARANTINE_ATTEMPTS;
+        Some((task, permit.filter(|_| quarantined)))
+    }
+
     async fn run_coordinator_dedup_once(&self) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources};
         use std::sync::atomic::Ordering::Relaxed;
 
-        let now = crate::clock::now_micros();
-        let task = {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            journal.claim_next(Operation::Dedup, now)
-        };
-        let Some(task) = task else { return Ok(false) };
+        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(Operation::Dedup) else { return Ok(false) };
         let key = task.key.clone();
         info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
             estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
@@ -10112,11 +10160,7 @@ impl Database {
             sync::atomic::Ordering::Relaxed,
         };
 
-        let task = {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            journal.claim_next(operation, crate::clock::now_micros())
-        };
-        let Some(task) = task else { return Ok(false) };
+        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
         let key = task.key.clone();
         info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
             estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
@@ -10757,11 +10801,7 @@ impl Database {
 
     async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources, TaskLease, TaskState};
-        let task = {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            journal.claim_next(operation, crate::clock::now_micros())
-        };
-        let Some(task) = task else { return Ok(false) };
+        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
         let key = task.key.clone();
         info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
             estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");

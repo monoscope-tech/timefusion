@@ -774,7 +774,34 @@ impl TaskJournal {
         true
     }
 
-    pub fn claim_next(&mut self, operation: Operation, now_micros: i64) -> Option<MaintenanceTask> {
+    /// Attempts after which a unit has PROVEN it does not fit its deadline.
+    ///
+    /// One timeout is a blip — a FairSpillPool squeeze, an object-store stall.
+    /// Two is the slice itself, and is exactly the threshold `abandon_running`
+    /// already uses to decide a unit is oversized rather than unlucky.
+    pub const QUARANTINE_ATTEMPTS: u32 = 2;
+
+    /// Claim one unit. `allow_quarantined` admits units that have already timed
+    /// out [`Self::QUARANTINE_ATTEMPTS`] times; the caller gates it on a small
+    /// occupancy permit so proven-unfittable work cannot hold the whole pool.
+    ///
+    /// Measured on prod 2026-08-18 21:00 UTC over 60 minutes of logs: 47 units
+    /// timed out (BaseRollup 24, HotPacking 12, SealedConsolidation 11) against
+    /// a 900s deadline each. That is 42,300 of 57,600 available worker-seconds —
+    /// 73% of ALL maintenance capacity — spent committing nothing, while
+    /// ~40,000 pending BaseRollup units could not get a slot. Over 180s
+    /// `tasks_complete` rose by 2 with `tasks_running` pinned at 16, and the one
+    /// rollup that completed took 812ms.
+    ///
+    /// Neither existing lever reaches this. `abandon_running`'s backoff decides
+    /// how OFTEN a doomed unit runs, never what it costs when it does; and its
+    /// bisection makes the total worse, because halving a slice cannot halve a
+    /// per-file cost — measured at ~3.2s per parquet file the same day — it only
+    /// doubles the number of units paying it. #176's cap bounds occupancy, which
+    /// is the right lever, but exempts BaseRollup, and BaseRollup is half the
+    /// timeouts: the exemption assumed rollup units advance coverage, which is
+    /// true only of one that COMPLETES.
+    pub fn claim_next(&mut self, operation: Operation, now_micros: i64, allow_quarantined: bool) -> Option<MaintenanceTask> {
         // The winning scheduling class, as a streaming minimum.
         //
         // This used to call `fair_ready_tasks`, which builds a BTreeMap of every
@@ -872,14 +899,15 @@ impl TaskJournal {
         } else {
             self.claim_tick.is_multiple_of(2)
         };
+        let claimable = |task: &MaintenanceTask| {
+            task.key.operation == operation
+                && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                && task.deadline_micros <= now_micros
+                && (allow_quarantined || task.attempts < Self::QUARANTINE_ATTEMPTS)
+        };
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64, i64)> {
             let mut class: Option<(u8, i64, i64)> = None;
-            for task in journal.snapshot.tasks.iter().filter(|task| {
-                task.key.operation == operation
-                    && matches!(task.state, TaskState::Pending | TaskState::Retry)
-                    && task.deadline_micros <= now_micros
-                    && !(sealed_only && is_live_frontier(task.key.slice, now_micros))
-            }) {
+            for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_live_frontier(task.key.slice, now_micros))) {
                 let candidate = scheduling_class(task, now_micros);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
                     class = Some(candidate);
@@ -891,13 +919,8 @@ impl TaskJournal {
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
         let mut fallback: Option<&MaintenanceTask> = None;
         let mut next: Option<&MaintenanceTask> = None;
-        for task in self.snapshot.tasks.iter().filter(|task| {
-            task.key.operation == operation
-                && matches!(task.state, TaskState::Pending | TaskState::Retry)
-                && task.deadline_micros <= now_micros
-                && scheduling_class(task, now_micros) == class
-                && self.dependencies_complete(task)
-        }) {
+        for task in self.snapshot.tasks.iter().filter(|task| claimable(task) && scheduling_class(task, now_micros) == class && self.dependencies_complete(task))
+        {
             if fallback.is_none_or(|current| {
                 (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
             }) {
@@ -1663,8 +1686,8 @@ mod tests {
         {
             journal.upsert(input);
         }
-        assert_eq!(journal.claim_next(Operation::Dedup, 0).expect("first").key.project_id, "a");
-        assert_eq!(journal.claim_next(Operation::Dedup, 0).expect("second").key.project_id, "b");
+        assert_eq!(journal.claim_next(Operation::Dedup, 0, true).expect("first").key.project_id, "a");
+        assert_eq!(journal.claim_next(Operation::Dedup, 0, true).expect("second").key.project_id, "b");
     }
 
     #[test]
@@ -1892,7 +1915,7 @@ mod tests {
 
         let mut sealed_claims = 0;
         for _ in 0..12 {
-            let claimed = journal.claim_next(Operation::BaseRollup, now).expect("a task is always available");
+            let claimed = journal.claim_next(Operation::BaseRollup, now, true).expect("a task is always available");
             if !is_live_frontier(claimed.key.slice, now) {
                 sealed_claims += 1;
             }
@@ -2176,10 +2199,57 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         journal.upsert(task("p", 0, MIN_SLICE_MICROS, Operation::Dedup));
-        let claimed = journal.claim_next(Operation::Dedup, 0).expect("claim");
+        let claimed = journal.claim_next(Operation::Dedup, 0, true).expect("claim");
         assert_eq!(claimed.state, TaskState::Running);
         assert_eq!(claimed.attempts, 1);
-        assert!(journal.claim_next(Operation::Dedup, 0).is_none());
+        assert!(journal.claim_next(Operation::Dedup, 0, true).is_none());
+    }
+
+    /// A unit that has proven it cannot fit its deadline must not be able to
+    /// crowd out work that can.
+    ///
+    /// Prod 2026-08-18 21:00 UTC, 60 minutes of logs: 47 units timed out at
+    /// 900s each — 42,300 of 57,600 available worker-seconds, 73% of ALL
+    /// maintenance capacity, committing nothing — while ~40,000 pending
+    /// BaseRollup units could not get a slot and `tasks_complete` advanced by 2
+    /// per 180s with `tasks_running` pinned at 16. The one rollup that did
+    /// complete took 812ms.
+    ///
+    /// Neither the backoff nor the bisection in `abandon_running` bounds this:
+    /// the backoff sets how OFTEN a doomed unit runs, not what it costs, and
+    /// halving a slice cannot halve a per-file cost (~3.2s per parquet file,
+    /// measured the same day) — it doubles the number of units paying it.
+    #[test]
+    fn a_unit_that_cannot_fit_its_deadline_does_not_crowd_out_one_that_can() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Two units, identical but for their history. The doomed one sorts
+        // FIRST on every tiebreak in `claim_next` (project id, then key), so a
+        // scheduler blind to attempts is guaranteed to pick it.
+        let doomed = task("a_doomed", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
+        let key = doomed.key.clone();
+        journal.upsert(doomed);
+        journal.upsert(task("b_fresh", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
+        // Two runs that ended in a timeout. `mark_running` is the same call
+        // `claim_next` uses to count an attempt, driven directly here so the
+        // setup does not also rotate the project-fairness cursor.
+        for _ in 0..TaskJournal::QUARANTINE_ATTEMPTS {
+            assert!(journal.mark_running(&key));
+            journal.retry(&key, "timed_out".to_owned(), 0);
+        }
+
+        // Without a quarantine slot the worker must skip it and run the unit
+        // that can still finish.
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, 0, false).expect("fresh work is claimable").key.project_id,
+            "b_fresh",
+            "a proven-unfittable unit must not be claimed while ordinary work waits"
+        );
+
+        // Deprioritised, never abandoned: with a slot it still takes its turn,
+        // or a partition whose rollup is genuinely expensive — the one the 30d
+        // goal needs most — would never gain coverage at all.
+        assert_eq!(journal.claim_next(Operation::BaseRollup, 0, true).expect("quarantined work still runs").key, key);
     }
 
     /// A sealed day's ten-minute leftovers collapse into one day unit — but
@@ -2323,7 +2393,7 @@ mod tests {
             journal.frontier_lag_secs.store(lag, std::sync::atomic::Ordering::Relaxed);
             let mut sealed_claims = 0;
             for _ in 0..8 {
-                let Some(claimed) = journal.claim_next(Operation::BaseRollup, now) else { continue };
+                let Some(claimed) = journal.claim_next(Operation::BaseRollup, now, true) else { continue };
                 if !is_live_frontier(claimed.key.slice, now) {
                     sealed_claims += 1;
                 }
@@ -2364,7 +2434,7 @@ mod tests {
         let coarse = task("p", 3 * DAY_MICROS, 4 * DAY_MICROS, Operation::BaseRollup);
         journal.enqueue(coarse.key.clone(), 0, 0, 0);
 
-        let claimed = journal.claim_next(Operation::BaseRollup, now).expect("a sealed task is claimable");
+        let claimed = journal.claim_next(Operation::BaseRollup, now, true).expect("a sealed task is claimable");
         assert_eq!(
             claimed.key.slice.width(),
             DAY_MICROS,
@@ -2516,11 +2586,11 @@ mod tests {
             journal.upsert(base);
         }
         journal.upsert(task("p", 0, DERIVED_SLICE_MICROS, Operation::DerivedRollup));
-        assert!(journal.claim_next(Operation::DerivedRollup, 0).is_none());
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none());
         for key in base_keys {
             journal.complete(&key);
         }
-        assert!(journal.claim_next(Operation::DerivedRollup, 0).is_some());
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some());
     }
 
     #[test]
@@ -2566,7 +2636,7 @@ mod tests {
         for child in children {
             journal.complete(&child);
         }
-        assert!(journal.claim_next(Operation::DerivedRollup, 0).is_some());
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some());
     }
 
     #[test]
