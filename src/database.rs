@@ -1081,6 +1081,31 @@ const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration =
 /// or dispatcher without racing the file-rewrite timeout at the same instant.
 const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
 
+/// How long before a unit whose source is still buffered could possibly run.
+///
+/// `has_rows_in_range` is not a transient condition when the slice reaches into
+/// time that has not finished yet: a day-wide unit covering TODAY sees buffered
+/// rows on every attempt until midnight, so the flat five-second retry this used
+/// to take was an unbounded spin. Prod 2026-08-18 21:00 UTC had exactly that —
+/// one BaseRollup task at **attempts=195** on today's day-wide slice, re-claimed
+/// every 30-70 seconds for hours.
+///
+/// It is not a harmless spin, because a 5s backoff leaves the task permanently
+/// eligible while genuinely fresh work still waits on a real deadline, and
+/// `claim_next` takes the smallest ready `(class, order_key)`. So the doomed few
+/// monopolise claims: of 427 task starts in 90 minutes, **134 went to tasks with
+/// 100+ attempts and 267 to tasks with 10+**, against ~40,000 pending BaseRollup
+/// units that were never reached.
+///
+/// The earliest the slice can be complete is its own end plus the finalization
+/// delay the write path already honours. Floored at five seconds, so a sealed
+/// slice merely waiting on a slow flush behaves exactly as it did before.
+fn buffered_source_retry_delay(slice: crate::maintenance_coordinator::TimeSlice, now_micros: i64) -> std::time::Duration {
+    const FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
+    let earliest = slice.end_micros.saturating_add(crate::maintenance_coordinator::FINALIZATION_DELAY_MICROS);
+    u64::try_from(earliest.saturating_sub(now_micros)).map_or(FLOOR, |micros| std::time::Duration::from_micros(micros).max(FLOOR))
+}
+
 fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Operation) -> std::time::Duration {
     use crate::maintenance_coordinator::Operation;
     match operation {
@@ -10054,7 +10079,7 @@ impl Database {
         };
 
         if self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&key.project_id, &key.source, key.slice.start_micros, key.slice.end_micros)) {
-            retry("source_not_flushed".to_owned(), std::time::Duration::from_secs(5))?;
+            retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::clock::now_micros()))?;
             return Ok(true);
         }
         let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive()) else {
@@ -10196,7 +10221,7 @@ impl Database {
         if !derived
             && self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&key.project_id, &key.source, key.slice.start_micros, key.slice.end_micros))
         {
-            retry("source_not_flushed".to_owned(), std::time::Duration::from_secs(5))?;
+            retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::clock::now_micros()))?;
             return Ok(true);
         }
 
@@ -20481,6 +20506,30 @@ mod tests {
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
     fn far_future() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
+    /// A unit whose slice has not finished yet must back off past the slice, not
+    /// spin. Prod 2026-08-18 had one BaseRollup task at attempts=195 on today's
+    /// day-wide slice: `has_rows_in_range` is true until midnight, and a flat 5s
+    /// retry left it permanently eligible, monopolising `claim_next` ahead of
+    /// ~40,000 pending units that had never run once.
+    #[test]
+    fn a_slice_that_has_not_finished_backs_off_past_its_own_end() {
+        use crate::maintenance_coordinator::{FINALIZATION_DELAY_MICROS, TimeSlice};
+        const HOUR: i64 = 3_600 * 1_000_000;
+        let now = 20 * HOUR;
+        let day = TimeSlice::new(0, 24 * HOUR).expect("day slice");
+
+        // Today's day-wide unit cannot succeed before midnight plus finalization.
+        let delay = super::buffered_source_retry_delay(day, now);
+        let expected = (24 * HOUR - now + FINALIZATION_DELAY_MICROS) as u64;
+        assert_eq!(delay.as_micros() as u64, expected, "a unit must wait out the rest of its own slice, not 5 seconds");
+        assert!(delay.as_secs() > 4 * 3_600, "the old 5s retry is what made this an unbounded spin");
+
+        // A sealed slice merely waiting on a slow flush is unchanged: the floor
+        // applies, so ordinary frontier work keeps retrying promptly.
+        let sealed = TimeSlice::new(0, HOUR).expect("sealed slice");
+        assert_eq!(super::buffered_source_retry_delay(sealed, now).as_secs(), 5, "an already-sealed slice keeps the fast retry");
     }
 
     /// The debt cap must leave workers for the rollup chain without starving debt
