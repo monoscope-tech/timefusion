@@ -459,6 +459,59 @@ are untouched.
 `pending_base_rollup` turns over; `eligible_watermark_lag_seconds` stops
 tracking wall clock 1:1.
 
+### The loop this sits in, and why the same fix is the entry point
+
+Aggregate read counters over the same 180s window:
+
+```
+parquet.files_planned   +73,535   =  408 file-opens per second
+parquet.read_time_us    +28,640s  =  ~389 ms per file, ~159 readers' worth
+parquet.bytes_read      +8.09 GB  =  45 MB/s for all that effort
+parquet.scans           +218      =  ~337 files planned PER SCAN
+```
+
+A `ScanMetadataCompleted` line for one window reads `active_add_files=186,
+active_add_files_bytes=186,419,280` — **~1 MB per file against the 256 MB
+`COORDINATOR_SEALED_TARGET_BYTES`**. Partitions are fragmented by two orders of
+magnitude, so every query and every rollup unit pays hundreds of ~389 ms
+object-store round trips to read a few megabytes.
+
+That closes a self-sustaining loop:
+
+```
+fragmented partitions -> rollup day units exceed 900s -> timeouts burn 73%
+of capacity -> HotPacking/SealedConsolidation never run -> partitions stay
+fragmented
+```
+
+Queries and maintenance are not two problems; they are the same file count seen
+from two directions. The quarantine cap is the entry point precisely because it
+is the only one of these arrows that can be cut without first fixing the others
+— it reclaims the capacity that consolidation needs, and consolidation is what
+makes both the rollup units and the queries cheap.
+
+**Sequencing that follows:** measure the reclaimed capacity first, and only then
+decide whether consolidation throughput is itself sufficient. If partitions
+defragment, rollup day units start fitting and coverage builds without any
+further change. If they do not, the next lever is consolidation's own unit cost,
+not the scheduler.
+
+### Two secondary defects found while measuring (neither is today's blocker)
+
+1. **`decode_polls_inflight` leaks.** `decode_begin`/`decode_end` bracket an
+   `await` on the object store (`database.rs:19193/19208`), so a cancelled query
+   — and prod cancels 127 per 25 min — drops the future between them and never
+   decrements. The gauge rises monotonically with `peak == current` (10,408 and
+   climbing ~200/min). Harmless to the semaphore, which returns owned permits on
+   drop, but it makes `decode_peak_batch_bytes × decode_polls_inflight_peak` —
+   the figure the comment says to size a Transient budget from — meaningless.
+2. **`DataSourceExec.output_bytes` overstates by ~15x** when batches are split
+   (1,567 MB reported vs 106 MB at the FilterExec directly above it, same
+   228.1 K rows), because a sliced batch's `get_array_memory_size` still counts
+   the whole parent buffer. Do not read that field as I/O; the plan's earlier
+   "hot leg materialises 1.5 GB" reading came from this and is wrong. The hot
+   leg's real cost is `time_elapsed_opening = 2.88s` over 48 local files.
+
 ---
 
 ## 6. Phase 2 — aim the backfill at the goal (enqueue control)
