@@ -929,14 +929,42 @@ fn build_optimize_session_state_tuned(
 /// the rollup tier. A project whose ROLLUP is broken still has recent source
 /// partitions, so it stays counted; asking the tier instead would let the very
 /// failure this metric exists to catch exclude itself from it.
+/// The window the contiguity gauge reports over, and the value it saturates at.
+/// Equal to the 30d dashboard goal: 30 means a 30d panel is fully answerable.
+const CONTIGUITY_HORIZON_DAYS: u64 = 30;
+
 fn min_contiguous_days<'a>(
-    covered: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&'a str>,
+    covered: &HashSet<(String, chrono::NaiveDate)>, source: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&'a str>,
 ) -> (u64, Option<&'a str>) {
+    // A day the SOURCE never held counts as covered. A rollup cannot exist for
+    // rows that do not exist, and a query over that day correctly returns
+    // nothing whether or not a tier partition is there — so an absent day is
+    // answered, not missing.
+    //
+    // Without this the gauge is unreachable by construction, and it was:
+    // measured 2026-08-18, project 4f020cf8 held source rows on 08-14 (85),
+    // 08-16 (4) and 08-18 (8) and NOTHING on 08-15 or 08-17. Its tier matches
+    // that exactly, so the tier is correct and complete — yet counting back from
+    // yesterday it scored 0, and because this is a MINIMUM over active projects
+    // it pinned the whole fleet's gauge to 0 no matter how much coverage every
+    // other project had. `6297304f` scored 4 and `5ce1c976` 1 in the same sweep.
+    //
+    // The goal is "30 contiguous days a 30d panel can answer from the tier", not
+    // "30 days on which every tenant happened to send traffic". One quiet
+    // low-traffic tenant must not make the target unattainable for the fleet.
+    let answered = |project: &str, date: chrono::NaiveDate| {
+        let key = (project.to_owned(), date);
+        covered.contains(&key) || !source.contains(&key)
+    };
+    // Bounded, because "answered" is true for every day before a project's first
+    // row: without a cap a quiet tenant scores the age of the epoch. 30 is the
+    // goal itself, so the gauge reads as progress toward it and saturates exactly
+    // when a 30d panel is fully answerable.
     active_projects
         .iter()
         .map(|project| {
-            let days = (1u64..)
-                .take_while(|back| today.checked_sub_days(chrono::Days::new(*back)).is_some_and(|date| covered.contains(&((*project).to_owned(), date))))
+            let days = (1u64..=CONTIGUITY_HORIZON_DAYS)
+                .take_while(|back| today.checked_sub_days(chrono::Days::new(*back)).is_some_and(|date| answered(project, date)))
                 .count() as u64;
             (days, Some(*project))
         })
@@ -9907,7 +9935,7 @@ impl Database {
                 // the window sends it to a raw scan — which is why `MIN(date)`
                 // and `tasks_pending` both read as progress on 2026-08-17 while
                 // 14d/30d queries stayed unroutable.
-                let (contiguous, worst_project) = min_contiguous_days(&covered, today, &active_projects);
+                let (contiguous, worst_project) = min_contiguous_days(&covered, &source_partitions, today, &active_projects);
                 let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
                 let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
                 // Every tier folds into one number, so take the worst; reset
@@ -21124,33 +21152,77 @@ mod tests {
         let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
         let covered = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day(*d))).collect::<HashSet<_>>();
         let active = |names: &[&'static str]| names.iter().copied().collect::<HashSet<&str>>();
+        // Every day in the window held source rows, so an absent day in `covered`
+        // is a genuine hole rather than a day with nothing to roll up.
+        let dense = |names: &[&str]| names.iter().flat_map(|p| (1u32..=31).map(move |d| ((*p).to_owned(), day(d)))).collect::<HashSet<_>>();
 
         // 08-16, 08-15, 08-14 unbroken back from yesterday.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), today, &active(&["a"])).0, 3);
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), &dense(&["a"]), today, &active(&["a"])).0, 3);
 
         // Prod's actual shape: plenty of days, but a hole right after yesterday.
         // Everything behind it is unreachable to a 30d panel, so it must not count.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), today, &active(&["a"])).0, 1);
+        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), &dense(&["a"]), today, &active(&["a"])).0, 1);
 
         // Today is the frontier's job — covering it must not extend the run.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 17)]), today, &active(&["a"])).0, 0, "yesterday missing is zero coverage however complete today is");
+        assert_eq!(
+            min_contiguous_days(&covered(&[("a", 17)]), &dense(&["a"]), today, &active(&["a"])).0,
+            0,
+            "yesterday missing is zero coverage however complete today is"
+        );
 
         // One starved project drags the fleet number down; averaging would hide it.
         assert_eq!(
-            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), today, &active(&["a", "b"])).0,
+            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), &dense(&["a", "b"]), today, &active(&["a", "b"])).0,
             1,
             "the worst project is the number that matters"
         );
-        assert_eq!(min_contiguous_days(&HashSet::new(), today, &active(&["a"])).0, 0);
+        assert_eq!(min_contiguous_days(&HashSet::new(), &dense(&["a"]), today, &active(&["a"])).0, 0);
 
         // A project that stopped ingesting can never have yesterday. Counting it
         // pinned the gauge at 0 forever on prod (`edb04135`, last wrote 08-03)
         // while every project anyone queries was fully covered.
         assert_eq!(
-            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("dormant", 3)]), today, &active(&["a"])).0,
+            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("dormant", 3)]), &dense(&["a", "dormant"]), today, &active(&["a"])).0,
             2,
             "a project that no longer ingests must not pin the fleet number at zero"
         );
+    }
+
+    /// A day the SOURCE never held must count as answered, or the gauge is
+    /// unreachable by construction and one quiet tenant pins the fleet at zero.
+    ///
+    /// Measured on prod 2026-08-18. Project `4f020cf8` held source rows on 08-14
+    /// (85), 08-16 (4) and 08-18 (8) and NOTHING on 08-15 or 08-17. Its tier
+    /// matched that exactly — correct and complete — yet counting back from
+    /// yesterday it scored 0, and because this is a MINIMUM it pinned the whole
+    /// fleet's gauge to 0 while `6297304f` scored 4 and `5ce1c976` scored 1.
+    ///
+    /// The goal is "30 contiguous days a 30d panel can answer from the tier", not
+    /// "30 days on which every tenant happened to send traffic".
+    #[test]
+    fn a_day_with_no_source_rows_counts_as_answered() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date");
+        let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
+        let set = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day(*d))).collect::<HashSet<_>>();
+        let active = |names: &[&'static str]| names.iter().copied().collect::<HashSet<&str>>();
+
+        // 4f020cf8's real shape: source on 14/16/18 only, tier matching exactly.
+        let source = set(&[("q", 14), ("q", 16), ("q", 18)]);
+        let covered = set(&[("q", 14), ("q", 16), ("q", 18)]);
+        assert_eq!(
+            min_contiguous_days(&covered, &source, today, &active(&["q"])).0,
+            CONTIGUITY_HORIZON_DAYS,
+            "17 and 15 had no rows to roll up, and neither did anything older — fully answered"
+        );
+
+        // A day the source DID hold and the tier does not is still a real hole.
+        let source = set(&[("q", 17), ("q", 16), ("q", 15)]);
+        let covered = set(&[("q", 17), ("q", 15)]);
+        assert_eq!(min_contiguous_days(&covered, &source, today, &active(&["q"])).0, 1, "16 has rows and no tier — a genuine gap");
+
+        // A project that emitted nothing at all in the window is fully answered
+        // rather than scoring zero.
+        assert_eq!(min_contiguous_days(&HashSet::new(), &HashSet::new(), today, &active(&["silent"])).0, CONTIGUITY_HORIZON_DAYS);
     }
 
     #[test]
