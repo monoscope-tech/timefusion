@@ -663,6 +663,22 @@ pub(crate) fn hybrid_branch_count(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> us
     ranges.len().saturating_add(complement(lo, hi, ranges).len())
 }
 
+/// Which projects the ROLLUP leg is allowed to answer for, and which must be
+/// read raw across the whole window because their coverage was not proved.
+///
+/// Coverage is intersected across a cross-project query's projects, so before
+/// this a single project short of coverage refused the query for every other
+/// project too. Prod 2026-08-18: 9 of 10 projects had coverage for the window
+/// and the tenth sent all ten to a raw scan.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectSplit {
+    /// `None` means every project the query reads — the pinned case, or a
+    /// cross-project query where all of them proved coverage.
+    pub covered: Option<Vec<String>>,
+    /// Read raw over the WHOLE window. Disjoint from `covered` by construction.
+    pub raw_only: Vec<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct RoutedRollup {
     pub source: String,
@@ -728,7 +744,7 @@ impl RoutedRollup {
     ///
     /// The aliases are synthetic (`__g0`, `__s1_0`) rather than the query's, so a
     /// dashboard alias like `c` or `time` can never collide with a state column.
-    fn leg(&self, table: &str, ranges: &[(i64, i64)], extra: &str) -> String {
+    fn leg(&self, table: &str, ranges: &[(i64, i64)], extra: &str, projects: &str) -> String {
         let select = self
             .groups
             .iter()
@@ -747,7 +763,7 @@ impl RoutedRollup {
         let ranges = ranges.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR ");
         let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
         let group_by = self.group_by();
-        format!("SELECT {select} FROM {table} WHERE {}({ranges}){extra}{row_filters}{group_by}", self.project_predicate())
+        format!("SELECT {select} FROM {table} WHERE {projects}({ranges}){extra}{row_filters}{group_by}")
     }
 
     /// `project_id = '…' AND `, or empty when the query groups by project_id.
@@ -757,6 +773,16 @@ impl RoutedRollup {
         self.project_id.as_deref().map_or_else(String::new, |project| format!("project_id = {} AND ", sql_literal(project)))
     }
 
+    /// `project_id IN (…) AND `, or the pinned predicate when the split names no
+    /// subset. Empty only when the query groups by project_id AND every project
+    /// proved coverage.
+    fn projects_in(&self, projects: Option<&[String]>) -> String {
+        match projects {
+            Some(list) => format!("project_id IN ({}) AND ", list.iter().map(|p| sql_literal(p)).collect::<Vec<_>>().join(", ")),
+            None => self.project_predicate(),
+        }
+    }
+
     /// The rewrite. `interior` is the grain-aligned `[a, b)` the rollup leg owns;
     /// the raw leg owns exactly `[lo, a)` and `[b, hi)`, so the three are a
     /// partition of `[lo, hi)` — no gap, no overlap.
@@ -764,7 +790,7 @@ impl RoutedRollup {
     /// When the interior is the whole window this collapses to a single
     /// statement against the rollup table, which is both cheaper and the shape
     /// the aligned fast path has always emitted.
-    pub fn sql(&self, generations: &[(String, String, String)], interiors: &[(i64, i64)]) -> String {
+    pub fn sql(&self, generations: &[(String, String, String)], interiors: &[(i64, i64)], split: &ProjectSplit) -> String {
         let generations = format!(
             " AND ({})",
             generations
@@ -785,7 +811,18 @@ impl RoutedRollup {
         // stand-in `hi`: `complement` would otherwise stop the tail there and
         // the rewrite would answer without the newest rows.
         let fringes = complement(self.lo, if self.open_end { OPEN_END } else { self.hi }, interiors);
-        if fringes.is_empty() {
+        let rollup_projects = self.projects_in(split.covered.as_deref());
+        // A project whose coverage was not proved is read raw across the WHOLE
+        // window. Together with the covered projects' rollup interior and raw
+        // fringes that is an exact partition of (project x time): every cell is
+        // read by exactly one leg, so nothing is dropped and nothing double
+        // counted. Without it a single uncovered project refused the query for
+        // every other project.
+        let raw_only_leg = (!split.raw_only.is_empty()).then(|| {
+            let whole = [(self.lo, if self.open_end { OPEN_END } else { self.hi })];
+            self.leg(&self.source, &whole, "", &self.projects_in(Some(&split.raw_only)))
+        });
+        if fringes.is_empty() && raw_only_leg.is_none() {
             // Single leg: the rollup rows ARE the partial states, so the merge
             // applies directly to the measure columns.
             let select = self
@@ -799,9 +836,8 @@ impl RoutedRollup {
             let group_by = self.group_by();
             let having = self.guard.as_ref().map_or_else(String::new, |guard| format!(" HAVING {} > 0", guard.merge.sql(&guard.measures)));
             return format!(
-                "SELECT {select} FROM {} WHERE {}({}){generations}{row_filters}{group_by}{having}",
+                "SELECT {select} FROM {} WHERE {rollup_projects}({}){generations}{row_filters}{group_by}{having}",
                 self.target,
-                self.project_predicate(),
                 interiors.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR "),
             );
         }
@@ -819,11 +855,12 @@ impl RoutedRollup {
         let group_by = self.group_by();
         let having =
             self.guard.as_ref().map_or_else(String::new, |guard| format!(" HAVING {} > 0", guard.merge.sql(&[format!("__s{}_0", self.measures.len())])));
-        format!(
-            "SELECT {outer} FROM ({} UNION ALL {}) AS rollup_union{group_by}{having}",
-            self.leg(&self.target, interiors, &generations),
-            self.leg(&self.source, &fringes, ""),
-        )
+        let mut legs = vec![self.leg(&self.target, interiors, &generations, &rollup_projects)];
+        if !fringes.is_empty() {
+            legs.push(self.leg(&self.source, &fringes, "", &rollup_projects));
+        }
+        legs.extend(raw_only_leg);
+        format!("SELECT {outer} FROM ({}) AS rollup_union{group_by}{having}", legs.join(" UNION ALL "))
     }
 }
 
@@ -1994,14 +2031,14 @@ mod tests {
 
     /// The rewrite when the rollup owns the whole window — the single-leg shape.
     fn generated_sql(route: &RoutedRollup) -> String {
-        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)])
+        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)], &ProjectSplit::default())
     }
 
     /// The rewrite when only part of the window is certified, so raw fringes and
     /// a live tail are unioned in.
     fn hybrid_sql(route: &RoutedRollup, horizon: i64) -> String {
         let interior = interior(route.lo, route.hi, route.grain, horizon).expect("a routable interior");
-        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[interior])
+        route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[interior], &ProjectSplit::default())
     }
 
     #[tokio::test]
@@ -2079,6 +2116,51 @@ mod tests {
         );
         let miss = route_for(&state, &sql).await.expect_err("an unaligned truncation must be refused");
         assert!(matches!(miss, MissReason::UnknownFilter), "expected UnknownFilter, got {miss:?}");
+    }
+
+    /// One project short of coverage must not refuse the query for every other
+    /// project. Prod 2026-08-18: 9 of 10 projects had coverage for the window and
+    /// the tenth sent all ten to a raw scan of every row.
+    ///
+    /// The legs must PARTITION (project x time): covered projects read the rollup
+    /// over the interior and raw over the fringes, uncovered projects read raw
+    /// over the whole window. A gap drops rows and an overlap double counts them,
+    /// and no downstream aggregate can detect either.
+    #[tokio::test]
+    async fn an_uncovered_project_reads_raw_while_the_others_still_route() {
+        let state = session().await;
+        let sql = format!("SELECT project_id, COUNT(*) FROM {SOURCE} WHERE {WINDOW} GROUP BY 1");
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let split = ProjectSplit { covered: Some(vec!["good".into(), "fine".into()]), raw_only: vec!["lagging".into()] };
+        let generated = route.sql(&[("good".into(), "1970-01-01".into(), "generation".into())], &[(route.lo, route.hi)], &split);
+
+        // The rollup leg answers only for the projects that proved coverage...
+        assert!(
+            generated.contains(&format!("FROM {TARGET} WHERE project_id IN ('good', 'fine')")),
+            "rollup leg must be restricted to covered projects: {generated}"
+        );
+        // ...and the uncovered one is read raw across the WHOLE window, not dropped.
+        assert!(generated.contains(&format!("FROM {SOURCE} WHERE project_id IN ('lagging')")), "the uncovered project must still be read, raw: {generated}");
+        assert!(generated.contains("UNION ALL"), "the two must be unioned: {generated}");
+        // The uncovered leg spans the full window, so no part of its data is lost
+        // to an interior it was never in.
+        assert!(generated.contains(&format!("timestamp >= to_timestamp_micros({})", route.lo)), "raw-only leg must start at the window start: {generated}");
+    }
+
+    /// With every project covered the rewrite must be byte-for-byte what it was
+    /// before the split existed — no `IN` list, no extra leg. This is the case
+    /// that runs constantly, and a needless predicate on it would be a permanent
+    /// tax to fix a rare one.
+    #[tokio::test]
+    async fn an_all_covered_query_emits_exactly_the_unsplit_rewrite() {
+        let state = session().await;
+        let sql = format!("SELECT project_id, COUNT(*) FROM {SOURCE} WHERE {WINDOW} GROUP BY 1");
+        let route = route_for(&state, &sql).await.expect("match").expect("route");
+        let generations = [("p".to_string(), "1970-01-01".to_string(), "generation".to_string())];
+        let unsplit = route.sql(&generations, &[(route.lo, route.hi)], &ProjectSplit::default());
+        let all_covered = route.sql(&generations, &[(route.lo, route.hi)], &ProjectSplit { covered: None, raw_only: Vec::new() });
+        assert_eq!(unsplit, all_covered);
+        assert!(!unsplit.contains("project_id IN"), "no project list when every project is covered: {unsplit}");
     }
 
     /// Grouping by project_id is what makes the query answerable; merely
