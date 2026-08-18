@@ -3792,22 +3792,24 @@ impl Database {
                 // miss histogram cannot tell a missing cron from a churning
                 // partition, which is the only question a rollout has to answer.
                 let Some(coverage) = self.rollup_coverage.get(&key) else {
-                    miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
-                    // A miss counter alone cannot be acted on — the same lesson
-                    // `rollup_miss_sampled` exists for. `not_built` folds every
-                    // project into one number, and with coverage intersected
-                    // across the set a SINGLE uncovered project refuses the whole
-                    // query. Name it, or finding it costs a manual sweep.
+                    // Deliberately does NOT set `miss`. `recover_rollup_coverage`
+                    // repopulates SLICE coverage after a restart and never this
+                    // date-level map, so on a process that has not itself rebuilt
+                    // the partition this lookup misses for EVERY date while the
+                    // slice loop below still covers the window completely.
                     //
-                    // NOT reported here, deliberately. `recover_rollup_coverage`
-                    // repopulates SLICE coverage after a restart, never this
-                    // date-level map, so on a process that has not rebuilt a
-                    // partition itself this lookup misses for every date while the
-                    // slice loop below still covers the window completely. Reported
-                    // from the per-project result instead, which is the honest
-                    // question: did this project contribute any covered range at
-                    // all? (The first version of this log fired on the date miss
-                    // and named a project whose coverage was in fact fine.)
+                    // Setting `miss` here made `not_built` the reported reason for
+                    // every later refusal, whatever actually caused it, because the
+                    // returns below are `miss.unwrap_or(<real reason>)`. Prod
+                    // 2026-08-18: 5,454 of 5,516 misses were `not_built`, and the
+                    // real reason was invisible. It also meant the strict
+                    // (non-realtime) path refused every window on a freshly
+                    // restarted process even when slice coverage served it whole —
+                    // rollup reads worked at all only because
+                    // `TIMEFUSION_ROLLUP_REALTIME_TAIL` happened to be on.
+                    //
+                    // Genuine absence is caught after the slice loop, from whether
+                    // the project contributed any covered range at all.
                     continue;
                 };
                 let source_fp = fingerprints
@@ -3850,7 +3852,10 @@ impl Database {
                 slice_ticket.push((entry.key().clone(), coverage.source_fp, coverage.generation.clone()));
             }
             let covered = merge_ranges(covered);
+            // The honest NotBuilt: this project produced no covered range for the
+            // window by EITHER route — date-level or slice.
             if covered.is_empty() {
+                miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
                 first_uncovered.get_or_insert_with(|| project.clone());
             }
             per_project.push(covered);
