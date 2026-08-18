@@ -103,6 +103,38 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
 /// One bit per hour of a UTC day. `ALL_HOURS` is the conservative value: every
 /// invalidation means it unless the caller can prove a narrower set.
 pub(crate) const ALL_HOURS: u32 = (1 << 24) - 1;
+
+/// The hours of a partition-day a committed file can hold rows for, from its
+/// Delta stats JSON (`minValues.timestamp` / `maxValues.timestamp`). `None`
+/// when stats or timestamp bounds are absent — the caller falls back to
+/// `ALL_HOURS`, never to skipping work. A computed mask of zero (bounds
+/// entirely outside the partition day) is likewise treated as absent.
+///
+/// This is what lets a boot reconcile invalidate the ONE hour a downtime
+/// commit actually touched instead of all 24 (`enqueue_maintenance_hours`
+/// with `ALL_HOURS` was ~312 durable tasks per active project per restart,
+/// prod 2026-08-18 — the queue's dominant growth source under deploy churn).
+pub(crate) fn hours_from_stats_json(stats: &str, day_start_micros: i64) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(stats).ok()?;
+    // Writers spell timestamp bounds either as epoch micros or RFC 3339.
+    let parse_ts = |side: &str| -> Option<i64> {
+        let v = value.get(side)?.get("timestamp")?;
+        if let Some(micros) = v.as_i64() {
+            return Some(micros);
+        }
+        chrono::DateTime::parse_from_rfc3339(v.as_str()?).ok().map(|t| t.timestamp_micros())
+    };
+    let (lo, hi) = (parse_ts("minValues")?, parse_ts("maxValues")?);
+    let (lo_h, hi_h) = ((lo - day_start_micros).div_euclid(HOUR_MICROS), (hi - day_start_micros).div_euclid(HOUR_MICROS));
+    if hi_h < 0 || lo_h >= 24 || lo_h > hi_h {
+        return None;
+    }
+    let mut mask = 0u32;
+    for hour in lo_h.clamp(0, 23)..=hi_h.clamp(0, 23) {
+        mask |= 1 << hour;
+    }
+    (mask != 0).then_some(mask)
+}
 pub(crate) const ROLLUP_COHORT_MAX_PROJECTS: usize = 64;
 pub(crate) const ROLLUP_COHORT_MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const ROLLUP_WAVE_MAX_PROJECTS: usize = 1_024;
@@ -1696,6 +1728,35 @@ mod tests {
     use std::sync::Arc;
 
     const SOURCE: &str = "otel_logs_and_spans";
+
+    #[test]
+    fn hours_from_stats_json_bounds_the_hours_a_file_can_touch() {
+        let day_start = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let at = |hour: i64, minute: i64| day_start + hour * HOUR_MICROS + minute * 60 * 1_000_000;
+
+        // Epoch micros form: a file spanning 09:10..10:45 touches hours 9 and 10.
+        let stats = format!(r#"{{"numRecords": 100, "minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, at(9, 10), at(10, 45));
+        assert_eq!(hours_from_stats_json(&stats, day_start), Some(0b11 << 9));
+
+        // RFC 3339 form: a point file touches exactly one hour.
+        let stats = r#"{"minValues": {"timestamp": "2026-08-18T03:00:00Z"}, "maxValues": {"timestamp": "2026-08-18T03:59:59.999999Z"}}"#;
+        assert_eq!(hours_from_stats_json(stats, day_start), Some(1 << 3));
+
+        // A whole-day file is honestly all hours.
+        let stats = format!(r#"{{"minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, day_start, day_start + 24 * HOUR_MICROS - 1);
+        assert_eq!(hours_from_stats_json(&stats, day_start), Some(ALL_HOURS));
+
+        // Bounds spilling outside the partition day are clamped, never trusted
+        // into an empty mask.
+        let stats = format!(r#"{{"minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, day_start - 5 * HOUR_MICROS, at(2, 0));
+        assert_eq!(hours_from_stats_json(&stats, day_start), Some(0b111));
+        let stats = format!(r#"{{"minValues": {{"timestamp": {}}}, "maxValues": {{"timestamp": {}}}}}"#, day_start - 5 * HOUR_MICROS, day_start - HOUR_MICROS);
+        assert_eq!(hours_from_stats_json(&stats, day_start), None, "a file wholly outside the day must read as unknown, not as nothing");
+
+        // No stats, no timestamp bounds, garbage: all unknown.
+        assert_eq!(hours_from_stats_json(r#"{"numRecords": 5}"#, day_start), None);
+        assert_eq!(hours_from_stats_json("not json", day_start), None);
+    }
 
     fn spec() -> RollupSpec {
         crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
