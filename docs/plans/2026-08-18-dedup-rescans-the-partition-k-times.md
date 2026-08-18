@@ -47,7 +47,7 @@ So a partition is decoded K times and every row is MD5-hashed K times, to keep
 
 ```rust
 shards = ceil(est_decoded_bytes / decoded_budget)          // clamp 1..=256
-est_decoded_bytes = max(rows x 4096, compressed x 12) x 2  // deliberately pessimistic
+est_decoded_bytes = max(rows x 4096, compressed x 12) x 2  // and it is ACCURATE — see below
 decoded_budget    = 512 MiB                                // MAX_DECODED_BYTES
 ```
 
@@ -55,12 +55,8 @@ For a 1.8 GB partition (measured on shipbubble, and that was a ONE-MINUTE
 window): `1.8 GB x 12 x 2 / 512 MiB` ~= **84 shards**. By the row term, with
 10M rows, ~160. K is clamped at 256.
 
-Two consequences worth stating separately:
+One consequence worth stating separately:
 
-- **Every unit of over-estimate costs a whole extra pass over the data.** The
-  estimate takes the MAX of two conservative terms and then doubles it. If real
-  decoded size is 3x compressed rather than 12x, K is ~4x larger than needed
-  and so is the work.
 - **Raising `decoded_budget` divides K directly**, but that Arrow decode is
   explicitly OUTSIDE the memory pool, so it trades CPU for untracked heap —
   which is the exact shape of the 2026-08 OOM series. Not a free knob.
@@ -68,7 +64,8 @@ Two consequences worth stating separately:
 This also explains the ~18% of CPU in kernel memory management
 (`clear_page_erms`, TLB shootdowns, `mmap_lock` contention): K passes allocate,
 touch and free the same buffers K times. Jemalloc `dirty_decay_ms:0` made each
-of those frees an immediate `madvise` — addressed separately.
+of those frees an immediate `madvise` — addressed separately in #153, which took
+that ~15% down to ~3.8% measured before/after on prod.
 
 ## The redesign
 
@@ -108,19 +105,71 @@ negotiable:
 - Per-shard staging with an all-or-nothing commit; a partial failure must stage
   nothing.
 
-## Cheaper wins available before the redesign
+## The estimate is ACCURATE — measured, and it kills the obvious fix
 
-1. **Replace `md5` with a non-cryptographic hash.** Bucketing needs an even,
-   NULL-safe, stable spread — not a cryptographic digest. 5.71% of all CPU.
-   Requires a small UDF (ahash is already a dependency).
-2. **Revisit `bytes_per_row = 4096` and `inflation = 12` against measurement.**
-   Every 2x of over-estimate is 2x the passes. Neither has been checked against
-   an actual decoded-vs-compressed ratio.
-3. **Done:** log K and its inputs (`dedup_rewrite_sharded`), so the
-   amplification is visible before anyone tunes the estimate or the budget.
+> **Correction.** An earlier version of this document called the estimate
+> "deliberately pessimistic" and proposed tuning `bytes_per_row` and `inflation`
+> down as a cheap win. That was inference from the compression ratio looking
+> implausible. It was wrong, and acting on it would have caused OOMs rather than
+> speedups.
+
+`dedup_shard_decoded` (#157), prod 2026-08-18:
+
+```
+shards=8  rows=63046  actual_decoded_mb=515  predicted_decoded_mb=491
+```
+
+Actual **515 MB** against a predicted 491 MB. The estimate slightly UNDER-states,
+and this is the streamed figure, which counts POST-dedup rows — so the true input
+ratio is higher still. 63,046 rows at 515 MB is ~8.5 KB per row decoded, above
+the `bytes_per_row = 4096` the estimate uses.
+
+That also settles the earlier `shards=18, est_decoded_mb=9191, compressed_mb=130,
+files=1` line, which looked absurd: a 77x compression ratio is simply real for
+ZSTD over repetitive Variant/JSON columns. One 130 MB file genuinely decodes to
+~10 GB, and reading it 18 times is ~180 GB of decode work.
+
+**So there is no constant to tune.** K is large because the data really is that
+large decoded. Only two things reduce it:
+
+- the redesign below — one pass instead of K
+- raising `MAX_DECODED_BYTES`, which trades CPU for heap OUTSIDE the memory pool.
+  That is the shape of the August OOM series and remains refused.
+
+## The cheapest remaining lead: the streaming branch may not need sharding at all
+
+Not yet verified — this is the next experiment, not a conclusion.
+
+The `limits.is_some()` branch does not `collect()`. It runs
+
+```sql
+SELECT … FROM (SELECT …, ROW_NUMBER() OVER (PARTITION BY keys ORDER BY tiebreak) …) WHERE __tf_rn = 1
+```
+
+and streams the result straight into the writer. A window function over a sorted
+input is exactly shape B (sort-based dedup) — the machinery is ALREADY there and
+already spills under the memory pool. If that is true, the sharding on top of it
+is redundant for this branch, and K can go to 1 by not sharding rather than by
+rewriting anything.
+
+The question that decides it: does DataFusion plan this as a `BoundedWindowAggExec`
+that streams per partition, or as a `WindowAggExec` that buffers the whole input?
+The first is bounded; the second is not, and the sharding is load-bearing.
+
+**Test it, do not reason about it**: force `shards = 1` against a partition known
+to decode past the budget, under a deliberately small pool, and see whether it
+spills or fails. The collecting branch is separate and genuinely does need the
+bound.
+
+## Cheaper wins
+
+1. **Done (#156):** replaced `md5` with `hash_bucket`. It was 5.87% of all CPU and
+   the largest single symbol on the box; it is now absent from the profile.
+2. **Done (#154, #157):** log K, its inputs, and what a shard actually decodes to
+   — which is what turned the tuning idea above from plausible into refuted.
 
 ## How to tell it worked
 
 - `dedup_rewrite_sharded` shards falls to single digits, or the event stops
-- `md5::compress` leaves the profile
+- ~~`md5::compress` leaves the profile~~ — done, #156
 - maintenance completes more units per core-hour, not merely more units

@@ -8971,7 +8971,7 @@ impl Database {
                 })
                 .sum::<u64>()
                 .saturating_mul(2); // RowConverter keyed copy in dedup_batches
-            let shards = dedup_shard_count(est_decoded_bytes, rewrite_bytes.max(0) as u64, decoded_budget, compressed_budget);
+            let shards = dedup_shard_count(limits.is_some(), est_decoded_bytes, rewrite_bytes.max(0) as u64, decoded_budget, compressed_budget);
             // K is the read/decode AMPLIFICATION of this rewrite, and nothing
             // logged it. Each shard is an independent query over the SAME files
             // (`N shards paid N scans + sorts + writes`, below), so the partition
@@ -15298,7 +15298,34 @@ fn dedup_shard_concurrency(decoded_budget: u64, cores: usize) -> usize {
 
 /// Returns the hash-shard count needed to keep one dedup rewrite within either
 /// configured byte budget. A zero budget disables that ceiling.
-fn dedup_shard_count(decoded_bytes: u64, rewrite_bytes: u64, decoded_budget: u64, rewrite_budget: u64) -> u64 {
+///
+/// `streaming` selects the branch that dedups with a `ROW_NUMBER` window and
+/// writes the result straight through, rather than `collect()`ing the partition
+/// into Arrow first. **That branch is not bounded by the decoded-bytes budget,
+/// because it never spends it.** DataFusion plans its dedup as
+///
+/// ```text
+/// FilterExec: row_number(…) = 1
+///   BoundedWindowAggExec: mode=[Sorted]
+///     SortExec: expr=[<dedup keys>]
+/// ```
+///
+/// — `Sorted` mode holds one PARTITION BY group at a time (a single key's
+/// duplicates, so a handful of rows) and `SortExec` spills under the memory
+/// pool. Sharding it means K full rescans of the same files to buy a bound the
+/// execution shape already provides, and the coordinator runs those passes
+/// SERIALLY (`max_concurrent_shards: 1`), so K multiplies wall clock too.
+///
+/// Prod 2026-08-18 measured `shards=18` over a single 130 MB file, and
+/// separately confirmed the estimate driving that is accurate — the partition
+/// really does decode to ~10 GB. There is no constant to tune; the budget is
+/// simply the wrong question for this branch.
+///
+/// The collecting branch DOES materialise the partition, so it keeps the bound.
+fn dedup_shard_count(streaming: bool, decoded_bytes: u64, rewrite_bytes: u64, decoded_budget: u64, rewrite_budget: u64) -> u64 {
+    if streaming {
+        return 1;
+    }
     let shards_for = |bytes: u64, budget: u64| if budget > 0 { bytes.div_ceil(budget) } else { 1 };
     shards_for(decoded_bytes, decoded_budget).max(shards_for(rewrite_bytes, rewrite_budget)).clamp(1, DEDUP_BUCKET_COUNT)
 }
@@ -24970,9 +24997,11 @@ mod tests {
         assert_eq!(dedup_shard_concurrency(GIB / 2, 8), 2, "cores/4 bounds it on a small box");
         assert_eq!(dedup_shard_concurrency(0, 48), 1, "no configured ceiling means one shard already holds everything");
 
-        assert_eq!(dedup_shard_count(100, 100, 100, 100), 1);
-        assert_eq!(dedup_shard_count(101, 100, 100, 100), 2);
-        assert_eq!(dedup_shard_count(u64::MAX, 1, 1, 0), DEDUP_BUCKET_COUNT);
+        assert_eq!(dedup_shard_count(false, 100, 100, 100, 100), 1);
+        assert_eq!(dedup_shard_count(false, 101, 100, 100, 100), 2);
+        assert_eq!(dedup_shard_count(false, u64::MAX, 1, 1, 0), DEDUP_BUCKET_COUNT);
+        // The streaming branch never collects, so no budget can shard it.
+        assert_eq!(dedup_shard_count(true, u64::MAX, u64::MAX, 1, 1), 1, "a ROW_NUMBER dedup is bounded by its execution shape, not by the decoded budget");
     }
 
     #[test]
