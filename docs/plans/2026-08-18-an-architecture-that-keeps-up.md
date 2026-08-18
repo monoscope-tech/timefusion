@@ -674,6 +674,67 @@ is durable, so "already stuck" is the normal case after any incident. Any future
 scheduler change needs an explicit answer to "what happens to the tasks that
 predate it?" — the deploy alone will not clear them.
 
+### The backfill planner had not run at all (#188) — and this explains G1
+
+`plan_rollup_backfill` begins with
+
+```rust
+if pending >= BACKFILL_PENDING_CEILING { return Ok(0); }   // 25,000
+```
+
+Prod sat at **61,306 pending**, and the live frontier alone holds the journal
+above 25,000 indefinitely. So the pass returned at its first statement every 60
+seconds, for hours. **This was not a valve that had closed; it was one that could
+never reopen.**
+
+The ceiling's stated argument — a deep journal taxes every `claim_next` — is an
+argument about minting MORE work. The early return also took three things that
+mint nothing:
+
+- **`rollup_min_contiguous_days`**, the goal gauge, was not being *computed*. It
+  read a stale 0 all night, which is why it never moved no matter what was
+  fixed — and `coverage_is_short()` reads it to weight the entire scheduling
+  cycle.
+- **`rollup_coverage_contiguity`**, the only per-project coverage view.
+- **#186's base-tier proof**, which is why that fix appeared to do nothing after
+  it shipped.
+
+#188 gates the enqueue rather than the pass.
+
+**This retro-explains several earlier conclusions in this document.** Any
+statement of the form "the gauge did not move, therefore X did not work" made
+before #188 is unsupported — the gauge could not move. The contiguity-targeted
+ordering (§6) and the deferral-at-goal have likewise never executed on prod.
+They are still unevaluated, not disproven.
+
+### What the fixes actually bought, honestly (as of 2026-08-19 00:00 UTC)
+
+Maintenance no longer wastes capacity — that is measured and solid:
+
+- **Zero timeouts** in the last 20 minutes of logs, against 47/hour before.
+- Claim mix went from 18% fresh work to 61%; the 100+-attempt population
+  collapsed from 134 starts to 7.
+- `tasks_complete` peaked at **+56.75/min** against +0.67/min before.
+
+But steady-state throughput settled back to **~2 units/min**, and the reason is
+now different and honest: units *complete* rather than timing out, and they cost
+456–801s each (BaseRollup 801s, HotPacking 578s, SealedConsolidation 456s).
+16 workers ÷ ~600s ≈ 1.6/min, which matches the observation exactly. **The waste
+is gone; what remains is genuine per-unit cost**, and that cost is the ~1 MB file
+problem — hundreds of ~389 ms object-store round trips per unit.
+
+**G2 is not met.** shipbubble 1d/7d/30d still time out at 60s. A project that
+DOES have coverage returns rather than timing out — `94c5dc1f` (17 days of 1h
+tier): 14d in **9.8s**, 7d in **23.1s** — note 14d is *faster* than 7d, because
+14d routes to the tier while 7d pays more of the uncovered recent tail. So
+routing works and helps by ~2.5x, and is still 10x short of the 1s target.
+
+**Do not raise maintenance scan parallelism to fix the unit cost.**
+`MAINTENANCE_MAX_PARTITIONS = 2` and the `maintenance_scan` flag exist because
+rollup builds planned at 48 partitions OOM-killed prod four times in ninety
+minutes on 2026-08-13. That lever is closed; the file count is the one that is
+open.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
