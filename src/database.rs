@@ -3779,7 +3779,7 @@ impl Database {
         // a day drags that day into the raw leg instead of being silently omitted
         // from the answer.
         let mut per_project: Vec<Vec<(i64, i64)>> = Vec::with_capacity(projects.len());
-        let mut first_uncovered: Option<(String, String)> = None;
+        let mut first_uncovered: Option<String> = None;
         for project in &projects {
             let mut covered: Vec<(i64, i64)> = Vec::new();
             for date in &dates {
@@ -3798,7 +3798,16 @@ impl Database {
                     // project into one number, and with coverage intersected
                     // across the set a SINGLE uncovered project refuses the whole
                     // query. Name it, or finding it costs a manual sweep.
-                    first_uncovered.get_or_insert_with(|| (project.clone(), date.clone()));
+                    //
+                    // NOT reported here, deliberately. `recover_rollup_coverage`
+                    // repopulates SLICE coverage after a restart, never this
+                    // date-level map, so on a process that has not rebuilt a
+                    // partition itself this lookup misses for every date while the
+                    // slice loop below still covers the window completely. Reported
+                    // from the per-project result instead, which is the honest
+                    // question: did this project contribute any covered range at
+                    // all? (The first version of this log fired on the date miss
+                    // and named a project whose coverage was in fact fine.)
                     continue;
                 };
                 let source_fp = fingerprints
@@ -3840,7 +3849,11 @@ impl Database {
                 }
                 slice_ticket.push((entry.key().clone(), coverage.source_fp, coverage.generation.clone()));
             }
-            per_project.push(merge_ranges(covered));
+            let covered = merge_ranges(covered);
+            if covered.is_empty() {
+                first_uncovered.get_or_insert_with(|| project.clone());
+            }
+            per_project.push(covered);
         }
         // The intersection, so a range is read from the rollup only where every
         // project proved it. For the pinned case there is one element and this is
@@ -3854,17 +3867,16 @@ impl Database {
         let realtime = self.config.maintenance.timefusion_rollup_realtime_tail;
         // Sampled on the same limiter as `rollup_miss_sampled`, so a
         // multiple-per-second miss rate cannot flood the log.
-        if let Some((project, date)) = &first_uncovered
+        if let Some(project) = &first_uncovered
             && crate::metrics::sample_rollup_miss()
         {
             warn!(
                 project_id = %project,
-                date = %date,
                 source = %route.source,
                 target = %route.target,
                 projects_in_window = projects.len(),
                 event = "rollup_uncovered_project",
-                "a project in the window has no rollup coverage; with coverage intersected across the set this refuses the whole query"
+                "a project in the window contributed NO covered range; with coverage intersected across the set this refuses the whole query"
             );
         }
         // With the tail off, the pre-fringe contract stands exactly: the rollup
@@ -3874,6 +3886,30 @@ impl Database {
         }
         let interiors = crate::rollup::interiors(route.lo, route.hi, route.grain, horizon, &covered);
         if interiors.is_empty() {
+            // The single most common refusal in production, and the counter alone
+            // cannot explain it: an empty interior can mean no coverage overlaps
+            // the window, or that coverage overlaps but the BUFFERED horizon cuts
+            // it away, or that what survives is narrower than one grain. Those
+            // want opposite fixes — build more coverage vs flush sooner vs widen
+            // the window — and nothing outside the process can tell them apart.
+            if crate::metrics::sample_rollup_miss() {
+                warn!(
+                    lo = route.lo,
+                    hi = route.hi,
+                    horizon,
+                    // How far the buffered horizon pulled `hi` back. Large means
+                    // the answer is the flush path, not the rollup builds.
+                    horizon_shortfall_secs = (route.hi - horizon).max(0) / 1_000_000,
+                    grain_secs = route.grain / 1_000_000,
+                    covered_ranges = covered.len(),
+                    covered_start = covered.first().map(|range| range.0).unwrap_or_default(),
+                    covered_end = covered.last().map(|range| range.1).unwrap_or_default(),
+                    projects_in_window = projects.len(),
+                    target = %route.target,
+                    event = "rollup_empty_interior",
+                    "coverage produced no usable interior for this window"
+                );
+            }
             return Err(miss.unwrap_or(crate::rollup::MissReason::TinyInterior));
         }
         if crate::rollup::hybrid_branch_count(route.lo, route.hi, &interiors) > 32 {
