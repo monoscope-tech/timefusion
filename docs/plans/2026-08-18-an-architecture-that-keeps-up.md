@@ -512,6 +512,32 @@ not the scheduler.
    "hot leg materialises 1.5 GB" reading came from this and is wrong. The hot
    leg's real cost is `time_elapsed_opening = 2.88s` over 48 local files.
 
+### #180's coarsening guard cannot fire for the population it targets
+
+`coarsen_sealed_slices` now does `groups.retain(|_, bytes| *bytes <=
+MAX_DECODED_BYTES)`, where `bytes` is the SUM of the fused children's
+`estimated_decoded_bytes`. But `invalidate` mints every frontier slice with a
+literal `estimated_decoded_bytes: 0` (`maintenance_coordinator.rs:765`), so a
+day fused from 144 frontier slices sums to **0** and always passes the guard.
+Prod confirms it: every day-wide `maintenance_task_started` logs `est_mb=0`,
+across seven distinct projects. Only `plan_rollup_backfill`-originated units
+carry a real figure (it passes `MAX_DECODED_BYTES`), which is why the one unit
+seen with an estimate — `be87ebc1 width=720min est_mb=256` — is a bisected
+backfill day, not a coarsened one.
+
+#180's test constructs tasks with explicit non-zero byte counts, so it passes
+while the production population is entirely zeros. **Do not read a post-#180
+improvement as evidence the guard worked.**
+
+The gap is not closed by guessing a better default. `0` here means *unknown*,
+and treating unknown as zero makes every admission and split decision maximally
+optimistic — exactly backwards for a guard — while treating unknown as "too big"
+would refuse to fuse anything and undo #178's 12,763-slice collapse entirely.
+The honest resolution is the one already shipping: for a KNOWN-oversized day,
+#180 keeps the slices; for an UNKNOWN one, the system learns by running it, and
+the quarantine cap bounds what that lesson costs to two workers instead of
+sixteen. The two changes cover the two cases; neither covers both.
+
 ---
 
 ## 6. Phase 2 — aim the backfill at the goal (enqueue control)
