@@ -9839,14 +9839,26 @@ impl Database {
         if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
             return Ok(0);
         }
-        {
+        // Deferring the ENQUEUE must not skip the MEASUREMENT. The goal gauge
+        // `rollup_min_contiguous_days` is published ~110 lines below this point,
+        // so returning early here meant it was never computed whenever the queue
+        // was deep — i.e. the instrument went dark exactly when the system was
+        // behind and the number mattered most.
+        //
+        // Measured 2026-08-18: `tasks_pending` 61,310 against a 25,000 ceiling,
+        // `rollup_coverage_contiguity` logged ZERO times in 12 minutes, and the
+        // gauge sat at its initial 0 — indistinguishable from a real zero. This
+        // codebase has now shipped four gauges that stopped meaning what they
+        // said; this is the same failure in a different shape.
+        let defer_enqueue = {
             let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let pending = journal.tasks().filter(|task| task.state != crate::maintenance_coordinator::TaskState::Complete).count();
-            if pending >= BACKFILL_PENDING_CEILING {
+            let defer = pending >= BACKFILL_PENDING_CEILING;
+            if defer {
                 debug!(pending, ceiling = BACKFILL_PENDING_CEILING, event = "rollup_backfill_deferred");
-                return Ok(0);
             }
-        }
+            defer
+        };
         let today = crate::clock::today_utc();
         let earliest = today - chrono::Duration::days(horizon);
         let mut queued = 0usize;
@@ -9959,6 +9971,11 @@ impl Database {
                 covered_per_tier.push((index, covered));
             }
             let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
+            // The gauge above is published; the enqueue below is what the ceiling
+            // gates. Everything from here on mints work.
+            if defer_enqueue {
+                continue;
+            }
             let mut want: Vec<(String, chrono::NaiveDate)> = missing_tiers.keys().cloned().collect();
             // Skip any day that already has ROLLUP work queued. `invalidate`
             // takes `deadline.max(new_deadline)`, so re-invalidating a day that
