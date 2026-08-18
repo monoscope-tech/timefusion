@@ -10203,15 +10203,45 @@ impl Database {
                     // distinguishable: #139 fixed day-tagged files being
                     // unselectable, and if any tier still comes back empty this
                     // is the number that says whether tags are the reason.
-                    let (Some(start), Some(end)) = (
+                    match (
                         tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
                         tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                    ) else {
-                        untagged_inputs = untagged_inputs.saturating_add(1);
-                        continue;
-                    };
-                    if tag(crate::maintenance_coordinator::TAG_PROJECT) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
-                        continue;
+                    ) {
+                        (Some(start), Some(end)) => {
+                            if tag(crate::maintenance_coordinator::TAG_PROJECT) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
+                                continue;
+                            }
+                        }
+                        // No slice tags — a file written before tagging existed.
+                        // Prune it on its OWN timestamp statistics, exactly as the
+                        // base branch above already does, instead of dropping it.
+                        //
+                        // Dropping it was silent and permanent: prod 2026-08-18
+                        // logged `maintenance_rollup_untagged_input` 15 times in 20
+                        // minutes, and EVERY rollup published in that window was a
+                        // derived unit with rows=0. The 1h tier — the one 14d/30d
+                        // queries read — sat at 6 days while the 1m tier had 22,
+                        // because history written before tagging can never reach it.
+                        //
+                        // Safe because this is pruning, not correctness: the
+                        // candidate set is already scoped to this (project, date)
+                        // partition, and the aggregation SQL filters `project_id`,
+                        // `date` and the timestamp range itself. A file kept here
+                        // that does not belong costs IO; a file dropped here loses
+                        // its rows for good. Missing statistics therefore mean
+                        // KEEP, never skip.
+                        _ => {
+                            untagged_inputs = untagged_inputs.saturating_add(1);
+                            if let Ok(Some(stats)) = add.get_stats()
+                                && let (Some(min), Some(max)) = (
+                                    stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+                                    stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+                                )
+                                && (min >= key.slice.end_micros || max < key.slice.start_micros)
+                            {
+                                continue;
+                            }
+                        }
                     }
                 }
                 let decoded = u64::try_from(add.size.max(0)).unwrap_or(0).saturating_mul(12);
