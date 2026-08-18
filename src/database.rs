@@ -1743,12 +1743,8 @@ pub const COVERAGE_SHORT_DAYS: u64 = 14;
 /// This orders ADMISSION into the journal (bounded per pass); execution order
 /// within the journal remains `claim_next`'s (width, recency, fairness).
 fn backfill_cells_by_contiguity(
-    mut want: Vec<(String, chrono::NaiveDate)>,
-    covered_per_tier: &[(usize, HashSet<(String, chrono::NaiveDate)>)],
-    today: chrono::NaiveDate,
-    horizon_days: i64,
-    goal_days: i64,
-    coverage_short: bool,
+    mut want: Vec<(String, chrono::NaiveDate)>, covered_per_tier: &[(usize, HashSet<(String, chrono::NaiveDate)>)], today: chrono::NaiveDate,
+    horizon_days: i64, goal_days: i64, coverage_short: bool,
 ) -> Vec<(String, chrono::NaiveDate)> {
     if covered_per_tier.is_empty() {
         // No tier resolved: contiguity is unknowable, so keep the historical
@@ -1764,13 +1760,8 @@ fn backfill_cells_by_contiguity(
             })
             .count() as i64
     };
-    let runs: HashMap<String, i64> = want
-        .iter()
-        .map(|(project, _)| project.as_str())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .map(|project| (project.to_owned(), run_of(project)))
-        .collect();
+    let runs: HashMap<String, i64> =
+        want.iter().map(|(project, _)| project.as_str()).collect::<HashSet<_>>().into_iter().map(|project| (project.to_owned(), run_of(project))).collect();
     if coverage_short {
         want.retain(|(project, _)| runs.get(project).copied().unwrap_or(0) < goal_days);
     }
@@ -20913,9 +20904,8 @@ mod tests {
     fn backfill_ordering_fills_the_worst_projects_earliest_hole_first() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
         let day = |back: i64| today - chrono::Duration::days(back);
-        let covered = |project: &str, backs: &[i64]| -> HashSet<(String, chrono::NaiveDate)> {
-            backs.iter().map(|back| (project.to_owned(), day(*back))).collect()
-        };
+        let covered =
+            |project: &str, backs: &[i64]| -> HashSet<(String, chrono::NaiveDate)> { backs.iter().map(|back| (project.to_owned(), day(*back))).collect() };
         // Two tiers; a day counts only when BOTH have it. mid's day-2 is in
         // only one tier, so its run is 1, not 2 — holey tiers must not count.
         let tier_a: HashSet<(String, chrono::NaiveDate)> = covered("mid", &[1, 2]).into_iter().chain(covered("done", &[1, 2, 3, 4])).collect();
