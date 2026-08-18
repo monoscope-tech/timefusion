@@ -651,6 +651,47 @@ snapshots to find what is NOT moving, then (2) go to the logs and histogram
 to the standing snapshots (Phase 0.5).** Every future scheduler question should
 start there, and no scheduling change should be evaluated without it.
 
+### #184 did not reach the tasks it was written for (#186)
+
+Measured after #184 deployed: `pending_derived_rollup` went **746 → 759** over
+300s. Still not draining, and now growing.
+
+#184 carried the proof through `enqueue`, but `plan_rollup_backfill` **skips
+every day that already has rollup work queued**
+(`want.retain(|key| !queued.contains(key))`). A derived unit blocked by
+`dependencies_complete` stays queued forever → its day is permanently ineligible
+for that admission → the one path that could have carried the proof never runs
+for it. **The tasks that most needed the fix were exactly the ones it could not
+reach**, and every one of the 759 predated it.
+
+#186 proves it directly on the existing task, over all candidate days rather
+than the 24 admitted per pass — touching queued tasks only, minting nothing,
+moving no deadline.
+
+The general lesson, worth more than the fix: **a change that only takes effect
+at enqueue time cannot repair a queue that is already stuck**, and this journal
+is durable, so "already stuck" is the normal case after any incident. Any future
+scheduler change needs an explicit answer to "what happens to the tasks that
+predate it?" — the deploy alone will not clear them.
+
+### Still open at hand-off, in priority order
+
+1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
+   ~42,000 against roughly 420 day-wide sealed units (14 projects × 30 days), so
+   the overwhelming majority are 10-minute frontier slices. `claim_next`'s sealed
+   reservation drops to **one claim in four** while
+   `eligible_watermark_lag_seconds` exceeds its budget — and it is at 2,000s and
+   rising — so exactly when coverage needs sealed work most, it gets the least.
+   This is the next thing to attribute.
+2. **`candidates` is not filtered to `active_projects`.** The backfill takes
+   every source partition in the horizon, while `active_projects` is computed
+   right beside it and used only for the gauge. Since
+   `backfill_cells_by_contiguity` orders by run length ASC, dormant tenants sort
+   first. The same artifact that makes `rollup_min_contiguous_days` read 0 also
+   steers the work queue.
+3. **The read path** (Phase 5) is untouched and is half of G2: `GatedScanExec`
+   at `permits=0`, and 430 hot file groups for a one-day window.
+
 ---
 
 ## 6. Phase 2 — aim the backfill at the goal (enqueue control)
