@@ -722,10 +722,20 @@ atomic_stats! {
     /// file already covered them. Expected to be rare; if it is not, a late row
     /// inside an already-published day may be going stale in the coarse tier.
     rollup_skipped_covered_by_wider,
-    /// Base rollup files a derived unit could not read because they carry no
-    /// parseable slice tags. Such a file is invisible to the coarse tier
-    /// forever, and the unit publishes rows=0 and completes — indistinguishable
-    /// from a genuinely empty slice unless this is counted.
+    /// Base rollup files carrying no parseable slice tags — history written
+    /// before tagging existed.
+    ///
+    /// Until #169 such a file was DROPPED, so it was invisible to the coarse
+    /// tier forever while the unit published rows=0 and completed,
+    /// indistinguishable from a genuinely empty slice. That is what this counter
+    /// was added to expose, and it did: 15 hits in 20 minutes against 16 of 16
+    /// derived publications at rows=0.
+    ///
+    /// It now counts files SELECTED by the fallback — pruned on their own
+    /// timestamp statistics instead of discarded — so it measures how much of the
+    /// base tier predates tagging, not how much is unreachable. Expect it to
+    /// shrink as those partitions are rewritten; a rise means older history is
+    /// being reached, which is the point.
     rollup_untagged_inputs,
     /// Contiguous sealed days of rollup coverage, counting back from yesterday,
     /// minimised over every (project, declared tier).

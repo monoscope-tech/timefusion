@@ -10252,13 +10252,25 @@ impl Database {
         };
         if untagged_inputs > 0 {
             crate::metrics::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
+            // Since #169 these files are KEPT — pruned on their own timestamp
+            // statistics rather than discarded — so this is no longer a report of
+            // data that can never arrive. It now measures how much of the base
+            // tier predates tagging and is therefore being selected by the wider,
+            // stats-only test. Left at `warn` while that population is still
+            // large; it should shrink as those partitions are rewritten.
+            //
+            // The old text said "their rows can never reach this tier", which was
+            // true when it was written and false the moment #169 shipped. Stale
+            // log text is worse than none: this exact line was the evidence used
+            // to diagnose the empty coarse tier, and it would have been read the
+            // same way again.
             warn!(
                 table = %key.physical_table,
                 project_id = %key.project_id,
                 slice_start = key.slice.start_micros,
                 untagged_inputs,
                 event = "maintenance_rollup_untagged_input",
-                "base files carry no slice tags; their rows can never reach this tier"
+                "base files carry no slice tags; selected on timestamp statistics instead"
             );
         }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
