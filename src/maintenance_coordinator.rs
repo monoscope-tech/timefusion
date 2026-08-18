@@ -36,6 +36,18 @@ pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 /// type-erased. The two strings are DataFusion's own — `ResourcesExhausted`'s
 /// `Display` and the `ExternalSorter`'s message — and both are asserted against
 /// verbatim prod text in `capacity_failures_are_recognised_from_prod_text`.
+/// Seconds a unit of this operation is allowed to run before the coordinator
+/// abandons it. Defined here, beside `Operation`, because the retry backoff and
+/// the deadline have to agree: a unit that ran to its deadline burned that much
+/// of a worker, and retrying it sooner than that lets a permanently oversized
+/// unit hold a slot almost continuously.
+pub const fn operation_deadline_secs(operation: Operation) -> u64 {
+    match operation {
+        Operation::Dedup => 5 * 60,
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
+    }
+}
+
 pub fn is_capacity_failure(message: &str) -> bool {
     message.contains("Resources exhausted") || message.contains("Not enough memory to continue external sort")
 }
@@ -920,8 +932,21 @@ impl TaskJournal {
         if attempts >= 2 && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1)) {
             return;
         }
-        let delay_micros = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
-        self.retry(key, "worker_error".to_owned(), now_micros.saturating_add(delay_micros));
+        // Floored at this operation's OWN deadline. A unit that cannot be split
+        // — repair is the standing case, since its cost is the file it rewrites
+        // and time-bisection cannot shrink a file set — otherwise burns the full
+        // deadline, waits out a backoff that tops out at 256s, and burns it
+        // again: a ~78% duty cycle on a worker, forever, for a unit that has
+        // never once produced anything.
+        //
+        // Measured on prod 2026-08-18: 7 Repair units timed out at 900s inside a
+        // 15-minute window, which is 6,300 of the 14,400 available slot-seconds
+        // — 44% of ALL maintenance capacity, spent on units that complete
+        // nothing. Rollup coverage could not advance behind that no matter how
+        // the scheduling cycle was weighted.
+        let backoff_micros = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+        let floor_micros = i64::try_from(operation_deadline_secs(key.operation).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+        self.retry(key, "worker_error".to_owned(), now_micros.saturating_add(backoff_micros.max(floor_micros)));
     }
 
     /// A unit that failed because its input did not FIT will fail identically
@@ -1394,6 +1419,62 @@ impl Drop for AdmissionPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit that cannot be split — repair is the standing case, since its cost
+    /// is the file it rewrites and time-bisection cannot shrink a file set — must
+    /// not come straight back. Burning a 900s deadline and returning 256s later
+    /// is a ~78% duty cycle on a worker, forever, for a unit that has never
+    /// produced anything.
+    ///
+    /// Prod 2026-08-18: 7 Repair units timed out at 900s inside a 15-minute
+    /// window — 6,300 of 14,400 available slot-seconds, 44% of all maintenance
+    /// capacity. Rollup coverage could not advance behind that whatever the
+    /// scheduling cycle did.
+    #[test]
+    fn a_unit_that_burned_its_deadline_waits_at_least_that_long_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // A single-slice repair unit: `byte_bounded_units` cannot divide it, so
+        // the split path declines and the backoff is what bounds the waste.
+        let mut unit = task("p", 0, 1, Operation::Repair);
+        unit.attempts = 5;
+        unit.state = TaskState::Running;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        let now = 1_000_000_000;
+        journal.abandon_running(&key, now);
+
+        let deadline_micros = i64::try_from(operation_deadline_secs(Operation::Repair) * 1_000_000).expect("fits");
+        let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
+        assert!(
+            not_before >= now + deadline_micros,
+            "a repair unit that burned {}s must wait at least that long again, waited {}s",
+            deadline_micros / 1_000_000,
+            (not_before - now) / 1_000_000
+        );
+    }
+
+    /// The floor must not REPLACE exponential backoff, only raise it. A unit that
+    /// has failed many times should keep backing off past the deadline, or a
+    /// permanently broken unit still returns every 15 minutes forever.
+    #[test]
+    fn the_deadline_floor_does_not_cap_exponential_backoff() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut unit = task("p", 0, 1, Operation::Dedup);
+        unit.attempts = 8;
+        unit.state = TaskState::Running;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        let now = 0;
+        journal.abandon_running(&key, now);
+        let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
+        let exponential = 256 * 1_000_000i64;
+        let floor = i64::try_from(operation_deadline_secs(Operation::Dedup) * 1_000_000).expect("fits");
+        assert_eq!(not_before, now + exponential.max(floor), "the delay is the greater of the two, never the lesser");
+    }
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
         MaintenanceTask {
