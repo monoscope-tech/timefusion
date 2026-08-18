@@ -82,6 +82,32 @@ enabling for everything.
 one asserting that a project missing coverage for part of the window pushes that
 part to the raw leg rather than dropping it.
 
+#### What #155 actually buys, measured after the fact
+
+The intersection is conservative by construction: one project short of coverage
+for a range sends that range to the raw leg for EVERY project. So it matters
+which projects land in the set, and that is decided by the window.
+
+Measured 2026-08-18, prod:
+
+- **10 projects** have source rows in the last hour, and every one of them has
+  `dashboard_1m_v3` coverage for 08-15..08-17. The intersection is non-empty, so
+  the ~24/min overview query — a 1-hour window — routes.
+- The tier as a whole holds **13 projects**, and `4f020cf8` has exactly one day
+  (08-16, 4 rows). Any window wide enough to include a project like that in the
+  source loses the whole range to the raw leg.
+
+So #155 helps the frequent narrow overview immediately, and helps 14d/30d
+cross-project queries only as coverage becomes uniform. It is not a substitute
+for finishing the backlog.
+
+**The follow-up that removes the dependency**: group projects by their covered
+set — there are only a few distinct ones — and emit one rollup leg per group
+with `project_id IN (…)`, sending the rest to the raw leg. Exact, and it stops
+one four-row project from voiding everyone else's coverage. Bounded by the
+existing 32-branch check. Not attempted yet; it is a real change to the leg
+structure and wants its own tests.
+
 ### 3. Dedup: stop decoding each partition K times
 
 Root-caused and documented in
