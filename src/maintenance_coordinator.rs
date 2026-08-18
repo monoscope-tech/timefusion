@@ -41,7 +41,7 @@ pub fn is_capacity_failure(message: &str) -> bool {
 }
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
-const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
 pub const TAG_SOURCE: &str = "timefusion.source";
 pub const TAG_PROJECT: &str = "timefusion.project";

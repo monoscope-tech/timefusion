@@ -3780,6 +3780,11 @@ impl Database {
         // from the answer.
         let mut per_project: Vec<Vec<(i64, i64)>> = Vec::with_capacity(projects.len());
         let mut first_uncovered: Option<String> = None;
+        // Projects that proved coverage, and those that did not. Only the first
+        // group is intersected — including a project with nothing would empty the
+        // intersection and refuse the query for everyone, which is exactly what
+        // prod did on 2026-08-18 with 9 of 10 projects covered.
+        let (mut covered_projects, mut raw_only): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         for project in &projects {
             let mut covered: Vec<(i64, i64)> = Vec::new();
             for date in &dates {
@@ -3853,17 +3858,29 @@ impl Database {
             }
             let covered = merge_ranges(covered);
             // The honest NotBuilt: this project produced no covered range for the
-            // window by EITHER route — date-level or slice.
+            // window by EITHER route — date-level or slice. It no longer REFUSES
+            // the query, though: the project is read raw across the whole window
+            // while the covered projects still route, so one lagging tenant costs
+            // its own rows a raw scan instead of everyone's.
             if covered.is_empty() {
                 miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
                 first_uncovered.get_or_insert_with(|| project.clone());
+                raw_only.push(project.clone());
+            } else {
+                per_project.push(covered);
+                covered_projects.push(project.clone());
             }
-            per_project.push(covered);
         }
-        // The intersection, so a range is read from the rollup only where every
-        // project proved it. For the pinned case there is one element and this is
-        // exactly the old behaviour.
+        // The intersection over the COVERED projects only, so a range is read from
+        // the rollup where each of them proved it. For the pinned case there is
+        // one element and this is exactly the old behaviour.
         let covered = per_project.into_iter().reduce(|left, right| intersect_ranges(&left, &right)).unwrap_or_default();
+        // `None` = every project the query reads, which keeps the pinned case and
+        // the all-covered case emitting exactly the SQL they did before.
+        let split = crate::rollup::ProjectSplit {
+            covered: (route.project_id.is_none() && !raw_only.is_empty()).then(|| covered_projects.clone()),
+            raw_only: if route.project_id.is_none() { raw_only.clone() } else { Vec::new() },
+        };
         generations.sort_unstable();
         generations.dedup();
         // A buffered row is missing from EVERY rollup partition, whichever dates
@@ -3931,7 +3948,7 @@ impl Database {
         }
         let mode = if interiors == [(route.lo, route.hi)] { "full" } else { "hybrid" };
         Ok(Some(RollupRewrite {
-            sql: route.sql(&generations, &interiors),
+            sql: route.sql(&generations, &interiors, &split),
             grain: format!("{}us", route.grain),
             mode,
             matched: route.matched,
