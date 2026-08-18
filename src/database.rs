@@ -1060,7 +1060,8 @@ const COORDINATOR_OWNS_SLICE_MAINTENANCE: bool = true;
 ///
 /// Dedup and rollup source windows split recursively, so they retain the old
 /// five-minute fairness bound even though file rewrites need a longer deadline.
-const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(crate::maintenance_coordinator::operation_deadline_secs(crate::maintenance_coordinator::Operation::Dedup));
 
 /// Maximum wall time for one coordinator file-rewrite unit.
 ///
@@ -1072,7 +1073,8 @@ const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration = std::time::Durati
 /// ceiling lets the conservative measured rewrite floor (460 KB/s) finish one
 /// 256 MiB run with commit margin, while the 512 MiB spill pool remains the
 /// hard decoded-memory bound.
-const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(crate::maintenance_coordinator::operation_deadline_secs(crate::maintenance_coordinator::Operation::Repair));
 
 /// Last-resort guard around planning plus one operation-specific unit. The
 /// operation itself has the tighter bound above; this catches a wedged planner
