@@ -321,33 +321,26 @@ which cross-validates the drain side of the model.
 
 ## 6. Phase 2 — aim the backfill at the goal (enqueue control)
 
-The planner (`plan_rollup_backfill`, `database.rs:9700`) already enqueues
-day-sized units for only the missing tiers, newest-first. Two changes make it
-goal-directed — and both are validated in the simulator (Phase 0.1) against a
-real journal before they ship:
+**IMPLEMENTED 2026-08-18** as `backfill_cells_by_contiguity` (`database.rs`,
+regression guard `backfill_ordering_fills_the_worst_projects_earliest_hole_first`):
 
-1. **Contiguity-targeted ordering.** Today it walks newest-first over all
-   missing (project, day) cells uniformly. Instead, score each cell by whether
-   completing it *extends a contiguous run back from yesterday* for its
-   (project, source, tier) — the exact predicate `min_contiguous_days`
-   measures. A day that fills a hole in a run of 12 outranks a day that starts
-   a new run at 29 days ago. This maximizes G1 per unit of work instead of per
-   unit of calendar.
-   → verify: sim says contiguity rises faster than newest-first; in a test
-   fixture with holey coverage, the enqueue order fills holes before extending
-   depth; on prod, `rollup_min_contiguous_days` rises within hours, not days.
-2. **Admit the backlog is triage, and say so in the journal.** While
-   `coverage_is_short()` (14-day gate, `database.rs:1726`), cells beyond the
-   30-day goal window for projects already at 30 should not be enqueued at
-   all — the 35-day horizon (`d_rollup_backfill_days`) is a dedup-certification
-   requirement, not a rollup-routing requirement, and the two horizons are
-   currently conflated in one planner. Split them: certification keeps 35 days,
-   rollup backfill aims at the contiguous-30 target.
-   → verify: enqueue rate from the planner drops; G1 keeps rising;
-   certification coverage (its own gauge) is unaffected.
+1. **Contiguity-targeted ordering.** Each 60s pass now admits the worst
+   project's earliest holes first — (run length ASC, hole distance ASC) —
+   instead of uniformly newest-first. This orders ADMISSION; execution order
+   in the journal remains `claim_next`'s. With rollup units measured at ~3s
+   and the restart-driven growth fixed, admission cadence (24 cells/pass) was
+   the binding constraint, so admission order is where the leverage is.
+2. **Deferral at the goal.** While `coverage_is_short()`, cells for projects
+   already at 30 contiguous days are not enqueued at all — the triage half of
+   the horizon split. The full certification/routing horizon split is NOT
+   done: the deferral achieves the triage without a new knob (§12: no
+   flexibility knobs without a measurement).
 
-**Explicitly not doing:** another slot-mix reweighting. #167 proved the mix is
-not binding. `dependencies_complete` already orders BaseRollup → DerivedRollup.
+Original sketch, for the record:
+
+1. ~~Contiguity-targeted ordering~~ and 2. ~~triage~~ — as above.
+   → verify: unit test pins hole-filling before depth-extending; on prod,
+   `rollup_min_contiguous_days` rises within hours of the deploy, not days.
 
 ---
 

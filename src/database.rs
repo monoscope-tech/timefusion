@@ -1728,6 +1728,57 @@ impl PartitionStats {
 /// contiguity model.
 pub const COVERAGE_SHORT_DAYS: u64 = 14;
 
+/// Sort backfill cells to maximize the fleet-min contiguous coverage per unit
+/// of work, and defer projects already at the goal while coverage is short.
+///
+/// `rollup_min_contiguous_days` is a MIN over (project, tier) of contiguous
+/// days back from yesterday, so a cell's marginal value is zero unless it
+/// extends the worst project's run: order by (project's current run ASC, hole
+/// distance from yesterday ASC) — the worst project's earliest hole first. A
+/// project at `goal_days` contiguous has nothing left that moves the metric,
+/// so while `coverage_short` its older cells wait rather than compete for the
+/// same queue. Newest-first built every project to the same shallow depth and
+/// left the min at zero — breadth-first was the 2026-08-18 failure mode.
+///
+/// This orders ADMISSION into the journal (bounded per pass); execution order
+/// within the journal remains `claim_next`'s (width, recency, fairness).
+fn backfill_cells_by_contiguity(
+    mut want: Vec<(String, chrono::NaiveDate)>,
+    covered_per_tier: &[(usize, HashSet<(String, chrono::NaiveDate)>)],
+    today: chrono::NaiveDate,
+    horizon_days: i64,
+    goal_days: i64,
+    coverage_short: bool,
+) -> Vec<(String, chrono::NaiveDate)> {
+    if covered_per_tier.is_empty() {
+        // No tier resolved: contiguity is unknowable, so keep the historical
+        // newest-first behavior rather than silently dropping or keeping all.
+        want.sort_by(|(_, a), (_, b)| b.cmp(a));
+        return want;
+    }
+    let run_of = |project: &str| -> i64 {
+        (0..horizon_days)
+            .take_while(|back| {
+                let day = today - chrono::Duration::days(back + 1);
+                covered_per_tier.iter().all(|(_, covered)| covered.contains(&(project.to_owned(), day)))
+            })
+            .count() as i64
+    };
+    let runs: HashMap<String, i64> = want
+        .iter()
+        .map(|(project, _)| project.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|project| (project.to_owned(), run_of(project)))
+        .collect();
+    if coverage_short {
+        want.retain(|(project, _)| runs.get(project).copied().unwrap_or(0) < goal_days);
+    }
+    let yesterday = today - chrono::Duration::days(1);
+    want.sort_by_key(|(project, date)| (runs.get(project).copied().unwrap_or(0), (yesterday - *date).num_days()));
+    want
+}
+
 /// Is contiguous rollup coverage short enough to be worth reweighting for?
 ///
 /// Reads the gauge `rollup_coverage_contiguity` publishes — the minimum over
@@ -9970,10 +10021,14 @@ impl Database {
             if want.is_empty() {
                 continue;
             }
-            // Newest first: recent days are what dashboards actually read, and
-            // an oldest-first pass spends the whole horizon on data nobody has
-            // queried yet.
-            want.sort_by(|(pa, da), (pb, db)| db.cmp(da).then_with(|| pa.cmp(pb)));
+            // Contiguity-greedy, not newest-first: the goal metric is the MIN
+            // over projects of contiguous days back from yesterday, so a pass
+            // spends its budget on the worst project's earliest holes, and a
+            // project already at the 30-day goal is deferred entirely while
+            // coverage is short. Newest-first built every project to the same
+            // shallow depth and left the min at zero — breadth-first was the
+            // 2026-08-18 overnight failure mode.
+            let mut want = backfill_cells_by_contiguity(want, &covered_per_tier, today, horizon, 30, coverage_is_short());
             let total = want.len();
             want.truncate(BACKFILL_PARTITIONS_PER_PASS);
             // DAY-sized units, not the frontier's ten-minute slices.
@@ -20849,6 +20904,41 @@ mod tests {
         assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
         assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), Some(version));
         Ok(())
+    }
+
+    /// The backfill admission order must spend each pass on the worst project's
+    /// earliest hole, and must not spend anything on a project already at the
+    /// goal while coverage is short — the min-metric cannot move otherwise.
+    #[test]
+    fn backfill_ordering_fills_the_worst_projects_earliest_hole_first() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+        let day = |back: i64| today - chrono::Duration::days(back);
+        let covered = |project: &str, backs: &[i64]| -> HashSet<(String, chrono::NaiveDate)> {
+            backs.iter().map(|back| (project.to_owned(), day(*back))).collect()
+        };
+        // Two tiers; a day counts only when BOTH have it. mid's day-2 is in
+        // only one tier, so its run is 1, not 2 — holey tiers must not count.
+        let tier_a: HashSet<(String, chrono::NaiveDate)> = covered("mid", &[1, 2]).into_iter().chain(covered("done", &[1, 2, 3, 4])).collect();
+        let tier_b: HashSet<(String, chrono::NaiveDate)> = covered("mid", &[1]).into_iter().chain(covered("done", &[1, 2, 3, 4])).collect();
+        let tiers = vec![(0usize, tier_a), (1usize, tier_b)];
+        let want: Vec<(String, chrono::NaiveDate)> = [("worst", 1), ("worst", 2), ("worst", 3), ("mid", 2), ("mid", 3), ("done", 5), ("done", 6)]
+            .into_iter()
+            .map(|(project, back)| (project.to_owned(), day(back)))
+            .collect();
+
+        let ordered = backfill_cells_by_contiguity(want.clone(), &tiers, today, 10, 4, true);
+        let position = |project: &str, back: i64| ordered.iter().position(|cell| cell == &(project.to_owned(), day(back)));
+        assert!(position("worst", 1) < position("worst", 2) && position("worst", 2) < position("worst", 3), "within a project, earliest hole first");
+        assert!(position("worst", 3) < position("mid", 2), "the run-less project outranks a hole in a run of 1");
+        assert!(position("mid", 2) < position("mid", 3));
+        assert!(!ordered.iter().any(|(project, _)| project == "done"), "a project at the 4-day goal is deferred while coverage is short");
+
+        // Healthy fleet: the deferral releases, and the done project's older
+        // cells sort behind everything that extends a run.
+        let ordered = backfill_cells_by_contiguity(want, &tiers, today, 10, 4, false);
+        let at = |project: &str, back: i64| ordered.iter().position(|cell| cell == &(project.to_owned(), day(back))).unwrap_or(usize::MAX);
+        assert_ne!(at("done", 5), usize::MAX, "goal projects are backfilled once coverage is healthy");
+        assert!(at("mid", 3) < at("done", 5), "run-extending cells still outrank beyond-goal cells");
     }
 
     /// Reconciling a missed commit must invalidate only the hours the commit's
