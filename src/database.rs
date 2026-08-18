@@ -10889,8 +10889,33 @@ impl Database {
                     Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await,
                 }
             };
+            // A unit's DURATION is the number every deadline decision needs and
+            // none of them has. Raising a deadline only helps if the units that
+            // miss it would finish in the longer window; if they would not, the
+            // waste per timeout rises with the deadline instead of falling.
+            // Prod 2026-08-18 has that question open for three operations at once
+            // — dedup (15 timeouts per 30 min at 300s, ~16% of capacity), sealed
+            // consolidation (3, ~9%) and repair (2, ~6%) — and it cannot be
+            // answered from the timeout count alone, because a timeout says only
+            // "longer than the deadline", never how much longer.
+            let started = std::time::Instant::now();
             let completed = match tokio::time::timeout(timeout, work).await {
-                Ok(result) => result?,
+                Ok(result) => {
+                    let elapsed = started.elapsed();
+                    // Only the slow tail: a unit finishing well inside its
+                    // deadline says nothing, and this runs on every claim.
+                    if elapsed.as_secs_f64() > timeout.as_secs_f64() / 4.0 {
+                        info!(
+                            ?operation,
+                            elapsed_secs = elapsed.as_secs(),
+                            deadline_secs = timeout.as_secs(),
+                            headroom_pct = (100.0 * (1.0 - elapsed.as_secs_f64() / timeout.as_secs_f64())) as i64,
+                            event = "maintenance_unit_slow",
+                            "a maintenance unit used a large share of its deadline"
+                        );
+                    }
+                    result?
+                }
                 Err(_) => {
                     // Dropping the operation future drops its TaskLease. The
                     // claimed unit is durably requeued and all resource tokens
