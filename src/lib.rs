@@ -20,6 +20,7 @@ pub mod hot_tier;
 pub mod insert_coerce;
 pub mod logical_count_index;
 pub mod maintenance_coordinator;
+pub mod maintenance_sim;
 pub mod mem_buffer;
 pub mod metrics;
 pub mod object_store_cache;
