@@ -65,12 +65,35 @@ pub const fn operation_deadline_secs(operation: Operation) -> u64 {
         // which `split_time_task` refuses. So the unit retries whole, forever, at
         // full cost — the same trap #168 fixed for repair.
         //
-        // REVERT TRIGGER: if dedup timeouts do not fall, this makes things WORSE,
-        // because the waste per timeout scales with the deadline (12 x 300s ->
-        // 12 x 900s). Watch `maintenance_coordinator_unit_timed_out` with
-        // `operation=Dedup`; if it holds near 12 per 20 minutes, put this back to
-        // 5 * 60 and shrink the units instead.
-        Operation::Dedup => 15 * 60,
+        // REVERTED 2026-08-18, ~15 minutes after it shipped. Prod took a 125.1 GB
+        // OOM (exit 137, `tokio-rt-worker`) at 11:38 UTC, and the interval
+        // between OOMs had shortened from 15 hours to 4.2:
+        //
+        //     08-17 09:39 -> 16:39   7h
+        //     08-18 07:27           15h
+        //     08-18 11:38          4.2h   <- with the 900s deadline live
+        //
+        // Not proven — this OOM signature predates the change and its likeliest
+        // driver is a query-side join (see the handover, section 6.4). But the
+        // mechanism is precisely what the original 5 minutes was protecting: a
+        // dedup unit holds a rewrite permit AND its Arrow decode is OUTSIDE the
+        // DataFusion memory pool, so tripling the deadline triples how long that
+        // untracked memory is held, times the concurrent units.
+        //
+        // The argument for raising it was that #161 made the streaming branch a
+        // `BoundedWindowAggExec` over a spillable sort. That is true of the
+        // STREAMING branch; the collecting branch still materialises. Overriding
+        // a comment that named this exact risk, on a partial reading of which
+        // branch runs, was the mistake.
+        //
+        // The measurement that motivated it still stands and is still worth
+        // acting on — dedup units are bimodal, and 5 minutes is below what
+        // comparable file rewrites (320-440s) cost. The right fix is to make the
+        // units FIT, not to let them run longer: `byte_bounded_units` bisects in
+        // time only above MIN_SLICE_MICROS and emits hash shards below it, which
+        // `split_time_task` refuses outright. Teaching it to accept hash-sharded
+        // children would let an oversized unit shrink instead of retrying whole.
+        Operation::Dedup => 5 * 60,
         Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
     }
 }
