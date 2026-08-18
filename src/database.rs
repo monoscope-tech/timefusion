@@ -9990,6 +9990,45 @@ impl Database {
                     .collect();
                 want.retain(|key| !queued.contains(key));
             }
+            // The days just filtered out are the ones that most need the proof:
+            // a derived unit blocked by `dependencies_complete` stays queued
+            // forever, which makes its day permanently ineligible for the
+            // admission above, which is the only path that could have told it
+            // the base tier is there. Prod 2026-08-18 22:50 UTC:
+            // `pending_derived_rollup` did not move after #184 shipped, because
+            // every one of those 759 tasks predated it.
+            //
+            // So prove it directly, over ALL candidate days rather than the 24
+            // admitted per pass — this touches existing tasks only, mints
+            // nothing, and cannot affect admission or deadlines.
+            {
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut proven = 0usize;
+                for ((project_id, date), missing) in &missing_tiers {
+                    if *date >= today || missing.iter().any(|index| schema.rollups[*index].derive_from.is_none()) {
+                        continue;
+                    }
+                    let Some(day_start) = date.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
+                    let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
+                    for index in missing {
+                        let spec = &schema.rollups[*index];
+                        if spec.derive_from.is_none() {
+                            continue;
+                        }
+                        proven += usize::from(journal.prove_base_tier(&crate::maintenance_coordinator::TaskKey {
+                            physical_table: spec.table_name(&source),
+                            source: source.clone(),
+                            project_id: project_id.clone(),
+                            slice,
+                            operation: crate::maintenance_coordinator::Operation::DerivedRollup,
+                        }));
+                    }
+                }
+                if proven != 0 {
+                    journal.checkpoint()?;
+                    info!(source, proven, event = "rollup_derived_base_tier_proven");
+                }
+            }
             if want.is_empty() {
                 continue;
             }

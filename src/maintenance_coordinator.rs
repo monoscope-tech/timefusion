@@ -661,6 +661,26 @@ impl TaskJournal {
         collapsed
     }
 
+    /// Record that the base tier a queued derived unit aggregates already
+    /// exists. Returns whether anything changed.
+    ///
+    /// The planner cannot do this through `enqueue`, because it SKIPS every day
+    /// that already has rollup work queued (`want.retain(|key| !queued...)`) —
+    /// and a day with a stuck derived task is exactly such a day. So the tasks
+    /// that most need the proof are the ones `enqueue` can never reach: prod
+    /// 2026-08-18 22:50 UTC, `pending_derived_rollup` still did not move after
+    /// #184 shipped, because all 759 of them predated it.
+    pub fn prove_base_tier(&mut self, key: &TaskKey) -> bool {
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let task = &mut self.snapshot.tasks[index];
+        if task.base_tier_present {
+            return false;
+        }
+        task.base_tier_present = true;
+        self.dirty_tasks.insert(key.clone());
+        true
+    }
+
     pub fn upsert(&mut self, task: MaintenanceTask) {
         self.dirty_tasks.insert(task.key.clone());
         if let Some(index) = self.task_indices.get(&task.key).copied() {
@@ -2296,6 +2316,33 @@ mod tests {
         // base tier is there. That must be enough.
         journal.enqueue_with_base_tier(derived("historical"), 0, 1, 0, true);
         assert_eq!(journal.claim_next(Operation::DerivedRollup, 0, true).expect("proven base tier makes the unit claimable").key.project_id, "historical");
+    }
+
+    /// The planner must be able to prove the base tier for a task it can no
+    /// longer reach through `enqueue`.
+    ///
+    /// A blocked derived unit stays queued, which makes its day permanently
+    /// ineligible for backfill admission (`want.retain(|key| !queued...)`),
+    /// which is the only path that could have carried the proof. Prod
+    /// 2026-08-18 22:50 UTC: `pending_derived_rollup` did not move after #184
+    /// shipped, because all 759 tasks predated it.
+    #[test]
+    fn an_already_queued_derived_unit_can_still_be_told_its_base_tier_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = TaskKey {
+            physical_table: "rollup_1h".to_owned(),
+            source: "source".to_owned(),
+            project_id: "p".to_owned(),
+            slice: TimeSlice::new(0, 3_600_000_000).expect("slice"),
+            operation: Operation::DerivedRollup,
+        };
+        journal.enqueue(key.clone(), 0, 1, 0);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: blocked by the dependency gate");
+
+        assert!(journal.prove_base_tier(&key), "the proof lands on an existing task");
+        assert!(!journal.prove_base_tier(&key), "and is idempotent");
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "the unit becomes claimable without being re-enqueued");
     }
 
     /// The proof latches. The frontier re-enqueues the same key without it, and
