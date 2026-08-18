@@ -213,6 +213,29 @@ pub struct MaintenanceTask {
     pub retry_reason: Option<String>,
     #[serde(default)]
     pub publication: Option<Publication>,
+    /// The base tier this derived unit aggregates is ALREADY PRESENT, proven
+    /// from real rollup coverage by `plan_rollup_backfill` rather than from
+    /// journal bookkeeping.
+    ///
+    /// `dependencies_complete` otherwise requires COMPLETE `BaseRollup` TASKS
+    /// contiguously covering the slice. For a frontier hour that is right. For a
+    /// historical day whose 1m tier was built weeks ago — possibly by an older
+    /// code path, possibly with its journal records long since collapsed — no
+    /// such task exists, so the unit is unclaimable forever and `claim_next`
+    /// skips it with no counter and no log.
+    ///
+    /// Prod 2026-08-18 22:30 UTC is that shape exactly: the 1m base tier is 33
+    /// days deep on most projects while the 1h derived tier it feeds sits at
+    /// 9-17, `pending_derived_rollup` did not move by ONE task across two 240s
+    /// windows with workers free, and all 35 derived units claimed in 20 minutes
+    /// were frontier slices whose base had completed minutes earlier.
+    ///
+    /// Only ever set from positive evidence — the planner computes `missing`
+    /// tiers from actual coverage, so a derived tier missing while no base tier
+    /// is missing means the base data is there. That is strictly better evidence
+    /// than the journal's, which is why this overrides rather than supplements.
+    #[serde(default)]
+    pub base_tier_present: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -632,6 +655,7 @@ impl TaskJournal {
                 created_unix_ms: u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default(),
                 retry_reason: None,
                 publication: None,
+                base_tier_present: false,
             });
         }
         collapsed
@@ -649,6 +673,13 @@ impl TaskJournal {
     }
 
     pub fn enqueue(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) {
+        self.enqueue_with_base_tier(key, deadline_micros, estimated_decoded_bytes, created_unix_ms, false);
+    }
+
+    /// `base_tier_present` records that the tier this unit aggregates already
+    /// exists — see the field on [`MaintenanceTask`]. Only `plan_rollup_backfill`
+    /// can prove it, because only it reads actual tier coverage.
+    pub fn enqueue_with_base_tier(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool) {
         if let Some(index) = self.task_indices.get(&key).copied() {
             let task = &mut self.snapshot.tasks[index];
             if task.state != TaskState::Running {
@@ -657,13 +688,18 @@ impl TaskJournal {
                     || task.deadline_micros != new_deadline
                     || task.estimated_decoded_bytes != estimated_decoded_bytes
                     || task.retry_reason.is_some()
-                    || task.publication.is_some();
+                    || task.publication.is_some()
+                    // Latching, never clearing: the planner proves presence, and
+                    // a later enqueue that cannot prove it (the frontier's) is
+                    // silence, not evidence of absence.
+                    || (base_tier_present && !task.base_tier_present);
                 if changed {
                     task.state = TaskState::Pending;
                     task.deadline_micros = new_deadline;
                     task.estimated_decoded_bytes = estimated_decoded_bytes;
                     task.retry_reason = None;
                     task.publication = None;
+                    task.base_tier_present |= base_tier_present;
                     self.dirty_tasks.insert(key);
                 }
             }
@@ -683,6 +719,7 @@ impl TaskJournal {
             created_unix_ms,
             retry_reason: None,
             publication: None,
+            base_tier_present,
         });
     }
 
@@ -770,6 +807,7 @@ impl TaskJournal {
                         created_unix_ms,
                         retry_reason: None,
                         publication: None,
+                        base_tier_present: false,
                     });
                     self.dirty_tasks.insert(key);
                 }
@@ -965,6 +1003,11 @@ impl TaskJournal {
             Operation::DerivedRollup => Some(Operation::BaseRollup),
             _ => None,
         };
+        // Proven from real tier coverage, which is strictly better evidence than
+        // the journal's own record of who built what. See the field's comment.
+        if task.base_tier_present {
+            return true;
+        }
         required.is_none_or(|required| {
             let mut intervals = self
                 .snapshot
@@ -1642,6 +1685,7 @@ mod tests {
             created_unix_ms: 0,
             retry_reason: None,
             publication: None,
+            base_tier_present: false,
         }
     }
 
@@ -2218,6 +2262,58 @@ mod tests {
         assert_eq!(claimed.state, TaskState::Running);
         assert_eq!(claimed.attempts, 1);
         assert!(journal.claim_next(Operation::Dedup, 0, true).is_none());
+    }
+
+    /// A derived unit whose base TIER already exists must be claimable, even
+    /// when no `BaseRollup` journal task records that it was built.
+    ///
+    /// Prod 2026-08-18 22:30 UTC: the 1m base tier was 33 days deep on most
+    /// projects while the 1h derived tier it feeds sat at 9-17,
+    /// `pending_derived_rollup` did not move by ONE task across two 240s windows
+    /// with workers free, and every derived unit claimed in 20 minutes was a
+    /// frontier slice whose base had completed minutes earlier. Historical days
+    /// were unclaimable — `claim_next` skips a dependency-blocked task silently,
+    /// with no counter and no log, which is the sixth silent refusal in this
+    /// family.
+    #[test]
+    fn a_derived_unit_runs_when_its_base_tier_exists_without_a_journal_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let derived = |project: &str| TaskKey {
+            physical_table: "rollup_1h".to_owned(),
+            source: "source".to_owned(),
+            project_id: project.to_owned(),
+            slice: TimeSlice::new(0, 3_600_000_000).expect("slice"),
+            operation: Operation::DerivedRollup,
+        };
+
+        // The status quo, and correct on its own terms: no completed base task
+        // covers this slice, so the unit is refused.
+        journal.enqueue(derived("historical"), 0, 1, 0);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "without evidence the dependency gate still holds");
+
+        // The backfill planner reads real tier coverage, so it can prove the
+        // base tier is there. That must be enough.
+        journal.enqueue_with_base_tier(derived("historical"), 0, 1, 0, true);
+        assert_eq!(journal.claim_next(Operation::DerivedRollup, 0, true).expect("proven base tier makes the unit claimable").key.project_id, "historical");
+    }
+
+    /// The proof latches. The frontier re-enqueues the same key without it, and
+    /// silence is not evidence that coverage stopped existing.
+    #[test]
+    fn a_proven_base_tier_is_not_forgotten_by_a_later_enqueue() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = TaskKey {
+            physical_table: "rollup_1h".to_owned(),
+            source: "source".to_owned(),
+            project_id: "p".to_owned(),
+            slice: TimeSlice::new(0, 3_600_000_000).expect("slice"),
+            operation: Operation::DerivedRollup,
+        };
+        journal.enqueue_with_base_tier(key.clone(), 0, 1, 0, true);
+        journal.enqueue(key.clone(), 0, 1, 0);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "a later uninformed enqueue must not clear the proof");
     }
 
     /// A unit that has proven it cannot fit its deadline must not be able to

@@ -9720,6 +9720,7 @@ impl Database {
                         created_unix_ms,
                         retry_reason: None,
                         publication: None,
+                        base_tier_present: false,
                     });
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
@@ -9745,6 +9746,7 @@ impl Database {
                             created_unix_ms,
                             retry_reason: None,
                             publication: None,
+                            base_tier_present: false,
                         });
                     }
                 }
@@ -9997,8 +9999,8 @@ impl Database {
                 for (project_id, date) in &want {
                     let Some(day_start) = date.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
-                    let mut enqueue = |physical_table: String, operation| {
-                        journal.enqueue(
+                    let mut enqueue = |physical_table: String, operation, base_tier_present| {
+                        journal.enqueue_with_base_tier(
                             crate::maintenance_coordinator::TaskKey {
                                 physical_table,
                                 source: source.clone(),
@@ -10009,6 +10011,7 @@ impl Database {
                             now,
                             crate::maintenance_coordinator::MAX_DECODED_BYTES,
                             created_unix_ms,
+                            base_tier_present,
                         );
                     };
                     // Only the tiers this day is actually missing. Enqueueing
@@ -10022,7 +10025,7 @@ impl Database {
                     // the common case here: 1m is 22-32 days deep while 1h is
                     // 2-6, so most queued days need the coarse tier alone.
                     if needs_source_scan {
-                        enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup);
+                        enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup, false);
                     }
                     for index in missing {
                         let spec = &schema.rollups[index];
@@ -10031,7 +10034,17 @@ impl Database {
                         } else {
                             crate::maintenance_coordinator::Operation::BaseRollup
                         };
-                        enqueue(spec.table_name(&source), operation);
+                        // `!needs_source_scan` means no BASE tier is missing for
+                        // this day, i.e. the tier this derived unit aggregates is
+                        // already built. That is read from actual coverage, so it
+                        // proves what `dependencies_complete` can otherwise only
+                        // infer from journal records that a historical day does
+                        // not have — see `MaintenanceTask::base_tier_present`.
+                        enqueue(
+                            spec.table_name(&source),
+                            operation,
+                            operation == crate::maintenance_coordinator::Operation::DerivedRollup && !needs_source_scan,
+                        );
                     }
                     queued = queued.saturating_add(1);
                 }
