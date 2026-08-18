@@ -2680,6 +2680,28 @@ pub struct Database {
     /// `wave_bin_staged`) plus a hard ceiling should a future caller drive
     /// staging outside `round_robin_bins`' K.
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// Caps how many coordinator WORKERS may sit in debt work at once — dedup,
+    /// hot packing, sealed consolidation, repair — leaving the rest for the
+    /// rollup chain while coverage is short.
+    ///
+    /// The other rewrite semaphores bound MEMORY. This one bounds OCCUPANCY,
+    /// which is a different and, as it turns out, the binding scarcity. Measured
+    /// 2026-08-18 over 45 minutes with the phase timing from #174:
+    ///
+    ///     BaseRollup/DerivedRollup   174 starts, NOT ONE over 60s
+    ///     HotPacking                 895s, 861s, 837s, 731s
+    ///     SealedConsolidation        767s, 729s, 294s
+    ///
+    /// Rollup units are cheap; debt units hold a worker for 12-15 minutes. With
+    /// 16 workers that is why `pending_base_rollup` sat at ~15,800 draining at
+    /// 2.6 starts/min: not because rollup is slow, but because every worker was
+    /// inside a quarter-hour file rewrite.
+    ///
+    /// It is also why #167 did nothing. That change gave the rollup chain 6 of
+    /// 10 ATTEMPTS, but a slot is consumed by wall clock: at seconds-per-rollup
+    /// against 850s-per-packing, attempt share and slot-time share are different
+    /// by two orders of magnitude.
+    maintenance_debt_slots: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the
     /// time-windowed target to hash-join keys; ungated bursts starve reads on a
     /// CPU-throttled box (prod 2026-07-19). Permits = `timefusion_dml_merge_concurrency`.
@@ -3306,6 +3328,11 @@ impl Database {
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             rollup_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(rollup_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
+            // Three quarters to debt, so a quarter of the workers is always free
+            // for the rollup chain. Not fewer: file counts left ungoverned is its
+            // own outage (2026-08-01, files at 2-3k degrading every query), and
+            // debt still holds the large majority of capacity.
+            maintenance_debt_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs * 3 / 4).max(1))),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -10929,6 +10956,25 @@ impl Database {
                 continue;
             }
             attempted[index] = true;
+            // Debt work cannot advance coverage — `dependencies_complete` makes
+            // BaseRollup depend on nothing — but it holds a worker for 12-15
+            // minutes while a rollup unit holds one for seconds. Cap how many
+            // workers may be inside it at once so the rollup chain always has
+            // somewhere to run. Failing to acquire falls through to the next
+            // operation in the cycle, which is work-conserving: the worker picks
+            // up rollup instead of idling.
+            //
+            // Only while coverage is short, on the same self-limiting signal as
+            // the cycle weighting, so a healthy system goes back to using every
+            // worker for whatever is queued.
+            let _debt_slot = match operation {
+                Operation::BaseRollup | Operation::DerivedRollup => None,
+                _ if !coverage_is_short() => None,
+                _ => match Arc::clone(&self.maintenance_debt_slots).try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => continue,
+                },
+            };
             let timeout = coordinator_operation_timeout(operation);
             let work = async {
                 match operation {
@@ -20395,6 +20441,25 @@ mod tests {
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
     fn far_future() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+    }
+
+    /// The debt cap must leave workers for the rollup chain without starving debt
+    /// entirely — file counts left ungoverned degraded every query on 2026-08-01.
+    #[test]
+    fn the_debt_cap_reserves_workers_without_starving_debt() {
+        // Mirrors the sizing in `Database::new`.
+        let permits = |jobs: usize| (jobs * 3 / 4).max(1);
+        // Prod shape: 16 workers -> 12 for debt, 4 always free for rollup.
+        assert_eq!(permits(16), 12, "a quarter of the workers stays free for the rollup chain");
+        assert_eq!(16 - permits(16), 4);
+        // Debt keeps the large majority of capacity, which is the point: it is
+        // deprioritised, not switched off.
+        assert!(permits(16) * 2 > 16, "debt must still hold most of the workers");
+        // A single-worker box must not deadlock into zero debt progress.
+        assert_eq!(permits(1), 1, "one worker still runs debt");
+        assert_eq!(permits(2), 1);
+        // Monotonic in the worker count — more workers never means less debt.
+        assert!((1..64).all(|jobs| permits(jobs) <= permits(jobs + 1)));
     }
 
     /// The reweighting must move slots to the rollup chain WITHOUT starving
