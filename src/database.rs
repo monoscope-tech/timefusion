@@ -10040,11 +10040,18 @@ impl Database {
                         // proves what `dependencies_complete` can otherwise only
                         // infer from journal records that a historical day does
                         // not have — see `MaintenanceTask::base_tier_present`.
-                        enqueue(
-                            spec.table_name(&source),
-                            operation,
-                            operation == crate::maintenance_coordinator::Operation::DerivedRollup && !needs_source_scan,
-                        );
+                        //
+                        // Sealed days only. `partitions_of` reports PRESENCE — a
+                        // partition with one file counts — which is a true
+                        // statement about a day that has stopped changing and a
+                        // misleading one about a day still being written, where
+                        // the base tier is mid-build by definition. Today's
+                        // derived work is the frontier's anyway (`invalidate`
+                        // mints it per hour with its base slices right there in
+                        // the journal), so it loses nothing and keeps the strict
+                        // check where the strict check is cheap and correct.
+                        let base_proven = operation == crate::maintenance_coordinator::Operation::DerivedRollup && !needs_source_scan && *date < today;
+                        enqueue(spec.table_name(&source), operation, base_proven);
                     }
                     queued = queued.saturating_add(1);
                 }

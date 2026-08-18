@@ -611,6 +611,46 @@ guard above). **Not yet proven** — starvation alone could explain the old
 numbers. The discriminator is now available and cheap: with workers free, if
 `pending_derived_rollup` stays flat, it is the dependency gate.
 
+### The discriminator ran, and it is the dependency gate (#184)
+
+Two further 240s windows on the post-#181 process, workers free and zero
+timeouts:
+
+- `pending_derived_rollup` did not move by **one task**.
+- All **35** derived units claimed in 20 minutes were *frontier* slices whose
+  base had completed minutes earlier.
+- No project's 1h day count moved at all (94c5dc1f 17, 98fdd4f3 10, be87ebc1 9,
+  shipbubble 6 — unchanged across the whole window).
+
+Confirmed the sixth silent refusal. `dependencies_complete` requires COMPLETE
+`BaseRollup` *journal tasks* contiguously covering a derived unit's slice, and
+`claim_next` evaluates it inside a filter — so a historical day whose 1m tier was
+built weeks ago, by an older code path or with its journal records since
+collapsed, is unclaimable forever with no counter and no log.
+
+Fixed by making the evidence match the question: `plan_rollup_backfill` computes
+`missing` tiers from ACTUAL rollup coverage, so a day missing its derived tier
+while missing no base tier proves the base data is present. That fact is
+recorded on the task (`MaintenanceTask::base_tier_present`) and the gate honours
+it; frontier units, where the planner can prove nothing, keep the strict check.
+
+**This is the shortest path to G1/G2 that exists**, because derived units read no
+raw data at all — the 1h tier can backfill from the 1m tier that is already 33
+days deep.
+
+### Standing correction to this plan's method
+
+Three of the four defects found tonight were *silent refusals in a filter
+predicate* — work that is queued, eligible-looking on every gauge, and never
+claimed. Gauges cannot see them: `pending_derived_rollup` reads identically
+whether 757 tasks are waiting their turn or can never be claimed at all.
+
+What found all three was the same two-step: (1) diff two `timefusion_stats`
+snapshots to find what is NOT moving, then (2) go to the logs and histogram
+`maintenance_task_started` by `operation` and by `attempts`. **Add that histogram
+to the standing snapshots (Phase 0.5).** Every future scheduler question should
+start there, and no scheduling change should be evaluated without it.
+
 ---
 
 ## 6. Phase 2 — aim the backfill at the goal (enqueue control)
