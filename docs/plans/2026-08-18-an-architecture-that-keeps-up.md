@@ -1537,6 +1537,59 @@ suggests most). A stale task drained is capacity stolen from a real one.
 → verify: a count of pending tasks whose partition already meets policy. If it
 is the majority, Phase C subsumes this entirely.
 
+## 21b. Phase D executed — the results, and the treadmill it exposed
+
+**#198 retired 4,290 stale hygiene tasks in one pass** (2,646 + 1,644).
+`pending_hot_packing` collapsed **2,654 → 70**: today's compaction is done.
+
+Sealed consolidation barely moved (2,218 → 2,130), which was the interesting
+part. It is **not a backlog — it is a treadmill**, and the Delta log says why.
+Over 381 commits of the prod log:
+
+```
+add actions: 1,648    untagged: 1,593 (96.7%)    tagged: 55, all delta-rs.optimize.sort_by
+```
+
+Only the OPTIMIZE path tags its output. `plan_compaction_debt` admitted a
+partition when any file was `!is_sorted_run()`, so **every partition holding a
+flush-written file — which is every partition — was permanently out of policy**,
+and ingest recreated the condition faster than consolidation cleared it.
+
+The codebase already knew. From `repair_verified_sorted`'s own comment: *"the
+flush path sorts and stamps a correct footer WITHOUT the tag, so an untagged
+file is only a suspect… admission by tag alone would rewrite a healthy 716 MB
+file for nothing."* Repair honours that and footer-checks. Consolidation did
+not, and treated suspicion as proof.
+
+**#200** gives consolidation file SIZE — unambiguous, and what the word means —
+and leaves sortedness to Repair, which verifies it. Expected effect: sealed
+consolidation pending falls from ~2,130 toward the **108** the object-storage
+audit found.
+
+**Generalises the §16.3 lesson:** three cases of *presence* substituted for
+*completeness*, and now a fourth of *absence-of-a-tag* substituted for
+*absence-of-the-property*. Both are the same error — reading a cheap proxy as
+the fact — and every one of them created work that could never be finished.
+
+### Coverage machinery: all of it now live and confirmed
+
+```
+base_tier_ready = 374   dependencies satisfied from real coverage (#197)
+tier_holes      = 318   holes ranked ahead of re-derives          (#199)
+derived_sealed  = 485   the historical work itself
+derived_not_due = 504   post-restart backoff; decays
+```
+
+Every known blocker on the derived tier is now addressed: dependency (#197),
+priority (#189), occupancy (#190), admission (#191/#192), visibility
+(#194/#196), and ordering (#199). What remains is throughput once the deadlines
+mature — which needs a QUIET WINDOW to measure, not another change.
+
+**Stopping deploys here.** Seventeen changes have shipped in one session and
+every deploy resets the counters that would show whether they worked; §12's
+"≥2h quiet before believing a throughput number" has been violated repeatedly
+out of necessity and should now be honoured.
+
 ## 22. Ordering, and the one-line rationale for it
 
 1. **A** (local loop) — because every estimate below is currently a projection.
