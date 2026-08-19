@@ -977,6 +977,35 @@ nothing, stop fixing and go count the population it acts on. Four fixes in a row
 were validated against `pending_derived_rollup` ≈ 900 without once checking that
 those 900 were all frontier work.
 
+### The census paid for itself in one pass (#194 -> #195)
+
+03:00 UTC, first census reading:
+
+```
+source=otel_logs_and_spans  cells_missing=264  cells_wanted=0  defer_enqueue=false
+source=otel_metrics         cells_missing=215  cells_wanted=0  defer_enqueue=false
+```
+
+The planner sees **every** hole. **Every** one is vetoed as already-queued. So
+the tasks exist and are pending, and the question was never "why can't the
+planner see the work" — it was "why is queued work never claimed". That is the
+opposite of what four earlier fixes assumed, and no measurement available before
+#194 could distinguish the two.
+
+The answer followed immediately: #186's proof is keyed on one exact **day-wide**
+`TaskKey`, and prod's queued work is hour-wide. `invalidate` mints derived units
+at `DERIVED_SLICE_MICROS` (one hour), and `coarsen_sealed_slices` will not fuse
+a day whose day-wide unit already exists in ANY state — including `Complete`,
+which is precisely what a legacy rows=0 publication leaves behind. So such a day
+holds hour-wide PENDING tasks under a COMPLETED day-wide one, and the proof
+landed on the completed task, which is never claimed. #195 makes the proof a
+property of the day at any width.
+
+**This is the argument for buying observability mid-investigation.** #194 changed
+no behaviour and cost one deploy; it then resolved in a single pass a question
+that four behavioural fixes had each answered wrongly. When consecutive correct
+fixes produce no effect, the next change should be a measurement, not a fifth fix.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
