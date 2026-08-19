@@ -848,6 +848,28 @@ machine that builds coverage went from producing nothing to producing 260k
 rollup rows a minute, and every defect between here and the goal is now named,
 measured, and either fixed or written down below.
 
+### The seventh: the missing days were never enqueued (#191)
+
+With every other defect fixed, the derived backlog drained (634 → 601) and
+**every one of 132 derived claims in the window was a frontier HOUR. Zero sealed
+days.** Not because they lost the claim — #189/#190 fixed that — but because
+there was no historical work left in the journal at all.
+
+#188 stopped the ceiling disabling the whole pass, but it still deferred the
+ENQUEUE, and the live frontier alone holds the journal at ~43,000 against the
+25,000 ceiling, *replenished by ingest*. Waiting for it to fall is waiting
+forever. The days shipbubble is missing had never been enqueued and could not be.
+
+#191 makes the ceiling bind only when coverage is healthy. Bounded and
+self-limiting in both directions: at most 24 cells per pass, contiguity ordering
+aims them at the worst project's earliest hole, and coverage reaching
+`COVERAGE_SHORT_DAYS` restores it.
+
+**Seven now, same shape, still queueing behind one another.** Capacity → backoff
+→ dependency → admission-of-the-pass → priority → occupancy → admission-of-the-
+work. The list in §"one-line summary" should be read as evidence for the method,
+not as a claim that it is finished.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
