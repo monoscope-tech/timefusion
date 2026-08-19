@@ -2114,10 +2114,19 @@ const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 ///
 /// Beyond this bound a task is deliberately NOT starved. `scheduling_class`'s
 /// own history records why: plain oldest-first sent 10 of 10 historical starts
-/// to data months old while the last 30 days went untouched. 45 days sits
-/// comfortably outside `timefusion_rollup_backfill_days` (35), so the entire
-/// window the 30-day goal needs can escalate, and nothing older can.
-const STARVATION_HORIZON_MICROS: i64 = 45 * 24 * 60 * 60 * 1_000_000;
+/// to data months old while the last 30 days went untouched.
+///
+/// 31 days, because the escape valve must cover the GOAL window and no more.
+/// At 45 it did not: prod 2026-08-19 had hygiene claiming 2026-07-17, 07-19 and
+/// 07-20 — correctly oldest-first, and 30+ days back, so outside the window any
+/// 30d panel reads. The source table spans 2023-01-01 to 2026-08-19 with 75 of
+/// its 89 partition-days holding 10 or more files, so there is always older
+/// debt to find; without a bound tied to the goal, oldest-first spends the whole
+/// escalation there and the days a 30d query actually needs wait behind it.
+///
+/// Outside the window a partition still gets served by ordinary newest-first
+/// ordering. It is deprioritised, not abandoned.
+const STARVATION_HORIZON_MICROS: i64 = 31 * 24 * 60 * 60 * 1_000_000;
 
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64) {
     if is_live_frontier(task.key.slice, now_micros) {
@@ -3227,6 +3236,15 @@ mod tests {
         // of 10 historical starts landing on data months old.
         let ancient = super::scheduling_class(&sealed_hours_ago("f", 60 * 24), now);
         assert!(recent_new < ancient, "past STARVATION_HORIZON_MICROS a day no longer escalates");
+
+        // The bound tracks the GOAL window, not merely "old". A day 40 days back
+        // is outside what a 30d panel reads, and at a 45-day horizon prod spent
+        // the escalation on 2026-07-17..07-20 while the days a 30d query needed
+        // waited behind them. The source table always has older debt to find —
+        // it spans 2023-01-01 with 75 of 89 partition-days above 10 files.
+        let outside_goal_window = super::scheduling_class(&sealed_hours_ago("h", 40 * 24), now);
+        let inside_goal_window = super::scheduling_class(&sealed_hours_ago("i", 25 * 24), now);
+        assert!(inside_goal_window < outside_goal_window, "a day inside the 30d window must outrank one outside it");
 
         // And starvation never lets sealed work outrank the live frontier.
         let frontier = super::scheduling_class(&task("g", now - 600_000_000, now, Operation::BaseRollup), now);
