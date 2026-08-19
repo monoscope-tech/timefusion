@@ -967,11 +967,32 @@ impl TaskJournal {
         // guarantees tomorrow's yesterday is holed, and the coverage metric can
         // never leave zero. Frontier health is a PREREQUISITE for the coverage
         // goal, not a competitor to it.
-        let sealed_turn = if self.frontier_lag_secs.load(std::sync::atomic::Ordering::Relaxed) > FRONTIER_LAG_BUDGET_SECS {
-            self.claim_tick.is_multiple_of(4)
-        } else {
-            self.claim_tick.is_multiple_of(2)
-        };
+        //
+        // DerivedRollup always takes the sealed turn, because for THIS operation
+        // the reservation's premise does not hold. The frontier mints derived
+        // work at `DERIVED_SLICE_MICROS` — one unit per stream per HOUR, ~24 a
+        // day — against 144 Dedup plus 144 BaseRollup for the same stream-day.
+        // Derived is roughly 3% of frontier creation, so preferring sealed for
+        // it cannot meaningfully starve the frontier, which is the entire reason
+        // the share is throttled.
+        //
+        // What it does buy is the goal. The derived tier is the one 14d/30d
+        // dashboards read, and it is the coverage gap: prod 2026-08-19 00:10 UTC
+        // had the 1m base tier 33 days deep against a 1h tier at 9-17, with 387
+        // historical day-wide derived units freshly unblocked by #186/#188 — and
+        // EVERY derived unit claimed in the following 12 minutes was a one-hour
+        // frontier slice for today or yesterday. Class is strict priority, the
+        // frontier regenerates continuously, so without a reservation the
+        // historical units never run at all.
+        //
+        // Costs nothing when there is no sealed derived work: the caller already
+        // falls back to any class.
+        let sealed_turn = operation == Operation::DerivedRollup
+            || if self.frontier_lag_secs.load(std::sync::atomic::Ordering::Relaxed) > FRONTIER_LAG_BUDGET_SECS {
+                self.claim_tick.is_multiple_of(4)
+            } else {
+                self.claim_tick.is_multiple_of(2)
+            };
         let claimable = |task: &MaintenanceTask| {
             task.key.operation == operation
                 && matches!(task.state, TaskState::Pending | TaskState::Retry)
@@ -2282,6 +2303,37 @@ mod tests {
         assert_eq!(claimed.state, TaskState::Running);
         assert_eq!(claimed.attempts, 1);
         assert!(journal.claim_next(Operation::Dedup, 0, true).is_none());
+    }
+
+    /// Historical derived work must not lose every claim to the frontier.
+    ///
+    /// Prod 2026-08-19 00:10 UTC: 387 historical day-wide derived units had just
+    /// been unblocked (#186/#188), the 1h tier they build was 9-17 days deep
+    /// against a 33-day base tier — and EVERY derived unit claimed in the next
+    /// 12 minutes was a one-hour frontier slice for today or yesterday. Class is
+    /// strict priority and the frontier regenerates continuously, so without a
+    /// reservation the historical units never run at all.
+    #[test]
+    fn a_sealed_derived_unit_is_not_starved_by_the_frontier() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 40 * 24 * 3_600_000_000i64;
+        let derived = |project: &str, start: i64, width: i64| {
+            let mut task = task(project, start, start + width, Operation::DerivedRollup);
+            task.base_tier_present = true;
+            task.deadline_micros = 0;
+            task
+        };
+        // A one-hour frontier slice, and a day-wide sealed one ten days back.
+        journal.upsert(derived("frontier", now - 3_600_000_000, 3_600_000_000));
+        let sealed_start = now - 10 * 24 * 3_600_000_000;
+        journal.upsert(derived("sealed", sealed_start, 24 * 3_600_000_000));
+
+        // The frontier is behind, which is exactly when the general reservation
+        // shrinks — and exactly when coverage needs the sealed unit most.
+        journal.frontier_lag_secs.store(FRONTIER_LAG_BUDGET_SECS + 1, std::sync::atomic::Ordering::Relaxed);
+        let claimed = journal.claim_next(Operation::DerivedRollup, now, true).expect("a derived unit is claimable");
+        assert_eq!(claimed.key.project_id, "sealed", "historical derived work must win the claim, not today's");
     }
 
     /// A derived unit whose base TIER already exists must be claimable, even
