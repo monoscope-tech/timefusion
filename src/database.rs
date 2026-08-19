@@ -15734,10 +15734,24 @@ fn select_coordinator_compaction_candidates(candidates: Vec<TailAdd>, target: i6
     let mut bytes = 0i64;
     let mut selected = Vec::new();
     for add in candidates {
-        if has_unsorted && add.is_sorted_run {
+        // A file at or above target is converged and is never packing's work,
+        // whatever its tags say. This skip used to sit behind `!has_unsorted`,
+        // and `is_sorted_run` reads a tag only the OPTIMIZE path writes — 1,593
+        // of 1,648 prod adds carry none — so `has_unsorted` was true for
+        // effectively every partition and the skip never ran.
+        //
+        // Prod 2026-08-19: whale/07-30 (103 files, 53.5 GB, already 0.52 GB per
+        // file) was admitted for holding two small files, then selected its
+        // half-gigabyte converged ones — 4.44 GB per unit, over the 900 s
+        // deadline every time, re-claimed with attempts climbing 1 → 7. It took
+        // 11 of 20 SealedConsolidation starts in 25 minutes while 2026-08-13 sat
+        // at 167 files for six days and got none. Sortedness is Repair's job;
+        // `plan_compaction_debt`'s admission test is already size-only for the
+        // same reason, and this is the half that was missed.
+        if add.size >= target {
             continue;
         }
-        if !has_unsorted && add.size >= target {
+        if has_unsorted && add.is_sorted_run {
             continue;
         }
         if !selected.is_empty() && bytes.saturating_add(add.size) > limit {
@@ -19198,7 +19212,6 @@ mod writer_properties_tests {
         assert!(!sorted);
         assert_eq!(drain(passthrough).len(), 2);
     }
-
 }
 
 #[cfg(test)]
@@ -21018,6 +21031,39 @@ mod tests {
         assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(super::REPAIR_SLICE_TARGET_BYTES));
     }
 
+    /// A packing pass must never rewrite a file that is already at or above target.
+    ///
+    /// The converged-file skip used to sit behind `!has_unsorted`, and `is_sorted_run` reads a tag
+    /// only the OPTIMIZE path writes — 1,593 of 1,648 prod adds carry no tags at all. So
+    /// `has_unsorted` was true for effectively every partition and the skip never ran: a partition
+    /// admitted for holding two small files went on to select its half-gigabyte converged ones.
+    ///
+    /// Prod 2026-08-19: whale/2026-07-30 (103 files, 53.5 GB, already 0.52 GB/file) took 11 of 20
+    /// SealedConsolidation starts in 25 minutes at 4.44 GB estimated per unit, exceeded its 900 s
+    /// deadline every time, and was re-claimed with attempts climbing 1 → 7 — while 2026-08-13 sat
+    /// at 167 files for six days and got zero starts. Sortedness belongs to Repair; this pass is
+    /// size-only, exactly as `plan_compaction_debt`'s admission test already is.
+    #[test]
+    fn coordinator_packing_never_rewrites_a_converged_file() {
+        const MB: i64 = 1024 * 1024;
+        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None };
+
+        // The whale/07-30 shape: converged files carrying no sorted-run tag, beside real small debt.
+        let whale = vec![f("converged-a", 520, false), f("converged-b", 512, false), f("small-a", 6, false), f("small-b", 6, false)];
+        assert_eq!(
+            super::select_coordinator_compaction_candidates(whale, 256 * MB),
+            vec!["small-a", "small-b"],
+            "a packing unit takes the small files and leaves the converged ones alone"
+        );
+
+        // Nothing but converged untagged files is nothing to pack — the task retires as compliant.
+        let done = vec![f("converged-a", 520, false), f("converged-b", 512, false)];
+        assert!(
+            super::select_coordinator_compaction_candidates(done, 256 * MB).is_empty(),
+            "an already-packed partition must produce no work, whatever its tags say"
+        );
+    }
+
     /// Coordinator sealed units must fit their deadline and file-count contract.
     ///
     /// A target too large was repeatedly cancelled mid-rewrite and made zero durable progress. A
@@ -22287,8 +22333,8 @@ mod tests {
     /// dropped, adjacent slices abut exactly, and every value in `samples` lands
     /// in exactly one slice.
     fn assert_tiles(bounds: &[(i64, Option<i64>)], lo: i64, hi: i64, samples: &[i64]) {
-        assert_eq!(bounds[0].0, lo, "first slice starts at lo");
         let last = *bounds.last().expect("non-empty");
+        assert_eq!(bounds[0].0, lo, "first slice starts at lo");
         assert!(last.1.is_none(), "last slice is open so hi is never dropped");
         // The doc's claim about `hi`, actually checked. Without this the
         // parameter was unused, which is how it read as dead rather than as an
