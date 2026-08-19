@@ -19199,30 +19199,6 @@ mod writer_properties_tests {
         assert_eq!(drain(passthrough).len(), 2);
     }
 
-    // A bucket whose batches have evolved schemas (an extra nullable column on
-    // the 2nd batch, which mem_buffer's schemas_compatible admits) is unified
-    // to a superset schema and globally sorted — no abort, no data loss — so the
-    // flushed file gets an honest footer and stays eligible for the reader's
-    // ordering pushdown. (Previously this returned sorted=false; see
-    // `heterogeneous_bucket_still_sorts_with_honest_footer` for why that
-    // silently disabled top-N pushdown on prod.)
-    #[test]
-    fn sort_batches_tolerates_schema_evolution() {
-        use arrow::array::{Int64Array, StringArray};
-        use arrow_schema::{DataType, Field, Schema};
-        let s1 = std::sync::Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
-        let s2 = std::sync::Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false), Field::new("extra", DataType::Utf8, true)]));
-        let b1 = RecordBatch::try_new(s1, vec![std::sync::Arc::new(Int64Array::from(vec![2, 1]))]).unwrap();
-        let b2 =
-            RecordBatch::try_new(s2, vec![std::sync::Arc::new(Int64Array::from(vec![3])), std::sync::Arc::new(StringArray::from(vec![Some("x")]))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2], DEFAULT_SORT_SKIP_BYTES);
-        let out = drain(out);
-        assert!(sorted, "mixed-schema bucket is unified and sorted, not left unsorted");
-        assert_eq!(out.len(), 1, "batches unified into one sorted file");
-        let ts = out[0].column_by_name("timestamp").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(ts.values(), &[1, 2, 3], "globally sorted by the declared key across evolved batches");
-        assert!(out[0].schema().column_with_name("extra").is_some(), "evolved superset column survives (no data loss)");
-    }
 }
 
 #[cfg(test)]
@@ -20362,7 +20338,10 @@ mod tests {
 
     /// The metric exists because the two we had both read as progress while
     /// 14d/30d queries were unroutable. It must report the CONTIGUOUS run, and
-    /// must be dragged down by the worst project.
+    /// must be dragged down by the worst project — but a day the SOURCE never
+    /// held must still count as answered (else the gauge is unreachable by
+    /// construction: the goal is "30 contiguous days a 30d panel can answer
+    /// from the tier", not "30 days every tenant happened to send traffic").
     #[test]
     fn contiguous_coverage_ignores_days_stranded_behind_a_hole() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).expect("date");
@@ -20403,38 +20382,29 @@ mod tests {
             2,
             "a project that no longer ingests must not pin the fleet number at zero"
         );
-    }
 
-    /// A day the source never held must count as answered, or the gauge is unreachable by
-    /// construction.
-    ///
-    /// The goal is "30 contiguous days a 30d panel can answer from the tier", not "30 days on
-    /// which every tenant happened to send traffic". A quiet tenant would otherwise pin the fleet
-    /// gauge to zero.
-    #[test]
-    fn a_day_with_no_source_rows_counts_as_answered() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date");
-        let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
-        let set = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day(*d))).collect::<HashSet<_>>();
-        let active = |names: &[&'static str]| names.iter().copied().collect::<HashSet<&str>>();
-
+        // A day the source never held must count as answered, or the gauge is
+        // unreachable by construction: the goal is "30 contiguous days a 30d
+        // panel can answer from the tier", not "30 days on which every tenant
+        // happened to send traffic".
+        let today2 = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date");
+        let day2 = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
+        let set = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day2(*d))).collect::<HashSet<_>>();
         // 4f020cf8's real shape: source on 14/16/18 only, tier matching exactly.
         let source = set(&[("q", 14), ("q", 16), ("q", 18)]);
-        let covered = set(&[("q", 14), ("q", 16), ("q", 18)]);
+        let covered_q = set(&[("q", 14), ("q", 16), ("q", 18)]);
         assert_eq!(
-            min_contiguous_days(&covered, &source, today, &active(&["q"])).0,
+            min_contiguous_days(&covered_q, &source, today2, &active(&["q"])).0,
             CONTIGUITY_HORIZON_DAYS,
             "17 and 15 had no rows to roll up, and neither did anything older — fully answered"
         );
-
         // A day the source DID hold and the tier does not is still a real hole.
         let source = set(&[("q", 17), ("q", 16), ("q", 15)]);
-        let covered = set(&[("q", 17), ("q", 15)]);
-        assert_eq!(min_contiguous_days(&covered, &source, today, &active(&["q"])).0, 1, "16 has rows and no tier — a genuine gap");
-
+        let covered_q = set(&[("q", 17), ("q", 15)]);
+        assert_eq!(min_contiguous_days(&covered_q, &source, today2, &active(&["q"])).0, 1, "16 has rows and no tier — a genuine gap");
         // A project that emitted nothing at all in the window is fully answered
         // rather than scoring zero.
-        assert_eq!(min_contiguous_days(&HashSet::new(), &HashSet::new(), today, &active(&["silent"])).0, CONTIGUITY_HORIZON_DAYS);
+        assert_eq!(min_contiguous_days(&HashSet::new(), &HashSet::new(), today2, &active(&["silent"])).0, CONTIGUITY_HORIZON_DAYS);
     }
 
     #[test]
@@ -21684,16 +21654,11 @@ mod tests {
             super::classify_resume(&ok, "logs", 100_000, &resume_live(&[("in1", None), ("in2", Some(70))])),
             RowMismatch { target_rows: -1, staged_rows: 100 }
         );
-    }
-
-    /// Staged parquet is uuid-named, so its presence in the snapshot can only
-    /// mean OUR commit landed before the crash — clear the intent, never
-    /// re-commit (re-committing would remove files the landed commit added).
-    #[test]
-    fn resume_clears_an_entry_whose_commit_already_landed() {
-        let entry = resume_intent(&["in1"], vec![resume_add("out1", 100)]);
-        let live = resume_live(&[("out1", Some(100))]);
-        assert_eq!(super::classify_resume(&entry, "logs", 100_000, &live), super::ResumeVerdict::AlreadyLanded);
+        // Staged parquet is uuid-named, so its presence in the snapshot can only
+        // mean OUR commit landed before the crash — clear the intent, never
+        // re-commit (re-committing would remove files the landed commit added).
+        let landed = resume_intent(&["in1"], vec![resume_add("out1", 100)]);
+        assert_eq!(super::classify_resume(&landed, "logs", 100_000, &resume_live(&[("out1", Some(100))])), AlreadyLanded);
     }
 
     /// The Add stats column list must be the narrow prune set, not the whole schema, and must never
@@ -22591,6 +22556,24 @@ mod tests {
         Ok(())
     }
 
+    /// Scrambled-event-time batches of `batches_n × rows_per_batch` wide rows (`id_width` bytes
+    /// each), so an append-ordered pass-through cannot masquerade as a sort.
+    fn wide_row_batches(rows_per_batch: i64, batches_n: i64, id_width: usize) -> Vec<RecordBatch> {
+        use arrow::array::{StringArray, TimestampMicrosecondArray};
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("timestamp", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+        ]));
+        (0..batches_n)
+            .map(|b| {
+                let ts: TimestampMicrosecondArray =
+                    (0..rows_per_batch).map(|i| Some((b * rows_per_batch + i).wrapping_mul(2_654_435_761) % 1_000_000_000)).collect();
+                let ids = StringArray::from_iter_values((0..rows_per_batch).map(|i| format!("{b:04}-{i:06}-{}", "x".repeat(id_width))));
+                RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(ts), Arc::new(ids)]).unwrap()
+            })
+            .collect()
+    }
+
     /// Escalated flush sorts must be one pool consumer.
     ///
     /// Each plan used to fan out to many `ExternalSorters` plus an unspillable merge exec, so N
@@ -22599,36 +22582,20 @@ mod tests {
     /// survives even a minimum pool floor with data far larger than the pool.
     #[tokio::test]
     async fn escalated_flush_sort_is_one_pool_consumer_and_survives_a_minimum_pool() -> Result<()> {
-        use arrow::array::{StringArray, TimestampMicrosecondArray};
+        use arrow::array::TimestampMicrosecondArray;
         let mut cfg = (*create_test_config("flush-sort-floor")).clone();
         cfg.maintenance.timefusion_sort_skip_bytes = 0; // every group escalates
         cfg.maintenance.timefusion_flush_sort_pool_mb = 64; // the config floor
         let db = Database::with_config(Arc::new(cfg)).await?;
-
         let table = get_schema("otel_logs_and_spans").expect("registered");
-        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("timestamp", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
-            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
-        ]));
-        // ~128 MB across 16 batches — 2× the pool — with scrambled event time,
-        // so an append-ordered pass-through cannot masquerade as a sort.
-        let per_batch = 10_000i64;
-        let batches: Vec<RecordBatch> = (0..16)
-            .map(|b| {
-                let ts: TimestampMicrosecondArray = (0..per_batch).map(|i| Some((b * per_batch + i).wrapping_mul(2_654_435_761) % 1_000_000_000)).collect();
-                let ids = StringArray::from_iter_values((0..per_batch).map(|i| format!("{b:04}-{i:06}-{}", "x".repeat(800))));
-                RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(ts), Arc::new(ids)]).unwrap()
-            })
-            .collect();
+        // ~128 MB across 16 batches — 2× the pool.
+        let batches = wide_row_batches(10_000, 16, 800);
 
         let (out, escalated) = db.sort_flush_group(table, batches, UnsortedFallback::Allow).await?;
         assert!(escalated, "the spilling sort starved its own pool and fell back to writing unsorted");
         let FlushBatches::Ready(it) = out else { panic!("escalated path yields Ready batches") };
-        let sorted: Vec<RecordBatch> = it.collect();
-        let stamps: Vec<i64> = sorted
-            .iter()
-            .flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec())
-            .collect();
+        let stamps: Vec<i64> =
+            it.flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec()).collect();
         assert_eq!(stamps.len(), 160_000, "the sort must not lose or duplicate rows");
         assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
         Ok(())
@@ -22641,29 +22608,16 @@ mod tests {
     /// spills.
     #[tokio::test]
     async fn flush_sort_batch_is_small_enough_for_its_pool_to_admit_one() -> Result<()> {
-        use arrow::array::{StringArray, TimestampMicrosecondArray};
+        use arrow::array::TimestampMicrosecondArray;
         let mut cfg = (*create_test_config("flush-sort-wide-rows")).clone();
         cfg.maintenance.timefusion_sort_skip_bytes = 0; // every group escalates
         cfg.maintenance.timefusion_flush_sort_pool_mb = 64; // the config floor
         let db = Database::with_config(Arc::new(cfg)).await?;
-
         let table = get_schema("otel_logs_and_spans").expect("registered");
-        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("timestamp", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
-            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
-        ]));
         // ~8 KB per row: one 8192-row batch would be ~65 MB, just over the 64 MB
-        // pool, so the OLD batch size cannot admit a single batch. Scrambled
-        // event time so an append-ordered pass-through cannot fake a sort.
+        // pool, so the OLD batch size cannot admit a single batch.
         let (rows_per_batch, batches_n) = (1_000i64, 16i64);
-        let batches: Vec<RecordBatch> = (0..batches_n)
-            .map(|b| {
-                let ts: TimestampMicrosecondArray =
-                    (0..rows_per_batch).map(|i| Some((b * rows_per_batch + i).wrapping_mul(2_654_435_761) % 1_000_000_000)).collect();
-                let ids = StringArray::from_iter_values((0..rows_per_batch).map(|i| format!("{b:04}-{i:06}-{}", "x".repeat(8_000))));
-                RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(ts), Arc::new(ids)]).unwrap()
-            })
-            .collect();
+        let batches = wide_row_batches(rows_per_batch, batches_n, 8_000);
 
         let (out, escalated) = db.sort_flush_group(table, batches, UnsortedFallback::Allow).await?;
         assert!(escalated, "the pool could not admit one batch, so the group was written UNSORTED — the footer-poison path");
@@ -23255,9 +23209,12 @@ mod tests {
     /// Anchors the Delta-empty short-circuit correctness invariant:
     /// `delta_scan_can_be_skipped` must return `false` (the conservative default
     /// that runs the full scan) until `mark_delta_has_files` is called, and
-    /// the flip is monotonic and per-(project,table). This is the load-
-    /// bearing predicate for the 45% latency win — a regression that
-    /// flipped polarity would silently hide post-flush data.
+    /// the flip is monotonic and per-(project,table), never downgraded once set.
+    ///
+    /// A flush callback marks `(p, t)` true; a concurrent reader's `resolve_table` may observe
+    /// `version() == 0` on its just-loaded snapshot. `populate_resolve_caches` used to store that
+    /// false observation, downgrade the bit, and subsequent scans would skip Delta until restart
+    /// — the load-bearing predicate for the 45% latency win. The fix only ever stores `true`.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_delta_has_files_sticky_bit() -> Result<()> {
@@ -23284,56 +23241,21 @@ mod tests {
         db.mark_delta_has_files(&p1, t);
         assert!(!db.delta_scan_can_be_skipped(&p1, t), "re-mark is idempotent — still has files");
 
-        // Sticky-true invariant: the populate path inside resolve_table
-        // (and helpers) must NEVER downgrade an already-set true to false,
-        // even if it observes version == 0 on a stale snapshot. Simulate
-        // the populate path's store(false) — must be a no-op when the
-        // bit is true.
-        // White-box test: reach into delta_has_files via the public API
-        // by re-asserting; the populate helper is private but the
-        // invariant matters at the field level.
-        // (For a true round-trip we'd resolve the table; setup_test_database
-        // doesn't yet have a Delta-empty table to test that branch, but the
-        // populate_resolve_caches docstring documents the property and the
-        // implementation only ever calls store(true).)
-        assert!(!db.delta_scan_can_be_skipped(&p1, t), "sticky-true: bit stays set across subsequent resolves");
-        Ok(())
-    }
-
-    /// Test the sticky bit: after a project is marked as having files, no code path may
-    /// downgrade the bit and hide those files from queries.
-    ///
-    /// A flush callback marks `(p, t)` true; a concurrent reader's `resolve_table` may observe
-    /// `version() == 0` on its just-loaded snapshot. `populate_resolve_caches` used to store that
-    /// false observation, downgrade the bit, and subsequent scans would skip Delta until restart.
-    /// The fix only ever stores `true`. This test forces the sequence without needing a real race.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_delta_has_files_resolve_doesnt_downgrade() -> Result<()> {
-        let (db, _ctx, prefix) = setup_test_database().await?;
-        let project_id = format!("proj-{prefix}");
-        let table = "otel_logs_and_spans";
-
-        // Simulate the flush callback marking files-present for this project.
-        db.mark_delta_has_files(&project_id, table);
-        assert!(!db.delta_scan_can_be_skipped(&project_id, table), "post-mark: bit is true → not known empty");
-
         // Force a resolve of the unified table. The fresh handle reports
         // version() == 0 because nothing has been written. Pre-fix this
         // would have downgraded the bit; post-fix the sticky-true
         // invariant holds.
-        let _t = db.resolve_table(&project_id, table).await?;
+        let _t = db.resolve_table(&p1, t).await?;
         assert!(
-            !db.delta_scan_can_be_skipped(&project_id, table),
+            !db.delta_scan_can_be_skipped(&p1, t),
             "STICKY-TRUE: resolve_table observing version==0 must NOT downgrade a previously-marked bit. \
              A regression here means post-flush rows get hidden from queries."
         );
 
         // Resolve via the alternative path used by SELECTs (try_fast_resolve
         // → fast_resolve_cache hit) — same invariant must hold.
-        let _ = db.try_fast_resolve(&project_id, table);
-        assert!(!db.delta_scan_can_be_skipped(&project_id, table), "STICKY-TRUE preserved across try_fast_resolve too");
-
+        let _ = db.try_fast_resolve(&p1, t);
+        assert!(!db.delta_scan_can_be_skipped(&p1, t), "STICKY-TRUE preserved across try_fast_resolve too");
         Ok(())
     }
 
@@ -23602,38 +23524,6 @@ mod tests {
         assert_eq!(ring.len(), 0);
     }
 
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_insert_and_query() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx, prefix) = setup_test_database().await?;
-            let project_id = format!("project_{}", prefix);
-
-            // Test basic insert
-            let batch = json_to_batch(vec![test_span("test1", "span1", &project_id)])?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-
-            // Verify count
-            let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
-            use datafusion::arrow::array::AsArray;
-            let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-            assert_eq!(count, 1);
-
-            // Test field selection
-            let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "test1");
-            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "span1");
-
-            // Shutdown database
-            db.shutdown().await?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
-    }
-
     /// C3 end-to-end through the real stack (bootstrap → WAL → MemBuffer →
     /// coalescing flush → Delta → SQL). With the flag on, two projects' rows
     /// flushed in the same tick land in ONE Delta commit and both are queryable
@@ -23885,39 +23775,43 @@ mod tests {
 
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_multiple_projects() -> Result<()> {
+    async fn test_insert_query_and_project_isolation() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let (db, ctx, prefix) = setup_test_database().await?;
-            let projects: Vec<String> = (1..=3).map(|i| format!("proj{}_{}", i, prefix)).collect();
+            use datafusion::arrow::array::AsArray;
 
-            // Insert data for multiple projects
+            // Basic insert, count and field selection on a single project.
+            let solo = format!("project_{}", prefix);
+            let batch = json_to_batch(vec![test_span("test1", "span1", &solo)])?;
+            db.insert_records_batch(&solo, "otel_logs_and_spans", vec![batch], true, None).await?;
+            let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", solo)).await?.collect().await?;
+            assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 1);
+            let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", solo)).await?.collect().await?;
+            assert_eq!(result[0].num_rows(), 1);
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "test1");
+            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "span1");
+
+            // Multiple projects: isolation per project, and a total across them.
+            let projects: Vec<String> = (1..=3).map(|i| format!("proj{}_{}", i, prefix)).collect();
             for project in &projects {
                 let batch = json_to_batch(vec![test_span(&format!("id_{}", project), &format!("span_{}", project), project)])?;
                 db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
             }
-
-            // Verify project isolation
-            use datafusion::arrow::array::AsArray;
             for project in &projects {
                 let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
                 assert_eq!(result[0].num_rows(), 1);
                 assert_eq!(get_str(result[0].column(0).as_ref(), 0), format!("id_{}", project));
             }
-
-            // Verify total count - need to check across all projects
             let mut total_count = 0;
             for project in &projects {
                 let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
-                let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-                total_count += count;
+                total_count += result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
             }
-            assert_eq!(total_count, 3);
+            assert_eq!(total_count, 3, "each project keeps exactly its own row, unseen by the others");
 
-            // Shutdown database
             db.shutdown().await?;
-
             Ok(())
         })
         .await
@@ -23995,6 +23889,7 @@ mod tests {
         .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
     }
 
+    /// Literal SQL `INSERT`, both single- and multi-row, alongside a prior API insert.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_sql_insert() -> Result<()> {
@@ -24008,7 +23903,7 @@ mod tests {
             let batch = json_to_batch(vec![test_span("id1", "name1", &proj1)])?;
             db.insert_records_batch(&proj1, "otel_logs_and_spans", vec![batch], true, None).await?;
 
-            // Insert via SQL
+            // Single-row insert via SQL
             let sql = format!(
                 "INSERT INTO otel_logs_and_spans (
                        project_id, date, timestamp, id, hashes, name, level, status_code, summary
@@ -24037,51 +23932,30 @@ mod tests {
             assert_eq!(result[0].num_rows(), 1);
             assert_eq!(get_str(result[0].column(1).as_ref(), 0), "sql_name");
 
-            db.shutdown().await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
-    }
-
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_multi_row_sql_insert() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx, prefix) = setup_test_database().await?;
-            let project_id = format!("multirow_{}", prefix);
-            use datafusion::arrow::array::AsArray;
-
-            // Test multi-row INSERT
+            // Multi-row INSERT, in one statement, returns a count of rows inserted
+            // and preserves per-row field values and (default) insertion order.
+            let multirow_id = format!("multirow_{}", prefix);
             let sql = format!("INSERT INTO otel_logs_and_spans (
                        project_id, date, timestamp, id, hashes, name, level, status_code, summary
                      ) VALUES
-                     ('{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK', ARRAY['Multi-row insert test 1']),
-                     ('{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', ARRAY['Multi-row insert test 2']),
-                     ('{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', ARRAY['Multi-row insert test 3 - ERROR'])",
-                     project_id, project_id, project_id);
-
-            // Multi-row INSERT returns a count of rows inserted
+                     ('{multirow_id}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK', ARRAY['Multi-row insert test 1']),
+                     ('{multirow_id}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', ARRAY['Multi-row insert test 2']),
+                     ('{multirow_id}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', ARRAY['Multi-row insert test 3 - ERROR'])");
             let result = ctx.sql(&sql).await?.collect().await?;
-            let inserted_count = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-            assert_eq!(inserted_count, 3);
+            assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 3);
 
-            // Verify all 3 records exist
-            let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
+            let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{multirow_id}'");
             let result = ctx.sql(&sql).await?.collect().await?;
-            let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-            assert_eq!(count, 3);
+            assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 3);
 
-            // Verify individual records
-            let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY id", project_id)).await?.collect().await?;
+            let result =
+                ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{multirow_id}' ORDER BY id")).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 3);
             assert_eq!(get_str(result[0].column(0).as_ref(), 0), "id1");
             assert_eq!(get_str(result[0].column(0).as_ref(), 1), "id2");
             assert_eq!(get_str(result[0].column(0).as_ref(), 2), "id3");
 
-            // Shutdown database
             db.shutdown().await?;
-
             Ok(())
         })
         .await
