@@ -1959,10 +1959,7 @@ fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake:
 fn dedup_adds_by_path(adds: impl Iterator<Item = deltalake::kernel::Add>, table_name: &str) -> Vec<deltalake::kernel::Add> {
     let mut seen = std::collections::HashSet::new();
     let mut total = 0usize;
-    let out: Vec<deltalake::kernel::Add> = adds
-        .inspect(|_| total += 1)
-        .filter(|add| seen.insert(add.path.clone()))
-        .collect();
+    let out: Vec<deltalake::kernel::Add> = adds.inspect(|_| total += 1).filter(|add| seen.insert(add.path.clone())).collect();
     let dropped = total - out.len();
     if dropped > 0 {
         warn!(table_name, dropped, event = "snapshot_duplicate_adds", "snapshot listed the same file more than once — reads over it double-count rows");
@@ -2714,8 +2711,7 @@ impl Database {
     /// All maintenance targets (unified + custom project tables) as `(name, table)` pairs,
     /// for cron jobs that sweep every table.
     async fn all_maintenance_targets(&self) -> Vec<(String, Arc<RwLock<DeltaTable>>)> {
-        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
-            self.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> = self.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
         targets.extend(self.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
         targets
     }
@@ -5949,7 +5945,14 @@ impl Database {
             .sorting_columns
             .iter()
             .filter(|c| arrow_schema.index_of(&c.name).is_ok())
-            .map(|c| format!("{} {} NULLS {}", crate::rollup::quoted(&c.name), if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { "FIRST" } else { "LAST" }))
+            .map(|c| {
+                format!(
+                    "{} {} NULLS {}",
+                    crate::rollup::quoted(&c.name),
+                    if c.descending { "DESC" } else { "ASC" },
+                    if c.nulls_first { "FIRST" } else { "LAST" }
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         if order_by.is_empty() {
@@ -6708,9 +6711,8 @@ impl Database {
             .map(|(i, prep, key)| async move {
                 let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, staged_writer, .. } = prep;
                 let mut writer = staged_writer.expect("filtered above");
-                let adds: Result<Vec<Action>> = Self::stage_batches(&mut writer, batches, max_file_bytes)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
+                let adds: Result<Vec<Action>> =
+                    Self::stage_batches(&mut writer, batches, max_file_bytes).await.map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
                 (i, key, adds.map(|adds| StagedUnit { table_ref, schema, dirty_bins, adds, stage_store }))
             })
             .buffer_unordered(parallelism)
@@ -8202,9 +8204,7 @@ impl Database {
         // Probe-only provider (chunk detection). The rewrite builds its own
         // provider per attempt — from a FRESH snapshot, with the synthetic
         // source-file column — in `dedup_rewrite_chunk`.
-        let provider = Self::narrow_provider(log_store, snapshot, partition_files, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
+        let provider = Self::narrow_provider(log_store, snapshot, partition_files, None).await.map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
         // A fresh state is intentional: SessionState clones retain mutable
         // catalog/execution internals and can resolve the scan name to an older
         // eager snapshot. FileSelection above removes the expensive all-table
@@ -8751,14 +8751,11 @@ impl Database {
                             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
                             let (shard_before, shard_after) = if limits.is_some() {
                                 let count_sql = format!("SELECT COUNT(*) FROM {scan_name} WHERE {rows_filter}");
-                                let shard_before = Self::scalar_i64(ctx, &count_sql)
-                                    .await?
-                                    .map_or(0, |v| usize::try_from(v.max(0)).unwrap_or(usize::MAX));
+                                let shard_before = Self::scalar_i64(ctx, &count_sql).await?.map_or(0, |v| usize::try_from(v.max(0)).unwrap_or(usize::MAX));
                                 if shard_before == 0 {
                                     return Ok((0, 0));
                                 }
-                                let columns =
-                                    schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
+                                let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
                                 let keys = schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
                                 let order = schema
                                     .dedup_tiebreak
@@ -10368,8 +10365,7 @@ impl Database {
         // throughput zero, because the constraint is per-unit cost.
         let unit_started = std::time::Instant::now();
         let ctx = self.bounded_rollup_maintenance_context()?;
-        let provider =
-            Self::narrow_provider(log_store, snapshot, selected, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
+        let provider = Self::narrow_provider(log_store, snapshot, selected, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
         const RAW: &str = "__maintenance_slice_raw";
         ctx.register_table(RAW, provider)?;
         let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp);
@@ -10540,9 +10536,7 @@ impl Database {
                 let Some((start, end)) = slice_tag_range(add) else {
                     return false;
                 };
-                tag_project(add) == Some(key.project_id.as_str())
-                    && start >= key.slice.start_micros
-                    && end <= key.slice.end_micros
+                tag_project(add) == Some(key.project_id.as_str()) && start >= key.slice.start_micros && end <= key.slice.end_micros
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -11345,12 +11339,7 @@ impl Database {
             if !tagged.is_empty() {
                 for ((project_id, slice_start, slice_end, generation, source_fp), rows) in tagged {
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else { continue };
-                    let complete = self.journal().rollup_slice_complete(
-                        source,
-                        &project_id,
-                        &target,
-                        slice,
-                    );
+                    let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else { continue };
                     if !complete || crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
                         continue;
@@ -15282,7 +15271,14 @@ fn schema_order_by_clause(schema: &crate::schema::TableSchema) -> String {
     let cols = schema
         .sorting_columns
         .iter()
-        .map(|c| format!("{} {}{}", crate::rollup::quoted(&c.name), if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { " NULLS FIRST" } else { " NULLS LAST" }))
+        .map(|c| {
+            format!(
+                "{} {}{}",
+                crate::rollup::quoted(&c.name),
+                if c.descending { "DESC" } else { "ASC" },
+                if c.nulls_first { " NULLS FIRST" } else { " NULLS LAST" }
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(" ORDER BY {cols}")
