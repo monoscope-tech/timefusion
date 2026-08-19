@@ -12850,9 +12850,9 @@ impl Database {
                     //
                     // NOT gated on `TailPass::Repair`: a packing bin is equally
                     // data-preserving, and today's oversized unsorted file is
-                    // repaired by the PACK pass (see
-                    // `pack_pass_still_repairs_todays_oversized_unsorted_file_when_nothing_packs`)
-                    // — those rewrites are just as long. A packing bin's inputs
+                    // repaired by the PACK pass (see the gap-rule case in
+                    // `select_tail_bin_policy`) — those rewrites are just as long.
+                    // A packing bin's inputs
                     // change every tick, so the lookup almost always misses; the
                     // cost of that miss is one small local file read.
                     if let Some(bin) = self.resumable_staged_bin(table_ref, table_name, &project_id, &files).await {
@@ -19412,27 +19412,6 @@ mod tests {
         Ok(())
     }
 
-    /// Derived work must keep workers no matter how busy the expensive units are.
-    ///
-    /// Freeing workers from debt for "the rollup chain" is not uniform: a sealed BaseRollup day is
-    /// slow, so it takes the freed worker and DerivedRollup starves behind it. Derived is cheap and
-    /// builds the 1h tier that 30-day dashboards read.
-    #[test]
-    fn derived_work_keeps_workers_the_expensive_units_cannot_take() {
-        // Mirrors the sizing in `Database::new`.
-        let others = |jobs: usize| jobs.saturating_sub(2).max(1);
-        // Prod shape: everything else shares 14, so 2 always remain for derived.
-        assert_eq!(others(16), 14);
-        assert_eq!(16 - others(16), 2, "two workers stay reachable by derived work");
-        // A small box must still make progress on the expensive operations.
-        assert_eq!(others(1), 1, "one worker still runs everything");
-        assert_eq!(others(2), 1);
-        // Monotonic: more workers never means fewer for the rest.
-        assert!((1..64).all(|jobs| others(jobs) <= others(jobs + 1)));
-        // And the reserve never grows to swallow the pool.
-        assert!((3..64).all(|jobs| others(jobs) >= jobs - 2));
-    }
-
     /// Coverage published for one source must survive planning the next.
     ///
     /// `set_base_tier_ready` / `set_tier_holes` replace wholesale, which is right because coverage can
@@ -19788,24 +19767,6 @@ mod tests {
         Ok(())
     }
 
-    /// The debt cap must leave workers for the rollup chain without starving debt entirely.
-    #[test]
-    fn the_debt_cap_reserves_workers_without_starving_debt() {
-        // Mirrors the sizing in `Database::new`.
-        let permits = |jobs: usize| (jobs * 3 / 4).max(1);
-        // Prod shape: 16 workers -> 12 for debt, 4 always free for rollup.
-        assert_eq!(permits(16), 12, "a quarter of the workers stays free for the rollup chain");
-        assert_eq!(16 - permits(16), 4);
-        // Debt keeps the large majority of capacity, which is the point: it is
-        // deprioritised, not switched off.
-        assert!(permits(16) * 2 > 16, "debt must still hold most of the workers");
-        // A single-worker box must not deadlock into zero debt progress.
-        assert_eq!(permits(1), 1, "one worker still runs debt");
-        assert_eq!(permits(2), 1);
-        // Monotonic in the worker count — more workers never means less debt.
-        assert!((1..64).all(|jobs| permits(jobs) <= permits(jobs + 1)));
-    }
-
     /// The reweighting must move slots to the rollup chain without starving anything. Each
     /// operation keeps a slot so file debt cannot drop to zero and let counts run away.
     #[test]
@@ -19958,33 +19919,22 @@ mod tests {
         }
     }
 
-    /// Query-session decode buffers cost `batch_size × row width` per partition per concurrent
-    /// query and are invisible to the memory pool, so the bound has to be the config. Large batch
-    /// sizes for wide rows caused multi-gigabyte decoder allocations.
+    /// Query-session sizing: decode buffers cost `batch_size × row width` per partition per
+    /// concurrent query and are invisible to the memory pool, so the bound has to be the config
+    /// (large batch sizes for wide rows caused multi-gigabyte decoder allocations); and a rollup
+    /// build is a background rewrite and must be planned like one — it goes through
+    /// `query_delta_only`, which built its session like an interactive query's, so
+    /// `target_partitions` was the CPU quota rather than `MAINTENANCE_MAX_PARTITIONS`.
     #[tokio::test]
-    async fn query_session_bounds_the_wide_row_decode_buffers() -> Result<()> {
-        let db = Database::with_config(create_test_config("query-batch-size")).await?;
-        let state = Arc::new(db).create_session_context().state();
-        let exec = &state.config().options().execution;
-        assert_eq!(exec.batch_size, 2048, "wide otel rows: one 8192-row batch measured 63MB");
-        Ok(())
-    }
-
-    /// A rollup build is a background rewrite and must be planned like one.
-    ///
-    /// It goes through `query_delta_only`, which built its session like an interactive query's, so
-    /// `target_partitions` was the CPU quota rather than `MAINTENANCE_MAX_PARTITIONS`. Parquet decode
-    /// buffers scale with that fan-out and are invisible to the memory pool, so a whole-day scan ran
-    /// many times the concurrent decode it needed.
-    #[tokio::test]
-    async fn a_maintenance_scan_plans_with_maintenance_parallelism() -> Result<()> {
-        let config = create_test_config("maintenance-scan-partitions");
+    async fn query_session_sizing() -> Result<()> {
+        let config = create_test_config("query-session-sizing");
         let query_partitions = config.memory.timefusion_query_partitions;
         let db = Database::with_config(config).await?;
+        let exec = &Arc::new(db.clone()).create_session_context().state().config().options().execution.clone();
+        assert_eq!(exec.batch_size, 2048, "wide otel rows: one 8192-row batch measured 63MB");
 
         let partitions = |db: Database| Arc::new(db).create_session_context().state().config().options().execution.target_partitions;
         let query = partitions(db.clone());
-
         let mut maintenance = db.clone();
         maintenance.maintenance_scan = true;
         let scan = partitions(maintenance);
@@ -20799,58 +20749,45 @@ mod tests {
         reap_orphaned_spill_dirs_blocking(&dir.path().join("does-not-exist"), vec![]);
     }
 
-    /// On the unified table every default project commits to ONE Delta log, so
-    /// `derive_wal_cursor_for_table` sees every tenant's watermarks. Positions
-    /// are per-`topic:shard` walrus offsets and are NOT comparable across
-    /// topics: a busy tenant's high block_id applied to a quiet tenant's cursor
-    /// skips that tenant's unreplayed WAL entries — acked-write loss on any
-    /// Delta-scan boot (which runs on EVERY boot, `bootstrap.rs`). A watermark
-    /// must therefore only ever be applied to the topic that wrote it.
+    /// Watermark JSON format invariants, all sharing one build-info/parse harness.
+    /// Positions are per-`topic:shard` walrus offsets and NOT comparable across
+    /// topics — applying a busy tenant's high block_id to a quiet tenant's cursor
+    /// skips that tenant's unreplayed WAL entries (acked-write loss on every
+    /// Delta-scan boot). Each block below pins one distinct edge case that a
+    /// production incident or a format-compat requirement forced.
     #[test]
-    fn watermark_is_scoped_to_its_own_topic() {
+    fn watermark_json_format_invariants() {
         use walrus_rust::WalPosition;
+
+        // topic scoping: only the topic that wrote a watermark may apply it — not
+        // a co-tenant sharing the same physical log, not a different table, and a
+        // legacy (pre-topic) commit contributes nothing rather than being applied
+        // to everyone (unattributable is indistinguishable from another tenant's,
+        // and duplicates read-side dedup removes are preferable to loss).
         let busy = serialize_watermark_to_json(&vec![Some(WalPosition { block_id: 9_000, offset: 0 })], "busy_proj", "otel_logs_and_spans");
         let mut info = std::collections::HashMap::new();
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(busy));
-
-        // The tenant that wrote it still gets it.
         assert_eq!(parse_watermark_from_json(&info, 1, "busy_proj", "otel_logs_and_spans"), vec![Some(WalPosition { block_id: 9_000, offset: 0 })]);
-        // Another tenant sharing the same physical log must get nothing.
-        assert_eq!(parse_watermark_from_json(&info, 1, "quiet_proj", "otel_logs_and_spans"), vec![None]);
-        // Same project, different table is also a different topic.
-        assert_eq!(parse_watermark_from_json(&info, 1, "busy_proj", "otel_metrics"), vec![None]);
-
-        // A legacy (pre-fix) commit carries no topic. It must contribute
-        // nothing rather than be applied to everyone: unattributable is
-        // indistinguishable from another tenant's, and duplicates (which
-        // read-side dedup removes) are always preferable to loss.
+        assert_eq!(parse_watermark_from_json(&info, 1, "quiet_proj", "otel_logs_and_spans"), vec![None], "co-tenant on the same log gets nothing");
+        assert_eq!(parse_watermark_from_json(&info, 1, "busy_proj", "otel_metrics"), vec![None], "different table is a different topic");
         let legacy: serde_json::Map<String, serde_json::Value> =
             [("0".to_string(), serde_json::json!({ "block_id": 9_000, "offset": 0 }))].into_iter().collect();
         let mut old = std::collections::HashMap::new();
         old.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(legacy));
-        assert_eq!(parse_watermark_from_json(&old, 1, "any_proj", "otel_logs_and_spans"), vec![None]);
-    }
+        assert_eq!(parse_watermark_from_json(&old, 1, "any_proj", "otel_logs_and_spans"), vec![None], "topic-less legacy commit applies to no one");
 
-    /// All-None watermark serializes to an empty object, which
-    /// `build_watermark_commit_properties` turns into a default
-    /// `CommitProperties` (no metadata written). Recovery sees no key and
-    /// silently skips the commit — same path as old commits from before
-    /// this feature landed.
-    #[test]
-    fn watermark_all_none_omits_metadata() {
+        // all-None serializes to an empty object, which `build_watermark_commit_properties`
+        // turns into a default `CommitProperties` (no metadata written) — recovery sees no
+        // key and silently skips the commit, same path as pre-feature commits.
         let wm: crate::write::DeltaWatermark = vec![None, None, None];
         assert!(serialize_watermark_to_json(&wm, "p", "t").is_empty());
-        let mut info = std::collections::HashMap::new();
-        info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(serde_json::Map::new()));
-        assert!(parse_watermark_from_json(&info, 3, "p", "t").iter().all(|p| p.is_none()));
-    }
+        let mut empty_info = std::collections::HashMap::new();
+        empty_info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(serde_json::Map::new()));
+        assert!(parse_watermark_from_json(&empty_info, 3, "p", "t").iter().all(|p| p.is_none()));
 
-    /// Per-shard MAX across commits: a shard's position is whichever commit
-    /// observed the furthest. A commit missing a shard contributes nothing
-    /// (replay-derived commits without watermarks must not reset the MAX).
-    #[test]
-    fn watermark_max_across_commits_takes_per_shard_furthest() {
-        use walrus_rust::WalPosition;
+        // per-shard MAX across commits: a shard's position is whichever commit observed the
+        // furthest; a commit missing a shard (including a replay-derived one with no
+        // watermark key at all) contributes nothing and must not reset the MAX.
         let mk_info = |entries: &[(usize, u64, u64)]| {
             let map: serde_json::Map<String, serde_json::Value> =
                 entries.iter().map(|(s, b, o)| (s.to_string(), serde_json::json!({ "block_id": b, "offset": o }))).collect();
@@ -20860,99 +20797,67 @@ mod tests {
             info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(map));
             info
         };
-        // Commit A: shard 0 at (5, 100), shard 1 at (5, 50)
         let a = mk_info(&[(0, 5, 100), (1, 5, 50)]);
-        // Commit B: shard 0 at (6, 0) — past A on shard 0; nothing for shard 1
-        let b = mk_info(&[(0, 6, 0)]);
-        // Commit C: replay-derived, no watermark key at all
-        let c: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
-        // Commit D: shard 1 at (5, 30) — BEHIND A on shard 1; must lose to A
-        let d = mk_info(&[(1, 5, 30)]);
-
+        let b = mk_info(&[(0, 6, 0)]); // past A on shard 0; nothing for shard 1
+        let c: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new(); // replay-derived, no watermark key
+        let d = mk_info(&[(1, 5, 30)]); // behind A on shard 1; must lose to A
         let max = max_watermark_across_commits([&a, &b, &c, &d], 3, "p", "t");
         assert_eq!(max[0], Some(WalPosition { block_id: 6, offset: 0 }));
         assert_eq!(max[1], Some(WalPosition { block_id: 5, offset: 50 }));
         assert_eq!(max[2], None, "shard 2 unwritten by all commits stays None");
-    }
 
-    /// C3 crash-recovery invariant: ONE coalesced commit carries every included
-    /// project's watermark, and on replay each project resumes from ITS OWN
-    /// position. No project may inherit, skip, or lose a position because a
-    /// co-tenant's watermark rode the same commit — positions are per-topic
-    /// walrus offsets and are not comparable across topics (applying a busy
-    /// tenant's offset to a quiet one skips unreplayed entries = acked-write
-    /// loss on every boot).
-    #[test]
-    fn coalesced_commit_resumes_each_project_from_its_own_watermark() {
-        use walrus_rust::WalPosition;
+        // coalesced commits (C3 crash-recovery invariant): ONE commit carries every
+        // included project's watermark, and each project resumes from ITS OWN position —
+        // never a co-tenant's, and a project absent from the commit gets nothing.
         let t = "otel_logs_and_spans";
-        let a = vec![Some(WalPosition { block_id: 900, offset: 10 }), None];
-        let b = vec![None, Some(WalPosition { block_id: 4, offset: 7 })];
-        let c = vec![Some(WalPosition { block_id: 1, offset: 1 }), Some(WalPosition { block_id: 2, offset: 2 })];
+        let ca = vec![Some(WalPosition { block_id: 900, offset: 10 }), None];
+        let cb = vec![None, Some(WalPosition { block_id: 4, offset: 7 })];
+        let cc = vec![Some(WalPosition { block_id: 1, offset: 1 }), Some(WalPosition { block_id: 2, offset: 2 })];
         let json = serialize_watermarks_to_json([
-            ("proj_a".to_string(), t.to_string(), a.clone()),
-            ("proj_b".to_string(), t.to_string(), b.clone()),
-            ("proj_c".to_string(), t.to_string(), c.clone()),
+            ("proj_a".to_string(), t.to_string(), ca.clone()),
+            ("proj_b".to_string(), t.to_string(), cb.clone()),
+            ("proj_c".to_string(), t.to_string(), cc.clone()),
         ]);
-        let mut info = std::collections::HashMap::new();
-        info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
-
-        assert_eq!(parse_watermark_from_json(&info, 2, "proj_a", t), a, "proj_a must resume from its own position");
-        assert_eq!(parse_watermark_from_json(&info, 2, "proj_b", t), b, "proj_b must resume from its own position");
-        assert_eq!(parse_watermark_from_json(&info, 2, "proj_c", t), c, "proj_c must resume from its own position");
-        // A project that was NOT in the commit gets nothing — never a co-tenant's
-        // (far ahead) position.
-        assert_eq!(parse_watermark_from_json(&info, 2, "proj_d", t), vec![None, None]);
-        // Same project, different table is a different topic.
-        assert_eq!(parse_watermark_from_json(&info, 2, "proj_a", "otel_metrics"), vec![None, None]);
-        // And the per-shard MAX across a coalesced + a per-project commit still
-        // resolves per project (boot-time cursor derivation).
+        let mut coalesced = std::collections::HashMap::new();
+        coalesced.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
+        assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_a", t), ca, "proj_a resumes from its own position");
+        assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_b", t), cb, "proj_b resumes from its own position");
+        assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_c", t), cc, "proj_c resumes from its own position");
+        assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_d", t), vec![None, None], "project absent from the commit gets nothing");
+        assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_a", "otel_metrics"), vec![None, None]);
         let mut solo = std::collections::HashMap::new();
         solo.insert(
             WAL_WATERMARK_KEY.to_string(),
             serde_json::Value::Object(serialize_watermark_to_json(&vec![Some(WalPosition { block_id: 901, offset: 0 }), None], "proj_a", t)),
         );
-        let max = max_watermark_across_commits([&info, &solo], 2, "proj_a", t);
-        assert_eq!(max, vec![Some(WalPosition { block_id: 901, offset: 0 }), None]);
-        assert_eq!(max_watermark_across_commits([&info, &solo], 2, "proj_b", t), b, "proj_b unaffected by proj_a's later solo commit");
-    }
+        // MAX across a coalesced + a per-project commit still resolves per project.
+        assert_eq!(max_watermark_across_commits([&coalesced, &solo], 2, "proj_a", t), vec![Some(WalPosition { block_id: 901, offset: 0 }), None]);
+        assert_eq!(max_watermark_across_commits([&coalesced, &solo], 2, "proj_b", t), cb, "proj_b unaffected by proj_a's later solo commit");
 
-    /// A one-project "coalesced" commit must serialize to the EXACT legacy flat
-    /// shape — the non-coalesced path and any older binary reading these commits
-    /// must see no format change at all.
-    #[test]
-    fn single_project_coalesced_watermark_keeps_legacy_shape() {
-        use walrus_rust::WalPosition;
-        let wm = vec![Some(WalPosition { block_id: 3, offset: 4 }), None];
+        // a one-project "coalesced" commit must serialize to the EXACT legacy flat shape —
+        // the non-coalesced path and older binaries reading these commits see no format change.
+        let single_wm = vec![Some(WalPosition { block_id: 3, offset: 4 }), None];
         assert_eq!(
-            serialize_watermarks_to_json([("p".to_string(), "t".to_string(), wm.clone())]),
-            serialize_watermark_to_json(&wm, "p", "t"),
+            serialize_watermarks_to_json([("p".to_string(), "t".to_string(), single_wm.clone())]),
+            serialize_watermark_to_json(&single_wm, "p", "t"),
             "single-topic coalesced commits must keep the flat legacy shape byte-for-byte"
         );
-        // All-None topics drop out entirely; a commit with nothing to say writes
-        // no metadata (recovery silently skips it).
         assert!(serialize_watermarks_to_json([("p".to_string(), "t".to_string(), vec![None, None])]).is_empty());
-        // Two topics where only one has positions collapses to the flat form.
-        let one = serialize_watermarks_to_json([("p".to_string(), "t".to_string(), wm.clone()), ("q".to_string(), "t".to_string(), vec![None, None])]);
-        assert_eq!(one, serialize_watermark_to_json(&wm, "p", "t"));
-    }
+        let one = serialize_watermarks_to_json([("p".to_string(), "t".to_string(), single_wm.clone()), ("q".to_string(), "t".to_string(), vec![None, None])]);
+        assert_eq!(one, serialize_watermark_to_json(&single_wm, "p", "t"), "one populated topic of two collapses to the flat form");
 
-    /// Two units for the SAME topic in one commit (should not happen — the flush
-    /// layer coalesces per (project, table) first — but must never silently drop
-    /// one): the survivor takes the per-shard MAX, so it can never sit BEHIND a
-    /// contributor's rows that this commit made durable.
-    #[test]
-    fn duplicate_topic_in_one_commit_takes_per_shard_max() {
-        use walrus_rust::WalPosition;
-        let json = serialize_watermarks_to_json([
+        // two units for the SAME topic in one commit (shouldn't happen — the flush layer
+        // coalesces per (project, table) first — but must never silently drop one): the
+        // survivor takes the per-shard MAX.
+        let dup_json = serialize_watermarks_to_json([
             ("p".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 5, offset: 100 }), Some(WalPosition { block_id: 1, offset: 0 })]),
             ("p".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 5, offset: 40 }), Some(WalPosition { block_id: 9, offset: 0 })]),
             ("q".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 2, offset: 0 })]),
         ]);
-        let mut info = std::collections::HashMap::new();
-        info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
+        let mut dup_info = std::collections::HashMap::new();
+        dup_info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(dup_json));
         assert_eq!(
-            parse_watermark_from_json(&info, 2, "p", "t"),
+            parse_watermark_from_json(&dup_info, 2, "p", "t"),
             vec![Some(WalPosition { block_id: 5, offset: 100 }), Some(WalPosition { block_id: 9, offset: 0 })]
         );
     }
@@ -21063,7 +20968,7 @@ mod tests {
         assert_eq!(
             super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack),
             vec!["big_unsorted"],
-            "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files"
+            "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files (the gap rule: today's poisoned file still gets repaired even though `TailPass::Repair` excludes today)"
         );
         // ...and exactly one per bin, so a backlog drains across ticks instead
         // of rewriting several hundred-megabyte files in a single pass.
@@ -21209,28 +21114,6 @@ mod tests {
             "a small sealed footer-less file is still repair work, newest first"
         );
         assert!(super::select_tail_bin(&[], TARGET, 2, TARGET / 4, SEAL, TailPass::Repair).is_empty(), "nothing admitted => no work");
-    }
-
-    /// Today's partition still repairs itself in the GAPS of the packing pass —
-    /// the sealed-date split must not orphan an oversized unsorted file written
-    /// today, which no `TailPass::Repair` tick will ever see (it excludes today).
-    #[test]
-    fn pack_pass_still_repairs_todays_oversized_unsorted_file_when_nothing_packs() {
-        const TARGET: i64 = 1000;
-        const SEAL: i64 = 10_000;
-        let f = |path: &str, size: i64, sorted: bool, min: i64, max: i64| super::TailAdd {
-            path: path.into(),
-            size,
-            is_sorted_run: sorted,
-            event_range: Some((min, max)),
-        };
-        // Packing keeps priority while a packable slice exists.
-        let busy = vec![f("poison", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&busy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["a", "b"], "packing first");
-
-        // Once it runs out, the tick spends itself on today's poisoned file.
-        let converged = vec![f("poison", 900, false, 1, 2)];
-        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["poison"], "gap rule repairs today");
     }
 
     /// Scope admission for the hot tail. Sealed-date repair exists because an unsorted file that
@@ -21873,22 +21756,6 @@ mod tests {
         }
     }
 
-    /// The dedup tick's two halves run in sequence, so one shared deadline is not a split — the
-    /// first half takes all of it. A probe phase can consume the whole budget and leave the sweep
-    /// (partition certification and rollup builds) with no share.
-    #[test]
-    fn the_dedup_tick_budget_leaves_the_sweep_a_share_the_drain_cannot_take() {
-        let budget = std::time::Duration::from_secs(240);
-        let now = std::time::Instant::now();
-        let (drain_deadline, sweep_deadline) = (now + budget.mul_f64(0.6), now + budget);
-        assert!(drain_deadline < sweep_deadline, "a drain that can run to the pass deadline starves the sweep behind it");
-        let sweep_share = sweep_deadline - drain_deadline;
-        assert!(sweep_share >= budget.mul_f64(0.3), "the sweep's guaranteed share is too thin to certify anything: {sweep_share:?}");
-        // Both halves must still fit the tick, or the pass overruns its period
-        // and `maintenance_job_sem` skips every later tick.
-        assert!(sweep_deadline <= now + budget);
-    }
-
     /// A repair bin that times out or panics must still clear its slot, or
     /// `repair_bins_in_flight` reads "busy" forever and the gauge stops being
     /// able to tell a grinding repair from a wedged one.
@@ -22235,15 +22102,6 @@ mod tests {
         let c = Database::filesets_for_dates(&plus, &[d]);
         assert_eq!(a[&d], b[&d]);
         assert_ne!(a[&d], c[&d]);
-    }
-
-    #[tokio::test]
-    async fn maintenance_job_gate_serializes_full_and_light_jobs() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let full = gate.clone().acquire_owned().await.unwrap();
-        assert!(gate.clone().try_acquire_owned().is_err());
-        drop(full);
-        assert!(gate.try_acquire_owned().is_ok());
     }
 
     #[test]
@@ -22627,20 +22485,6 @@ mod tests {
         assert_eq!(stamps.len() as i64, rows_per_batch * batches_n, "the sort must not lose or duplicate rows");
         assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
         Ok(())
-    }
-
-    /// Repair must never overlap repair. The startup pass and the cron are separate tasks; only one
-    /// may run at a time. Two concurrent repair passes would each take half the light-rewrite permits
-    /// and together starve packing. The shared `try_lock` makes the exclusion real.
-    #[tokio::test]
-    async fn a_second_repair_pass_stands_down_while_one_is_running() {
-        let guard = Arc::new(tokio::sync::Mutex::new(()));
-        let held = guard.clone().try_lock_owned().expect("first pass takes the guard");
-        // The other entry point must DECLINE, not queue: a repair pass runs for
-        // up to 144 minutes, so blocking would pile ticks up behind it.
-        assert!(guard.try_lock().is_err(), "a second repair pass must stand down while one holds the guard");
-        drop(held);
-        assert!(guard.try_lock().is_ok(), "the guard must release when the pass finishes, or repair stops forever");
     }
 
     /// The DML footer declaration must track the path that actually sorts.
