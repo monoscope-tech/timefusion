@@ -150,20 +150,53 @@ comparator tweak reaches it in useful time.
    flight. Batch the merges, then leave prod alone for hours before believing any
    convergence number.
 
-## What actually moves a 26 TB number
+## What moves a 26 TB number — and two levers that turned out NOT to
 
-Only two things, and neither is a scheduler change:
+The obvious candidates were tested against the journal and the code, and both
+are refuted. Recording them so they are not proposed a third time.
 
-1. **Per-unit cost.** Phase timing measured `scan_ms=481682 stage_ms=30
-   commit_ms=961 rows=142` — 99.8% of a unit is the read. An uncompacted sealed
-   partition's files each span the whole day, so timestamp-stat pruning cannot
-   skip any of them. **Compacting a day before rolling it up is worth more than
-   any ordering change**, and it is the same root cause as the query-side
-   fragmentation finding (~1 MB files against a 256 MB target).
-2. **Deriving rather than rebuilding.** The 1h tier derives from 1m. Where 1m is
-   complete this is cheap; the reason it is not happening for 08-01..08-14 is
-   link one of the chain, not the derive path.
+**Compaction is not the lever, because these days are already compacted.**
+`sealed_consolidation` state for the gating days:
 
-Convergence itself is wall-clock physics and cannot be compressed. What can be
-compressed is the cost of each unit and the number of restarts that discard
-partial work.
+| date | consol pending | consol complete | base_rollup pending |
+| --- | --- | --- | --- |
+| 2026-08-06 | 0 | 37 | 1376 |
+| 2026-08-10 | 1 | 34 | 2353 |
+| 2026-08-13 | 9 | 49 | 1985 |
+| 2026-08-14 | 5 | 53 | 682 |
+
+Consolidation has essentially finished for 08-06..08-15 and the decode estimate
+is still 200-800 GB/day. Consolidation reduces FILE COUNT (and therefore
+file-open overhead and query planning cost); it does not reduce DECODED BYTES,
+which is what a rollup must pay to aggregate every row once.
+
+**The estimator is not inflating rollups either.** It would have been a good
+story — a full-row estimate over a narrow rollup projection would both overstate
+the TB and over-split units (the 928-fragment explosion). It is false: the rollup
+path scales by projection exactly as the dedup path does,
+
+```rust
+let decoded = add.size * 12;
+estimated += decoded * projected_numerator / projected_denominator;
+```
+
+and its numerator is genuinely narrow — `project_id, date, timestamp` plus
+`dedup_keys`, `dedup_tiebreak`, `tombstone_column`, `spec.dimensions`,
+`spec.measures` columns and filter tokens, over `source_schema.fields.len()`.
+
+**So the ~4.9 TB is real, projection-aware, irreducible decode.** Building 9 days
+of 1m rollups for this data means reading those bytes once. That leaves only:
+
+1. **Decode throughput** — bytes/sec actually achieved, which is where per-unit
+   phase timing (`scan_ms=481682` for 142 rows) still deserves attention: the
+   question is no longer "how many bytes" but "why so few bytes/sec".
+2. **Not being restarted.** Six deploys in 2.5 hours discards partial work on
+   units that need 8-15 minutes. This is the cheapest available win and costs
+   nothing but patience.
+3. **Deriving rather than rebuilding.** The 1h tier derives from 1m. Where 1m is
+   complete this is cheap; it is not happening for 08-01..08-14 because of link
+   one of the chain, not the derive path.
+
+Convergence is wall-clock physics and cannot be compressed. What can be
+compressed is decode throughput and the number of restarts that discard partial
+work.
