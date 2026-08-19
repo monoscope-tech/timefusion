@@ -984,6 +984,12 @@ fn repair_bin_date(files: &[String]) -> &str {
     files.first().and_then(|p| p.split('/').find_map(|seg| seg.strip_prefix("date="))).unwrap_or("")
 }
 
+/// The value of one Hive-style `key=value` path segment, or `None` if the
+/// path carries no such segment.
+fn path_partition_value<'a>(path: &'a str, key: &str) -> Option<&'a str> {
+    path.split('/').find_map(|segment| segment.strip_prefix(&format!("{key}=")))
+}
+
 /// Parallelism for the repair sort specifically.
 ///
 /// `MAINTENANCE_MAX_PARTITIONS` pins many concurrent sorters at 2 to protect the bounded pool,
@@ -1962,15 +1968,12 @@ fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake:
 /// mismatches the plan and stalls compaction.
 fn dedup_adds_by_path(adds: impl Iterator<Item = deltalake::kernel::Add>, table_name: &str) -> Vec<deltalake::kernel::Add> {
     let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<deltalake::kernel::Add> = Vec::new();
-    let mut dropped = 0usize;
-    for add in adds {
-        if seen.insert(add.path.clone()) {
-            out.push(add);
-        } else {
-            dropped += 1;
-        }
-    }
+    let mut total = 0usize;
+    let out: Vec<deltalake::kernel::Add> = adds
+        .inspect(|_| total += 1)
+        .filter(|add| seen.insert(add.path.clone()))
+        .collect();
+    let dropped = total - out.len();
     if dropped > 0 {
         warn!(table_name, dropped, event = "snapshot_duplicate_adds", "snapshot listed the same file more than once — reads over it double-count rows");
         crate::observability::maintenance_stats().snapshot_duplicate_adds.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1996,7 +1999,7 @@ fn drop_batch_column(mut batch: RecordBatch, name: &str) -> RecordBatch {
 fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
     use arrow::{array::StructArray, compute::cast};
     use datafusion::arrow::datatypes::{DataType, Field};
-    remap_batch_columns(batch, |field, col| {
+    remap_batch_columns(batch, |_, field, col| {
         let DataType::Struct(struct_fields) = field.data_type() else { return Ok(None) };
         // Only act on Variant structs that still carry a BinaryView leg.
         if !is_variant_type(field.data_type()) || !struct_fields.iter().any(|f| matches!(f.data_type(), DataType::BinaryView)) {
@@ -2032,10 +2035,11 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
 /// Shared by the Variant→Binary cast and the timestamp-timezone normalizer so
 /// their no-op and metadata semantics can't drift.
 fn remap_batch_columns(
-    batch: RecordBatch, remap: impl Fn(&arrow_schema::FieldRef, &arrow::array::ArrayRef) -> DFResult<Option<(arrow_schema::FieldRef, arrow::array::ArrayRef)>>,
+    batch: RecordBatch,
+    remap: impl Fn(usize, &arrow_schema::FieldRef, &arrow::array::ArrayRef) -> DFResult<Option<(arrow_schema::FieldRef, arrow::array::ArrayRef)>>,
 ) -> DFResult<RecordBatch> {
     let schema = batch.schema();
-    let remapped = schema.fields().iter().zip(batch.columns()).map(|(f, c)| remap(f, c)).collect::<DFResult<Vec<_>>>()?;
+    let remapped = schema.fields().iter().zip(batch.columns()).enumerate().map(|(i, (f, c))| remap(i, f, c)).collect::<DFResult<Vec<_>>>()?;
     if remapped.iter().all(Option::is_none) {
         return Ok(batch);
     }
@@ -2066,7 +2070,7 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
             || tz.eq_ignore_ascii_case("GMT")
             || tz.eq_ignore_ascii_case("Z")
     };
-    remap_batch_columns(batch, |field, col| {
+    remap_batch_columns(batch, |_, field, col| {
         let DataType::Timestamp(unit, Some(tz)) = field.data_type() else { return Ok(None) };
         if !is_utc_offset(tz.as_ref()) {
             return Ok(None);
@@ -2160,16 +2164,12 @@ fn derive_date_partition(batch: RecordBatch) -> DFResult<RecordBatch> {
 /// land their JSON-string values in the underlying Delta storage which expects Variant structs.
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
     use datafusion::arrow::{
-        array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray, StructArray},
+        array::{Array, LargeStringArray, StringArray, StringViewArray, StructArray},
         compute::cast,
         datatypes::{DataType, Field},
     };
     use parquet_variant_compute::VariantArrayBuilder;
     use parquet_variant_json::JsonToVariant;
-
-    let batch_schema = batch.schema();
-    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
 
     fn utf8_to_variant<'a>(iter: impl ExactSizeIterator<Item = Option<&'a str>>) -> DFResult<StructArray> {
         let mut builder = VariantArrayBuilder::new(iter.len());
@@ -2193,25 +2193,24 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         Ok(StructArray::new(fields.into(), vec![metadata, value], arr.nulls().cloned()))
     }
 
-    for (idx, target_field) in target_schema.fields().iter().enumerate().take(columns.len()).filter(|(_, f)| is_variant_type(f.data_type())) {
-        let col = &columns[idx];
+    remap_batch_columns(batch, |idx, _field, col| {
+        let Some(target_field) = target_schema.fields().get(idx) else { return Ok(None) };
+        if !is_variant_type(target_field.data_type()) {
+            return Ok(None);
+        }
         // Downcasts are guarded by the `DataType::*` match arm above. If Arrow ever
         // returns a different concrete array for the same logical type, surface as
         // a DataFusionError instead of panicking on the INSERT path.
         let name = target_field.name();
         let bad_downcast = |ty: &str| DataFusionError::Execution(format!("{ty} downcast failed for column {name}"));
-        let converted: ArrayRef = match col.data_type() {
-            DataType::Utf8View => Arc::new(utf8_to_variant(col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter())?),
-            DataType::Utf8 => Arc::new(utf8_to_variant(col.as_any().downcast_ref::<StringArray>().ok_or_else(|| bad_downcast("Utf8"))?.iter())?),
-            DataType::LargeUtf8 => Arc::new(utf8_to_variant(col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| bad_downcast("LargeUtf8"))?.iter())?),
-            _ => continue, // already Variant struct
+        let converted = match col.data_type() {
+            DataType::Utf8View => utf8_to_variant(col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter())?,
+            DataType::Utf8 => utf8_to_variant(col.as_any().downcast_ref::<StringArray>().ok_or_else(|| bad_downcast("Utf8"))?.iter())?,
+            DataType::LargeUtf8 => utf8_to_variant(col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| bad_downcast("LargeUtf8"))?.iter())?,
+            _ => return Ok(None), // already Variant struct
         };
-        columns[idx] = converted;
-        new_fields[idx] = target_field.clone();
-    }
-
-    let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, columns).map_err(arrow_err)
+        Ok(Some((target_field.clone(), Arc::new(converted) as arrow::array::ArrayRef)))
+    })
 }
 
 // Fallback ZSTD level when a configured/tier level is rejected as out-of-range.
@@ -3354,6 +3353,55 @@ impl Database {
         Ok((built, removed, blobs))
     }
 
+    /// For one resolved table (root), gather live parquet files, group by
+    /// owning project (partition segment), drop files already covered by that
+    /// project's tantivy manifest, and drop files over the configured backfill
+    /// size cap. Returns per-project uncovered URIs, per-file sizes (for
+    /// callers that need them again), and the table's object store; bumps
+    /// `*oversized` by the count skipped for size and, when `warn_skipped`,
+    /// logs one warning per project with a size-skip.
+    async fn group_uncovered_files_by_project(
+        &self, svc: &crate::tantivy::search::TantivyIndexService, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, oversized: &mut u64,
+        warn_skipped: bool,
+    ) -> anyhow::Result<(HashMap<String, Vec<String>>, HashMap<String, u64>, Arc<dyn object_store::ObjectStore>)> {
+        use crate::tantivy::search::project_id_of_uri;
+        let (uris, sizes, delta_store) = {
+            let t = table_ref.read().await;
+            let sizes: HashMap<String, u64> = match t.snapshot() {
+                Ok(s) => s.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect(),
+                Err(_) => HashMap::new(),
+            };
+            (t.get_file_uris()?.collect::<Vec<String>>(), sizes, t.log_store().object_store(None))
+        };
+        let mut by_pid: HashMap<String, Vec<String>> = HashMap::new();
+        for uri in uris.into_iter().filter(|uri| uri.ends_with(".parquet")) {
+            if let Some(pid) = project_id_of_uri(&uri) {
+                by_pid.entry(pid.to_string()).or_default().push(uri);
+            }
+        }
+        let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
+        let mut result: HashMap<String, Vec<String>> = HashMap::with_capacity(by_pid.len());
+        for (pid, mut uris) in by_pid {
+            let manifest = crate::tantivy::load_manifest(svc.object_store.as_ref(), table_name, &pid).await?;
+            let covered: std::collections::HashSet<&String> =
+                manifest.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
+            uris.retain(|uri| !covered.contains(uri));
+            if max_bytes > 0 {
+                let before = uris.len();
+                uris.retain(|uri| crate::tantivy::search::parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_none_or(|size| *size <= max_bytes));
+                let skipped = before - uris.len();
+                *oversized = oversized.saturating_add(skipped as u64);
+                if warn_skipped && skipped > 0 {
+                    // No silent caps: oversized files stay uncovered until a
+                    // bigger-memory runner reconciles without the limit.
+                    warn!(table_name, project_id = %pid, skipped, "tantivy backfill skipped files over TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB");
+                }
+            }
+            result.insert(pid, uris);
+        }
+        Ok((result, sizes, delta_store))
+    }
+
     /// Count live parquet the Tantivy manifest does not cover, without building anything.
     ///
     /// `backfill_table_indexes` only runs from the daily reconcile cron, so after a deploy the
@@ -3361,7 +3409,6 @@ impl Database {
     /// metadata-only: the Delta log names live files and the manifest names covered ones. No
     /// parquet is read and no index is built, so it is safe to run far more often.
     pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64)> {
-        use crate::tantivy::search::project_id_of_uri;
         let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0)) };
         let (mut uncovered, mut oversized) = (0u64, 0u64);
         for table_name in svc.config.indexed_tables() {
@@ -3372,31 +3419,8 @@ impl Database {
             roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| *t == table_name).map(|(p, _)| p.clone()));
             for root in roots {
                 let Ok(table_ref) = self.resolve_table(&root, &table_name).await else { continue };
-                let (uris, sizes) = {
-                    let t = table_ref.read().await;
-                    let sizes: HashMap<String, u64> = match t.snapshot() {
-                        Ok(snapshot) => snapshot.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect(),
-                        Err(_) => HashMap::new(),
-                    };
-                    (t.get_file_uris()?.collect::<Vec<String>>(), sizes)
-                };
-                let mut by_pid: HashMap<String, Vec<String>> = HashMap::new();
-                for uri in uris.into_iter().filter(|uri| uri.ends_with(".parquet")) {
-                    if let Some(pid) = project_id_of_uri(&uri) {
-                        by_pid.entry(pid.to_string()).or_default().push(uri);
-                    }
-                }
-                let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
-                for (pid, mut uris) in by_pid {
-                    let manifest = crate::tantivy::load_manifest(svc.object_store.as_ref(), &table_name, &pid).await?;
-                    let covered: std::collections::HashSet<&String> =
-                        manifest.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
-                    uris.retain(|uri| !covered.contains(uri));
-                    if max_bytes > 0 {
-                        let before = uris.len();
-                        uris.retain(|uri| crate::tantivy::search::parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_none_or(|size| *size <= max_bytes));
-                        oversized = oversized.saturating_add((before - uris.len()) as u64);
-                    }
+                let (by_pid, ..) = self.group_uncovered_files_by_project(&svc, &table_ref, &table_name, &mut oversized, false).await?;
+                for uris in by_pid.into_values() {
                     uncovered = uncovered.saturating_add(uris.len() as u64);
                 }
             }
@@ -3408,7 +3432,7 @@ impl Database {
     }
 
     async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy::search::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
-        use crate::tantivy::search::{parquet_rel_of_uri, project_id_of_uri};
+        use crate::tantivy::search::parquet_rel_of_uri;
         // Unified table ("default") holds every default-routed project's
         // files; custom project tables are resolved separately.
         let mut roots: Vec<String> = vec!["default".into()];
@@ -3420,39 +3444,9 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
             };
-            let (uris, sizes, delta_store) = {
-                let t = table_ref.read().await;
-                let sizes: HashMap<String, u64> = match t.snapshot() {
-                    Ok(s) => s.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect(),
-                    Err(_) => HashMap::new(),
-                };
-                (t.get_file_uris()?.collect::<Vec<String>>(), sizes, t.log_store().object_store(None))
-            };
-            // Group live files by owning project (partition segment).
-            let mut by_pid: HashMap<String, Vec<String>> = HashMap::new();
-            for u in uris.into_iter().filter(|u| u.ends_with(".parquet")) {
-                if let Some(pid) = project_id_of_uri(&u) {
-                    by_pid.entry(pid.to_string()).or_default().push(u);
-                }
-            }
-            let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
+            let (by_pid, _sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
             let mut queues = Vec::with_capacity(by_pid.len());
             for (pid, mut uris) in by_pid {
-                let m = crate::tantivy::load_manifest(svc.object_store.as_ref(), table_name, &pid).await?;
-                let covered: std::collections::HashSet<&String> =
-                    m.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
-                uris.retain(|u| !covered.contains(u));
-                if max_bytes > 0 {
-                    let before = uris.len();
-                    uris.retain(|u| parquet_rel_of_uri(u).and_then(|rel| sizes.get(rel)).is_none_or(|sz| *sz <= max_bytes));
-                    let skipped = before - uris.len();
-                    oversized_total = oversized_total.saturating_add(skipped as u64);
-                    if skipped > 0 {
-                        // No silent caps: oversized files stay uncovered until a
-                        // bigger-memory runner reconciles without the limit.
-                        warn!(table_name, project_id = %pid, skipped, "tantivy backfill skipped files over TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB");
-                    }
-                }
                 // Dashboard acceptance is governed by recent windows; a
                 // terabyte of legacy history must not stand in front of the
                 // last seven days after a migration.
@@ -3681,10 +3675,7 @@ impl Database {
                     miss = miss.or(Some(crate::rollup::MissReason::NotBuilt));
                     continue;
                 }
-                match covered.last_mut() {
-                    Some(last) if last.1 == day_start => last.1 = end,
-                    _ => covered.push((day_start, end)),
-                }
+                covered.push((day_start, end));
                 generations.push((project.clone(), date.clone(), coverage.generation.clone()));
                 ticket.push((key, source_fp, source_epoch, coverage.generation.clone(), coverage.covered_through));
             }
@@ -5723,45 +5714,19 @@ impl Database {
         // Build S3 configuration
         let mut builder = AmazonS3Builder::new().with_bucket_name(bucket).with_retry(retry_config).with_client_options(client_options);
 
-        // Apply storage options
-        if let Some(access_key) = storage_options.get("AWS_ACCESS_KEY_ID") {
+        // Apply storage options, falling back to config values
+        if let Some(access_key) = storage_options.get("AWS_ACCESS_KEY_ID").or(self.config.aws.aws_access_key_id.as_ref()) {
             builder = builder.with_access_key_id(access_key);
         }
-        if let Some(secret_key) = storage_options.get("AWS_SECRET_ACCESS_KEY") {
+        if let Some(secret_key) = storage_options.get("AWS_SECRET_ACCESS_KEY").or(self.config.aws.aws_secret_access_key.as_ref()) {
             builder = builder.with_secret_access_key(secret_key);
         }
-        if let Some(region) = storage_options.get("AWS_REGION") {
+        if let Some(region) = storage_options.get("AWS_REGION").or(self.config.aws.aws_default_region.as_ref()) {
             builder = builder.with_region(region);
         }
-        if let Some(endpoint) = storage_options.get("AWS_ENDPOINT_URL") {
+        if let Some(endpoint) = storage_options.get("AWS_ENDPOINT_URL").or(Some(&self.config.aws.aws_s3_endpoint)) {
             builder = builder.with_endpoint(endpoint);
             // If endpoint is HTTP, allow HTTP connections
-            if endpoint.starts_with("http://") {
-                builder = builder.with_allow_http(true);
-            }
-        }
-
-        // Use config values as fallback
-        if storage_options.get("AWS_ACCESS_KEY_ID").is_none()
-            && let Some(ref key) = self.config.aws.aws_access_key_id
-        {
-            builder = builder.with_access_key_id(key);
-        }
-        if storage_options.get("AWS_SECRET_ACCESS_KEY").is_none()
-            && let Some(ref secret) = self.config.aws.aws_secret_access_key
-        {
-            builder = builder.with_secret_access_key(secret);
-        }
-        if storage_options.get("AWS_REGION").is_none()
-            && let Some(ref region) = self.config.aws.aws_default_region
-        {
-            builder = builder.with_region(region);
-        }
-
-        // Check if we need to use config for endpoint and allow HTTP
-        if storage_options.get("AWS_ENDPOINT_URL").is_none() {
-            let endpoint = &self.config.aws.aws_s3_endpoint;
-            builder = builder.with_endpoint(endpoint);
             if endpoint.starts_with("http://") {
                 builder = builder.with_allow_http(true);
             }
@@ -6005,7 +5970,7 @@ impl Database {
             .sorting_columns
             .iter()
             .filter(|c| arrow_schema.index_of(&c.name).is_ok())
-            .map(|c| format!("\"{}\" {} NULLS {}", c.name, if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { "FIRST" } else { "LAST" }))
+            .map(|c| format!("{} {} NULLS {}", crate::rollup::quoted(&c.name), if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { "FIRST" } else { "LAST" }))
             .collect::<Vec<_>>()
             .join(", ");
         if order_by.is_empty() {
@@ -7051,24 +7016,15 @@ impl Database {
                 // the confirm must never make flush durability depend on R2.
                 self.warm_cache_for_uris(warm_store.clone(), warm_table_uri.clone(), warm_added.clone(), Some(crate::config::CACHE_CONFIRM_TIMEOUT), false)
                     .await;
-                let db = self.clone();
-                let shutdown = self.maintenance_shutdown.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {}
-                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None, true) => {}
-                    }
-                });
-            } else {
-                let db = self.clone();
-                let shutdown = self.maintenance_shutdown.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {}
-                        _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None, true) => {}
-                    }
-                });
             }
+            let db = self.clone();
+            let shutdown = self.maintenance_shutdown.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None, true) => {}
+                }
+            });
         }
         for (project, dirty_bins) in projects {
             self.statistics_extractor.invalidate(project, table_name).await;
@@ -7490,7 +7446,7 @@ impl Database {
         let counts = uris
             .iter()
             .filter(|uri| uri.contains(&date_marker))
-            .filter_map(|uri| uri.split('/').find_map(|segment| segment.strip_prefix("project_id=")))
+            .filter_map(|uri| path_partition_value(uri, "project_id"))
             .filter(|project_id| !project_id.is_empty())
             .fold(std::collections::HashMap::<&str, usize>::new(), |mut counts, project_id| {
                 *counts.entry(project_id).or_default() += 1;
@@ -7554,7 +7510,7 @@ impl Database {
                 hot_bin_admits(&file.path(), &date_marker, &repair_markers, size, sorted_run, repairable, policy).then_some(())?;
                 // `stats()` is reached only past both tag/size exclusions.
                 let path = file.path();
-                let project_id = path.split('/').find_map(|s| s.strip_prefix("project_id=")).filter(|p| !p.is_empty()).map(str::to_owned)?;
+                let project_id = path_partition_value(&path, "project_id").filter(|p| !p.is_empty()).map(str::to_owned)?;
                 Some((project_id, TailAdd::from_stats(path.into_owned(), size, sorted_run, file.stats().as_deref())))
             })
             .fold(HashMap::<String, Vec<TailAdd>>::new(), |mut per_project, (project_id, add)| {
@@ -7791,15 +7747,13 @@ impl Database {
     /// ascending. Drives the CLI/pgwire "compact old partitions" loop.
     pub async fn partition_dates(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<Vec<chrono::NaiveDate>> {
         let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
-        let mut dates = std::collections::BTreeSet::new();
-        for uri in &uris {
-            if let Some(i) = uri.find("date=") {
-                let tail = &uri[i + 5..];
-                if let Ok(d) = tail.get(..10).unwrap_or(tail).parse::<chrono::NaiveDate>() {
-                    dates.insert(d);
-                }
-            }
-        }
+        let dates: std::collections::BTreeSet<chrono::NaiveDate> = uris
+            .iter()
+            .filter_map(|uri| {
+                let tail = &uri[uri.find("date=")? + 5..];
+                tail.get(..10).unwrap_or(tail).parse().ok()
+            })
+            .collect();
         Ok(dates.into_iter().collect())
     }
 
@@ -8352,7 +8306,7 @@ impl Database {
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;
         let safe_pid = project_id.replace('\'', "''");
         let filter = format!("project_id = '{safe_pid}' AND date = DATE '{date_str}'");
-        let keys_csv = schema.dedup_keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ");
+        let keys_csv = schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ");
         Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / BIN_MICROS).collect())
     }
 
@@ -8405,7 +8359,7 @@ impl Database {
         // The probe aggregates group keys only: bounded by key cardinality,
         // not row width. It also stops the every-5-min whole-partition
         // replace_where rewrite, the main Remove-tombstone factory.
-        let keys_csv = schema.dedup_keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ");
+        let keys_csv = schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ");
 
         // Identify the hour buckets that actually contain duplicates. A dup
         // group shares one exact `timestamp` (it's a dedup key), so chunking
@@ -8541,13 +8495,17 @@ impl Database {
         use deltalake::{kernel::Action, writer::DeltaWriter};
         use futures::StreamExt;
         let read_string_column = |batches: Vec<RecordBatch>| -> Result<Vec<String>> {
-            let mut out = Vec::new();
-            for batch in batches {
-                let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
-                let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
-                out.extend((0..col.len()).filter(|&i| !col.is_null(i)).map(|i| col.value(i).to_string()));
-            }
-            Ok(out)
+            Ok(batches
+                .into_iter()
+                .map(|batch| -> Result<Vec<String>> {
+                    let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+                    let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
+                    Ok((0..col.len()).filter(|&i| !col.is_null(i)).map(|i| col.value(i).to_string()).collect())
+                })
+                .collect::<Result<Vec<Vec<String>>>>()?
+                .into_iter()
+                .flatten()
+                .collect())
         };
         // Re-plan loop: a concurrent rewrite (optimize / z-order / another
         // dedup) can remove a target file mid-flight, so the scan's file ids no
@@ -8822,12 +8780,12 @@ impl Database {
                                     return Ok((0, 0));
                                 }
                                 let columns =
-                                    schema.fields.iter().map(|field| format!("\"{}\"", field.name.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
-                                let keys = schema.dedup_keys.iter().map(|field| format!("\"{}\"", field.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
+                                    schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
+                                let keys = schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
                                 let order = schema
                                     .dedup_tiebreak
                                     .as_ref()
-                                    .map_or_else(|| keys.clone(), |field| format!("\"{}\" DESC NULLS LAST", field.replace('"', "\"\"")));
+                                    .map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", crate::rollup::quoted(field)));
                                 let order_by = schema_order_by_clause(schema);
                                 let sql = format!(
                                     "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn \
@@ -8971,7 +8929,7 @@ impl Database {
                 wave_id: wave_id.clone(),
                 table_name: table_name.to_string(),
                 project_id: project_id.to_string(),
-                recorded_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                recorded_at: crate::support::now_secs(),
                 paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
                 // Cleanup-only: a dedup rewrite DROPS rows, so the resume path's
                 // row-preservation check can't tell a valid staging from a
@@ -9000,7 +8958,7 @@ impl Database {
     fn partition_files_by_pid(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, Vec<String>>> {
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
         for uri in table.get_file_uris()?.filter(|u| u.contains(date_marker) && u.ends_with(".parquet")) {
-            let pid = uri.split('/').find_map(|seg| seg.strip_prefix("project_id=")).unwrap_or("default").to_string();
+            let pid = path_partition_value(&uri, "project_id").unwrap_or("default").to_string();
             m.entry(pid).or_default().push(uri);
         }
         Ok(m)
@@ -9184,7 +9142,7 @@ impl Database {
 
     fn maintenance_partition_from_action(path: &str, partition_values: Option<&HashMap<String, Option<String>>>) -> Option<(String, String)> {
         let value = |name: &str| partition_values.and_then(|values| values.get(name)).and_then(Option::as_deref).map(str::to_owned);
-        let path_value = |name: &str| path.split('/').find_map(|segment| segment.strip_prefix(&format!("{name}="))).map(str::to_owned);
+        let path_value = |name: &str| path_partition_value(path, name).map(str::to_owned);
         let date = value("date").or_else(|| path_value("date"))?;
         let project = value("project_id").or_else(|| path_value("project_id")).unwrap_or_else(|| "default".to_owned());
         Some((project, date))
@@ -10134,13 +10092,16 @@ impl Database {
             journal.enqueue(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());
         }
         let stats = crate::observability::maintenance_stats();
-        let counters = [
-            stats.rollup_scan_duration_ms.load(Relaxed),
-            stats.rollup_staging_duration_ms.load(Relaxed),
-            stats.rollup_commit_duration_ms.load(Relaxed),
-            stats.rollup_end_to_end_duration_ms.load(Relaxed),
-            stats.rollup_scan_cohorts.load(Relaxed),
-        ];
+        let snapshot = || {
+            [
+                stats.rollup_scan_duration_ms.load(Relaxed),
+                stats.rollup_staging_duration_ms.load(Relaxed),
+                stats.rollup_commit_duration_ms.load(Relaxed),
+                stats.rollup_end_to_end_duration_ms.load(Relaxed),
+                stats.rollup_scan_cohorts.load(Relaxed),
+            ]
+        };
+        let counters = snapshot();
         let started = std::time::Instant::now();
         match operation {
             Operation::Dedup => {
@@ -10154,13 +10115,7 @@ impl Database {
             }
         }
         let wall = started.elapsed();
-        let after = [
-            stats.rollup_scan_duration_ms.load(Relaxed),
-            stats.rollup_staging_duration_ms.load(Relaxed),
-            stats.rollup_commit_duration_ms.load(Relaxed),
-            stats.rollup_end_to_end_duration_ms.load(Relaxed),
-            stats.rollup_scan_cohorts.load(Relaxed),
-        ];
+        let after = snapshot();
         let (state, retry_reason) = {
             let journal = self.journal();
             journal.tasks().find(|task| task.key == key).map(|task| (Some(task.state), task.retry_reason.clone())).unwrap_or((None, None))
@@ -10450,7 +10405,7 @@ impl Database {
             shard_keys =
                 std::iter::once("project_id".to_owned()).chain(std::iter::once("timestamp".to_owned())).chain(spec.dimensions.iter().cloned()).collect();
         }
-        let shard_key_sql = shard_keys.iter().map(|field| format!("CAST(\"{}\" AS VARCHAR)", field.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
+        let shard_key_sql = shard_keys.iter().map(|field| format!("CAST({} AS VARCHAR)", crate::rollup::quoted(field))).collect::<Vec<_>>().join(", ");
         // Same reasoning as the dedup rewrite's bucketing: an even, stable spread
         // is all this needs, and a cryptographic digest evaluated per row is not
         // free — see `hash_bucket`.
@@ -10476,14 +10431,14 @@ impl Database {
                     key.slice.end_micros
                 )
             } else {
-                let columns = source_schema.fields.iter().map(|field| format!("\"{}\"", field.name.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
-                let keys = source_schema.dedup_keys.iter().map(|field| format!("\"{}\"", field.replace('"', "\"\""))).collect::<Vec<_>>().join(", ");
+                let columns = source_schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
+                let keys = source_schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
                 let order =
-                    source_schema.dedup_tiebreak.as_ref().map_or_else(|| keys.clone(), |field| format!("\"{}\" DESC NULLS LAST", field.replace('"', "\"\"")));
+                    source_schema.dedup_tiebreak.as_ref().map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", crate::rollup::quoted(field)));
                 let tombstone = source_schema
                     .tombstone_column
                     .as_ref()
-                    .map_or_else(String::new, |field| format!(" AND COALESCE(\"{}\", false) = false", field.replace('"', "\"\"")));
+                    .map_or_else(String::new, |field| format!(" AND COALESCE({}, false) = false", crate::rollup::quoted(field)));
                 format!(
                     "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn FROM {RAW} \
                      WHERE project_id = '{}' AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}){shard_predicate}) \
@@ -10823,7 +10778,7 @@ impl Database {
                     if !path.contains(&date_marker) {
                         return None;
                     }
-                    let path_project = path.split('/').find_map(|segment| segment.strip_prefix("project_id="));
+                    let path_project = path_partition_value(&path, "project_id");
                     if path_project.is_some_and(|project| project != key.project_id) {
                         return None;
                     }
@@ -13358,7 +13313,7 @@ impl Database {
             wave_id: wave_id.clone(),
             table_name: table_name.to_string(),
             project_id: project_id.to_string(),
-            recorded_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            recorded_at: crate::support::now_secs(),
             paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
             // Recorded so a restart RESUMES this bin instead of re-staging it:
             // the inputs make staleness decidable, the Adds rebuild the bin
@@ -13891,7 +13846,7 @@ impl Database {
             (live, target_adds, table.log_store().object_store(None))
         };
         let live_view: std::collections::HashMap<&str, Option<i64>> = live.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now_secs = crate::support::now_secs();
         let stats = crate::observability::maintenance_stats();
         for entry in &candidates {
             match classify_resume(entry, table_name, now_secs, &live_view) {
@@ -13980,7 +13935,7 @@ impl Database {
             };
             (snapshot.log_data().iter().map(|f| f.path().into_owned()).collect::<std::collections::HashSet<String>>(), table.log_store().object_store(None))
         };
-        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now_secs = crate::support::now_secs();
         let orphans = staged_orphan_deletions(&entries, table_name, now_secs, &referenced);
         // Deletes are independent single-key calls — run them concurrently so a
         // crash that left many staged bins doesn't serialize N R2 round-trips
@@ -14028,10 +13983,14 @@ impl Database {
             let g = table_ref.read().await;
             (g.table_url().to_string(), g.version().unwrap_or(0))
         };
-        let last = self.checkpoint_versions.get(&url).map(|e| *e).unwrap_or(0);
-        if version.saturating_sub(last) >= WAVE_CHECKPOINT_VERSIONS {
+        if self.checkpoint_lag(&url, version) >= WAVE_CHECKPOINT_VERSIONS {
             self.checkpoint_and_cleanup_table(table_ref, table_name).await;
         }
+    }
+
+    /// Versions committed since `url`'s last checkpoint (0 if never checkpointed).
+    fn checkpoint_lag(&self, url: &str, version: u64) -> u64 {
+        version.saturating_sub(self.checkpoint_versions.get(url).map_or(0, |e| *e))
     }
 
     /// One-way safety brakes, checked at wave boundaries only. In-flight bins always finish and commit.
@@ -14375,7 +14334,7 @@ impl Database {
             (g.clone(), g.table_url().to_string(), g.version().unwrap_or(0))
         };
         let interval = self.config.parquet.timefusion_checkpoint_interval.max(1);
-        let lag = version.saturating_sub(self.checkpoint_versions.get(&url).map(|e| *e).unwrap_or(0));
+        let lag = self.checkpoint_lag(&url, version);
         // Gauge: max lag seen this tick (job resets to 0 first). A large, growing
         // value means the checkpoint task is failing or wedged.
         crate::observability::maintenance_stats().checkpoint_lag_versions.fetch_max(lag, Relaxed);
@@ -14990,6 +14949,22 @@ fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema::Sorti
 #[cfg(test)]
 pub(crate) const DEFAULT_SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
 
+/// Unify a schema-diverse batch of `RecordBatch`es to one superset schema: if
+/// every batch already shares the first batch's schema this is a no-op;
+/// otherwise `Schema::try_merge` computes a lossless superset (missing/nullable
+/// fields unioned) and every batch is cast to it via `cast_record_batch`
+/// (`add_missing=true`). `None` on merge or cast failure — the caller falls
+/// back to writing the original batches unsorted.
+fn unify_batch_schemas(batches: Vec<RecordBatch>) -> Option<(arrow_schema::SchemaRef, Vec<RecordBatch>)> {
+    let first_schema = batches[0].schema();
+    if batches.iter().all(|b| b.schema() == first_schema) {
+        return Some((first_schema, batches));
+    }
+    let merged = arrow_schema::Schema::try_merge(batches.iter().map(|b| b.schema().as_ref().clone())).ok().map(Arc::new)?;
+    let normalized = batches.iter().map(|b| deltalake::kernel::schema::cast_record_batch(b, merged.clone(), true, true)).collect::<Result<Vec<_>, _>>().ok()?;
+    Some((merged, normalized))
+}
+
 fn sort_batches_by_schema(schema: &crate::schema::TableSchema, batches: Vec<RecordBatch>, skip_over_bytes: usize) -> (FlushBatches, bool) {
     use arrow::{
         compute::{SortOptions, concat_batches},
@@ -15018,7 +14993,6 @@ fn sort_batches_by_schema(schema: &crate::schema::TableSchema, batches: Vec<Reco
     if total_bytes > skip_over_bytes {
         return unsorted(batches);
     }
-    let first_schema = batches[0].schema();
     // A schema-diverse bucket (mem_buffer's `schemas_compatible` admits batches
     // that differ by an evolved nullable column) is unified to a common
     // superset schema and every batch cast to it, so the bucket STILL flushes
@@ -15030,22 +15004,11 @@ fn sort_batches_by_schema(schema: &crate::schema::TableSchema, batches: Vec<Reco
     // `try_merge` yields a lossless superset (missing/nullable fields unioned),
     // and `cast_record_batch(add_missing=true)` fills absent columns with
     // nulls; any incompatibility falls back to the old unsorted write.
-    let (arrow_schema, batches) = if batches.iter().all(|b| b.schema() == first_schema) {
-        (first_schema, batches)
-    } else {
-        let merged = match arrow_schema::Schema::try_merge(batches.iter().map(|b| b.schema().as_ref().clone())) {
-            Ok(m) => Arc::new(m),
-            Err(e) => {
-                warn!("sort_batches_by_schema: schema merge failed, writing unsorted: {e}");
-                return unsorted(batches);
-            }
-        };
-        match batches.iter().map(|b| deltalake::kernel::schema::cast_record_batch(b, merged.clone(), true, true)).collect::<Result<Vec<_>, _>>() {
-            Ok(normalized) => (merged, normalized),
-            Err(e) => {
-                warn!("sort_batches_by_schema: schema-unify cast failed, writing unsorted: {e}");
-                return unsorted(batches);
-            }
+    let (arrow_schema, batches) = match unify_batch_schemas(batches.clone()) {
+        Some(pair) => pair,
+        None => {
+            warn!("sort_batches_by_schema: schema unify failed, writing unsorted");
+            return unsorted(batches);
         }
     };
     let sort_idx: Vec<(usize, &crate::schema::SortingColumnDef)> =
@@ -15163,17 +15126,9 @@ fn sort_batches_by_schema_reference(schema: &crate::schema::TableSchema, batches
     if batches.is_empty() || schema.sorting_columns.is_empty() {
         return (batches, false);
     }
-    let first_schema = batches[0].schema();
-    let (arrow_schema, batches) = if batches.iter().all(|b| b.schema() == first_schema) {
-        (first_schema, batches)
-    } else {
-        let Ok(merged) = arrow_schema::Schema::try_merge(batches.iter().map(|b| b.schema().as_ref().clone())).map(Arc::new) else {
-            return (batches, false);
-        };
-        match batches.iter().map(|b| deltalake::kernel::schema::cast_record_batch(b, merged.clone(), true, true)).collect::<Result<Vec<_>, _>>() {
-            Ok(normalized) => (merged, normalized),
-            Err(_) => return (batches, false),
-        }
+    let (arrow_schema, batches) = match unify_batch_schemas(batches.clone()) {
+        Some(pair) => pair,
+        None => return (batches, false),
     };
     let sort_idx: Vec<(usize, &crate::schema::SortingColumnDef)> =
         schema.sorting_columns.iter().filter_map(|sc| arrow_schema.index_of(&sc.name).ok().map(|i| (i, sc))).collect();
@@ -15359,7 +15314,7 @@ fn schema_order_by_clause(schema: &crate::schema::TableSchema) -> String {
     let cols = schema
         .sorting_columns
         .iter()
-        .map(|c| format!("\"{}\" {}{}", c.name, if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { " NULLS FIRST" } else { " NULLS LAST" }))
+        .map(|c| format!("{} {}{}", crate::rollup::quoted(&c.name), if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { " NULLS FIRST" } else { " NULLS LAST" }))
         .collect::<Vec<_>>()
         .join(", ");
     format!(" ORDER BY {cols}")
@@ -15757,15 +15712,14 @@ fn carried_coverage_tags(targets: &[deltalake::kernel::Add]) -> HashMap<String, 
     const COVERAGE_TAGS: [&str; 6] = [TAG_SOURCE, TAG_PROJECT, TAG_SLICE_START, TAG_SLICE_END, TAG_SOURCE_FINGERPRINT, TAG_GENERATION];
     let Some(first) = targets.first() else { return HashMap::new() };
     let value = |add: &deltalake::kernel::Add, tag: &str| add.tags.as_ref().and_then(|tags| tags.get(tag).cloned().flatten());
-    let mut carried = HashMap::new();
-    for tag in COVERAGE_TAGS {
-        let Some(expected) = value(first, tag) else { return HashMap::new() };
-        if targets.iter().any(|add| value(add, tag).as_deref() != Some(expected.as_str())) {
-            return HashMap::new();
-        }
-        carried.insert(tag.to_owned(), expected);
-    }
-    carried
+    COVERAGE_TAGS
+        .into_iter()
+        .map(|tag| {
+            let expected = value(first, tag)?;
+            targets.iter().all(|add| value(add, tag).as_deref() == Some(expected.as_str())).then_some((tag.to_owned(), expected))
+        })
+        .collect::<Option<HashMap<_, _>>>()
+        .unwrap_or_default()
 }
 
 fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
@@ -16899,15 +16853,17 @@ impl ProjectRoutingTable {
         // "timestamp" when the schema isn't registered (custom/dynamic tables).
         let time_column = crate::schema::get_schema(&self.table_name).map(|s| s.time_column_name().to_string()).unwrap_or_else(|| "timestamp".to_string());
 
-        let mut optimized_filters = filters.to_vec();
-
-        for filter in filters {
-            let date_filters = time_range_partition_pruner::timestamp_to_date_filters(filter, &time_column);
-            if !date_filters.is_empty() {
-                debug!("Added {} date partition filter(s) for {} on column {}", date_filters.len(), self.table_name, time_column);
-                optimized_filters.extend(date_filters);
-            }
-        }
+        let optimized_filters: Vec<Expr> = filters
+            .iter()
+            .cloned()
+            .chain(filters.iter().flat_map(|filter| {
+                let date_filters = time_range_partition_pruner::timestamp_to_date_filters(filter, &time_column);
+                if !date_filters.is_empty() {
+                    debug!("Added {} date partition filter(s) for {} on column {}", date_filters.len(), self.table_name, time_column);
+                }
+                date_filters
+            }))
+            .collect();
 
         // Check if project_id filter is present
         if !self.has_project_id_in_filters(&optimized_filters) {
@@ -17168,9 +17124,9 @@ impl ProjectRoutingTable {
         covered_files: Option<&std::collections::HashSet<String>>, zero_hit_files: Option<&std::collections::HashSet<String>>,
         row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>, query_time_range: Option<(i64, i64)>,
     ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
+        let narrow = |filters: &[Expr]| filters.iter().cloned().chain(id_filter.cloned()).collect::<Vec<_>>();
         let Some(covered) = covered_files else {
-            let mut narrowed = filters.to_vec();
-            narrowed.extend(id_filter.cloned());
+            let narrowed = narrow(filters);
             return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?]);
         };
 
@@ -17183,8 +17139,7 @@ impl ProjectRoutingTable {
         // Complete coverage keeps the established single-provider fast path.
         // The split is only needed when the exact snapshot has raw debt.
         if raw.is_empty() && !indexed.is_empty() {
-            let mut narrowed = filters.to_vec();
-            narrowed.extend(id_filter.cloned());
+            let narrowed = narrow(filters);
             return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?]);
         }
         if let Some(zero) = zero_hit_files {
@@ -17193,8 +17148,7 @@ impl ProjectRoutingTable {
 
         let mut plans = Vec::with_capacity(2);
         if !indexed.is_empty() {
-            let mut narrowed = filters.to_vec();
-            narrowed.extend(id_filter.cloned());
+            let narrowed = narrow(filters);
             plans.push(self.scan_delta_table(table, state, projection, &narrowed, limit, Some(&indexed), None, row_selections).await?);
         }
         if !raw.is_empty() {
@@ -17429,24 +17383,29 @@ impl ProjectRoutingTable {
     /// and `false` as live, so an all-NULL tombstone column has no effect. `keep` strips the marker
     /// back off when it was projected only for this filter.
 
+    /// `(column, name)` pairs for an identity projection over `idxs` — each index
+    /// kept as-is, by position, with its own field name. Shared by `project_indices`
+    /// and `filter_tombstones`, which both restore a plain column subset.
+    fn identity_projection_exprs(schema: &SchemaRef, idxs: impl Iterator<Item = usize>) -> Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> {
+        idxs.map(|i| {
+            (Arc::new(PhysicalColumn::new(schema.field(i).name(), i)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>, schema.field(i).name().clone())
+        })
+        .collect()
+    }
+
     /// Restore a requested column set from an augmented scan, by index into the input.
     /// Mirrors what `DedupExec`'s `output_projection` does for paths that skip it.
     fn project_indices(plan: Arc<dyn ExecutionPlan>, idxs: &[usize]) -> DFResult<Arc<dyn ExecutionPlan>> {
-        use datafusion::physical_expr::PhysicalExpr;
         let schema = plan.schema();
         if idxs.len() == schema.fields().len() && idxs.iter().enumerate().all(|(i, &j)| i == j) {
             return Ok(plan);
         }
-        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-            idxs.iter().map(|&i| (Arc::new(PhysicalColumn::new(schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>, schema.field(i).name().clone())).collect();
+        let exprs = Self::identity_projection_exprs(&schema, idxs.iter().copied());
         Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
     }
 
     fn filter_tombstones(plan: Arc<dyn ExecutionPlan>, marker: &str, keep: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        use datafusion::{
-            physical_expr::{PhysicalExpr, expressions::binary},
-            physical_plan::filter::FilterExec,
-        };
+        use datafusion::{physical_expr::expressions::binary, physical_plan::filter::FilterExec};
         let schema = plan.schema();
         let Ok(idx) = schema.index_of(marker) else { return Ok(plan) };
         let live = binary(
@@ -17457,8 +17416,7 @@ impl ProjectRoutingTable {
         )?;
         let filtered = Arc::new(FilterExec::try_new(live, plan)?) as Arc<dyn ExecutionPlan>;
         let Some(k) = keep.filter(|&k| k < schema.fields().len()) else { return Ok(filtered) };
-        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-            (0..k).map(|i| (Arc::new(PhysicalColumn::new(schema.field(i).name(), i)) as Arc<dyn PhysicalExpr>, schema.field(i).name().clone())).collect();
+        let exprs = Self::identity_projection_exprs(&schema, 0..k);
         Ok(Arc::new(ProjectionExec::try_new(exprs, filtered)?))
     }
 
@@ -22571,27 +22529,31 @@ mod tests {
         assert!(bounds.last().expect("non-empty").1.is_none());
     }
 
+    /// Shared tiling invariant for `repair_bounds_from_cuts` / `repair_slice_bounds`:
+    /// the first slice starts at `lo`, the last is open-ended so `hi` is never
+    /// dropped, adjacent slices abut exactly, and every value in `samples` lands
+    /// in exactly one slice.
+    fn assert_tiles(bounds: &[(i64, Option<i64>)], lo: i64, hi: i64, samples: &[i64]) {
+        assert_eq!(bounds[0].0, lo, "first slice starts at lo");
+        assert!(bounds.last().expect("non-empty").1.is_none(), "last slice is open so hi is never dropped");
+        for w in bounds.windows(2) {
+            assert_eq!(w[0].1.expect("only the last is open"), w[1].0, "{:?} must abut {:?}", w[0], w[1]);
+        }
+        for &v in samples {
+            let hits = bounds.iter().filter(|(s, e)| v >= *s && e.is_none_or(|e| v < e)).count();
+            assert_eq!(hits, 1, "value {v} must fall in exactly one slice of {bounds:?}");
+        }
+    }
+
     /// Quantile cuts must tile exactly like the uniform split — a gap drops rows
     /// and an overlap duplicates them, putting two versions of one key in
     /// different files where keep-greatest can no longer see them together.
     #[test]
     fn repair_cut_bounds_tile_the_range_and_survive_skew() {
-        let tiles = |bounds: &[(i64, Option<i64>)], lo: i64, hi: i64| {
-            assert_eq!(bounds[0].0, lo, "first slice starts at lo");
-            assert!(bounds.last().expect("non-empty").1.is_none(), "last slice is open so hi is never dropped");
-            for w in bounds.windows(2) {
-                assert_eq!(w[0].1.expect("only the last is open"), w[1].0, "{:?} must abut {:?}", w[0], w[1]);
-            }
-            for v in [lo, lo + 1, (lo + hi) / 2, hi - 1, hi] {
-                let hits = bounds.iter().filter(|(s, e)| v >= *s && e.is_none_or(|e| v < e)).count();
-                assert_eq!(hits, 1, "value {v} must fall in exactly one slice of {bounds:?}");
-            }
-        };
-
         // Skewed cuts — the whole point: they may bunch anywhere in the range.
         let bounds = super::repair_bounds_from_cuts(0, 1000, &[997, 998, 999]);
         assert_eq!(bounds.len(), 4);
-        tiles(&bounds, 0, 1000);
+        assert_tiles(&bounds, 0, 1000, &[0, 1, 500, 999, 1000]);
 
         // Ties collapse to FEWER slices, never to an overlap.
         assert_eq!(super::repair_bounds_from_cuts(0, 100, &[50, 50, 50]), vec![(0, Some(50)), (50, None)]);
@@ -22601,24 +22563,14 @@ mod tests {
         assert_eq!(super::repair_bounds_from_cuts(0, 100, &[]), vec![(0, None)]);
 
         // A cut exactly at hi is legal: it opens a final slice holding only hi.
-        tiles(&super::repair_bounds_from_cuts(0, 100, &[100]), 0, 100);
+        assert_tiles(&super::repair_bounds_from_cuts(0, 100, &[100]), 0, 100, &[0, 1, 50, 99, 100]);
     }
 
     #[test]
     fn repair_slices_tile_the_range_without_gaps_or_overlaps() {
         for (lo, hi, n) in [(0i64, 100i64, 4usize), (-50, 50, 3), (1_700_000_000_000_000, 1_700_000_086_400_000, 8), (0, 1, 4), (5, 5, 4)] {
             let bounds = super::repair_slice_bounds(lo, hi, n);
-            assert_eq!(bounds[0].0, lo, "first slice starts at lo");
-            assert!(bounds.last().expect("non-empty").1.is_none(), "the last slice is unbounded so hi itself is never dropped");
-            for pair in bounds.windows(2) {
-                let (prev, next) = (pair[0], pair[1]);
-                assert_eq!(prev.1.expect("only the last is open"), next.0, "slice {prev:?} must abut {next:?} exactly");
-            }
-            // Every value in [lo, hi] lands in exactly one half-open slice.
-            for v in [lo, hi, lo + (hi - lo) / 2] {
-                let hits = bounds.iter().filter(|(a, b)| v >= *a && b.is_none_or(|e| v < e)).count();
-                assert_eq!(hits, 1, "value {v} must fall in exactly one slice of {bounds:?}");
-            }
+            assert_tiles(&bounds, lo, hi, &[lo, hi, lo + (hi - lo) / 2]);
         }
         // Degenerate inputs decline slicing rather than producing nonsense.
         assert_eq!(super::repair_slice_bounds(10, 5, 4), vec![(10, None)], "hi <= lo is a single unbounded pass");

@@ -35,6 +35,12 @@ pub fn now_micros() -> i64 {
     frozen_micros().unwrap_or_else(|| chrono::Utc::now().timestamp_micros())
 }
 
+/// Wall-clock seconds since epoch, honoring the frozen-clock test seam (see `now_micros`).
+#[inline]
+pub fn now_secs() -> u64 {
+    (now_micros() / 1_000_000).max(0) as u64
+}
+
 /// Today's UTC date on the (possibly frozen) clock. Maintenance that decides
 /// which partitions are sealed must read this rather than `Utc::now`, or a
 /// frozen-clock test sees a date its fixture data never lands in.

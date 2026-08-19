@@ -622,6 +622,11 @@ pub(crate) struct RoutedRollup {
     measures: Vec<RoutedMeasure>,
 }
 
+/// Quote a SQL identifier, escaping embedded `"` by doubling it.
+pub(crate) fn quoted(alias: &str) -> String {
+    format!("\"{}\"", alias.replace('"', "\"\""))
+}
+
 impl RoutedRollup {
     /// A half-open range predicate. Only `>=`/`<` are ever emitted: an inclusive
     /// bound on either side of a shared boundary double counts a whole bucket.
@@ -635,10 +640,6 @@ impl RoutedRollup {
             return format!("(timestamp >= to_timestamp_micros({start}))");
         }
         format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))")
-    }
-
-    fn quoted(alias: &str) -> String {
-        format!("\"{}\"", alias.replace('"', "\"\""))
     }
 
     /// `GROUP BY 1, 2, …`, positional so it stays valid whether the select list
@@ -739,8 +740,8 @@ impl RoutedRollup {
             let select = self
                 .groups
                 .iter()
-                .map(|(expression, alias)| format!("{expression} AS {}", Self::quoted(alias)))
-                .chain(self.measures.iter().map(|measure| format!("{} AS {}", measure.merge.sql(&measure.measures), Self::quoted(&measure.alias))))
+                .map(|(expression, alias)| format!("{expression} AS {}", quoted(alias)))
+                .chain(self.measures.iter().map(|measure| format!("{} AS {}", measure.merge.sql(&measure.measures), quoted(&measure.alias))))
                 .collect::<Vec<_>>()
                 .join(", ");
             let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
@@ -756,10 +757,10 @@ impl RoutedRollup {
             .groups
             .iter()
             .enumerate()
-            .map(|(index, (_, alias))| format!("__g{index} AS {}", Self::quoted(alias)))
+            .map(|(index, (_, alias))| format!("__g{index} AS {}", quoted(alias)))
             .chain(self.measures.iter().enumerate().map(|(index, measure)| {
                 let states = (0..measure.merge.arity()).map(|state| format!("__s{index}_{state}")).collect::<Vec<_>>();
-                format!("{} AS {}", measure.merge.sql(&states), Self::quoted(&measure.alias))
+                format!("{} AS {}", measure.merge.sql(&states), quoted(&measure.alias))
             }))
             .collect::<Vec<_>>()
             .join(", ");
