@@ -10050,6 +10050,7 @@ impl Database {
             }
             let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
             let mut want: Vec<(String, chrono::NaiveDate)> = missing_tiers.keys().cloned().collect();
+            let cells_missing = want.len();
             // Skip any day that already has ROLLUP work queued. `invalidate`
             // takes `deadline.max(new_deadline)`, so re-invalidating a day that
             // already has an eligible task pushes that task's deadline OUT by a
@@ -10152,6 +10153,27 @@ impl Database {
                     info!(source, proven, event = "rollup_derived_base_tier_proven");
                 }
             }
+            // THE census, and it exists because its absence cost most of a night.
+            // Every gauge in this system reports the STATE of coverage; none
+            // reported what the planner BELIEVES about it, so four consecutive
+            // correct fixes (#186, #189, #190, #192) shipped against a queue that
+            // was empty for a reason none of them addressed, and the only way to
+            // tell was to infer it from `queued=` on a line that does not print
+            // when there is nothing to queue.
+            //
+            // `cells_missing` is what coverage says is absent; `cells_wanted` is
+            // what survives the already-queued veto. missing=0 means the planner
+            // sees no holes (suspect `partitions_of`); missing>0 with wanted=0
+            // means the work is queued and the question is why it is not CLAIMED.
+            // Those want opposite investigations and were indistinguishable.
+            info!(
+                source,
+                cells_missing,
+                cells_wanted = want.len(),
+                cells_admitted = want.len().min(BACKFILL_PARTITIONS_PER_PASS),
+                defer_enqueue,
+                event = "rollup_backfill_census"
+            );
             if want.is_empty() || defer_enqueue {
                 continue;
             }
