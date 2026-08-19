@@ -2023,3 +2023,84 @@ found to have run *four minutes after the sample*, restoring 8,254 slices.
 
 Batch pushes; leave ≥2 h before quoting throughput. This is the same lesson as
 `tf_deploy_cadence_starves_dedup` and it was re-learned by ignoring it.
+
+---
+
+# Part V — the estimate (2026-08-19)
+
+## 33. What the telemetry said, in one tick
+
+§29 shipped subsume and §24 the width cascade, and `pending_base_rollup` did not
+move (84,834 → 88,100 → 85,503, flat over 6 minutes with **one** task completing).
+Rather than reason a fifth time, §22's rule: ship the breakdown. It answered in
+one tick:
+
+    subsumed=114  fused=0  candidates=257535  blocked=249786  over_budget=7749
+
+`fused=0`. Not "small" — zero, every tick. 97% of candidates blocked.
+
+## 34. Splitting was a no-op
+
+The estimate excluded only files **entirely disjoint** from the slice, then
+counted every remaining file WHOLE. Maintenance files span a whole day, so a
+ten-minute slice estimated *exactly what the day-wide slice did*.
+
+`split_time_task` bisects when the estimate exceeds `MAX_DECODED_BYTES`. The
+halves estimated the same. So it split again, and again, to
+`MIN_SLICE_MICROS` — ~144 units per (project, date), each still claiming and
+reading the whole day. **Splitting assumes bisecting a unit halves its cost;
+the estimate made that assumption false**, and the mechanism ran to its floor.
+
+One defect, every symptom: 85k units against 260 real cells, BaseRollup at ~1.1
+completions/min, `over_budget`, and a queue pinned at equilibrium.
+
+**Fixed (d50b2c3):** `slice_share_of_file` scales each file's contribution by
+the share of its own span the slice covers. Files are written sorted by
+timestamp with row-group statistics, so a ten-minute slice really does decode
+~1/144 of a day-spanning file. Two bounds are load-bearing — a file with no
+usable timestamp bounds keeps full weight (unknown must never estimate cheap),
+and the share is floored at one row group (parquet cannot prune below one).
+
+## 35. Why nothing could fuse back
+
+The other half of `fused=0`. A `Superseded` unit blocked fusion at every width
+at or above its own. A cell split all the way down therefore carried superseded
+ancestors at day, 12h, 6h and 1h, which between them blocked **every** fusion
+width — while none of them could subsume, since a superseded parent must not
+delete the children that replaced it (§29). Its descendants were unreachable by
+any mechanism the queue possessed.
+
+Superseded no longer blocks. The anti-loop guard it was written for is really
+the budget test, which is stronger: fusion happens only when the children's
+summed estimate fits, and a unit that fits does not split. Refusing on
+supersededness would also have pinned the queue to a measurement now known to be
+wrong.
+
+## 36. Two things the queue was not
+
+Worth recording because both were believed today, and acted on:
+
+- **Not 339× redundancy.** §28 read `cells_missing=260` against 88,100 units as
+  duplication. The units are mostly *split descendants* — real, distinct tasks,
+  each wrongly sized. Subsume was still correct (it took `pending_dedup` 14,519
+  → 3,753), but it was never going to touch base rollup.
+- **Not a scheduling or capacity problem.** Nine scheduler changes in Part I,
+  three collapsing changes in Parts III–IV. The constraint was a per-unit
+  constant (§23) produced by a per-unit estimate (§34).
+
+## 37. An unmerged fix for a second growth source
+
+`fix/precise-restart-reconcile` carries `2524212` — "reconcile missed commits by
+touched hours, not whole days" — measured against a real prod journal on
+2026-08-18 and **never merged** (4 ahead, 59 behind).
+`reconcile_maintenance_task_cursors` enqueues `ALL_HOURS` for every partition
+named by commits since the durable cursor, and maintenance's own commits name
+those partitions — so each pass re-expands a day into 144 slices. That branch
+also carries `timefusion sim` and `timefusion run-unit`, the Phase 0 tooling
+§4 wrongly recorded as landed.
+
+Cherry-picked cleanly except `lib.rs`, `rollup.rs` and this file; it wants a
+follow-up pass to finish (module renames since, `claim_next` arity, the
+`base_tier_present` field). Worth finishing: it is the only measured fix for
+restart-driven queue growth, and `sim` replaces 18-minute deploy cycles with
+seconds.
