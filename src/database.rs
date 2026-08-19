@@ -10414,7 +10414,7 @@ impl Database {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             journal.claim_next(operation, crate::clock::now_micros(), permit.is_some())?
         };
-        let quarantined = task.attempts >= crate::maintenance_coordinator::TaskJournal::QUARANTINE_ATTEMPTS;
+        let quarantined = crate::maintenance_coordinator::TaskJournal::is_quarantined(&task);
         Some((task, permit.filter(|_| quarantined)))
     }
 
