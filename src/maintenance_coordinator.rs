@@ -16,6 +16,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 pub const NORMAL_SLICE_MICROS: i64 = 10 * 60 * 1_000_000;
+pub const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+/// Widths `coarsen_sealed_slices` fuses sealed units to, widest first. It takes
+/// the widest whose summed estimate fits `MAX_DECODED_BYTES`; below the finest,
+/// the mint width stands. Each divides the one above, so an aligned unit at any
+/// width sits inside exactly one bucket at every coarser width.
+pub const COARSEN_WIDTHS: [i64; 3] = [DAY_MICROS, 6 * 60 * 60 * 1_000_000, 60 * 60 * 1_000_000];
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
@@ -575,59 +581,66 @@ impl TaskJournal {
     /// historical backlog; this is the recurring form, because every midnight
     /// creates another day of it.
     ///
-    /// Anti-loop guard: a day whose day-unit ALREADY exists in any state is
-    /// skipped. `split_time_task` leaves the parent `Superseded` when a unit is
-    /// too big, so without this a whale's day would be split into children,
-    /// coarsened back into a day, split again, forever.
+    /// Fusion is a cascade over `COARSEN_WIDTHS`, not a day-or-nothing choice:
+    /// a span lands at the widest width whose estimate fits the decode budget.
+    /// Day-or-nothing left an over-budget day holding all 144 of its ten-minute
+    /// slices, and on an uncompacted sealed partition each of those re-reads the
+    /// whole day regardless — so the fallback for "too big to scan once" was to
+    /// scan it 144 times.
+    ///
+    /// Anti-loop guard: a span already covered by a non-complete unit at least
+    /// that wide is skipped. `split_time_task` leaves the parent `Superseded`
+    /// when a unit is too big, so without this a whale's day would be split into
+    /// children, fused back into a day, split again, forever. The guard is
+    /// per-width, so a superseded day blocks only the day — its children still
+    /// fuse at six hours, which is the point of the cascade.
     pub fn coarsen_sealed_slices(&mut self, now_micros: i64) -> usize {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let day_of = |start: i64| start.div_euclid(DAY_MICROS) * DAY_MICROS;
+        COARSEN_WIDTHS.iter().map(|&width| self.coarsen_to_width(width, now_micros)).sum()
+    }
+
+    /// One pass of `coarsen_sealed_slices` at a single width.
+    ///
+    /// Fuses every strictly-narrower sealed unit in a bucket into one unit of
+    /// `width`, when the bucket's summed estimate fits `MAX_DECODED_BYTES` and
+    /// nothing at least that wide already covers it.
+    fn coarsen_to_width(&mut self, width: i64, now_micros: i64) -> usize {
+        let bucket_of = |start: i64| start.div_euclid(width) * width;
         let coarsenable = |task: &MaintenanceTask| {
             matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
                 && matches!(task.state, TaskState::Pending | TaskState::Retry)
                 && !is_live_frontier(task.key.slice, now_micros)
-                && task.key.slice.width() < DAY_MICROS
+                && task.key.slice.width() < width
         };
-        // Every day unit EXCEPT a completed one. In-flight units must still block,
-        // to avoid duplicating claimed work; a SUPERSEDED one must block too, and
-        // that is load-bearing — `split_time_task` supersedes a day unit when it
-        // is too big and replaces it with children, so re-coarsening those would
-        // rebuild the oversized parent and split/coarsen forever
-        // (`coarsen_sealed_slices` has a test that pins exactly this).
+        // Which buckets may not be fused at this width, and why. Three distinct
+        // reasons, and collapsing them into one rule is what made the old
+        // day-or-nothing version dead-end:
         //
-        // A COMPLETE day unit is different: it is not evidence the day is too big,
-        // only that it was built once. Blocking on it is what let the queue fill
-        // with sub-day slices that can never be collapsed.
+        //   Running          — claimed work. Never race it, at any width.
+        //   Superseded, <= W — proven too big at a width no larger than this
+        //                      one, so this one cannot fit either.
+        //   Pending/Retry, >= W — the span is already queued at least this wide;
+        //                      a narrower unit inside it is duplicate work.
         //
-        // Once a day had been rolled up once, its day unit stayed in the journal
-        // as Complete forever, so every later invalidation for that day minted a
-        // ten-minute slice that hit `continue` here and was processed alone. And
-        // a slice is not cheaper than the day: an uncompacted sealed partition's
-        // files each span the WHOLE day, so timestamp-stat pruning cannot skip
-        // any of them and a ten-minute slice reads the same ~828 files a day unit
-        // would. Prod 2026-08-18 measured the consequence directly, via the phase
-        // timing from #174:
-        //
-        //     scan_ms=481682  stage_ms=30  commit_ms=961  rows=142
-        //
-        // Eight minutes of scanning to produce 142 rows, 99.8% of it in the read,
-        // and 144 of those per day where one would do. Meanwhile
-        // `maintenance_sealed_slices_coarsened` logged ZERO in 30 minutes against
-        // 37,065 pending base rollups.
-        //
-        // Re-coarsening a completed day is not lost work: `upsert` replaces the
-        // Complete day task with a Pending one, which is correct — the day is
-        // dirty again, that is why the slices exist — and rebuilding it as one
-        // unit costs one scan instead of 144.
-        let existing: HashSet<(String, String, String, Operation, i64)> = self
-            .snapshot
-            .tasks
-            .iter()
-            .filter(|task| task.key.slice.width() >= DAY_MICROS && task.state != TaskState::Complete)
-            .map(|task| {
-                (task.key.physical_table.clone(), task.key.source.clone(), task.key.project_id.clone(), task.key.operation, day_of(task.key.slice.start_micros))
-            })
-            .collect();
+        // The middle rule is the cascade. `split_time_task` supersedes a unit
+        // that did not fit and replaces it with children; without the width
+        // comparison a superseded DAY would block its children at every width
+        // and they would sit at ten minutes forever, which is the state prod was
+        // in. With it, a superseded day frees six hours, a superseded six hours
+        // frees one, and each supersede strictly lowers the ceiling — so the
+        // split/fuse loop the guard exists to prevent still cannot run.
+        let mut blocked: HashSet<(String, String, String, Operation, i64)> = HashSet::new();
+        for task in self.snapshot.tasks.iter().filter(|task| match task.state {
+            TaskState::Running => true,
+            TaskState::Superseded => task.key.slice.width() <= width,
+            TaskState::Pending | TaskState::Retry => task.key.slice.width() >= width,
+            TaskState::Complete => false,
+        }) {
+            let mut bucket = bucket_of(task.key.slice.start_micros);
+            while bucket < task.key.slice.end_micros {
+                blocked.insert((task.key.physical_table.clone(), task.key.source.clone(), task.key.project_id.clone(), task.key.operation, bucket));
+                bucket = bucket.saturating_add(width);
+            }
+        }
 
         let mut groups: HashMap<(String, String, String, Operation, i64), u64> = HashMap::new();
         for task in self.snapshot.tasks.iter().filter(|task| coarsenable(task)) {
@@ -636,17 +649,17 @@ impl TaskJournal {
                 task.key.source.clone(),
                 task.key.project_id.clone(),
                 task.key.operation,
-                day_of(task.key.slice.start_micros),
+                bucket_of(task.key.slice.start_micros),
             );
-            if existing.contains(&group) {
+            if blocked.contains(&group) {
                 continue;
             }
             *groups.entry(group).or_default() += task.estimated_decoded_bytes;
         }
-        // Only fuse a day that will actually FIT. Coarsening is a win because one
-        // day unit does one full-day scan where 144 slices each did the same scan
-        // — but a day unit that cannot finish inside its deadline does none of
-        // them, and that is strictly worse than the slices it replaced.
+        // Only fuse a span that will actually FIT. Coarsening is a win because
+        // one unit does one scan where 144 slices each did the same scan — but a
+        // unit that cannot finish inside its deadline does none of them, and
+        // that is strictly worse than the slices it replaced.
         //
         // Measured after #178 shipped: BaseRollup began timing out at 900s for
         // the first time (4 in a 10-minute window), and rollup output collapsed
@@ -654,9 +667,19 @@ impl TaskJournal {
         // and abandon-bisect paths were expected to right-size those units and did
         // not, or not nearly fast enough.
         //
+        // What this test must NOT do is give up. Day-or-nothing meant an
+        // over-budget day kept all 144 of its ten-minute slices, and on an
+        // uncompacted sealed partition every one of those slices re-reads the
+        // WHOLE day anyway — no timestamp-stat pruning can skip a file that
+        // spans it. So the fallback for a day too big to scan once was to scan
+        // it 144 times. That is why this is a cascade: the day that does not fit
+        // is offered six hours, then one hour, and lands at the widest span it
+        // can actually finish. Prod 2026-08-19 sat at 84,834 pending base
+        // rollups with coarsening logging 12, 6, 3, then nothing — everything
+        // collapsible had collapsed and the rest was over budget forever.
+        //
         // The children's own estimates are already summed here, so the test is
-        // free. A day over budget keeps its slices: they complete, which beats a
-        // day unit that repeatedly times out and publishes nothing.
+        // free.
         groups.retain(|_, bytes| *bytes <= MAX_DECODED_BYTES);
         if groups.is_empty() {
             return 0;
@@ -669,13 +692,13 @@ impl TaskJournal {
                     task.key.source.clone(),
                     task.key.project_id.clone(),
                     task.key.operation,
-                    day_of(task.key.slice.start_micros),
+                    bucket_of(task.key.slice.start_micros),
                 ))
         });
         let collapsed = collapsed - self.snapshot.tasks.len();
         self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
-        for ((physical_table, source, project_id, operation, day), bytes) in groups {
-            let Ok(slice) = TimeSlice::new(day, day.saturating_add(DAY_MICROS)) else { continue };
+        for ((physical_table, source, project_id, operation, bucket), bytes) in groups {
+            let Ok(slice) = TimeSlice::new(bucket, bucket.saturating_add(width)) else { continue };
             self.upsert(MaintenanceTask {
                 key: TaskKey { physical_table, source, project_id, slice, operation },
                 state: TaskState::Pending,
@@ -2967,6 +2990,48 @@ mod tests {
         // or a partition whose rollup is genuinely expensive — the one the 30d
         // goal needs most — would never gain coverage at all.
         assert_eq!(journal.claim_next(Operation::BaseRollup, 0, true).expect("quarantined work still runs").key, key);
+    }
+
+    /// A sealed day too big to scan as one unit lands at a narrower width,
+    /// not back at ten minutes.
+    ///
+    /// This is the state prod was in on 2026-08-19: `pending_base_rollup =
+    /// 84,834`, with `maintenance_sealed_slices_coarsened` logging 12, 6, 3 and
+    /// then nothing for the rest of the process's life. Everything that fit a
+    /// day had already been fused; every remaining day was over
+    /// `MAX_DECODED_BYTES` and so kept all 144 of its ten-minute slices.
+    ///
+    /// That fallback is not merely slower, it is inverted. On an uncompacted
+    /// sealed partition every file spans the whole day, so timestamp-stat
+    /// pruning skips nothing and a ten-minute slice reads exactly the files a
+    /// day unit would — measured at `scan_ms=481682` to publish 142 rows. The
+    /// day-or-nothing rule therefore answered "too expensive to scan once" with
+    /// "scan it 144 times".
+    #[test]
+    fn a_day_over_the_decode_budget_lands_at_a_narrower_width_not_at_ten_minutes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+
+        // One sealed day of ten-minute slices whose summed estimate busts the
+        // day budget but leaves each six-hour quarter comfortably inside it.
+        let per_slice = MAX_DECODED_BYTES / 96;
+        for slot in 0..(DAY_MICROS / NORMAL_SLICE_MICROS) {
+            let start = 3 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, per_slice, 0);
+        }
+        let minted = journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup).count();
+        assert_eq!(minted, 144, "the live path mints one unit per ten-minute slice");
+
+        journal.coarsen_sealed_slices(now);
+
+        let widths = journal
+            .tasks()
+            .filter(|t| t.key.operation == Operation::BaseRollup && t.state == TaskState::Pending)
+            .map(|t| t.key.slice.width())
+            .collect::<Vec<_>>();
+        assert_eq!(widths.len(), 4, "a day over budget must fuse into its four six-hour quarters, got {widths:?}");
+        assert!(widths.iter().all(|width| *width == 6 * 60 * 60 * 1_000_000), "expected six-hour units, got {widths:?}");
     }
 
     /// A sealed day's ten-minute leftovers collapse into one day unit — but
