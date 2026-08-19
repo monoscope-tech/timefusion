@@ -25,6 +25,27 @@ pub const COARSEN_WIDTHS: [i64; 3] = [DAY_MICROS, 6 * 60 * 60 * 1_000_000, 60 * 
 /// Widths a unit can be SUBSUMED at, finest first — the mint width plus every
 /// fusion width. Each divides the next, so an aligned unit at any of them sits
 /// wholly inside one bucket of every coarser one.
+/// What one `coarsen_sealed_slices` pass actually did, per stage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoarsenReport {
+    /// Units dropped because a wider live unit already covers them.
+    pub subsumed: usize,
+    /// Units replaced by a wider fused unit.
+    pub fused: usize,
+    /// Sealed units eligible to fuse, before any group was rejected.
+    pub candidates: usize,
+    /// Candidates whose bucket a Running / equal-or-wider / superseded unit held.
+    pub blocked: usize,
+    /// Candidates in a group whose summed estimate exceeded MAX_DECODED_BYTES.
+    pub over_budget: usize,
+}
+
+impl CoarsenReport {
+    pub const fn total(self) -> usize {
+        self.subsumed + self.fused
+    }
+}
+
 pub const SUBSUME_WIDTHS: [i64; 4] = [NORMAL_SLICE_MICROS, 60 * 60 * 1_000_000, 6 * 60 * 60 * 1_000_000, DAY_MICROS];
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
@@ -599,10 +620,32 @@ impl TaskJournal {
     /// per-width, so a superseded day blocks only the day — its children still
     /// fuse at six hours, which is the point of the cascade.
     pub fn coarsen_sealed_slices(&mut self, now_micros: i64) -> usize {
+        self.coarsen_sealed_slices_reporting(now_micros).total()
+    }
+
+    /// `coarsen_sealed_slices`, with the per-stage breakdown.
+    ///
+    /// The totals alone cannot say why a pass is small, and that is the only
+    /// question worth asking of it. Prod 2026-08-19: subsume took `pending_dedup`
+    /// from 14,519 to 3,753 in one pass while `pending_base_rollup` moved
+    /// 88,104 → 85,287 and the fuse pass settled at ~76 units/tick — at which
+    /// rate the base queue needs ~18 hours. Whether that is candidates being
+    /// blocked, groups over budget, or simply few candidates is invisible from
+    /// a single collapsed count, and every answer implies a different fix.
+    pub fn coarsen_sealed_slices_reporting(&mut self, now_micros: i64) -> CoarsenReport {
         // SUBSUME before fusing. Fusion cannot touch a bucket that a wider
         // pending unit already covers — it would duplicate claimed work — so on
         // its own it leaves exactly the redundancy it exists to remove.
-        self.subsume_covered_units(now_micros) + COARSEN_WIDTHS.iter().map(|&width| self.coarsen_to_width(width, now_micros)).sum::<usize>()
+        let subsumed = self.subsume_covered_units(now_micros);
+        let mut report = CoarsenReport { subsumed, ..Default::default() };
+        for &width in COARSEN_WIDTHS.iter() {
+            let stage = self.coarsen_to_width_reporting(width, now_micros);
+            report.fused += stage.fused;
+            report.candidates += stage.candidates;
+            report.blocked += stage.blocked;
+            report.over_budget += stage.over_budget;
+        }
+        report
     }
 
     /// Drop sealed units wholly covered by a WIDER non-complete unit for the
@@ -700,7 +743,7 @@ impl TaskJournal {
     /// Fuses every strictly-narrower sealed unit in a bucket into one unit of
     /// `width`, when the bucket's summed estimate fits `MAX_DECODED_BYTES` and
     /// nothing at least that wide already covers it.
-    fn coarsen_to_width(&mut self, width: i64, now_micros: i64) -> usize {
+    fn coarsen_to_width_reporting(&mut self, width: i64, now_micros: i64) -> CoarsenReport {
         let bucket_of = |start: i64| start.div_euclid(width) * width;
         let coarsenable = |task: &MaintenanceTask| {
             matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
@@ -739,8 +782,11 @@ impl TaskJournal {
             }
         }
 
+        let mut report = CoarsenReport::default();
         let mut groups: HashMap<(String, String, String, Operation, i64), u64> = HashMap::new();
+        let mut members: HashMap<(String, String, String, Operation, i64), usize> = HashMap::new();
         for task in self.snapshot.tasks.iter().filter(|task| coarsenable(task)) {
+            report.candidates += 1;
             let group = (
                 task.key.physical_table.clone(),
                 task.key.source.clone(),
@@ -749,9 +795,11 @@ impl TaskJournal {
                 bucket_of(task.key.slice.start_micros),
             );
             if blocked.contains(&group) {
+                report.blocked += 1;
                 continue;
             }
-            *groups.entry(group).or_default() += task.estimated_decoded_bytes;
+            *groups.entry(group.clone()).or_default() += task.estimated_decoded_bytes;
+            *members.entry(group).or_default() += 1;
         }
         // Only fuse a span that will actually FIT. Coarsening is a win because
         // one unit does one scan where 144 slices each did the same scan — but a
@@ -777,9 +825,15 @@ impl TaskJournal {
         //
         // The children's own estimates are already summed here, so the test is
         // free.
-        groups.retain(|_, bytes| *bytes <= MAX_DECODED_BYTES);
+        groups.retain(|group, bytes| {
+            let fits = *bytes <= MAX_DECODED_BYTES;
+            if !fits {
+                report.over_budget += members.get(group).copied().unwrap_or(0);
+            }
+            fits
+        });
         if groups.is_empty() {
-            return 0;
+            return report;
         }
         let collapsed = self.snapshot.tasks.len();
         self.snapshot.tasks.retain(|task| {
@@ -792,7 +846,7 @@ impl TaskJournal {
                     bucket_of(task.key.slice.start_micros),
                 ))
         });
-        let collapsed = collapsed - self.snapshot.tasks.len();
+        report.fused = collapsed - self.snapshot.tasks.len();
         self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
         for ((physical_table, source, project_id, operation, bucket), bytes) in groups {
             let Ok(slice) = TimeSlice::new(bucket, bucket.saturating_add(width)) else { continue };
@@ -810,7 +864,7 @@ impl TaskJournal {
                 base_tier_present: false,
             });
         }
-        collapsed
+        report
     }
 
     /// Record that the base tier a queued derived unit aggregates already

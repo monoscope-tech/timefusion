@@ -11306,17 +11306,27 @@ impl Database {
             // do — and every midnight mints another day of them. Collapsing
             // them is what keeps the queue from growing at the rate projects
             // are added.
-            let collapsed = {
+            let report = {
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let collapsed = journal.coarsen_sealed_slices(crate::support::now_micros());
-                if collapsed != 0 {
+                let report = journal.coarsen_sealed_slices_reporting(crate::support::now_micros());
+                if report.total() != 0 {
                     journal.checkpoint()?;
                 }
-                collapsed
+                report
             };
-            if collapsed != 0 {
-                info!(collapsed, event = "maintenance_sealed_slices_coarsened");
-            }
+            // Logged even when nothing collapsed, and that is the point: a pass
+            // that removes nothing is the interesting case, and the old line
+            // fired only on success so the stall was invisible. `candidates`
+            // against `blocked` + `over_budget` says which of the three reasons
+            // a small pass has, and they want different fixes.
+            info!(
+                subsumed = report.subsumed,
+                fused = report.fused,
+                candidates = report.candidates,
+                blocked = report.blocked,
+                over_budget = report.over_budget,
+                event = "maintenance_sealed_slices_coarsened"
+            );
         }
         // Tantivy coverage census: metadata-only, so it is throttled by wall
         // clock rather than admission. Every 15 minutes keeps
