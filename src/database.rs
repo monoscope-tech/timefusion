@@ -989,6 +989,16 @@ fn min_contiguous_days<'a>(
 /// lets the caller enqueue only the absent tier: a derived tier reads the base
 /// TIER, so a day missing only its derived tier needs no raw source scan and no
 /// dedup at all.
+/// Does this file prove its partition holds no rows?
+///
+/// Only an EXPLICIT zero counts. A file whose stats are missing is unknown, and
+/// unknown must read as non-empty: treating it as empty would re-plan work that
+/// is already done, forever, for every partition written before stats existed.
+/// The zero case is the one that needs acting on — see `partitions_of`.
+fn partition_file_is_empty(num_records: Option<i64>) -> bool {
+    num_records == Some(0)
+}
+
 fn tiers_missing_per_day(
     candidates: &[(String, chrono::NaiveDate)], covered_per_tier: &[(usize, HashSet<(String, chrono::NaiveDate)>)],
 ) -> HashMap<(String, chrono::NaiveDate), Vec<usize>> {
@@ -9915,12 +9925,39 @@ impl Database {
             }
             // Metadata only — the Delta log already names every partition, so
             // this never touches parquet.
+            // A partition holding only EMPTY files is not coverage.
+            //
+            // `log_data()` lists files, and a rollup unit that aggregated nothing
+            // still commits one. Pre-#169 that was the normal outcome for history:
+            // a derived unit dropped base files it could not read slice tags on,
+            // published rows=0, and marked itself complete — which the comment on
+            // that path already describes as reading "exactly like 'this slice is
+            // genuinely empty'". The resulting zero-row partition then made the
+            // day look COVERED to this planner, so it was never rebuilt, so it
+            // stayed empty. Permanently.
+            //
+            // Measured on prod 2026-08-19 02:30 UTC with #181-#192 all live:
+            // `94c5dc1f` had 34 CONTIGUOUS days of 1m tier and a 1h tier missing
+            // 2026-08-01 through 08-13, and the backfill planner reported
+            // `queued=1 remaining=0` — it could not see a single one of those
+            // days as missing. That is why #186's proof, #189's reservation,
+            // #190's worker reserve and #192's per-tier veto all had nothing to
+            // act on: the work was never planned, because the holes were invisible.
+            //
+            // Missing stats mean UNKNOWN, so they count as covered: undercounting
+            // coverage re-plans work that may already be done, which is wasteful
+            // but safe, while this direction is only taken on an explicit zero.
             let partitions_of = |table: &DeltaTable| -> Result<HashSet<(String, chrono::NaiveDate)>> {
                 Ok(table
                     .snapshot()?
                     .log_data()
                     .iter()
                     .filter_map(|file| {
+                        #[allow(deprecated)]
+                        let add = file.add_action();
+                        if partition_file_is_empty(add.get_stats().ok().flatten().map(|stats| stats.num_records)) {
+                            return None;
+                        }
                         let path = file.path();
                         let date =
                             path.split('/').find_map(|segment| segment.strip_prefix("date=")).and_then(|value| value.parse::<chrono::NaiveDate>().ok())?;
@@ -20798,6 +20835,24 @@ mod tests {
         assert_eq!(blocked, 1, "the tier that already has work queued must not be enqueued twice");
         assert!(others > 0, "a sibling tier of the same day must still be planned, got {others}");
         Ok(())
+    }
+
+    /// A partition of empty files must not read as coverage.
+    ///
+    /// A rollup unit that aggregated nothing still commits a file. Pre-#169 that
+    /// was the normal outcome for history — a derived unit dropped base files it
+    /// could not read slice tags on and published rows=0 — and the resulting
+    /// zero-row partition made the day look COVERED, so it was never rebuilt, so
+    /// it stayed empty. Prod 2026-08-19: `94c5dc1f` had 34 contiguous days of 1m
+    /// tier, a 1h tier missing 2026-08-01..08-13, and a planner reporting
+    /// `queued=1 remaining=0` — blind to every one of those holes.
+    #[test]
+    fn an_empty_partition_file_is_not_coverage() {
+        assert!(super::partition_file_is_empty(Some(0)), "an explicit zero-row file proves nothing was built");
+        assert!(!super::partition_file_is_empty(Some(1)), "a file with rows is coverage");
+        // Unknown must read as covered: the other direction re-plans finished
+        // work forever for every partition written before stats existed.
+        assert!(!super::partition_file_is_empty(None), "missing stats are unknown, never empty");
     }
 
     /// While coverage is short, the goal outranks the ceiling.
