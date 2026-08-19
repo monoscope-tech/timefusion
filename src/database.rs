@@ -10472,8 +10472,43 @@ impl Database {
         };
         let probe_hash_shards = usize::try_from(estimated_bytes.div_ceil(MAX_DECODED_BYTES).clamp(1, DEDUP_BUCKET_COUNT)).unwrap_or(1);
         let limits = DedupExecutionLimits { max_decoded_bytes: MAX_DECODED_BYTES, max_concurrent_shards: 1, probe_hash_shards };
+        // Certification is a property of the whole PARTITION — the read path keys
+        // `dedup_clean_fp` on (project, table, date) and refuses the skip if ANY
+        // in-window partition lacks an entry — so only a unit covering the entire
+        // day can grant it, and only over a file set that did not move under it.
+        //
+        // Nothing else can grant it any more, which is why this exists.
+        // `dedup_sweep` is the sole caller of `record_certification`, and the
+        // dedup cron skips every rollup-declared table ("owned by durable
+        // coordinator tasks", 2026-08-16) — so for `otel_logs_and_spans`, the
+        // table every 30d query reads, certification became unreachable the day
+        // the coordinator took ownership and this path did not take the duty with
+        // it. Prod 2026-08-19: `dedup_denied_never_certified_pct = 99.9`, the
+        // whole fleet, with the only surviving entries the 80 reloaded from disk
+        // at boot. `DedupExec` then survives in every plan, which is the single
+        // largest term left in 30d query latency.
+        //
+        // Day-wide units are the normal shape for sealed days because
+        // `coarsen_sealed_slices` fuses them there; a narrower unit simply does
+        // not certify, exactly as a truncated sweep does not.
+        let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
+        let covers_day = key.slice.start_micros <= day_start && key.slice.end_micros >= day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
+        let pre_files = match covers_day {
+            true => {
+                let table = table.read().await;
+                Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default()
+            }
+            false => Vec::new(),
+        };
         match self.dedup_partition_range_limited(&table, &key.source, &key.project_id, date, Some(key.slice), Some(limits)).await {
-            Ok((_, true)) => {
+            Ok((dropped, true)) => {
+                // Before the journal lock: `record_certification` awaits, and the
+                // journal guard is a std Mutex.
+                if covers_day
+                    && let Err(error) = self.record_certification(&table, &key.physical_table, &key.project_id, date, &pre_files, (dropped, true)).await
+                {
+                    warn!(%error, project_id = %key.project_id, %date, "certification bookkeeping failed after a clean day-wide dedup");
+                }
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 journal.complete(&key);
                 journal.checkpoint()?;
@@ -20536,6 +20571,61 @@ mod tests {
                 .count()
         };
         assert_eq!(sealed_tasks, 0, "a single untagged file is a Repair suspect, not consolidation debt");
+        Ok(())
+    }
+
+    /// A clean day-wide coordinator dedup unit must CERTIFY the partition.
+    ///
+    /// Certification is what removes `DedupExec` from a plan, and `dedup_sweep`
+    /// is the only thing that ever granted it. The dedup cron skips every
+    /// rollup-declared table ("owned by durable coordinator tasks", 2026-08-16),
+    /// so for `otel_logs_and_spans` — the table every 30d query reads — the
+    /// sweep stopped running and this path did not take the duty with it.
+    /// Certification became unreachable: prod 2026-08-19 measured
+    /// `dedup_denied_never_certified_pct = 99.9` with the only surviving entries
+    /// the 80 reloaded from disk at boot, and shipbubble certified on 0 of its
+    /// 14 sealed days.
+    #[tokio::test]
+    #[serial]
+    async fn a_clean_day_wide_coordinator_dedup_certifies_the_partition() -> Result<()> {
+        use crate::maintenance_coordinator::{DAY_MICROS, Operation, TaskKey, TimeSlice};
+        let db = Database::with_config(create_test_config("coord-dedup-certify")).await?;
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        // A sealed day with NO duplicates: the pass must drop nothing and leave
+        // the file set where it found it, which is exactly what certification
+        // requires.
+        let day = Utc::now() - chrono::Duration::days(3);
+        db.insert_records_batch(
+            &project,
+            "otel_logs_and_spans",
+            vec![json_to_batch(vec![test_span_ts("only", "op", &project, day.timestamp_micros())])?],
+            true,
+            None,
+        )
+        .await?;
+
+        let date = day.date_naive();
+        let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
+        let slice = TimeSlice::new(day_start, day_start + DAY_MICROS)?;
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            journal.enqueue(
+                TaskKey {
+                    physical_table: "otel_logs_and_spans".to_owned(),
+                    source: "otel_logs_and_spans".to_owned(),
+                    project_id: project.clone(),
+                    slice,
+                    operation: Operation::Dedup,
+                },
+                0,
+                1024,
+                0,
+            );
+        }
+        assert!(db.run_coordinator_dedup_once().await?, "the day-wide dedup unit must be claimed and run");
+
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+        assert!(db.dedup_clean_fp.contains_key(&key), "a clean day-wide unit must certify the partition; without it DedupExec survives in every 30d plan");
         Ok(())
     }
 
