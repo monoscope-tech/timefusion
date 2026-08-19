@@ -9836,6 +9836,28 @@ impl Database {
                     planned_keys.insert((project_id.clone(), date, operation));
                     let estimate =
                         small.iter().fold(0u64, |bytes, file| bytes.saturating_add(u64::try_from(file.size.max(0)).unwrap_or_default().saturating_mul(12)));
+                    // A sealed partition's age is measured from when it SEALED,
+                    // not from when this scan happened to notice it again.
+                    //
+                    // `scheduling_class` escalates a task that has waited past
+                    // `STARVATION_MICROS`, and that is the mechanism meant to
+                    // rescue exactly this: prod 2026-08-19 had 2026-08-13 at 167
+                    // files for FIVE days, unchanged across three dashboard
+                    // snapshots, while seven younger sealed days converged past
+                    // it. It never escalated because hygiene work is re-derived
+                    // by this scan and (since it stopped being persisted) also
+                    // re-created on every restart — so `created_unix_ms` reset to
+                    // `now` several times a day and the 24 h threshold was
+                    // unreachable by construction.
+                    //
+                    // The seal time is the honest clock for derived work: it says
+                    // "this partition has been out of policy for five days",
+                    // which is the fact the escalation exists to act on, and it
+                    // survives restarts because it is a property of the data
+                    // rather than of the process. Today's partition keeps `now`
+                    // — it is the live tail, not a backlog.
+                    let sealed_at_ms = u64::try_from(slice.end_micros.max(0).div_euclid(1_000)).unwrap_or_default();
+                    let created_unix_ms = if date == today { created_unix_ms } else { sealed_at_ms.min(created_unix_ms) };
                     planned.push(MaintenanceTask {
                         key: TaskKey { physical_table: source.clone(), source: source.clone(), project_id: project_id.clone(), slice, operation },
                         state: TaskState::Pending,
@@ -20846,6 +20868,55 @@ mod tests {
 
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
         assert!(db.dedup_clean_fp.contains_key(&key), "a clean day-wide unit must certify the partition; without it DedupExec survives in every 30d plan");
+        Ok(())
+    }
+
+    /// A long-sealed fragmented partition must be aged from its SEAL time.
+    ///
+    /// `scheduling_class` escalates work that has waited past
+    /// `STARVATION_MICROS`, and that is what should have rescued 2026-08-13 —
+    /// 167 files, unchanged across three dashboard snapshots over five days,
+    /// while seven younger sealed days converged past it. It never escalated:
+    /// hygiene work is re-derived by `plan_compaction_debt` and, since it
+    /// stopped being persisted, re-created on every restart, so
+    /// `created_unix_ms` reset to `now` several times a day and the 24 h
+    /// threshold was unreachable by construction.
+    ///
+    /// The seal time is the honest clock — a property of the data, not of the
+    /// process — so it survives restarts and says what the escalation needs to
+    /// know: how long this partition has been out of policy.
+    #[tokio::test]
+    async fn a_long_sealed_partition_is_aged_from_when_it_sealed_not_when_rescanned() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        let db = Database::with_config(create_test_config("hygiene-seal-age")).await?;
+        let project = format!("age_{}", uuid::Uuid::new_v4().simple());
+        // Two flushes on a long-sealed day => two small files => consolidation
+        // debt, planned fresh by a scan running right now.
+        let day = Utc::now() - chrono::Duration::days(6);
+        for id in ["a", "b"] {
+            db.insert_records_batch(
+                &project,
+                "otel_logs_and_spans",
+                vec![json_to_batch(vec![test_span_ts(id, "op", &project, day.timestamp_micros())])?],
+                true,
+                None,
+            )
+            .await?;
+        }
+        db.plan_compaction_debt().await?;
+
+        let created = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal.tasks().find(|task| task.key.project_id == project && task.key.operation == Operation::SealedConsolidation).map(|task| task.created_unix_ms)
+        };
+        let created = created.expect("a six-day-old partition with two small files is consolidation debt");
+        let now_ms = u64::try_from(crate::support::now_micros().div_euclid(1_000)).unwrap_or_default();
+        let waited_hours = (now_ms.saturating_sub(created)) / 3_600_000;
+        assert!(
+            waited_hours >= 24,
+            "a partition sealed six days ago must read as waiting >24h so it can escalate; got {waited_hours}h — \
+             aged from the rescan it would read as 0 and starve forever"
+        );
         Ok(())
     }
 
