@@ -472,7 +472,15 @@ impl TaskJournal {
     const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v3";
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
     const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v1";
-    const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v1";
+    /// v2, because v1 ran and threw its own work away. It cleared 85,047
+    /// estimates in memory and persisted only its CURSOR — `checkpoint` writes
+    /// dirty cursors but cannot express the task rewrites, and the `compact`
+    /// that would have is only there as of f945bf1. So the journal kept every
+    /// stale number while the marker said the migration was done, and prod came
+    /// back with `over_budget=52,178` and no way left to clear it. A migration
+    /// that records completion more durably than its effect is worse than one
+    /// that never ran.
+    const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v2";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
