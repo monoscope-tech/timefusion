@@ -1661,6 +1661,34 @@ absent tag for an absent property, and now a rewrite that preserves the proxy
 (`sorted`) while dropping the fact (coverage identity). When a file is rewritten,
 ask what the OLD file was evidence FOR, not just what it looked like.
 
+## 21d. Result: file hygiene is caught up
+
+Measured 2026-08-19 ~10:30 UTC with #198 and #200 both live:
+
+| class | at 04:45 | now | note |
+|---|---|---|---|
+| `pending_hot_packing` | 2,654 | **66** | today's compaction done |
+| `pending_sealed_consolidation` | 2,218 | **283** | matches the ~108-per-source audit |
+| `pending_repair` | 584 | 575 | Repair now solely owns sortedness, as designed |
+| `eligible_watermark_lag_seconds` | 0 | **0** | frontier still caught up |
+
+**Sealed consolidation fell 87%** and landed where reading object storage said it
+should. The two changes were complementary and neither alone was enough: #198
+retired what was already done (4,290 tasks in its first pass), #200 stopped the
+policy re-creating it (the sort-tag treadmill). Together they turned an
+apparently-8.18 TB, never-converging class into a small finite backlog.
+
+**What this validates about the method**, and it is the whole argument of Part II:
+both fixes came from reading the storage layer directly — `aws s3 ls` over 24,637
+objects, and 381 commits of the Delta log — not from any counter the process
+exposes. The counters said 2,218 pending and −0.27/min forever. The storage said
+877 of 1,033 partitions were already compliant. **When a queue and the world
+disagree, the world is right.**
+
+Remaining queues are `pending_dedup` (14,816) and `pending_base_rollup` (65,934),
+both dominated by self-replenishing frontier work — see §19, which is the
+frontier unit model and the last structural item.
+
 ## 22. Ordering, and the one-line rationale for it
 
 1. **A** (local loop) — because every estimate below is currently a projection.
