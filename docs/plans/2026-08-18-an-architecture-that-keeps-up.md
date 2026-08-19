@@ -2264,3 +2264,49 @@ sealed days at 10–384 files. Compaction and certification are one chain, and t
 compaction dashboard shows 08-13 frozen at 167 files for a fifth day on the
 newest-first ordering that #199 already fixed for rollups and never for hygiene.
 That ordering fix is the smallest remaining unblocked item.
+
+## Part VIII — 2026-08-19 late: the packing pass rewrote converged files
+
+`pending_sealed_consolidation` is now **41** (was 2,218) and `pending_hot_packing`
+**20**, which finally matches the object-storage audit (~108 sealed partitions
+genuinely out of policy). The queue was never the problem; what it *pointed at* was.
+
+**The defect.** `select_coordinator_compaction_candidates` gated its converged-file
+skip behind `!has_unsorted`, and `is_sorted_run` reads a tag only the OPTIMIZE path
+writes — 1,593 of 1,648 prod adds carry none. So `has_unsorted` was true for
+effectively every partition and `if add.size >= target { continue }` was unreachable:
+a partition admitted for holding two small files then selected its half-gigabyte
+converged files and re-sorted them. Fixed in `2efbcf5`; the skip is unconditional.
+
+**Measured before:** 20 SealedConsolidation claims in 25 min, **11 on whale
+07-30/07-31/08-01** (already packed at 0.52 GB/file), 4.44 GB per unit, over the 900 s
+deadline every time. **Zero** on 2026-08-13, frozen at 167 files for six days.
+**After:** whale's share fell to 2 of 5.
+
+**The lesson worth keeping.** The oldest-first starvation ordering (`811c588`) was
+working *correctly* — that is what exposed this. It aimed every sealed claim at the
+oldest debt, and the oldest debt was fourteen whale days that needed nothing. A
+correct scheduler pointed at a wrong eligibility test is indistinguishable from a
+broken scheduler until you ask what the winner does with its turn.
+
+**Compaction is otherwise done.** All 944 project-days on or before 08-12 hold 2,168
+files; 900 of 944 cells are at ≤2 files. Of the 15 cells at ≥10 files, 14 are the
+whale's 07-20…08-02 at 0.42–1.0 GB/file — correctly sized, not fragmented. One
+genuinely fragmented historical cell remains (whale/08-09).
+
+**Repair is real work, and it converges.** 614 pending, walking one file per claim;
+`attempts=42` is 42 files probed, not 42 failures. `repair_verified_sorted` persists
+(12,955 paths loaded at boot), so the walk survives restarts.
+
+### The measurement constraint I keep violating
+
+`rollup_hits_full_total` was **4,453** on a process with hours of uptime and reads
+**0** on every fresh one. I deployed three times in 90 minutes tonight, so I have not
+once observed the steady state I am trying to move. `CLAUDE.md` already says ≥2h quiet
+before trusting throughput numbers, and the deploy cadence also re-walks Repair and
+truncates dedup units. **Next step is deliberately not a code change: hold deploys and
+let it run.** Open questions that need that quiet window:
+
+1. Does 2026-08-13 finally take a SealedConsolidation claim?
+2. Does `rollup_median_contiguous_days` climb from 4 as the 6,860 base rollups drain?
+3. Does `rollup_hits_full_total` leave zero on a long-lived process?
