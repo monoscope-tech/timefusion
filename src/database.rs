@@ -527,7 +527,7 @@ impl Drop for FlushWaiter {
 
 /// Get a Delta table from custom project tables by project_id and table_name
 pub async fn get_custom_delta_table(custom_tables: &CustomProjectTables, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
-    custom_tables.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned()
+    custom_tables.read().await.get(&table_key(project_id, table_name)).cloned()
 }
 
 /// Get a Delta table from unified tables by table_name
@@ -1663,6 +1663,11 @@ async fn last_checkpoint_readable(store: &Arc<dyn object_store::ObjectStore>) ->
         }
     }
     Ok(true)
+}
+
+/// (project_id, table_name) key shape shared by the table caches/maps below.
+pub(crate) fn table_key(project_id: &str, table_name: &str) -> (String, String) {
+    (project_id.to_string(), table_name.to_string())
 }
 
 /// Exponential backoff between OCC conflict retries — single policy for every
@@ -2932,6 +2937,20 @@ impl Database {
         &self.custom_project_tables
     }
 
+    /// Lock the maintenance task journal, recovering from mutex poisoning.
+    fn journal(&self) -> std::sync::MutexGuard<'_, crate::maintenance_coordinator::TaskJournal> {
+        self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// All maintenance targets (unified + custom project tables) as `(name, table)` pairs,
+    /// for cron jobs that sweep every table.
+    async fn all_maintenance_targets(&self) -> Vec<(String, Arc<RwLock<DeltaTable>>)> {
+        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
+            self.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+        targets.extend(self.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+        targets
+    }
+
     /// Perform a Delta table UPDATE operation
     pub async fn perform_delta_update(
         &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>,
@@ -3016,7 +3035,7 @@ impl Database {
                         debug!("Updated table for {}/{} to version {}", project_id, table_name, version);
                         // Update our version tracking to reflect what we just loaded
                         let mut versions = self.last_written_versions.write().await;
-                        versions.insert((project_id.to_string(), table_name.to_string()), version);
+                        versions.insert(table_key(project_id, table_name), version);
                     }
                     return Ok(());
                 }
@@ -3028,14 +3047,7 @@ impl Database {
                     }
 
                     debug!("Failed to update table for {}/{} (attempt {}/{}): {}, retrying...", project_id, table_name, retries, MAX_RETRIES, e);
-                    // Exponential backoff with jitter, capped at ~6.4s.
-                    // `100 << retries` doubles each attempt; clamp to 6 shifts
-                    // so a long retry chain doesn't sleep for minutes. Jitter
-                    // is `± delay/4` so concurrent retriers don't thunder.
-                    let base = 100u64 << retries.min(6);
-                    let jitter = fastrand::u64(0..=base / 2);
-                    let delay = base / 2 * 3 + jitter; // base*0.75 .. base*1.25
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                    tokio::time::sleep(occ_backoff(retries as usize)).await;
                 }
             }
         }
@@ -4516,9 +4528,7 @@ impl Database {
                     let db = db.clone();
                     async move {
                         info!("Running scheduled cold consolidation on sealed partitions");
-                        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
-                            db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-                        targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+                        let targets = db.all_maintenance_targets().await;
                         for (name, table) in &targets {
                             if let Err(e) = db.consolidate_sealed_partitions(table, name).await {
                                 error!("Consolidate (cold tier) failed for '{}': {}", name, e);
@@ -4542,9 +4552,7 @@ impl Database {
                     let db = db.clone();
                     async move {
                         info!("Running scheduled tier recompression (warm→cold@{}d zstd={})", cold_cutoff, zstd_cold);
-                        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
-                            db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-                        targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+                        let targets = db.all_maintenance_targets().await;
                         for (name, table) in &targets {
                             if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
                                 error!("Recompress (cold tier) failed for '{}': {}", name, e);
@@ -5054,7 +5062,7 @@ impl Database {
 
     /// Check if a project has custom storage configuration (their own S3 bucket)
     async fn has_custom_storage(&self, project_id: &str, table_name: &str) -> bool {
-        self.storage_configs.read().await.contains_key(&(project_id.to_string(), table_name.to_string()))
+        self.storage_configs.read().await.contains_key(&table_key(project_id, table_name))
     }
 
     /// Snapshot of the custom-storage (project, table) keys — one lock
@@ -5087,7 +5095,7 @@ impl Database {
         // a `(String, String)` key directly). Holding for now — the
         // allocations are not the bottleneck and the lock removal in this
         // PR already eliminated the dominant overhead.
-        self.fast_resolve_cache.get(&(project_id.to_string(), table_name.to_string())).map(|r| Arc::clone(r.value()))
+        self.fast_resolve_cache.get(&table_key(project_id, table_name)).map(|r| Arc::clone(r.value()))
     }
 
     /// `true` iff the scan path is allowed to skip the Delta side entirely
@@ -5111,7 +5119,7 @@ impl Database {
         // `docs/membuffer_flush_fix_plan.md` (borrowed-tuple-key wrapper for
         // all three table-keyed DashMaps at once).
         self.delta_has_files
-            .get(&(project_id.to_string(), table_name.to_string()))
+            .get(&table_key(project_id, table_name))
             // Acquire-load pairs with the Release-store in mark_delta_has_files
             // and populate_resolve_caches. The DashMap shard lock already
             // provides a happens-before via its own acquire/release of the
@@ -5125,7 +5133,7 @@ impl Database {
     /// Mark a (project, table) as having Delta files. Called by the flush
     /// callback after a successful commit.
     pub fn mark_delta_has_files(&self, project_id: &str, table_name: &str) {
-        let key = (project_id.to_string(), table_name.to_string());
+        let key = table_key(project_id, table_name);
         let flag = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         flag.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -5232,7 +5240,7 @@ impl Database {
     /// loader) would reopen the staleness window described above and break
     /// this seeding step; don't.
     async fn populate_resolve_caches(&self, project_id: &str, table_name: &str, t: &Arc<RwLock<DeltaTable>>) {
-        let key = (project_id.to_string(), table_name.to_string());
+        let key = table_key(project_id, table_name);
         let was_new = self.fast_resolve_cache.insert(key.clone(), Arc::clone(t)).is_none();
         // Operator-visible warning so unbounded growth (documented on the
         // field) doesn't sit unseen in `scan.fast_resolve_cache_entries`.
@@ -5282,7 +5290,7 @@ impl Database {
     /// by `resolve_unified_table` / `resolve_custom_table` so the staleness rule
     /// can't drift between them.
     async fn refresh_cached_table(&self, table: Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
-        let last_written_version = self.last_written_versions.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned();
+        let last_written_version = self.last_written_versions.read().await.get(&table_key(project_id, table_name)).cloned();
         let current_version = table.read().await.version();
         if should_refresh_table(current_version, last_written_version) {
             self.update_table(&table, project_id, table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {e}")))?;
@@ -5294,7 +5302,7 @@ impl Database {
     async fn resolve_custom_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         // Check custom_project_tables cache first — handle cloned and the map
         // guard dropped before the refresh (see `resolve_unified_table`).
-        let cached = self.custom_project_tables.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned();
+        let cached = self.custom_project_tables.read().await.get(&table_key(project_id, table_name)).cloned();
         if let Some(table) = cached {
             debug!("Found custom table for project '{}' table '{}' in cache", project_id, table_name);
             return self.refresh_cached_table(table, project_id, table_name).await;
@@ -5363,7 +5371,7 @@ impl Database {
         // Check cache first
         {
             let tables = self.custom_project_tables.read().await;
-            if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
+            if let Some(table) = tables.get(&table_key(project_id, table_name)) {
                 return Ok(Arc::clone(table));
             }
         }
@@ -5371,7 +5379,7 @@ impl Database {
         // Get custom storage config for this project
         let configs = self.storage_configs.read().await;
         let config = configs
-            .get(&(project_id.to_string(), table_name.to_string()))
+            .get(&table_key(project_id, table_name))
             .ok_or_else(|| anyhow::anyhow!("No storage config found for project '{}' table '{}'", project_id, table_name))?
             .clone();
         drop(configs);
@@ -5406,11 +5414,11 @@ impl Database {
         // indefinitely and wedge every maintenance job that walks the map.
         let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
         let mut tables = self.custom_project_tables.write().await;
-        if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
+        if let Some(table) = tables.get(&table_key(project_id, table_name)) {
             return Ok(Arc::clone(table));
         }
         let table_arc = Arc::new(RwLock::new(table));
-        tables.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
+        tables.insert(table_key(project_id, table_name), Arc::clone(&table_arc));
         info!("Cached custom table for project '{}' table '{}', cache now contains {} entries", project_id, table_name, tables.len());
 
         Ok(table_arc)
@@ -6548,6 +6556,31 @@ impl Database {
         Ok(table)
     }
 
+    /// Casts each of `batches` to `writer`'s table schema (`RecordBatchWriter`,
+    /// unlike `WriteBuilder`, doesn't cast for us — Utf8View→Utf8 etc, missing
+    /// columns filled with nulls; safe=true, add_missing=true mirrors
+    /// `WriteBuilder`'s own coercion) and streams them in, flushing at
+    /// `max_file_bytes` so one oversized bucket (the MemBuffer ceiling is GBs)
+    /// doesn't land as a single file — on a sorted stream each flushed piece
+    /// keeps its own footer and stays time-disjoint. Shared by the per-project
+    /// staged-commit path and the cross-project coalesced flush's staging phase.
+    async fn stage_batches(
+        writer: &mut deltalake::writer::RecordBatchWriter, batches: FlushBatches, max_file_bytes: usize,
+    ) -> Result<Vec<deltalake::kernel::Action>, deltalake::DeltaTableError> {
+        use deltalake::writer::DeltaWriter;
+        let target_schema = writer.arrow_schema();
+        let mut staged = Vec::new();
+        for b in batches {
+            let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
+            writer.write(casted).await?;
+            if writer.buffer_len() >= max_file_bytes {
+                staged.extend(writer.flush().await?);
+            }
+        }
+        staged.extend(writer.flush().await?);
+        Ok(staged.into_iter().map(deltalake::kernel::Action::Add).collect())
+    }
+
     /// Everything a staged (lock-free parquet upload) Delta write needs, built
     /// once per (project, table) unit. Shared by `insert_records_batch` and the
     /// cross-project coalesced flush path so both prepare writes identically.
@@ -6750,39 +6783,15 @@ impl Database {
             use deltalake::{
                 kernel::{Action, transaction::TableReference},
                 protocol::DeltaOperation,
-                writer::DeltaWriter,
             };
 
             // Upload parquet (no commit) on the staging clone — outside the lock.
-            // RecordBatchWriter (unlike WriteBuilder) doesn't cast the batch to
-            // the table schema, so cast each batch to the table's arrow schema
-            // first — Utf8View→Utf8 etc, filling any missing column with nulls
-            // (safe=true, add_missing=true mirrors WriteBuilder's own coercion).
-            let target_schema = writer.arrow_schema();
             let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
-            let adds: Vec<Action> = async {
-                let mut staged = Vec::new();
-                for b in batches {
-                    let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
-                    writer.write(casted).await?;
-                    // A single flush bucket can be enormous (the MemBuffer
-                    // ceiling is GBs), and `RecordBatchWriter::flush` would emit
-                    // it as ONE file. Cut at the ceiling — on a sorted stream
-                    // each piece keeps its footer and stays time-disjoint.
-                    if writer.buffer_len() >= max_file_bytes {
-                        staged.extend(writer.flush().await?);
-                    }
-                }
-                staged.extend(writer.flush().await?);
-                Ok::<_, deltalake::DeltaTableError>(staged)
-            }
-            .instrument(stage_span)
-            .await
-            .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e))?
-            .into_iter()
-            .map(Action::Add)
-            .collect();
+            let adds: Vec<Action> = Self::stage_batches(&mut writer, batches, max_file_bytes)
+                .instrument(stage_span)
+                .await
+                .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e))?;
             if adds.is_empty() {
                 return Ok(Vec::new());
             }
@@ -7028,7 +7037,7 @@ impl Database {
     /// Returns one result per input unit in input order. `Ok` carries the added file URIs,
     /// attributed by `project_id=` partition path when the commit spanned projects.
     pub async fn insert_records_batches_coalesced(&self, units: Vec<CoalescedWriteUnit>) -> Vec<Result<Vec<String>>> {
-        use deltalake::{kernel::Action, protocol::DeltaOperation, writer::DeltaWriter};
+        use deltalake::{kernel::Action, protocol::DeltaOperation};
         use futures::stream::{self, StreamExt};
         let parallelism = self.config.buffer.flush_parallelism();
         let mut results: Vec<Result<Vec<String>>> = units.iter().map(|_| Ok(Vec::new())).collect();
@@ -7071,26 +7080,9 @@ impl Database {
             .map(|(i, prep, key)| async move {
                 let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, staged_writer, .. } = prep;
                 let mut writer = staged_writer.expect("filtered above");
-                // RecordBatchWriter (unlike WriteBuilder) doesn't cast the batch
-                // to the table schema — cast first (Utf8View→Utf8 etc, missing
-                // columns filled with nulls), mirroring the per-project path.
-                let target_schema = writer.arrow_schema();
-                let adds = async {
-                    let mut staged = Vec::new();
-                    for b in batches {
-                        let casted = deltalake::kernel::schema::cast_record_batch(&b?, target_schema.clone(), true, true)?;
-                        writer.write(casted).await?;
-                        // Same file-size ceiling as the per-project path.
-                        if writer.buffer_len() >= max_file_bytes {
-                            staged.extend(writer.flush().await?);
-                        }
-                    }
-                    staged.extend(writer.flush().await?);
-                    Ok::<_, deltalake::DeltaTableError>(staged)
-                }
-                .await
-                .map(|adds| adds.into_iter().map(Action::Add).collect::<Vec<Action>>())
-                .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
+                let adds: Result<Vec<Action>> = Self::stage_batches(&mut writer, batches, max_file_bytes)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
                 (i, key, adds.map(|adds| StagedUnit { table_ref, schema, dirty_bins, adds, stage_store }))
             })
             .buffer_unordered(parallelism)
@@ -7344,7 +7336,7 @@ impl Database {
         if let Some(version) = committed_version {
             let mut versions = self.last_written_versions.write().await;
             for (project, _) in projects {
-                versions.insert((project.to_string(), table_name.to_string()), version);
+                versions.insert(table_key(project, table_name), version);
             }
             debug!("Stored last written version for {}/{} (+{} coalesced): {}", project_id, table_name, projects.len().saturating_sub(1), version);
         } else {
@@ -7421,7 +7413,7 @@ impl Database {
             && committed_version.is_some_and(|v| (v + Self::reconcile_offset(project_id, table_name, reconcile_n)).is_multiple_of(reconcile_n))
         {
             let (table_ref, shutdown) = (table_ref.clone(), self.maintenance_shutdown.clone());
-            let (project_id, table_name) = (project_id.to_string(), table_name.to_string());
+            let (project_id, table_name) = table_key(project_id, table_name);
             tokio::spawn(async move {
                 tokio::select! {
                     _ = shutdown.cancelled() => {}
@@ -8607,6 +8599,22 @@ impl Database {
         Ok((dropped, complete && result.failed.is_empty()))
     }
 
+    /// Builds a `TableProviderBuilder` scoped to exactly `files` off
+    /// `snapshot`/`log_store` — the "scan just these files" shape every
+    /// maintenance narrow-scan path uses. `file_col` requests the synthetic
+    /// file-identity passthrough column dedup rewrites key on.
+    async fn narrow_provider(
+        log_store: deltalake::logstore::LogStoreRef, snapshot: Arc<deltalake::kernel::EagerSnapshot>, files: Vec<String>, file_col: Option<&str>,
+    ) -> Result<Arc<dyn TableProvider>, deltalake::DeltaTableError> {
+        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
+        let mut builder =
+            TableProviderBuilder::default().with_log_store(log_store).with_eager_snapshot(snapshot).with_file_selection(FileSelection::from_file_paths(files));
+        if let Some(col) = file_col {
+            builder = builder.with_file_column(col);
+        }
+        Ok(Arc::new(builder.build().await?))
+    }
+
     /// Probe-only DataFusion ctx over ONE (project, date) partition's snapshot
     /// files, registered as [`DEDUP_SCAN_NAME`]. Bypasses ProjectRoutingTable:
     /// its MemBuffer union would feed in-flight rows to dedup, which would then
@@ -8622,7 +8630,6 @@ impl Database {
     async fn dedup_probe_ctx(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, date_str: &str, limits: Option<DedupExecutionLimits>,
     ) -> Result<datafusion::prelude::SessionContext> {
-        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
         let (snapshot, log_store) = {
             let table = table_ref.read().await;
             (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
@@ -8631,11 +8638,7 @@ impl Database {
         // Probe-only provider (chunk detection). The rewrite builds its own
         // provider per attempt — from a FRESH snapshot, with the synthetic
         // source-file column — in `dedup_rewrite_chunk`.
-        let provider = TableProviderBuilder::default()
-            .with_log_store(log_store)
-            .with_eager_snapshot(snapshot)
-            .with_file_selection(FileSelection::from_file_paths(partition_files))
-            .build()
+        let provider = Self::narrow_provider(log_store, snapshot, partition_files, None)
             .await
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
         // A fresh state is intentional: SessionState clones retain mutable
@@ -8654,7 +8657,7 @@ impl Database {
             },
         );
         let ctx = datafusion::prelude::SessionContext::new_with_state(state);
-        ctx.register_table(DEDUP_SCAN_NAME, Arc::new(provider))?;
+        ctx.register_table(DEDUP_SCAN_NAME, provider)?;
         Ok(ctx)
     }
 
@@ -8689,6 +8692,20 @@ impl Database {
             }
         }
         Ok(starts)
+    }
+
+    /// Runs `sql` and pulls its first output row's `column(0)` as an `i64` —
+    /// the common "run an aggregate probe, get one scalar back" shape used
+    /// throughout the dedup rewrite path. `None` if the result is empty or
+    /// `column(0)` isn't an `Int64Array`; callers layer their own
+    /// exactly-one-row / non-negative validation on top where needed.
+    async fn scalar_i64(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<Option<i64>> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches
+            .first()
+            .filter(|b| b.num_rows() > 0)
+            .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>())
+            .map(|a| a.value(0)))
     }
 
     /// BATCH probe (2026-08-05): classify EVERY 10-minute bin of one
@@ -8828,15 +8845,7 @@ impl Database {
             // rewrite, gated on the same any-dupes probe.
             let probe =
                 format!("SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS g WHERE c > 1");
-            let dup_rows = ctx
-                .sql(&probe)
-                .await?
-                .collect()
-                .await?
-                .first()
-                .filter(|b| b.num_rows() > 0)
-                .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
-                .unwrap_or(0);
+            let dup_rows = Self::scalar_i64(&ctx, &probe).await?.unwrap_or(0);
             if dup_rows <= 0 { (Vec::new(), false) } else { (vec![(filter.clone(), format!("project_id = '{safe_pid}' AND date = '{date_str}'"))], false) }
         };
         if chunks.is_empty() {
@@ -8935,21 +8944,15 @@ impl Database {
                 let table = table_ref.read().await;
                 (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
             };
-            use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
             let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
-            let provider = TableProviderBuilder::default()
-                .with_log_store(chunk_log_store)
-                .with_eager_snapshot(Arc::clone(&chunk_snapshot))
-                .with_file_column(DEDUP_FILE_COL)
-                .with_file_selection(FileSelection::from_file_paths(partition_files))
-                .build()
+            let provider = Self::narrow_provider(chunk_log_store, Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL))
                 .await
                 .map_err(|e| anyhow::anyhow!("dedup rewrite provider: {e}"))?;
             let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
                 self.config.memory.timefusion_query_partitions,
                 self.maintenance_runtime_env(),
             ));
-            ctx.register_table(scan_name, Arc::new(provider))?;
+            ctx.register_table(scan_name, provider)?;
 
             // 1. Which files hold the chunk's rows — ground truth from the
             // scan itself, no per-file stats parsing.
@@ -9086,16 +9089,8 @@ impl Database {
             let logical_rows_sql = format!(
                 "SELECT count(*) FROM (SELECT 1 FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
             );
-            let expected_logical_rows = ctx
-                .sql(&logical_rows_sql)
-                .await?
-                .collect()
-                .await?
-                .first()
-                .filter(|batch| batch.num_rows() == 1)
-                .and_then(|batch| batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>())
-                .map(|array| array.value(0))
-                .ok_or_else(|| anyhow::anyhow!("dedup rewrite distinct-key validation returned no scalar"))?;
+            let expected_logical_rows =
+                Self::scalar_i64(&ctx, &logical_rows_sql).await?.ok_or_else(|| anyhow::anyhow!("dedup rewrite distinct-key validation returned no scalar"))?;
             let expected_logical_rows =
                 u64::try_from(expected_logical_rows).map_err(|_| anyhow::anyhow!("dedup rewrite distinct-key validation returned a negative count"))?;
 
@@ -9106,14 +9101,7 @@ impl Database {
                 let max_group_sql = format!(
                     "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
                 );
-                let max_group = ctx
-                    .sql(&max_group_sql)
-                    .await?
-                    .collect()
-                    .await?
-                    .first()
-                    .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
-                    .unwrap_or(0);
+                let max_group = Self::scalar_i64(&ctx, &max_group_sql).await?.unwrap_or(0);
                 if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
                     crate::observability::record_dedup_chunk_skipped();
                     error!(
@@ -9202,14 +9190,9 @@ impl Database {
                             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
                             let (shard_before, shard_after) = if limits.is_some() {
                                 let count_sql = format!("SELECT COUNT(*) FROM {scan_name} WHERE {rows_filter}");
-                                let shard_before = ctx
-                                    .sql(&count_sql)
+                                let shard_before = Self::scalar_i64(ctx, &count_sql)
                                     .await?
-                                    .collect()
-                                    .await?
-                                    .first()
-                                    .and_then(|batch| batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>())
-                                    .map_or(0, |values| usize::try_from(values.value(0).max(0)).unwrap_or(usize::MAX));
+                                    .map_or(0, |v| usize::try_from(v.max(0)).unwrap_or(usize::MAX));
                                 if shard_before == 0 {
                                     return Ok((0, 0));
                                 }
@@ -9459,7 +9442,7 @@ impl Database {
         let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(std::io::Error::other)?;
         let day_start = day.and_hms_opt(0, 0, 0).ok_or_else(|| std::io::Error::other("invalid maintenance date"))?.and_utc().timestamp_micros();
         let observed_at = crate::support::now_micros();
-        let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut journal = self.journal();
         for spec in &schema.rollups {
             let target = spec.table_name(source);
             for (start, end) in crate::rollup::dirty_ranges(day_start, hours) {
@@ -9498,7 +9481,7 @@ impl Database {
                 (table.version().unwrap_or_default(), table.log_store())
             };
             let cursor_key = format!("{storage_project}:{source}");
-            let current_cursor = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).source_cursor(&cursor_key);
+            let current_cursor = self.journal().source_cursor(&cursor_key);
             // The first coordinator start has no durable cursor. Establish a
             // baseline at the already-loaded snapshot instead of expanding the
             // complete table history into thousands of urgent tasks. Existing
@@ -9506,7 +9489,7 @@ impl Database {
             // discovers historical debt. Production showed the old bootstrap
             // path monopolizing CPU for 21.9s immediately after preload.
             if current_cursor.is_none() {
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 journal.set_source_cursor(cursor_key, version);
                 journal.checkpoint()?;
                 continue;
@@ -9568,7 +9551,7 @@ impl Database {
                 self.enqueue_maintenance_hours(&project, &source, &date, hours)?;
                 queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
             }
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             journal.set_source_cursor(cursor_key, version);
             journal.checkpoint()?;
         }
@@ -9739,7 +9722,7 @@ impl Database {
             // never retire work — that is the direction that silently drops
             // compaction.
             let retired = {
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 let stale: Vec<_> = journal
                     .tasks()
                     .filter(|task| {
@@ -9764,7 +9747,7 @@ impl Database {
         }
         let count = planned.len();
         if count != 0 {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             for task in planned {
                 journal.enqueue(task.key, task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms);
             }
@@ -9861,7 +9844,7 @@ impl Database {
         // 24 cells per 60s against 43,000, which is noise next to never building
         // the coverage at all.
         let defer_enqueue = {
-            let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let journal = self.journal();
             let pending = journal.tasks().filter(|task| task.state != crate::maintenance_coordinator::TaskState::Complete).count();
             let defer = pending >= BACKFILL_PENDING_CEILING && !coverage_is_short();
             if defer {
@@ -10091,7 +10074,7 @@ impl Database {
             // planner enqueues day-sized units through `enqueue`, which takes
             // `deadline.min(...)` and can only pull a deadline IN.
             let queued_tables: HashSet<(String, chrono::NaiveDate, String)> = {
-                let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let journal = self.journal();
                 journal
                     .tasks()
                     .filter(|task| task.key.source == source && crate::maintenance_coordinator::blocks_rollup_backfill(task))
@@ -10120,7 +10103,7 @@ impl Database {
             // admitted per pass — this touches existing tasks only, mints
             // nothing, and cannot affect admission or deadlines.
             {
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 let mut proven = 0usize;
                 for ((project_id, date), missing) in &missing_tiers {
                     if *date >= today || missing.iter().any(|index| schema.rollups[*index].derive_from.is_none()) {
@@ -10167,7 +10150,7 @@ impl Database {
             // Pairs with the cell census: that one says whether the planner sees
             // the holes, this one says why the work it already queued never runs.
             let (derived_pending, derived_sealed, derived_unproven, derived_quarantined, derived_not_due) = {
-                let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let journal = self.journal();
                 journal.claimability_census(crate::maintenance_coordinator::Operation::DerivedRollup, crate::support::now_micros())
             };
             info!(
@@ -10182,7 +10165,7 @@ impl Database {
                 derived_quarantined,
                 derived_not_due,
                 derived_refusal = {
-                    let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let journal = self.journal();
                     journal
                         .first_refused_sealed(crate::maintenance_coordinator::Operation::DerivedRollup, crate::support::now_micros())
                         .map_or_else(|| "none_pending".to_owned(), |(project, date, reason)| format!("{reason}:{project:.8}:{date}"))
@@ -10224,7 +10207,7 @@ impl Database {
             let now = crate::support::now_micros();
             let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
             {
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 for (project_id, date) in &want {
                     let Some(day_start) = date.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
@@ -10297,7 +10280,7 @@ impl Database {
         // source inside the loop meant the last table wiped the rest — see the
         // declaration above.
         {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             journal.set_base_tier_ready(all_base_tier_ready);
             journal.set_tier_holes(all_tier_holes);
         }
@@ -10316,11 +10299,17 @@ impl Database {
     ) -> Option<(crate::maintenance_coordinator::MaintenanceTask, Option<tokio::sync::OwnedSemaphorePermit>)> {
         let permit = Arc::clone(&self.maintenance_quarantine_slots).try_acquire_owned().ok();
         let task = {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             journal.claim_next(operation, crate::support::now_micros(), permit.is_some())?
         };
         let quarantined = crate::maintenance_coordinator::TaskJournal::is_quarantined(&task);
         Some((task, permit.filter(|_| quarantined)))
+    }
+
+    fn log_task_started(&self, task: &crate::maintenance_coordinator::MaintenanceTask) {
+        let key = &task.key;
+        info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
     }
 
     async fn run_coordinator_dedup_once(&self) -> Result<bool> {
@@ -10329,12 +10318,11 @@ impl Database {
 
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(Operation::Dedup) else { return Ok(false) };
         let key = task.key.clone();
-        info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
-            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
+        self.log_task_started(&task);
         let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
             let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             journal.retry(&key, reason, crate::support::now_micros().saturating_add(delay_micros));
             journal.checkpoint()
         };
@@ -10398,7 +10386,7 @@ impl Database {
                 .fold(0u64, u64::saturating_add)
         };
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             if journal.split_time_task(&key, estimated_bytes) {
                 journal.checkpoint()?;
                 info!(
@@ -10456,7 +10444,7 @@ impl Database {
                 {
                     warn!(%error, project_id = %key.project_id, %date, "certification bookkeeping failed after a clean day-wide dedup");
                 }
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 journal.complete(&key);
                 journal.checkpoint()?;
                 crate::observability::maintenance_stats().maintenance_processed_bytes.fetch_add(task.estimated_decoded_bytes, Relaxed);
@@ -10465,7 +10453,7 @@ impl Database {
             Err(error) => {
                 let delay = std::time::Duration::from_secs(1u64 << task.attempts.min(8));
                 let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 journal.retry_or_split(&key, format!("dedup: {error:#}"), crate::support::now_micros().saturating_add(delay_micros), task.attempts);
                 journal.checkpoint()?;
             }
@@ -10500,7 +10488,7 @@ impl Database {
         let key = TaskKey { physical_table, source: source.to_owned(), project_id: project_id.to_owned(), slice, operation };
         let now = crate::support::now_micros();
         {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             if operation == Operation::DerivedRollup {
                 // A derived unit is unclaimable until its base generation is
                 // Complete; a scratch journal has none. Seed the dependency
@@ -10558,7 +10546,7 @@ impl Database {
             stats.rollup_scan_cohorts.load(Relaxed),
         ];
         let (state, retry_reason) = {
-            let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let journal = self.journal();
             journal.tasks().find(|task| task.key == key).map(|task| (Some(task.state), task.retry_reason.clone())).unwrap_or((None, None))
         };
         Ok(UnitRunReport {
@@ -10579,7 +10567,6 @@ impl Database {
     async fn run_coordinator_rollup_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources, TaskState};
         use deltalake::{
-            delta_datafusion::{FileSelection, TableProviderBuilder},
             kernel::{Action, transaction::TableReference},
             protocol::{DeltaOperation, SaveMode},
             writer::DeltaWriter,
@@ -10589,14 +10576,26 @@ impl Database {
             sync::atomic::Ordering::Relaxed,
         };
 
+        // Reads back the slice an `Add` was tagged with — used repeatedly below
+        // to reconcile a rebuilt slice's coverage against already-live files.
+        fn slice_tag_range(add: &deltalake::kernel::Add) -> Option<(i64, i64)> {
+            let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
+            Some((
+                tag(crate::maintenance_coordinator::TAG_SLICE_START)?.parse::<i64>().ok()?,
+                tag(crate::maintenance_coordinator::TAG_SLICE_END)?.parse::<i64>().ok()?,
+            ))
+        }
+        fn tag_project(add: &deltalake::kernel::Add) -> Option<&str> {
+            add.tags.as_ref().and_then(|tags| tags.get(crate::maintenance_coordinator::TAG_PROJECT)).and_then(Option::as_deref)
+        }
+
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
         let key = task.key.clone();
-        info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
-            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
+        self.log_task_started(&task);
         let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
             let delay = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             journal.retry(&key, reason, crate::support::now_micros().saturating_add(delay));
             journal.checkpoint()
         };
@@ -10677,7 +10676,6 @@ impl Database {
                     continue;
                 }
                 if derived {
-                    let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
                     // OVERLAP, not containment. A base file is tagged with the
                     // slice of the UNIT that wrote it, and that unit's width is
                     // unrelated to this one's: the backfill writes day-wide base
@@ -10703,12 +10701,9 @@ impl Database {
                     // distinguishable: #139 fixed day-tagged files being
                     // unselectable, and if any tier still comes back empty this
                     // is the number that says whether tags are the reason.
-                    match (
-                        tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                        tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                    ) {
-                        (Some(start), Some(end)) => {
-                            if tag(crate::maintenance_coordinator::TAG_PROJECT) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
+                    match slice_tag_range(&add) {
+                        Some((start, end)) => {
+                            if tag_project(&add) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
                                 continue;
                             }
                         }
@@ -10787,7 +10782,7 @@ impl Database {
             );
         }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             if journal.split_time_task(&key, estimated_bytes) {
                 journal.checkpoint()?;
                 return Ok(true);
@@ -10824,15 +10819,10 @@ impl Database {
         // throughput zero, because the constraint is per-unit cost.
         let unit_started = std::time::Instant::now();
         let ctx = self.bounded_rollup_maintenance_context()?;
-        let provider = TableProviderBuilder::default()
-            .with_log_store(log_store)
-            .with_eager_snapshot(snapshot)
-            .with_file_selection(FileSelection::from_file_paths(selected))
-            .build()
-            .await
-            .map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
+        let provider =
+            Self::narrow_provider(log_store, snapshot, selected, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
         const RAW: &str = "__maintenance_slice_raw";
-        ctx.register_table(RAW, Arc::new(provider))?;
+        ctx.register_table(RAW, provider)?;
         let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp);
         let target_schema = get_schema(&key.physical_table).ok_or_else(|| anyhow::anyhow!("rollup target schema missing"))?;
         let mut shard_keys = if derived {
@@ -10985,7 +10975,6 @@ impl Database {
         let replaced = live_adds
             .iter()
             .filter(|add| {
-                let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
                 // OVERLAP, not exact equality. Slice WIDTH is not stable for a
                 // given range: `split_time_task` cuts a day into children and
                 // `coarsen_sealed_slices` (#134) fuses them back, so the same
@@ -10999,13 +10988,10 @@ impl Database {
                 // the rest is republished; until it is, the coverage check sees
                 // an incomplete tier and the query falls back to raw rather
                 // than reading a hole.
-                let (Some(start), Some(end)) = (
-                    tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                    tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                ) else {
+                let Some((start, end)) = slice_tag_range(add) else {
                     return false;
                 };
-                tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
+                tag_project(add) == Some(key.project_id.as_str())
                     && start >= key.slice.start_micros
                     && end <= key.slice.end_micros
             })
@@ -11043,14 +11029,8 @@ impl Database {
         // them and the republication double-counts. Run it at 11:20 UTC and it
         // passes; run it at 12:30 UTC and it reports 14 where 9 is right.
         let covered_by_wider = live_adds.iter().find_map(|add| {
-            let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
-            let (Some(start), Some(end)) = (
-                tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-            ) else {
-                return None;
-            };
-            (tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
+            let (start, end) = slice_tag_range(add)?;
+            (tag_project(add) == Some(key.project_id.as_str())
                 && (start, end) != (key.slice.start_micros, key.slice.end_micros)
                 && start <= key.slice.start_micros
                 && end >= key.slice.end_micros)
@@ -11077,7 +11057,7 @@ impl Database {
             // contains. It terminates: the wider unit publishes at its own
             // width, so it never re-enters this branch.
             crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
                 journal.enqueue(
                     crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() },
@@ -11109,7 +11089,7 @@ impl Database {
         // diagnosis pass chasing a rollup outage that was not happening.
         let (action_count, output_files) = (actions.len() as u64, adds.len() as u64);
 
-        let still_running = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).state(&key) == Some(TaskState::Running);
+        let still_running = self.journal().state(&key) == Some(TaskState::Running);
         if !still_running {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
             return Ok(true);
@@ -11138,7 +11118,7 @@ impl Database {
         }
 
         let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut journal = self.journal();
         if journal.state(&key) == Some(TaskState::Running) {
             self.rollup_slice_coverage.insert(
                 (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros),
@@ -11255,11 +11235,10 @@ impl Database {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources, TaskLease, TaskState};
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
         let key = task.key.clone();
-        info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
-            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
+        self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, seconds: u64| -> Result<()> {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             journal.retry(&key, reason, crate::support::now_micros().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX).saturating_mul(1_000_000)));
             journal.checkpoint()
         };
@@ -11277,7 +11256,7 @@ impl Database {
         };
         let files = self.coordinator_compaction_files(&table_ref, &key).await?;
         if files.is_empty() {
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             journal.complete(&key);
             journal.checkpoint()?;
             return Ok(true);
@@ -11294,7 +11273,7 @@ impl Database {
         };
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
             let remaining = !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty();
-            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut journal = self.journal();
             if remaining {
                 journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
             } else {
@@ -11319,7 +11298,7 @@ impl Database {
             Ok(BinOutcome::Converged) => true,
             Ok(BinOutcome::Retry) => false,
             Err(error) => {
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 journal.retry_or_split(&key, format!("compaction: {error:#}"), crate::support::now_micros().saturating_add(30 * 1_000_000), task.attempts);
                 journal.checkpoint()?;
                 return Ok(true);
@@ -11329,7 +11308,7 @@ impl Database {
         if completed {
             crate::observability::maintenance_stats().maintenance_processed_bytes.fetch_add(processed_bytes, std::sync::atomic::Ordering::Relaxed);
         }
-        let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut journal = self.journal();
         if journal.state(&key) == Some(TaskState::Running) {
             if completed {
                 if remaining {
@@ -11370,7 +11349,7 @@ impl Database {
             // them is what keeps the queue from growing at the rate projects
             // are added.
             let report = {
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut journal = self.journal();
                 let report = journal.coarsen_sealed_slices_reporting(crate::support::now_micros());
                 if report.total() != 0 {
                     // `checkpoint` again, not `compact`. It briefly had to be
@@ -11809,7 +11788,7 @@ impl Database {
                 }
                 Err(_) => HashMap::new(),
             };
-            let published = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).published_rollups(source, &target);
+            let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {
                 self.rollup_slice_coverage.insert(
                     (key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros),
@@ -11826,7 +11805,7 @@ impl Database {
             if !tagged.is_empty() {
                 for ((project_id, slice_start, slice_end, generation, source_fp), rows) in tagged {
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else { continue };
-                    let complete = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rollup_slice_complete(
+                    let complete = self.journal().rollup_slice_complete(
                         source,
                         &project_id,
                         &target,
@@ -11971,19 +11950,13 @@ impl Database {
         &self, snapshot: Arc<deltalake::kernel::EagerSnapshot>, log_store: deltalake::logstore::LogStoreRef, files: Vec<String>,
         columns: crate::read::LogicalCountColumns<'_>,
     ) -> Result<Vec<RecordBatch>> {
-        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let provider = TableProviderBuilder::default()
-            .with_log_store(log_store)
-            .with_eager_snapshot(snapshot)
-            .with_file_selection(FileSelection::from_file_paths(files))
-            .build()
-            .await
-            .map_err(|error| anyhow::anyhow!("logical-count overlay provider: {error}"))?;
+        let provider =
+            Self::narrow_provider(log_store, snapshot, files, None).await.map_err(|error| anyhow::anyhow!("logical-count overlay provider: {error}"))?;
         let context = SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env()));
-        context.register_table("__logical_count_overlay", Arc::new(provider))?;
+        context.register_table("__logical_count_overlay", provider)?;
         Ok(context
             .table("__logical_count_overlay")
             .await?
@@ -12010,8 +11983,6 @@ impl Database {
     }
 
     async fn build_logical_count_partition(&self, key: &crate::read::CountPartition, force_refresh: bool) -> Result<()> {
-        use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
-
         let _permit = tokio::select! {
             permit = self.logical_count_build_sem.acquire() => permit?,
             () = self.maintenance_shutdown.cancelled() => return Ok(()),
@@ -12044,16 +12015,12 @@ impl Database {
         let mut index = crate::read::LogicalCountIndex::new();
 
         if !files.is_empty() {
-            let provider = TableProviderBuilder::default()
-                .with_log_store(log_store)
-                .with_eager_snapshot(eager_snapshot)
-                .with_file_selection(FileSelection::from_file_paths(files.clone()))
-                .build()
+            let provider = Self::narrow_provider(log_store, eager_snapshot, files.clone(), None)
                 .await
                 .map_err(|error| anyhow::anyhow!("logical-count provider: {error}"))?;
             let context =
                 SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()));
-            context.register_table("__logical_count_src", Arc::new(provider))?;
+            context.register_table("__logical_count_src", provider)?;
             let frame = context.table("__logical_count_src").await?.select_columns(&[columns.timestamp, columns.id, columns.tiebreak, columns.deleted])?;
             let mut stream = frame.execute_stream().await?;
             loop {
@@ -12982,7 +12949,8 @@ impl Database {
         };
         let before = snap();
         let result = self.optimize_table_light_until(table, table_name, pass, tick_deadline).await;
-        let [planned, completed, bins, brakes] = std::array::from_fn(|i| snap()[i] - before[i]);
+        let after = snap();
+        let [planned, completed, bins, brakes] = std::array::from_fn(|i| after[i] - before[i]);
         let elapsed = t0.elapsed();
         match result {
             Ok(()) if elapsed > OPTIMIZE_WARN => {
@@ -14884,15 +14852,6 @@ impl Database {
 
                 // Log file sizes for monitoring storage savings
                 if !metrics.files_deleted.is_empty() {
-                    let _total_size: u64 = metrics
-                        .files_deleted
-                        .iter()
-                        .filter_map(|_path| {
-                            // Extract size from path if available
-                            // This is a simplified approach - in production you might want to query actual file sizes
-                            None::<u64>
-                        })
-                        .sum();
                     debug!("Vacuum operation details: {:?}", metrics.files_deleted);
                 }
 
@@ -17910,6 +17869,72 @@ impl ProjectRoutingTable {
         Ok(plans)
     }
 
+    /// Delta-only scan shared by `scan()`'s two Delta-alone callers: no
+    /// buffered layer configured, and "nothing above Delta" (mem ∪ hot legs
+    /// both empty). Re-derives `skip_dedup` against the RESOLVED table so the
+    /// fingerprint verdict applies to the exact snapshot being read (the
+    /// `pre_skip_dedup` passed in was decided above the projection, before
+    /// any table was resolved). When granted, restores the pushed `limit` —
+    /// sound only because nothing above a Delta-only scan drops rows unless
+    /// the tombstone filter does.
+    ///
+    /// No `output_projection.is_none()` conjunct: it stood in for "the keys
+    /// are still in the scan", which is now unconditionally true. It also
+    /// never meant what it said — the TOMBSTONE marker alone turns
+    /// `output_projection` `Some`, so on any table declaring both
+    /// (otel_logs_and_spans declares both) it silently revoked every skip it
+    /// was supposed to allow.
+    ///
+    /// `readmit_mutable_filters` controls whether a granted skip also
+    /// re-admits, from `unstripped_filters`, the version-mutable-column
+    /// predicates the leg-safety strip removed upstream: sound here because
+    /// `dedup_skip_allowed` is never granted while the MemBuffer leg is in
+    /// play, and MemBuffer is exactly where uncertified versions live. The
+    /// no-buffered-layer caller has no MemBuffer leg ever and passes `true`;
+    /// the "nothing above Delta" caller passes `false`, preserving that
+    /// branch's existing behavior of leaving `delta_only_filters` unextended.
+    ///
+    /// Returns `(skip_dedup, plans)` — the caller still owns `tag_shape` (the
+    /// scan-local `ScanShape` mutex) and `wrap_result`.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_delta_only(
+        &self, state: &dyn Session, projection: Option<&Vec<usize>>, optimized_filters: &[Expr], unstripped_filters: &[Expr], project_id: &str,
+        query_time_range: Option<(i64, i64)>, dedup_keys: &[String], pre_skip_dedup: bool, tombstone: &Option<String>, orig_limit: Option<usize>,
+        limit: Option<usize>, readmit_mutable_filters: bool, tantivy_id_filter: Option<&Expr>,
+        tantivy_covered_files: Option<&std::collections::HashSet<String>>, tantivy_exclude: Option<&std::collections::HashSet<String>>,
+        tantivy_row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
+    ) -> DFResult<(bool, Vec<Arc<dyn ExecutionPlan>>)> {
+        let mut delta_only_filters = optimized_filters.to_vec();
+        let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
+        let table = delta_table.read().await;
+        let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, project_id, query_time_range, dedup_keys).granted();
+        if skip_dedup && readmit_mutable_filters {
+            let mutable = Self::version_mutable_columns(&self.table_name);
+            let leg_safe = |f: &Expr| {
+                !Self::references_tombstone(&self.table_name, f) && !mutable.as_ref().is_some_and(|m| f.column_refs().iter().any(|c| m.contains(&c.name)))
+            };
+            delta_only_filters.extend(unstripped_filters.iter().filter(|f| !leg_safe(f) && !Self::references_tombstone(&self.table_name, f)).cloned());
+        }
+        // Restoring the pushed limit is only sound when nothing above the
+        // scan drops rows — the tombstone filter does, regardless of dedup.
+        let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
+        let plans = self
+            .scan_delta_with_tantivy(
+                &table,
+                state,
+                projection,
+                &delta_only_filters,
+                eff_limit,
+                tantivy_id_filter,
+                tantivy_covered_files,
+                tantivy_exclude,
+                tantivy_row_selections,
+                query_time_range,
+            )
+            .await?;
+        Ok((skip_dedup, plans))
+    }
+
     /// Shared tail of the Delta scan: projection-index translation into the
     /// provider's schema, the provider scan itself, and type coercion.
     async fn scan_via_provider(
@@ -19251,61 +19276,50 @@ impl TableProvider for ProjectRoutingTable {
         let Some(layer) = self.database.buffered_layer() else {
             // No buffered layer, query Delta directly
             debug!("No buffered layer, querying Delta only");
-            let mut delta_only_filters = optimized_filters.clone();
             // The augmented key columns a skip leaves behind are projected away by
             // `project_indices` in the plan builder above, so a restore is no obstacle.
-            let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
-            let table = delta_table.read().await;
-            // Same guard for the dedup gate and the scan: the fingerprint
-            // verdict applies to exactly the snapshot being read.
-            // `pre_skip_dedup` already decided this above the projection; re-check
-            // against the RESOLVED table so the fingerprint verdict applies to the
-            // exact snapshot being read.
-            // No `output_projection.is_none()` conjunct: it stood in for "the keys are
-            // still in the scan", which is now unconditionally true. It also never meant
-            // what it said — the TOMBSTONE marker alone turns `output_projection` `Some`,
-            // so on any table declaring both (otel_logs_and_spans declares both) it
-            // silently revoked every skip it was supposed to allow.
-            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys).granted();
-            if skip_dedup {
-                tag_shape(&|s| s.skip_dedup = true);
-                // The window is sweep-certified: exactly one row per key, and it
-                // is the winner. The reason a version-mutable predicate may not
-                // reach a leg — that it drops the NEWER version and leaves
-                // keep-greatest serving a stale one — has no instance here,
-                // because there is no superseded version to serve. This is the
-                // same argument `dedup_skip_allowed` makes to delete DedupExec
-                // entirely; a scan that needs no dedup needs no protection from
-                // pruning below it.
-                //
-                // This is the half that matters for dashboards. Skipping dedup
-                // reclaims the key projection; pushing `kind = 'server'` down
-                // reclaims the ROWS, and prod 2026-08-09 measured monoscope-self
-                // decoding 15.97 M rows to keep 35.89 K of them (445x) because
-                // only `timestamp >=` ever reached Parquet.
-                //
-                // Delta-only by construction: `dedup_skip_allowed` is never
-                // granted while the MemBuffer leg is in play, and MemBuffer is
-                // exactly where uncertified versions live.
-                delta_only_filters.extend(unstripped_filters.iter().filter(|f| !leg_safe(f) && !Self::references_tombstone(&self.table_name, f)).cloned());
-            }
-            // Restoring the pushed limit is only sound when nothing above the
-            // scan drops rows — the tombstone filter does, regardless of dedup.
-            let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
-            let plans = self
-                .scan_delta_with_tantivy(
-                    &table,
+            //
+            // The window is sweep-certified: exactly one row per key, and it
+            // is the winner. The reason a version-mutable predicate may not
+            // reach a leg — that it drops the NEWER version and leaves
+            // keep-greatest serving a stale one — has no instance here,
+            // because there is no superseded version to serve. This is the
+            // same argument `dedup_skip_allowed` makes to delete DedupExec
+            // entirely; a scan that needs no dedup needs no protection from
+            // pruning below it.
+            //
+            // This is the half that matters for dashboards. Skipping dedup
+            // reclaims the key projection; pushing `kind = 'server'` down
+            // reclaims the ROWS, and prod 2026-08-09 measured monoscope-self
+            // decoding 15.97 M rows to keep 35.89 K of them (445x) because
+            // only `timestamp >=` ever reached Parquet.
+            //
+            // Delta-only by construction: `dedup_skip_allowed` is never
+            // granted while the MemBuffer leg is in play, and MemBuffer is
+            // exactly where uncertified versions live. See `scan_delta_only`.
+            let (skip_dedup, plans) = self
+                .scan_delta_only(
                     state,
                     projection,
-                    &delta_only_filters,
-                    eff_limit,
+                    &optimized_filters,
+                    unstripped_filters,
+                    &project_id,
+                    query_time_range,
+                    &dedup_keys,
+                    pre_skip_dedup,
+                    &tombstone,
+                    orig_limit,
+                    limit,
+                    true,
                     tantivy_id_filter.as_ref(),
                     tantivy_covered_files.as_ref(),
                     tantivy_exclude.as_ref(),
                     tantivy_row_selections.as_ref(),
-                    query_time_range,
                 )
                 .await?;
+            if skip_dedup {
+                tag_shape(&|s| s.skip_dedup = true);
+            }
             // This leg IS the Delta read, and until now it said so to nobody:
             // `record_scan` gates every dedup counter on `has_delta`, so a
             // deployment without a buffered layer reported zero eligible scans
@@ -19389,40 +19403,34 @@ impl TableProvider for ProjectRoutingTable {
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
         if mem_partitions.is_empty() && hot_plan.is_none() && hot_ranges.is_empty() {
             debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
-            let delta_only_filters = optimized_filters.clone();
             tag_shape(&|s| s.has_delta = true);
-            let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
-            let table = delta_table.read().await;
-            // Same guard for the dedup gate and the scan (see branch above).
-            // `pre_skip_dedup` already decided this above the projection; re-check
-            // against the RESOLVED table so the fingerprint verdict applies to the
-            // exact snapshot being read.
-            // No `output_projection.is_none()` conjunct: it stood in for "the keys are
-            // still in the scan", which is now unconditionally true. It also never meant
-            // what it said — the TOMBSTONE marker alone turns `output_projection` `Some`,
-            // so on any table declaring both (otel_logs_and_spans declares both) it
-            // silently revoked every skip it was supposed to allow.
-            let skip_dedup = pre_skip_dedup && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys).granted();
-            if skip_dedup {
-                tag_shape(&|s| s.skip_dedup = true);
-            }
-            // Restoring the pushed limit is only sound when nothing above the
-            // scan drops rows — the tombstone filter does, regardless of dedup.
-            let eff_limit = if skip_dedup && tombstone.is_none() { orig_limit } else { limit };
-            let plans = self
-                .scan_delta_with_tantivy(
-                    &table,
+            // Same guard for the dedup gate and the scan (see branch above, and
+            // `scan_delta_only`'s doc comment). `readmit_mutable_filters: false`
+            // here matches this branch's existing behavior of leaving
+            // `delta_only_filters` unextended on a skip.
+            let (skip_dedup, plans) = self
+                .scan_delta_only(
                     state,
                     projection,
-                    &delta_only_filters,
-                    eff_limit,
+                    &optimized_filters,
+                    unstripped_filters,
+                    &project_id,
+                    query_time_range,
+                    &dedup_keys,
+                    pre_skip_dedup,
+                    &tombstone,
+                    orig_limit,
+                    limit,
+                    false,
                     tantivy_id_filter.as_ref(),
                     tantivy_covered_files.as_ref(),
                     tantivy_exclude.as_ref(),
                     tantivy_row_selections.as_ref(),
-                    query_time_range,
                 )
                 .await?;
+            if skip_dedup {
+                tag_shape(&|s| s.skip_dedup = true);
+            }
             return wrap_result(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect());
         }
 
@@ -25162,13 +25170,7 @@ mod tests {
         // Locally <3s; CI's MinIO + fresh Delta-table create-on-write under 3-way
         // concurrent contention regularly exceeds 60s on the GHA runner. Headroom.
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            dotenv::dotenv().ok();
-            unsafe {
-                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
-            }
-
-            let db = Database::new().await?;
+            let db = Database::with_config(create_test_config("concurrent-writes-same-project")).await?;
             let db = Arc::new(db);
             let project_id = format!("concurrent_test_{}", uuid::Uuid::new_v4());
 
@@ -25203,13 +25205,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_table_creation() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            dotenv::dotenv().ok();
-            unsafe {
-                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
-            }
-
-            let db = Database::new().await?;
+            let db = Database::with_config(create_test_config("concurrent-table-creation")).await?;
             let db = Arc::new(db);
 
             // Create multiple projects concurrently - each will try to create its own table
@@ -25246,13 +25242,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             use crate::write::BatchQueue;
 
-            dotenv::dotenv().ok();
-            unsafe {
-                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
-            }
-
-            let db = Arc::new(Database::new().await?);
+            let db = Arc::new(Database::with_config(create_test_config("batch-queue-under-load")).await?);
             let queue = BatchQueue::new(Arc::clone(&db), 100, 50); // 100ms interval, 50 rows max
 
             let project_id = format!("queue_test_{}", uuid::Uuid::new_v4());
@@ -25286,13 +25276,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_mixed_operations() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            dotenv::dotenv().ok();
-            unsafe {
-                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
-            }
-
-            let db = Database::new().await?;
+            let db = Database::with_config(create_test_config("concurrent-mixed-operations")).await?;
             let db = Arc::new(db);
 
             // Test concurrent writes to DIFFERENT projects (no conflicts)
