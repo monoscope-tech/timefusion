@@ -9743,11 +9743,7 @@ impl Database {
                         .find_map(|segment| segment.strip_prefix("project_id="))
                         .map(str::to_owned)
                         .unwrap_or_else(|| if storage_project.is_empty() { "default".to_owned() } else { storage_project.clone() });
-                    partitions.entry((project, date)).or_default().push(CompactionDebtFile {
-                        size: file.size(),
-                        sorted: is_sorted_run(&file.tags()),
-                        path: path.to_string(),
-                    });
+                    partitions.entry((project, date)).or_default().push(CompactionDebtFile { size: file.size(), path: path.to_string() });
                 }
             }
             // Every partition this scan examined, and every (partition, op) it
@@ -9768,8 +9764,29 @@ impl Database {
                 let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid compaction date"))?.and_utc().timestamp_micros();
                 let slice = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS))?;
                 let small_target = if date == today { COORDINATOR_HOT_TARGET_BYTES } else { COORDINATOR_SEALED_TARGET_BYTES };
-                let small = files.iter().filter(|file| file.size < small_target || !file.sorted).collect::<Vec<_>>();
-                if small.len() >= 2 || small.iter().any(|file| !file.sorted) {
+                // SIZE only. Sortedness belongs to Repair, which owns it below.
+                //
+                // Admitting on `!file.sorted` made every partition permanently
+                // out of policy, because the tag it reads is not the fact it
+                // wants: `repair_verified_sorted`'s own comment records that
+                // "the flush path sorts and stamps a correct footer WITHOUT the
+                // tag, so an untagged file is only a *suspect*", and Repair
+                // therefore footer-checks before rewriting. Consolidation did
+                // not, so it treated suspicion as proof.
+                //
+                // Measured 2026-08-19 over 381 commits of the prod Delta log:
+                // 1,593 of 1,648 add actions carry NO tags at all — only the
+                // OPTIMIZE path tags its output. So every partition holding any
+                // flush-written file — which is every partition — was
+                // permanently admitted, and ingest recreated the condition
+                // faster than consolidation cleared it. That is why the class
+                // sat at -0.27/min forever: not a backlog, a treadmill.
+                //
+                // Object storage agrees with the size-only policy: of 1,033
+                // partitions, 877 are already compliant and 108 sealed ones are
+                // genuinely out of policy — against 2,130 pending tasks.
+                let small = files.iter().filter(|file| file.size < small_target).collect::<Vec<_>>();
+                if small.len() >= 2 {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
                     let estimate =
@@ -15956,7 +15973,6 @@ struct HotStageOptions {
 
 struct CompactionDebtFile {
     size: i64,
-    sorted: bool,
     path: String,
 }
 
@@ -21108,6 +21124,50 @@ mod tests {
         assert!((1..64).all(|jobs| others(jobs) <= others(jobs + 1)));
         // And the reserve never grows to swallow the pool.
         assert!((3..64).all(|jobs| others(jobs) >= jobs - 2));
+    }
+
+    /// Consolidation admits on SIZE. An untagged-but-large file is not debt.
+    ///
+    /// The tag `is_sorted_run` reads is not the fact it wants:
+    /// `repair_verified_sorted`'s comment records that the flush path sorts and
+    /// stamps a correct footer WITHOUT the tag, so untagged means *suspect*, not
+    /// unsorted — and Repair footer-checks before rewriting. Consolidation did
+    /// not, so it treated suspicion as proof and re-admitted every partition
+    /// forever. Measured over 381 commits of the prod Delta log: 1,593 of 1,648
+    /// add actions carry no tags at all.
+    #[tokio::test]
+    async fn consolidation_admits_on_size_not_on_a_missing_sort_tag() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let db = Database::with_config(create_test_config("consolidation-size")).await?;
+        let project = format!("size_{}", uuid::Uuid::new_v4().simple());
+        // One sealed day, flushed once: a single untagged file, well under the
+        // 256 MB target. One file is not two, so it is not consolidation debt
+        // however untagged it is.
+        let day = Utc::now() - chrono::Duration::days(3);
+        db.insert_records_batch(
+            &project,
+            "otel_logs_and_spans",
+            vec![json_to_batch(vec![test_span_ts("a", "op", &project, day.timestamp_micros())])?],
+            true,
+            None,
+        )
+        .await?;
+
+        db.plan_compaction_debt().await?;
+
+        let sealed_tasks = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal
+                .tasks()
+                .filter(|task| {
+                    task.key.project_id == project
+                        && task.key.operation == Operation::SealedConsolidation
+                        && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                })
+                .count()
+        };
+        assert_eq!(sealed_tasks, 0, "a single untagged file is a Repair suspect, not consolidation debt");
+        Ok(())
     }
 
     /// A hygiene task for a partition the scan proved compliant must be retired,
