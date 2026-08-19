@@ -2090,7 +2090,19 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// tasks instead — the standard fix for exactly this. Normal ordering stays
 /// newest-first; anything that has waited past the threshold escalates ahead of
 /// it, and the escalated set is finite, so it cannot swallow the budget.
-const STARVATION_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+/// How long past SEALING a partition may still carry debt before it is overdue.
+///
+/// This measures the data, not the task record (see `scheduling_class`), so the
+/// value has to mean something about days rather than about queue latency. At 24
+/// h every sealed day but yesterday qualified, and a flag everything sets is a
+/// flag that sorts nothing — which is how 2026-08-13 stayed at exactly 167 files
+/// through three ordering changes.
+///
+/// Three days leaves the window dashboards actually read (today via the live
+/// frontier, plus the last two sealed days) ordered newest-first for freshness,
+/// and treats everything behind it as backlog to be drained oldest-first for
+/// contiguity.
+const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 /// ...and an UPPER bound, because an escape valve everything fits through is
 /// not an escape valve.
 ///
@@ -2144,7 +2156,30 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         // history is still built first.
         //
         // Starved work leads, then width, then recency — see `STARVATION_MICROS`.
-        let waited = now_micros.saturating_sub(i64::try_from(task.created_unix_ms).unwrap_or(i64::MAX).saturating_mul(1_000));
+        //
+        // A SEALED task's age is how long its DATA has been sealed, not how long
+        // its record has existed. Three separate bugs came from the latter, and
+        // all three are the same mistake — a task record's birthday is a
+        // property of the process, and this system re-creates records constantly:
+        //
+        //   * `plan_compaction_debt` re-derives hygiene every 60 s, and since
+        //     hygiene stopped being persisted it re-creates it on every restart,
+        //     so `created_unix_ms` reset several times a day and the threshold
+        //     was unreachable.
+        //   * `coarsen_to_width` stamped each fused unit with `now`, so the
+        //     day-wide unit it produced was permanently fresher than the narrow
+        //     leftovers it did not fuse — coarsening starved its own output.
+        //   * Correcting only NEW fusions left 255 already-fused day-wide Dedup
+        //     units carrying a recent stamp, and prod claimed ZERO of them
+        //     across 466 claims in 10 minutes while narrow sealed units ran.
+        //     Certification needs a day-wide dedup unit, so it stayed at 0%.
+        //
+        // Seal time fixes all three at once and cannot regress the same way: it
+        // is derived from the slice, so every task covering a day — narrow or
+        // day-wide, freshly minted or fused an hour ago — reports the same age,
+        // and `-width` then breaks the tie in favour of the day-wide unit, which
+        // is exactly the desired order.
+        let waited = now_micros.saturating_sub(task.key.slice.end_micros);
         let starved = u8::from(!(STARVATION_MICROS..=STARVATION_HORIZON_MICROS).contains(&waited));
         // Starved work drains OLDEST-first; fresh work stays newest-first.
         //
@@ -2735,16 +2770,14 @@ mod tests {
         let now: i64 = 10 * 24 * 60 * 60 * 1_000_000;
         // Older slice, and the older deadline too — under the previous ordering
         // this ran first purely because it had been waiting longest.
-        // Both freshly planned. The claim is about which SLICE a dashboard
-        // needs, so neither may be starved — starved work drains oldest-first
-        // by design, and that is a different question.
-        let fresh = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
-        let mut older_slice = task("a", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
+        // Both cover days that sealed RECENTLY, so neither is overdue. Age now
+        // comes from the slice, and overdue work drains oldest-first by design
+        // — a different question from which slice a dashboard needs.
+        let base = now - 2 * 24 * 3_600_000_000;
+        let mut older_slice = task("a", base, base + MIN_SLICE_MICROS, Operation::BaseRollup);
         older_slice.deadline_micros = now - 2 * 60 * 1_000_000;
-        older_slice.created_unix_ms = fresh;
-        let mut newer_slice = task("b", MIN_SLICE_MICROS, 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
+        let mut newer_slice = task("b", base + MIN_SLICE_MICROS, base + 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
         newer_slice.deadline_micros = now - 60 * 1_000_000;
-        newer_slice.created_unix_ms = fresh;
         let ready = fair_ready_tasks([&older_slice, &newer_slice], now);
         assert_eq!(ready.first().expect("ready task").key.project_id, "b", "the more recent slice is the one a dashboard query needs");
     }
@@ -3157,44 +3190,47 @@ mod tests {
     /// must STILL be newest-first, and only genuinely starved tasks escalate.
     #[test]
     fn sealed_work_ages_out_of_starvation_without_becoming_oldest_first() {
-        const DAY: i64 = 24 * 3_600_000_000;
-        // Well past STARVATION_HORIZON_MICROS, so 'created 60 days ago' is a
-        // positive instant rather than clamping to 0 and reading as maximally
-        // starved — which is the opposite of what that case is testing.
-        let now = 100 * DAY;
-        let sealed = |day: i64, created_days_ago: i64| {
-            let mut t = task("p", day * DAY, day * DAY + DAY, Operation::SealedConsolidation);
-            t.created_unix_ms = u64::try_from((now - created_days_ago * DAY).div_euclid(1_000)).unwrap_or_default();
-            t
+        const HOUR: i64 = 3_600_000_000;
+        const DAY: i64 = 24 * HOUR;
+        let now = 400 * DAY;
+        // Age comes from the SLICE, so a case is described by how long ago its
+        // day sealed. Anything sealing within 24 h is the live frontier and is
+        // class 0 regardless — these are all older than that.
+        let sealed_hours_ago = |project: &str, hours: i64| {
+            let end = now - hours * HOUR;
+            task(project, end - DAY, end, Operation::SealedConsolidation)
         };
 
-        // Both minted just now: newest day wins, exactly as before.
-        let fresh_new = super::scheduling_class(&sealed(35, 0), now);
-        let fresh_old = super::scheduling_class(&sealed(20, 0), now);
-        assert!(fresh_new < fresh_old, "among fresh tasks the newest sealed day still leads");
+        // Inside the overdue threshold: recent sealed days stay newest-first,
+        // which is what a dashboard reads.
+        let recent_new = super::scheduling_class(&sealed_hours_ago("a", 30), now);
+        let recent_old = super::scheduling_class(&sealed_hours_ago("b", 60), now);
+        assert!(recent_new < recent_old, "among days not yet overdue the newest still leads");
 
-        // The old day's task has now waited four days: it overtakes.
-        let starved_old = super::scheduling_class(&sealed(20, 4), now);
-        assert!(starved_old < fresh_new, "a task starved past the threshold overtakes newer sealed work");
+        // Past it, a day is backlog and overtakes those recent days.
+        let overdue = super::scheduling_class(&sealed_hours_ago("c", 10 * 24), now);
+        assert!(overdue < recent_new, "a day overdue past the threshold overtakes newer sealed work");
+
+        // The backlog drains from its OLD end — the half that was missing, and
+        // why 2026-08-13 sat at 167 files while seven younger days passed it.
+        let overdue_older = super::scheduling_class(&sealed_hours_ago("d", 30 * 24), now);
+        assert!(overdue_older < overdue, "a backlog drains oldest-first: the older overdue day leads");
+
+        // A day-wide unit still beats a narrow one covering the SAME day, which
+        // is what lets certification get the day-wide dedup unit it requires.
+        let end = now - 30 * 24 * HOUR;
+        let narrow = super::scheduling_class(&task("e", end - NORMAL_SLICE_MICROS, end, Operation::SealedConsolidation), now);
+        assert!(overdue_older < narrow, "width breaks the tie: the day-wide unit leads its own day's slices");
+
+        // Past the horizon a day stops escalating, so months-old data can never
+        // take the sealed budget — the failure `scheduling_class` records as 10
+        // of 10 historical starts landing on data months old.
+        let ancient = super::scheduling_class(&sealed_hours_ago("f", 60 * 24), now);
+        assert!(recent_new < ancient, "past STARVATION_HORIZON_MICROS a day no longer escalates");
 
         // And starvation never lets sealed work outrank the live frontier.
-        let frontier = super::scheduling_class(&task("p", now - 600_000_000, now, Operation::BaseRollup), now);
-        assert!(frontier < starved_old, "class still leads: the frontier outranks even starved sealed work");
-
-        // WITHIN the starved set, oldest drains first. Without this, escalating
-        // merely joins a larger set that is still ordered newest-first, which is
-        // why 2026-08-13 stayed at 167 files for five days after ageing sealed
-        // hygiene from its seal time made every old partition "starved".
-        let starved_older = super::scheduling_class(&sealed(13, 4), now);
-        let starved_newer = super::scheduling_class(&sealed(30, 4), now);
-        assert!(starved_older < starved_newer, "a backlog drains from its OLD end: the older starved day must lead");
-
-        // ...and past the horizon a task stops escalating, so months-old data
-        // can never take the sealed budget. `scheduling_class`'s own history:
-        // plain oldest-first sent 10 of 10 historical starts to data months old
-        // while the last 30 days went untouched.
-        let ancient = super::scheduling_class(&sealed(20, 60), now);
-        assert!(fresh_new < ancient, "past STARVATION_HORIZON_MICROS a task no longer escalates");
+        let frontier = super::scheduling_class(&task("g", now - 600_000_000, now, Operation::BaseRollup), now);
+        assert!(frontier < overdue_older, "class still leads: the frontier outranks even overdue sealed work");
     }
 
     /// A hole must be claimed before a day that already has tier output.
@@ -3222,9 +3258,10 @@ mod tests {
             t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
             t
         };
-        // Both are SEALED (day 38+ would fall inside the live-frontier window
-        // and never reach the sealed turn). Day 35 is the newer of the two, so
-        // newest-first takes it; day 20 is the old hole.
+        // Both are SEALED and both are overdue, so backlog order applies and the
+        // OLDER day leads on age alone. The hole is deliberately put on the
+        // NEWER day, so `fills_a_hole` has to beat that ordering rather than
+        // merely agree with it — a control that agreed would prove nothing.
         journal.upsert(at("recent", 35));
         journal.upsert(at("oldhole", 20));
         journal.set_base_tier_ready(HashSet::from([
@@ -3232,8 +3269,8 @@ mod tests {
             ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
         ]));
 
-        // With no hole information, newest-first wins — the status quo.
-        assert_eq!(journal.claim_next(Operation::DerivedRollup, now, true).expect("claim").key.project_id, "recent");
+        // With no hole information, the older overdue day leads on age.
+        assert_eq!(journal.claim_next(Operation::DerivedRollup, now, true).expect("claim").key.project_id, "oldhole");
 
         // Told which cell is a hole, the hole goes first instead.
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
@@ -3243,11 +3280,11 @@ mod tests {
             ("source".to_owned(), "recent".to_owned(), "1970-02-05".to_owned()),
             ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
         ]));
-        journal.set_tier_holes(HashSet::from([("source".to_owned(), "oldhole".to_owned(), "rollup_1h".to_owned(), "1970-01-21".to_owned())]));
+        journal.set_tier_holes(HashSet::from([("source".to_owned(), "recent".to_owned(), "rollup_1h".to_owned(), "1970-02-05".to_owned())]));
         assert_eq!(
             journal.claim_next(Operation::DerivedRollup, now, true).expect("claim").key.project_id,
-            "oldhole",
-            "a missing day must outrank a newer day that already has output"
+            "recent",
+            "a missing day must outrank an OLDER day that already has output — holes rank above backlog age"
         );
     }
 
