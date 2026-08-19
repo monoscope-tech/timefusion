@@ -768,6 +768,16 @@ impl TaskJournal {
         self.base_tier_ready.len()
     }
 
+    /// Which sources contributed to the published coverage and holes. Exists so
+    /// a test can prove the sets are not merely the last source planned.
+    pub fn base_tier_ready_sources(&self) -> HashSet<String> {
+        self.base_tier_ready.iter().map(|(source, ..)| source.clone()).collect()
+    }
+
+    pub fn tier_hole_sources(&self) -> HashSet<String> {
+        self.tier_holes.iter().map(|(source, ..)| source.clone()).collect()
+    }
+
     /// Publish which `(source, project, tier table, date)` are MISSING, so
     /// `claim_next` can rank holes ahead of re-derives. Replaced wholesale for
     /// the same reason as `base_tier_ready`.

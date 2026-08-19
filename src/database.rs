@@ -9981,6 +9981,19 @@ impl Database {
         // worst-case number, so the first tier of a sweep seeds it and the rest
         // minimise into it.
         let mut first_tier_of_sweep = true;
+        // Accumulated across EVERY source, then published once below.
+        //
+        // `set_base_tier_ready` / `set_tier_holes` replace wholesale, which is
+        // right — coverage can go backwards — but calling them per source inside
+        // this loop meant the last table processed wiped every earlier one. Prod
+        // 2026-08-19: the census logged `base_tier_ready=374` at
+        // `otel_logs_and_spans` and `272` at `otel_metrics`, and whatever table
+        // sorted last left the journal holding only its own cells. So
+        // `dependencies_complete` saw an empty set for the source that mattered
+        // and 303 sealed derived tasks stayed unclaimable — the ready set from
+        // #197 and the hole ranking from #199 were both live and both inert.
+        let mut all_base_tier_ready: HashSet<(String, String, String)> = HashSet::new();
+        let mut all_tier_holes: HashSet<(String, String, String, String)> = HashSet::new();
 
         for (storage_project, source, table_ref) in self.all_tables().await {
             let Some(schema) = get_schema(&source) else { continue };
@@ -10117,27 +10130,19 @@ impl Database {
             // this by DAY, so it cannot miss a derived task whatever slice that
             // task covers — the failure that made #184/#186/#195 inert, measured
             // on prod as derived_unproven=674 of derived_pending=674.
-            {
-                let ready: HashSet<(String, String, String)> = covered_per_tier
+            all_base_tier_ready.extend(
+                covered_per_tier
                     .iter()
                     .filter(|(index, _)| schema.rollups[*index].derive_from.is_none())
-                    .flat_map(|(_, covered)| covered.iter().map(|(project, date)| (source.clone(), project.clone(), date.to_string())))
-                    .collect();
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                journal.set_base_tier_ready(ready);
-            }
+                    .flat_map(|(_, covered)| covered.iter().map(|(project, date)| (source.clone(), project.clone(), date.to_string()))),
+            );
             let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
             // Publish the holes so `claim_next` can rank them ahead of days that
             // already have tier output. Same coverage read, same 60s cadence.
-            {
-                let mut holes: HashSet<(String, String, String, String)> = HashSet::new();
-                for ((project, date), missing) in &missing_tiers {
-                    for index in missing {
-                        holes.insert((source.clone(), project.clone(), schema.rollups[*index].table_name(&source), date.to_string()));
-                    }
+            for ((project, date), missing) in &missing_tiers {
+                for index in missing {
+                    all_tier_holes.insert((source.clone(), project.clone(), schema.rollups[*index].table_name(&source), date.to_string()));
                 }
-                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                journal.set_tier_holes(holes);
             }
             let mut want: Vec<(String, chrono::NaiveDate)> = missing_tiers.keys().cloned().collect();
             let cells_missing = want.len();
@@ -10270,14 +10275,8 @@ impl Database {
                 source,
                 cells_missing,
                 cells_wanted = want.len(),
-                base_tier_ready = {
-                    let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    journal.base_tier_ready_len()
-                },
-                tier_holes = {
-                    let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    journal.tier_holes_len()
-                },
+                base_tier_ready = all_base_tier_ready.len(),
+                tier_holes = all_tier_holes.len(),
                 derived_pending,
                 derived_sealed,
                 derived_unproven,
@@ -10388,6 +10387,14 @@ impl Database {
             }
             // Never let a bounded pass read as "covered everything".
             info!(source, queued = want.len(), remaining = total - want.len(), horizon_days = horizon, event = "rollup_backfill_planned");
+        }
+        // Published ONCE, after every source has contributed. Replacing per
+        // source inside the loop meant the last table wiped the rest — see the
+        // declaration above.
+        {
+            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            journal.set_base_tier_ready(all_base_tier_ready);
+            journal.set_tier_holes(all_tier_holes);
         }
         Ok(queued)
     }
@@ -21168,6 +21175,43 @@ mod tests {
         assert!((1..64).all(|jobs| others(jobs) <= others(jobs + 1)));
         // And the reserve never grows to swallow the pool.
         assert!((3..64).all(|jobs| others(jobs) >= jobs - 2));
+    }
+
+    /// Coverage published for one source must survive planning the next.
+    ///
+    /// `set_base_tier_ready` / `set_tier_holes` replace wholesale, which is
+    /// right — coverage can go backwards — but calling them per source inside
+    /// the planner's loop meant the LAST table processed wiped every earlier
+    /// one. Prod 2026-08-19: the census logged `base_tier_ready=374` at
+    /// `otel_logs_and_spans` and `272` at `otel_metrics`, and whichever table
+    /// sorted last left the journal holding only its own cells — so
+    /// `dependencies_complete` saw an empty set for the source that mattered and
+    /// 303 sealed derived tasks stayed unclaimable. #197's ready set and #199's
+    /// hole ranking were both live and both inert.
+    #[tokio::test]
+    async fn coverage_published_for_one_source_survives_planning_the_next() -> Result<()> {
+        let mut cfg = (*create_test_config("multi-source-coverage")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let project = format!("multi_{}", uuid::Uuid::new_v4().simple());
+        let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
+        // `all_tables` yields several unified tables, so the planner loop runs
+        // more than once whatever we write to. Only this source has coverage.
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, ts)])?], true, None).await?;
+
+        db.plan_rollup_backfill().await?;
+
+        // `tier_holes` is the same accumulate-across-sources path and is
+        // non-empty immediately: the source has a partition, the tier does not.
+        // Before the fix this held only whichever table sorted LAST, so the one
+        // source that actually has cells was wiped by an empty sibling.
+        let sources = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal.tier_hole_sources()
+        };
+        assert!(sources.contains("otel_logs_and_spans"), "cells published for a source must survive planning the others, got {sources:?}");
+        Ok(())
     }
 
     /// A rewrite must carry coverage identity forward — and must NEVER invent it.
