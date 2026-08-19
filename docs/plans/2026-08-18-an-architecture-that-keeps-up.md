@@ -1457,10 +1457,23 @@ the healthy shape.
 
 → verify: local TF serves a 1-day query over the copied partition.
 
-**A.2 — Restore `sim` and `run-unit`.** Both are described in §4 as landed but
-are **not on master** (they live on another branch). They are the single biggest
-turnaround win available: `run-unit` answers "where do the 800 seconds go" in
-minutes without a deploy. Port them forward first.
+**A.2 — BUILD `sim` and `run-unit`. They do not exist.**
+
+§4 marks both "✅ **Landed**" with file paths and CLI flags. They are not on
+master, and they are not on any branch: a search of every remote ref for a `sim`
+or `run-unit` subcommand in `main.rs` returns **nothing**. `src/maintenance_sim.rs`
+resolves on a handful of stale June `claude/*` branches but is empty.
+
+This is the most consequential inaccuracy in Part I, and it is self-explaining:
+**the entire overnight session ran on ~20-minute prod deploy cycles precisely
+because the tooling that was supposed to make that unnecessary had never been
+written.** Nine of the thirteen changes were diagnosed by deploying to
+production and reading logs. §4's own opening line — "No design decision in this
+plan should require a prod deploy to evaluate" — was never true.
+
+Treat every other "✅ Landed" claim in §4 as unverified until checked against
+master. Build `run-unit` first: it answers "where do the 800 seconds go" in
+minutes, and no class heavier than a rollup has EVER been profiled.
 
 → verify: `timefusion run-unit --op sealed --project 28f62f01 --date 2026-08-17`
 prints a scan/stage/commit decomposition.
