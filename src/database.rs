@@ -19206,6 +19206,7 @@ mod tests {
     use std::path::PathBuf;
 
     use serial_test::serial;
+    use test_case::test_case;
 
     use super::*;
     use crate::{config::AppConfig, support::test_helpers::*};
@@ -20429,43 +20430,29 @@ mod tests {
         assert_eq!(metrics.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
     }
 
-    /// The decode pressure valve's ABSOLUTE backstop tiers: full concurrency
-    /// until 88% of the cgroup limit, quarter pool to 95%, fully serialized past
-    /// that. Claims never exceed the pool (progress guaranteed) and never drop
-    /// to zero. The rate-based tiers are covered separately below.
-    #[test]
-    fn pressure_permit_claim_tiers() {
-        const CALM: u64 = u64::MAX; // not projected to reach the limit at all
-        assert_eq!(pressure_permit_claim_at(0, CALM, 16), 1);
-        assert_eq!(pressure_permit_claim_at(87, CALM, 16), 1);
-        assert_eq!(pressure_permit_claim_at(88, CALM, 16), 4);
-        assert_eq!(pressure_permit_claim_at(94, CALM, 16), 4);
-        assert_eq!(pressure_permit_claim_at(95, CALM, 16), 16);
-        assert_eq!(pressure_permit_claim_at(200, CALM, 16), 16);
-        assert_eq!(pressure_permit_claim_at(88, CALM, 2), 1, "tiny pools floor at 1");
-        assert_eq!(pressure_permit_claim_at(95, CALM, 1), 1);
-    }
-
-    /// The whole point of the rework: a box PARKED at the old first tier's
-    /// percentage must not throttle, and a box RUSHING at the wall from well
-    /// below it must. 70%/82% could not express that, and flapped 52 times in
-    /// 25 minutes on a working set that simply sat at 69-70% (135648b).
-    #[test]
-    fn the_valve_fires_on_rate_not_on_a_parked_working_set() {
-        // Morning traffic: parked at 70%, going nowhere. Full concurrency.
-        assert_eq!(pressure_permit_claim_at(70, u64::MAX, 16), 1, "a steady working set must never be throttled");
-        // Booting: filling caches at ~1 GB/s from near-empty, so the projection
-        // is short but the process is nowhere near the wall and will plateau.
-        // Throttling here throttles every query in the system for no reason.
-        assert_eq!(pressure_permit_claim_at(18, 65, 16), 1, "a cold process filling fast must not engage the valve");
-        assert_eq!(pressure_permit_claim_at(49, 10, 16), 1, "below the floor, even a tiny projection is not evidence");
-        // Same 70%, but projected to hit the limit inside a minute. Throttle.
-        assert_eq!(pressure_permit_claim_at(70, 60, 16), 4, "a burst must engage the valve well before 88%");
-        // And with seconds left, serialize — still from only 70% used.
-        assert_eq!(pressure_permit_claim_at(70, 10, 16), 16);
-        // The absolute backstop survives: a burst too fast to project still
-        // trips on level alone.
-        assert_eq!(pressure_permit_claim_at(96, u64::MAX, 16), 16);
+    /// The decode pressure valve. ABSOLUTE backstop tiers: full concurrency until 88% of the
+    /// cgroup limit, quarter pool to 95%, fully serialized past that — claims never exceed the
+    /// pool (progress guaranteed) and never drop to zero. RATE-based tiers are the whole point of
+    /// the rework: a box PARKED at the old first tier's percentage must not throttle, and a box
+    /// RUSHING at the wall from well below it must — 70%/82% could not express that, and flapped
+    /// 52 times in 25 minutes on a working set that simply sat at 69-70% (135648b).
+    const CALM: u64 = u64::MAX; // not projected to reach the limit at all
+    #[test_case(0, CALM, 16 => 1 ; "well under the backstop")]
+    #[test_case(87, CALM, 16 => 1 ; "just under the 88% backstop")]
+    #[test_case(88, CALM, 16 => 4 ; "88% backstop trips to quarter pool")]
+    #[test_case(94, CALM, 16 => 4 ; "still quarter pool just under 95%")]
+    #[test_case(95, CALM, 16 => 16 ; "95% backstop fully serializes")]
+    #[test_case(200, CALM, 16 => 16 ; "over 100% still fully serializes")]
+    #[test_case(88, CALM, 2 => 1 ; "tiny pools floor at 1")]
+    #[test_case(95, CALM, 1 => 1 ; "single-permit pool floors at 1")]
+    #[test_case(70, u64::MAX, 16 => 1 ; "a steady working set parked at 70% must never be throttled")]
+    #[test_case(18, 65, 16 => 1 ; "a cold process filling fast from near-empty must not engage the valve")]
+    #[test_case(49, 10, 16 => 1 ; "below the floor, even a tiny projection is not evidence")]
+    #[test_case(70, 60, 16 => 4 ; "a burst projected to hit the limit within a minute engages the valve well before 88%")]
+    #[test_case(70, 10, 16 => 16 ; "seconds left at only 70% used still serializes")]
+    #[test_case(96, u64::MAX, 16 => 16 ; "a burst too fast to project still trips on level alone")]
+    fn pressure_permit_claim_tiers(usage_pct: u64, eta_secs: u64, total: u32) -> u32 {
+        pressure_permit_claim_at(usage_pct, eta_secs, total)
     }
 
     /// The hot tier's own reads must not read as memory pressure.
@@ -22432,57 +22419,34 @@ mod tests {
             .collect()
     }
 
-    /// Escalated flush sorts must be one pool consumer.
-    ///
-    /// Each plan used to fan out to many `ExternalSorters` plus an unspillable merge exec, so N
-    /// gate permits meant far more than N pool consumers and the sort starved its own pool, writing
-    /// unsorted files. The escalated sort must be a single-partition plan with no merge exec so it
-    /// survives even a minimum pool floor with data far larger than the pool.
+    /// Escalated flush sorts, config floor (64 MB pool, sort_skip_bytes=0 so every group
+    /// escalates). Each plan used to fan out to many `ExternalSorters` plus an unspillable merge
+    /// exec, so N gate permits meant far more than N pool consumers and the sort starved its own
+    /// pool, writing unsorted files — the escalated sort must be a single-partition plan with no
+    /// merge exec so it survives a minimum pool floor with data far larger than the pool. And a
+    /// batch is the sort's indivisible admission unit, so a pool that cannot hold one batch cannot
+    /// spill — it just fails, poisoning the partition's footer ordering; wide rows can make one
+    /// default-sized batch larger than a small floor pool.
+    #[test_case(10_000, 16, 800, 160_000 ; "128MB across 16 batches, 2x the pool, starves the sort into escalation")]
+    #[test_case(1_000, 16, 8_000, 16_000 ; "8KB rows: one old-sized batch would be 65MB, over the 64MB pool floor")]
     #[tokio::test]
-    async fn escalated_flush_sort_is_one_pool_consumer_and_survives_a_minimum_pool() -> Result<()> {
+    async fn escalated_flush_sort_is_one_pool_consumer_and_admits_wide_row_batches(
+        rows_per_batch: i64, batches_n: i64, id_width: usize, expected_rows: i64,
+    ) -> Result<()> {
         use arrow::array::TimestampMicrosecondArray;
         let mut cfg = (*create_test_config("flush-sort-floor")).clone();
         cfg.maintenance.timefusion_sort_skip_bytes = 0; // every group escalates
         cfg.maintenance.timefusion_flush_sort_pool_mb = 64; // the config floor
         let db = Database::with_config(Arc::new(cfg)).await?;
         let table = get_schema("otel_logs_and_spans").expect("registered");
-        // ~128 MB across 16 batches — 2× the pool.
-        let batches = wide_row_batches(10_000, 16, 800);
+        let batches = wide_row_batches(rows_per_batch, batches_n, id_width);
 
         let (out, escalated) = db.sort_flush_group(table, batches, UnsortedFallback::Allow).await?;
-        assert!(escalated, "the spilling sort starved its own pool and fell back to writing unsorted");
+        assert!(escalated, "the pool could not sustain the sort and fell back to writing unsorted");
         let FlushBatches::Ready(it) = out else { panic!("escalated path yields Ready batches") };
         let stamps: Vec<i64> =
             it.flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec()).collect();
-        assert_eq!(stamps.len(), 160_000, "the sort must not lose or duplicate rows");
-        assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
-        Ok(())
-    }
-
-    /// A batch is the sort's indivisible admission unit, so a pool that cannot hold one batch
-    /// cannot spill — it just fails, and the flush path writes the group unsorted, poisoning the
-    /// partition's footer ordering. Wide rows can make one default-sized batch larger than a
-    /// small floor pool. Using 256, the same batch size `repair_session_state` uses, admits and
-    /// spills.
-    #[tokio::test]
-    async fn flush_sort_batch_is_small_enough_for_its_pool_to_admit_one() -> Result<()> {
-        use arrow::array::TimestampMicrosecondArray;
-        let mut cfg = (*create_test_config("flush-sort-wide-rows")).clone();
-        cfg.maintenance.timefusion_sort_skip_bytes = 0; // every group escalates
-        cfg.maintenance.timefusion_flush_sort_pool_mb = 64; // the config floor
-        let db = Database::with_config(Arc::new(cfg)).await?;
-        let table = get_schema("otel_logs_and_spans").expect("registered");
-        // ~8 KB per row: one 8192-row batch would be ~65 MB, just over the 64 MB
-        // pool, so the OLD batch size cannot admit a single batch.
-        let (rows_per_batch, batches_n) = (1_000i64, 16i64);
-        let batches = wide_row_batches(rows_per_batch, batches_n, 8_000);
-
-        let (out, escalated) = db.sort_flush_group(table, batches, UnsortedFallback::Allow).await?;
-        assert!(escalated, "the pool could not admit one batch, so the group was written UNSORTED — the footer-poison path");
-        let FlushBatches::Ready(it) = out else { panic!("escalated path yields Ready batches") };
-        let stamps: Vec<i64> =
-            it.flat_map(|b| b.column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec()).collect();
-        assert_eq!(stamps.len() as i64, rows_per_batch * batches_n, "the sort must not lose or duplicate rows");
+        assert_eq!(stamps.len() as i64, expected_rows, "the sort must not lose or duplicate rows");
         assert!(stamps.windows(2).all(|w| w[0] >= w[1]), "output must honor the schema's timestamp DESC ordering");
         Ok(())
     }
@@ -23617,9 +23581,12 @@ mod tests {
         .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
     }
 
+    /// SQL surface smoke test, one shared DB/session: insert+count+select+project isolation,
+    /// level/duration/compound filtering, literal SQL `INSERT` (single- and multi-row) alongside
+    /// an API insert, and timestamp filtering + `to_char` formatting.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_insert_query_and_project_isolation() -> Result<()> {
+    async fn sql_surface_smoke() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let (db, ctx, prefix) = setup_test_database().await?;
             use datafusion::arrow::array::AsArray;
@@ -23655,99 +23622,52 @@ mod tests {
             }
             assert_eq!(total_count, 3, "each project keeps exactly its own row, unseen by the others");
 
-            db.shutdown().await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
-    }
-
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_filtering() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx, prefix) = setup_test_database().await?;
-            let project_id = format!("filter_proj_{}", prefix);
+            // Level / duration / compound filtering.
+            let filter_project = format!("filter_proj_{}", prefix);
             use chrono::Utc;
             use serde_json::json;
-
             let now = Utc::now();
             let records = vec![
                 json!({
-                    "timestamp": now.timestamp_micros(),
-                    "id": "span1",
-                    "name": "test_span_1",
-                    "project_id": &project_id,
-                    "level": "INFO",
-                    "status_code": "OK",
-                    "duration": 100_000_000,
-                    "date": now.date_naive().to_string(),
-                    "hashes": [],
-                    "summary": ["Test span 1 - INFO level"]
+                    "timestamp": now.timestamp_micros(), "id": "span1", "name": "test_span_1", "project_id": &filter_project,
+                    "level": "INFO", "status_code": "OK", "duration": 100_000_000, "date": now.date_naive().to_string(),
+                    "hashes": [], "summary": ["Test span 1 - INFO level"]
                 }),
                 json!({
-                    "timestamp": (now + chrono::Duration::minutes(10)).timestamp_micros(),
-                    "id": "span2",
-                    "name": "test_span_2",
-                    "project_id": &project_id,
-                    "level": "ERROR",
-                    "status_code": "ERROR",
-                    "status_message": "Error occurred",
-                    "duration": 200_000_000,
-                    "date": now.date_naive().to_string(),
-                    "hashes": [],
-                    "summary": ["Test span 2 - ERROR level"]
+                    "timestamp": (now + chrono::Duration::minutes(10)).timestamp_micros(), "id": "span2", "name": "test_span_2",
+                    "project_id": &filter_project, "level": "ERROR", "status_code": "ERROR", "status_message": "Error occurred",
+                    "duration": 200_000_000, "date": now.date_naive().to_string(), "hashes": [], "summary": ["Test span 2 - ERROR level"]
                 }),
             ];
-
             let batch = json_to_batch(records)?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-
-            // Test filtering by level
-            let result =
-                ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'", project_id)).await?.collect().await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
-
-            // Test filtering by duration
-            let result =
-                ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND duration > 150000000", project_id)).await?.collect().await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
-
-            // Test compound filtering
+            db.insert_records_batch(&filter_project, "otel_logs_and_spans", vec![batch], true, None).await?;
             let result = ctx
-                .sql(&format!("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'", project_id))
+                .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'", filter_project))
+                .await?
+                .collect()
+                .await?;
+            assert_eq!(result[0].num_rows(), 1);
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
+            let result = ctx
+                .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND duration > 150000000", filter_project))
+                .await?
+                .collect()
+                .await?;
+            assert_eq!(result[0].num_rows(), 1);
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
+            let result = ctx
+                .sql(&format!("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'", filter_project))
                 .await?
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
             assert_eq!(get_str(result[0].column(1).as_ref(), 0), "Error occurred");
 
-            // Shutdown database to ensure proper cleanup
-            db.shutdown().await?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
-    }
-
-    /// Literal SQL `INSERT`, both single- and multi-row, alongside a prior API insert.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_sql_insert() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx, prefix) = setup_test_database().await?;
-            let proj1 = format!("default_{}", prefix);
-            let proj2 = format!("proj2_{}", prefix);
-            use datafusion::arrow::array::AsArray;
-
-            // Insert via API first
-            let batch = json_to_batch(vec![test_span("id1", "name1", &proj1)])?;
-            db.insert_records_batch(&proj1, "otel_logs_and_spans", vec![batch], true, None).await?;
-
-            // Single-row insert via SQL
+            // Literal SQL INSERT, single- and multi-row, alongside a prior API insert.
+            let sql_proj1 = format!("default_{}", prefix);
+            let sql_proj2 = format!("sqlins_proj2_{}", prefix);
+            let batch = json_to_batch(vec![test_span("id1", "name1", &sql_proj1)])?;
+            db.insert_records_batch(&sql_proj1, "otel_logs_and_spans", vec![batch], true, None).await?;
             let sql = format!(
                 "INSERT INTO otel_logs_and_spans (
                        project_id, date, timestamp, id, hashes, name, level, status_code, summary
@@ -23755,27 +23675,21 @@ mod tests {
                        '{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z',
                        'sql_id', ARRAY[], 'sql_name', 'INFO', 'OK', ARRAY['SQL inserted test span']
                      )",
-                proj2
+                sql_proj2
             );
             let result = ctx.sql(&sql).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 1);
-
-            // Verify both records exist - need to check both projects
-            let mut total_count = 0;
-            for project in [&proj1, &proj2] {
+            let mut sql_total = 0;
+            for project in [&sql_proj1, &sql_proj2] {
                 let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
-                let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-                total_count += count;
+                sql_total += result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
             }
-            assert_eq!(total_count, 2);
-
-            // Verify SQL-inserted record
+            assert_eq!(sql_total, 2);
             let result =
-                ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'sql_id'", proj2)).await?.collect().await?;
+                ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'sql_id'", sql_proj2)).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 1);
             assert_eq!(get_str(result[0].column(1).as_ref(), 0), "sql_name");
-
             // Multi-row INSERT, in one statement, returns a count of rows inserted
             // and preserves per-row field values and (default) insertion order.
             let multirow_id = format!("multirow_{}", prefix);
@@ -23787,11 +23701,9 @@ mod tests {
                      ('{multirow_id}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', ARRAY['Multi-row insert test 3 - ERROR'])");
             let result = ctx.sql(&sql).await?.collect().await?;
             assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 3);
-
             let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{multirow_id}'");
             let result = ctx.sql(&sql).await?.collect().await?;
             assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 3);
-
             let result =
                 ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{multirow_id}' ORDER BY id")).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 3);
@@ -23799,66 +23711,32 @@ mod tests {
             assert_eq!(get_str(result[0].column(0).as_ref(), 1), "id2");
             assert_eq!(get_str(result[0].column(0).as_ref(), 2), "id3");
 
-            db.shutdown().await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
-    }
-
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_timestamp_operations() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx, prefix) = setup_test_database().await?;
-            let project_id = format!("ts_test_{}", prefix);
-            use chrono::Utc;
-            use serde_json::json;
-
+            // Timestamp filtering and `to_char` formatting.
+            let ts_project = format!("ts_test_{}", prefix);
             let base_time = chrono::DateTime::parse_from_rfc3339("2023-01-01T10:00:00Z").unwrap().with_timezone(&Utc);
             let records = vec![
                 json!({
-                    "timestamp": base_time.timestamp_micros(),
-                    "id": "early",
-                    "name": "early_span",
-                    "project_id": &project_id,
-                    "date": base_time.date_naive().to_string(),
-                    "hashes": [],
-                    "summary": ["Early span for timestamp test"]
+                    "timestamp": base_time.timestamp_micros(), "id": "early", "name": "early_span", "project_id": &ts_project,
+                    "date": base_time.date_naive().to_string(), "hashes": [], "summary": ["Early span for timestamp test"]
                 }),
                 json!({
-                    "timestamp": (base_time + chrono::Duration::hours(2)).timestamp_micros(),
-                    "id": "late",
-                    "name": "late_span",
-                    "project_id": &project_id,
-                    "date": base_time.date_naive().to_string(),
-                    "hashes": [],
-                    "summary": ["Late span for timestamp test"]
+                    "timestamp": (base_time + chrono::Duration::hours(2)).timestamp_micros(), "id": "late", "name": "late_span",
+                    "project_id": &ts_project, "date": base_time.date_naive().to_string(), "hashes": [], "summary": ["Late span for timestamp test"]
                 }),
             ];
-
             let batch = json_to_batch(records)?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-
-            // First check if any records were inserted - need to specify project_id
-            let all_records = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
-            assert!(!all_records.is_empty(), "No records found in table");
-
-            // Test timestamp filtering - need to include project_id
+            db.insert_records_batch(&ts_project, "otel_logs_and_spans", vec![batch], true, None).await?;
             let result = ctx
-                .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND timestamp > '2023-01-01T11:00:00Z'", project_id))
+                .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND timestamp > '2023-01-01T11:00:00Z'", ts_project))
                 .await?
                 .collect()
                 .await?;
-            assert!(!result.is_empty(), "Query returned no results");
             assert_eq!(result[0].num_rows(), 1);
             assert_eq!(get_str(result[0].column(0).as_ref(), 0), "late");
-
-            // Test timestamp formatting - need to include project_id
             let result = ctx
                 .sql(&format!(
                     "SELECT id, to_char(timestamp, 'YYYY-MM-DD HH24:MI') as ts FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY timestamp",
-                    project_id
+                    ts_project
                 ))
                 .await?
                 .collect()
@@ -23867,9 +23745,7 @@ mod tests {
             assert_eq!(get_str(result[0].column(1).as_ref(), 0), "2023-01-01 10:00");
             assert_eq!(get_str(result[0].column(1).as_ref(), 1), "2023-01-01 12:00");
 
-            // Shutdown database to ensure proper cleanup
             db.shutdown().await?;
-
             Ok(())
         })
         .await
