@@ -756,6 +756,48 @@ impl TaskJournal {
         (pending, sealed, unproven, quarantined, not_due)
     }
 
+    /// The first SEALED task of `operation` that `claim_next` would refuse, and
+    /// why — as `(project, date, reason)`.
+    ///
+    /// Every count in `claimability_census` is a property of the task in
+    /// isolation. None of them answers the question that actually matters, which
+    /// is why `best_class(sealed_only = true)` returns None while sealed tasks
+    /// sit pending. Prod 2026-08-19 has been in exactly that state through four
+    /// fixes: 141 sealed derived units, ~60 neither quarantined nor future-dated,
+    /// and not one claimed — every derived claim an hour-wide slice of today.
+    ///
+    /// Bounded to `LIMIT` evaluations because `dependencies_complete` is a scan;
+    /// a sample is enough to name the reason, and naming it is the whole point.
+    pub fn first_refused_sealed(&self, operation: Operation, now_micros: i64) -> Option<(String, String, &'static str)> {
+        const LIMIT: usize = 64;
+        let why = |task: &MaintenanceTask| -> &'static str {
+            if task.deadline_micros > now_micros {
+                "not_due"
+            } else if Self::is_quarantined(task) {
+                "quarantined"
+            } else if !self.dependencies_complete(task) {
+                "dependencies"
+            } else {
+                // Nothing about the task refuses it, so the refusal is upstream —
+                // in class ordering or the operation cycle, not in eligibility.
+                "CLAIMABLE"
+            }
+        };
+        let describe = |task: &MaintenanceTask| {
+            let date = chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
+                .map(|time| time.date_naive().to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            (task.key.project_id.clone(), date, why(task))
+        };
+        let mut sealed = self.snapshot.tasks.iter().filter(|task| {
+            task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && !is_live_frontier(task.key.slice, now_micros)
+        });
+        // A claimable one is the interesting answer: it means eligibility is fine
+        // and the refusal is in ordering. Otherwise report the first task's reason.
+        let sample: Vec<_> = sealed.by_ref().take(LIMIT).collect();
+        sample.iter().find(|task| why(task) == "CLAIMABLE").or_else(|| sample.first()).map(|task| describe(task))
+    }
+
     /// Publish which `(source, project, date)` have their BASE tier built, read
     /// from real rollup coverage. Replaces the set wholesale: coverage can go
     /// backwards (a rewrite, a vacuum), and a stale "ready" is the direction
