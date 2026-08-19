@@ -18,11 +18,21 @@ Four dimensions, each from the cheapest source that is actually authoritative:
 
   sorted     the parquet FOOTER's `sorting_columns`, optionally (--footers).
              NOT the `delta-rs.optimize.sort_by` tag: only the OPTIMIZE path
-             writes it, 1,593 of 1,648 adds carry no tags at all, and the flush
-             path sorts and stamps a correct footer WITHOUT the tag. Reading the
-             tag as the property is what made every partition look permanently
-             out of policy. The tag column is still shown, to make that gap
-             visible rather than hide it.
+             writes it, and the flush path sorts and stamps a correct footer
+             WITHOUT the tag, so reading the tag as the property made every
+             partition look permanently out of policy.
+
+             There is no tag column at all now, because this tool could not
+             measure one. `DeltaTable.get_add_actions()` does not expose `tags`
+             — the fields are path/size_bytes/num_records/modification_time/
+             partition.*/min.*/max.*/null_count.* and nothing else — so
+             `add.get("tags")` returned None for every row and the column read
+             0/N always. It was reported as evidence twice on 2026-08-19,
+             including a conclusion that compaction had stripped the rollup
+             tier's coverage tags. Read from the Delta log directly instead, the
+             1m tier's last 25 commits were 25/25 tagged with the full identity
+             set. A probe that returns the same extreme value for every row is
+             far likelier to be broken than the system it measures.
 
   deduped    whether the plan still contains `DedupExec` for that day.
              A certified partition skips it. The scan.dedup_* counters are
@@ -120,7 +130,7 @@ def partitions(source: str, since: str) -> dict[tuple[str, str], dict]:
     uri = f"s3://{os.environ['AWS_S3_BUCKET']}/timefusion/{source}"
     table = DeltaTable(uri, storage_options=storage)
     cells: dict[tuple[str, str], dict] = collections.defaultdict(
-        lambda: {"files": 0, "bytes": 0, "rows": 0, "tagged": 0, "paths": []}
+        lambda: {"files": 0, "bytes": 0, "rows": 0, "paths": []}
     )
     for add in table.get_add_actions(flatten=True).to_struct_array().to_pylist():
         date = str(add.get("partition.date"))
@@ -131,9 +141,6 @@ def partitions(source: str, since: str) -> dict[tuple[str, str], dict]:
         cell["files"] += 1
         cell["bytes"] += add.get("size_bytes") or 0
         cell["rows"] += add.get("num_records") or 0
-        tags = add.get("tags")
-        if isinstance(tags, dict) and tags.get("delta-rs.optimize.sort_by"):
-            cell["tagged"] += 1
         if len(cell["paths"]) < 1:
             cell["paths"].append(add.get("path"))
     return dict(cells), table.version()
@@ -268,7 +275,7 @@ def main() -> int:
 
     print(f"\n{args.source} · project {project[:8]} · snapshot v{version} · since {args.since}")
     print(f"compacted = <=2 active files · sorted = footer sorting_columns · deduped = no DedupExec in plan\n")
-    head = f"{'date':<12}{'files':>6}{'GB':>7}{'rows':>11}  {'compact':>7} {'tag':>5} {'sorted':>6} {'dedup':>5} {'1m':>3} {'1h':>3}"
+    head = f"{'date':<12}{'files':>6}{'GB':>7}{'rows':>11}  {'compact':>7} {'sorted':>6} {'dedup':>5} {'1m':>3} {'1h':>3}"
     print(head)
     print("-" * len(re.sub(r"\033\[[0-9;]*m", "", head)))
 
@@ -280,10 +287,9 @@ def main() -> int:
         srt = footer_sorted(args.source, cell["paths"][0]) if (args.footers and cell["paths"]) else None
         ded = certified(url, args.source, project, date) if url and not open_day else None
         has_1m, has_1h = date in tiers["1m"], date in tiers["1h"]
-        tag = f"{cell['tagged']}/{cell['files']}"
         print(
             f"{date:<12}{cell['files']:>6}{cell['bytes'] / 2**30:>7.2f}{cell['rows']:>11}  "
-            f"{mark(compact):>7} {_color(f'{tag:>5}', DIM)} {mark(srt):>6} {mark(ded):>5} "
+            f"{mark(compact):>7} {mark(srt):>6} {mark(ded):>5} "
             f"{mark(has_1m, 'yes', 'NO')} {mark(has_1h, 'yes', 'NO')}"
             + ("  (open)" if open_day else "")
         )
