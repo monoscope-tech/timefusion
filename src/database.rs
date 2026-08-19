@@ -10048,6 +10048,20 @@ impl Database {
 
                 covered_per_tier.push((index, covered));
             }
+            // Which (project, date) have their BASE tier built, from the same
+            // coverage the planner just read. `dependencies_complete` consults
+            // this by DAY, so it cannot miss a derived task whatever slice that
+            // task covers — the failure that made #184/#186/#195 inert, measured
+            // on prod as derived_unproven=674 of derived_pending=674.
+            {
+                let ready: HashSet<(String, String, String)> = covered_per_tier
+                    .iter()
+                    .filter(|(index, _)| schema.rollups[*index].derive_from.is_none())
+                    .flat_map(|(_, covered)| covered.iter().map(|(project, date)| (source.clone(), project.clone(), date.to_string())))
+                    .collect();
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.set_base_tier_ready(ready);
+            }
             let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
             let mut want: Vec<(String, chrono::NaiveDate)> = missing_tiers.keys().cloned().collect();
             let cells_missing = want.len();
@@ -10180,6 +10194,10 @@ impl Database {
                 source,
                 cells_missing,
                 cells_wanted = want.len(),
+                base_tier_ready = {
+                    let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    journal.base_tier_ready_len()
+                },
                 derived_pending,
                 derived_sealed,
                 derived_unproven,

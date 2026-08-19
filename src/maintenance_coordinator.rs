@@ -312,6 +312,22 @@ pub struct TaskJournal {
     dirty_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
     fair_cursors: HashMap<Operation, String>,
+    /// `(source, project_id, date)` whose BASE tier is already built, as read
+    /// from real rollup coverage by `plan_rollup_backfill` every 60s.
+    ///
+    /// `dependencies_complete` consults this instead of requiring COMPLETE
+    /// `BaseRollup` TASKS, which a historical day does not have. Three attempts
+    /// to carry the same fact as a per-task flag failed (#184, #186, #195),
+    /// because the flag had to land on exactly the right `TaskKey` and the
+    /// queued work is not the width the planner assumes: prod 2026-08-19 06:30
+    /// measured `derived_unproven=674` out of `derived_pending=674` — the flag
+    /// had never been set on ONE pending task.
+    ///
+    /// A day is the right key because that is what the fact is about, so it
+    /// cannot miss a task whatever slice that task covers. Runtime only, never
+    /// journalled: the planner rebuilds it from coverage each pass, so a restart
+    /// costs one pass and it self-heals if coverage changes underneath it.
+    base_tier_ready: HashSet<(String, String, String)>,
     /// Rotates so a fixed share of claims is reserved for sealed work. Runtime
     /// only — never journalled; losing it across a restart costs nothing.
     claim_tick: u64,
@@ -411,6 +427,7 @@ impl TaskJournal {
             dirty_tasks: HashSet::new(),
             dirty_cursors: HashSet::new(),
             fair_cursors: HashMap::new(),
+            base_tier_ready: HashSet::new(),
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
         })
@@ -722,6 +739,18 @@ impl TaskJournal {
             not_due += usize::from(task.deadline_micros > now_micros);
         }
         (pending, sealed, unproven, quarantined, not_due)
+    }
+
+    /// Publish which `(source, project, date)` have their BASE tier built, read
+    /// from real rollup coverage. Replaces the set wholesale: coverage can go
+    /// backwards (a rewrite, a vacuum), and a stale "ready" is the direction
+    /// that derives from a tier that is not there.
+    pub fn set_base_tier_ready(&mut self, ready: HashSet<(String, String, String)>) {
+        self.base_tier_ready = ready;
+    }
+
+    pub fn base_tier_ready_len(&self) -> usize {
+        self.base_tier_ready.len()
     }
 
     pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
@@ -1113,7 +1142,17 @@ impl TaskJournal {
         };
         // Proven from real tier coverage, which is strictly better evidence than
         // the journal's own record of who built what. See the field's comment.
+        //
+        // The day-keyed set is checked first and is the one that actually works:
+        // the per-task flag has to be set on exactly the right `TaskKey`, and
+        // prod measured 674 of 674 pending derived tasks without it. Keying the
+        // fact on the DAY it is a fact about cannot miss a task.
         if task.base_tier_present {
+            return true;
+        }
+        if let Some(date) = chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| time.date_naive().to_string())
+            && self.base_tier_ready.contains(&(task.key.source.clone(), task.key.project_id.clone(), date))
+        {
             return true;
         }
         required.is_none_or(|required| {
@@ -2506,6 +2545,43 @@ mod tests {
         assert_eq!(unproven, 1, "only the one without a base-tier proof is dependency-blocked");
         assert_eq!(quarantined, 1, "only the one that burned its attempts is quarantined");
         assert_eq!(not_due, 1, "only the one with a future deadline is not yet due");
+    }
+
+    /// The day-keyed ready set must unblock a derived task of ANY width.
+    ///
+    /// Three attempts to carry this fact as a per-task flag were inert (#184,
+    /// #186, #195) because the flag had to land on exactly the right `TaskKey`
+    /// and the queued work is not the width the planner assumes. Prod
+    /// 2026-08-19 06:30: `derived_unproven=674` of `derived_pending=674` — the
+    /// flag had never been set on ONE pending task. A day is what the fact is
+    /// about, so keying on it cannot miss a task.
+    #[test]
+    fn the_base_tier_ready_set_unblocks_derived_work_of_any_width() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const HOUR: i64 = 3_600_000_000;
+        let at = |start: i64, width: i64| TaskKey {
+            physical_table: "rollup_1h".to_owned(),
+            source: "source".to_owned(),
+            project_id: "p".to_owned(),
+            slice: TimeSlice::new(start, start + width).expect("slice"),
+            operation: Operation::DerivedRollup,
+        };
+        // An hour-wide task and a day-wide one, both inside 1970-01-01.
+        journal.enqueue(at(0, HOUR), 0, 1, 0);
+        journal.enqueue(at(5 * HOUR, HOUR), 0, 1, 0);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: dependency-blocked");
+
+        journal.set_base_tier_ready(HashSet::from([("source".to_owned(), "p".to_owned(), "1970-01-01".to_owned())]));
+        assert_eq!(journal.base_tier_ready_len(), 1);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "an hour-wide task is unblocked by a DAY-keyed fact");
+
+        // Wholesale replacement: coverage can go backwards, and a stale "ready"
+        // would derive from a tier that is no longer there.
+        journal.set_base_tier_ready(HashSet::new());
+        let key = at(5 * HOUR, HOUR);
+        journal.retry(&key, "requeue".to_owned(), 0);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "clearing the set re-blocks the work");
     }
 
     /// The proof must reach the tasks that actually exist, at their own width.
