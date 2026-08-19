@@ -1019,14 +1019,10 @@ const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration =
 
 /// Maximum wall time for one coordinator file-rewrite unit.
 ///
-/// Dedup and rollup units normally finish inside five minutes because their
-/// source windows split recursively. File packing is different: it must create
-/// runs near 256 MiB or the sealed-file-count invariant can never converge.
-/// Production 2026-08-16 showed a 511 MiB sealed merge being cancelled at the
-/// old five-minute ceiling and then selected again unchanged. A 15-minute
-/// ceiling lets the conservative measured rewrite floor (460 KB/s) finish one
-/// 256 MiB run with commit margin, while the 512 MiB spill pool remains the
-/// hard decoded-memory bound.
+/// Dedup and rollup units normally finish quickly because their source windows split recursively.
+/// File packing must create runs near 256 MiB or the sealed-file-count invariant never converges.
+/// A 15-minute ceiling lets the measured rewrite floor finish a 256 MiB run with commit margin,
+/// while the spill pool remains the hard decoded-memory bound.
 const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(crate::maintenance_coordinator::operation_deadline_secs(crate::maintenance_coordinator::Operation::Repair));
 
@@ -2335,14 +2331,11 @@ pub struct Database {
     fast_resolve_cache: FastResolveCache,
     /// Per-(project, table) sticky bit: "Delta may hold matching files."
     ///
-    /// The bit is at least as conservative as truth, never falsely `false`:
-    /// - Cold start / first resolve: `version > 0` from the loaded snapshot ⇒ true.
-    /// - Steady state: flush callback marks it true after every commit that adds files.
-    ///
-    /// While false, `ProjectRoutingTable::scan` short-circuits the Delta scan entirely;
-    /// MemBuffer is authoritative. This avoids building a delta-rs TableProvider for projects
-    /// that have never committed. `Arc<AtomicBool>` is used because `Database` derives `Clone`
-    /// and `AtomicBool: !Clone`.
+    /// The bit is at least as conservative as truth, never falsely `false`. Cold start sets it true
+    /// when `version > 0`; flush callbacks set it true after commits that add files. While false,
+    /// scans skip Delta entirely and MemBuffer is authoritative, avoiding building a delta-rs
+    /// `TableProvider` for projects that have never committed. `Arc<AtomicBool>` is used because
+    /// `Database` derives `Clone` and `AtomicBool` is not `Clone`.
     delta_has_files: dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
     /// Per-(project, table) cached Delta-side `TableProvider` and the snapshot version it was built
     /// against.
@@ -2472,16 +2465,12 @@ pub struct Database {
     /// has exhausted the pool at a higher parallelism. Cleared on success, so a
     /// file only carries a degraded setting while it needs one.
     repair_degradation: Arc<dashmap::DashMap<String, usize>>,
-    /// Caps concurrent HEAVY maintenance rewrites — and ONLY those: dedup
-    /// dirty-bin staging (`stage_dedup_chunk`), full optimize (Z-order /
-    /// consolidate), nightly light-consolidate (`optimize_table_light_inner`)
-    /// and `recompress_partition`. Their Arrow footprint is invisible to the
-    /// DataFusion memory pool (a `SELECT * … collect()` doesn't reserve through
-    /// it), so aggregate concurrency — not the pool — is the real bound against
-    /// the cgroup OOM (prod 2026-07-04). Permits = `derived.rewrite_permits()`.
+    /// Caps concurrent heavy maintenance rewrites.
     ///
-    /// The hot-tail WAVE engine deliberately does NOT share this semaphore —
-    /// see [`Self::light_rewrite_sem`].
+    /// Applies to dedup dirty-bin staging, full optimize, light-consolidate, and recompress.
+    /// Their Arrow footprint is invisible to the DataFusion memory pool, so aggregate concurrency,
+    /// not the pool, is the real bound against cgroup OOM. The hot-tail wave engine deliberately
+    /// does not share this semaphore; see [`Self::light_rewrite_sem`].
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent hot-tail wave staging.
     ///
@@ -2527,16 +2516,13 @@ pub struct Database {
     /// permits alone are insufficient: a waiting light job can exhaust its
     /// table timeout before it ever starts work.
     maintenance_job_sem: Arc<tokio::sync::Semaphore>,
-    /// Serializes in-process Delta commits (flush appends vs dedup
-    /// replace_where) PER PHYSICAL TABLE, keyed via `table_lock_key`.
-    /// delta-kernel's OCC checker cannot evaluate the bare-string timestamp
-    /// predicate replace_where commits carry (errors "arrow_cast should have
-    /// been simplified"), so a dedup commit racing any concurrent append to
-    /// the SAME log aborts — every attempt, forever, on a busy table.
-    /// Serializing per-log commits lets the rebase see no newer versions and
-    /// skip the checker. Formerly a process-wide mutex, which needlessly
-    /// serialized commits to *different* Delta logs and capped flush
-    /// throughput below `flush_parallelism` (issue #83).
+    /// Serializes in-process Delta commits per physical table, keyed via `table_lock_key`.
+    ///
+    /// delta-kernel's OCC checker cannot evaluate the bare-string timestamp predicate that
+    /// `replace_where` commits carry, so a dedup commit racing any concurrent append to the same
+    /// log aborts every attempt. Serializing per-log commits lets the rebase see no newer versions
+    /// and skip the checker. A process-wide mutex formerly serialized commits to different Delta
+    /// logs needlessly, capping flush throughput.
     commit_locks: DmlLocks,
     /// Flush/ingest committers currently QUEUED on each table's `commit_locks`
     /// entry (same key). `tokio::sync::Mutex` is FIFO and every holder is
@@ -2646,16 +2632,13 @@ fn sort_backfill_uris_newest_first(uris: &mut [String]) {
 
 type TantivyBackfillWork = (String, String, String); // project, relative parquet, absolute URI
 
-/// A file's decoded contribution to a slice, scaled by the share of its time span the slice
-/// covers.
+/// A file's decoded contribution to a slice, scaled by the share of its time span the slice covers.
 ///
-/// Counting the whole file for any overlap made splitting a no-op. Files are sorted by
-/// timestamp with row-group statistics, so a narrow slice of a day-spanning file decodes only
-/// the overlapping row groups. Files with no usable timestamp bounds keep their full weight
-/// (unknown must never estimate cheap), and the fraction is clamped to at least one row
-/// group's worth so a narrow slice is never estimated as free — parquet cannot prune below a
-/// row group. The row-group count is deliberately conservative: too few row groups makes the
-/// floor larger, which over-estimates, the safe direction.
+/// Counting the whole file for any overlap made splitting a no-op. A narrow slice of a day-spanning
+/// file decodes only the overlapping row groups. Files with no usable timestamp bounds keep their
+/// full weight (unknown must never estimate cheap), and the fraction is clamped to at least one row
+/// group's worth so a narrow slice is never estimated as free. The row-group count is deliberately
+/// conservative: too few row groups makes the floor larger, which over-estimates, the safe direction.
 fn estimated_row_groups(size_bytes: i64) -> u64 {
     const TARGET_ROW_GROUP_BYTES: i64 = 128 * 1024 * 1024;
     u64::try_from(size_bytes.max(0).div_euclid(TARGET_ROW_GROUP_BYTES).max(1)).unwrap_or(1)
@@ -3380,16 +3363,12 @@ impl Database {
         Ok((built, removed, blobs))
     }
 
-    /// Count live parquet the Tantivy manifest does not cover, without building
-    /// anything.
+    /// Count live parquet the Tantivy manifest does not cover, without building anything.
     ///
-    /// `backfill_table_indexes` already publishes these gauges, but it only runs
-    /// from the daily reconcile cron — so after a deploy the reindex has no
-    /// reported remaining-work figure for up to 24 hours, which is exactly the
-    /// blind spot that had the reindex being chased by hand from sibling
-    /// containers. This is the same diff, metadata-only: the Delta log names the
-    /// live files and the manifest names the covered ones. No parquet is read
-    /// and no index is built, so it is safe to run far more often than a pass.
+    /// `backfill_table_indexes` only runs from the daily reconcile cron, so after a deploy the
+    /// reindex has no reported remaining-work figure for hours. This is the same diff but
+    /// metadata-only: the Delta log names live files and the manifest names covered ones. No
+    /// parquet is read and no index is built, so it is safe to run far more often.
     pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64)> {
         use crate::tantivy::search::project_id_of_uri;
         let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0)) };
@@ -7026,16 +7005,12 @@ impl Database {
         }
     }
 
-    /// Shared post-commit bookkeeping for both the staged and merge write
-    /// paths: record the version for read-after-write, swap the shared handle
-    /// (version-guarded), warm the just-written files, invalidate stats, and
-    /// return the newly added file URIs.
+    /// Shared post-commit bookkeeping for staged and merge write paths.
     ///
-    /// `projects` is every (project_id, dirty_bins) the commit carried — one on
-    /// the per-project path, N on a coalesced cross-project commit. Everything
-    /// per-project (last-written version for read-after-write, statistics
-    /// invalidation, dirty-bin enqueue) runs once per entry; the table-wide work
-    /// (snapshot persist, handle swap, warm, reconcile) runs once for the commit.
+    /// Records the version for read-after-write, swaps the shared handle (version-guarded), warms
+    /// just-written files, invalidates stats, and returns the added file URIs. `projects` is every
+    /// `(project_id, dirty_bins)` the commit carried. Per-project work runs once per entry; table-wide
+    /// work runs once for the commit.
     #[allow(clippy::too_many_arguments)]
     async fn record_committed_write(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, new_table: DeltaTable,
@@ -11296,16 +11271,13 @@ impl Database {
         Ok(())
     }
 
-    /// `bound_for` gives, per (project, date), an EXCLUSIVE upper bound on the row
-    /// timestamps a file may contain to be folded in. Files entirely at or above
-    /// it are ignored.
+    /// Exclusive upper bound on row timestamps a file may contain to be folded into a slice.
     ///
-    /// This is what lets a day still being written hold stable coverage. Its
-    /// whole-day fingerprint moves on every flush, so coverage keyed on it is
-    /// invalid within minutes; bounded to the part the build actually read, new
-    /// files landing ABOVE the bound change nothing, while a rewrite or a late
-    /// file BELOW it still moves the fingerprint and correctly invalidates —
-    /// which is the only direction that can serve a wrong number.
+    /// This lets a day still being written hold stable coverage. Its whole-day fingerprint moves on
+    /// every flush, so coverage keyed on it would invalidate within minutes. Bounded to the part the
+    /// build actually read, new files landing above the bound change nothing, while a rewrite or late
+    /// file below it moves the fingerprint and correctly invalidates — the only direction that can
+    /// serve a wrong number.
     fn partition_fingerprints_bounded(
         table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
     ) -> Result<HashMap<(String, String), u64>> {
@@ -15276,16 +15248,15 @@ fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
         .join(",")
 }
 
-/// SQL `ORDER BY` clause (leading space, quoted identifiers) matching the
-/// schema's sort order, for rewrite paths that stream through a `SELECT` rather
-/// than delta-rs optimize (recompress). Empty when no sort order is declared.
+/// SQL `ORDER BY` clause matching the schema's sort order, for rewrite paths that stream through
+/// a `SELECT` rather than delta-rs optimize. Empty when no sort order is declared.
+
 /// Input bytes one repair slice may cover.
 ///
 /// A whole-file sort does not fit the light pool, so the unit must shrink. 256 MB is the only
 /// value with an observed successful completion. A 64 MB target was tried and reverted: the
-/// apparent throughput cliff was concurrent-bin contention, not size, and no large bin
-/// completed before restart at that size. If retuning, measure completion time for one bin
-/// of a known size on an idle box.
+/// apparent throughput cliff was concurrent-bin contention, not size. If retuning, measure
+/// completion time for one bin of a known size on an idle box.
 const REPAIR_SLICE_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 
 /// Run the min/max/null probe for slice planning. `None` declines slicing —
@@ -15456,16 +15427,13 @@ fn parse_staged_intents(contents: &str) -> Vec<StagedIntent> {
     contents.lines().filter(|l| !l.trim().is_empty()).filter_map(|line| serde_json::from_str::<StagedIntent>(line).ok()).collect()
 }
 
-/// Which staged paths to delete on boot: everything the Delta log does NOT
-/// reference. A referenced path belongs to a wave that DID commit (the manifest
-/// entry just never got removed — crash after commit, before compaction of the
-/// manifest), and deleting it would destroy live data. Pure so the decision is
-/// testable without an object store; deliberately takes the referenced set from
-/// the snapshot rather than a LIST — R2 listing is a known incident source and
-/// this path must never issue one.
-/// `now_secs` gates the rolling-deploy hazard: entries younger than
-/// `STAGED_INTENT_MIN_AGE_SECS` may belong to a live instance sharing the
-/// volume and are left for its own wave commit / the next boot / VACUUM.
+/// Which staged paths to delete on boot: everything the Delta log does not reference.
+///
+/// A referenced path belongs to a wave that did commit, and deleting it would destroy live data.
+/// The decision is pure and testable without an object store; it deliberately takes the referenced
+/// set from the snapshot rather than a LIST. `now_secs` gates the rolling-deploy hazard: entries
+/// younger than `STAGED_INTENT_MIN_AGE_SECS` may belong to a live instance sharing the volume and are
+/// left for its own wave commit, the next boot, or VACUUM.
 const STAGED_INTENT_MIN_AGE_SECS: u64 = 30 * 60;
 
 fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs: u64, referenced: &std::collections::HashSet<String>) -> Vec<String> {
@@ -15638,14 +15606,11 @@ fn wave_dropped_rows(bins: &[StagedBin]) -> u64 {
 
 /// Assemble one staged unit's Remove+Add actions.
 ///
-/// `data_change` distinguishes hot compaction from dedup:
-/// - `false` (compaction): preserves every row, so both sides are data-preserving. The fork's
-///   conflict checker downgrades to snapshot isolation, letting a wave commit next to
-///   concurrent ingest appends without the OCC ladder.
-/// - `true` (dedup): drops rows, so those actions must NOT claim data-preserving. Dedup pays the
-///   honest OCC price; the wave still wins because N chunk commits collapse into one.
-///
-/// `wave_operation` derives the `DeltaOperation` from the same flag so the two cannot drift.
+/// `data_change` distinguishes hot compaction from dedup. `false` (compaction) preserves every row,
+/// so the fork's conflict checker downgrades to snapshot isolation and a wave can commit next to
+/// concurrent ingest appends without the OCC ladder. `true` (dedup) drops rows, so those actions
+/// must not claim data-preserving. `wave_operation` derives the `DeltaOperation` from the same flag
+/// so the two cannot drift.
 fn staged_actions(
     targets: &[deltalake::kernel::Add], staged: Vec<deltalake::kernel::Action>, data_change: bool,
 ) -> (Vec<deltalake::kernel::Action>, Vec<deltalake::kernel::Action>) {
@@ -15959,14 +15924,9 @@ fn hot_bin_admits(path: &str, today_marker: &str, repair_markers: &[String], siz
 
 /// Pool bytes one escalated flush sort needs to finish without being refused.
 ///
-/// 512 MB was too small, MEASURED (prod 2026-08-08). A single sort's merge
-/// phase reached **675 MB** and was then refused 96.9 MB with "18.4 MB remain
-/// available for the total memory pool: fair(pool_size: 1024.0 MB)" — the whole
-/// 1 GB pool was gone, because the 512 MB divisor had admitted a SECOND sort
-/// alongside it. Every such refusal writes the group UNSORTED, and one unsorted
-/// file disables the reader's all-or-nothing footer ordering for its entire
-/// partition: the flush path was manufacturing exactly the footer poison the
-/// repair pass exists to clean up.
+/// 512 MB was too small: a single sort's merge phase exceeded it and a second sort was admitted
+/// alongside, exhausting the whole pool. Every such refusal writes the group unsorted, and one
+/// unsorted file disables the reader's all-or-nothing footer ordering for its entire partition.
 const MIN_SPILL_SORT_BYTES: usize = 1 << 30;
 
 /// How many escalated flush sorts may run at once on a pool of `pool_bytes`.
@@ -17471,16 +17431,12 @@ impl ProjectRoutingTable {
         Some(schema.schema_ref().fields().iter().map(|f| f.name().clone()).filter(|n| !immutable.contains(n.as_str())).collect())
     }
 
-    /// Does `f` mention the table's tombstone marker? Such a predicate must
-    /// NEVER reach a scan leg. Applied at the source — `MemBuffer::query`'s
-    /// `compile_filter_conjunction`, or the Delta kernel — it would drop the
-    /// tombstone row *before* the dedup, leaving the older live version to win
-    /// keep-greatest: a deleted row silently resurrects, with no error anywhere.
-    /// Reported `Unsupported` so DataFusion keeps its own `FilterExec` above the
-    /// whole scan (above `DedupExec` and the tombstone filter), and stripped
-    /// again in `scan` so a filter arriving by any other route still can't be
-    /// pushed into a leg. Both together, because someone will try to optimize
-    /// this downward later.
+    /// Does `f` mention the table's tombstone marker? Such a predicate must never reach a scan leg.
+    ///
+    /// Applied at the source it would drop the tombstone row before the dedup, leaving the older
+    /// live version to win keep-greatest and a deleted row silently resurrects. Reported
+    /// `Unsupported` so DataFusion keeps its own `FilterExec` above the whole scan, and stripped again
+    /// in `scan` so a filter arriving by any other route still cannot be pushed into a leg.
     pub(crate) fn references_tombstone(table_name: &str, f: &Expr) -> bool {
         crate::schema::get_schema(table_name).and_then(|s| s.tombstone_column.as_deref()).is_some_and(|t| f.column_refs().iter().any(|c| c.name == t))
     }
@@ -17762,16 +17718,14 @@ fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
     plan.children().into_iter().filter_map(selected_file_work).reduce(|(n, b), (n2, b2)| (n + n2, b + b2))
 }
 
-/// Decode-admission pressure valve: how many of the wide-scan semaphore's `total` permits
-/// one decode poll must claim. 1 normally; a quarter of the pool at tier 1; the whole pool at
-/// tier 2.
+/// Decode-admission pressure valve: how many of the wide-scan semaphore's `total` permits one decode
+/// poll must claim. 1 normally; a quarter of the pool at tier 1; the whole pool at tier 2.
 ///
 /// Decode heap is untracked by any DataFusion pool, so the only OOM lever is concurrency.
-/// Fixed-percentage thresholds failed in both directions (too late at 88/95%, too early and
-/// on the working set at 70/82%), so tiers fire on projected seconds to the limit: a box
-/// parked at 70% has near-zero consumption rate and never throttles. The absolute 88/95%
-/// backstops remain so the valve is never later than the old behaviour. Pressure is memcg
-/// usage minus reclaimable cache, sampled at most every 250ms.
+/// Fixed-percentage thresholds failed in both directions, so tiers fire on projected seconds to
+/// the limit; a box parked at 70% has near-zero consumption rate and never throttles. Absolute
+/// backstops remain so the valve is never later than the old behaviour. Pressure is memcg usage
+/// minus reclaimable cache, sampled at most every 250ms.
 fn scan_pressure_permits(total: u32) -> u32 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -19564,16 +19518,12 @@ mod tests {
         Ok(())
     }
 
-    /// The backfill ceiling must defer only the ENQUEUE, never the whole pass.
+    /// The backfill ceiling must defer only the enqueue, never the whole pass.
     ///
-    /// Prod 2026-08-18 23:30 UTC sat at 61,306 pending against the 25,000
-    /// ceiling — and the live frontier alone keeps it above that indefinitely —
-    /// so `plan_rollup_backfill` returned at its first statement every 60s for
-    /// hours. That silently took THREE other things with it, none of which mint
-    /// any work: the `rollup_median_contiguous_days` gauge that `coverage_is_short`
-    /// reads to weight the entire scheduling cycle (stale at 0 the whole time),
-    /// the per-project `rollup_coverage_contiguity` log, and #186's base-tier
-    /// proof for already-queued derived units.
+    /// The live frontier alone can keep pending above the ceiling indefinitely, so the planner
+    /// would return at its first statement and take several other outputs with it: the
+    /// `rollup_median_contiguous_days` gauge that `coverage_is_short` actually reads, the
+    /// per-project coverage contiguity log, and the base-tier proof for already-queued derived units.
     #[tokio::test]
     async fn the_backfill_ceiling_defers_enqueueing_without_stopping_the_pass() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
@@ -20141,16 +20091,12 @@ mod tests {
         Ok(())
     }
 
-    /// A rollup build is a background rewrite and must be PLANNED like one.
+    /// A rollup build is a background rewrite and must be planned like one.
     ///
-    /// It goes through `query_delta_only`, which built its session exactly like
-    /// an interactive query's — so `target_partitions` was the container's CPU
-    /// quota (48 in prod) rather than `MAINTENANCE_MAX_PARTITIONS`. Parquet
-    /// decode buffers scale with that fan-out and are invisible to the memory
-    /// pool (same blind spot as the batch-size test above), so a whole-day scan
-    /// of a busy partition ran 24x the concurrent decode it needed. Prod
-    /// 2026-08-13 OOM-killed the instance four times in the ninety minutes
-    /// after the backfill started completing builds again.
+    /// It goes through `query_delta_only`, which built its session like an interactive query's, so
+    /// `target_partitions` was the CPU quota rather than `MAINTENANCE_MAX_PARTITIONS`. Parquet decode
+    /// buffers scale with that fan-out and are invisible to the memory pool, so a whole-day scan ran
+    /// many times the concurrent decode it needed.
     #[tokio::test]
     async fn a_maintenance_scan_plans_with_maintenance_parallelism() -> Result<()> {
         let config = create_test_config("maintenance-scan-partitions");
@@ -21361,16 +21307,12 @@ mod tests {
         );
     }
 
-    /// A repair pass rewrites the NEWEST poisoned file, not the oldest.
+    /// A repair pass rewrites the newest poisoned file, not the oldest.
     ///
-    /// The poison is all-or-nothing over a query window: the most recent
-    /// footer-less date is the wall a user's `WHERE timestamp >= …` hits, so
-    /// repairing it is the only thing that widens the window. The shared pass
-    /// took `fresh.first()` after an ASCENDING sort by event time — i.e. the
-    /// oldest, which no query window reaches first and which is also the big
-    /// legacy file most likely to outrun the budget. Prod 2026-08-08: talstack
-    /// 6297304f was walled at 8 days by ONE file on 2026-07-30 while repair
-    /// ground on May.
+    /// The poison is all-or-nothing over a query window: the most recent footer-less date is the
+    /// wall a user's time predicate hits, so repairing it is the only thing that widens the window.
+    /// The old path took `fresh.first()` after an ascending sort — i.e. the oldest — which no query
+    /// window reaches first and which is most likely to outrun the budget.
     #[test]
     fn repair_pass_takes_the_newest_poisoned_file_then_the_smallest() {
         const TARGET: i64 = 1000;
@@ -23711,14 +23653,10 @@ mod tests {
 
     /// Provider cache invalidation on snapshot version change.
     ///
-    /// The cache keyed on `(project, table) → (version, Arc<OnceCell<Provider>>)`
-    /// must replace the cell when `table.version()` advances. A regression in
-    /// the `if entry.0 != current_version` branch would serve stale Delta
-    /// files to queries (pre-flush state forever).
-    ///
-    /// Strategy: do two queries to the same table, with an insert between
-    /// them that adds a commit (bumping version). The second query must see
-    /// the new row — proving the cached provider was rebuilt.
+    /// The cache keyed on `(project, table) → (version, Arc<OnceCell<Provider>>)` must replace the
+    /// cell when `table.version()` advances. Strategy: query the table, insert a commit to bump
+    /// version, then query again; the second query must see the new row, proving the cached provider
+    /// was rebuilt.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_delta_provider_cache_invalidates_on_version_change() -> Result<()> {
