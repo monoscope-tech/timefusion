@@ -939,6 +939,44 @@ could have worked. **Before fixing how a queue is served, verify the queue has
 the items you think it has** — `pending_derived_rollup` was ~900 the whole time
 and every one of them was frontier work.
 
+### The ninth, and the one that was actually blocking G1: empty partitions read as coverage (#193)
+
+02:30 UTC, #181-#192 all live:
+
+```
+94c5dc1f  1m tier  34 CONTIGUOUS days   2026-07-17 .. 08-19
+94c5dc1f  1h tier  18 days, missing     2026-08-01 .. 08-13
+backfill planner   queued=1 remaining=0
+```
+
+The planner could not see a single one of those days as missing.
+
+`partitions_of` lists FILES, and a rollup unit that aggregated nothing still
+commits one. Pre-#169 that was the normal outcome for history — a derived unit
+dropped base files whose slice tags it could not read and published rows=0,
+which that path's own comment describes as reading *"exactly like this slice is
+genuinely empty"*. The zero-row partition then made the day look **covered**, so
+it was never rebuilt, so it stayed empty. Permanently. A closed loop that could
+not be entered from outside.
+
+**This retro-explains the previous four fixes.** #186 (proof), #189 (sealed
+reservation), #190 (worker reserve) and #192 (per-tier veto) were each correct
+and each entirely inert, because they all govern how queued work is SERVED and
+the work was never QUEUED — the holes were invisible to the planner.
+
+**The generalised lesson, which is worth more than the fix:** *presence is not
+completeness*. This codebase has now been bitten by that exact substitution three
+times in one night — `partitions_of` counting an empty file as coverage,
+`missing_tiers` treating one file as a built day, and `blocks_rollup_backfill`
+treating one queued task as a planned day. Any predicate that answers "is X
+done?" by asking "does something for X exist?" should be treated as suspect on
+sight.
+
+**Diagnostic rule earned here:** when a fix that should obviously work does
+nothing, stop fixing and go count the population it acts on. Four fixes in a row
+were validated against `pending_derived_rollup` ≈ 900 without once checking that
+those 900 were all frontier work.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
