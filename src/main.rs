@@ -91,12 +91,10 @@ use anyhow::Context;
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use timefusion::{
-    bootstrap,
-    buffered_write_layer::BufferedWriteLayer,
-    clock,
     config::{self, AppConfig},
     database::{Database, RecompressOutcome},
-    secret_crypto, telemetry,
+    observability, server, support,
+    write::BufferedWriteLayer,
 };
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
@@ -123,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     // Before the runtime, so every worker thread and listener socket inherits
     // the raised limit. `bootstrap()` calls it too, for the e2e harness — which
     // does NOT go through main().
-    bootstrap::raise_file_limit();
+    server::raise_file_limit();
 
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("healthcheck") {
@@ -132,7 +130,7 @@ fn main() -> anyhow::Result<()> {
     // CLI helper: `timefusion encrypt-secret <plaintext>` — prints ciphertext
     // for use in `timefusion_projects` rows, then exits. Needs no config.
     if subcommand.as_deref() == Some("encrypt-secret") {
-        return secret_crypto::run_cli();
+        return config::run_cli();
     }
 
     // Maintenance CLIs get the maintenance-heavy budget shape (the server
@@ -271,11 +269,11 @@ fn init_cli_tracing() {
 }
 
 /// `timefusion redrive-dml [--dir PATH] [--dry-run]` — replay parked quarantine/dml
-/// enrichment groups (see [`timefusion::dml_coalescer::redrive_dml_quarantine`]).
+/// enrichment groups (see [`timefusion::dml::redrive_dml_quarantine`]).
 async fn run_redrive_dml_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
     // Two-token flags need lookahead into the arg iterator, so this stays a loop.
-    let mut dir = cfg.core.wal_dir().join(timefusion::wal::QUARANTINE_DIR_NAME).join("dml");
+    let mut dir = cfg.core.wal_dir().join(timefusion::write::wal::QUARANTINE_DIR_NAME).join("dml");
     let mut dry_run = false;
     let mut it = std::env::args().skip(2);
     while let Some(a) = it.next() {
@@ -286,24 +284,24 @@ async fn run_redrive_dml_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     }
     let db = Arc::new(Database::with_config(Arc::new(cfg.clone())).await?);
-    let (ok, skipped) = timefusion::dml_coalescer::redrive_dml_quarantine(&db, &dir, dry_run).await;
+    let (ok, skipped) = timefusion::dml::redrive_dml_quarantine(&db, &dir, dry_run).await;
     println!("redrive-dml: {ok} recovered, {skipped} left parked (dir {dir:?})");
     db.shutdown().await
 }
 
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize OpenTelemetry with OTLP exporter
-    telemetry::init_telemetry(&cfg.telemetry)?;
+    observability::init_telemetry(&cfg.telemetry)?;
     // AFTER init_telemetry: config is built before the subscriber exists, so
     // logging the tree at derivation time is silently swallowed — which is why
     // prod could carry TIMEFUSION_MEMORY_LIMIT_GB=26 while actually budgeting
     // 120 GiB with nothing on the box revealing the gap (2026-07-31).
     config::log_derived_budget(&cfg.derived);
-    clock::init_from_env();
+    support::init_from_env();
 
     // Start heap+CPU profiling (no-op unless --features profiling on Linux).
     // Early, so the profiles dir exists before jemalloc's first interval dump.
-    timefusion::profiling::start(cfg.core.timefusion_data_dir.clone());
+    timefusion::observability::start(cfg.core.timefusion_data_dir.clone());
 
     info!("Starting TimeFusion application");
 
@@ -322,7 +320,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let early_task = tokio::spawn({
         let shutdown = early_shutdown.clone();
         async move {
-            timefusion::pgwire_early_bind::run_until_ready(&pg_listener, shutdown).await;
+            timefusion::server::run_until_ready(&pg_listener, shutdown).await;
             pg_listener
         }
     });
@@ -338,7 +336,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // start-first deploy this self-resolves (readiness is a TCP check the early
     // responder already satisfies, so the orchestrator stops the old instance,
     // which releases the lock); stop-first shortens the handoff but isn't required.
-    let _wal_dir_lock = timefusion::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?;
+    let _wal_dir_lock = timefusion::write::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?;
 
     // Initialize database with explicit config
     let t_db = std::time::Instant::now();
@@ -355,11 +353,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // Create buffered layer with delta write callback
     let db_for_callback = db.clone();
-    let delta_write_callback: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(
-        move |project_id: String,
-              table_name: String,
-              batches: Vec<arrow::array::RecordBatch>,
-              wal_watermark: timefusion::buffered_write_layer::DeltaWatermark| {
+    let delta_write_callback: timefusion::write::DeltaWriteCallback =
+        Arc::new(move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>, wal_watermark: timefusion::write::DeltaWatermark| {
             let db = db_for_callback.clone();
             Box::pin(async move {
                 // insert_records_batch returns the URIs of files newly added by this
@@ -377,15 +372,14 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 db.mark_delta_has_files(&project_id, &table_name);
                 Ok(added)
             })
-        },
-    );
+        });
 
     // Register UDFs on the real SessionContext up front so its FunctionRegistry
     // doubles as the WAL-replay registry — no throwaway bootstrap context.
     // Table providers depend on buffered_layer and are registered after recovery.
     let mut session_context = Arc::new(db.clone()).create_session_context();
     db.setup_session_udfs(&mut session_context)?;
-    let registry: Arc<timefusion::functions::FnRegistry> = Arc::new(session_context.state());
+    let registry: Arc<timefusion::read::functions::FnRegistry> = Arc::new(session_context.state());
 
     // Tantivy sidecar indexes are always-on whenever at least one table has
     // `tantivy.indexed: true` fields in its YAML schema (or appears in the
@@ -393,12 +387,12 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
     // TantivyPredicateRewriter — callers don't need to know tantivy exists.
     // Pre-init WAL GC (gated + drained-flag consumption inside the helper).
-    timefusion::wal::boot_wal_gc(&cfg.core.wal_dir());
+    timefusion::write::wal::boot_wal_gc(&cfg.core.wal_dir());
 
     let t_layer = std::time::Instant::now();
     let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?
         .with_delta_writer(delta_write_callback)
-        .with_coalesced_delta_writer(timefusion::bootstrap::coalesced_delta_write_callback(&db));
+        .with_coalesced_delta_writer(timefusion::server::coalesced_delta_write_callback(&db));
     info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
     let indexed_tables = cfg.tantivy.indexed_tables();
     let bucket = cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default();
@@ -410,9 +404,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     } else {
         let storage_uri = format!("s3://{bucket}/{}/tantivy", cfg.core.timefusion_table_prefix);
         let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
-        let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
+        let svc = Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
         layer = layer.with_tantivy_indexer(svc.clone().callback());
-        let search = Arc::new(timefusion::tantivy_index::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone()));
+        let search = Arc::new(timefusion::tantivy::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone()));
         db = db.with_tantivy_search(search).with_tantivy_indexer(svc.clone());
         info!("Tantivy sidecar indexes active for tables: {:?}", indexed_tables);
         Some(svc)
@@ -422,7 +416,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize OpenTelemetry metrics — observable gauges read snapshot_stats()
     // each export cycle (30s), keeping the hot path untouched. Weak ref so
     // metrics don't extend the layer's lifetime.
-    if let Err(e) = timefusion::metrics::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer), tantivy_svc_for_metrics.as_ref().map(Arc::downgrade)) {
+    if let Err(e) =
+        timefusion::observability::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer), tantivy_svc_for_metrics.as_ref().map(Arc::downgrade))
+    {
         error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
     }
 
@@ -432,7 +428,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // the early-bind handoff, which is precisely when the sampler starts being
     // interesting.
     let lag_shutdown = tokio_util::sync::CancellationToken::new();
-    timefusion::metrics::spawn_runtime_lag_sampler(lag_shutdown.clone());
+    timefusion::observability::spawn_runtime_lag_sampler(lag_shutdown.clone());
 
     // Fast-forward walrus cursors before WAL replay so we don't re-inject
     // entries Delta already has. Fast path: a `clean_shutdown=true` snapshot
@@ -446,7 +442,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         // CursorSnapshot docs for the single-writer assumption and the `rm`
         // escape hatch. Backwards clock skew (NTP correction, snapshot ported
         // across hosts) is clamped to 0 by `saturating_sub`, not wrapped negative.
-        let age_secs = timefusion::clock::now_micros().saturating_sub(snap.written_at_micros) / 1_000_000;
+        let age_secs = timefusion::support::now_micros().saturating_sub(snap.written_at_micros) / 1_000_000;
         match wal_ref.restore_cursor_snapshot(&snap) {
             Ok(tables_advanced) => {
                 info!(
@@ -541,7 +537,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     early_shutdown.cancel();
     let listener = early_task.await?;
 
-    let auth_config = timefusion::pgwire_handlers::AuthConfig::from_core(&cfg.core)?;
+    let auth_config = timefusion::server::AuthConfig::from_core(&cfg.core)?;
 
     // PGWire shutdown signal: when cancelled, the accept loop in
     // `serve_with_handlers` stops accepting new connections so the
@@ -555,7 +551,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         let scan_metrics = Some(db.scan_metrics.clone());
         let db_for_pg = Arc::clone(&db);
         async move {
-            if let Err(e) = timefusion::pgwire_handlers::serve_with_listener(
+            if let Err(e) = timefusion::server::serve_with_listener(
                 listener,
                 Arc::new(session_context),
                 &pg_opts,
@@ -600,7 +596,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         async move {
             let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
             info!("Starting gRPC ingestion server on port: {}", grpc_port);
-            let svc = timefusion::grpc_handlers::IngestService::new(db_for_grpc, grpc_token).into_server();
+            let svc = timefusion::server::IngestService::new(db_for_grpc, grpc_token).into_server();
             let serve = tonic::transport::Server::builder().add_service(svc).serve_with_shutdown(addr, async move {
                 shutdown.cancelled().await;
                 info!("gRPC server: shutdown signal received, draining in-flight requests");
@@ -638,7 +634,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(Duration::from_millis(25)).await;
             let wal_dir = cfg.core.wal_dir();
-            if !timefusion::wal::takeover_requested(&wal_dir) {
+            if !timefusion::write::wal::takeover_requested(&wal_dir) {
                 continue;
             }
             if buffered_layer.is_deploy_handoff_ready() {
@@ -652,10 +648,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             // one box. A request nobody has satisfied for this long means the
             // predecessor is that instance, so take the ordinary graceful path
             // anyway; it fences writes and flushes exactly like SIGTERM does.
-            if timefusion::wal::takeover_request_age(&wal_dir).is_some_and(|age| age >= timefusion::wal::TAKEOVER_ESCALATE_AFTER) {
+            if timefusion::write::wal::takeover_request_age(&wal_dir).is_some_and(|age| age >= timefusion::write::wal::TAKEOVER_ESCALATE_AFTER) {
                 warn!(
                     "WAL takeover requested {}s ago and this instance never reached handoff readiness; shutting down anyway so the replacement can start",
-                    timefusion::wal::TAKEOVER_ESCALATE_AFTER.as_secs()
+                    timefusion::write::wal::TAKEOVER_ESCALATE_AFTER.as_secs()
                 );
                 break;
             }
@@ -867,7 +863,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         (false, bucket) if !bucket.is_empty() => {
             let storage_uri = format!("s3://{bucket}/{}/tantivy", cfg.core.timefusion_table_prefix);
             let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
-            db.with_tantivy_indexer(Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store, Arc::new(cfg.tantivy.clone()))))
+            db.with_tantivy_indexer(Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store, Arc::new(cfg.tantivy.clone()))))
         }
         _ => db,
     };

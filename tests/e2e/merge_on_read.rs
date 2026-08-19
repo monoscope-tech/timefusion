@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
@@ -64,7 +64,7 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
     // resolved against rows that live in Delta + the hot tier, not MemBuffer.
     // The clock must leave the rows' bucket first — only a SEALED bucket is
     // flushable, and only a drained one is demoted.
-    clock::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
+    support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
     env.force_flush().await?;
     env.force_evict().await?;
     let before = env.snapshot_stats().hot_tier;

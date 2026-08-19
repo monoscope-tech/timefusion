@@ -57,7 +57,7 @@ use dashmap::{DashMap, DashSet};
 use datafusion::{error::Result as DFResult, logical_expr::Expr, physical_expr::PhysicalExpr, physical_plan::ExecutionPlan};
 use tracing::{debug, info, warn};
 
-use crate::mem_buffer::{TableKey, compile_filter_conjunction, overlaps, table_key};
+use crate::write::mem_buffer::{TableKey, compile_filter_conjunction, overlaps, table_key};
 
 const EXT: &str = "arrow";
 const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
@@ -124,7 +124,7 @@ impl DemotionHealth {
     fn suppressed(&self) -> bool {
         match self.until.load(Relaxed) {
             0 => false,
-            until if crate::clock::now_micros() < until => true,
+            until if crate::support::now_micros() < until => true,
             _ => {
                 self.until.store(0, Relaxed);
                 self.demoted.store(0, Relaxed);
@@ -540,7 +540,7 @@ impl HotTier {
         if h.until.load(Relaxed) != 0 || demoted < sample || wasted * 100 < demoted * WASTE_PCT {
             return;
         }
-        h.until.store(crate::clock::now_micros() + SUPPRESSION_COOLDOWN.as_micros() as i64, Relaxed);
+        h.until.store(crate::support::now_micros() + SUPPRESSION_COOLDOWN.as_micros() as i64, Relaxed);
         h.episodes.fetch_add(1, Relaxed);
         self.suppressions.fetch_add(1, Relaxed);
         info!(
@@ -569,9 +569,9 @@ impl HotTier {
         //
         // Best-effort: an unsortable batch set is still worth demoting, it just
         // does not carry the `s` marker and so contributes no ordering claim.
-        let owned = crate::schema_loader::get_schema(table_name)
+        let owned = crate::schema::get_schema(table_name)
             .filter(|s| !s.sorting_columns.is_empty())
-            .and_then(|s| crate::mem_buffer::sort_partition(s, batches.to_vec()));
+            .and_then(|s| crate::write::mem_buffer::sort_partition(s, batches.to_vec()));
         let (batches, sorted) = owned.as_deref().map_or((batches, false), |b| (b, true));
         let Some(schema) = batches.first().map(|b| b.schema()) else { return Ok(None) };
         let dir = self.root.join(project_id).join(table_name);
@@ -579,15 +579,13 @@ impl HotTier {
         let seq = self.seq.fetch_add(1, Relaxed);
         // The stamp rides in the FILENAME so `rescan` recovers the gate after a
         // restart without reopening every file.
-        let max_stamp = crate::schema_loader::get_schema(table_name)
-            .filter(|s| s.version_append)
-            .and_then(|s| s.dedup_tiebreak.clone())
-            .and_then(|c| max_stamp_of(batches, &c));
+        let max_stamp =
+            crate::schema::get_schema(table_name).filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone()).and_then(|c| max_stamp_of(batches, &c));
         let stamp_suffix = max_stamp.map(|s| format!("_{s}")).unwrap_or_default();
         let sort_marker = if sorted { "s" } else { "" };
         let covers_marker = if covers_window { "c" } else { "" };
         let path = dir.join(format!("{bucket_id}_{min_ts}_{end_ts}_{seq}{sort_marker}{covers_marker}{stamp_suffix}.{EXT}"));
-        crate::wal::write_atomic_with(&path, true, |f| {
+        crate::write::wal::write_atomic_with(&path, true, |f| {
             // UNCOMPRESSED, deliberately (2026-08-14). LZ4 bought hours per GB
             // on a 128GB cap, but the box has 1.1TB free, so the cap was the
             // wrong constraint to optimise against. Uncompressed restores the
@@ -724,7 +722,7 @@ impl HotTier {
         if metas.is_empty() {
             return HotLeg::default();
         }
-        let declared = crate::schema_loader::get_schema(table_name);
+        let declared = crate::schema::get_schema(table_name);
         let versioned = declared.as_ref().is_some_and(|s| s.version_append);
         let orders = declared.is_some_and(|s| !s.sorting_columns.is_empty());
         let plan = plan_leg(&metas, mem_ranges, versioned, orders, &|p| self.validate(p));
@@ -968,7 +966,7 @@ impl HotTier {
 
     pub fn stats(&self) -> HotTierStats {
         let (files, bytes) = self.index.iter().fold((0usize, 0u64), |(f, b), e| (f + e.len(), b + e.values().map(|m| m.bytes).sum::<u64>()));
-        let now = crate::clock::now_micros();
+        let now = crate::support::now_micros();
         let mut suppressed: Vec<_> = self
             .health
             .iter()
@@ -1798,7 +1796,7 @@ mod tests {
     fn suppression_lifts_after_cooldown() {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
-        let t0 = crate::clock::set_micros(crate::clock::now_micros());
+        let t0 = crate::support::set_micros(crate::support::now_micros());
         for i in 0..PROBE_DEMOTES as i64 {
             tier.demote("p1", "t", Bucket { bucket_id: i, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: true });
             tier.invalidate("p1", "t");
@@ -1807,7 +1805,7 @@ mod tests {
         tier.demote("p1", "t", Bucket { bucket_id: 10, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: true });
         assert_eq!(tier.stats().files, 0, "still inside the cooldown");
 
-        crate::clock::set_micros(t0 + SUPPRESSION_COOLDOWN.as_micros() as i64 + 1);
+        crate::support::set_micros(t0 + SUPPRESSION_COOLDOWN.as_micros() as i64 + 1);
         tier.demote("p1", "t", Bucket { bucket_id: 11, batches: &[batch(4)], min_ts: 10, max_ts: 20, covers_window: true });
         let s = tier.stats();
         assert_eq!((s.files, s.suppressed_tables), (1, 0), "cooldown elapsed → demotion resumes");
@@ -1816,7 +1814,7 @@ mod tests {
         // per cooldown instead of one per flush.
         tier.invalidate("p1", "t");
         assert_eq!(tier.stats().suppressions, 2);
-        crate::clock::unfreeze();
+        crate::support::unfreeze();
     }
 
     /// Suppression only gates WRITES: files already on disk keep serving.

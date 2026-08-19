@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use timefusion::{clock, database::TailPass};
+use timefusion::{database::TailPass, support};
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
@@ -43,7 +43,7 @@ async fn footerless_partition(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
         env.advance(Duration::from_secs(120));
         env.force_flush().await?;
     }
-    clock::set_micros(FROZEN_START_MICROS);
+    support::set_micros(FROZEN_START_MICROS);
     let files = live_files(env).await?;
     assert!(files.len() > 1, "fixture must produce several files to rewrite, got {files:?}");
     Ok(files)

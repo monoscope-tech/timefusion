@@ -10,11 +10,11 @@ use arrow_ipc::writer::StreamWriter;
 use serial_test::serial;
 use timefusion::{
     database::Database,
-    grpc_handlers::{
+    server::{
         IngestService,
         pb::{WriteBatch, ingest_client::IngestClient, write_ack::Status as AckStatus},
     },
-    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span},
+    support::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span},
 };
 use tokio::io::DuplexStream;
 use tokio_stream::wrappers::ReceiverStream;
@@ -57,7 +57,7 @@ async fn make_client(svc: IngestService) -> IngestClient<tonic::transport::Chann
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_write_round_trip() -> Result<()> {
     let cfg = TestConfigBuilder::new("grpc_test").with_buffer_mode(BufferMode::Enabled).build();
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
 
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -92,7 +92,7 @@ async fn grpc_write_round_trip() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_rejects_bad_payload() -> Result<()> {
     let cfg = TestConfigBuilder::new("grpc_test").with_buffer_mode(BufferMode::Enabled).build();
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
 
     let mut client = make_client(IngestService::new(db, None)).await;
@@ -112,7 +112,7 @@ async fn grpc_rejects_bad_payload() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_auth_rejects_missing_token() -> Result<()> {
     let cfg = TestConfigBuilder::new("grpc_test").with_buffer_mode(BufferMode::Enabled).build();
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
 
     let mut client = make_client(IngestService::new(db, Some("s3cret".into()))).await;

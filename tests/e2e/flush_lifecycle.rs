@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
@@ -28,7 +28,7 @@ async fn flush_completed_bucket_only() -> anyhow::Result<()> {
     // is still the "current" open bucket. Advancing further (e.g.
     // bucket_b_ts + 2*bucket_size) would also mark B as completed and
     // both would flush, defeating the test.
-    clock::set_micros(bucket_b_ts);
+    support::set_micros(bucket_b_ts);
 
     let stats_before = env.snapshot_stats();
     assert!(stats_before.mem_total_rows >= 2, "expected >=2 rows pre-flush, got {:?}", stats_before);

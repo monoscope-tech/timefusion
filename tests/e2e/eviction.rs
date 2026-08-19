@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
@@ -17,9 +17,9 @@ async fn old_data_evicted_recent_retained() -> anyhow::Result<()> {
     insert_at(&client, "old", FROZEN_START_MICROS).await?;
 
     // Advance well past retention; everything before the new "now" is old.
-    clock::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
+    support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
 
-    insert_at(&client, "recent", clock::now_micros()).await?;
+    insert_at(&client, "recent", support::now_micros()).await?;
 
     // Run flush + eviction.
     env.force_flush().await?;

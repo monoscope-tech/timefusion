@@ -9,7 +9,7 @@ use bytes::Bytes;
 use object_store::{ObjectStoreExt, PutPayload, path::Path};
 use timefusion::{
     database::Database,
-    object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
+    storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
 };
 
 #[tokio::test]

@@ -35,7 +35,7 @@ use datafusion::{
 use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
 use futures::StreamExt;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
-use timefusion::read_dedup::DedupExec;
+use timefusion::read::DedupExec;
 
 // ── Counting allocator: peak live bytes + total alloc count ──────────────────
 struct CountingAlloc;
@@ -219,7 +219,7 @@ fn bench_flush_dedup(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total as u64));
         group.bench_function(format!("{}k_rows_{}pct_dup", total / 1000, 100 - distinct * 100 / total), |b| {
             b.iter(|| {
-                let out = timefusion::mem_buffer::dedup_batches(batches.clone(), &keys, Some("version"), None).unwrap();
+                let out = timefusion::write::mem_buffer::dedup_batches(batches.clone(), &keys, Some("version"), None).unwrap();
                 std::hint::black_box(out.iter().map(|x| x.num_rows()).sum::<usize>())
             })
         });

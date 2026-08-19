@@ -5,7 +5,7 @@ use datafusion::arrow::array::AsArray;
 use serial_test::serial;
 use timefusion::{
     database::Database,
-    test_utils::test_helpers::{array_get_str as get_str, *},
+    support::test_helpers::{array_get_str as get_str, *},
 };
 
 async fn setup_test_database() -> Result<(Database, datafusion::prelude::SessionContext)> {

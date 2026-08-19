@@ -18,8 +18,8 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
-use timefusion::test_utils::test_helpers::delta_physical_row_count;
+use timefusion::support;
+use timefusion::support::test_helpers::delta_physical_row_count;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at, insert_for};
 
@@ -75,7 +75,7 @@ async fn a_sealed_partition_converges_through_durable_bounded_tasks() -> anyhow:
 
     // Seal the day: move the clock into the NEXT UTC day so the partition is
     // cold (cold_optimize_after_days = 1). This is the state prod was in.
-    clock::set_micros(day_start + 86_400 * sec + 6 * 3_600 * sec);
+    support::set_micros(day_start + 86_400 * sec + 6 * 3_600 * sec);
 
     // Drain the same durable units background workers execute. Repeated calls
     // are safe and stand in for progress resumed across process restarts.
@@ -138,7 +138,7 @@ async fn catchup_scores_actionable_project_debt_not_date_wide_file_count() -> an
         env.advance(Duration::from_secs(bucket_secs * 2));
         env.force_flush().await?;
     }
-    clock::set_micros(day_start + 2 * day);
+    support::set_micros(day_start + 2 * day);
 
     let table_ref = env.db().resolve_table("fragmented", "otel_logs_and_spans").await?;
     let file_counts = || async {

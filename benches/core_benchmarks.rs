@@ -5,7 +5,7 @@ use datafusion::execution::context::SessionContext;
 use timefusion::{
     config::AppConfig,
     database::Database,
-    test_utils::test_helpers::{json_to_batch, test_span},
+    support::test_helpers::{json_to_batch, test_span},
 };
 
 fn bench_config(name: &str) -> Arc<AppConfig> {
@@ -46,7 +46,7 @@ fn is_minio_available() -> bool {
 async fn setup_write_bench(name: &str) -> (SessionContext, Arc<Database>, String) {
     let cfg = bench_config(name);
     unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await.unwrap().with_buffered_layer(Arc::clone(&layer)));
     let mut ctx = db.clone().create_session_context();
     db.setup_session_context(&mut ctx).unwrap();
@@ -58,7 +58,7 @@ async fn setup_write_bench(name: &str) -> (SessionContext, Arc<Database>, String
 async fn setup_read_bench(name: &str, pre_insert: usize) -> (SessionContext, Arc<Database>, String) {
     let cfg = minio_config(name);
     unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await.unwrap().with_buffered_layer(Arc::clone(&layer)));
     let mut ctx = db.clone().create_session_context();
     db.setup_session_context(&mut ctx).unwrap();
@@ -78,14 +78,14 @@ async fn setup_s3_bench(name: &str) -> (SessionContext, Arc<Database>, String) {
 
     let db_for_cb = Database::with_config(Arc::clone(&cfg)).await.unwrap();
     let db_clone = db_for_cb.clone();
-    let delta_cb: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(move |project_id, table_name, batches, _watermark| {
+    let delta_cb: timefusion::write::DeltaWriteCallback = Arc::new(move |project_id, table_name, batches, _watermark| {
         let db = db_clone.clone();
         Box::pin(async move {
             db.insert_records_batch(&project_id, &table_name, batches, true, None).await?;
             Ok(Vec::new())
         })
     });
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap().with_delta_writer(delta_cb));
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap().with_delta_writer(delta_cb));
     let db = db_for_cb.with_buffered_layer(Arc::clone(&layer));
 
     let pid = format!("bench_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -150,7 +150,7 @@ fn bench_inmemory_writes(c: &mut Criterion) {
     {
         let cfg = bench_config("wapi");
         unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
-        let layer = rt.block_on(async { Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap()) });
+        let layer = rt.block_on(async { Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap()) });
         let db = rt.block_on(async { Arc::new(Database::with_config(cfg).await.unwrap().with_buffered_layer(layer)) });
         let pid = format!("bench_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let batches: Vec<_> = (0..10).map(|i| json_to_batch(vec![test_span(&format!("id_{i}"), "span", &pid)]).unwrap()).collect();

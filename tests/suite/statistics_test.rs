@@ -1,5 +1,5 @@
 use anyhow::Result;
-use timefusion::statistics::DeltaStatisticsExtractor;
+use timefusion::read::DeltaStatisticsExtractor;
 
 #[tokio::test]
 async fn test_statistics_extractor_cache() -> Result<()> {

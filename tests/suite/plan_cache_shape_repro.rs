@@ -17,7 +17,7 @@ use datafusion::{
 
 async fn ctx() -> SessionContext {
     let mut ctx = SessionContext::new();
-    timefusion::functions::register_custom_functions(&mut ctx).unwrap();
+    timefusion::read::functions::register_custom_functions(&mut ctx).unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("project_id", DataType::Utf8, false),
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),

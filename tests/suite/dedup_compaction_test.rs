@@ -13,7 +13,7 @@ use datafusion::arrow::{
 use serial_test::serial;
 use timefusion::{
     database::Database,
-    test_utils::test_helpers::{BufferMode, TestConfigBuilder, array_get_str, delta_physical_row_count, json_to_batch, test_span_ts},
+    support::test_helpers::{BufferMode, TestConfigBuilder, array_get_str, delta_physical_row_count, json_to_batch, test_span_ts},
 };
 
 #[serial]
@@ -300,7 +300,7 @@ async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_ans
     // A REAL buffered layer: without one `min_buffered_micros` is always None,
     // the bound degenerates to the day end, and the partial-day case this test
     // exists for is never exercised.
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -628,7 +628,7 @@ async fn dedup_shards_over_budget_and_preserves_rows() -> Result<()> {
         .iter()
         .flat_map(|b| {
             let col = b.column(0);
-            (0..b.num_rows()).map(|i| timefusion::test_utils::test_helpers::array_get_str(col.as_ref(), i)).collect::<Vec<_>>()
+            (0..b.num_rows()).map(|i| timefusion::support::test_helpers::array_get_str(col.as_ref(), i)).collect::<Vec<_>>()
         })
         .collect();
     assert_eq!(got, vec!["a", "b", "c", "d"], "every distinct id preserved exactly once");
@@ -767,7 +767,7 @@ async fn update_from_duplicate_source_keys_applies_last_write_wins() -> Result<(
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
-    use timefusion::test_utils::test_helpers::minio_test_config;
+    use timefusion::support::test_helpers::minio_test_config;
     let id = format!("cold-consol-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let dir = format!("/tmp/timefusion-{id}");
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -816,7 +816,7 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
         let paths = batch.column_by_name("path").unwrap();
         let file_sizes = batch.column_by_name("size_bytes").unwrap().as_primitive::<Int64Type>();
         (0..file_sizes.len())
-            .filter(|&i| timefusion::test_utils::test_helpers::array_get_str(paths.as_ref(), i).contains(&marker))
+            .filter(|&i| timefusion::support::test_helpers::array_get_str(paths.as_ref(), i).contains(&marker))
             .map(|i| file_sizes.value(i))
             .collect()
     };
@@ -891,7 +891,7 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
 /// A `Database` with a real buffered layer, so writes can land in MemBuffer.
 async fn buffered_db(name: &str) -> Result<(Arc<Database>, String)> {
     let cfg = TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).build();
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(layer));
     Ok((db, format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8])))
 }
@@ -903,7 +903,7 @@ async fn write(db: &Arc<Database>, project_id: &str, rows: Vec<serde_json::Value
 }
 
 async fn write_to(db: &Arc<Database>, table: &str, project_id: &str, rows: Vec<serde_json::Value>, to_delta: bool) -> Result<()> {
-    let batch = timefusion::test_utils::test_helpers::json_to_batch_for(table, rows)?;
+    let batch = timefusion::support::test_helpers::json_to_batch_for(table, rows)?;
     db.insert_records_batch(project_id, table, vec![batch], to_delta, None).await?;
     Ok(())
 }
@@ -956,7 +956,7 @@ async fn column_strings(db: &Arc<Database>, sql: &str) -> Result<Vec<String>> {
         .collect()
         .await?
         .iter()
-        .flat_map(|b| (0..b.num_rows()).map(|i| timefusion::test_utils::test_helpers::array_get_str(b.column(0).as_ref(), i)).collect::<Vec<_>>())
+        .flat_map(|b| (0..b.num_rows()).map(|i| timefusion::support::test_helpers::array_get_str(b.column(0).as_ref(), i)).collect::<Vec<_>>())
         .collect())
 }
 
@@ -1250,7 +1250,7 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
     // Pre-create the unified Delta table at the OLD column set, at exactly the
     // URI `get_or_create_unified_table` will later resolve, so TF LOADS this
     // table instead of creating one from the YAML.
-    let schema = timefusion::schema_loader::get_schema(TABLE).expect("fixture registered");
+    let schema = timefusion::schema::get_schema(TABLE).expect("fixture registered");
     let added = ["updated_at", "deleted"];
     let old_columns: Vec<_> = schema.columns()?.into_iter().filter(|c| !added.contains(&c.name().as_str())).collect();
     assert_eq!(old_columns.len(), schema.columns()?.len() - added.len(), "the fixture must still declare the columns this test removes");
@@ -1268,11 +1268,11 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
     // point is the Delta commit.
     let db_inner = Database::with_config(Arc::clone(&cfg)).await?;
     let db_for_cb = db_inner.clone();
-    let cb: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(move |project, table, batches, wm| {
+    let cb: timefusion::write::DeltaWriteCallback = Arc::new(move |project, table, batches, wm| {
         let db = db_for_cb.clone();
         Box::pin(async move { db.insert_records_batch(&project, &table, batches, true, Some(&wm)).await })
     });
-    let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(cb));
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(cb));
     let db = Arc::new(db_inner.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = chrono::Utc::now().timestamp_micros();
@@ -1282,7 +1282,7 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
     // skew that failed every prod flush.
     for (i, skip_queue) in [(0, true), (1, false)] {
         let rows = vec![mor_row(&format!("k{i}"), "v", &project_id, ts - i * 1000, None)];
-        let batch = timefusion::test_utils::test_helpers::json_to_batch_for(TABLE, rows)?;
+        let batch = timefusion::support::test_helpers::json_to_batch_for(TABLE, rows)?;
         db.insert_records_batch(&project_id, TABLE, vec![batch], skip_queue, None).await.map_err(|e| {
             anyhow::anyhow!(
                 "writing the YAML's column set into a Delta table created at an OLDER one failed (skip_queue={skip_queue}): {e}\n\
@@ -1550,7 +1550,7 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
     const TABLE: &str = "mor_versioned";
     let cfg = TestConfigBuilder::new("migrate_cols").with_buffer_mode(BufferMode::Enabled).build();
 
-    let schema = timefusion::schema_loader::get_schema(TABLE).expect("fixture registered");
+    let schema = timefusion::schema::get_schema(TABLE).expect("fixture registered");
     let added = ["updated_at", "deleted"];
     let old_columns: Vec<_> = schema.columns()?.into_iter().filter(|c| !added.contains(&c.name().as_str())).collect();
     let (storage_uri, storage_options) = unified_table_location(&cfg, TABLE);
@@ -1592,7 +1592,7 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
 #[serial]
 #[tokio::test]
 async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
-    use timefusion::tantivy_index::{manifest, service::TantivyIndexService};
+    use timefusion::tantivy::{load_manifest, search::TantivyIndexService};
     const TABLE: &str = "otel_logs_and_spans";
     let cfg = TestConfigBuilder::new("tantivy_reconcile").with_buffer_mode(BufferMode::Enabled).build();
     let tantivy_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -1613,7 +1613,7 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     // is why it was being chased by hand from sibling containers (three
     // OOM-killed on 2026-08-16). Seed a sentinel first: a gauge that is simply
     // never written also reads 0, so asserting 0 alone would pass vacuously.
-    let tantivy_stats = timefusion::metrics::maintenance_stats();
+    let tantivy_stats = timefusion::observability::maintenance_stats();
     let ordering = std::sync::atomic::Ordering::Relaxed;
     tantivy_stats.tantivy_uncovered_files.store(999, ordering);
 
@@ -1635,7 +1635,7 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     );
     let (uncovered_after, _) = db.tantivy_coverage_census().await?;
     assert_eq!(uncovered_after, 0, "after indexing every uncovered file the census must independently agree the reindex is done");
-    let m = manifest::load(tantivy_store.as_ref(), TABLE, &project_id).await?;
+    let m = load_manifest(tantivy_store.as_ref(), TABLE, &project_id).await?;
     assert_eq!(m.entries.len(), 2, "per-uuid manifest covers both files");
 
     // Compact 2 files → 1: the inputs' entries are now stale.
@@ -1647,7 +1647,7 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     // "default" list would miss this manifest) and the output file covered.
     let (_, removed2, _) = db.tantivy_reconcile_table(TABLE).await?;
     assert!(removed2 >= 2, "pre-compaction entries must be GC'd, removed={removed2}");
-    let m = manifest::load(tantivy_store.as_ref(), TABLE, &project_id).await?;
+    let m = load_manifest(tantivy_store.as_ref(), TABLE, &project_id).await?;
     let live: Vec<String> = table_ref.read().await.get_file_uris()?.filter(|u| u.contains(&project_id)).collect();
     assert!(!live.is_empty());
     let covered: Vec<&String> = m.entries.values().filter(|e| e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
@@ -1776,8 +1776,7 @@ async fn a_certified_partition_with_buffered_rows_still_answers_without_the_keys
     cfg.maintenance.timefusion_read_dedup_skip_swept = true;
     let cfg = Arc::new(cfg);
     let db0 = Database::with_config(Arc::clone(&cfg)).await?;
-    let layer =
-        Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::bootstrap::delta_write_callback(&db0)));
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
     let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -1929,7 +1928,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     struct ClockGuard;
     impl Drop for ClockGuard {
         fn drop(&mut self) {
-            timefusion::clock::unfreeze();
+            timefusion::support::unfreeze();
         }
     }
     let _clock_guard = ClockGuard;
@@ -1947,7 +1946,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(
+    timefusion::support::advance_micros(
         timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
     );
     assert!(db.run_maintenance_units(1024).await? > 0, "eligible slice tasks must be drained");
@@ -1987,7 +1986,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     // than no metric, and it cost a full diagnosis pass chasing a rollup outage
     // that was not happening. nextest gives each test its own process, so these
     // process-global counters are this test's alone.
-    let stats = timefusion::metrics::maintenance_stats();
+    let stats = timefusion::observability::maintenance_stats();
     let ordering = std::sync::atomic::Ordering::Relaxed;
     assert!(stats.rollup_output_rows.load(ordering) > 0, "the coordinator published rollup rows but rollup_output_rows_total stayed 0");
     assert!(stats.rollup_staged_projects.load(ordering) > 0, "the coordinator published a slice but rollup_staged_projects_total stayed 0");
@@ -2005,7 +2004,7 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("span_late", "op", &project_id, late)])?], true, None)
         .await?;
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(
+    timefusion::support::advance_micros(
         timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
     );
     assert!(db.run_maintenance_units(1024).await? > 0, "late slice tasks must be drained");
@@ -2038,7 +2037,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     struct ClockGuard;
     impl Drop for ClockGuard {
         fn drop(&mut self) {
-            timefusion::clock::unfreeze();
+            timefusion::support::unfreeze();
         }
     }
     let _clock_guard = ClockGuard;
@@ -2086,7 +2085,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-    timefusion::clock::advance_micros(
+    timefusion::support::advance_micros(
         timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
     );
     assert!(db.run_maintenance_units(1024).await? > 0, "eligible yesterday slices must be drained");
@@ -2210,10 +2209,10 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // cannot see it: the substitution happens in `DmlQueryPlanner`, and EXPLAIN
     // renders its inner plan with the DEFAULT planner, so an explained query
     // always shows the raw scan even when the real one routes.
-    let hits = || timefusion::metrics::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
-    let misses = || timefusion::metrics::maintenance_stats().rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
+    let hits = || timefusion::observability::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
+    let misses = || timefusion::observability::maintenance_stats().rollup_misses_total.load(std::sync::atomic::Ordering::Relaxed);
     let miss_snapshot = || {
-        let stats = timefusion::metrics::maintenance_stats();
+        let stats = timefusion::observability::maintenance_stats();
         [
             stats.rollup_miss_not_built.load(std::sync::atomic::Ordering::Relaxed),
             stats.rollup_miss_stale_coverage.load(std::sync::atomic::Ordering::Relaxed),
@@ -2257,7 +2256,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // inherits the wall clock late in the UTC day, the same six-hour covered
     // interior falls below the 20% hybrid cost threshold and the assertion
     // becomes time-of-day dependent.
-    timefusion::clock::set_micros(hi + 3_600_000_000);
+    timefusion::support::set_micros(hi + 3_600_000_000);
     let open = query.replace(&format!(" AND timestamp < to_timestamp_micros({hi})"), "");
     let before = hits();
     let open_reasons_before = miss_snapshot();
@@ -2381,7 +2380,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // the frontier scheduling path rather than the sealed one this asserts on.
     // That made the test pass at 23:00 UTC and fail at 03:00 UTC on the very same
     // commit — it failed CI on 2026-08-18 and reproduced identically on master.
-    timefusion::clock::advance_micros(
+    timefusion::support::advance_micros(
         timefusion::maintenance_coordinator::LIVE_FRONTIER_WINDOW_MICROS
             + timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS
             + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS

@@ -28,7 +28,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use deltalake::DeltaTable;
-use timefusion::optimizers::time_range_partition_pruner::with_date_partition_filters;
+use timefusion::read::optimizers::time_range_partition_pruner::with_date_partition_filters;
 
 const PROJECT: &str = "prune-proj";
 const BASE_DAY: i32 = 19_723; // 2024-01-01, days since epoch

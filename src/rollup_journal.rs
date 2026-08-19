@@ -37,7 +37,7 @@ struct Snapshot {
 }
 
 fn path(data_dir: &Path) -> PathBuf {
-    crate::wal::meta_path(data_dir, "rollup_invalidations.json")
+    crate::write::wal::meta_path(data_dir, "rollup_invalidations.json")
 }
 
 pub fn load(data_dir: &Path) -> Vec<RollupInvalidation> {
@@ -72,7 +72,7 @@ pub fn store(data_dir: &Path, entries: &[RollupInvalidation]) -> std::io::Result
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec(&Snapshot { version: VERSION, entries: entries.to_vec() }).map_err(std::io::Error::other)?;
-    crate::wal::write_atomic_with(&path, true, |file| file.write_all(&bytes))
+    crate::write::wal::write_atomic_with(&path, true, |file| file.write_all(&bytes))
 }
 
 #[cfg(test)]

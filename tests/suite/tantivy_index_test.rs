@@ -16,8 +16,11 @@ use tantivy::{
     schema::IndexRecordOption,
 };
 use timefusion::{
-    schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
-    tantivy_index::{Hit, build_for_table, build_in_memory, query_index},
+    schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    tantivy::{
+        build_for_table, build_in_memory,
+        search::{Hit, query_index},
+    },
 };
 
 fn ts_field(name: &str, nullable: bool) -> FieldDef {

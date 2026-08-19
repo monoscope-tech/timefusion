@@ -14,10 +14,10 @@
 use std::sync::Arc;
 
 use serial_test::serial;
-use timefusion::{database::Database, test_utils::test_helpers::minio_test_config};
+use timefusion::{database::Database, support::test_helpers::minio_test_config};
 
 async fn tf_session() -> anyhow::Result<datafusion::prelude::SessionContext> {
-    timefusion::test_utils::init_test_logging();
+    timefusion::support::init_test_logging();
     let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let cfg = minio_test_config(&test_id, &format!("/tmp/timefusion-unnest-{test_id}"));
     let db = Arc::new(Database::with_config(cfg).await?);

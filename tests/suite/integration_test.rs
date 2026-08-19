@@ -5,7 +5,7 @@ mod integration {
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
     use serial_test::serial;
-    use timefusion::{database::Database, test_utils::test_helpers::minio_test_config};
+    use timefusion::{database::Database, support::test_helpers::minio_test_config};
     use tokio::sync::Notify;
     use tokio_postgres::{Client, NoTls};
     use uuid::Uuid;
@@ -18,7 +18,7 @@ mod integration {
 
     impl TestServer {
         async fn start() -> Result<Self> {
-            timefusion::test_utils::init_test_logging();
+            timefusion::support::init_test_logging();
 
             let test_id = Uuid::new_v4().to_string();
             // Kernel-assigned free port: tests now run as concurrent processes,
@@ -43,11 +43,11 @@ mod integration {
                 db_clone.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-                let auth_config = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
+                let auth_config = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
-                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_config, None, None, std::future::pending::<()>()) => {
+                    res = timefusion::server::serve_with_logging(Arc::new(ctx), &opts, auth_config, None, None, std::future::pending::<()>()) => {
                         if let Err(e) = res {
                             eprintln!("Server error: {:?}", e);
                         }

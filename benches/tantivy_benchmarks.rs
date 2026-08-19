@@ -19,8 +19,8 @@ use arrow::{
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
 use timefusion::{
-    schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
-    tantivy_index::{builder::build_in_memory, reader::query_index, store},
+    schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    tantivy::{build_in_memory, search::query_index},
 };
 
 fn table() -> TableSchema {
@@ -113,12 +113,12 @@ fn bench_size_ratio(c: &mut Criterion) {
     let table = table();
     let n = 100_000usize;
     let b = synthetic_batch(n);
-    let (blob, stats) = store::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy_index::MergeMode::Now).unwrap();
+    let (blob, stats) = timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now).unwrap();
     let bytes_per_row = blob.len() as f64 / stats.rows as f64;
     println!("tantivy index size: {} bytes for {} rows ({:.2} bytes/row)", blob.len(), stats.rows, bytes_per_row);
     c.bench_function("tantivy_pack_100k_zstd_19", |bench| {
         bench.iter(|| {
-            let _ = store::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy_index::MergeMode::Now).unwrap();
+            let _ = timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now).unwrap();
         });
     });
 }
@@ -132,11 +132,11 @@ use std::{path::PathBuf, time::Duration};
 
 use serde_json::json;
 use timefusion::{
-    buffered_write_layer::DeltaWriteCallback,
     config::{AppConfig, TantivyConfig},
     database::Database,
-    tantivy_index::{search::TantivySearchService, service::TantivyIndexService},
-    test_utils::test_helpers::json_to_batch,
+    support::test_helpers::json_to_batch,
+    tantivy::search::{TantivyIndexService, TantivySearchService},
+    write::DeltaWriteCallback,
 };
 
 fn make_app_cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
@@ -168,7 +168,7 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
             Ok(post.into_iter().filter(|u| !pre_set.contains(u)).collect())
         })
     });
-    let mut layer = timefusion::test_utils::test_helpers::test_layer(cfg_arc.clone()).ok()?.with_delta_writer(delta_cb);
+    let mut layer = timefusion::support::test_helpers::test_layer(cfg_arc.clone()).ok()?.with_delta_writer(delta_cb);
     if tantivy_enabled {
         let bucket = cfg_arc.aws.aws_s3_bucket.clone().unwrap();
         let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg_arc.core.timefusion_table_prefix);

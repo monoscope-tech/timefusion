@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use datafusion_postgres::ServerOptions;
-use timefusion::{database::Database, test_utils::test_helpers::minio_test_config};
+use timefusion::{database::Database, support::test_helpers::minio_test_config};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -34,10 +34,10 @@ impl TestServer {
             let mut ctx = db_clone.clone().create_session_context();
             db_clone.setup_session_context(&mut ctx).expect("setup context");
             let options = ServerOptions::new().with_host("127.0.0.1".into()).with_port(port);
-            let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
+            let auth = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
             tokio::select! {
                 _ = shutdown_clone.notified() => {}
-                result = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &options, auth, None, None, std::future::pending::<()>()) => {
+                result = timefusion::server::serve_with_logging(Arc::new(ctx), &options, auth, None, None, std::future::pending::<()>()) => {
                     if let Err(error) = result { eprintln!("server error: {error:?}"); }
                 }
             }

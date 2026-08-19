@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
@@ -33,8 +33,8 @@ async fn drained_buckets_are_demoted_and_served() -> anyhow::Result<()> {
     let client = env.pg_client().await?;
 
     insert_at(&client, "old", FROZEN_START_MICROS).await?;
-    clock::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
-    insert_at(&client, "recent", clock::now_micros()).await?;
+    support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
+    insert_at(&client, "recent", support::now_micros()).await?;
 
     // Flush commits to Delta and drains the buckets; eviction waits out the
     // in-flight demotion (it shares the demote permit) and then GCs the tier.
@@ -82,7 +82,7 @@ async fn demoted_buckets_survive_restart() -> anyhow::Result<()> {
     let mut env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
     let client = env.pg_client().await?;
     insert_at(&client, "old", FROZEN_START_MICROS).await?;
-    clock::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
+    support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
     env.force_flush().await?;
     env.force_evict().await?;
 

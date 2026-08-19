@@ -27,7 +27,7 @@ mod jsonb_oid {
 
     impl Server {
         async fn start() -> Result<Self> {
-            timefusion::test_utils::init_test_logging();
+            timefusion::support::init_test_logging();
             let test_id = Uuid::new_v4().to_string();
             let port = 5600 + (rand::random::<u16>() % 200);
 
@@ -52,10 +52,10 @@ mod jsonb_oid {
                 let mut ctx = db_clone.clone().create_session_context();
                 db_clone.setup_session_context(&mut ctx).unwrap();
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-                let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
+                let auth = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
                 tokio::select! {
                     _ = sd.notified() => {}
-                    _ = timefusion::pgwire_handlers::serve_with_logging(
+                    _ = timefusion::server::serve_with_logging(
                         Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()
                     ) => {}
                 }

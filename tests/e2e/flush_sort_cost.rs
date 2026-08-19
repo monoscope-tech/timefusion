@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
@@ -32,7 +32,7 @@ async fn timed_flush(skip_bytes: usize, rows: i64) -> anyhow::Result<(Duration, 
         let jitter = ((i * 7919) % rows) * 1_000;
         insert_at(&client, &format!("f-{i}"), FROZEN_START_MICROS - 600_000_000 + jitter).await?;
     }
-    clock::set_micros(FROZEN_START_MICROS);
+    support::set_micros(FROZEN_START_MICROS);
     let t = Instant::now();
     env.force_flush().await?;
     let elapsed = t.elapsed();

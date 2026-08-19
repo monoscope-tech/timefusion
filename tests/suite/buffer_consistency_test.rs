@@ -7,9 +7,9 @@ use datafusion::arrow::array::{Array, AsArray, StringViewArray};
 use serial_test::serial;
 use test_case::test_case;
 use timefusion::{
-    buffered_write_layer::BufferedWriteLayer,
     database::Database,
-    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span},
+    support::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span},
+    write::BufferedWriteLayer,
 };
 
 fn get_str(arr: &dyn Array, idx: usize) -> String {
@@ -24,8 +24,7 @@ async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<Bu
     // reported success. It now errors instead, which would strand these tests'
     // rows in MemBuffer; either way the harness must mirror production.
     let db0 = Database::with_config(Arc::clone(&cfg)).await?;
-    let layer =
-        Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::bootstrap::delta_write_callback(&db0)));
+    let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
     let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     Ok((db, layer, project_id))

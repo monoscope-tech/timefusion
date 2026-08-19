@@ -10,10 +10,10 @@ use aws_sdk_s3::config::{Credentials, Region};
 use datafusion_postgres::ServerOptions;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 use timefusion::{
-    bootstrap::{self, Bootstrapped},
-    buffered_write_layer::BufferedWriteLayer,
-    clock,
     config::AppConfig,
+    server::{Bootstrapped, bootstrap},
+    support,
+    write::BufferedWriteLayer,
 };
 use tokio::sync::Notify;
 use tokio_postgres::{Client, NoTls};
@@ -234,10 +234,10 @@ impl E2eEnvBuilder {
     }
 
     pub async fn start(self) -> Result<E2eEnv> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
 
         // Freeze clock BEFORE bootstrap so background tasks see test time.
-        clock::set_micros(self.frozen_at_micros);
+        support::set_micros(self.frozen_at_micros);
 
         let (minio, endpoint) = ensure_local_minio().await?;
 
@@ -294,7 +294,7 @@ impl E2eEnvBuilder {
             test_id: &test_id,
         });
 
-        let bootstrapped = bootstrap::bootstrap(Arc::clone(&cfg)).await.context("bootstrap")?;
+        let bootstrapped = bootstrap(Arc::clone(&cfg)).await.context("bootstrap")?;
 
         // Pre-warm the default tenant table (matches integration_test pattern).
         bootstrapped.db.get_or_create_table("e2e_project", "otel_logs_and_spans").await.context("pre-warm table")?;
@@ -410,7 +410,7 @@ impl E2eEnv {
             test_id: &self.test_id,
         });
 
-        let bootstrapped = bootstrap::bootstrap(Arc::clone(&cfg)).await.context("re-bootstrap")?;
+        let bootstrapped = bootstrap(Arc::clone(&cfg)).await.context("re-bootstrap")?;
         bootstrapped.db.get_or_create_table("e2e_project", "otel_logs_and_spans").await.context("pre-warm table")?;
 
         self.pg_shutdown = Arc::new(Notify::new());
@@ -429,12 +429,12 @@ impl E2eEnv {
     /// Advance the virtual clock by `delta`. Doesn't await any background work
     /// — pair with `await_next_flush` / `await_next_eviction` for assertions.
     pub fn advance(&self, delta: Duration) -> i64 {
-        clock::advance_micros(delta.as_micros() as i64)
+        support::advance_micros(delta.as_micros() as i64)
     }
 
     /// Force-run a full flush immediately and synchronously. Returns
     /// `FlushStats` so tests can assert on what happened.
-    pub async fn force_flush(&self) -> Result<timefusion::buffered_write_layer::FlushStats> {
+    pub async fn force_flush(&self) -> Result<timefusion::write::FlushStats> {
         self.buffered_layer().flush_all_now().await
     }
 
@@ -465,13 +465,13 @@ impl E2eEnv {
         Ok(())
     }
 
-    pub fn snapshot_stats(&self) -> timefusion::buffered_write_layer::StatsSnapshot {
+    pub fn snapshot_stats(&self) -> timefusion::write::StatsSnapshot {
         self.buffered_layer().snapshot_stats()
     }
 
     /// Foyer hit/miss/size snapshot. Returns `None` if Foyer was disabled
     /// via builder. Tests use this to assert cache warmth post-flush.
-    pub async fn foyer_stats(&self) -> Option<timefusion::object_store_cache::CombinedCacheStats> {
+    pub async fn foyer_stats(&self) -> Option<timefusion::storage::CombinedCacheStats> {
         let cache = self.db().object_store_cache()?;
         Some(cache.get_stats().await)
     }
@@ -494,7 +494,7 @@ impl Drop for E2eEnv {
             let _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(b.db.shutdown_by(deadline)));
         }
         // Unfreeze so we don't leak state into the next test in this binary.
-        clock::unfreeze();
+        support::unfreeze();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
@@ -671,10 +671,10 @@ fn spawn_pgwire(
 ) {
     tokio::spawn(async move {
         let opts = ServerOptions::new();
-        let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
+        let auth = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
         tokio::select! {
             _ = shutdown.notified() => {},
-            res = timefusion::pgwire_handlers::serve_with_listener(listener, session_ctx, &opts, auth, None, Some(db), std::future::pending::<()>()) => {
+            res = timefusion::server::serve_with_listener(listener, session_ctx, &opts, auth, None, Some(db), std::future::pending::<()>()) => {
                 if let Err(e) = res {
                     eprintln!("pgwire error: {e:?}");
                 }

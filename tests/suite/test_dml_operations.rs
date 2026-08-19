@@ -8,7 +8,7 @@ mod tests {
     use timefusion::{
         config::AppConfig,
         database::Database,
-        test_utils::test_helpers::{array_get_str as get_str, minio_test_config},
+        support::test_helpers::{array_get_str as get_str, minio_test_config},
     };
     use tracing::info;
 
@@ -67,7 +67,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_query() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -76,7 +76,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
 
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
@@ -123,7 +123,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_with_predicate() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -132,7 +132,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
 
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
@@ -231,7 +231,7 @@ mod tests {
             }),
         ];
 
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Delete all ERROR level records
@@ -268,7 +268,7 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn test_update_multiple_columns() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -277,7 +277,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
 
         // Insert directly to Delta (skip_queue=true)
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
@@ -317,7 +317,7 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn test_delete_verify_counts() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -355,7 +355,7 @@ mod tests {
             }),
         ];
 
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Verify initial count
@@ -387,7 +387,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_with_common_subexpression() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -396,7 +396,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // `duration + 100` appears twice in SET — CSE-eligible subexpr that
@@ -449,7 +449,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_values() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -458,7 +458,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         let df = ctx
@@ -484,7 +484,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_no_match_no_change() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -493,7 +493,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         let df = ctx
@@ -521,7 +521,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_with_predicate() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -530,7 +530,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         let df = ctx
@@ -561,7 +561,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_unnest_text_array() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -570,7 +570,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Monoscope UPDATE-2 lifted shape: parallel unnest of text[] arrays
@@ -606,7 +606,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_unnest_text_array_idempotent() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -615,7 +615,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         let sql = "UPDATE otel_logs_and_spans o
@@ -646,7 +646,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_guard_survives_pushed_down_time_bounds() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -655,7 +655,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         let sql = format!(
@@ -686,7 +686,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_source_beyond_key_pushdown_cap() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -695,7 +695,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // 4100 keys: 4098 misses + Bob + Alice.
@@ -727,12 +727,12 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_mem_leg_survives_late_layer_attach() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment; #[serial]
         // prevents concurrent access to this process-global.
-        let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+        let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
 
         let db0 = Database::with_config(cfg).await?;
         // Session context created BEFORE the layer is attached — main.rs order.
@@ -742,7 +742,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         // skip_queue=false → rows land in the buffer, not Delta.
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], false, None).await?;
 
@@ -764,7 +764,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_does_not_block_readers_or_writers() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let mut cfg = (*create_test_config(&test_id)).clone();
         // This test observes concurrency during a SLOW merge. Force copy-on-write:
@@ -803,7 +803,7 @@ mod tests {
                     })
                 })
                 .collect();
-            let batch = timefusion::test_utils::test_helpers::json_to_batch_for(INPLACE_TABLE, records)?;
+            let batch = timefusion::support::test_helpers::json_to_batch_for(INPLACE_TABLE, records)?;
             db.insert_records_batch("test_project", INPLACE_TABLE, vec![batch], true, None).await?;
         }
 
@@ -832,7 +832,7 @@ mod tests {
         assert!(!update_handle.is_finished(), "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock");
 
         // Writer mid-UPDATE (direct Delta insert commits + swaps the handle).
-        let extra = timefusion::test_utils::test_helpers::json_to_batch_for(
+        let extra = timefusion::support::test_helpers::json_to_batch_for(
             INPLACE_TABLE,
             vec![serde_json::json!({
                 "id": "extra", "name": "Extra", "project_id": "test_project",
@@ -861,7 +861,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_multi_column_set() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -870,7 +870,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let records = create_test_records(now);
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         let df = ctx
@@ -905,7 +905,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_coalesced_defers_and_drains() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let mut cfg = (*create_test_config(&test_id)).clone();
         cfg.buffer.timefusion_dml_coalesce_secs = 3600; // timer never fires; drains are explicit
@@ -915,7 +915,7 @@ mod tests {
         db.setup_session_context(&mut ctx)?;
 
         let now = chrono::Utc::now();
-        let batch = timefusion::test_utils::test_helpers::json_to_batch_for(INPLACE_TABLE, create_test_records(now))?;
+        let batch = timefusion::support::test_helpers::json_to_batch_for(INPLACE_TABLE, create_test_records(now))?;
         db.insert_records_batch("test_project", INPLACE_TABLE, vec![batch], true, None).await?;
 
         let update = |val: i64, name: &str| {
@@ -959,7 +959,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn coalescer_splits_duplicate_source_keys_single_statement() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let mut cfg = (*create_test_config(&test_id)).clone();
         cfg.buffer.timefusion_dml_coalesce_secs = 3600; // explicit drains only
@@ -969,7 +969,7 @@ mod tests {
         db.setup_session_context(&mut ctx)?;
 
         let now = chrono::Utc::now();
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(create_test_records(now))?;
+        let batch = timefusion::support::test_helpers::json_to_batch(create_test_records(now))?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // One statement, source has TWO rows for name='Bob' → duplicate join keys.
@@ -999,7 +999,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn coalescer_splits_duplicate_composite_source_keys() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let mut cfg = (*create_test_config(&test_id)).clone();
         cfg.buffer.timefusion_dml_coalesce_secs = 3600;
@@ -1016,7 +1016,7 @@ mod tests {
             "context___span_id": "S1", "context___trace_id": "T1",
             "hashes": [], "summary": []
         });
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(vec![rec])?;
+        let batch = timefusion::support::test_helpers::json_to_batch(vec![rec])?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Source: two rows for the SAME (span_id, trace_id) — the multi-tag shape.
@@ -1043,21 +1043,21 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_buffered_rows_persisted_by_flush() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
-        let cfg = timefusion::test_utils::test_helpers::TestConfigBuilder::new("dml_wm").build();
+        timefusion::support::init_test_logging();
+        let cfg = timefusion::support::test_helpers::TestConfigBuilder::new("dml_wm").build();
         // The layer needs the SAME Delta writer prod uses: without it
         // `flush_bucket` cannot persist anything (it now fails rather than
         // draining into the void), and this test is precisely about the flush
         // persisting the post-DML value.
         let db0 = Database::with_config(Arc::clone(&cfg)).await?;
         let layer =
-            Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::bootstrap::delta_write_callback(&db0)));
+            Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
         let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
         let now = chrono::Utc::now();
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(create_test_records(now))?;
+        let batch = timefusion::support::test_helpers::json_to_batch(create_test_records(now))?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Rows are buffer-resident. The mem leg applies; the Delta leg has
@@ -1101,10 +1101,10 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_applies_to_rows_outside_event_time_bound() -> Result<()> {
-        timefusion::test_utils::init_test_logging();
+        timefusion::support::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
-        let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+        let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
         let db0 = Database::with_config(cfg).await?;
         let mut ctx = Arc::new(db0.clone()).create_session_context();
         let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
@@ -1116,7 +1116,7 @@ mod tests {
             "timestamp": far_future, "level": "INFO", "status_code": "OK", "duration": 1,
             "date": "2238-12-31", "hashes": [], "summary": []
         });
-        let batch = timefusion::test_utils::test_helpers::json_to_batch(vec![record])?;
+        let batch = timefusion::support::test_helpers::json_to_batch(vec![record])?;
         // skip_queue=true: straight to Delta, as prod's junk predates the bound.
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 

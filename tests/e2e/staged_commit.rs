@@ -82,7 +82,7 @@ async fn concurrent_unified_table_staging_loses_nothing() -> anyhow::Result<()> 
         handles.push(tokio::spawn(async move {
             for i in 0..per {
                 let batch =
-                    timefusion::test_utils::test_helpers::json_to_batch(vec![timefusion::test_utils::test_helpers::test_span(&format!("{p}-{i}"), "span", p)])?;
+                    timefusion::support::test_helpers::json_to_batch(vec![timefusion::support::test_helpers::test_span(&format!("{p}-{i}"), "span", p)])?;
                 // skip_queue=true → straight to the staged commit path, bypassing MemBuffer.
                 db.insert_records_batch(p, "otel_logs_and_spans", vec![batch], true, None).await?;
             }
@@ -115,7 +115,7 @@ async fn schema_evolving_batch_falls_back_to_merge() -> anyhow::Result<()> {
     db.get_or_create_table("evolve_proj", "otel_logs_and_spans").await?;
 
     // Standard otel batch + one column the table schema doesn't have.
-    let base = timefusion::test_utils::test_helpers::json_to_batch(vec![timefusion::test_utils::test_helpers::test_span("evo-1", "span", "evolve_proj")])?;
+    let base = timefusion::support::test_helpers::json_to_batch(vec![timefusion::support::test_helpers::test_span("evo-1", "span", "evolve_proj")])?;
     let n = base.num_rows();
     let mut fields: Vec<Arc<Field>> = base.schema().fields().iter().cloned().collect();
     let mut cols = base.columns().to_vec();

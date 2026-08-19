@@ -13,17 +13,17 @@ use object_store::memory::InMemory;
 use tempfile::TempDir;
 use timefusion::{
     config::TantivyConfig,
-    schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
-    tantivy_index::{
-        manifest::{self, ManifestEntry},
-        search::TantivySearchService,
-        service::TantivyIndexService,
+    schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    tantivy::{
+        ManifestEntry, SCHEMA_VERSION, load_manifest,
+        search::{TantivyIndexService, TantivySearchService},
         udf::TextMatchPred,
+        upsert_manifest,
     },
 };
 
-fn level_error_node() -> timefusion::tantivy_index::udf::PredNode {
-    timefusion::tantivy_index::udf::PredNode::Leaf(TextMatchPred { column: "level".into(), query: "ERROR".into() })
+fn level_error_node() -> timefusion::tantivy::udf::PredNode {
+    timefusion::tantivy::udf::PredNode::Leaf(TextMatchPred { column: "level".into(), query: "ERROR".into() })
 }
 
 #[allow(dead_code)]
@@ -94,7 +94,7 @@ async fn callback_builds_index_and_search_returns_hits() {
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["test-uri".into()]).await.expect("callback");
 
     // Manifest has one entry now
-    let m = manifest::load(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
     assert_eq!(m.entries.len(), 1);
     let entry = m.entries.values().next().unwrap();
     assert_eq!(entry.rows, 3);
@@ -131,7 +131,7 @@ async fn multi_pred_and_is_single_pass_and_conjunctive() {
     let cache = TempDir::new().unwrap();
     let search = TantivySearchService::new(store, cache.path().to_path_buf());
     let preds = vec![TextMatchPred { column: "level".into(), query: "ERROR".into() }, TextMatchPred { column: "id".into(), query: "c".into() }];
-    let node = timefusion::tantivy_index::udf::PredNode::from_preds(&preds).expect("non-empty");
+    let node = timefusion::tantivy::udf::PredNode::from_preds(&preds).expect("non-empty");
     let r = search.search_with_stats(table_name, project_id, &node, 1000, None).await.unwrap().expect("usable");
     assert_eq!(r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec!["c".to_string()]);
     assert_eq!(r.indexed_rows, 3, "denominator must count the index set once, not per predicate");
@@ -153,11 +153,11 @@ async fn single_file_flush_publishes_partition_mirrored_blob() {
     let b = batch(&[(1_000_000, "a", "ERROR")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec![uri.clone()]).await.unwrap();
 
-    let m = manifest::load(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
     let entry = m.entries.get(&rel).expect("manifest keyed by table-relative parquet path");
     assert_eq!(entry.covered_files, vec![uri], "covered_files must keep the absolute URI");
     let blob = entry.index.as_ref().expect("index built");
-    assert_eq!(blob, &timefusion::tantivy_index::store::index_path_for_parquet(table_name, &rel).to_string(), "blob must live at the partition-mirrored path");
+    assert_eq!(blob, &timefusion::tantivy::index_path_for_parquet(table_name, &rel).to_string(), "blob must live at the partition-mirrored path");
 
     // And the read side must find + query it.
     let cache = TempDir::new().unwrap();
@@ -196,7 +196,7 @@ async fn callback_skips_when_table_not_indexed() {
     let cb = svc.callback();
     let b = batch(&[(1_000_000, "a", "INFO")]);
     cb("p1".into(), "no_such_table".into(), vec![b], vec![]).await.expect("noop callback");
-    let m = manifest::load(store.as_ref(), "no_such_table", "p1").await.unwrap();
+    let m = load_manifest(store.as_ref(), "no_such_table", "p1").await.unwrap();
     assert!(m.entries.is_empty(), "no manifest entry should be written for an unknown table");
 }
 
@@ -205,7 +205,7 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
     // Simulate an entry whose build failed: index=None, error=Some.
     // search() must skip it and return zero hits (no panic).
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    manifest::upsert(
+    upsert_manifest(
         store.as_ref(),
         "logs",
         "p1",
@@ -214,7 +214,7 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
             index: None,
             rows: 0,
             built_at: chrono::Utc::now(),
-            schema_version: manifest::SCHEMA_VERSION,
+            schema_version: SCHEMA_VERSION,
             min_timestamp_micros: None,
             max_timestamp_micros: None,
             error: Some("simulated build failure".into()),
@@ -243,7 +243,7 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     // First flush wrote file_a; second flush wrote file_b.
     cb(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "INFO")])], vec!["file_a".into()]).await.unwrap();
     cb(project_id.into(), table_name.into(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["file_b".into()]).await.unwrap();
-    let m_before = manifest::load(store.as_ref(), table_name, project_id).await.unwrap();
+    let m_before = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
     assert_eq!(m_before.entries.len(), 2);
 
     // Compaction has rewritten file_a away but file_b survives. Only the
@@ -252,7 +252,7 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     assert_eq!(report.entries_removed, 1, "only one entry should be stale");
     assert_eq!(report.kept, 1, "the entry covering file_b should be kept");
 
-    let m_after = manifest::load(store.as_ref(), table_name, project_id).await.unwrap();
+    let m_after = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
     assert_eq!(m_after.entries.len(), 1, "one entry should remain");
     let surviving = m_after.entries.values().next().unwrap();
     assert_eq!(surviving.covered_files, vec!["file_b".to_string()]);
@@ -260,7 +260,7 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     // Calling GC with no live URIs should drop the remaining entry.
     let report2 = svc.gc_after_compaction(table_name, project_id, &[]).await.unwrap();
     assert_eq!(report2.entries_removed, 1);
-    let m_final = manifest::load(store.as_ref(), table_name, project_id).await.unwrap();
+    let m_final = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
     assert!(m_final.entries.is_empty());
 }
 

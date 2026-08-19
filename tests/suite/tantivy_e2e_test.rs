@@ -24,11 +24,11 @@ use datafusion::{arrow::array::AsArray, execution::context::SessionContext};
 use serde_json::json;
 use serial_test::serial;
 use timefusion::{
-    buffered_write_layer::DeltaWriteCallback,
     config::{AppConfig, TantivyConfig},
     database::Database,
-    tantivy_index::{search::TantivySearchService, service::TantivyIndexService},
-    test_utils::test_helpers::json_to_batch,
+    support::test_helpers::json_to_batch,
+    tantivy::search::{TantivyIndexService, TantivySearchService},
+    write::DeltaWriteCallback,
 };
 
 fn cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
@@ -70,7 +70,7 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
         })
     });
 
-    let mut layer = timefusion::test_utils::test_helpers::test_layer(cfg_arc.clone())?.with_delta_writer(delta_cb);
+    let mut layer = timefusion::support::test_helpers::test_layer(cfg_arc.clone())?.with_delta_writer(delta_cb);
     let mut svc: Option<Arc<TantivyIndexService>> = None;
     if tantivy_enabled {
         let bucket = cfg_arc.aws.aws_s3_bucket.clone().unwrap();
@@ -162,10 +162,10 @@ const TABLE: &str = "otel_logs_and_spans";
 /// build is a detached task since the flush-throughput work (ef13450) —
 /// `flush_all_now()` returning only guarantees the Delta commit, so tests
 /// asserting on the manifest must wait for the sidecar to catch up.
-async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, project: &str, want: usize) -> Result<timefusion::tantivy_index::manifest::Manifest> {
+async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, project: &str, want: usize) -> Result<timefusion::tantivy::Manifest> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let m = timefusion::tantivy_index::manifest::load(store, TABLE, project).await?;
+        let m = timefusion::tantivy::load_manifest(store, TABLE, project).await?;
         if m.entries.len() >= want {
             return Ok(m);
         }
@@ -316,7 +316,7 @@ async fn compaction_gc_drops_stale_indexes_keeps_live_ones() -> Result<()> {
     let live = vec![all_uris[0].clone()];
     let report = svc.gc_after_compaction(TABLE, &p, &live).await?;
     assert!(report.entries_removed >= 1, "at least one stale entry should be dropped");
-    let m_after = timefusion::tantivy_index::manifest::load(svc.object_store.as_ref(), TABLE, &p).await?;
+    let m_after = timefusion::tantivy::load_manifest(svc.object_store.as_ref(), TABLE, &p).await?;
     assert!(m_after.entries.len() < m_before.entries.len(), "post-gc manifest should shrink");
 
     Ok(())
@@ -520,7 +520,7 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
         .search_with_stats(
             TABLE,
             &p,
-            &timefusion::tantivy_index::udf::PredNode::Leaf(timefusion::tantivy_index::udf::TextMatchPred { column: "id".into(), query: uid.into() }),
+            &timefusion::tantivy::udf::PredNode::Leaf(timefusion::tantivy::udf::TextMatchPred { column: "id".into(), query: uid.into() }),
             1000,
             None,
         )
@@ -544,7 +544,7 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Result<()> {
-    use timefusion::tantivy_index::manifest;
+    use timefusion::tantivy::{load_manifest, save_manifest};
 
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (db, ctx, svc) = build_db(&format!("{id}-cov-on"), true).await?;
@@ -600,12 +600,12 @@ async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Re
 
     // Neuter exactly one entry: its parquet stays LIVE in Delta but is now
     // uncovered (index=None). The other entry remains valid + returns hits.
-    let mut m2 = manifest::load(store.as_ref(), TABLE, &p).await?;
+    let mut m2 = load_manifest(store.as_ref(), TABLE, &p).await?;
     let first_key = m2.entries.keys().next().cloned().unwrap();
     let e = m2.entries.get_mut(&first_key).unwrap();
     e.index = None;
     e.error = Some("simulated uncovered file".into());
-    manifest::save(store.as_ref(), TABLE, &p, &m2).await?;
+    save_manifest(store.as_ref(), TABLE, &p, &m2).await?;
 
     // With one live file uncovered, the covered file uses Tantivy and the
     // uncovered file scans raw. Their disjoint union must still return BOTH
@@ -616,10 +616,7 @@ async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Re
         .search_with_stats(
             TABLE,
             &p,
-            &timefusion::tantivy_index::udf::PredNode::Leaf(timefusion::tantivy_index::udf::TextMatchPred {
-                column: "status_message".into(),
-                query: "login".into(),
-            }),
+            &timefusion::tantivy::udf::PredNode::Leaf(timefusion::tantivy::udf::TextMatchPred { column: "status_message".into(), query: "login".into() }),
             1000,
             None,
         )

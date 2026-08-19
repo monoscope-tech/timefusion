@@ -20,7 +20,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
-use timefusion::mem_buffer::MemBuffer;
+use timefusion::write::mem_buffer::MemBuffer;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![

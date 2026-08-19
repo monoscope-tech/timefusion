@@ -9,7 +9,7 @@
 //!     by at least one bucket duration.
 
 use proptest::prelude::*;
-use timefusion::{clock, mem_buffer::MemBuffer, test_utils::test_helpers};
+use timefusion::{support, support::test_helpers, write::mem_buffer::MemBuffer};
 
 // Invariants exercised below: row count conservation across inserts,
 // monotonic bucket id, strict advancement when the frozen clock jumps.
@@ -21,10 +21,10 @@ proptest! {
         rows in proptest::collection::vec(1usize..50, 1..10),
     ) {
         // Use a frozen clock so bucket boundaries are deterministic.
-        clock::set_micros(1_900_000_000_000_000);
+        support::set_micros(1_900_000_000_000_000);
 
         let buf = MemBuffer::default();
-        let ts = clock::now_micros();
+        let ts = support::now_micros();
         let mut expected: usize = 0;
         for n in &rows {
             let records: Vec<_> = (0..*n)
@@ -37,7 +37,7 @@ proptest! {
         let stats = buf.get_stats();
         prop_assert_eq!(stats.total_rows, expected);
 
-        clock::unfreeze();
+        support::unfreeze();
     }
 
     #[test]
@@ -50,16 +50,16 @@ proptest! {
     fn current_bucket_id_strictly_advances_when_clock_jumps(
         jumps in proptest::collection::vec(1u32..1000u32, 1..20),
     ) {
-        clock::set_micros(1_900_000_000_000_000);
-        let bucket_micros: i64 = timefusion::mem_buffer::bucket_duration_micros();
+        support::set_micros(1_900_000_000_000_000);
+        let bucket_micros: i64 = timefusion::write::mem_buffer::bucket_duration_micros();
         let mut prev = MemBuffer::current_bucket_id();
         for j in jumps {
             // Jump at least one bucket forward to guarantee a strict increase.
-            clock::advance_micros(bucket_micros * (j as i64 + 1));
+            support::advance_micros(bucket_micros * (j as i64 + 1));
             let cur = MemBuffer::current_bucket_id();
             prop_assert!(cur > prev, "expected {} > {}", cur, prev);
             prev = cur;
         }
-        clock::unfreeze();
+        support::unfreeze();
     }
 }

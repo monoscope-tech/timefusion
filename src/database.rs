@@ -44,10 +44,10 @@ use url::Url;
 
 use crate::{
     config::{self, AppConfig},
-    errors::arrow_err,
-    object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
-    schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type},
-    statistics::DeltaStatisticsExtractor,
+    observability::arrow_err,
+    read::DeltaStatisticsExtractor,
+    schema::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type},
+    storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
 };
 
 // Unified tables: one Delta table per schema (table_name -> DeltaTable)
@@ -662,7 +662,7 @@ pub(crate) async fn ensure_table_properties(table: DeltaTable, desired: HashMap<
 fn within_recency(uri: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
     // Single source of truth for `date=` partition recency parsing, shared with
     // the object-store cache admission window.
-    crate::object_store_cache::date_partition_within(uri, cutoff)
+    crate::storage::date_partition_within(uri, cutoff)
 }
 
 /// Whether `uri`'s `date=YYYY-MM-DD` Hive partition overlaps the `[lo, hi]`
@@ -670,7 +670,7 @@ fn within_recency(uri: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
 /// (conservative: treat as in-window so the coverage gate still demands an
 /// index for it). Open bounds (`i64::MIN`/`MAX`) match everything on that side.
 fn uri_date_in_window(uri: &str, lo: i64, hi: i64) -> bool {
-    let Some(d) = crate::object_store_cache::date_partition_of(uri) else {
+    let Some(d) = crate::storage::date_partition_of(uri) else {
         return true;
     };
     let to_date = |ts: i64, open: i64| (ts != open).then(|| chrono::DateTime::from_timestamp_micros(ts)).flatten().map(|dt| dt.date_naive());
@@ -902,7 +902,7 @@ fn build_optimize_session_state_tuned(
     // context): `dedup_shards_over_budget_and_preserves_rows` failed with
     // "Invalid function 'hash_bucket'". Registered on the one builder every
     // maintenance context goes through rather than at each call site.
-    datafusion::execution::FunctionRegistry::register_udf(&mut state, Arc::new(crate::functions::hash_bucket_udf())).ok();
+    datafusion::execution::FunctionRegistry::register_udf(&mut state, Arc::new(crate::read::functions::hash_bucket_udf())).ok();
     state
 }
 
@@ -1322,10 +1322,10 @@ where
                     match running.as_ref() {
                         Some(h) if !h.is_finished() => {
                             skips += 1;
-                            crate::metrics::maintenance_stats().cron_ticks_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::observability::maintenance_stats().cron_ticks_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if running_since.is_some_and(|s| s.elapsed() >= LONG_RUNNING_WARN_THRESHOLD) {
                                 warn!("{name} job run still in progress after {:?} — may be wedged or just slow (skips={skips})", LONG_RUNNING_WARN_THRESHOLD);
-                                crate::metrics::record_cron_long_running();
+                                crate::observability::record_cron_long_running();
                             } else {
                                 warn!("{name} job tick skipped: previous run still in progress ({skips} consecutive)");
                             }
@@ -1338,7 +1338,7 @@ where
                         }
                         None => {}
                     }
-                    crate::metrics::maintenance_stats().cron_ticks_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::maintenance_stats().cron_ticks_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     running_since = Some(std::time::Instant::now());
                     let future = job();
                     running = Some(match &executor {
@@ -1360,9 +1360,7 @@ const WAL_WATERMARK_KEY: &str = "timefusion.wal_watermark";
 /// `commitInfo.info[WAL_WATERMARK_KEY]`. Only shards with a position are
 /// included — absent shards mean "no constraint from this commit", which is
 /// how the per-shard MAX aggregation across commits ignores them.
-fn serialize_watermark_to_json(
-    watermark: &crate::buffered_write_layer::DeltaWatermark, project_id: &str, table_name: &str,
-) -> serde_json::Map<String, serde_json::Value> {
+fn serialize_watermark_to_json(watermark: &crate::write::DeltaWatermark, project_id: &str, table_name: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut map: serde_json::Map<String, serde_json::Value> = watermark
         .iter()
         .enumerate()
@@ -1396,7 +1394,7 @@ const WATERMARK_TOPICS_KEY: &str = "topics";
 /// Topics whose watermark has no positions are dropped (same rule as the
 /// single-topic form). Exactly one surviving topic ⇒ flat legacy shape.
 fn serialize_watermarks_to_json(
-    entries: impl IntoIterator<Item = (String, String, crate::buffered_write_layer::DeltaWatermark)>,
+    entries: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut per_topic: Vec<(String, serde_json::Map<String, serde_json::Value>)> = entries
         .into_iter()
@@ -1597,7 +1595,7 @@ fn base_commit_properties() -> CommitProperties {
 /// silently skips that commit.
 /// Takes every (project, table, watermark) the commit carries — one entry on
 /// the per-project path, N on a coalesced cross-project commit.
-fn build_watermark_commit_properties(watermarks: impl IntoIterator<Item = (String, String, crate::buffered_write_layer::DeltaWatermark)>) -> CommitProperties {
+fn build_watermark_commit_properties(watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>) -> CommitProperties {
     let entries = serialize_watermarks_to_json(watermarks);
     if entries.is_empty() {
         return base_commit_properties();
@@ -1796,7 +1794,7 @@ const COVERAGE_SHORT_DAYS: u64 = 14;
 /// yesterday. That is exactly the number a 14d/30d query needs, and it is
 /// already computed once per backfill sweep, so this costs an atomic load.
 fn coverage_is_short() -> bool {
-    crate::metrics::maintenance_stats().rollup_min_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
+    crate::observability::maintenance_stats().rollup_min_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
 }
 
 /// Sort and coalesce half-open ranges, merging any that touch or overlap.
@@ -1953,14 +1951,14 @@ pub struct CoalescedWriteUnit {
     pub project_id: String,
     pub table_name: String,
     pub batches: Vec<RecordBatch>,
-    pub watermark: crate::buffered_write_layer::DeltaWatermark,
+    pub watermark: crate::write::DeltaWatermark,
 }
 
 /// A unit whose parquet is uploaded and whose `Add` actions are waiting for the
 /// shared commit.
 struct StagedUnit {
     table_ref: Arc<RwLock<DeltaTable>>,
-    schema: &'static crate::schema_loader::TableSchema,
+    schema: &'static crate::schema::TableSchema,
     dirty_bins: Vec<(String, i64)>,
     adds: Vec<deltalake::kernel::Action>,
     stage_store: Arc<dyn object_store::ObjectStore>,
@@ -2003,7 +2001,7 @@ const INCONCLUSIVE_COMMIT_MARKER: &str = "landing-unconfirmed";
 ///
 /// It is NOT the mechanism that bounds commits — that is the commit-log request
 /// class (see `AwsConfig::log_request_timeout` and
-/// [`crate::object_store_cache::RequestClassRouter`]), which bounds each log
+/// [`crate::storage::RequestClassRouter`]), which bounds each log
 /// request at 30s and the whole retry ladder at `RetryConfig::retry_timeout`
 /// (180s). Bounding at the client is strictly better because a timeout there is
 /// an ordinary commit error the landed-probe already classifies, while a
@@ -2040,7 +2038,7 @@ async fn bounded_commit_await<T, E: std::fmt::Display>(
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(CommitFailure { message: e.to_string(), timed_out: false }),
         Err(_) => {
-            crate::metrics::record_commit_timeout(op);
+            crate::observability::record_commit_timeout(op);
             warn!(
                 table_name,
                 op,
@@ -2093,7 +2091,7 @@ type PreparedForPhysicalTable = (PreparedWrite, (String, String));
 /// Output of [`Database::prepare_staged_write`] — see its doc comment.
 struct PreparedWrite {
     table_ref: Arc<RwLock<DeltaTable>>,
-    schema: &'static crate::schema_loader::TableSchema,
+    schema: &'static crate::schema::TableSchema,
     dirty_bins: Vec<(String, i64)>,
     /// Lazy: the sort-merge runs when the staging writer drains it, so a
     /// batch-prepare of N units doesn't hold N sorted buckets at once.
@@ -2151,7 +2149,7 @@ fn dedup_adds_by_path(adds: impl Iterator<Item = deltalake::kernel::Add>, table_
     }
     if dropped > 0 {
         warn!(table_name, dropped, event = "snapshot_duplicate_adds", "snapshot listed the same file more than once — reads over it double-count rows");
-        crate::metrics::maintenance_stats().snapshot_duplicate_adds.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().snapshot_duplicate_adds.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
     }
     out
 }
@@ -2365,8 +2363,8 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         let metadata = cast(arr.column(0), &DataType::Binary).map_err(arrow_err)?;
         let value = cast(arr.column(1), &DataType::Binary).map_err(arrow_err)?;
         let fields = vec![
-            Arc::new(Field::new(crate::schema_loader::VARIANT_METADATA_FIELD, DataType::Binary, false)),
-            Arc::new(Field::new(crate::schema_loader::VARIANT_VALUE_FIELD, DataType::Binary, false)),
+            Arc::new(Field::new(crate::schema::VARIANT_METADATA_FIELD, DataType::Binary, false)),
+            Arc::new(Field::new(crate::schema::VARIANT_VALUE_FIELD, DataType::Binary, false)),
         ];
         Ok(StructArray::new(fields.into(), vec![metadata, value], arr.nulls().cloned()))
     }
@@ -2589,7 +2587,7 @@ pub struct Database {
     /// distribution shifts under real load. Counters are cumulative since
     /// process start; deltas are useful for rate analysis.
     pub scan_metrics: Arc<ScanMetrics>,
-    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    batch_queue: Option<Arc<crate::write::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
     /// Cancels `maintenance_shutdown` when the LAST guard-holding `Database`
     /// clone drops. Database is Clone, so a per-value `impl Drop` cancelling
@@ -2669,8 +2667,8 @@ pub struct Database {
     /// Exact merge-on-read count partitions. Query threads use only the
     /// process-local front; disk loads and Delta builds are single-flight and
     /// bounded in the background so a cold cache cannot amplify query load.
-    logical_count_cache: Arc<crate::logical_count_index::LogicalCountCache>,
-    logical_count_building: Arc<dashmap::DashSet<crate::logical_count_index::CountPartition>>,
+    logical_count_cache: Arc<crate::read::LogicalCountCache>,
+    logical_count_building: Arc<dashmap::DashSet<crate::read::CountPartition>>,
     logical_count_build_sem: Arc<tokio::sync::Semaphore>,
     /// Dirty `(project, table, date, 10-minute bin)` keys recorded only after
     /// a Delta append commits. In-memory by design: after restart the
@@ -2861,7 +2859,7 @@ pub struct Database {
     /// `Option<Arc<_>>` here silently left pre-layer clones without the mem
     /// leg: pgwire UPDATEs skipped the buffer and lost updates to unflushed
     /// rows.
-    buffered_layer: Arc<std::sync::OnceLock<Arc<crate::buffered_write_layer::BufferedWriteLayer>>>,
+    buffered_layer: Arc<std::sync::OnceLock<Arc<crate::write::BufferedWriteLayer>>>,
     /// Per-clone override for `query_delta_only`: hides the shared layer so
     /// scans bypass the in-memory buffer.
     bypass_buffer: bool,
@@ -2882,13 +2880,13 @@ pub struct Database {
     /// Late-binding shared cells like `buffered_layer`: attached by `with_*`
     /// builders after boot has already cloned Database into sessions/planners,
     /// so a plain Option would leave those clones silently service-less.
-    tantivy_search: Arc<std::sync::OnceLock<Arc<crate::tantivy_index::search::TantivySearchService>>>,
-    tantivy_indexer: Arc<std::sync::OnceLock<Arc<crate::tantivy_index::service::TantivyIndexService>>>,
+    tantivy_search: Arc<std::sync::OnceLock<Arc<crate::tantivy::search::TantivySearchService>>>,
+    tantivy_indexer: Arc<std::sync::OnceLock<Arc<crate::tantivy::search::TantivyIndexService>>>,
     /// Deferred-DML coalescer (see `dml_coalescer`) — populated by
     /// `start_dml_coalescer` when `TIMEFUSION_DML_COALESCE_SECS > 0`. Same
     /// late-binding shared-cell pattern as `buffered_layer`: the DML planner
     /// clones Database before boot wiring finishes.
-    dml_coalescer: Arc<std::sync::OnceLock<Arc<crate::dml_coalescer::DmlCoalescer>>>,
+    dml_coalescer: Arc<std::sync::OnceLock<Arc<crate::dml::DmlCoalescer>>>,
     /// Per-table, per-date set of live file URIs as of the last successful full
     /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
     /// it rewrites every file in the window on every run, even sealed days that
@@ -3048,7 +3046,7 @@ impl Database {
     /// `declare_sorted`: pass `true` only from paths that sort rows by the
     /// schema sort keys before writing (flush, dedup). Optimize/compact pass
     /// `false`. See `build_writer_properties`.
-    fn create_writer_properties(&self, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
+    fn create_writer_properties(&self, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
         build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted)
     }
 
@@ -3170,20 +3168,20 @@ impl Database {
         .fetch_all(pool)
         .await?;
 
-        let key_set = crate::secret_crypto::key_configured();
+        let key_set = crate::config::key_configured();
         let mut map = HashMap::new();
         let mut plaintext_rows = 0usize;
         for mut config in configs {
-            let enc_access = config.s3_access_key_id.starts_with(crate::secret_crypto::ENC_PREFIX);
-            let enc_secret = config.s3_secret_access_key.starts_with(crate::secret_crypto::ENC_PREFIX);
-            match crate::secret_crypto::decrypt_or_passthrough(&config.s3_access_key_id) {
+            let enc_access = config.s3_access_key_id.starts_with(crate::config::ENC_PREFIX);
+            let enc_secret = config.s3_secret_access_key.starts_with(crate::config::ENC_PREFIX);
+            match crate::config::decrypt_or_passthrough(&config.s3_access_key_id) {
                 Ok(v) => config.s3_access_key_id = v,
                 Err(e) => {
                     error!("Skipping {}/{}: cannot decrypt s3_access_key_id: {}", config.project_id, config.table_name, e);
                     continue;
                 }
             }
-            match crate::secret_crypto::decrypt_or_passthrough(&config.s3_secret_access_key) {
+            match crate::config::decrypt_or_passthrough(&config.s3_secret_access_key) {
                 Ok(v) => config.s3_secret_access_key = v,
                 Err(e) => {
                     error!("Skipping {}/{}: cannot decrypt s3_secret_access_key: {}", config.project_id, config.table_name, e);
@@ -3245,17 +3243,17 @@ impl Database {
     pub async fn with_config(cfg: Arc<AppConfig>) -> Result<Self> {
         // Active tables rewrite their snapshot every flush; week-stale files
         // belong to dropped/idle tables and would otherwise accumulate forever.
-        crate::snapshot_cache::prune_stale(&Self::delta_snapshot_dir(&cfg), crate::snapshot_cache::SNAPSHOT_MAX_AGE);
+        crate::storage::prune_stale(&Self::delta_snapshot_dir(&cfg), crate::storage::SNAPSHOT_MAX_AGE);
         let dedup_dirty_bins = Arc::new(dashmap::DashMap::new());
-        for bin in crate::dirty_bin_queue::load(&cfg.core.timefusion_data_dir) {
+        for bin in crate::storage::load_sidecar::<crate::storage::DirtyBin>(&cfg.core.timefusion_data_dir, crate::storage::DIRTY_BINS) {
             dedup_dirty_bins.insert((bin.project_id, bin.table_name, bin.date, bin.bin), ());
         }
-        crate::metrics::maintenance_stats().dirty_bin_queue_depth.store(dedup_dirty_bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().dirty_bin_queue_depth.store(dedup_dirty_bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let rollup_dirty = Arc::new(dashmap::DashMap::new());
         let rollup_source_epochs = Arc::new(dashmap::DashMap::new());
         let rollup_invalidated_at = Arc::new(dashmap::DashMap::new());
         let mut maintenance_tasks = crate::maintenance_coordinator::TaskJournal::load(&cfg.core.timefusion_data_dir)?;
-        let requeued_tasks = maintenance_tasks.requeue_running(crate::clock::now_micros());
+        let requeued_tasks = maintenance_tasks.requeue_running(crate::support::now_micros());
         if requeued_tasks != 0 {
             maintenance_tasks.checkpoint()?;
             info!(requeued_tasks, event = "maintenance_tasks_requeued");
@@ -3269,11 +3267,11 @@ impl Database {
             }
             rollup_dirty.insert(key, dirty);
         }
-        let rollup_stats = crate::metrics::maintenance_stats();
+        let rollup_stats = crate::observability::maintenance_stats();
         rollup_stats
             .rollup_dirty_partitions
             .store(rollup_dirty.iter().filter(|entry| *entry.value() != 0).count() as u64, std::sync::atomic::Ordering::Relaxed);
-        let now_unix_ms = crate::certification_store::now_unix_ms();
+        let now_unix_ms = crate::storage::now_unix_ms();
         rollup_stats.rollup_oldest_invalidation_age_secs.store(
             rollup_invalidated_at.iter().map(|entry| now_unix_ms.saturating_sub(*entry.value()) / 1_000).max().unwrap_or(0),
             std::sync::atomic::Ordering::Relaxed,
@@ -3285,12 +3283,12 @@ impl Database {
         let dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>> = Arc::new(dashmap::DashMap::new());
         if cfg.maintenance.timefusion_dedup_certification_persist {
             let now = std::time::Instant::now();
-            for entry in crate::certification_store::load(&cfg.core.timefusion_data_dir) {
+            for entry in crate::storage::load_sidecar::<crate::storage::StoredCertification>(&cfg.core.timefusion_data_dir, crate::storage::CERTIFICATIONS) {
                 // Rebuild the monotonic instant from the stored wall-clock age, so
                 // dwell keeps measuring the certification's real lifetime instead
                 // of restarting at this boot. A clock that moved backwards (or an
                 // entry from the future) falls back to "granted now".
-                let since = crate::certification_store::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
+                let since = crate::storage::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
                 dedup_clean_fp.insert((entry.project_id, entry.table_name, entry.date), Certification { fp: entry.fp, since });
             }
             info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
@@ -3368,10 +3366,8 @@ impl Database {
             coordinator_io_slots,
             coordinator_io_slots,
         );
-        let logical_count_cache = Arc::new(crate::logical_count_index::LogicalCountCache::new(
-            cfg.core.timefusion_data_dir.join("logical_count"),
-            cfg.derived.logical_count_memory_bytes(),
-        ));
+        let logical_count_cache =
+            Arc::new(crate::read::LogicalCountCache::new(cfg.core.timefusion_data_dir.join("logical_count"), cfg.derived.logical_count_memory_bytes()));
         let db = Self {
             config: cfg,
             runtime_env: Arc::new(std::sync::OnceLock::new()),
@@ -3495,7 +3491,7 @@ impl Database {
     }
 
     /// Set the batch queue to use for insert operations
-    pub fn with_batch_queue(mut self, batch_queue: Arc<crate::batch_queue::BatchQueue>) -> Self {
+    pub fn with_batch_queue(mut self, batch_queue: Arc<crate::write::BatchQueue>) -> Self {
         self.batch_queue = Some(batch_queue);
         self
     }
@@ -3503,18 +3499,18 @@ impl Database {
     /// Set the buffered write layer for WAL + in-memory buffer. Publishes to
     /// every existing clone (shared OnceLock) — set-once; a second call is a
     /// no-op.
-    pub fn with_buffered_layer(self, layer: Arc<crate::buffered_write_layer::BufferedWriteLayer>) -> Self {
+    pub fn with_buffered_layer(self, layer: Arc<crate::write::BufferedWriteLayer>) -> Self {
         let _ = self.buffered_layer.set(layer);
         self
     }
 
     /// Get the buffered write layer if configured
-    pub fn buffered_layer(&self) -> Option<&Arc<crate::buffered_write_layer::BufferedWriteLayer>> {
+    pub fn buffered_layer(&self) -> Option<&Arc<crate::write::BufferedWriteLayer>> {
         if self.bypass_buffer { None } else { self.buffered_layer.get() }
     }
 
     /// The deferred-DML coalescer, when enabled (see `start_dml_coalescer`).
-    pub fn dml_coalescer(&self) -> Option<&Arc<crate::dml_coalescer::DmlCoalescer>> {
+    pub fn dml_coalescer(&self) -> Option<&Arc<crate::dml::DmlCoalescer>> {
         self.dml_coalescer.get()
     }
 
@@ -3527,7 +3523,7 @@ impl Database {
         if secs == 0 {
             return;
         }
-        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(secs, self.config.buffer.dml_coalesce_fold()));
+        let coalescer = Arc::new(crate::dml::DmlCoalescer::new(secs, self.config.buffer.dml_coalesce_fold()));
         if self.dml_coalescer.set(coalescer.clone()).is_ok() {
             tokio::spawn(coalescer.run(self.background_clone(), (*self.maintenance_shutdown).clone()));
         }
@@ -3535,24 +3531,24 @@ impl Database {
 
     /// Attach the tantivy search service used by the scan-side prefilter.
     /// Publishes to every existing clone (shared OnceLock, set-once).
-    pub fn with_tantivy_search(self, svc: Arc<crate::tantivy_index::search::TantivySearchService>) -> Self {
+    pub fn with_tantivy_search(self, svc: Arc<crate::tantivy::search::TantivySearchService>) -> Self {
         let _ = self.tantivy_search.set(svc);
         self
     }
 
-    pub fn tantivy_search(&self) -> Option<&Arc<crate::tantivy_index::search::TantivySearchService>> {
+    pub fn tantivy_search(&self) -> Option<&Arc<crate::tantivy::search::TantivySearchService>> {
         self.tantivy_search.get()
     }
 
     /// Attach the write-side tantivy service. Used by the compaction-GC hook
     /// in `optimize_table` to clean up stale sidecar indexes after files are
     /// rewritten away. Publishes to every existing clone (shared OnceLock).
-    pub fn with_tantivy_indexer(self, svc: Arc<crate::tantivy_index::service::TantivyIndexService>) -> Self {
+    pub fn with_tantivy_indexer(self, svc: Arc<crate::tantivy::search::TantivyIndexService>) -> Self {
         let _ = self.tantivy_indexer.set(svc);
         self
     }
 
-    pub fn tantivy_indexer(&self) -> Option<&Arc<crate::tantivy_index::service::TantivyIndexService>> {
+    pub fn tantivy_indexer(&self) -> Option<&Arc<crate::tantivy::search::TantivyIndexService>> {
         self.tantivy_indexer.get()
     }
 
@@ -3581,7 +3577,7 @@ impl Database {
     /// Rebuild only files deferred by WAL replay, after replay has completed.
     /// The on-disk queue is removed entry-by-entry only after a successful
     /// build, so a second restart resumes the remaining work.
-    pub fn spawn_deferred_tantivy_reindex(self: &Arc<Self>, layer: Arc<crate::buffered_write_layer::BufferedWriteLayer>) {
+    pub fn spawn_deferred_tantivy_reindex(self: &Arc<Self>, layer: Arc<crate::write::BufferedWriteLayer>) {
         let Some(svc) = self.tantivy_indexer().cloned() else { return };
         if layer.deferred_tantivy_files().is_empty() {
             return;
@@ -3596,8 +3592,8 @@ impl Database {
                 let result = async {
                     let table = table_ref?;
                     let store = table.read().await.log_store().object_store(None);
-                    let rel = crate::tantivy_index::service::parquet_rel_of_uri(&file.uri)
-                        .ok_or_else(|| anyhow::anyhow!("invalid deferred parquet URI {}", file.uri))?;
+                    let rel =
+                        crate::tantivy::search::parquet_rel_of_uri(&file.uri).ok_or_else(|| anyhow::anyhow!("invalid deferred parquet URI {}", file.uri))?;
                     svc.build_index_for_file(&file.table_name, &file.project_id, rel, &file.uri, store).await
                 }
                 .await;
@@ -3649,7 +3645,7 @@ impl Database {
         // by project uuid at build time) — a fixed "default"+customs list never
         // visits unified tenants.
         let (mut removed, mut blobs) = (0usize, 0usize);
-        for pid in crate::tantivy_index::manifest::list_projects(svc.object_store.as_ref(), table_name).await? {
+        for pid in crate::tantivy::list_manifest_projects(svc.object_store.as_ref(), table_name).await? {
             let Ok(table_ref) = self.resolve_table(&pid, table_name).await else { continue };
             let live_uris: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             let report = svc.gc_after_compaction(table_name, &pid, &live_uris).await?;
@@ -3677,7 +3673,7 @@ impl Database {
     /// live files and the manifest names the covered ones. No parquet is read
     /// and no index is built, so it is safe to run far more often than a pass.
     pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64)> {
-        use crate::tantivy_index::{manifest, service::project_id_of_uri};
+        use crate::tantivy::search::project_id_of_uri;
         let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0)) };
         let (mut uncovered, mut oversized) = (0u64, 0u64);
         for table_name in svc.config.indexed_tables() {
@@ -3704,32 +3700,27 @@ impl Database {
                 }
                 let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
                 for (pid, mut uris) in by_pid {
-                    let manifest = manifest::load(svc.object_store.as_ref(), &table_name, &pid).await?;
+                    let manifest = crate::tantivy::load_manifest(svc.object_store.as_ref(), &table_name, &pid).await?;
                     let covered: std::collections::HashSet<&String> =
                         manifest.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
                     uris.retain(|uri| !covered.contains(uri));
                     if max_bytes > 0 {
                         let before = uris.len();
-                        uris.retain(|uri| {
-                            crate::tantivy_index::service::parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_none_or(|size| *size <= max_bytes)
-                        });
+                        uris.retain(|uri| crate::tantivy::search::parquet_rel_of_uri(uri).and_then(|rel| sizes.get(rel)).is_none_or(|size| *size <= max_bytes));
                         oversized = oversized.saturating_add((before - uris.len()) as u64);
                     }
                     uncovered = uncovered.saturating_add(uris.len() as u64);
                 }
             }
         }
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         stats.tantivy_uncovered_files.store(uncovered, std::sync::atomic::Ordering::Relaxed);
         stats.tantivy_oversized_skipped.store(oversized, std::sync::atomic::Ordering::Relaxed);
         Ok((uncovered, oversized))
     }
 
-    async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy_index::service::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
-        use crate::tantivy_index::{
-            manifest,
-            service::{parquet_rel_of_uri, project_id_of_uri},
-        };
+    async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy::search::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
+        use crate::tantivy::search::{parquet_rel_of_uri, project_id_of_uri};
         // Unified table ("default") holds every default-routed project's
         // files; custom project tables are resolved separately.
         let mut roots: Vec<String> = vec!["default".into()];
@@ -3759,7 +3750,7 @@ impl Database {
             let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
             let mut queues = Vec::with_capacity(by_pid.len());
             for (pid, mut uris) in by_pid {
-                let m = manifest::load(svc.object_store.as_ref(), table_name, &pid).await?;
+                let m = crate::tantivy::load_manifest(svc.object_store.as_ref(), table_name, &pid).await?;
                 let covered: std::collections::HashSet<&String> =
                     m.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
                 uris.retain(|u| !covered.contains(u));
@@ -3799,7 +3790,7 @@ impl Database {
         // running total. `uncovered` reaching 0 is what "the reindex is done"
         // means, and nothing reported it before — which is why the reindex was
         // being chased by hand from sibling containers.
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         stats.tantivy_uncovered_files.store(uncovered_total.saturating_sub(built as u64), std::sync::atomic::Ordering::Relaxed);
         stats.tantivy_oversized_skipped.store(oversized_total, std::sync::atomic::Ordering::Relaxed);
         info!(table_name, built, uncovered_before = uncovered_total, oversized_skipped = oversized_total, event = "tantivy_backfill_pass");
@@ -4054,7 +4045,7 @@ impl Database {
         // Sampled on the same limiter as `rollup_miss_sampled`, so a
         // multiple-per-second miss rate cannot flood the log.
         if let Some(project) = &first_uncovered
-            && crate::metrics::sample_rollup_miss()
+            && crate::observability::sample_rollup_miss()
         {
             warn!(
                 project_id = %project,
@@ -4078,7 +4069,7 @@ impl Database {
             // it away, or that what survives is narrower than one grain. Those
             // want opposite fixes — build more coverage vs flush sooner vs widen
             // the window — and nothing outside the process can tell them apart.
-            if crate::metrics::sample_rollup_miss() {
+            if crate::observability::sample_rollup_miss() {
                 warn!(
                     lo = route.lo,
                     hi = route.hi,
@@ -4205,7 +4196,7 @@ impl Database {
         // lets a blocking decode stall the timers that cancel it.
         let coordinator_job_workers = self.config.derived.coordinator_jobs();
         let coordinator_runtime_workers = (self.config.derived.cores / 8).clamp(2, 4).max(coordinator_job_workers + 2);
-        db.maintenance_debt_planned_at.store(crate::clock::now_micros(), std::sync::atomic::Ordering::Relaxed);
+        db.maintenance_debt_planned_at.store(crate::support::now_micros(), std::sync::atomic::Ordering::Relaxed);
         {
             let db = Arc::clone(&db);
             let cancel = cancel.clone();
@@ -4227,7 +4218,7 @@ impl Database {
                             let migrated = journal.migrate_derived_slices();
                             // One-shot: collapse the fine-grained sealed backfill
                             // so the coarse planner can re-derive it day-sized.
-                            let coarsened = journal.migrate_fine_grained_backfill(crate::clock::now_micros()).unwrap_or_default();
+                            let coarsened = journal.migrate_fine_grained_backfill(crate::support::now_micros()).unwrap_or_default();
                             if coarsened != 0 {
                                 info!(coarsened, event = "maintenance_coarse_backfill_migrated");
                             }
@@ -4345,7 +4336,7 @@ impl Database {
                             if !coverage_db.wait_for_preload(&coverage_cancel).await {
                                 return;
                             }
-                            for source in crate::schema_loader::registry().list_tables() {
+                            for source in crate::schema::registry().list_tables() {
                                 if let Err(error) = coverage_db.recover_rollup_coverage(&source).await {
                                     warn!(source, %error, "rollup coverage recovery failed; those partitions stay on raw scans");
                                 }
@@ -4701,7 +4692,7 @@ impl Database {
                     let budget = db.config.tantivy.cache_disk_bytes();
                     // Walks the whole cache tree and unlinks — never on the runtime's worker threads.
                     let Ok(report) = tokio::task::spawn_blocking(move || svc.reap_disk_cache(budget)).await else { return };
-                    crate::metrics::record_tantivy_cache_bytes(report.bytes_before - report.bytes_removed);
+                    crate::observability::record_tantivy_cache_bytes(report.bytes_before - report.bytes_removed);
                     if report.dirs_removed > 0 || report.errors > 0 {
                         info!(
                             "tantivy cache reap: scanned={} before={}MB removed={} freed={}MB errors={} budget={}MB",
@@ -4851,7 +4842,7 @@ impl Database {
         // below via `build_query_runtime_env` instead.
 
         // Cap query parallelism at the container's CPU quota (derived in
-        // autotune::apply; 0 = leave DataFusion's default). See MemoryConfig.
+        // config::apply; 0 = leave DataFusion's default). See MemoryConfig.
         if self.maintenance_scan {
             let _ = options.set("datafusion.execution.target_partitions", &MAINTENANCE_MAX_PARTITIONS.to_string());
         } else if self.config.memory.timefusion_query_partitions > 0 {
@@ -4947,9 +4938,12 @@ impl Database {
         let record_metrics = self.config.memory.timefusion_tracing_record_metrics;
 
         // Cell-capped preview formatter — the default renders whole cell values;
-        // see `telemetry::capped_preview_fn` for the 2026-07-06 OOM it prevents.
-        let tracing_options =
-            InstrumentationOptions::builder().record_metrics(record_metrics).preview_limit(5).preview_fn(Arc::new(crate::telemetry::capped_preview_fn)).build();
+        // see `observability::capped_preview_fn` for the 2026-07-06 OOM it prevents.
+        let tracing_options = InstrumentationOptions::builder()
+            .record_metrics(record_metrics)
+            .preview_limit(5)
+            .preview_fn(Arc::new(crate::observability::capped_preview_fn))
+            .build();
 
         let instrument_rule = instrument_with_info_spans!(options: tracing_options);
 
@@ -4958,24 +4952,24 @@ impl Database {
         //                VariantSelectRewriter runs AFTER TypeCoercion (wraps Variant cols with variant_to_json)
         let analyzer_rules: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
             Arc::new(datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction::new()),
-            Arc::new(crate::optimizers::VariantInsertRewriter),
+            Arc::new(crate::read::optimizers::VariantInsertRewriter),
             // Tantivy predicate rewriter runs BEFORE TypeCoercion so the
             // injected `text_match(col, lit)` calls get coerced like any
             // other UDF args (Utf8 vs Utf8View etc).
-            Arc::new(crate::optimizers::TantivyPredicateRewriter::new(self.config.tantivy.route_equality())),
+            Arc::new(crate::read::optimizers::TantivyPredicateRewriter::new(self.config.tantivy.route_equality())),
             // Expands `f(qualifier.*)` into `f(qualifier.c1, …, qualifier.cN)`
             // before TypeCoercion rejects the typeless wildcard. Postgres parity.
-            Arc::new(crate::optimizers::WildcardFnArgExpander),
+            Arc::new(crate::read::optimizers::WildcardFnArgExpander),
             // PG parity: `COALESCE(list_col, '{}')` — re-type PG array string
             // literals as list literals before TypeCoercion fails the call.
-            Arc::new(crate::optimizers::PgArrayLiteralRewriter),
+            Arc::new(crate::read::optimizers::PgArrayLiteralRewriter),
             // PG clients put EXISTS in a SELECT list (pgAdmin's `is_catalog`);
             // DataFusion only decorrelates EXISTS in a filter, so rewrite it to
             // the equivalent correlated `count(1) > 0` scalar subquery, which it
             // does decorrelate. Before TypeCoercion so the comparison coerces.
-            Arc::new(crate::optimizers::ExistsInProjection),
+            Arc::new(crate::read::optimizers::ExistsInProjection),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
-            Arc::new(crate::optimizers::VariantSelectRewriter),
+            Arc::new(crate::read::optimizers::VariantSelectRewriter),
         ];
 
         let session_state = SessionStateBuilder::new()
@@ -4985,12 +4979,12 @@ impl Database {
             .with_analyzer_rules(analyzer_rules)
             // Appended after DataFusion's defaults so push_down_limit has
             // already folded LIMIT into Sort.fetch — see the rule's docs.
-            .with_optimizer_rule(Arc::new(crate::optimizers::DeferExpensiveProjection))
+            .with_optimizer_rule(Arc::new(crate::read::optimizers::DeferExpensiveProjection))
             // Must run LAST: re-restores Variant scan types that
             // optimize_projections reverts to Utf8View when it rebuilds each
             // TableScan from the lying provider schema — see the rule's docs
             // (fixes XX000 on `DISTINCT ON` over Variant columns).
-            .with_optimizer_rule(Arc::new(crate::optimizers::VariantScanSchemaRestore))
+            .with_optimizer_rule(Arc::new(crate::read::optimizers::VariantScanSchemaRestore))
             // Physical rules: start from DataFusion's defaults, splice our
             // mem∪delta union-ordering rule in *before* EnforceDistribution so
             // the built-in EnforceDistribution/EnforceSorting do the
@@ -5000,13 +4994,13 @@ impl Database {
             .with_physical_optimizer_rules({
                 let mut rules = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules;
                 let pos = rules.iter().position(|r| r.name() == "EnforceDistribution").unwrap_or(0);
-                rules.insert(pos, Arc::new(crate::optimizers::OrderedUnionForTopK));
+                rules.insert(pos, Arc::new(crate::read::optimizers::OrderedUnionForTopK));
                 // After EnforceSorting/EnforceDistribution, never before: this rule exists to
                 // undo their (locally correct) decision to discharge DedupExec's ordering as
                 // trivially satisfied when a pushed equality pins the sort column to a
                 // constant, which leaves the operator reading through an order-erasing
                 // coalesce. See `DedupNeedsOrderedInput`.
-                rules.push(Arc::new(crate::optimizers::DedupNeedsOrderedInput));
+                rules.push(Arc::new(crate::read::optimizers::DedupNeedsOrderedInput));
                 rules.push(instrument_rule);
                 rules
             })
@@ -5016,7 +5010,7 @@ impl Database {
             .with_query_planner(Arc::new(DmlQueryPlanner::new(self.clone())))
             // PostgreSQL custom casts, including jsonpath and regproc, become
             // text consistently for simple and extended protocol queries.
-            .with_type_planner(Arc::new(crate::functions::PostgresTypePlanner))
+            .with_type_planner(Arc::new(crate::read::functions::PostgresTypePlanner))
             .build();
 
         SessionContext::new_with_state(session_state)
@@ -5027,7 +5021,8 @@ impl Database {
         self.register_set_config_udf(ctx);
         // CRITICAL: Register custom functions BEFORE JSON functions to ensure VariantAwareExprPlanner
         // intercepts -> and ->> operators on Variant columns before JsonExprPlanner handles them as strings
-        crate::functions::register_custom_functions(ctx).map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
+        crate::read::functions::register_custom_functions(ctx)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
         self.register_json_functions(ctx);
         Ok(())
     }
@@ -5035,7 +5030,7 @@ impl Database {
     /// Register routing, stats, and PostgreSQL catalog tables. Depends on `self.buffered_layer`
     /// being set (stats table holds an Arc to it).
     pub fn setup_session_tables(&self, ctx: &mut SessionContext) -> DFResult<()> {
-        use crate::schema_loader::registry;
+        use crate::schema::registry;
 
         let batch_queue = self.batch_queue.as_ref().map(Arc::clone);
         let registry = registry();
@@ -5071,14 +5066,14 @@ impl Database {
         let dp_handle = self.delta_provider_cache.clone();
         // Provider count, not key count: a key holds a small version ring, and
         // the provider total is what tracks retained heap.
-        let cache_sizes: crate::stats_table::CacheSizeSnapshot = Arc::new(move || (fr_handle.len(), dp_handle.iter().map(|e| e.value().len()).sum()));
+        let cache_sizes: crate::server::pg_compat::CacheSizeSnapshot = Arc::new(move || (fr_handle.len(), dp_handle.iter().map(|e| e.value().len()).sum()));
         let foyer = self.object_store_cache.clone();
-        let foyer_stats: crate::stats_table::FoyerStatsSnapshot =
-            Arc::new(move || foyer.as_ref().map_or_else(crate::object_store_cache::FoyerRuntimeStats::default, |cache| cache.runtime_stats()));
+        let foyer_stats: crate::server::pg_compat::FoyerStatsSnapshot =
+            Arc::new(move || foyer.as_ref().map_or_else(crate::storage::FoyerRuntimeStats::default, |cache| cache.runtime_stats()));
         ctx.register_table(
             "timefusion_stats",
             Arc::new(
-                crate::stats_table::StatsTableProvider::new(self.buffered_layer().cloned())
+                crate::server::pg_compat::StatsTableProvider::new(self.buffered_layer().cloned())
                     .with_scan_metrics(self.scan_metrics.clone())
                     .with_cache_sizes(cache_sizes)
                     .with_foyer_stats(foyer_stats)
@@ -5098,7 +5093,7 @@ impl Database {
             ),
         )?;
 
-        crate::pg_compat::setup_catalog(ctx, &self.config.core.pgwire_user, self.config.core.timefusion_pgwire_max_statement_secs)?;
+        crate::server::pg_compat::setup_catalog(ctx, &self.config.core.pgwire_user, self.config.core.timefusion_pgwire_max_statement_secs)?;
         Ok(())
     }
 
@@ -5517,7 +5512,7 @@ impl Database {
             .create_object_store_with_timeout(storage_uri, storage_options, self.config.aws.log_request_timeout())
             .instrument(tracing::trace_span!("create_object_store_log_class"))
             .await?;
-        let routed = Arc::new(crate::object_store_cache::RequestClassRouter::new(log_store_client, base_store)) as Arc<dyn object_store::ObjectStore>;
+        let routed = Arc::new(crate::storage::RequestClassRouter::new(log_store_client, base_store)) as Arc<dyn object_store::ObjectStore>;
         let instrumented_store = instrument_object_store(routed, "s3");
 
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
@@ -5767,13 +5762,11 @@ impl Database {
                 // Metadata is cheap and required independently of a full-body
                 // warm: a cold Parquet header/footer probe must never trigger a
                 // whole-object GET.
-                let _ = crate::object_store_cache::warm_parquet_metadata(store.as_ref(), &path, metadata_size_hint).await;
+                let _ = crate::storage::warm_parquet_metadata(store.as_ref(), &path, metadata_size_hint).await;
                 if warm_full_files && recent {
                     let hit = match shared {
-                        Some(shared) => {
-                            crate::object_store_cache::warm_full_if_absent(store.as_ref(), shared, &path, &bucket_cache_key(table_path, &path)).await
-                        }
-                        None => crate::object_store_cache::warm_full(store.as_ref(), &path).await,
+                        Some(shared) => crate::storage::warm_full_if_absent(store.as_ref(), shared, &path, &bucket_cache_key(table_path, &path)).await,
+                        None => crate::storage::warm_full(store.as_ref(), &path).await,
                     };
                     fetched.fetch_add(hit as usize, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -5801,11 +5794,11 @@ impl Database {
         // Never a durability gate: on timeout the commit is already done and the
         // uncached tail just costs the next query an object-store round trip.
         if tokio::time::timeout(deadline, pass).await.is_err() {
-            crate::metrics::record_cache_confirm_timeout();
+            crate::observability::record_cache_confirm_timeout();
             warn!("cache confirm exceeded {:?} for {} file(s) — proceeding uncached (commit unaffected)", deadline, count);
         }
         let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
-        crate::metrics::record_cache_confirm(count as u64, fetched as u64);
+        crate::observability::record_cache_confirm(count as u64, fetched as u64);
         debug!("cache confirm: {count} file(s), {fetched} fetched, {:.1}s", t0.elapsed().as_secs_f64());
     }
 
@@ -5901,7 +5894,7 @@ impl Database {
         let shutdown = self.maintenance_shutdown.clone();
         let concurrency = self.config.maintenance.timefusion_warm_concurrency.max(1);
         let preload = async move {
-            let preload_all = futures::stream::iter(crate::schema_loader::registry().list_tables()).for_each_concurrent(concurrency, |table_name| {
+            let preload_all = futures::stream::iter(crate::schema::registry().list_tables()).for_each_concurrent(concurrency, |table_name| {
                 let db = Arc::clone(&db);
                 async move {
                     let t = std::time::Instant::now();
@@ -6041,7 +6034,7 @@ impl Database {
 
     /// `create_object_store` with an explicit per-request timeout, so the
     /// commit-log request class can get its own client (see
-    /// [`crate::object_store_cache::RequestClassRouter`]). Every other setting
+    /// [`crate::storage::RequestClassRouter`]). Every other setting
     /// — retries, pool sizing, credentials — is identical by construction.
     pub async fn create_object_store_with_timeout(
         &self, storage_uri: &str, storage_options: &HashMap<String, String>, request_timeout: String,
@@ -6128,7 +6121,7 @@ impl Database {
 
     /// Directory holding locally persisted Delta snapshots (see `snapshot_cache`).
     fn delta_snapshot_dir(cfg: &AppConfig) -> PathBuf {
-        crate::wal::meta_path(&cfg.core.timefusion_data_dir, "delta_snapshots")
+        crate::write::wal::meta_path(&cfg.core.timefusion_data_dir, "delta_snapshots")
     }
 
     /// Whether snapshot refreshes may take the incremental catch-up fast path
@@ -6301,7 +6294,7 @@ impl Database {
     /// [`UnsortedFallback`]. The two callers want opposite things, and getting
     /// it wrong is how prod ended up 55% unsorted.
     async fn sort_flush_group(
-        &self, schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>, fallback: UnsortedFallback,
+        &self, schema: &crate::schema::TableSchema, batches: Vec<RecordBatch>, fallback: UnsortedFallback,
     ) -> Result<(FlushBatches, bool)> {
         // An empty group, or a table declaring no sort order, has no footer to
         // lose: `sorted = false` there is not a degradation and must not abort.
@@ -6343,7 +6336,7 @@ impl Database {
                 // losing them is not on the table. Counted because one such file
                 // disables the reader's ordering for its whole partition — this
                 // must never be silent (2026-08-03).
-                crate::metrics::record_flush_sort_unsorted_fallback();
+                crate::observability::record_flush_sort_unsorted_fallback();
                 Ok((FlushBatches::Ready(batches.into_iter()), false))
             }
         }
@@ -6367,7 +6360,7 @@ impl Database {
     /// Returns `None` if anything goes wrong, so the caller falls back to
     /// writing the ORIGINAL batches unsorted. A flush must never lose rows to
     /// a sort failure.
-    async fn sort_flush_group_spilling(&self, schema: &crate::schema_loader::TableSchema, batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
+    async fn sort_flush_group_spilling(&self, schema: &crate::schema::TableSchema, batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
         use datafusion::{datasource::MemTable, prelude::SessionContext};
         // Hold a slice of the shared spill pool for the whole sort. Queueing
         // here costs latency on an already-oversized group; losing the slice
@@ -6565,7 +6558,7 @@ impl Database {
         if let Some(state) = table.state.clone() {
             self.snapshot_persist_gate.insert(url.clone(), now);
             let dir = Self::delta_snapshot_dir(&self.config);
-            tokio::task::spawn_blocking(move || crate::snapshot_cache::store(&dir, &url, &state));
+            tokio::task::spawn_blocking(move || crate::storage::store_snapshot(&dir, &url, &state));
         }
     }
 
@@ -6595,7 +6588,7 @@ impl Database {
                 .with_storage_options(storage_options.clone())
                 .with_allow_http(true))
         };
-        let restored = match crate::snapshot_cache::load(&Self::delta_snapshot_dir(&self.config), storage_uri) {
+        let restored = match crate::storage::load_snapshot(&Self::delta_snapshot_dir(&self.config), storage_uri) {
             Some(state) => {
                 let restored_version = state.version();
                 let mut table = builder()?.build()?;
@@ -6738,16 +6731,15 @@ impl Database {
         )
     )]
     pub async fn insert_records_batch(
-        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::buffered_write_layer::DeltaWatermark>,
+        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>,
     ) -> Result<Vec<String>> {
         self.insert_records_batch_bounded(project_id, table_name, batches, skip_queue, watermark, true).await
     }
 
     /// `bound: false` is for DML re-appends only — see
-    /// [`crate::buffered_write_layer::BufferedWriteLayer::insert_bounded`].
+    /// [`crate::write::BufferedWriteLayer::insert_bounded`].
     pub async fn insert_records_batch_bounded(
-        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool,
-        watermark: Option<&crate::buffered_write_layer::DeltaWatermark>, bound: bool,
+        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::write::DeltaWatermark>, bound: bool,
     ) -> Result<Vec<String>> {
         let span = tracing::Span::current();
         // Normalize timezone-as-offset (`+00:00`) timestamp columns to the
@@ -6794,7 +6786,7 @@ impl Database {
         // value — a re-stamp would give a crash-retried flush a different value
         // than the WAL holds. WAL replay bypasses this function entirely and
         // seeds the clock via `insert_coerce::observe_batch` instead.
-        let batches = if watermark.is_none() { crate::insert_coerce::stamp_version(&table_name, batches) } else { batches };
+        let batches = if watermark.is_none() { crate::write::stamp_version(&table_name, batches) } else { batches };
 
         // If buffered layer is configured and not skipping, use it (WAL → MemBuffer flow).
         // No files are written synchronously on this path; an empty URI list is correct.
@@ -7396,7 +7388,7 @@ impl Database {
         match tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, self.probe_commit_landed(table_ref, adds)).await {
             Ok(probe) => probe,
             Err(_) => {
-                crate::metrics::record_commit_timeout("landing_probe");
+                crate::observability::record_commit_timeout("landing_probe");
                 CommitProbe::Inconclusive
             }
         }
@@ -7588,7 +7580,7 @@ impl Database {
     /// Must run *before* `recover_from_wal`. Best-effort: any failure to read
     /// metadata is logged and skipped (walrus's locally-fsynced cursor wins),
     /// so this can't make recovery worse than today's at-least-once behaviour.
-    pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::wal::WalManager) -> anyhow::Result<usize> {
+    pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::write::wal::WalManager) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
 
         // Group logical WAL topics by physical Delta log. Default-storage
@@ -7609,7 +7601,7 @@ impl Database {
         Ok(totals.into_iter().sum())
     }
 
-    async fn derive_wal_cursors_for_physical_table(&self, wal: &crate::wal::WalManager, topics: Vec<(String, String)>) -> anyhow::Result<usize> {
+    async fn derive_wal_cursors_for_physical_table(&self, wal: &crate::write::wal::WalManager, topics: Vec<(String, String)>) -> anyhow::Result<usize> {
         let Some((representative_project, representative_table)) = topics.first() else { return Ok(0) };
         // Scan recent commits; replay-derived commits without a watermark
         // contribute nothing so they can't reset the MAX backward.
@@ -7717,7 +7709,7 @@ impl Database {
 
         if kept_dates.is_empty() {
             info!("optimize: table={} all {} window partitions unchanged since last run — skipping (cache churn avoided)", table_name, window_dates.len());
-            crate::metrics::record_optimize_partitions(0, skipped as u64);
+            crate::observability::record_optimize_partitions(0, skipped as u64);
             return Ok(());
         }
 
@@ -7789,7 +7781,7 @@ impl Database {
                 match result {
                     Ok(result) => break Ok(result),
                     Err(e) if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_RETRIES => {
-                        crate::metrics::record_optimize_conflict();
+                        crate::observability::record_optimize_conflict();
                         attempt += 1;
                         warn!("Optimize OCC conflict for table={} (attempt {}/{}), refreshing + retrying: {}", table_name, attempt, MAX_RETRIES, e);
                     }
@@ -7814,7 +7806,7 @@ impl Database {
                         entry.insert(*d, new_sets.get(d).cloned().unwrap_or_default());
                     }
                 }
-                crate::metrics::record_optimize_partitions(kept_dates.len() as u64, skipped as u64);
+                crate::observability::record_optimize_partitions(kept_dates.len() as u64, skipped as u64);
 
                 let min_files = self.config.maintenance.timefusion_compact_min_files;
                 if metrics.total_considered_files < min_files {
@@ -7848,7 +7840,7 @@ impl Database {
                 if let Some(svc) = self.tantivy_indexer().cloned()
                     && svc.config.is_table_indexed(table_name)
                 {
-                    use crate::tantivy_index::service::{parquet_rel_of_uri, project_id_of_uri};
+                    use crate::tantivy::search::{parquet_rel_of_uri, project_id_of_uri};
                     let delta_store = { table_ref.read().await.log_store().object_store(None) };
                     let added: Vec<(String, String, String)> = live_uris
                         .iter()
@@ -7887,7 +7879,7 @@ impl Database {
                     // guessing (a fixed "default"+customs list never visited
                     // unified tenants' manifests, so their stale entries
                     // outlived every compaction until the nightly reconcile).
-                    let project_ids = match crate::tantivy_index::manifest::list_projects(svc.object_store.as_ref(), table_name).await {
+                    let project_ids = match crate::tantivy::list_manifest_projects(svc.object_store.as_ref(), table_name).await {
                         Ok(pids) => pids,
                         Err(e) => {
                             warn!("tantivy gc: manifest enumeration failed for {}: {}", table_name, e);
@@ -7911,9 +7903,9 @@ impl Database {
             }
             Err(e) => {
                 if is_occ_conflict_err(&e.to_string()) {
-                    crate::metrics::record_optimize_conflict();
+                    crate::observability::record_optimize_conflict();
                 }
-                crate::metrics::record_optimize_failed();
+                crate::observability::record_optimize_failed();
                 error!("Optimization operation failed: {}", e);
                 Err(anyhow::anyhow!("Table optimization failed: {}", e))
             }
@@ -8016,7 +8008,7 @@ impl Database {
     /// the same top-100 query take 130s across the midnight boundary versus
     /// 0.81s inside today (and OOM past the 2 GiB per-query dedup cap).
     fn select_all_hot_bins(
-        table: &DeltaTable, schema: &crate::schema_loader::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
+        table: &DeltaTable, schema: &crate::schema::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
     ) -> Result<Vec<(String, Vec<String>)>> {
         let date_marker = format!("date={today_str}/");
         let repair_markers: Vec<String> = policy.repair_dates.iter().map(|d| format!("date={d}/")).collect();
@@ -8241,7 +8233,7 @@ impl Database {
                         }
                         if attempt < MAX_ATTEMPTS {
                             if occ {
-                                crate::metrics::record_optimize_conflict();
+                                crate::observability::record_optimize_conflict();
                                 warn!(
                                     "compact date={date}: OCC conflict (no-progress attempt {attempt}/{MAX_ATTEMPTS}, total {total_attempts}), refreshing + retrying: {e}"
                                 );
@@ -8259,9 +8251,9 @@ impl Database {
                         }
                     }
                     if occ {
-                        crate::metrics::record_optimize_conflict();
+                        crate::observability::record_optimize_conflict();
                     }
-                    crate::metrics::record_optimize_failed();
+                    crate::observability::record_optimize_failed();
                     return Err(anyhow::anyhow!("compact date={date} table={table_name} failed: {e}"));
                 }
             }
@@ -8556,7 +8548,7 @@ impl Database {
     /// (bounds S3 I/O across the whole cold backlog). Covers "previous days and
     /// further", picking up backfill that landed in old partitions.
     pub async fn consolidate_sealed_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
-        let today = crate::clock::today_utc();
+        let today = crate::support::today_utc();
         let after_days = self.config.parquet.cold_optimize_after_days();
         let dates: Vec<chrono::NaiveDate> = self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
         info!("consolidate: table={} sweeping {} sealed partition(s) older than {}d", table_name, dates.len(), after_days);
@@ -8588,7 +8580,7 @@ impl Database {
     /// consolidating the worst one lowers its count until another becomes the
     /// worst.
     pub async fn consolidate_catchup(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, max_passes: usize) -> Result<()> {
-        let today = crate::clock::today_utc();
+        let today = crate::support::today_utc();
         let after_days = self.config.parquet.cold_optimize_after_days();
         let target_of = |d| self.optimize_target_for_date(d);
         // Count only files still BELOW their date's target: a partition of big
@@ -9052,7 +9044,7 @@ impl Database {
     /// verified duplicate-free.
     #[allow(clippy::too_many_arguments)]
     async fn stage_dedup_chunk(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, scan_name: &str,
         partition_filter: &str, chunk_filter: &str, label: &str, date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{kernel::Action, writer::DeltaWriter};
@@ -9266,7 +9258,7 @@ impl Database {
                     .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
                     .unwrap_or(0);
                 if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
-                    crate::metrics::record_dedup_chunk_skipped();
+                    crate::observability::record_dedup_chunk_skipped();
                     error!(
                         "dedup rewrite SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] files={} — duplicates persist until compaction shrinks the file set",
                         max_group,
@@ -9434,7 +9426,7 @@ impl Database {
                                 if shard_before == 0 {
                                     return Ok((0, 0));
                                 }
-                                let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None)?;
+                                let deduped = crate::write::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None)?;
                                 let shard_after = deduped.iter().map(RecordBatch::num_rows).sum();
                                 let deduped = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
                                 let (deduped, _) = self.sort_flush_group(schema, deduped, UnsortedFallback::Forbid).await?;
@@ -9600,9 +9592,9 @@ impl Database {
             .collect();
         entries.sort_by(|a, b| (&a.source, &a.project_id, &a.date).cmp(&(&b.source, &b.project_id, &b.date)));
         let dirty_entries = entries.iter().filter(|entry| entry.unknown || entry.dirty_hours != 0).collect::<Vec<_>>();
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         stats.rollup_dirty_partitions.store(dirty_entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let now = crate::certification_store::now_unix_ms();
+        let now = crate::storage::now_unix_ms();
         let oldest_age_secs = dirty_entries
             .iter()
             .filter_map(|entry| (entry.invalidated_unix_ms != 0).then_some(now.saturating_sub(entry.invalidated_unix_ms) / 1_000))
@@ -9619,7 +9611,7 @@ impl Database {
         }
         let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(std::io::Error::other)?;
         let day_start = day.and_hms_opt(0, 0, 0).ok_or_else(|| std::io::Error::other("invalid maintenance date"))?.and_utc().timestamp_micros();
-        let observed_at = crate::clock::now_micros();
+        let observed_at = crate::support::now_micros();
         let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for spec in &schema.rollups {
             let target = spec.table_name(source);
@@ -9722,8 +9714,8 @@ impl Database {
         if !self.config.maintenance.timefusion_light_optimize_enabled {
             return Ok(0);
         }
-        let now = crate::clock::now_micros();
-        let today = crate::clock::today_utc();
+        let now = crate::support::now_micros();
+        let today = crate::support::today_utc();
         let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
         let mut planned = Vec::new();
         for (storage_project, source, table_ref) in self.all_tables().await {
@@ -9974,7 +9966,7 @@ impl Database {
             }
             defer
         };
-        let today = crate::clock::today_utc();
+        let today = crate::support::today_utc();
         let earliest = today - chrono::Duration::days(horizon);
         let mut queued = 0usize;
         // `rollup_min_contiguous_days` folds every (source, tier) into one
@@ -10103,7 +10095,7 @@ impl Database {
                 // and `tasks_pending` both read as progress on 2026-08-17 while
                 // 14d/30d queries stayed unroutable.
                 let (contiguous, worst_project) = min_contiguous_days(&covered, &source_partitions, today, &active_projects);
-                let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+                let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
                 let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
                 // Every tier folds into one number, so take the worst; reset
                 // when this sweep starts over at the first tier of the first source.
@@ -10269,7 +10261,7 @@ impl Database {
             // the holes, this one says why the work it already queued never runs.
             let (derived_pending, derived_sealed, derived_unproven, derived_quarantined, derived_not_due) = {
                 let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                journal.claimability_census(crate::maintenance_coordinator::Operation::DerivedRollup, crate::clock::now_micros())
+                journal.claimability_census(crate::maintenance_coordinator::Operation::DerivedRollup, crate::support::now_micros())
             };
             info!(
                 source,
@@ -10285,7 +10277,7 @@ impl Database {
                 derived_refusal = {
                     let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     journal
-                        .first_refused_sealed(crate::maintenance_coordinator::Operation::DerivedRollup, crate::clock::now_micros())
+                        .first_refused_sealed(crate::maintenance_coordinator::Operation::DerivedRollup, crate::support::now_micros())
                         .map_or_else(|| "none_pending".to_owned(), |(project, date, reason)| format!("{reason}:{project:.8}:{date}"))
                 },
                 cells_admitted = want.len().min(BACKFILL_PARTITIONS_PER_PASS),
@@ -10322,7 +10314,7 @@ impl Database {
             // HotPacking is also dropped for sealed days: `plan_compaction_debt`
             // routes those to SealedConsolidation, so the ~41k HotPacking tasks
             // this used to mint for history were pure waste.
-            let now = crate::clock::now_micros();
+            let now = crate::support::now_micros();
             let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
             {
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -10418,7 +10410,7 @@ impl Database {
         let permit = Arc::clone(&self.maintenance_quarantine_slots).try_acquire_owned().ok();
         let task = {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            journal.claim_next(operation, crate::clock::now_micros(), permit.is_some())?
+            journal.claim_next(operation, crate::support::now_micros(), permit.is_some())?
         };
         let quarantined = crate::maintenance_coordinator::TaskJournal::is_quarantined(&task);
         Some((task, permit.filter(|_| quarantined)))
@@ -10436,12 +10428,12 @@ impl Database {
         let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
             let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            journal.retry(&key, reason, crate::clock::now_micros().saturating_add(delay_micros));
+            journal.retry(&key, reason, crate::support::now_micros().saturating_add(delay_micros));
             journal.checkpoint()
         };
 
         if self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&key.project_id, &key.source, key.slice.start_micros, key.slice.end_micros)) {
-            retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::clock::now_micros()))?;
+            retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::support::now_micros()))?;
             return Ok(true);
         }
         let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive()) else {
@@ -10520,14 +10512,14 @@ impl Database {
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 journal.complete(&key);
                 journal.checkpoint()?;
-                crate::metrics::maintenance_stats().maintenance_processed_bytes.fetch_add(task.estimated_decoded_bytes, Relaxed);
+                crate::observability::maintenance_stats().maintenance_processed_bytes.fetch_add(task.estimated_decoded_bytes, Relaxed);
             }
             Ok((_, false)) => retry("dedup_incomplete".to_owned(), std::time::Duration::from_secs(30))?,
             Err(error) => {
                 let delay = std::time::Duration::from_secs(1u64 << task.attempts.min(8));
                 let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                journal.retry_or_split(&key, format!("dedup: {error:#}"), crate::clock::now_micros().saturating_add(delay_micros), task.attempts);
+                journal.retry_or_split(&key, format!("dedup: {error:#}"), crate::support::now_micros().saturating_add(delay_micros), task.attempts);
                 journal.checkpoint()?;
             }
         }
@@ -10555,7 +10547,7 @@ impl Database {
         let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
             let delay = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            journal.retry(&key, reason, crate::clock::now_micros().saturating_add(delay));
+            journal.retry(&key, reason, crate::support::now_micros().saturating_add(delay));
             journal.checkpoint()
         };
         let Some(source_schema) = get_schema(&key.source) else {
@@ -10583,7 +10575,7 @@ impl Database {
         if !derived
             && self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&key.project_id, &key.source, key.slice.start_micros, key.slice.end_micros))
         {
-            retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::clock::now_micros()))?;
+            retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::support::now_micros()))?;
             return Ok(true);
         }
 
@@ -10709,7 +10701,7 @@ impl Database {
             (snapshot, table.log_store(), selected, estimated)
         };
         if untagged_inputs > 0 {
-            crate::metrics::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
             // Since #169 these files are KEPT — pruned on their own timestamp
             // statistics rather than discarded — so this is no longer a report of
             // data that can never arrive. It now measures how much of the base
@@ -11011,14 +11003,14 @@ impl Database {
             // the change; its own replace-set then removes everything it
             // contains. It terminates: the wider unit publishes at its own
             // width, so it never re-enters this branch.
-            crate::metrics::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
                 journal.enqueue(
                     crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() },
-                    crate::clock::now_micros(),
+                    crate::support::now_micros(),
                     MAX_DECODED_BYTES,
-                    u64::try_from(crate::clock::now_micros().div_euclid(1_000)).unwrap_or_default(),
+                    u64::try_from(crate::support::now_micros().div_euclid(1_000)).unwrap_or_default(),
                 );
             }
             journal.complete(&key);
@@ -11099,7 +11091,7 @@ impl Database {
                 estimated_decoded_bytes = estimated_bytes,
                 event = "maintenance_rollup_published"
             );
-            let stats = crate::metrics::maintenance_stats();
+            let stats = crate::observability::maintenance_stats();
             stats.maintenance_processed_bytes.fetch_add(estimated_bytes, Relaxed);
             stats.rollup_output_rows.fetch_add(rows, Relaxed);
             stats.rollup_output_files.fetch_add(output_files, Relaxed);
@@ -11195,7 +11187,7 @@ impl Database {
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, seconds: u64| -> Result<()> {
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            journal.retry(&key, reason, crate::clock::now_micros().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX).saturating_mul(1_000_000)));
+            journal.retry(&key, reason, crate::support::now_micros().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX).saturating_mul(1_000_000)));
             journal.checkpoint()
         };
         let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 })
@@ -11231,7 +11223,7 @@ impl Database {
             let remaining = !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty();
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if remaining {
-                journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::clock::now_micros());
+                journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
             } else {
                 journal.complete(&key);
             }
@@ -11255,25 +11247,25 @@ impl Database {
             Ok(BinOutcome::Retry) => false,
             Err(error) => {
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                journal.retry_or_split(&key, format!("compaction: {error:#}"), crate::clock::now_micros().saturating_add(30 * 1_000_000), task.attempts);
+                journal.retry_or_split(&key, format!("compaction: {error:#}"), crate::support::now_micros().saturating_add(30 * 1_000_000), task.attempts);
                 journal.checkpoint()?;
                 return Ok(true);
             }
         };
         let remaining = if completed { !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty() } else { false };
         if completed {
-            crate::metrics::maintenance_stats().maintenance_processed_bytes.fetch_add(processed_bytes, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().maintenance_processed_bytes.fetch_add(processed_bytes, std::sync::atomic::Ordering::Relaxed);
         }
         let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if journal.state(&key) == Some(TaskState::Running) {
             if completed {
                 if remaining {
-                    journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::clock::now_micros());
+                    journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
                 } else {
                     journal.complete(&key);
                 }
             } else {
-                journal.retry(&key, "compaction_incomplete".to_owned(), crate::clock::now_micros().saturating_add(30_000_000));
+                journal.retry(&key, "compaction_incomplete".to_owned(), crate::support::now_micros().saturating_add(30_000_000));
             }
             journal.checkpoint()?;
         }
@@ -11282,7 +11274,7 @@ impl Database {
 
     async fn run_maintenance_coordinator_once(&self) -> Result<bool> {
         use crate::maintenance_coordinator::Operation;
-        let now = crate::clock::now_micros();
+        let now = crate::support::now_micros();
         let last = self.maintenance_debt_planned_at.load(std::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last) >= 60_000_000
             && self.maintenance_debt_planned_at.compare_exchange(last, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
@@ -11306,7 +11298,7 @@ impl Database {
             // are added.
             let collapsed = {
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let collapsed = journal.coarsen_sealed_slices(crate::clock::now_micros());
+                let collapsed = journal.coarsen_sealed_slices(crate::support::now_micros());
                 if collapsed != 0 {
                     journal.checkpoint()?;
                 }
@@ -11505,7 +11497,7 @@ impl Database {
         // whose source rows can actually have changed. Historical discovery
         // and source-wide DML continue to pass ALL_HOURS explicitly.
         let affected_hours = hours;
-        self.rollup_invalidated_at.entry(source_key.clone()).or_insert_with(crate::certification_store::now_unix_ms);
+        self.rollup_invalidated_at.entry(source_key.clone()).or_insert_with(crate::storage::now_unix_ms);
         // This path is called with a precise timestamp-derived mask. Unknown
         // or source-wide changes use `invalidate_rollup_source` and pass
         // `ALL_HOURS` instead.
@@ -11624,7 +11616,7 @@ impl Database {
         for key in &keys {
             self.rollup_source_epochs.entry(key.clone()).and_modify(|epoch| *epoch = epoch.saturating_add(1));
             self.rollup_dirty.insert(key.clone(), crate::rollup::ALL_HOURS);
-            self.rollup_invalidated_at.entry(key.clone()).or_insert_with(crate::certification_store::now_unix_ms);
+            self.rollup_invalidated_at.entry(key.clone()).or_insert_with(crate::storage::now_unix_ms);
             self.enqueue_maintenance_hours(&key.0, &key.1, &key.2, crate::rollup::ALL_HOURS)?;
         }
         self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source);
@@ -11762,18 +11754,18 @@ impl Database {
             Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
             anyhow::bail!("could not attribute {} of {} staged rollup files to a cohort project", staged.len().saturating_sub(attributed), staged.len());
         }
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         stats.rollup_staged_projects.fetch_add(units.len() as u64, std::sync::atomic::Ordering::Relaxed);
         stats.rollup_output_rows.fetch_add(rows.values().sum(), std::sync::atomic::Ordering::Relaxed);
         stats.rollup_output_files.fetch_add(staged.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let staging_ms = started.elapsed().as_millis() as u64;
         stats.rollup_staging_duration_ms.fetch_add(staging_ms, std::sync::atomic::Ordering::Relaxed);
-        if let Some(metrics) = crate::metrics::registry() {
+        if let Some(metrics) = crate::observability::registry() {
             metrics.rollup_output_rows.add(rows.values().sum(), &[]);
             metrics.rollup_output_files.add(staged.len() as u64, &[]);
             metrics.rollup_staging_duration_ms.add(staging_ms, &[]);
         }
-        if let Some(metrics) = crate::metrics::registry() {
+        if let Some(metrics) = crate::observability::registry() {
             metrics.rollup_staged_projects.add(units.len() as u64, &[]);
         }
         Ok(RollupCommitWave { table_ref, target: target.to_string(), units })
@@ -11836,23 +11828,23 @@ impl Database {
                     table.state = Some(finalized.snapshot());
                     drop(commit_guard);
                     self.swap_and_refresh_cache(&wave.table_ref, table, None, &[&format!("date={}", fresh[0].date)]).await;
-                    let stats = crate::metrics::maintenance_stats();
+                    let stats = crate::observability::maintenance_stats();
                     stats.rollup_shared_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     stats.rollup_commit_actions.fetch_add(action_count, std::sync::atomic::Ordering::Relaxed);
                     let commit_ms = started.elapsed().as_millis() as u64;
                     stats.rollup_commit_duration_ms.fetch_add(commit_ms, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(metrics) = crate::metrics::registry() {
+                    if let Some(metrics) = crate::observability::registry() {
                         metrics.rollup_commit_duration_ms.add(commit_ms, &[]);
                     }
-                    if let Some(metrics) = crate::metrics::registry() {
+                    if let Some(metrics) = crate::observability::registry() {
                         metrics.rollup_shared_commits.add(1, &[]);
                         metrics.rollup_commit_actions.add(action_count, &[]);
                     }
                     return Ok(fresh);
                 }
                 Err(error) if is_occ_conflict_err(&error.to_string()) && attempt < 4 => {
-                    crate::metrics::maintenance_stats().rollup_occ_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(metrics) = crate::metrics::registry() {
+                    crate::observability::maintenance_stats().rollup_occ_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(metrics) = crate::observability::registry() {
                         metrics.rollup_occ_retries.add(1, &[]);
                     }
                     drop(commit_guard);
@@ -11863,8 +11855,8 @@ impl Database {
                     drop(commit_guard);
                     match self.probe_commit_landed_bounded(&wave.table_ref, &adds).await {
                         CommitProbe::Landed => {
-                            crate::metrics::maintenance_stats().rollup_ambiguous_landings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(metrics) = crate::metrics::registry() {
+                            crate::observability::maintenance_stats().rollup_ambiguous_landings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(metrics) = crate::observability::registry() {
                                 metrics.rollup_ambiguous_landings.add(1, &[]);
                             }
                             return Ok(fresh);
@@ -11936,11 +11928,11 @@ impl Database {
 
     async fn rebuild_rollup_cohort(&self, storage_project: &str, source: &str, date: &str, cohort: crate::rollup::RollupScanCohort) -> Result<Vec<String>> {
         let scan_started = std::time::Instant::now();
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         stats.rollup_scan_cohorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         stats.rollup_scan_projects.fetch_add(cohort.projects.len() as u64, std::sync::atomic::Ordering::Relaxed);
         stats.rollup_scan_estimated_bytes.fetch_add(cohort.estimated_decoded_bytes, std::sync::atomic::Ordering::Relaxed);
-        if let Some(metrics) = crate::metrics::registry() {
+        if let Some(metrics) = crate::observability::registry() {
             metrics.rollup_scan_cohorts.add(1, &[]);
             metrics.rollup_scan_projects.add(cohort.projects.len() as u64, &[]);
             metrics.rollup_scan_estimated_bytes.add(cohort.estimated_decoded_bytes, &[]);
@@ -12060,9 +12052,9 @@ impl Database {
                     },
                 );
                 let counter = if incremental {
-                    &crate::metrics::maintenance_stats().rollup_rebuilds_incremental
+                    &crate::observability::maintenance_stats().rollup_rebuilds_incremental
                 } else {
-                    &crate::metrics::maintenance_stats().rollup_rebuilds_full
+                    &crate::observability::maintenance_stats().rollup_rebuilds_full
                 };
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let hours = if incremental {
@@ -12076,7 +12068,7 @@ impl Database {
                 };
                 let hours_counter = if incremental { &stats.rollup_incremental_hours_rebuilt } else { &stats.rollup_full_hours_rebuilt };
                 hours_counter.fetch_add(hours, std::sync::atomic::Ordering::Relaxed);
-                if let Some(metrics) = crate::metrics::registry() {
+                if let Some(metrics) = crate::observability::registry() {
                     if incremental {
                         metrics.rollup_incremental_hours_rebuilt.add(hours, &[]);
                     } else {
@@ -12108,7 +12100,7 @@ impl Database {
         let elapsed_ms = scan_started.elapsed().as_millis() as u64;
         stats.rollup_scan_duration_ms.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
         stats.rollup_end_to_end_duration_ms.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
-        if let Some(metrics) = crate::metrics::registry() {
+        if let Some(metrics) = crate::observability::registry() {
             metrics.rollup_scan_duration_ms.add(elapsed_ms, &[]);
             metrics.rollup_end_to_end_duration_ms.add(elapsed_ms, &[]);
         }
@@ -12128,8 +12120,8 @@ impl Database {
                     }
                 }
                 Err(error) if cohort.projects.len() > 1 && is_rollup_cohort_resource_error(&error.to_string()) => {
-                    crate::metrics::maintenance_stats().rollup_cohort_splits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(metrics) = crate::metrics::registry() {
+                    crate::observability::maintenance_stats().rollup_cohort_splits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(metrics) = crate::observability::registry() {
                         metrics.rollup_cohort_splits.add(1, &[]);
                     }
                     if let Some((left, right)) = crate::rollup::split_scan_cohort(cohort) {
@@ -12140,8 +12132,8 @@ impl Database {
                 }
                 Err(error) => {
                     if projects.len() == 1 {
-                        crate::metrics::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(metrics) = crate::metrics::registry() {
+                        crate::observability::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(metrics) = crate::observability::registry() {
                             metrics.rollup_singleton_failures.add(1, &[]);
                         }
                     }
@@ -12235,18 +12227,18 @@ impl Database {
                     let days = arrow::array::AsArray::as_primitive_opt::<arrow::datatypes::Date32Type>(array.as_ref())?.value(row);
                     chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?.checked_add_signed(chrono::Duration::days(days as i64)).map(|date| date.to_string())
                 }
-                _ => Some(crate::test_utils::test_helpers::array_get_str(array.as_ref(), row)),
+                _ => Some(crate::support::test_helpers::array_get_str(array.as_ref(), row)),
             }
         };
         let dates = Some(dates);
         // (rows, min_ts, max_ts, max_stamp) per partition.
         let mut by_partition: HashMap<(String, String), (i64, i64, i64, i64)> = HashMap::new();
-        let min_ts = crate::count_pushdown::ts_micros_column(&actions, "min.timestamp");
-        let max_ts = crate::count_pushdown::ts_micros_column(&actions, "max.timestamp");
+        let min_ts = crate::read::ts_micros_column(&actions, "min.timestamp");
+        let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
         // The stamp is a timestamp on every current schema, but read an integer
         // one too rather than silently dropping the tightening if that changes.
         let stamp = tiebreak.map(|tiebreak| format!("max.{tiebreak}")).and_then(|name| {
-            crate::count_pushdown::ts_micros_column(&actions, &name)
+            crate::read::ts_micros_column(&actions, &name)
                 .or_else(|| actions.column_by_name(&name)?.as_any().downcast_ref::<arrow::array::Int64Array>().cloned())
         });
         for row in 0..actions.num_rows() {
@@ -12554,8 +12546,8 @@ impl Database {
             let (oversized, projects): (Vec<_>, Vec<_>) =
                 projects.into_iter().partition(|project| project.estimated_decoded_bytes > crate::rollup::ROLLUP_COHORT_MAX_DECODED_BYTES);
             for project in oversized {
-                crate::metrics::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(metrics) = crate::metrics::registry() {
+                crate::observability::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(metrics) = crate::observability::registry() {
                     metrics.rollup_singleton_failures.add(1, &[]);
                 }
                 self.record_rollup_failure(&project.project_id, source, &date.to_string());
@@ -12643,14 +12635,14 @@ impl Database {
     /// on this query path.
     pub(crate) fn logical_count_memory_for_files(
         &self, project_id: &str, table_name: &str, date: &str, files: &std::collections::HashSet<String>,
-    ) -> Option<(Arc<crate::logical_count_index::LogicalCountIndex>, Vec<String>)> {
-        let key = crate::logical_count_index::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
+    ) -> Option<(Arc<crate::read::LogicalCountIndex>, Vec<String>)> {
+        let key = crate::read::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
         self.logical_count_cache.get_memory_appendable(&key, files)
     }
 
     pub(crate) async fn logical_count_overlay_batches(
         &self, snapshot: Arc<deltalake::kernel::EagerSnapshot>, log_store: deltalake::logstore::LogStoreRef, files: Vec<String>,
-        columns: crate::logical_count_index::LogicalCountColumns<'_>,
+        columns: crate::read::LogicalCountColumns<'_>,
     ) -> Result<Vec<RecordBatch>> {
         use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
         if files.is_empty() {
@@ -12676,7 +12668,7 @@ impl Database {
     /// Schedule one exact partition build. Concurrent misses share the same
     /// single-flight key and the global semaphore bounds winner-map memory.
     pub(crate) fn schedule_logical_count_build(self: &Arc<Self>, project_id: &str, table_name: &str, date: &str, force_refresh: bool) {
-        let key = crate::logical_count_index::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
+        let key = crate::read::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
         if !self.logical_count_building.insert(key.clone()) {
             return;
         }
@@ -12690,7 +12682,7 @@ impl Database {
         });
     }
 
-    async fn build_logical_count_partition(&self, key: &crate::logical_count_index::CountPartition, force_refresh: bool) -> Result<()> {
+    async fn build_logical_count_partition(&self, key: &crate::read::CountPartition, force_refresh: bool) -> Result<()> {
         use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
 
         let _permit = tokio::select! {
@@ -12712,7 +12704,7 @@ impl Database {
         let current_files = files.iter().cloned().collect();
         if !force_refresh
             && let Some(added_files) = tokio::task::spawn_blocking(move || cache.load_appendable(&disk_key, &current_files)).await?
-            && added_files <= crate::logical_count_index::MAX_APPEND_OVERLAY_FILES
+            && added_files <= crate::read::MAX_APPEND_OVERLAY_FILES
         {
             return Ok(());
         }
@@ -12721,8 +12713,8 @@ impl Database {
         anyhow::ensure!(declared.dedup_keys == ["timestamp", "id"], "logical-count currently requires dedup keys [timestamp,id]");
         let tiebreak = declared.dedup_tiebreak.as_deref().ok_or_else(|| anyhow::anyhow!("logical-count table has no dedup tiebreak"))?;
         let deleted = declared.tombstone_column.as_deref().ok_or_else(|| anyhow::anyhow!("logical-count table has no tombstone column"))?;
-        let columns = crate::logical_count_index::LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak, deleted };
-        let mut index = crate::logical_count_index::LogicalCountIndex::new();
+        let columns = crate::read::LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak, deleted };
+        let mut index = crate::read::LogicalCountIndex::new();
 
         if !files.is_empty() {
             let provider = TableProviderBuilder::default()
@@ -12920,7 +12912,7 @@ impl Database {
             if let Some(entry) = self.dedup_backoff.get(&backoff_key)
                 && std::time::Instant::now() < entry.value().1
             {
-                crate::metrics::record_dedup_chunk_skipped();
+                crate::observability::record_dedup_chunk_skipped();
                 debug!("dedup sweep: {} in failure backoff, skipping", backoff_key);
                 continue;
             }
@@ -13024,13 +13016,13 @@ impl Database {
         if !self.config.maintenance.timefusion_dedup_certification_persist {
             return;
         }
-        let now_ms = crate::certification_store::now_unix_ms();
+        let now_ms = crate::storage::now_unix_ms();
         let mut entries: Vec<_> = self
             .dedup_clean_fp
             .iter()
             .map(|entry| {
                 let ((project_id, table_name, date), cert) = (entry.key().clone(), *entry.value());
-                crate::certification_store::StoredCertification {
+                crate::storage::StoredCertification {
                     project_id,
                     table_name,
                     date,
@@ -13042,8 +13034,8 @@ impl Database {
         // Newest first, so the cap drops the oldest — which is also the likeliest
         // to have been invalidated by a write already.
         entries.sort_by(|a, b| b.granted_unix_ms.cmp(&a.granted_unix_ms));
-        entries.truncate(crate::certification_store::PERSIST_CAP);
-        crate::certification_store::store(&self.config.core.timefusion_data_dir, &entries);
+        entries.truncate(crate::storage::PERSIST_CAP);
+        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::CERTIFICATIONS, &entries);
     }
 
     fn persist_dirty_bins(&self) {
@@ -13052,18 +13044,18 @@ impl Database {
             .iter()
             .map(|entry| {
                 let (project_id, table_name, date, bin) = entry.key();
-                crate::dirty_bin_queue::DirtyBin { project_id: project_id.clone(), table_name: table_name.clone(), date: date.clone(), bin: *bin }
+                crate::storage::DirtyBin { project_id: project_id.clone(), table_name: table_name.clone(), date: date.clone(), bin: *bin }
             })
             .collect();
         bins.sort_by(|a, b| (&a.table_name, &a.project_id, &a.date, a.bin).cmp(&(&b.table_name, &b.project_id, &b.date, b.bin)));
-        crate::dirty_bin_queue::store(&self.config.core.timefusion_data_dir, &bins);
-        crate::metrics::maintenance_stats().dirty_bin_queue_depth.store(bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::DIRTY_BINS, &bins);
+        crate::observability::maintenance_stats().dirty_bin_queue_depth.store(bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn enqueue_dirty_bin(&self, project_id: &str, table_name: &str, date: &str, bin: i64) {
         let key = (project_id.to_string(), table_name.to_string(), date.to_string(), bin);
         if self.dedup_dirty_bins.insert(key, ()).is_none() {
-            crate::metrics::maintenance_stats().dirty_bin_enqueued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().dirty_bin_enqueued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(project_id, table_name, date, bin, event = "dirty_bin_enqueued");
             self.persist_dirty_bins();
         }
@@ -13138,7 +13130,7 @@ impl Database {
         // already keep results correct — so it must never compete with the
         // persistence path for the per-table commit lock.
         if !flush_healthy() {
-            crate::metrics::maintenance_stats().dedup_passes_flush_yields.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().dedup_passes_flush_yields.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(table_name, event = "dedup_drain_flush_yield");
             return Ok(());
         }
@@ -13191,7 +13183,7 @@ impl Database {
             DIRTY_BIN_DRAIN_BATCH,
         );
         if !deferred.is_empty() {
-            crate::metrics::maintenance_stats().dedup_bins_deferred_cold.fetch_add(deferred.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().dedup_bins_deferred_cold.fetch_add(deferred.len() as u64, std::sync::atomic::Ordering::Relaxed);
             // ONE bounded summary per pass — a 10-day backlog is thousands of bins.
             info!(
                 table_name,
@@ -13307,7 +13299,7 @@ impl Database {
             // direction is safe — an unpersisted dequeue reappears after
             // restart and re-dedups (idempotent). End-of-pass persists.
             self.dedup_dirty_bins.remove(&key);
-            crate::metrics::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::observability::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
             let started = std::time::Instant::now();
             let staged = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
@@ -13341,7 +13333,7 @@ impl Database {
                     {
                         Ok(staged) => staged,
                         Err(_) => {
-                            crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::observability::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             Err(anyhow::anyhow!("staging exceeded the {bin_deadline:?} deadline (hung object-store read, or the pass ran out of budget)"))
                         }
                     }
@@ -13365,7 +13357,7 @@ impl Database {
             // `None` = the pass ran out of budget before this bin was admitted;
             // it is still queued, so the next tick serves it.
             let Some((key, elapsed, staged)) = admitted else { continue };
-            let stats = crate::metrics::maintenance_stats();
+            let stats = crate::observability::maintenance_stats();
             let (project_id, _, date, bin) = key.clone();
             if !committing {
                 requeue(key, &stats.dirty_bin_requeued);
@@ -13465,7 +13457,7 @@ impl Database {
             }
             match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
                 Ok(Ok(dup_bins)) => {
-                    let stats = crate::metrics::maintenance_stats();
+                    let stats = crate::observability::maintenance_stats();
                     let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
                     stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
                     stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
@@ -13477,7 +13469,7 @@ impl Database {
                     Vec::new()
                 }
                 Err(_) => {
-                    crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
+                    crate::observability::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
                     warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
                     Vec::new()
                 }
@@ -13508,7 +13500,7 @@ impl Database {
         let t0 = std::time::Instant::now();
         while !flush_healthy() {
             if t0.elapsed() >= FLUSH_RECOVERY_WAIT {
-                let stats = crate::metrics::maintenance_stats();
+                let stats = crate::observability::maintenance_stats();
                 stats.dedup_passes_flush_yields.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!(table_name, requeued = wave.len(), event = "dedup_drain_flush_yield");
                 for key in wave.drain(..).filter_map(|unit| unit.dedup.as_ref().and_then(|d| d.key.clone())) {
@@ -13531,7 +13523,7 @@ impl Database {
         markers.sort();
         markers.dedup();
         let result = self.commit_wave(table, table_name, &markers, true, units, 0).await;
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         let mut landed_bins: std::collections::HashSet<DirtyBinKey> = std::collections::HashSet::new();
         for unit in &result.landed {
             let Some(d) = &unit.dedup else { continue };
@@ -13578,11 +13570,11 @@ impl Database {
         match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE, drain_deadline).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
                 warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
-                crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::observability::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(()) => {}
             Err(e) => {
-                crate::metrics::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::observability::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 error!("Dirty-bin dedup failed for {label}: {e}");
             }
         }
@@ -13594,11 +13586,11 @@ impl Database {
             match self.dedup_sweep(table, table_name, dedup_key, Some(sweep_deadline)).await {
                 Ok(()) if t0.elapsed() > DEDUP_WARN => {
                     warn!("Dedup fallback sweep for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
-                    crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(()) => {}
                 Err(e) => {
-                    crate::metrics::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     error!("Dedup fallback sweep failed for {label}: {e}");
                 }
             }
@@ -13648,7 +13640,7 @@ impl Database {
         use std::sync::atomic::Ordering::Relaxed;
         const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         let t0 = std::time::Instant::now();
-        let m = crate::metrics::maintenance_stats();
+        let m = crate::observability::maintenance_stats();
         // Per-tick counter deltas in every outcome line — tick health (planned
         // vs completed, bins landed, brakes hit) must be readable from one log
         // line, not reconstructed from counter scrapes (2026-08-05 review:
@@ -13762,7 +13754,7 @@ impl Database {
     /// 8640s budget untouched. Raising the wave cap did nothing, because the
     /// pass was ending on an EMPTY PLAN, not on waves or time.
     async fn reselect_until_real_work(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
         mut planned: Vec<(String, Vec<String>)>,
     ) -> Result<Vec<(String, Vec<String>)>> {
         for _ in 0..REPAIR_RESELECT_ROUNDS {
@@ -13848,7 +13840,7 @@ impl Database {
     pub async fn stage_and_abandon_first_bin(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass,
     ) -> Result<Option<(String, Vec<String>)>> {
-        let today = chrono::DateTime::from_timestamp_micros(crate::clock::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
+        let today = chrono::DateTime::from_timestamp_micros(crate::support::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let repair_dates = self.repair_dates(today, pass);
         let policy = self.tail_pass_policy(pass, self.tail_pass_tick_budget(pass), &repair_dates);
         let planned = self.plan_tail_pass(table_ref, table_name, &today.to_string(), &policy).await?;
@@ -13885,7 +13877,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, pass: TailPass, tick_deadline: Option<std::time::Instant>,
     ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
-        // `crate::clock`, not `Utc::now()`: the hot tail scopes itself to TODAY's
+        // `crate::support`, not `Utc::now()`: the hot tail scopes itself to TODAY's
         // partition and to an event-time seal window, so a wall-clock read here
         // makes the whole pass unreachable from the virtual-time e2e harness —
         // which is why this path had no end-to-end coverage and shipped writing
@@ -13901,13 +13893,13 @@ impl Database {
             TailPass::Repair => match Arc::clone(&self.repair_pass_permit).try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
-                    crate::metrics::maintenance_stats().repair_ticks_yielded.fetch_add(1, Relaxed);
+                    crate::observability::maintenance_stats().repair_ticks_yielded.fetch_add(1, Relaxed);
                     info!(table_name, event = "repair_pass_yielded_to_another_table");
                     return Ok(());
                 }
             },
         };
-        let today = chrono::DateTime::from_timestamp_micros(crate::clock::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
+        let today = chrono::DateTime::from_timestamp_micros(crate::support::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let today_str = today.to_string();
         let repair_dates = self.repair_dates(today, pass);
         let budget = self.tail_pass_tick_budget(pass);
@@ -13917,7 +13909,7 @@ impl Database {
         if planned.is_empty() {
             return Ok(());
         }
-        crate::metrics::maintenance_stats().light_optimize_projects_planned.fetch_add(planned.len() as u64, Relaxed);
+        crate::observability::maintenance_stats().light_optimize_projects_planned.fetch_add(planned.len() as u64, Relaxed);
         info!(table_name, date = %today, ?pass, projects = planned.len(), event = "light_optimize_planned");
         let project_ids: Vec<String> = planned.iter().map(|(project_id, _)| project_id.clone()).collect();
         // Bins the current wave should stage, replaced wholesale by each wave's
@@ -14028,7 +14020,7 @@ impl Database {
             deadline,
             |round, remaining| {
                 info!(table_name, round, remaining = remaining.len(), event = "light_optimize_tick_budget_exhausted");
-                crate::metrics::maintenance_stats().light_optimize_tick_truncated.fetch_add(1, Relaxed);
+                crate::observability::maintenance_stats().light_optimize_tick_truncated.fetch_add(1, Relaxed);
                 // Next tick starts at the first project this tick never served.
                 let resume = remaining.first().and_then(|p| order_index.get(p).copied()).unwrap_or(0);
                 self.light_optimize_cursor.store(resume, Relaxed);
@@ -14113,7 +14105,7 @@ impl Database {
                     // Publish the sort while it runs, so `timefusion_stats` can
                     // distinguish a grinding repair from a wedged one. The guard
                     // decrements on every exit path including the timeout.
-                    let _in_flight = (pass == TailPass::Repair).then(|| InFlightGuard::enter(&crate::metrics::maintenance_stats().repair_bins_in_flight));
+                    let _in_flight = (pass == TailPass::Repair).then(|| InFlightGuard::enter(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(
                         left,
                         self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None }),
@@ -14142,7 +14134,7 @@ impl Database {
                     // comparable to `projects_planned` (the alert is
                     // completed < planned for N consecutive ticks).
                     if round == 0 {
-                        crate::metrics::maintenance_stats().light_optimize_projects_completed.fetch_add((staged - failed.min(staged)) as u64, Relaxed);
+                        crate::observability::maintenance_stats().light_optimize_projects_completed.fetch_add((staged - failed.min(staged)) as u64, Relaxed);
                     }
                     // Re-plan the NEXT wave from the just-committed snapshot: the
                     // outputs are tagged sorted runs and excluded from
@@ -14191,7 +14183,7 @@ impl Database {
     /// project stays in the rotation and the next round's re-plan serves it a
     /// fresh bin. `Converged` = nothing worth staging.
     async fn stage_hot_bin(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, project_id: &str, files: Vec<String>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema::TableSchema, project_id: &str, files: Vec<String>,
         options: HotStageOptions,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
@@ -14642,7 +14634,7 @@ impl Database {
             // would be saturating the commit path and compaction is exactly the
             // work that should yield.
             if flush_waiters.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::observability::maintenance_stats().wave_commits_yielded_to_flush.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!(table_name, engine, round, attempt = attempt + 1, bins = bins.len(), event = "wave_commit_flush_yield");
                 // Nothing was committed, so the bins' target files are still live
                 // and the staged parquet is referenced by nothing. Delta VACUUM
@@ -14786,7 +14778,7 @@ impl Database {
                     drop(commit_guard);
                     let occ = !timed_out && is_occ_conflict_err(&e);
                     if occ {
-                        crate::metrics::record_optimize_conflict();
+                        crate::observability::record_optimize_conflict();
                     }
                     if occ && attempt + 1 < MAX_RETRIES {
                         debug!("{engine} wave OCC conflict (attempt {}/{}) table={}", attempt + 1, MAX_RETRIES, table_name);
@@ -14809,7 +14801,7 @@ impl Database {
                             return WaveResult { landed: concat_landed(carried, fresh), failed };
                         }
                         CommitProbe::NotLanded => {
-                            crate::metrics::record_optimize_failed();
+                            crate::observability::record_optimize_failed();
                             error!("{engine} wave commit failed for '{}': {}", table_name, e);
                             self.discard_bins(&fresh).await;
                             failed.extend(fresh);
@@ -14886,10 +14878,10 @@ impl Database {
     /// commit dropped exactly zero rows from the table.
     fn record_wave_landed(landed: &[StagedBin], data_change: bool) {
         use std::sync::atomic::Ordering::Relaxed;
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         if data_change {
             for dropped in landed.iter().filter_map(|b| b.dedup.as_ref()).map(DedupUnit::dropped).filter(|d| *d > 0) {
-                crate::metrics::record_compaction_dedup_dropped(dropped);
+                crate::observability::record_compaction_dedup_dropped(dropped);
             }
             // Dedup waves count under their own counters — crediting them to
             // light_optimize_* made the stats under-report committed waves
@@ -15098,7 +15090,7 @@ impl Database {
         };
         let live_view: std::collections::HashMap<&str, Option<i64>> = live.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         for entry in &candidates {
             match classify_resume(entry, table_name, now_secs, &live_view) {
                 ResumeVerdict::Skip => continue,
@@ -15270,12 +15262,12 @@ impl Database {
         // which removes the contention the brake was standing in for.
         if let Some(stale_buckets) = self.buffered_layer().map(|layer| layer.stale_unflushed_bucket_count()).filter(|count| *count > 0) {
             info!(stale_buckets, event = "light_optimize_flush_debt_yield");
-            crate::metrics::maintenance_stats().light_optimize_flush_debt_yields.fetch_add(1, Relaxed);
+            crate::observability::maintenance_stats().light_optimize_flush_debt_yields.fetch_add(1, Relaxed);
             return Some(Brake::Stop("stale_unflushed_buckets"));
         }
         if self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) {
             info!(event = "light_optimize_wal_yield");
-            crate::metrics::maintenance_stats().light_optimize_wal_yields.fetch_add(1, Relaxed);
+            crate::observability::maintenance_stats().light_optimize_wal_yields.fetch_add(1, Relaxed);
             return Some(Brake::Degrade("wal_backlog_over_threshold"));
         }
         // HOST pressure, not just our cgroup: on an over-committed host the
@@ -15287,13 +15279,13 @@ impl Database {
         const HOST_MEM_BRAKE_FLOOR_BYTES: u64 = 12 * 1024 * 1024 * 1024;
         if host_mem_available_bytes().is_some_and(|avail| avail < HOST_MEM_BRAKE_FLOOR_BYTES) {
             info!(event = "light_optimize_host_memory_brake");
-            crate::metrics::maintenance_stats().light_optimize_memory_brakes.fetch_add(1, Relaxed);
+            crate::observability::maintenance_stats().light_optimize_memory_brakes.fetch_add(1, Relaxed);
             return Some(Brake::Stop("host_memory_low"));
         }
         let limit = self.config.derived.memory_brake_limit_bytes();
         if limit > 0 && process_memory_bytes().is_some_and(|used| used > limit) {
             info!(limit, event = "light_optimize_memory_brake");
-            crate::metrics::maintenance_stats().light_optimize_memory_brakes.fetch_add(1, Relaxed);
+            crate::observability::maintenance_stats().light_optimize_memory_brakes.fetch_add(1, Relaxed);
             return Some(Brake::Stop("memory_brake"));
         }
         None
@@ -15477,7 +15469,7 @@ impl Database {
                     let msg = e.to_string();
                     let is_conflict = is_occ_conflict_err(&msg);
                     if is_conflict {
-                        crate::metrics::record_optimize_conflict();
+                        crate::observability::record_optimize_conflict();
                     }
                     // "Found unmasked nulls for non-nullable StructArray" surfaces
                     // when delta-rs is mid-rewrite and the in-flight Add log lines
@@ -15489,7 +15481,7 @@ impl Database {
                         last_err = Some(e);
                         continue;
                     }
-                    crate::metrics::record_optimize_failed();
+                    crate::observability::record_optimize_failed();
                     error!(
                         "Light optimization operation failed for table={} project={} date={} (attempt {}): {}",
                         table_name,
@@ -15612,7 +15604,7 @@ impl Database {
         let lag = version.saturating_sub(self.checkpoint_versions.get(&url).map(|e| *e).unwrap_or(0));
         // Gauge: max lag seen this tick (job resets to 0 first). A large, growing
         // value means the checkpoint task is failing or wedged.
-        crate::metrics::maintenance_stats().checkpoint_lag_versions.fetch_max(lag, Relaxed);
+        crate::observability::maintenance_stats().checkpoint_lag_versions.fetch_max(lag, Relaxed);
         if lag < interval {
             return;
         }
@@ -15636,11 +15628,11 @@ impl Database {
                 match last_checkpoint_readable(&store).await {
                     Ok(true) => {
                         self.checkpoint_versions.insert(url, version);
-                        crate::metrics::maintenance_stats().checkpoints_created.fetch_add(1, Relaxed);
+                        crate::observability::maintenance_stats().checkpoints_created.fetch_add(1, Relaxed);
                         debug!("out-of-band checkpoint created + verified for '{}' at v{}", table_name, version);
                     }
                     Ok(false) => {
-                        crate::metrics::record_checkpoint_corrupt();
+                        crate::observability::record_checkpoint_corrupt();
                         error!(
                             "checkpoint for '{}' at v{} is unreadable after write (foreign/corrupt object) — withholding log cleanup to preserve the JSON recovery log; PAGE",
                             table_name, version
@@ -15648,19 +15640,19 @@ impl Database {
                         return;
                     }
                     Err(e) => {
-                        crate::metrics::record_checkpoint_failed();
+                        crate::observability::record_checkpoint_failed();
                         warn!("could not verify checkpoint for '{}' at v{}: {} — withholding log cleanup this tick", table_name, version, e);
                         return;
                     }
                 }
             }
             Ok(Err(e)) => {
-                crate::metrics::record_checkpoint_failed();
+                crate::observability::record_checkpoint_failed();
                 warn!("out-of-band checkpoint failed for '{}' at v{}: {} (retry next tick)", table_name, version, e);
                 return; // no fresh checkpoint boundary → skip cleanup this tick
             }
             Err(_) => {
-                crate::metrics::record_checkpoint_failed();
+                crate::observability::record_checkpoint_failed();
                 warn!("out-of-band checkpoint for '{}' timed out after {CHECKPOINT_OP_TIMEOUT:?} (retry next tick)", table_name);
                 return;
             }
@@ -15669,16 +15661,16 @@ impl Database {
         // successful checkpoint. Uses the table's logRetentionDuration.
         match tokio::time::timeout(CHECKPOINT_OP_TIMEOUT, deltalake::checkpoints::cleanup_metadata(&table, None)).await {
             Ok(Ok(n)) if n > 0 => {
-                crate::metrics::maintenance_stats().log_files_cleaned.fetch_add(n as u64, Relaxed);
+                crate::observability::maintenance_stats().log_files_cleaned.fetch_add(n as u64, Relaxed);
                 debug!("out-of-band log cleanup removed {} expired files for '{}'", n, table_name);
             }
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                crate::metrics::record_log_cleanup_failed();
+                crate::observability::record_log_cleanup_failed();
                 warn!("out-of-band log cleanup failed for '{}': {} (retry next tick)", table_name, e);
             }
             Err(_) => {
-                crate::metrics::record_log_cleanup_failed();
+                crate::observability::record_log_cleanup_failed();
                 warn!("out-of-band log cleanup for '{}' timed out after {CHECKPOINT_OP_TIMEOUT:?} (retry next tick)", table_name);
             }
         }
@@ -15700,7 +15692,7 @@ impl Database {
             Ok((_, metrics)) => {
                 let n = metrics.files_removed.len();
                 if n > 0 {
-                    crate::metrics::record_dangling_removed(n as u64);
+                    crate::observability::record_dangling_removed(n as u64);
                     warn!(
                         "reconcile: '{}' had {} dangling Add(s) (committed parquet missing from store) — Remove'd: {:?}",
                         table_name, n, metrics.files_removed
@@ -15709,7 +15701,7 @@ impl Database {
                 }
             }
             Err(e) => {
-                crate::metrics::maintenance_stats().reconcile_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::observability::maintenance_stats().reconcile_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!("reconcile filesystem_check failed for '{}': {} (retry next tick)", table_name, e);
             }
         }
@@ -15719,7 +15711,7 @@ impl Database {
     /// table. Driven by the checkpoint cron job (and directly by tests).
     pub async fn run_checkpoint_maintenance(&self) {
         // Reset the lag gauge so it reflects THIS tick's worst table.
-        crate::metrics::maintenance_stats().checkpoint_lag_versions.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::observability::maintenance_stats().checkpoint_lag_versions.store(0, std::sync::atomic::Ordering::Relaxed);
         for (_project_id, name, table) in self.all_tables().await {
             self.checkpoint_and_cleanup_table(&table, &name).await;
         }
@@ -16242,7 +16234,7 @@ impl SortMergeStream {
 }
 
 /// Sort one batch by `sort_idx`, returning it untouched when already ordered.
-fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema_loader::SortingColumnDef)]) -> Result<RecordBatch, arrow_schema::ArrowError> {
+fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema::SortingColumnDef)]) -> Result<RecordBatch, arrow_schema::ArrowError> {
     use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take_record_batch};
     let sort_cols: Vec<SortColumn> = sort_idx
         .iter()
@@ -16262,7 +16254,7 @@ fn sort_one_batch(batch: &RecordBatch, sort_idx: &[(usize, &crate::schema_loader
 #[cfg(test)]
 pub(crate) const DEFAULT_SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
 
-fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>, skip_over_bytes: usize) -> (FlushBatches, bool) {
+fn sort_batches_by_schema(schema: &crate::schema::TableSchema, batches: Vec<RecordBatch>, skip_over_bytes: usize) -> (FlushBatches, bool) {
     use arrow::{
         compute::{SortOptions, concat_batches},
         row::{RowConverter, SortField},
@@ -16320,7 +16312,7 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
             }
         }
     };
-    let sort_idx: Vec<(usize, &crate::schema_loader::SortingColumnDef)> =
+    let sort_idx: Vec<(usize, &crate::schema::SortingColumnDef)> =
         schema.sorting_columns.iter().filter_map(|sc| arrow_schema.index_of(&sc.name).ok().map(|i| (i, sc))).collect();
     if sort_idx.is_empty() {
         return unsorted(batches);
@@ -16430,7 +16422,7 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
 /// and kept as the equivalence oracle the property test compares against —
 /// the streaming path must reproduce this row order exactly, ties included.
 #[cfg(test)]
-fn sort_batches_by_schema_reference(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, bool) {
+fn sort_batches_by_schema_reference(schema: &crate::schema::TableSchema, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, bool) {
     use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch};
     if batches.is_empty() || schema.sorting_columns.is_empty() {
         return (batches, false);
@@ -16447,7 +16439,7 @@ fn sort_batches_by_schema_reference(schema: &crate::schema_loader::TableSchema, 
             Err(_) => return (batches, false),
         }
     };
-    let sort_idx: Vec<(usize, &crate::schema_loader::SortingColumnDef)> =
+    let sort_idx: Vec<(usize, &crate::schema::SortingColumnDef)> =
         schema.sorting_columns.iter().filter_map(|sc| arrow_schema.index_of(&sc.name).ok().map(|i| (i, sc))).collect();
     if sort_idx.is_empty() {
         return (batches, false);
@@ -16471,7 +16463,7 @@ fn sort_batches_by_schema_reference(schema: &crate::schema_loader::TableSchema, 
 /// `sorting_columns`. Empty when the table declares none (caller falls back to
 /// `Compact`). Directions mirror the schema so the written order matches the
 /// footer the flush/dedup path already declares.
-fn schema_optimize_sort_columns(schema: &crate::schema_loader::TableSchema) -> Vec<deltalake::operations::optimize::SortColumn> {
+fn schema_optimize_sort_columns(schema: &crate::schema::TableSchema) -> Vec<deltalake::operations::optimize::SortColumn> {
     schema
         .sorting_columns
         .iter()
@@ -16487,7 +16479,7 @@ fn schema_optimize_sort_columns(schema: &crate::schema_loader::TableSchema) -> V
 /// they're encoded in the path, not the stats. Writing stats for the whole 90+
 /// column schema instead cost 18.4% of process CPU in Add-stats `parse_json_impl`
 /// on every log replay (prod profile 2026-07-29).
-fn stats_columns_for(schema: &crate::schema_loader::TableSchema) -> String {
+fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
     std::iter::once(schema.time_column_name())
         .chain(schema.sorting_columns.iter().map(|c| c.name.as_str()))
         .chain(schema.dedup_keys.iter().map(String::as_str))
@@ -16649,7 +16641,7 @@ fn repair_bounds_from_cuts(lo: i64, hi: i64, cuts: &[i64]) -> Vec<(i64, Option<i
     starts.zip(ends).collect()
 }
 
-fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String {
+fn schema_order_by_clause(schema: &crate::schema::TableSchema) -> String {
     if schema.sorting_columns.is_empty() {
         return String::new();
     }
@@ -16664,7 +16656,7 @@ fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String 
 
 /// Full compaction optionally sorts by the schema's timestamp-leading keys so
 /// rewritten files retain tight timestamp statistics and an honest footer.
-fn full_optimize_type(schema: &crate::schema_loader::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
+fn full_optimize_type(schema: &crate::schema::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     choose_optimize_type(schema, false, allow_sort)
 }
 
@@ -16827,7 +16819,7 @@ struct WaveResult {
 /// that conversion in one pure, testable boundary.
 fn wave_added_parquet(bins: &[StagedBin], live_uris: &[String]) -> Vec<(String, String, String)> {
     let by_rel: HashMap<&str, &str> =
-        live_uris.iter().filter_map(|uri| crate::tantivy_index::service::parquet_rel_of_uri(uri).map(|rel| (rel, uri.as_str()))).collect();
+        live_uris.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri).map(|rel| (rel, uri.as_str()))).collect();
     bins.iter()
         .flat_map(|bin| {
             bin.adds.iter().filter_map(|action| {
@@ -16987,7 +16979,7 @@ pub(crate) fn process_memory_bytes() -> Option<usize> {
         // only series where growth actually predicts a kill.
         return Some(v.saturating_sub(cgroup_reclaimable_file_bytes().unwrap_or(0)));
     }
-    crate::metrics::process_rss_bytes()
+    crate::observability::process_rss_bytes()
 }
 
 /// Clean page cache from cgroup v2 `memory.stat`. `None` when unreadable (the
@@ -17140,7 +17132,7 @@ fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
 /// at 2-7s and never warmed while 3h (stable older files) did (prod 2026-07-21).
 fn seal_micros_now() -> i64 {
     const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
-    crate::clock::now_micros() - SEAL_LAG_MICROS
+    crate::support::now_micros() - SEAL_LAG_MICROS
 }
 
 /// The metadata one planner walk collects per candidate file. Decoupling
@@ -17842,7 +17834,7 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
 /// same one. Seconds-since-epoch does that and is monotonic, so a restart loop
 /// walks forward through the work list rather than re-picking its head.
 fn rotation_seed() -> usize {
-    usize::try_from(crate::clock::now_micros().unsigned_abs() / 1_000_000).unwrap_or(0)
+    usize::try_from(crate::support::now_micros().unsigned_abs() / 1_000_000).unwrap_or(0)
 }
 
 /// How many of the newest candidates share the one overrun-allowed slot.
@@ -17957,7 +17949,7 @@ where
             // deadline does cut still rotate via `on_truncate`.
             Some(Brake::Degrade(reason)) => {
                 concurrency = 1;
-                crate::metrics::maintenance_stats().light_optimize_ticks_degraded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::observability::maintenance_stats().light_optimize_ticks_degraded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!(round, served = pending.len(), reason, event = "light_optimize_wave_degraded");
             }
             None => {}
@@ -18043,9 +18035,7 @@ where
     failed
 }
 
-fn choose_optimize_type(
-    schema: &crate::schema_loader::TableSchema, allow_zorder: bool, allow_sort: bool,
-) -> (deltalake::operations::optimize::OptimizeType, bool) {
+fn choose_optimize_type(schema: &crate::schema::TableSchema, allow_zorder: bool, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     use deltalake::operations::optimize::OptimizeType;
     if allow_zorder && !schema.z_order_columns.is_empty() {
         return (OptimizeType::ZOrder(schema.z_order_columns.clone()), false);
@@ -18059,7 +18049,7 @@ fn choose_optimize_type(
 /// and the fork drops them for free while writing. Tiebreak mirrors flush
 /// dedup's last-write-wins — greatest `dedup_tiebreak` (observed_timestamp)
 /// sorts first and survives, so the enriched re-emit beats the base row.
-fn consolidate_optimize_type(schema: &crate::schema_loader::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
+fn consolidate_optimize_type(schema: &crate::schema::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     use deltalake::operations::optimize::{DedupConfig, OptimizeType, SortColumn};
     match choose_optimize_type(schema, false, allow_sort) {
         (OptimizeType::SortBy(cols), true) if !schema.dedup_keys.is_empty() => {
@@ -18102,7 +18092,7 @@ fn consolidate_optimize_type(schema: &crate::schema_loader::TableSchema, allow_s
 /// cannot capture that two tenants on the SAME schema measured 977 vs 1767
 /// bytes/row, but it does not need to. Moving 1M rows to ~100k is the win; the
 /// residual 2x spread across tenants is second order.
-fn row_group_row_count(schema: &crate::schema_loader::TableSchema, target_bytes: usize) -> usize {
+fn row_group_row_count(schema: &crate::schema::TableSchema, target_bytes: usize) -> usize {
     /// Encoded-but-uncompressed bytes a value of this type costs. Variable-width
     /// types are the telemetry payload (body/attributes/resource), so they
     /// dominate; the constants are deliberately rough and only need to put the
@@ -18127,7 +18117,7 @@ fn row_group_row_count(schema: &crate::schema_loader::TableSchema, target_bytes:
 }
 
 fn build_writer_properties(
-    parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool,
+    parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool,
 ) -> WriterProperties {
     use deltalake::datafusion::parquet::{
         basic::{Compression, Encoding, ZstdLevel},
@@ -18226,7 +18216,7 @@ fn build_writer_properties(
 /// `declare_ordering`, and the hot tier's `ArrowSource` via `with_output_ordering`.
 pub(crate) fn table_ordering(table_name: &str, out: &SchemaRef, sorted: bool) -> Option<datafusion::physical_expr::LexOrdering> {
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-    let table = crate::schema_loader::get_schema(table_name).filter(|_| sorted)?;
+    let table = crate::schema::get_schema(table_name).filter(|_| sorted)?;
     LexOrdering::new(
         table
             .sorting_columns
@@ -18247,7 +18237,7 @@ pub struct ProjectRoutingTable {
     default_project: String,
     database: Arc<Database>,
     schema: SchemaRef,
-    _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    _batch_queue: Option<Arc<crate::write::BatchQueue>>,
     table_name: String,
     /// When true, INSERTs commit straight to Delta (`skip_queue=true`),
     /// bypassing the BufferedWriteLayer (WAL + MemBuffer). Backs the
@@ -18258,7 +18248,7 @@ pub struct ProjectRoutingTable {
 
 impl ProjectRoutingTable {
     pub fn new(
-        default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>, table_name: String,
+        default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::write::BatchQueue>>, table_name: String,
     ) -> Self {
         Self { default_project, database, schema, _batch_queue: batch_queue, table_name, skip_queue: false }
     }
@@ -18271,7 +18261,7 @@ impl ProjectRoutingTable {
     }
 
     fn extract_project_id_from_filters(&self, filters: &[Expr]) -> Option<String> {
-        filters.iter().find_map(crate::optimizers::extract_project_id_from_expr)
+        filters.iter().find_map(crate::read::optimizers::extract_project_id_from_expr)
     }
 
     fn bounded_otel_scan_reason(&self, filters: &[Expr], limit: Option<usize>) -> Option<&'static str> {
@@ -18306,7 +18296,7 @@ impl ProjectRoutingTable {
         if !matches!(table_name, "otel_logs_and_spans" | "otel_metrics") {
             return None;
         }
-        if !filters.iter().any(|filter| crate::optimizers::extract_project_id_from_expr(filter).is_some()) {
+        if !filters.iter().any(|filter| crate::read::optimizers::extract_project_id_from_expr(filter).is_some()) {
             return Some("missing exact project_id filter");
         }
         (limit.is_none() && !lower_timestamp_bound).then_some("missing timestamp lower bound or scan limit")
@@ -18411,12 +18401,11 @@ impl ProjectRoutingTable {
 
     /// Apply time-series specific optimizations to filters
     fn apply_time_series_optimizations(&self, filters: &[Expr]) -> DFResult<Vec<Expr>> {
-        use crate::optimizers::time_range_partition_pruner;
+        use crate::read::optimizers::time_range_partition_pruner;
 
         // Resolve the schema-declared time column for this table; falls back to
         // "timestamp" when the schema isn't registered (custom/dynamic tables).
-        let time_column =
-            crate::schema_loader::get_schema(&self.table_name).map(|s| s.time_column_name().to_string()).unwrap_or_else(|| "timestamp".to_string());
+        let time_column = crate::schema::get_schema(&self.table_name).map(|s| s.time_column_name().to_string()).unwrap_or_else(|| "timestamp".to_string());
 
         let mut optimized_filters = filters.to_vec();
 
@@ -18438,7 +18427,7 @@ impl ProjectRoutingTable {
 
     /// Check if filters contain a project_id filter
     fn has_project_id_in_filters(&self, filters: &[Expr]) -> bool {
-        use crate::optimizers::ProjectIdPushdown;
+        use crate::read::optimizers::ProjectIdPushdown;
         ProjectIdPushdown::has_project_id_filter(filters)
     }
 
@@ -18506,7 +18495,7 @@ impl ProjectRoutingTable {
                 .get_file_uris()
                 .ok()?
                 .filter(|u| u.ends_with(".parquet") && include_files.map_or_else(|| !exclude_files.is_some_and(|e| e.contains(u)), |files| files.contains(u)))
-                .map(|u| crate::tantivy_index::service::parquet_rel_of_uri(&u).map(str::to_string))
+                .map(|u| crate::tantivy::search::parquet_rel_of_uri(&u).map(str::to_string))
                 .collect::<Option<Vec<String>>>()
         });
         // Row-selection pushdown: per-file matching ordinals keyed by rel path.
@@ -18515,7 +18504,7 @@ impl ProjectRoutingTable {
         let ordinal_selections: std::collections::HashMap<String, Vec<u64>> = row_selections
             .into_iter()
             .flatten()
-            .filter_map(|(uri, ords)| Some((crate::tantivy_index::service::parquet_rel_of_uri(uri)?.to_string(), ords.clone())))
+            .filter_map(|(uri, ords)| Some((crate::tantivy::search::parquet_rel_of_uri(uri)?.to_string(), ords.clone())))
             .collect();
         if file_selection.is_some() || !ordinal_selections.is_empty() {
             use deltalake::delta_datafusion::{FileSelection, MissingSelectedFilePolicy};
@@ -18771,7 +18760,7 @@ impl ProjectRoutingTable {
     /// reads as shallow while a `[30d ago, 29d ago]` history slice does not.
     fn scan_lookback_micros(&self, filters: &[Expr]) -> Option<i64> {
         match self.extract_time_range_from_filters(filters) {
-            Some((min, _)) if min != i64::MIN => Some(crate::clock::now_micros().saturating_sub(min)),
+            Some((min, _)) if min != i64::MIN => Some(crate::support::now_micros().saturating_sub(min)),
             _ => None,
         }
     }
@@ -18857,7 +18846,7 @@ impl ProjectRoutingTable {
     /// reads, and it keeps the sort injected over the in-memory legs as cheap as
     /// it can be. `None` (no tiebreak, or the sort key isn't a dedup key) leaves
     /// the plan exactly as it was before merge-on-read.
-    fn keep_greatest_ordering(table: &crate::schema_loader::TableSchema, leg_schema: &SchemaRef) -> Option<datafusion::physical_expr::LexOrdering> {
+    fn keep_greatest_ordering(table: &crate::schema::TableSchema, leg_schema: &SchemaRef) -> Option<datafusion::physical_expr::LexOrdering> {
         use datafusion::{
             arrow::{compute::SortOptions, datatypes::DataType},
             physical_expr::{LexOrdering, PhysicalSortExpr},
@@ -18894,7 +18883,7 @@ impl ProjectRoutingTable {
     /// `DedupExec`. This generalizes [`Self::references_tombstone`], which is
     /// this exact bug for one specific column.
     fn version_mutable_columns(table_name: &str) -> Option<std::collections::HashSet<String>> {
-        let schema = crate::schema_loader::get_schema(table_name).filter(|s| s.version_append)?;
+        let schema = crate::schema::get_schema(table_name).filter(|s| s.version_append)?;
         let immutable: std::collections::HashSet<&str> =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.partitions.iter().map(String::as_str)).collect();
         Some(schema.schema_ref().fields().iter().map(|f| f.name().clone()).filter(|n| !immutable.contains(n.as_str())).collect())
@@ -18911,7 +18900,7 @@ impl ProjectRoutingTable {
     /// pushed into a leg. Both together, because someone will try to optimize
     /// this downward later.
     pub(crate) fn references_tombstone(table_name: &str, f: &Expr) -> bool {
-        crate::schema_loader::get_schema(table_name).and_then(|s| s.tombstone_column.as_deref()).is_some_and(|t| f.column_refs().iter().any(|c| c.name == t))
+        crate::schema::get_schema(table_name).and_then(|s| s.tombstone_column.as_deref()).is_some_and(|t| f.column_refs().iter().any(|c| c.name == t))
     }
 
     /// Drop rows whose WINNING version is a tombstone (merge-on-read `DELETE`).
@@ -18977,7 +18966,7 @@ impl ProjectRoutingTable {
             if plan_field.data_type() == target_field.data_type() {
                 return false;
             }
-            !crate::schema_loader::is_variant_type(target_field.data_type())
+            !crate::schema::is_variant_type(target_field.data_type())
         };
 
         let needs_coercion = plan_schema.fields().iter().zip(target_schema.fields()).any(|(plan_field, target_field)| differs(plan_field, target_field));
@@ -19041,7 +19030,7 @@ impl ProjectRoutingTable {
     /// Extract time range (min, max) from query filters.
     /// Returns None if no time constraints found.
     fn extract_time_range_from_filters(&self, filters: &[Expr]) -> Option<(i64, i64)> {
-        use crate::optimizers::{is_col_through_cast, swap_comparison};
+        use crate::read::optimizers::{is_col_through_cast, swap_comparison};
         // Literal bound → microseconds. Strict (no Cast unwrap) so a cast-to-a-
         // different-unit literal yields None (→ widest window) rather than a
         // wrong-narrow one that could prune indexes holding matching rows.
@@ -19103,7 +19092,7 @@ impl ProjectRoutingTable {
 /// into a neighbouring date whose certification was never asked about — is
 /// directly testable.
 fn date_partition_window(filters: &[Expr]) -> Option<(i64, i64)> {
-    use crate::optimizers::is_col_through_cast;
+    use crate::read::optimizers::is_col_through_cast;
     const DAY_MICROS: i64 = 86_400_000_000;
     filters.iter().find_map(|filter| {
         let Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) = filter else { return None };
@@ -19474,7 +19463,7 @@ impl ExecutionPlan for GatedScanExec {
                 // poll, so the bypass scope covers exactly them. Only paid for
                 // when it's actually suppressing.
                 let next = match bypass {
-                    true => crate::object_store_cache::scan_bypass_scope(true, futures::StreamExt::next(&mut inner)).await,
+                    true => crate::storage::scan_bypass_scope(true, futures::StreamExt::next(&mut inner)).await,
                     false => futures::StreamExt::next(&mut inner).await,
                 };
                 let produced = next.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |b: &RecordBatch| b.get_array_memory_size() as u64);
@@ -19599,9 +19588,9 @@ impl TableProvider for ProjectRoutingTable {
         // Mark any filter that references a Variant column `Unsupported` so DataFusion
         // applies it via a FilterExec above the scan rather than pushing it into the
         // kernel. (Variant predicates can't prune row groups anyway.)
-        let variant_cols: std::collections::HashSet<String> = crate::schema_loader::registry()
+        let variant_cols: std::collections::HashSet<String> = crate::schema::registry()
             .get(&self.table_name)
-            .map(|s| s.schema_ref().fields().iter().filter(|f| crate::schema_loader::is_variant_type(f.data_type())).map(|f| f.name().clone()).collect())
+            .map(|s| s.schema_ref().fields().iter().filter(|f| crate::schema::is_variant_type(f.data_type())).map(|f| f.name().clone()).collect())
             .unwrap_or_default();
         let mutable = Self::version_mutable_columns(&self.table_name);
         Ok(filter
@@ -19722,8 +19711,8 @@ impl TableProvider for ProjectRoutingTable {
         // the invariant note above) is sound for them. Non-MOR tables keep
         // the stripped set (identical there anyway).
         let text_match_tree = match mutable.is_some() {
-            false => crate::tantivy_index::udf::collect_text_match_tree(&optimized_filters),
-            true => crate::tantivy_index::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?),
+            false => crate::tantivy::udf::collect_text_match_tree(&optimized_filters),
+            true => crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?),
         };
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter (time-
         // prunes the sidecar search + scopes the coverage gate to a needle's
@@ -19750,7 +19739,7 @@ impl TableProvider for ProjectRoutingTable {
             let tcfg = &self.database.config().tantivy;
             let max_hits = tcfg.prefilter_max_hits();
             let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
-            crate::metrics::record_tantivy_prefilter_attempt();
+            crate::observability::record_tantivy_prefilter_attempt();
 
             let mut delta_ids: Option<std::collections::HashSet<String>> = None;
             let mut delta_indexed_rows: u64 = 0;
@@ -19780,7 +19769,7 @@ impl TableProvider for ProjectRoutingTable {
                 }
                 Err(e) => {
                     warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);
-                    crate::metrics::record_tantivy_prefilter_error();
+                    crate::observability::record_tantivy_prefilter_error();
                     abort_reason = Some("delta_error");
                 }
             }
@@ -19792,24 +19781,24 @@ impl TableProvider for ProjectRoutingTable {
                     // scan even when matching rows exist there (e.g. data
                     // written directly without triggering an index build).
                     if delta_indexed_rows == 0 {
-                        crate::metrics::record_tantivy_prefilter_skipped();
+                        crate::observability::record_tantivy_prefilter_skipped();
                         debug!("Tantivy prefilter skipped for {}/{}: empty_index", project_id, self.table_name);
                     } else if (ids.len() as u64) * 100 >= delta_indexed_rows * min_sel_pct {
                         // Selectivity cutoff: if the hit set covers most of the
                         // indexed rows, the IN-list won't prune enough to be
                         // worth its planning cost. Bail; original predicate
                         // re-runs as the correctness backstop.
-                        crate::metrics::record_tantivy_prefilter_skipped();
+                        crate::observability::record_tantivy_prefilter_skipped();
                         debug!("Tantivy prefilter skipped for {}/{}: low_selectivity", project_id, self.table_name);
                     } else if delta_field_gap {
                         // An in-window index lacked one of the queried fields
                         // (schema evolution added a tantivy column after it was
                         // built). It can't answer that predicate yet appears
                         // "covered", so the IN-list would drop its rows — skip.
-                        crate::metrics::record_tantivy_prefilter_skipped();
+                        crate::observability::record_tantivy_prefilter_skipped();
                         debug!("Tantivy prefilter skipped for {}/{}: field_coverage_gap", project_id, self.table_name);
                     } else {
-                        crate::metrics::record_tantivy_prefilter_used();
+                        crate::observability::record_tantivy_prefilter_used();
                         tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
                             expr: Box::new(datafusion::logical_expr::col("id")),
                             list: ids.into_iter().map(lit).collect(),
@@ -19842,7 +19831,7 @@ impl TableProvider for ProjectRoutingTable {
                     }
                 }
             } else {
-                crate::metrics::record_tantivy_prefilter_skipped();
+                crate::observability::record_tantivy_prefilter_skipped();
                 if let Some(reason) = abort_reason {
                     debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
                 }
@@ -19862,7 +19851,7 @@ impl TableProvider for ProjectRoutingTable {
         // pushed projection with any dedup-key columns the query projected away
         // (so DedupExec can see them); `output_projection` then restores the
         // requested columns. No-op when the table declares no dedup_keys.
-        let table_schema = crate::schema_loader::get_schema(&self.table_name);
+        let table_schema = crate::schema::get_schema(&self.table_name);
         let dedup_keys: Vec<String> = table_schema.as_ref().map(|s| s.dedup_keys.clone()).unwrap_or_default();
         // The tiebreak rides in with the keys ONLY for merge-on-read tables:
         // DedupExec keeps the GREATEST version per key there
@@ -19974,12 +19963,12 @@ impl TableProvider for ProjectRoutingTable {
         // mask: the mask has to stay index-aligned with a list built by
         // flattening three Options, and `LegKind::sortable()` derives the same
         // bit from the identity that can't drift out of step with it.
-        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, crate::read_dedup::LegKind)>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>| -> DFResult<Arc<dyn ExecutionPlan>> {
             let leg_sortable: Vec<bool> = legs.iter().map(|(_, k)| k.sortable()).collect();
             let legs: Vec<Arc<dyn ExecutionPlan>> = legs
                 .into_iter()
-                .map(|(plan, kind)| match crate::read_dedup::ordering_probe_enabled() {
-                    true => Arc::new(crate::read_dedup::OrderingProbeExec::new(plan, kind)) as Arc<dyn ExecutionPlan>,
+                .map(|(plan, kind)| match crate::read::ordering_probe_enabled() {
+                    true => Arc::new(crate::read::OrderingProbeExec::new(plan, kind)) as Arc<dyn ExecutionPlan>,
                     false => plan,
                 })
                 .collect();
@@ -20042,7 +20031,7 @@ impl TableProvider for ProjectRoutingTable {
                 // already materialized, the sort is bounded and cheap, and a
                 // mem-only scan is exactly where a fresh version append lives
                 // — all-false left it permanently on unbounded keep-greatest.
-                match crate::optimizers::ordered_children(&plans, &req, None, &leg_sortable, false)? {
+                match crate::read::optimizers::ordered_children(&plans, &req, None, &leg_sortable, false)? {
                     Some(ordered) => {
                         // Only in-memory legs can reach here (Delta is marked
                         // unsortable), so this is cheap — no metric alarm.
@@ -20070,7 +20059,7 @@ impl TableProvider for ProjectRoutingTable {
             };
             let plan = match dedup_on {
                 true => Arc::new(
-                    crate::read_dedup::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?
+                    crate::read::DedupExec::with_tiebreak(plan, dedup_keys.clone(), dedup_tiebreak.clone(), output_projection.clone())?
                         // Declaring it REQUIRED is what stops EnforceSorting from
                         // deleting the merge above as unused — see the field docs.
                         .requiring(merge_req.clone()),
@@ -20160,7 +20149,7 @@ impl TableProvider for ProjectRoutingTable {
             // 2026-08-11 measurement was unaffected — but `query_delta_only`
             // (bypass_buffer) takes this path, so tests measured nothing at all.
             tag_shape(&|s| s.has_delta = true);
-            return wrap_result(plans.into_iter().map(|plan| (plan, crate::read_dedup::LegKind::Delta)).collect());
+            return wrap_result(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect());
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -20270,7 +20259,7 @@ impl TableProvider for ProjectRoutingTable {
                     query_time_range,
                 )
                 .await?;
-            return wrap_result(plans.into_iter().map(|plan| (plan, crate::read_dedup::LegKind::Delta)).collect());
+            return wrap_result(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect());
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
@@ -20287,7 +20276,7 @@ impl TableProvider for ProjectRoutingTable {
         if let Some(mem_plan) = mem_plan.clone().filter(|_| skip_delta) {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
-            return wrap_result(vec![(mem_plan, crate::read_dedup::LegKind::Mem)]);
+            return wrap_result(vec![(mem_plan, crate::read::LegKind::Mem)]);
         }
 
         // Build Delta filters with per-bucket exclusion.
@@ -20325,7 +20314,7 @@ impl TableProvider for ProjectRoutingTable {
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
         let version_col = table_schema.as_ref().filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone());
-        for (start, end) in crate::mem_buffer::merge_ranges([mem_ranges, hot_ranges].concat()) {
+        for (start, end) in crate::write::mem_buffer::merge_ranges([mem_ranges, hot_ranges].concat()) {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(start) });
             let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(end) });
@@ -20376,7 +20365,7 @@ impl TableProvider for ProjectRoutingTable {
         //
         // Identity travels WITH the plan, so the flatten cannot desynchronise it
         // from the sortability it implies (see `wrap_result`).
-        use crate::read_dedup::LegKind;
+        use crate::read::LegKind;
         let mut legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> =
             [mem_plan.map(|p| (p, LegKind::Mem)), hot_plan.map(|p| (p, LegKind::Hot))].into_iter().flatten().collect();
         legs.extend(delta_plans.into_iter().map(|p| (p, LegKind::Delta)));
@@ -20396,7 +20385,7 @@ mod writer_properties_tests {
     };
 
     use super::*;
-    use crate::schema_loader::{FieldDef, SortingColumnDef, TableSchema};
+    use crate::schema::{FieldDef, SortingColumnDef, TableSchema};
 
     fn cfg() -> crate::config::ParquetConfig {
         serde_json::from_str("{}").unwrap()
@@ -20933,7 +20922,7 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
-    use crate::{config::AppConfig, test_utils::test_helpers::*};
+    use crate::{config::AppConfig, support::test_helpers::*};
 
     /// A pass deadline no test will reach, for the drain's bounding parameter.
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
@@ -21093,7 +21082,7 @@ mod tests {
                 );
             }
         }
-        let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+        let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
         let restore = gauge.load(Relaxed);
         gauge.store(30, Relaxed);
         let healthy = db.plan_rollup_backfill().await?;
@@ -21146,7 +21135,7 @@ mod tests {
                 );
             }
         }
-        let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+        let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
         let restore = gauge.load(Relaxed);
         // A value the pass cannot legitimately produce for this fixture, so only
         // a pass that actually RAN can overwrite it.
@@ -21450,7 +21439,7 @@ mod tests {
     #[test]
     fn the_reweighting_switches_off_once_coverage_is_healthy() {
         use std::sync::atomic::Ordering::Relaxed;
-        let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+        let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
         let restore = gauge.load(Relaxed);
         gauge.store(0, Relaxed);
         assert!(coverage_is_short(), "zero contiguous days is short");
@@ -21827,7 +21816,7 @@ mod tests {
     #[test]
     fn row_group_row_count_binds_far_below_the_parquet_default() {
         const PARQUET_DEFAULT: usize = 1024 * 1024;
-        let otel = crate::schema_loader::get_schema("otel_logs_and_spans").expect("otel schema");
+        let otel = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
         let rows = super::row_group_row_count(otel, 128 * 1024 * 1024);
         assert!(rows < PARQUET_DEFAULT / 4, "otel row groups must shrink at least 4x, got {rows}");
         assert!(rows >= 32_768, "floor keeps footer overhead from dominating, got {rows}");
@@ -22220,7 +22209,7 @@ mod tests {
     async fn spawn_cron_job_skips_ticks_while_previous_run_hangs() {
         use std::sync::atomic::Ordering::Relaxed;
         let cancel = Arc::new(CancellationToken::new());
-        let skipped_before = crate::metrics::maintenance_stats().cron_ticks_skipped.load(Relaxed);
+        let skipped_before = crate::observability::maintenance_stats().cron_ticks_skipped.load(Relaxed);
         spawn_cron_job("hung-test", "* * * * * *", cancel.clone(), move || async move {
             std::future::pending::<()>().await; // never returns
         });
@@ -22228,7 +22217,7 @@ mod tests {
         // loaded CI runner where task startup and sleep wakeups slip.
         tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
         cancel.cancel();
-        let skipped = crate::metrics::maintenance_stats().cron_ticks_skipped.load(Relaxed) - skipped_before;
+        let skipped = crate::observability::maintenance_stats().cron_ticks_skipped.load(Relaxed) - skipped_before;
         assert!(skipped >= 1, "later ticks must be skipped (loop alive) while the first run hangs, got {skipped} skips");
     }
 
@@ -22460,7 +22449,7 @@ mod tests {
     /// this feature landed.
     #[test]
     fn watermark_all_none_omits_metadata() {
-        let wm: crate::buffered_write_layer::DeltaWatermark = vec![None, None, None];
+        let wm: crate::write::DeltaWatermark = vec![None, None, None];
         assert!(serialize_watermark_to_json(&wm, "p", "t").is_empty());
         let mut info = std::collections::HashMap::new();
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(serde_json::Map::new()));
@@ -24425,8 +24414,7 @@ mod tests {
 
         let base = json_to_batch_for("mor_versioned", vec![row("live", None), row("gone", None)])?;
         db.insert_records_batch(&project_id, "mor_versioned", vec![base], true, None).await?;
-        let key =
-            crate::logical_count_index::CountPartition { project_id: project_id.clone(), table_name: "mor_versioned".to_string(), date: date.to_string() };
+        let key = crate::read::CountPartition { project_id: project_id.clone(), table_name: "mor_versioned".to_string(), date: date.to_string() };
         db.build_logical_count_partition(&key, false).await?;
 
         let table_ref = db.resolve_table(&project_id, "mor_versioned").await?;
@@ -24523,7 +24511,7 @@ mod tests {
 
         // The brake must be blind to repair: an in-flight repair bin is exactly
         // the state that used to zero packing's throughput.
-        let _repair_bin = InFlightGuard::enter(&crate::metrics::maintenance_stats().repair_bins_in_flight);
+        let _repair_bin = InFlightGuard::enter(&crate::observability::maintenance_stats().repair_bins_in_flight);
         assert!(db.light_optimize_brake().is_none(), "a repair bin in flight must no longer stop packing");
         Ok(())
     }
@@ -24583,9 +24571,9 @@ mod tests {
 
         // A flush queued on the lock ⇒ the wave stands down without committing.
         let waiter = FlushWaiter::register(&db.flush_waiters("", "otel_logs_and_spans").await);
-        let yields = crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed);
+        let yields = crate::observability::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed);
         let deferred = db.commit_wave(&table_ref, "otel_logs_and_spans", &[], false, bin(), 0).await;
-        assert_eq!(crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed), yields + 1, "the yield is counted, not silent");
+        assert_eq!(crate::observability::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed), yields + 1, "the yield is counted, not silent");
         assert!(deferred.landed.is_empty(), "nothing may land while a flush waits");
         assert_eq!(deferred.failed.len(), 1, "the bin is requeued (dedup's dirty bin must not be certified clean)");
         assert_eq!(table_ref.read().await.version(), version, "no commit was attempted");
@@ -24593,7 +24581,7 @@ mod tests {
         // Flush done ⇒ the very same wave commits.
         drop(waiter);
         let landed = db.commit_wave(&table_ref, "otel_logs_and_spans", &[], false, bin(), 0).await;
-        assert_eq!(crate::metrics::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed), yields + 1, "no yield without a waiter");
+        assert_eq!(crate::observability::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed), yields + 1, "no yield without a waiter");
         assert_eq!(landed.landed.len(), 1);
         assert!(landed.failed.is_empty());
         assert_eq!(table_ref.read().await.version(), version.map(|v| v + 1), "the wave commits as before once no flush is queued");
@@ -24608,7 +24596,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_by_bounds_a_blocked_dml_drain() -> Result<()> {
         let db = Database::with_config(create_test_config("shutdown-drain-bound")).await?;
-        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(600, true));
+        let coalescer = Arc::new(crate::dml::DmlCoalescer::new(600, true));
         let _ = db.dml_coalescer.set(coalescer.clone());
         let _held = coalescer.lock_drain_for_test().await; // drain() blocks on this
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
@@ -25343,7 +25331,7 @@ mod tests {
         cfg.buffer.timefusion_flush_coalesce_commits = true;
         let cfg = Arc::new(cfg);
         tokio::time::timeout(std::time::Duration::from_secs(50), async {
-            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let b = crate::server::bootstrap(Arc::clone(&cfg)).await?;
             let t = "otel_logs_and_spans";
             let projects: Vec<String> = (0..3).map(|i| format!("e2e{i}_{prefix}")).collect();
 
@@ -25397,7 +25385,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(50), async {
             // Need the real buffered layer (force_flush path), so bootstrap the
             // full stack rather than the layer-less setup_test_database().
-            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let b = crate::server::bootstrap(Arc::clone(&cfg)).await?;
             let project_id = format!("ffq_{}", prefix);
 
             // 3 rows into the current (open) bucket, then force-flush them to
@@ -25444,12 +25432,12 @@ mod tests {
         let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&prefix);
         let res = tokio::time::timeout(std::time::Duration::from_secs(50), async {
-            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let b = crate::server::bootstrap(Arc::clone(&cfg)).await?;
             let project_id = format!("ffs_{}", prefix);
             // Freeze the clock mid-window so all inserts land in one
             // deterministic bucket we can later seal by advancing time.
-            let dur = crate::mem_buffer::bucket_duration_micros();
-            let t0 = crate::clock::set_micros((crate::clock::now_micros() / dur) * dur + dur / 2);
+            let dur = crate::write::mem_buffer::bucket_duration_micros();
+            let t0 = crate::support::set_micros((crate::support::now_micros() / dur) * dur + dur / 2);
 
             for i in 0..3 {
                 let batch = json_to_batch(vec![test_span_ts(&format!("flushed_{i}"), "span", &project_id, t0)])?;
@@ -25463,7 +25451,7 @@ mod tests {
             // Roll past the bucket boundary: the bucket is now sealed but
             // unflushed (the periodic flush hasn't run) — exactly the
             // backed-up state from the incident.
-            crate::clock::advance_micros(dur);
+            crate::support::advance_micros(dur);
 
             use datafusion::arrow::array::AsArray;
             let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
@@ -25474,7 +25462,7 @@ mod tests {
             Ok(())
         })
         .await;
-        crate::clock::unfreeze();
+        crate::support::unfreeze();
         res.map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
     }
 
@@ -25491,10 +25479,10 @@ mod tests {
         let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&prefix);
         let res = tokio::time::timeout(std::time::Duration::from_secs(50), async {
-            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let b = crate::server::bootstrap(Arc::clone(&cfg)).await?;
             let project_id = format!("ffw_{}", prefix);
-            let dur = crate::mem_buffer::bucket_duration_micros();
-            let t0 = crate::clock::set_micros((crate::clock::now_micros() / dur) * dur + dur / 2);
+            let dur = crate::write::mem_buffer::bucket_duration_micros();
+            let t0 = crate::support::set_micros((crate::support::now_micros() / dur) * dur + dur / 2);
 
             // Newer row first → force-flushed, lives only in Delta.
             let batch = json_to_batch(vec![test_span_ts("newer", "span", &project_id, t0 + 2_000_000)])?;
@@ -25514,7 +25502,7 @@ mod tests {
             Ok(())
         })
         .await;
-        crate::clock::unfreeze();
+        crate::support::unfreeze();
         res.map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
     }
 
@@ -25950,7 +25938,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_batch_queue_under_load() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            use crate::batch_queue::BatchQueue;
+            use crate::write::BatchQueue;
 
             dotenv::dotenv().ok();
             unsafe {
@@ -26158,7 +26146,11 @@ mod tests {
 
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(crate::metrics::maintenance_stats().dirty_bin_batch_probe_clean.load(Relaxed), 2, "both clean bins are consumed by the batch probe alone");
+        assert_eq!(
+            crate::observability::maintenance_stats().dirty_bin_batch_probe_clean.load(Relaxed),
+            2,
+            "both clean bins are consumed by the batch probe alone"
+        );
         assert!(db.dedup_dirty_bins.is_empty(), "clean and dup bins are all consumed");
         assert_eq!(delta_physical_row_count(&table).await?, 3, "the duplicate collapsed; clean rows untouched");
         Ok(())
@@ -26264,7 +26256,7 @@ mod tests {
         // standing in for the hung GET.
         use std::sync::atomic::Ordering::Relaxed;
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_millis(1), far_future()).await?;
-        assert!(crate::metrics::maintenance_stats().dedup_bin_stage_timeouts.load(Relaxed) >= 1, "the per-bin deadline must fire");
+        assert!(crate::observability::maintenance_stats().dedup_bin_stage_timeouts.load(Relaxed) >= 1, "the per-bin deadline must fire");
         assert_eq!(db.dedup_dirty_bins.len(), 1, "the timed-out bin is requeued, not lost");
         assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
 
@@ -26360,13 +26352,13 @@ mod tests {
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1);
 
-        let deferred_before = crate::metrics::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed);
+        let deferred_before = crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed);
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
         // Batch of 1 with a cold-only queue still serves it (lowest priority ≠
         // never), so the drain deduplicates rather than abandoning the rows.
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(
-            crate::metrics::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
+            crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
             deferred_before,
             "nothing to defer when the batch has room"
         );
@@ -26390,11 +26382,11 @@ mod tests {
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1);
 
-        let yields_before = crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
+        let yields_before = crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(
-            crate::metrics::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
+            crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
             yields_before + 1,
             "the skipped pass is counted, not silent"
         );

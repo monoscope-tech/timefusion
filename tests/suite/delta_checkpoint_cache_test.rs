@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use futures::TryStreamExt;
 use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 use serial_test::serial;
-use timefusion::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
+use timefusion::storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
 
 #[tokio::test]
 #[serial]

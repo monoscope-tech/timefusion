@@ -14,7 +14,7 @@
 
 use std::{sync::atomic::Ordering::Relaxed, time::Duration};
 
-use timefusion::metrics::maintenance_stats;
+use timefusion::observability::maintenance_stats;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_for};
 

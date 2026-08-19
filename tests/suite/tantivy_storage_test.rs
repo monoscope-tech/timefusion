@@ -13,14 +13,11 @@ use object_store::memory::InMemory;
 use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
 use tempfile::TempDir;
 use timefusion::{
-    schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
-    tantivy_index::{
-        builder::{IndexBuildStats, MergeMode},
-        manifest::{self, ManifestEntry},
-        query_index,
-        reader::Hit,
-        schema::build_for_table,
-        store,
+    schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    tantivy::{
+        IndexBuildStats, ManifestEntry, MergeMode, SCHEMA_VERSION, build_for_table, delete, download, load_manifest, remove_manifest_entries,
+        search::{Hit, query_index},
+        unpack_to_dir, upload, upsert_manifest, verify_blob,
     },
 };
 
@@ -76,23 +73,23 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     let batches = vec![batch()];
 
     // Build & pack
-    let (blob, stats): (_, IndexBuildStats) = store::build_and_pack(&table, &batches, 3, MergeMode::Deferred).expect("build_and_pack");
+    let (blob, stats): (_, IndexBuildStats) = timefusion::tantivy::build_and_pack(&table, &batches, 3, MergeMode::Deferred).expect("build_and_pack");
     assert_eq!(stats.rows, 3);
     assert!(!blob.is_empty());
 
     // Upload to in-memory store
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let path = store::blob_path("logs", "proj1", "00000000-0000-0000-0000-000000000001");
-    store::upload(store_obj.as_ref(), &path, blob.clone()).await.expect("upload");
+    let path = timefusion::tantivy::blob_path("logs", "proj1", "00000000-0000-0000-0000-000000000001");
+    upload(store_obj.as_ref(), &path, blob.clone()).await.expect("upload");
 
     // Download
-    let dl = store::download(store_obj.as_ref(), &path).await.expect("download");
+    let dl = timefusion::tantivy::download(store_obj.as_ref(), &path).await.expect("download");
     assert_eq!(dl, blob);
 
     // Unpack to a fresh dir, open, query
     let dir = TempDir::new().unwrap();
-    store::unpack_to_dir(&dl, dir.path()).expect("unpack");
-    let idx = store::open_index(dir.path()).expect("open");
+    unpack_to_dir(&dl, dir.path()).expect("unpack");
+    let idx = timefusion::tantivy::open_index(dir.path()).expect("open");
     let built = build_for_table(&table);
     let level_field = built.user_fields.get("level").unwrap().field;
     let q = TermQuery::new(Term::from_field_text(level_field, "ERROR"), IndexRecordOption::Basic);
@@ -100,8 +97,8 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     assert_eq!(hits, vec![Hit { timestamp_micros: 2_000_000, id: "b".into(), row_ordinal: Some(1) }]);
 
     // Delete, then ensure it's gone
-    store::delete(store_obj.as_ref(), &path).await.expect("delete");
-    assert!(store::download(store_obj.as_ref(), &path).await.is_err());
+    delete(store_obj.as_ref(), &path).await.expect("delete");
+    assert!(timefusion::tantivy::download(store_obj.as_ref(), &path).await.is_err());
 }
 
 /// Phase 2 primitive: index a parquet file read back from object storage
@@ -115,8 +112,8 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     use serde_json::json;
     use timefusion::{
         config::TantivyConfig,
-        tantivy_index::{search::TantivySearchService, service::TantivyIndexService},
-        test_utils::test_helpers::json_to_batch,
+        support::test_helpers::json_to_batch,
+        tantivy::search::{TantivyIndexService, TantivySearchService},
     };
 
     const TABLE: &str = "otel_logs_and_spans";
@@ -152,15 +149,15 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
 
     // Manifest entry is keyed by the parquet rel path, points at the
     // deterministic partition-mirrored blob, and the blob exists.
-    let m = manifest::load(store_obj.as_ref(), TABLE, "p1").await.unwrap();
+    let m = load_manifest(store_obj.as_ref(), TABLE, "p1").await.unwrap();
     let entry = m.entries.get(parquet_rel).expect("manifest entry keyed by parquet rel");
     assert_eq!(entry.rows, 3);
     assert!(entry.error.is_none());
-    let expected_blob = store::index_path_for_parquet(TABLE, parquet_rel).to_string();
+    let expected_blob = timefusion::tantivy::index_path_for_parquet(TABLE, parquet_rel).to_string();
     assert_eq!(entry.index.as_deref(), Some(expected_blob.as_str()));
     assert_eq!(entry.covered_files, vec![parquet_uri.clone()], "covered_files must carry the absolute URI (coverage gate / GC keying)");
     assert!(entry.ordinals_valid, "read-back build indexes parquet row order → ordinals valid for row selection");
-    store::download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob)).await.expect("blob exists");
+    download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob)).await.expect("blob exists");
 
     // And the published index is actually searchable end-to-end.
     let cache = TempDir::new().unwrap();
@@ -177,19 +174,19 @@ fn verify_blob_accepts_built_index_and_rejects_corruption() {
     // fails every future read on its immutable path). The merge-thread race
     // that produced corrupt blobs is timing-dependent — the fix is the
     // `wait_merging_threads()` join in `index_to_writer`; this pins the guard.
-    let (blob, _) = store::build_and_pack(&table(), &[batch()], 3, MergeMode::Now).expect("build_and_pack");
-    store::verify_blob(&blob).expect("freshly built blob must verify");
+    let (blob, _) = timefusion::tantivy::build_and_pack(&table(), &[batch()], 3, MergeMode::Now).expect("build_and_pack");
+    verify_blob(&blob).expect("freshly built blob must verify");
 
     // Truncating the blob yields an invalid tar.zst; verify must error, not panic.
-    assert!(store::verify_blob(&blob[..blob.len() / 2]).is_err(), "corrupt blob must be rejected");
-    assert!(store::verify_blob(b"not a tantivy archive").is_err(), "garbage blob must be rejected");
+    assert!(timefusion::tantivy::verify_blob(&blob[..blob.len() / 2]).is_err(), "corrupt blob must be rejected");
+    assert!(timefusion::tantivy::verify_blob(b"not a tantivy archive").is_err(), "garbage blob must be rejected");
 }
 
 #[tokio::test]
 async fn manifest_load_default_when_missing() {
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let m = manifest::load(store_obj.as_ref(), "logs", "proj1").await.expect("load empty");
-    assert_eq!(m.version, manifest::SCHEMA_VERSION);
+    let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.expect("load empty");
+    assert_eq!(m.version, SCHEMA_VERSION);
     assert!(m.entries.is_empty());
 }
 
@@ -200,15 +197,15 @@ async fn manifest_upsert_and_remove_roundtrip() {
         index: Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst".into()),
         rows: 100,
         built_at: Utc::now(),
-        schema_version: manifest::SCHEMA_VERSION,
+        schema_version: SCHEMA_VERSION,
         min_timestamp_micros: Some(1_000_000),
         max_timestamp_micros: Some(2_000_000),
         error: None,
         covered_files: vec!["part-uuid-1.parquet".into()],
         ordinals_valid: false,
     };
-    manifest::upsert(store_obj.as_ref(), "logs", "proj1", "part-uuid-1.parquet", entry.clone()).await.expect("upsert 1");
-    manifest::upsert(
+    upsert_manifest(store_obj.as_ref(), "logs", "proj1", "part-uuid-1.parquet", entry.clone()).await.expect("upsert 1");
+    upsert_manifest(
         store_obj.as_ref(),
         "logs",
         "proj1",
@@ -228,13 +225,13 @@ async fn manifest_upsert_and_remove_roundtrip() {
     .await
     .expect("upsert 2");
 
-    let m = manifest::load(store_obj.as_ref(), "logs", "proj1").await.unwrap();
+    let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.unwrap();
     assert_eq!(m.entries.len(), 2);
     assert_eq!(m.entries["part-uuid-1.parquet"].rows, 100);
     assert!(m.entries["part-uuid-2.parquet"].error.is_some());
 
-    manifest::remove_many(store_obj.as_ref(), "logs", "proj1", &["part-uuid-1.parquet".into()]).await.unwrap();
-    let m = manifest::load(store_obj.as_ref(), "logs", "proj1").await.unwrap();
+    remove_manifest_entries(store_obj.as_ref(), "logs", "proj1", &["part-uuid-1.parquet".into()]).await.unwrap();
+    let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.unwrap();
     assert_eq!(m.entries.len(), 1);
     assert!(m.entries.contains_key("part-uuid-2.parquet"));
 }
@@ -249,7 +246,7 @@ async fn concurrent_upserts_last_writer_wins() {
     let s2 = store_obj.clone();
     let (r1, r2) = tokio::join!(
         tokio::spawn(async move {
-            manifest::upsert(
+            upsert_manifest(
                 s1.as_ref(),
                 "logs",
                 "proj1",
@@ -269,7 +266,7 @@ async fn concurrent_upserts_last_writer_wins() {
             .await
         }),
         tokio::spawn(async move {
-            manifest::upsert(
+            upsert_manifest(
                 s2.as_ref(),
                 "logs",
                 "proj1",
@@ -291,7 +288,7 @@ async fn concurrent_upserts_last_writer_wins() {
     );
     r1.unwrap().unwrap();
     r2.unwrap().unwrap();
-    let m = manifest::load(store_obj.as_ref(), "logs", "proj1").await.unwrap();
+    let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.unwrap();
     // At least one of them survived. Race is acceptable; corruption is not.
     assert!(!m.entries.is_empty());
 }

@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
@@ -68,7 +68,7 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
     // Fresh rows so the scan spans MemBuffer ∪ the compacted Delta partition —
     // the shape a dashboard query actually takes.
     // Advance to the frozen start so every written row is now sealed.
-    clock::set_micros(FROZEN_START_MICROS);
+    support::set_micros(FROZEN_START_MICROS);
     let new_base = FROZEN_START_MICROS - 60 * sec;
     for i in 0..3i64 {
         insert_at(&client, &format!("m-{i}"), new_base + i * sec).await?;
@@ -145,7 +145,7 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
         env.advance(Duration::from_secs(bucket_secs * 2));
         env.force_flush().await?;
     }
-    clock::set_micros(FROZEN_START_MICROS);
+    support::set_micros(FROZEN_START_MICROS);
 
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
     let before: Vec<String> = {
@@ -235,7 +235,7 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
             insert_at(&client, &format!("s-{b}-{i}"), yesterday + (b * 300 + i * 20) * sec).await?;
         }
         env.force_flush().await?;
-        clock::set_micros(FROZEN_START_MICROS);
+        support::set_micros(FROZEN_START_MICROS);
     }
 
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
@@ -294,11 +294,11 @@ async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool
             insert_at(&client, &format!("x-{b}-{i}"), yesterday + (b * 300 + i * 20) * sec).await?;
         }
         env.force_flush().await?;
-        clock::set_micros(FROZEN_START_MICROS);
+        support::set_micros(FROZEN_START_MICROS);
     }
 
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    let before = timefusion::metrics::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed);
+    let before = timefusion::observability::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed);
 
     // Same table twice is the same contention the two tables have: one
     // process-wide permit, two concurrent passes.
@@ -308,12 +308,12 @@ async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool
     );
     a?;
     b?;
-    let yielded = timefusion::metrics::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let yielded = timefusion::observability::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
     assert_eq!(yielded, 1, "exactly one of two overlapping repair passes must yield the permit, got {yielded}");
 
     // And the permit must be RELEASED: a later pass still runs.
     env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair).await?;
-    let after = timefusion::metrics::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let after = timefusion::observability::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
     assert_eq!(after, 1, "the permit leaked — a pass that ran alone still yielded");
 
     Ok(())

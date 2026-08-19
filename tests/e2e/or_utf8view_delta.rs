@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
@@ -63,7 +63,7 @@ async fn or_equality_on_utf8view_delta_matches_in_list() -> anyhow::Result<()> {
 
     // Push everything from MemBuffer into Delta, then evict MemBuffer so the
     // query is served purely from parquet.
-    clock::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
+    support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
     env.force_flush().await?;
     env.force_evict().await?;
 

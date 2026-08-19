@@ -5,7 +5,7 @@
 //! output to the generated target schema. Read routing lives here as well, but
 //! is deliberately conservative: an unsupported query must use raw data.
 
-use crate::schema_loader::RollupSpec;
+use crate::schema::RollupSpec;
 
 /// Why a query cannot use a rollup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,12 +399,12 @@ pub fn to_rollup_batches(
     use std::sync::Arc;
 
     let target = spec.table_name(source);
-    let schema = crate::schema_loader::get_schema(&target).ok_or_else(|| anyhow::anyhow!("{target} schema missing"))?.schema_ref();
+    let schema = crate::schema::get_schema(&target).ok_or_else(|| anyhow::anyhow!("{target} schema missing"))?.schema_ref();
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| anyhow::anyhow!("invalid Unix epoch date"))?;
     let date_days = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?.signed_duration_since(epoch).num_days();
     let date_days = i32::try_from(date_days).map_err(|_| anyhow::anyhow!("rollup date `{date}` is outside Date32"))?;
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
-    let now = crate::clock::now_micros();
+    let now = crate::support::now_micros();
 
     aggregated
         .iter()
@@ -1156,7 +1156,7 @@ static MEASURE_FILTERS: std::sync::OnceLock<dashmap::DashMap<(String, String, St
 
 async fn measure_filters<'a>(
     session: &datafusion::execution::context::SessionState, source: &str, spec: &'a RollupSpec, project_id: &str, lo: i64, hi: i64,
-) -> Result<Vec<(&'a crate::schema_loader::RollupMeasure, String)>, MissReason> {
+) -> Result<Vec<(&'a crate::schema::RollupMeasure, String)>, MissReason> {
     let cache = MEASURE_FILTERS.get_or_init(dashmap::DashMap::new);
     let mut filters = Vec::with_capacity(spec.measures.len());
     for measure in &spec.measures {
@@ -1260,7 +1260,7 @@ pub(crate) async fn match_aggregates(
     let LogicalPlan::Aggregate(aggregate) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
     let mut predicates = Vec::new();
     let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(Vec::new()) };
-    let Some(schema) = crate::schema_loader::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
+    let Some(schema) = crate::schema::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
     // Try every declared rollup, coarsest grain first: a coarser grain reads
     // strictly fewer rows for the same answer. Ties break toward the narrower
@@ -1465,7 +1465,7 @@ async fn route_with_spec(
     // carries the missing bound through to `sql`, which leaves the trailing raw
     // range unbounded so rows past `now` are still returned.
     let open_end = hi.is_none();
-    let (lo, hi) = lo.zip(hi.or_else(|| Some(crate::clock::now_micros()))).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
+    let (lo, hi) = lo.zip(hi.or_else(|| Some(crate::support::now_micros()))).filter(|(lo, hi)| lo < hi).ok_or(MissReason::UnboundedTime)?;
     let grain = spec.grain_micros().ok_or(MissReason::UnsupportedShape)?;
     // A grain too coarse for the window can never yield a usable interior — the
     // aligned span inside it is empty or below the cost floor. Rejecting it here
@@ -1698,7 +1698,7 @@ mod tests {
     const SOURCE: &str = "otel_logs_and_spans";
 
     fn spec() -> RollupSpec {
-        crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
+        crate::schema::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
     }
 
     /// A window with a lower bound and NO upper bound must still route.
@@ -1732,7 +1732,7 @@ mod tests {
             "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY resource___service___name"
         );
         let route = route_for(&state, &sql).await.expect("route").expect("a route");
-        let generated = hybrid_sql(&route, crate::clock::now_micros());
+        let generated = hybrid_sql(&route, crate::support::now_micros());
         let tail = generated.rsplit("timestamp >=").next().expect("a trailing range");
         assert!(!tail.contains("timestamp <"), "the trailing raw range must stay open-ended, got: {generated}");
     }
@@ -1790,7 +1790,7 @@ mod tests {
         use datafusion::logical_expr::{col, lit};
         let text_match = |args: Vec<datafusion::logical_expr::Expr>| {
             datafusion::logical_expr::Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                crate::tantivy_index::udf::text_match_udf().into(),
+                crate::tantivy::udf::text_match_udf().into(),
                 args,
             ))
         };
@@ -1825,9 +1825,9 @@ mod tests {
 
     #[test]
     fn declared_rollup_is_generated_with_its_configured_fields() {
-        let source = crate::schema_loader::get_schema(SOURCE).expect("source schema");
+        let source = crate::schema::get_schema(SOURCE).expect("source schema");
         let spec = spec();
-        let target = crate::schema_loader::get_schema(&spec.table_name(SOURCE)).expect("generated rollup schema");
+        let target = crate::schema::get_schema(&spec.table_name(SOURCE)).expect("generated rollup schema");
         for name in spec.dimensions.iter().chain(spec.measures.iter().map(|measure| &measure.name)) {
             assert!(target.fields.iter().any(|field| field.name == *name), "missing configured rollup field `{name}`");
         }
@@ -1947,7 +1947,7 @@ mod tests {
             grain: "1h".into(),
             name: Some("hll_shape".into()),
             dimensions: vec!["kind".into()],
-            measures: vec![crate::schema_loader::RollupMeasure {
+            measures: vec![crate::schema::RollupMeasure {
                 name: "traces".into(),
                 agg: "hll".into(),
                 column: Some("context___trace_id".into()),
@@ -1987,13 +1987,13 @@ mod tests {
     /// back into a real logical plan.
     async fn session() -> datafusion::execution::context::SessionState {
         let mut ctx = datafusion::prelude::SessionContext::new();
-        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
+        crate::read::functions::register_custom_functions(&mut ctx).expect("functions register");
         // Every declared tier, not just the fine one: specs are tried
         // coarsest-first, so a session missing the coarse table could not plan a
         // rewrite the matcher legitimately chose.
-        let targets = crate::schema_loader::get_schema(SOURCE).expect("source schema").rollups.iter().map(|spec| spec.table_name(SOURCE)).collect::<Vec<_>>();
+        let targets = crate::schema::get_schema(SOURCE).expect("source schema").rollups.iter().map(|spec| spec.table_name(SOURCE)).collect::<Vec<_>>();
         for table_name in std::iter::once(SOURCE.to_string()).chain(targets) {
-            let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(&table_name).expect("schema").schema_ref(), vec![vec![]])
+            let table = datafusion::datasource::MemTable::try_new(crate::schema::get_schema(&table_name).expect("schema").schema_ref(), vec![vec![]])
                 .expect("empty table");
             ctx.register_table(table_name.as_str(), Arc::new(table)).expect("register table");
         }
@@ -2301,9 +2301,9 @@ mod tests {
     #[tokio::test]
     async fn a_metrics_panel_routes_with_an_in_filter_and_a_digest() {
         let mut ctx = datafusion::prelude::SessionContext::new();
-        crate::functions::register_custom_functions(&mut ctx).expect("functions register");
+        crate::read::functions::register_custom_functions(&mut ctx).expect("functions register");
         for table_name in ["otel_metrics", "otel_metrics_rollup_metrics_1m_v2"] {
-            let table = datafusion::datasource::MemTable::try_new(crate::schema_loader::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
+            let table = datafusion::datasource::MemTable::try_new(crate::schema::get_schema(table_name).expect("schema").schema_ref(), vec![vec![]])
                 .expect("empty table");
             ctx.register_table(table_name, Arc::new(table)).expect("register table");
         }

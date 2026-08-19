@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use timefusion::clock;
+use timefusion::support;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
@@ -64,7 +64,7 @@ async fn insert_select_unnest_coerces_text_to_variant() -> anyhow::Result<()> {
     assert_eq!(s, vec!["a".to_string(), "b,c".to_string()], "string_to_array(chr(31)) is comma-safe");
 
     // Flush to Delta + evict MemBuffer → the Variant predicate must still hold from parquet.
-    clock::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
+    support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
     env.force_flush().await?;
     env.force_evict().await?;
     let n_hit: i64 =

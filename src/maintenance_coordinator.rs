@@ -370,7 +370,7 @@ impl Drop for TaskLease {
     fn drop(&mut self) {
         let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if journal.state(&self.key) == Some(TaskState::Running) {
-            journal.abandon_running(&self.key, crate::clock::now_micros());
+            journal.abandon_running(&self.key, crate::support::now_micros());
             if let Err(error) = journal.checkpoint() {
                 tracing::error!(error = %error, task = ?self.key, "failed to checkpoint maintenance task lease recovery");
             }
@@ -399,8 +399,8 @@ impl TaskJournal {
     const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
-        let path = crate::wal::meta_path(data_dir, "maintenance_tasks.json");
-        let wal_path = crate::wal::meta_path(data_dir, "maintenance_tasks.wal");
+        let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
+        let wal_path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.wal");
         let mut snapshot = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<Snapshot>(&bytes)?,
             Err(error) if error.kind() == ErrorKind::NotFound => Snapshot { version: JOURNAL_VERSION, ..Snapshot::default() },
@@ -1318,7 +1318,7 @@ impl TaskJournal {
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let task = &mut self.snapshot.tasks[index];
         task.state = TaskState::Retry;
-        crate::metrics::set_maintenance_retry_reason(&reason);
+        crate::observability::set_maintenance_retry_reason(&reason);
         task.retry_reason = Some(reason);
         task.deadline_micros = not_before_micros;
         self.dirty_tasks.insert(key.clone());
@@ -1536,7 +1536,7 @@ impl TaskJournal {
             fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec(&self.snapshot)?;
-        crate::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
+        crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
         let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
         wal.sync_all()?;
         self.dirty_tasks.clear();
@@ -1546,7 +1546,7 @@ impl TaskJournal {
 
     pub fn publish_statistics(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         let mut counts = [0u64; 4];
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
@@ -1554,7 +1554,7 @@ impl TaskJournal {
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let mut per_operation = [0u64; 6];
         let (mut eligible_base_rollup, mut eligible_sealed) = (0u64, 0u64);
-        let now_micros = crate::clock::now_micros();
+        let now_micros = crate::support::now_micros();
         for task in &self.snapshot.tasks {
             let index = match task.state {
                 TaskState::Pending => 0,
@@ -1867,7 +1867,7 @@ impl AdmissionController {
             object_reads: state.capacity.object_reads.saturating_sub(state.available.object_reads),
             object_writes: state.capacity.object_writes.saturating_sub(state.available.object_writes),
         };
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         stats.maintenance_cpu_tokens_used.store(u64::from(used.cpu), Relaxed);
         stats.maintenance_decoded_bytes_used.store(used.decoded_bytes, Relaxed);
         stats.maintenance_object_read_tokens_used.store(u64::from(used.object_reads), Relaxed);
@@ -2179,7 +2179,7 @@ mod tests {
         // publish_statistics reads the real clock, so eligibility has to be
         // expressed against it — an epoch-relative `now` makes every deadline
         // look long past and the eligible/pending distinction vanishes.
-        let now = crate::clock::now_micros();
+        let now = crate::support::now_micros();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         let key = |op, start: i64, end: i64| TaskKey {
@@ -2197,7 +2197,7 @@ mod tests {
         journal.enqueue(key(Operation::Repair, old_start, old_start + MIN_SLICE_MICROS), now - 1, 1, 1);
         journal.publish_statistics();
 
-        let stats = crate::metrics::maintenance_stats();
+        let stats = crate::observability::maintenance_stats();
         assert_eq!(stats.pending_base_rollup.load(Relaxed), 2, "both rollup tasks are pending regardless of eligibility");
         assert_eq!(stats.pending_repair.load(Relaxed), 1);
         assert_eq!(stats.eligible_base_rollup.load(Relaxed), 1, "only the due rollup is claimable now — this is the distinction tasks_pending cannot make");
@@ -2214,7 +2214,7 @@ mod tests {
     /// the separately-planned compaction debt.
     #[test]
     fn coarse_backfill_migration_only_drops_fine_sealed_backfill() {
-        let now = crate::clock::now_micros();
+        let now = crate::support::now_micros();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         let day = 24 * 60 * 60 * 1_000_000i64;
@@ -2439,7 +2439,7 @@ mod tests {
         assert!(journal.mark_running(&key));
         journal.checkpoint().expect("running checkpoint");
         let journal = Arc::new(Mutex::new(journal));
-        let before_drop = crate::clock::now_micros();
+        let before_drop = crate::support::now_micros();
         drop(TaskLease::new(Arc::clone(&journal), key.clone()));
 
         let journal_guard = journal.lock().expect("lock");
