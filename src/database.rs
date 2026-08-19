@@ -2783,6 +2783,22 @@ pub struct Database {
     /// (~3.2s per parquet file, measured the same day); it only doubles the
     /// number of units paying it.
     maintenance_quarantine_slots: Arc<tokio::sync::Semaphore>,
+    /// Holds a couple of workers open for `DerivedRollup` while coverage is
+    /// short. Every OTHER operation must acquire one of these to run, so the
+    /// remainder is always available to derived work.
+    ///
+    /// #176 freed workers from debt for "the rollup chain", but that chain is
+    /// not uniform: a sealed `BaseRollup` day unit measured 801s on prod
+    /// 2026-08-19, so it takes the freed worker and `DerivedRollup` starves
+    /// behind it exactly as it starved behind debt. Derived is the cheap half —
+    /// it aggregates the base TIER and reads no raw data — and it builds the 1h
+    /// tier that 14d/30d dashboards read, which is the coverage gap (1m at 33
+    /// days against 1h at 9-17).
+    ///
+    /// Measured after #189 made those units claimable at all: 8 derived claims
+    /// in 25 minutes, 2 of them sealed. At that rate the ~700-unit backlog takes
+    /// 145 hours. Again the scarcity is slot-TIME, not attempts.
+    maintenance_derived_reserve: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the
     /// time-windowed target to hash-join keys; ungated bursts starve reads on a
     /// CPU-throttled box (prod 2026-07-19). Permits = `timefusion_dml_merge_concurrency`.
@@ -3420,6 +3436,10 @@ impl Database {
             // expensive is the one the 30d goal needs most. Two workers at 900s
             // is 1,800 of 57,600 worker-seconds — 3% — against the measured 73%.
             maintenance_quarantine_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs / 8).max(1))),
+            // Two of sixteen held open for derived work, expressed as the
+            // permits everything else must share. Never zero for the others: a
+            // one- or two-worker box must still make progress on everything.
+            maintenance_derived_reserve: Arc::new(tokio::sync::Semaphore::new(coordinator_jobs.saturating_sub(2).max(1))),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -11136,10 +11156,38 @@ impl Database {
             // Only while coverage is short, on the same self-limiting signal as
             // the cycle weighting, so a healthy system goes back to using every
             // worker for whatever is queued.
+            //
+            // `DerivedRollup` is exempt from BOTH caps, and holds a reservation
+            // of its own below, because #176's argument applies to it one level
+            // further down. That change freed workers from debt for "the rollup
+            // chain" — but BaseRollup's sealed day units are themselves 800s
+            // (measured 2026-08-19), so they take the freed workers and derived
+            // starves exactly as it did behind debt. Derived is the cheap half:
+            // it aggregates the base TIER and reads no raw data at all.
             let _debt_slot = match operation {
                 Operation::BaseRollup | Operation::DerivedRollup => None,
                 _ if !coverage_is_short() => None,
                 _ => match Arc::clone(&self.maintenance_debt_slots).try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => continue,
+                },
+            };
+            // Keep a couple of workers free for derived work while coverage is
+            // short. Everything else must leave `maintenance_derived_reserve`
+            // permits unclaimed; derived itself never takes one.
+            //
+            // Measured on prod 2026-08-19 00:40 UTC, after #189 made historical
+            // derived units claimable at all: 8 derived claims in 25 minutes, of
+            // which 2 were the sealed day units that build the tier. At that rate
+            // the ~700-unit backlog is 145 hours. The cause is wall clock, not
+            // attempts — the cycle already gives derived 2 of 10 slots, but a
+            // worker that picks HotPacking is gone for 578s and one that picks a
+            // sealed BaseRollup for 801s, so attempt share and slot-time share
+            // differ by two orders of magnitude. That is #176's finding exactly.
+            let _derived_reserve = match operation {
+                Operation::DerivedRollup => None,
+                _ if !coverage_is_short() => None,
+                _ => match Arc::clone(&self.maintenance_derived_reserve).try_acquire_owned() {
                     Ok(permit) => Some(permit),
                     Err(_) => continue,
                 },
@@ -20688,6 +20736,29 @@ mod tests {
         assert_eq!(queued, 0, "past the ceiling nothing new is enqueued");
         assert_ne!(recomputed, u64::MAX, "but the pass still ran and recomputed the goal gauge");
         Ok(())
+    }
+
+    /// Derived work must keep workers no matter how busy the expensive units are.
+    ///
+    /// #176 freed workers from debt for "the rollup chain", but a sealed
+    /// BaseRollup day unit is itself 801s (prod 2026-08-19), so it takes the
+    /// freed worker and DerivedRollup starves behind it exactly as it starved
+    /// behind debt. Derived is the cheap half — it aggregates the base TIER and
+    /// reads no raw data — and it builds the 1h tier 30d dashboards read.
+    #[test]
+    fn derived_work_keeps_workers_the_expensive_units_cannot_take() {
+        // Mirrors the sizing in `Database::new`.
+        let others = |jobs: usize| jobs.saturating_sub(2).max(1);
+        // Prod shape: everything else shares 14, so 2 always remain for derived.
+        assert_eq!(others(16), 14);
+        assert_eq!(16 - others(16), 2, "two workers stay reachable by derived work");
+        // A small box must still make progress on the expensive operations.
+        assert_eq!(others(1), 1, "one worker still runs everything");
+        assert_eq!(others(2), 1);
+        // Monotonic: more workers never means fewer for the rest.
+        assert!((1..64).all(|jobs| others(jobs) <= others(jobs + 1)));
+        // And the reserve never grows to swallow the pool.
+        assert!((3..64).all(|jobs| others(jobs) >= jobs - 2));
     }
 
     /// The debt cap must leave workers for the rollup chain without starving debt
