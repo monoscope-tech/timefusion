@@ -1590,6 +1590,77 @@ every deploy resets the counters that would show whether they worked; §12's
 "≥2h quiet before believing a throughput number" has been violated repeatedly
 out of necessity and should now be honoured.
 
+## 21c. What else is missing from the Delta log, and whether it matters
+
+Audited 2026-08-19 by reading the logs directly rather than trusting counters.
+
+| metadata | source table | 1m tier | 1h tier | verdict |
+|---|---|---|---|---|
+| `numRecords`, `minValues`, `maxValues`, `nullCount` | **1,648/1,648** | present | present | ✅ fine |
+| `min/max` on `timestamp`, `id`, `updated_at` | **1,648/1,648** | present | present | ✅ fine |
+| `min/max` on `date`, `project_id` | absent | absent | absent | ✅ **correct** — partition columns live in the path; Delta omits them by convention |
+| `delta-rs.optimize.sort_by` | 55/1,648 (3.3%) | 57/1,055 | 41/512 | ⚠️ only OPTIMIZE tags output — fixed by #200 |
+| `timefusion.*` coverage tags | n/a | **998/1,055** | **471/512** | ❌ **see below** |
+
+Two things are healthy and worth stating, because both had been suspected:
+
+- **Statistics are complete.** Every add carries `numRecords` and timestamp
+  min/max. So #193's `partition_file_is_empty` has the input it needs, and
+  timestamp-based file pruning is not silently degraded. The earlier worry that
+  missing stats might be defeating pruning is disproved.
+- **The rollup tiers ARE tagged** — which is why `recover_rollup_coverage`
+  re-adopted 8,589 slices. Coverage identity is being written correctly by the
+  rollup path.
+
+### The one that is NOT ok: consolidation strips coverage identity
+
+The tagged counts are **disjoint**. In the 1m tier, 998 files carry the six
+`timefusion.*` tags and 57 carry only `delta-rs.optimize.sort_by`; 998 + 57 =
+1,055. Same shape in the 1h tier (471 + 41 = 512).
+
+Cause, in `tag_sorted` on the rewrite output path:
+
+```rust
+let tag_sorted = |mut add: Add| {
+    if sorted { add.tags…insert(SORTED_RUN_TAG, "true"); }
+    Action::Add(add)
+};
+```
+
+It writes the sort tag and **carries nothing forward**. So consolidating a
+rollup-tier partition destroys that partition's `timefusion.source` /
+`project` / `slice_start` / `slice_end` / `source_fingerprint` / `generation`.
+
+**Why that is bad, and why it is worse than it looks:** `recover_rollup_coverage`
+re-derives coverage from exactly those tags. A consolidated tier partition is
+therefore no longer recoverable from storage — it survives only as long as the
+journal's `published_rollups` does. And the interaction is perverse: **the more
+successful compaction is, the more coverage identity it erases.** This session
+has been pushing consolidation hard, which actively erodes the thing G1 is
+trying to build. It is also the source of the constant
+`maintenance_rollup_untagged_input` warnings, since derived units reading a
+consolidated base partition fall back to timestamp-stats pruning (#169).
+
+Currently **5.4% of 1m-tier files and 8.0% of 1h-tier files** are already
+coverage-blind.
+
+**The fix, and why it is not a one-liner.** The output of a consolidation spans
+several input slices, so it cannot simply inherit one input's tags — claiming a
+wider slice than was actually aggregated is the silent-wrong-number failure this
+plan refuses elsewhere. The safe form: carry the tags forward only when every
+input of the bin agrees on `TAG_GENERATION` and `TAG_SOURCE_FINGERPRINT` (which
+they will, within one (project, date) partition of one tier), and set the
+output's slice to the union of the inputs'. Where the inputs disagree, omit the
+tags exactly as today. That is correct, conservative, and testable — but it is a
+correctness change to coverage identity and belongs in a measured window, not
+appended to a run of eighteen deploys.
+
+**Generalised finding, now the fifth of its kind:** every one of these bugs is a
+cheap proxy read as the fact it stands for — presence for completeness, an
+absent tag for an absent property, and now a rewrite that preserves the proxy
+(`sorted`) while dropping the fact (coverage identity). When a file is rewritten,
+ask what the OLD file was evidence FOR, not just what it looked like.
+
 ## 22. Ordering, and the one-line rationale for it
 
 1. **A** (local loop) — because every estimate below is currently a projection.
