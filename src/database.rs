@@ -21368,11 +21368,9 @@ mod tests {
         deltalake::kernel::Add { path: path.to_string(), size: 1024, modification_time: 0, data_change: true, ..Default::default() }
     }
 
-    /// A snapshot that lists one file twice must still map to ONE target, so
-    /// the planners' `targets.len() != files.len()` check stays meaningful.
-    /// Prod 2026-08-02: the incremental snapshot advance duplicated the file
-    /// list across a checkpoint, every plan logged "mapped 2/1 files", and both
-    /// dedup and hot-tail compaction stalled indefinitely.
+    /// A snapshot that lists one file twice must still map to one target, so the planners'
+    /// `targets.len() != files.len()` check stays meaningful. The incremental snapshot advance used to
+    /// duplicate the file list across a checkpoint, making every plan mismatch and stalling compaction.
     #[test]
     fn dedup_adds_by_path_collapses_a_duplicated_snapshot_entry() {
         let dup = vec![test_add("a.parquet"), test_add("b.parquet"), test_add("a.parquet")];
@@ -21472,11 +21470,11 @@ mod tests {
         assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
     }
 
-    /// The self-landed split (prod 2026-07-30 follow-up). "Targets gone" has TWO
-    /// causes and they need opposite handling: another writer rewrote them
-    /// (staged parquet is garbage → delete), or our OWN earlier attempt landed
-    /// and then reported an error (staged parquet is LIVE DATA → never delete,
-    /// credit the bin). The bin's own Adds are what tells them apart.
+    /// The self-landed split: "targets gone" has two causes that need opposite handling.
+    ///
+    /// Another writer may have rewritten the targets (staged parquet is garbage → delete), or our own
+    /// earlier attempt landed and then errored (staged parquet is live data → never delete, credit the
+    /// bin). The bin's own Adds are what tells them apart.
     #[test]
     fn a_bin_whose_own_adds_are_live_is_self_landed_not_stale() {
         let alpha = staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6)));
@@ -21694,8 +21692,6 @@ mod tests {
         assert_eq!(cols.len(), cols.iter().collect::<std::collections::HashSet<_>>().len(), "no duplicates");
     }
 
-    /// A repair pass must be bounded by its BUDGET, not by a wave count.
-    ///
     /// A repair pass must be bounded by its budget, not by a wave count.
     ///
     /// A wave serves one bin per project, so a flat wave cap could limit a pass to a handful of
@@ -21890,11 +21886,9 @@ mod tests {
         }
     }
 
-    /// The dedup tick's two halves run in SEQUENCE, so one shared deadline is
-    /// not a split — the first half takes all of it. Prod 2026-08-13, with
-    /// exactly that shape, logged `dedup_sweep_truncated swept=0 remaining=19`:
-    /// the drain's probes spent the whole 239s budget and the sweep (partition
-    /// certification and rollup builds) never ran a single item.
+    /// The dedup tick's two halves run in sequence, so one shared deadline is not a split — the
+    /// first half takes all of it. A probe phase can consume the whole budget and leave the sweep
+    /// (partition certification and rollup builds) with no share.
     #[test]
     fn the_dedup_tick_budget_leaves_the_sweep_a_share_the_drain_cannot_take() {
         let budget = std::time::Duration::from_secs(240);
@@ -21927,15 +21921,12 @@ mod tests {
         assert_eq!(counter.load(Relaxed), 0, "a panicking bin left the slot held");
     }
 
-    /// Repair bins are minutes apart, so a round that collected every outcome
-    /// before committing held finished rewrites hostage to the slowest sibling
-    /// — and a restart mid-round (deploy, or the ~2-hourly healthcheck kill)
-    /// discarded them all. Prod 2026-08-10/11: every whale tier drop arrived via
-    /// `staged_intent_resumed` on a LATER pass, never from a bin that staged and
-    /// committed in one.
+    /// A finished repair bin must commit without waiting for its slowest sibling.
     ///
-    /// The slow bin only finishes once the fast bin's commit has RUN, so a
-    /// collect-then-commit implementation cannot finish this test at all.
+    /// Repair bins are minutes apart, so a round that collected every outcome before committing held
+    /// finished rewrites hostage to the slowest sibling — and a restart mid-round discarded them all.
+    /// The slow bin only finishes once the fast bin's commit has run, so a collect-then-commit
+    /// implementation cannot finish this test at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_finished_repair_bin_commits_without_waiting_for_its_slow_sibling() {
         let (committed, gate) = (std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new())), std::sync::Arc::new(tokio::sync::Notify::new()));
@@ -21972,9 +21963,8 @@ mod tests {
         assert_eq!(*committed.lock().unwrap(), vec![vec!["fast".to_string()], vec!["slow".to_string()]], "one commit per bin, in completion order");
     }
 
-    /// The other half of the trade: packing bins are many and quick, and one
-    /// commit per bin drove OCC ladders to attempt 9-20 (2026-07-29). Packing
-    /// must still land the whole wave in a single call.
+    /// Packing bins are many and quick, and one commit per bin used to drive long OCC ladders.
+    /// Packing must still land the whole wave in a single call.
     #[tokio::test(flavor = "multi_thread")]
     async fn packing_still_commits_the_whole_wave_in_one_call() {
         let committed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
@@ -22003,9 +21993,8 @@ mod tests {
         assert_eq!(committed[0].len(), 3, "all three bins in the one commit");
     }
 
-    /// A dedup-raced bin (`Retry`) must NOT silence the project for the tick:
-    /// it stays in the rotation and gets a fresh bin next round (2026-07-29
-    /// review finding — `Ok(None)` overloading dropped it with the converged).
+    /// A dedup-raced bin (`Retry`) must not silence the project for the tick; it stays in rotation and
+    /// gets a fresh bin next round.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_keeps_a_vanished_bin_project_in_rotation() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
@@ -22106,9 +22095,8 @@ mod tests {
         Ok(())
     }
 
-    /// The tick must stop starting rounds past its wall-clock budget rather than
-    /// overrunning its own cron period (prod 2026-07-29: "still in progress
-    /// after 600s" on a 300s schedule).
+    /// The tick must stop starting rounds past its wall-clock budget rather than overrunning its
+    /// own cron period.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_stops_at_the_tick_deadline() {
         let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
@@ -22129,11 +22117,8 @@ mod tests {
         assert_eq!(*truncated.lock().unwrap(), vec![(0, 2)], "must truncate on round 0 with both projects still pending");
     }
 
-    /// Prod 2026-08-01: RSS went 50GB → 110GB (cgroup 128GB) INSIDE one round,
-    /// and the brake — sampled only at the round boundary — recorded its first
-    /// `Stop` after that round had already landed. A brake that can only fire
-    /// between rounds cannot bound the memory a round allocates, so it must also
-    /// gate ADMISSION of each bin within the round.
+    /// A brake sampled only at round boundaries cannot bound memory allocated inside a round, so it
+    /// must also gate admission of each bin within the round.
     ///
     /// A brake that engages after the round starts must therefore stop new bins
     /// from being admitted, leaving them pending for the boundary check to
@@ -22174,10 +22159,10 @@ mod tests {
         );
     }
 
-    /// Prod 2026-07-29: a permanently-engaged WAL brake truncated every tick at
-    /// round 0, so ZERO waves committed for hours. `Degrade` must keep a service
-    /// floor — the debt-ordered head project keeps getting served every round —
-    /// while `Stop` keeps the old full-truncation behaviour.
+    /// A permanently engaged WAL brake must degrade rather than truncate.
+    ///
+    /// Truncating every tick at round 0 commits zero waves for hours. `Degrade` keeps a service floor
+    /// by serving the head project serially; `Stop` keeps the old full-truncation behaviour.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_degrade_serves_all_projects_serially() {
         let run = |brake: Option<super::Brake>| async move {
@@ -22219,10 +22204,9 @@ mod tests {
         assert_eq!(truncated, vec![(0, vec!["head".to_string(), "b".to_string(), "c".to_string()])]);
     }
 
-    /// Cache keys are bucket-relative (inserts happen below the PrefixStore),
-    /// so evict/contains must join the table's in-bucket path back onto the
-    /// table-relative file path — probing with the bare relative path never
-    /// matches (prod 2026-08-03: evictions were no-ops, confirms re-fetched).
+    /// Cache keys are bucket-relative (inserts happen below the PrefixStore), so evict/contains must
+    /// join the table's in-bucket path back onto the table-relative file path. Probing with the bare
+    /// relative path never matches, so evictions become no-ops and confirms re-fetch.
     #[test]
     fn bucket_cache_key_restores_the_table_path_segment() {
         let prefix = super::table_cache_prefix("s3://bucket/timefusion/otel_logs_and_spans/proj-1?endpoint=x");
@@ -22664,13 +22648,9 @@ mod tests {
         Ok(())
     }
 
-    /// Repair must never overlap repair. The startup pass and the cron are
-    /// SEPARATE tasks, and `spawn_cron_job` tracks its in-flight run in a local
-    /// variable — so it can only skip ticks it started itself and is blind to
-    /// the startup pass. Two concurrent repair passes each take `k/2`
-    /// light-rewrite permits and together starve packing (prod 2026-08-08
-    /// 05:09). The shared `try_lock` is what makes the exclusion real; this
-    /// pins the semantics the two call sites depend on.
+    /// Repair must never overlap repair. The startup pass and the cron are separate tasks; only one
+    /// may run at a time. Two concurrent repair passes would each take half the light-rewrite permits
+    /// and together starve packing. The shared `try_lock` makes the exclusion real.
     #[tokio::test]
     async fn a_second_repair_pass_stands_down_while_one_is_running() {
         let guard = Arc::new(tokio::sync::Mutex::new(()));
@@ -22785,10 +22765,12 @@ mod tests {
         Ok(())
     }
 
-    /// prod 2026-07-30: a dedup dirty-bin drain held every heavy rewrite permit
-    /// for 25+ min and starved hot compaction (62 bins selected, 1 wave in 35
-    /// min). The wave engine must hold its OWN permits, so exhausting the heavy
-    /// semaphore leaves wave staging fully able to proceed.
+    /// Hot-tail wave staging must hold its own permits, not share the heavy maintenance rewrite
+    /// semaphore.
+    ///
+    /// A long dedup drain once held every heavy rewrite permit and starved hot compaction for tens of
+    /// minutes. The wave engine must have its own permits so exhausting the heavy semaphore leaves
+    /// wave staging fully able to proceed.
     #[tokio::test]
     async fn wave_staging_permits_are_independent_of_heavy_rewrite_permits() -> Result<()> {
         let db = Database::with_config(create_test_config("rewrite-sem-split")).await?;
@@ -22853,12 +22835,12 @@ mod tests {
         Ok(())
     }
 
-    /// prod 2026-07-30: the commit lock is FIFO and every holder is bounded, but
-    /// a backlogged tick queued several legally-minutes-long wave commits ahead
-    /// of the flush path — flush waited >600s to ACQUIRE and its watchdog killed
-    /// the attempt (`commit_lock_timeouts` stayed 0: nobody hung, flush starved).
-    /// Durability outranks maintenance, so a wave with a flush already queued
-    /// must NOT enqueue: it requeues its bins and counts the yield. With no
+    /// Flush/ingest committers queued ahead of a wave must make the wave yield.
+    ///
+    /// The commit lock is FIFO, and a backlogged tick can queue several long wave commits ahead of a
+    /// flush. The flush waits out the queue and gets killed by its watchdog even though no holder
+    /// hangs (`commit_lock_timeouts` stays 0). Durability outranks maintenance, so a wave with a flush
+    /// already queued must requeue its bins and count the yield. With no
     /// waiter it commits exactly as before.
     #[tokio::test]
     async fn wave_commit_yields_to_a_waiting_flush() -> Result<()> {
@@ -22925,13 +22907,11 @@ mod tests {
         Ok(())
     }
 
-    /// Regression guard for the 2026-06-11 prod planning-stall convoy: every
-    /// query refreshes the unified table via `refresh_table_snapshot`, and the
-    /// old implementation held the table WRITE lock across `update_state()`
-    /// (full log replay + object-store IO — 1s+ per post-flush refresh on
-    /// prod's 40k-action log), so all concurrent reads convoyed behind it for
-    /// 50-110s during flush passes. Pin the fix: while a refresh runs against
-    /// a deliberately slow object store, read-lock acquisition must stay fast.
+    /// Regression guard: snapshot refresh must not convoy readers behind a write lock.
+    ///
+    /// The old implementation held the table write lock across `update_state()` (full log replay +
+    /// object-store IO), so concurrent reads convoyed behind it for minutes during flush passes. With a
+    /// deliberately slow object store, read-lock acquisition must stay fast.
     #[tokio::test(flavor = "multi_thread")]
     async fn refresh_table_snapshot_does_not_block_readers() -> Result<()> {
         use object_store::throttle::{ThrottleConfig, ThrottledStore};
@@ -23138,11 +23118,11 @@ mod tests {
         Ok(())
     }
 
-    /// `--project` scoping is REFUSED while its deadlock is unexplained
-    /// (2026-08-08). Refusing beats both alternatives: hanging (what it does)
-    /// and silently ignoring the flag (which would rewrite every tenant on the
-    /// date without the caller asking). Re-enable only with a test that the
-    /// scoped write actually completes.
+    /// `--project` scoping is refused while its deadlock is unexplained.
+    ///
+    /// Refusing beats both alternatives: hanging (what it does) and silently ignoring the flag (which
+    /// would rewrite every tenant on the date without the caller asking). Re-enable only with a test
+    /// that the scoped write actually completes.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn recompress_refuses_project_scope_and_leaves_data_intact() -> Result<()> {
@@ -23728,12 +23708,12 @@ mod tests {
         .map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
     }
 
-    /// Regression for the 2026-06-11 prod visibility gap: rows force-flushed
-    /// to Delta from an open bucket became invisible once that bucket
-    /// *sealed* — the per-bucket exclusion masked the whole window from the
-    /// Delta scan while the flush backlog kept the bucket in MemBuffer for
-    /// hours. Force-flushed buckets must stay exempt from the exclusion for
-    /// their whole lifetime, not just while current.
+    /// Regression: rows force-flushed to Delta from an open bucket must stay visible after the bucket
+    /// seals.
+    ///
+    /// The per-bucket exclusion used to mask the whole window from the Delta scan while the flush
+    /// backlog kept the bucket in MemBuffer. Force-flushed buckets must stay exempt from the
+    /// exclusion for their whole lifetime, not just while current.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn force_flushed_bucket_rows_stay_queryable_after_seal() -> Result<()> {
