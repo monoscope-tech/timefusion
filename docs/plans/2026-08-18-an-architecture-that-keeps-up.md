@@ -1906,3 +1906,120 @@ the freshness trade-off, and is the only part that needs a decision rather than
 a measurement.
 
 Still explicitly not next: more scheduler tweaks.
+
+---
+
+# Part IV — the queue was never the work (2026-08-19)
+
+## 28. 88,100 pending base rollups are 260 cells
+
+`rollup_backfill_census`, same process:
+
+    cells_missing=260  cells_wanted=0  cells_admitted=0
+    base_tier_ready=381  tier_holes=311
+    derived_pending=428  derived_unproven=428  derived_not_due=290
+    derived_refusal="dependencies:87576849:2026-08-10"
+
+Against `pending_base_rollup = 88,100`. **260 real (project, date) cells behind
+88,100 queued units — about 339 per cell** — and the planner adds nothing,
+because every cell is already queued. The backlog is overwhelmingly the same
+work listed many times over, not work to be done.
+
+Every capacity estimate in Parts I–III was therefore computed against a number
+~339× too large. "88k units at 5.2 s each" is not the remaining work; the
+remaining work is ~260 cells.
+
+## 29. Why fusion alone could never fix it
+
+§24 shipped the width cascade and the queue did not move (84,834 → 88,100). The
+reason is a rule the cascade inherited: `coarsen_to_width` refuses any bucket
+already covered by a pending unit **at least as wide**. That refusal is correct
+— fusing there would duplicate claimed work — but a pending *day-wide* unit is
+precisely the condition under which the narrow units are redundant.
+
+So fusion collapses only the cells that have no day unit, and then goes quiet.
+The signature is the one §24 already named, and it means something narrower than
+I read into it: 12, 6, 3, then nothing is not "everything collapsible has
+collapsed", it is "everything left is blocked by the very unit that makes it
+redundant".
+
+**Shipped: `subsume_covered_units`,** running before the cascade. A sealed
+Pending/Retry unit wholly contained in a *wider non-complete* unit of the same
+`(table, source, project, operation)` is dropped. A rollup or dedup unit
+rebuilds its entire slice, so a ten-minute unit inside a queued day unit is not
+work — and it still costs a full day scan when claimed, because a sealed
+partition's files span the day and nothing prunes.
+
+Only non-complete units subsume. Complete means built once, not still queued; a
+narrower unit inside a completed day is a later invalidation that must run, and
+dropping it would lose that rebuild silently. Both halves are pinned by tests.
+
+## 30. Certification is structurally unreachable
+
+The 30-day latency goal has one dominant term left, and it is not coverage.
+
+    dedup_denied_never_certified_pct = 100.0     (fleet)
+    shipbubble: certified on 0 of 14 sealed days
+
+Not tuning — structure:
+
+1. Only two things write `dedup_clean_fp`: the boot loader and
+   `record_certification`.
+2. `dedup_sweep` is the **only** caller of `record_certification`.
+3. The dedup cron skips every rollup-declared table — `if
+   get_schema(&table_name).is_some_and(|s| !s.rollups.is_empty()) { continue }`,
+   added 2026-08-16, "owned by durable coordinator tasks".
+4. `run_coordinator_dedup_once` completed its task and never certified.
+
+So for `otel_logs_and_spans` certification became unreachable the day the
+coordinator took ownership of dedup, and the only surviving entries were the ~80
+reloaded from disk at boot. `DedupExec` then survives in every plan, on every
+window. Diagnostic signature: zero `dedup_sweep_truncated` lines over a long
+window with a large `pending_dedup`, and `dedup_certifications_loaded` as the
+only certification event in the process's life.
+
+**Shipped:** the coordinator dedup unit certifies when it covers a whole UTC day
+and the probe returns clean over an unmoved file set. Day width is required
+because the read path keys certification on `(project, table, date)` and refuses
+the skip if any in-window partition lacks an entry.
+
+**A coupling to keep in view.** Certification needs an *unmoved* file set, so a
+partition still being compacted cannot certify. Compaction and certification are
+one dependency chain, not two workstreams — shipbubble has 6 of 14 sealed days
+at 10–384 files, and none of them can certify until packing lands first. The
+order is: subsume → the real 260 cells drain → compaction packs the fragmented
+days → certification → `DedupExec` leaves the plan → 30d gets fast.
+
+## 31. Two bugs found by disbelieving a green test
+
+`a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer`
+carried a comment blaming intermittent CI failures on "the concurrency of a
+loaded shard". It is not concurrency — it is the **wall-clock hour of the run**.
+The test writes nine spans at fixed hours of "yesterday"; it passes while those
+hours sit inside the 24 h live frontier and fails once they age out and
+coarsening fuses them. The same commit passed at 11:20 UTC and reported 14 where
+9 is right at 12:30 UTC.
+
+Underneath was a real silent-wrong-numbers bug (fixed, `441421a`): the
+replace-set removes only files *contained* in the publishing slice, so a base
+slice publishing after a wider one covering it could neither replace it nor
+decline — both stayed live and every dashboard SUMmed both. `covered_by_wider`
+guarded exactly this and was gated to the derived tier, on the reasoning that a
+base slice must always publish because it absorbs late rows. That argues against
+silently *completing* the unit; the branch escalates instead, rebuilding the
+covering slice, which contains those rows. Nothing is dropped.
+
+**Method note.** A time-dependent test that fails "intermittently" is not flaky
+in the usual sense, and re-running it is the one diagnostic guaranteed not to
+work. Before believing a flake explanation, check whether the test's fixtures
+are anchored to `now`.
+
+## 32. Deploy discipline
+
+Three pushes in one hour produced three prod restarts, and every throughput
+number sampled in that window came from a process 2–20 minutes old. One reading
+(`rollup_hits = 0`) looked like a routing collapse until coverage recovery was
+found to have run *four minutes after the sample*, restoring 8,254 slices.
+
+Batch pushes; leave ≥2 h before quoting throughput. This is the same lesson as
+`tf_deploy_cadence_starves_dedup` and it was re-learned by ignoring it.
