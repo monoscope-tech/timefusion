@@ -771,9 +771,26 @@ impl TaskJournal {
         let mut blocked: HashSet<(String, String, String, Operation, i64)> = HashSet::new();
         for task in self.snapshot.tasks.iter().filter(|task| match task.state {
             TaskState::Running => true,
-            TaskState::Superseded => task.key.slice.width() <= width,
             TaskState::Pending | TaskState::Retry => task.key.slice.width() >= width,
-            TaskState::Complete => false,
+            // Superseded does NOT block, and that reversal is the point.
+            //
+            // It used to block every width at or above its own, so a cell split
+            // all the way down carried superseded ancestors at day, 12h, 6h and
+            // 1h — which between them blocked every fusion width while none of
+            // them could subsume (a superseded parent must not delete the
+            // children that replaced it). Its descendants were then permanently
+            // stuck: prod 2026-08-19 reported `fused=0 candidates=257,535
+            // blocked=249,786` on every tick, a queue that could not shrink by
+            // any mechanism it had.
+            //
+            // The anti-loop guard it was written for is really the budget test
+            // below, which is stronger: fusion happens only when the CHILDREN'S
+            // summed estimate fits `MAX_DECODED_BYTES`, and a unit that fits
+            // does not split, so split/fuse cannot cycle. Superseded only ever
+            // meant "did not fit under the estimate of the day", and with
+            // `slice_share_of_file` that estimate has changed — refusing on it
+            // forever would pin the queue to a measurement already known wrong.
+            TaskState::Superseded | TaskState::Complete => false,
         }) {
             let mut bucket = bucket_of(task.key.slice.start_micros);
             while bucket < task.key.slice.end_micros {

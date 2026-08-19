@@ -2905,6 +2905,50 @@ fn sort_backfill_uris_newest_first(uris: &mut [String]) {
 
 type TantivyBackfillWork = (String, String, String); // project, relative parquet, absolute URI
 
+/// A file's decoded contribution to a slice, scaled by the share of its own
+/// time span the slice covers.
+///
+/// Counting the WHOLE file for any file that merely overlaps is what made
+/// splitting a no-op. Maintenance files are written sorted by timestamp with
+/// row-group statistics, so a ten-minute slice of a day-spanning file decodes
+/// about 1/144 of it after row-group pruning — but the estimate said 144/144,
+/// identical to a day-wide slice's. `split_time_task` then bisected a day that
+/// "did not fit" into halves that estimated exactly the same, and again, all the
+/// way to `MIN_SLICE_MICROS`: ~144 units per (project, date) that each still
+/// claimed — and read — the whole day.
+///
+/// Prod 2026-08-19 measured the end state: `pending_base_rollup = 85,503` flat
+/// against a real 260 (project, date) cells, BaseRollup completing ~1.1
+/// units/min, and the coarsening pass reporting `fused=0 candidates=257,535
+/// blocked=249,786 over_budget=7,749` — nothing could ever fuse back.
+///
+/// Bounds, both load-bearing: a file with no usable timestamp bounds keeps its
+/// full weight (unknown must never estimate cheap), and the fraction is clamped
+/// to at least one row group's worth so a narrow slice is never estimated as
+/// free — parquet cannot prune below a row group.
+/// Row groups a file of this size plausibly has, for the pruning floor above.
+/// Parquet cannot prune below one row group, so the share can never be finer.
+/// Deliberately conservative: too FEW row groups makes the floor larger, which
+/// over-estimates, which is the safe direction.
+fn estimated_row_groups(size_bytes: i64) -> u64 {
+    const TARGET_ROW_GROUP_BYTES: i64 = 128 * 1024 * 1024;
+    u64::try_from(size_bytes.max(0).div_euclid(TARGET_ROW_GROUP_BYTES).max(1)).unwrap_or(1)
+}
+
+fn slice_share_of_file(file_min: Option<i64>, file_max: Option<i64>, slice: crate::maintenance_coordinator::TimeSlice, row_groups: u64) -> (u64, u64) {
+    let (Some(min), Some(max)) = (file_min, file_max) else { return (1, 1) };
+    let span = max.saturating_sub(min).saturating_add(1);
+    if span <= 0 {
+        return (1, 1);
+    }
+    let overlap = slice.end_micros.min(max.saturating_add(1)).saturating_sub(slice.start_micros.max(min));
+    if overlap <= 0 {
+        return (0, 1);
+    }
+    let floor = span.div_euclid(i64::try_from(row_groups.max(1)).unwrap_or(1)).max(1);
+    (u64::try_from(overlap.max(floor).min(span)).unwrap_or(1), u64::try_from(span).unwrap_or(1))
+}
+
 fn fair_tantivy_backfill_work(mut queues: Vec<(String, VecDeque<(String, String)>)>) -> Vec<TantivyBackfillWork> {
     // HashMap iteration is deliberately unstable. Pin project order so repair
     // is reproducible, then take one newest file from every project per round.
@@ -10436,17 +10480,22 @@ impl Database {
                 .filter_map(|file| {
                     #[allow(deprecated)]
                     let add = file.add_action();
-                    if let Ok(Some(stats)) = add.get_stats()
-                        && let (Some(min), Some(max)) = (
+                    let bounds = add.get_stats().ok().flatten().map(|stats| {
+                        (
                             stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
                             stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
                         )
+                    });
+                    let (min, max) = bounds.unwrap_or((None, None));
+                    if let (Some(min), Some(max)) = (min, max)
                         && (min >= key.slice.end_micros || max < key.slice.start_micros)
                     {
                         return None;
                     }
                     let decoded = u64::try_from(add.size.max(0)).unwrap_or(0).saturating_mul(12);
-                    Some(decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator))
+                    let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
+                    let (share, whole) = slice_share_of_file(min, max, key.slice, estimated_row_groups(add.size));
+                    Some(projected.saturating_mul(share).div_ceil(whole.max(1)))
                 })
                 .fold(0u64, u64::saturating_add)
         };
@@ -10695,7 +10744,20 @@ impl Database {
                     }
                 }
                 let decoded = u64::try_from(add.size.max(0)).unwrap_or(0).saturating_mul(12);
-                estimated = estimated.saturating_add(decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator));
+                let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
+                let (file_min, file_max) = add
+                    .get_stats()
+                    .ok()
+                    .flatten()
+                    .map(|stats| {
+                        (
+                            stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+                            stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+                        )
+                    })
+                    .unwrap_or((None, None));
+                let (share, whole) = slice_share_of_file(file_min, file_max, key.slice, estimated_row_groups(add.size));
+                estimated = estimated.saturating_add(projected.saturating_mul(share).div_ceil(whole.max(1)));
                 selected.push(path);
             }
             (snapshot, table.log_store(), selected, estimated)
@@ -23274,6 +23336,42 @@ mod tests {
         } else {
             panic!("Unsupported string array type: {:?}", array.data_type())
         }
+    }
+
+    /// A narrow slice of a day-spanning file must estimate a narrow share.
+    ///
+    /// The whole splitting mechanism assumes bisecting a unit halves its cost.
+    /// Counting every overlapping file whole broke that assumption: a ten-minute
+    /// slice of a day-spanning file estimated exactly what the day-wide slice
+    /// did, so `split_time_task` bisected to `MIN_SLICE_MICROS` and produced
+    /// ~144 units per (project, date) that each still claimed the whole day.
+    /// Prod 2026-08-19: `pending_base_rollup = 85,503` flat, BaseRollup
+    /// completing ~1.1 units/min, coarsening reporting `fused=0`.
+    #[test]
+    fn a_narrow_slice_estimates_a_narrow_share_of_a_day_spanning_file() {
+        use crate::maintenance_coordinator::TimeSlice;
+        const DAY: i64 = 86_400_000_000;
+        const TEN_MIN: i64 = 600_000_000;
+        let (file_min, file_max) = (0, DAY - 1);
+
+        let day = TimeSlice::new(0, DAY).expect("day slice");
+        assert_eq!(slice_share_of_file(Some(file_min), Some(file_max), day, 1), (DAY as u64, DAY as u64), "a day-wide slice takes the whole file");
+
+        // One row group, so the pruning floor is the whole file and the share
+        // cannot be finer — over-estimating is the safe direction.
+        let narrow = TimeSlice::new(0, TEN_MIN).expect("ten-minute slice");
+        assert_eq!(slice_share_of_file(Some(file_min), Some(file_max), narrow, 1), (DAY as u64, DAY as u64), "one row group cannot be pruned below");
+
+        // A realistically-chunked file prunes: the share collapses to roughly
+        // the slice's fraction of the day, which is what makes splitting work.
+        let (share, whole) = slice_share_of_file(Some(file_min), Some(file_max), narrow, 144);
+        assert!(share * 100 < whole, "a ten-minute slice must estimate well under 1% of a day-spanning file, got {share}/{whole}");
+
+        // Unknown bounds keep full weight — unknown must never estimate cheap.
+        assert_eq!(slice_share_of_file(None, None, narrow, 144), (1, 1));
+        // A disjoint file contributes nothing.
+        let after = TimeSlice::new(2 * DAY, 2 * DAY + TEN_MIN).expect("later slice");
+        assert_eq!(slice_share_of_file(Some(file_min), Some(file_max), after, 144).0, 0);
     }
 
     fn create_test_config(test_id: &str) -> Arc<AppConfig> {
