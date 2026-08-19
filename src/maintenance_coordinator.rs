@@ -428,6 +428,7 @@ impl TaskJournal {
     const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v3";
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
     const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v1";
+    const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -566,6 +567,41 @@ impl TaskJournal {
     /// operations the backfill mints. Frontier work is untouched, and
     /// SealedConsolidation/Repair are left alone because `plan_compaction_debt`
     /// already plans those day-sized.
+    /// Forget every stored byte estimate once, because they were all measured
+    /// with a broken ruler.
+    ///
+    /// Until `slice_share_of_file` the estimate counted whole files, so a
+    /// ten-minute child of a split day carried the WHOLE DAY's estimate — and
+    /// `coarsen_to_width` sums its members, so fusing 144 such children summed
+    /// 144 whole days and never fit. Prod 2026-08-19, immediately after the
+    /// estimate fix deployed:
+    ///
+    ///     subsumed=0 fused=0 candidates=266530 blocked=24 over_budget=266506
+    ///
+    /// `blocked` had collapsed from 249,786 to 24 — the superseded trap was
+    /// gone — and every single candidate was now refused on a number written
+    /// before the fix existed. A correction that only applies to new
+    /// measurements cannot repair a durable queue full of old ones.
+    ///
+    /// Zero is what a freshly minted unit already carries: the claim-time
+    /// preflight computes the real estimate and splits if it genuinely must, so
+    /// the worst case is one over-sized claim that immediately right-sizes
+    /// itself. That is strictly better than a queue that can never fuse.
+    pub fn clear_stale_estimates(&mut self) -> Option<usize> {
+        if self.snapshot.source_cursors.get(Self::STALE_ESTIMATE_MIGRATION).copied().unwrap_or_default() >= 1 {
+            return None;
+        }
+        let mut cleared = 0usize;
+        for task in self.snapshot.tasks.iter_mut().filter(|task| task.state != TaskState::Complete && task.estimated_decoded_bytes != 0) {
+            task.estimated_decoded_bytes = 0;
+            cleared += 1;
+        }
+        self.dirty_tasks.clear();
+        self.snapshot.source_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned(), 1);
+        self.dirty_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned());
+        Some(cleared)
+    }
+
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
         if self.snapshot.source_cursors.get(Self::COARSE_BACKFILL_MIGRATION).copied().unwrap_or_default() >= 1 {
             return None;
@@ -3158,6 +3194,42 @@ mod tests {
         // or a partition whose rollup is genuinely expensive — the one the 30d
         // goal needs most — would never gain coverage at all.
         assert_eq!(journal.claim_next(Operation::BaseRollup, 0, true).expect("quarantined work still runs").key, key);
+    }
+
+    /// The stale-estimate migration must run once, and must free fusion.
+    ///
+    /// Every stored estimate predating `slice_share_of_file` measured whole
+    /// files, so a ten-minute child of a split day carried the whole day's
+    /// number. `coarsen_to_width` sums its members, so 144 of them summed 144
+    /// whole days and could never fit. Prod 2026-08-19, right after the estimate
+    /// fix landed: `blocked=24 over_budget=266506` — the superseded trap gone
+    /// and every candidate refused on a number written before the fix existed.
+    #[test]
+    fn clearing_stale_estimates_runs_once_and_lets_a_split_day_fuse_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let day = 3 * DAY_MICROS;
+
+        // 144 children each carrying the WHOLE day's estimate, as a split under
+        // the old ruler produced.
+        for slot in 0..(DAY_MICROS / NORMAL_SLICE_MICROS) {
+            let start = day + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, MAX_DECODED_BYTES, 0);
+        }
+        assert_eq!(journal.coarsen_sealed_slices(now), 0, "summed stale estimates must refuse to fuse — that is the bug");
+
+        let cleared = journal.clear_stale_estimates().expect("first run migrates");
+        assert_eq!(cleared, 144, "every pending unit's estimate is suspect");
+        assert!(journal.clear_stale_estimates().is_none(), "the migration must not run twice");
+
+        assert!(journal.coarsen_sealed_slices(now) > 0, "with the stale numbers gone the day must fuse");
+        let widths = journal
+            .tasks()
+            .filter(|t| t.key.operation == Operation::BaseRollup && matches!(t.state, TaskState::Pending | TaskState::Retry))
+            .map(|t| t.key.slice.width())
+            .collect::<Vec<_>>();
+        assert_eq!(widths, vec![DAY_MICROS], "one day-wide unit should remain, got {widths:?}");
     }
 
     /// A day-wide unit must SUBSUME the ten-minute units inside it.

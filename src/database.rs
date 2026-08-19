@@ -4207,6 +4207,9 @@ impl Database {
                             let migrated = journal.migrate_derived_slices();
                             // One-shot: collapse the fine-grained sealed backfill
                             // so the coarse planner can re-derive it day-sized.
+                            if let Some(cleared) = journal.clear_stale_estimates() {
+                                info!(cleared, event = "maintenance_stale_estimates_cleared");
+                            }
                             let coarsened = journal.migrate_fine_grained_backfill(crate::support::now_micros()).unwrap_or_default();
                             if coarsened != 0 {
                                 info!(coarsened, event = "maintenance_coarse_backfill_migrated");
