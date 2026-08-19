@@ -10170,10 +10170,21 @@ impl Database {
             // sees no holes (suspect `partitions_of`); missing>0 with wanted=0
             // means the work is queued and the question is why it is not CLAIMED.
             // Those want opposite investigations and were indistinguishable.
+            // Pairs with the cell census: that one says whether the planner sees
+            // the holes, this one says why the work it already queued never runs.
+            let (derived_pending, derived_sealed, derived_unproven, derived_quarantined, derived_not_due) = {
+                let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.claimability_census(crate::maintenance_coordinator::Operation::DerivedRollup, crate::clock::now_micros())
+            };
             info!(
                 source,
                 cells_missing,
                 cells_wanted = want.len(),
+                derived_pending,
+                derived_sealed,
+                derived_unproven,
+                derived_quarantined,
+                derived_not_due,
                 cells_admitted = want.len().min(BACKFILL_PARTITIONS_PER_PASS),
                 defer_enqueue,
                 event = "rollup_backfill_census"

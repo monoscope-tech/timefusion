@@ -692,6 +692,38 @@ impl TaskJournal {
     ///
     /// The fact being recorded is a property of the DAY — "the tier this derives
     /// from is already built" — so it belongs on every task covering that day.
+    /// Why is queued work for `operation` not being claimed?
+    ///
+    /// Every counter this system has reports how much work EXISTS. None reports
+    /// why a task that exists is passed over, and `claim_next` decides that
+    /// inside filter predicates that leave no trace. That gap has now cost five
+    /// fixes shipped against wrong models of the queue (#186, #189, #190, #192,
+    /// #195), each individually correct.
+    ///
+    /// Returns `(pending, sealed, unproven, quarantined, not_yet_due)`, which
+    /// between them cover every reason `claim_next` skips a pending task.
+    ///
+    /// `unproven` counts `!base_tier_present` rather than calling
+    /// `dependencies_complete`, deliberately. That predicate is itself a scan of
+    /// the whole task set, so calling it per task would make this census O(n^2)
+    /// under the journal lock — ~900 x 55,000 every 60s on prod. The flag is the
+    /// actionable half anyway: for a historical derived unit it is exactly what
+    /// decides the dependency, and it is O(1).
+    pub fn claimability_census(&self, operation: Operation, now_micros: i64) -> (usize, usize, usize, usize, usize) {
+        let (mut pending, mut sealed, mut unproven, mut quarantined, mut not_due) = (0, 0, 0, 0, 0);
+        for task in self.snapshot.tasks.iter().filter(|task| task.key.operation == operation) {
+            if !matches!(task.state, TaskState::Pending | TaskState::Retry) {
+                continue;
+            }
+            pending += 1;
+            sealed += usize::from(!is_live_frontier(task.key.slice, now_micros));
+            unproven += usize::from(!task.base_tier_present);
+            quarantined += usize::from(task.attempts >= Self::QUARANTINE_ATTEMPTS);
+            not_due += usize::from(task.deadline_micros > now_micros);
+        }
+        (pending, sealed, unproven, quarantined, not_due)
+    }
+
     pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
         let mut proven = 0;
         for task in &mut self.snapshot.tasks {
@@ -2431,6 +2463,49 @@ mod tests {
         assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 1, "the proof lands on an existing task");
         assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 0, "and is idempotent");
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "the unit becomes claimable without being re-enqueued");
+    }
+
+    /// The claimability census must name each reason `claim_next` skips a task.
+    ///
+    /// Every counter in this system reports how much work EXISTS; none reported
+    /// why an existing task is passed over, and `claim_next` decides that inside
+    /// filter predicates that leave no trace. Five correct fixes shipped against
+    /// wrong models of the queue before this existed.
+    #[test]
+    fn the_claimability_census_separates_the_reasons_a_task_is_skipped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const HOUR: i64 = 3_600_000_000;
+        let now = 40 * 24 * HOUR;
+        let at = |project: &str, start: i64| TaskKey {
+            physical_table: "rollup_1h".to_owned(),
+            source: "source".to_owned(),
+            project_id: project.to_owned(),
+            slice: TimeSlice::new(start, start + HOUR).expect("slice"),
+            operation: Operation::DerivedRollup,
+        };
+
+        // Sealed and dependency-blocked: no completed BaseRollup covers it.
+        journal.enqueue(at("blocked", now - 10 * 24 * HOUR), 0, 1, 0);
+        // Sealed, proven, but not due yet.
+        let later = at("not_due", now - 10 * 24 * HOUR);
+        journal.enqueue(later.clone(), now + HOUR, 1, 0);
+        journal.prove_base_tier_for_day(&later, now - 10 * 24 * HOUR, now - 9 * 24 * HOUR);
+        // Sealed, proven, due, but has burned its attempts.
+        let doomed = at("doomed", now - 11 * 24 * HOUR);
+        journal.enqueue(doomed.clone(), 0, 1, 0);
+        journal.prove_base_tier_for_day(&doomed, now - 11 * 24 * HOUR, now - 10 * 24 * HOUR);
+        for _ in 0..TaskJournal::QUARANTINE_ATTEMPTS {
+            assert!(journal.mark_running(&doomed));
+            journal.retry(&doomed, "timed_out".to_owned(), 0);
+        }
+
+        let (pending, sealed, unproven, quarantined, not_due) = journal.claimability_census(Operation::DerivedRollup, now);
+        assert_eq!(pending, 3, "every pending derived task is counted");
+        assert_eq!(sealed, 3, "all three are older than the live frontier window");
+        assert_eq!(unproven, 1, "only the one without a base-tier proof is dependency-blocked");
+        assert_eq!(quarantined, 1, "only the one that burned its attempts is quarantined");
+        assert_eq!(not_due, 1, "only the one with a future deadline is not yet due");
     }
 
     /// The proof must reach the tasks that actually exist, at their own width.
