@@ -976,27 +976,18 @@ fn min_contiguous_days<'a>(
     (worst_days, worst, median)
 }
 
-/// Which declared tiers each candidate day is MISSING.
+/// Which declared tiers each candidate day is missing.
 ///
-/// The single set this replaced was subtracted per tier with
-/// `want.retain(|key| !covered.contains(key))`, which removes the days covered
-/// by ANY tier — the UNION — while the intent (stated in the comment above it)
-/// was the days not covered by EVERY tier, the INTERSECTION. A day present in
-/// the 1m tier but missing from the 1h tier was therefore dropped by the 1m
-/// pass and never enqueued, so the coarse tier could never be backfilled for a
-/// day the fine tier already had. Prod 2026-08-17: 1m held 22-32 days per
-/// project against 2-6 in 1h, and 1h only ever gained days 1m was also missing.
+/// The old code subtracted the union (days covered by any tier), but the intent is the
+/// intersection (days not covered by every tier). Returning which tiers are missing lets the
+/// caller enqueue only the absent tier: a derived tier reads the base tier, so a day missing
+/// only its derived tier needs no raw source scan or dedup.
 ///
-/// Returning WHICH tiers are missing, rather than just that one is, is what
-/// lets the caller enqueue only the absent tier: a derived tier reads the base
-/// TIER, so a day missing only its derived tier needs no raw source scan and no
-/// dedup at all.
 /// Does this file prove its partition holds no rows?
 ///
-/// Only an EXPLICIT zero counts. A file whose stats are missing is unknown, and
-/// unknown must read as non-empty: treating it as empty would re-plan work that
-/// is already done, forever, for every partition written before stats existed.
-/// The zero case is the one that needs acting on — see `partitions_of`.
+/// Only an explicit zero counts. Missing stats is unknown, and unknown must read as
+/// non-empty; treating it as empty would re-plan work that is already done forever. The zero
+/// case is the one to act on — see `partitions_of`.
 fn partition_file_is_empty(num_records: Option<i64>) -> bool {
     num_records == Some(0)
 }
@@ -1945,26 +1936,13 @@ struct StagedUnit {
 /// creates dangling Adds — the 2026-07-09 incident shape).
 const INCONCLUSIVE_COMMIT_MARKER: &str = "landing-unconfirmed";
 
-/// LAST-RESORT circuit breaker on a network await taken WHILE a per-table
-/// commit lock is held. That lock serializes every committer for one physical
-/// table (staged flush, coalesced flush, dedup waves, light-optimize waves), so
-/// a request that never returns pins the whole table at zero commit throughput
-/// (prod 2026-07-30 01:20–01:34: a dedup wave hung mid-commit and every other
-/// committer queued behind it).
+/// Last-resort circuit breaker on a network await taken while a per-table commit lock is held.
 ///
-/// It is NOT the mechanism that bounds commits — that is the commit-log request
-/// class (see `AwsConfig::log_request_timeout` and
-/// [`crate::storage::RequestClassRouter`]), which bounds each log
-/// request at 30s and the whole retry ladder at `RetryConfig::retry_timeout`
-/// (180s). Bounding at the client is strictly better because a timeout there is
-/// an ordinary commit error the landed-probe already classifies, while a
-/// timeout HERE abandons a future mid-flight and manufactures an unconfirmed
-/// landing (staged parquet must then be leaked rather than reclaimed).
-///
-/// So this fires only if a request escapes both client bounds — a bug or a
-/// pathological hang. 600s matches `CHECKPOINT_OP_TIMEOUT`; every firing is
-/// counted (`timefusion.commit.lock_timeouts`) and warned, and expected to be
-/// permanently zero.
+/// The lock serializes every committer for one physical table, so a hung request pins the
+/// whole table at zero commit throughput. This is NOT the primary commit timeout: per-request
+/// and retry-ladder bounds in the object-store client are strictly better, because timing out
+/// here abandons a future mid-flight and manufactures an unconfirmed landing. This fires only
+/// if a request escapes those bounds. 600s matches `CHECKPOINT_OP_TIMEOUT`.
 const COMMIT_LOCK_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A bounded in-guard commit await that did not succeed.
@@ -2639,27 +2617,13 @@ pub struct Database {
     /// `wave_bin_staged`) plus a hard ceiling should a future caller drive
     /// staging outside `round_robin_bins`' K.
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
-    /// Caps how many coordinator WORKERS may sit in debt work at once — dedup,
-    /// hot packing, sealed consolidation, repair — leaving the rest for the
-    /// rollup chain while coverage is short.
+    /// Cap how many coordinator workers may sit in debt work at once (dedup, hot packing,
+    /// sealed consolidation, repair), leaving the rest for the rollup chain while coverage is
+    /// short.
     ///
-    /// The other rewrite semaphores bound MEMORY. This one bounds OCCUPANCY,
-    /// which is a different and, as it turns out, the binding scarcity. Measured
-    /// 2026-08-18 over 45 minutes with the phase timing from #174:
-    ///
-    ///     BaseRollup/DerivedRollup   174 starts, NOT ONE over 60s
-    ///     HotPacking                 895s, 861s, 837s, 731s
-    ///     SealedConsolidation        767s, 729s, 294s
-    ///
-    /// Rollup units are cheap; debt units hold a worker for 12-15 minutes. With
-    /// 16 workers that is why `pending_base_rollup` sat at ~15,800 draining at
-    /// 2.6 starts/min: not because rollup is slow, but because every worker was
-    /// inside a quarter-hour file rewrite.
-    ///
-    /// It is also why #167 did nothing. That change gave the rollup chain 6 of
-    /// 10 ATTEMPTS, but a slot is consumed by wall clock: at seconds-per-rollup
-    /// against 850s-per-packing, attempt share and slot-time share are different
-    /// by two orders of magnitude.
+    /// The other rewrite semaphores bound memory; this one bounds occupancy, which turned out
+    /// to be the binding scarcity. Rollup units are cheap; debt units hold a worker for many
+    /// minutes, so filling all workers with debt starves rollup regardless of attempt share.
     maintenance_debt_slots: Arc<tokio::sync::Semaphore>,
     /// Cap workers inside units that have already timed out under
     /// `TaskJournal::QUARANTINE_ATTEMPTS`.
@@ -2977,28 +2941,15 @@ impl Database {
         storage_options
     }
 
-    /// Creates writer properties for a Delta write at a given compression tier.
+    /// Creates writer properties for a Delta write at a compression tier.
     ///
-    /// Tiered strategy: hot writes use level 3 (fast ingest);
-    /// `recompress_partition` rewrites older partitions at 9/15/19 to
-    /// maximize storage savings on
-    /// cold data. The chosen level is embedded in Parquet footer key-value
-    /// metadata (`timefusion.compression_tier`) so re-sweeps can skip files
-    /// already at the target tier.
-    ///
-    /// Encoding strategy per column:
-    /// - Timestamps/Date32, ints: `DELTA_BINARY_PACKED` (dict off for timestamps).
-    /// - Sorted-key Utf8 columns: `DELTA_BYTE_ARRAY` (delta-encoded, dict off) —
-    ///   excellent ratios on sorted ids/service names; harmless when only mostly
-    ///   sorted (still better than raw PLAIN).
-    /// - Other Utf8: default (dict on, auto-falls back to PLAIN at 8MB).
-    /// - Per-field `dictionary: false` opt-out for high-entropy free-text.
-    /// - Per-field `bloom_filter: true` opt-in for point-lookup columns
-    ///   (ids/trace_ids/span_ids); NDV scaled to row-group size.
-    ///
-    /// `declare_sorted`: pass `true` only from paths that sort rows by the
-    /// schema sort keys before writing (flush, dedup). Optimize/compact pass
-    /// `false`. See `build_writer_properties`.
+    /// Hot writes use zstd level 3 for fast ingest; cold rewrites use 9/15/19 for storage
+    /// savings. The chosen level is stored in footer metadata so re-sweeps can skip
+    /// already-target-tier files. Encoding is tuned per column: delta packing for
+    /// timestamps/ints, delta byte arrays for sorted strings, dictionary by default for other
+    /// strings with per-field opt-out, and bloom filters opt-in for point-lookup columns.
+    /// `declare_sorted` is `true` only for paths that sort rows by the schema's sort keys
+    /// (flush, dedup); optimize/compact pass `false`.
     fn create_writer_properties(&self, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
         build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted)
     }
@@ -5217,28 +5168,15 @@ impl Database {
         Ok(t)
     }
 
-    /// Seed `fast_resolve_cache` and (sticky-up only) `delta_has_files` from a
-    /// freshly-resolved Delta table handle. STICKY-TRUE INVARIANT: this only
-    /// ever flips `delta_has_files` false → true. If a prior flush callback
-    /// already observed files for `(project, table)`, or another task saw
-    /// version > 0 first, the snapshot we just loaded may still report
-    /// version == 0 (delta-rs caches state per handle and our update_state
-    /// scheduling is racy under load). Downgrading the bit here would let the
-    /// scan path skip Delta and silently hide rows. The default cell is
-    /// false-seeded; positive evidence (version > 0 or `mark_delta_has_files`)
-    /// is the only path to true.
+    /// Seed `fast_resolve_cache` and (sticky-up only) `delta_has_files` from a freshly-resolved
+    /// Delta table handle.
     ///
-    /// **Cold-start with pre-existing S3 data**: when this is the first
-    /// `resolve_table` call after process start AND there is pre-existing
-    /// data on S3 from a prior process, we rely on
-    /// `create_or_load_delta_table` calling `DeltaTableBuilder::load()`,
-    /// which populates the snapshot state from S3 inline. The handle
-    /// returned by `resolve_unified_table` / `resolve_custom_table` has its
-    /// `version()` already reflecting the on-S3 truth — so `has_files`
-    /// here is accurate and the bit is seeded true. Removing the synchronous
-    /// `.load()` in `create_or_load_delta_table` (e.g. switching to a lazy
-    /// loader) would reopen the staleness window described above and break
-    /// this seeding step; don't.
+    /// Sticky-true invariant: only flips `delta_has_files` false → true. Downgrading would skip
+    /// Delta and hide rows; positive evidence (`version > 0` or `mark_delta_has_files`) is the
+    /// only path to true. Cold-start with pre-existing S3 data relies on
+    /// `create_or_load_delta_table` calling `DeltaTableBuilder::load()` synchronously, so the
+    /// resolved handle already reflects S3 truth. A lazy loader would reopen that staleness
+    /// window and break this seeding.
     async fn populate_resolve_caches(&self, project_id: &str, table_name: &str, t: &Arc<RwLock<DeltaTable>>) {
         let key = table_key(project_id, table_name);
         let was_new = self.fast_resolve_cache.insert(key.clone(), Arc::clone(t)).is_none();
@@ -6382,27 +6320,15 @@ impl Database {
         pack_sort_partitions(self.pack_pool_bytes(), self.config.derived.max_light_optimize_k(), self.config.derived.cores)
     }
 
-    /// Its OWN pool (see `repair_pool_bytes`), deliberately SMALLER batches.
+    /// Repair batch size: deliberately smaller than packing's.
     ///
-    /// A repair bin is one whole file — prod's worst is 1,088,634,971 bytes,
-    /// which decodes to tens of GB of Arrow, spills many times, and then merges
-    /// those runs. `SortPreservingMergeExec` allocates per spill-run per batch,
-    /// so its ask scales with `batch_size` while a packing bin's (a handful of
-    /// small files, shallow merge) barely moves. Sharing 2048 with packing is
-    /// what made the merge ask 64.3 MB against 25.3 MB of headroom and fail:
-    ///
-    ///   Resources exhausted: Failed to allocate additional 64.3 MB for
-    ///   SortPreservingMergeExec[0] ... fair(pool_size: 22.5 GB)
-    ///
-    /// 256 is not a new number — it is what the MaintenanceCli budget profile
-    /// already uses, for exactly this reason ("a batch is the sort's
-    /// indivisible admission unit, and small pools must be able to admit one
-    /// before spilling can engage"). Trading scan throughput for an allocation
-    /// that fits is the right trade on a rewrite that otherwise never lands.
-    /// `partitions` comes from [`REPAIR_SORT_PARTITION_LADDER`]: a bin that
-    /// exhausted the pool is retried with fewer, because the unspillable
-    /// `SortPreservingMergeExec` is per-partition. Cached per parallelism —
-    /// there are three of them and repair runs one bin at a time.
+    /// A repair bin is one whole large file; `SortPreservingMergeExec` allocates per spill-run
+    /// per batch, so its ask scales with `batch_size`. Sharing 2048 with packing made the merge
+    /// ask exceed headroom. 256 matches the MaintenanceCli budget profile and lets the sort
+    /// admit one batch before spilling. `partitions` comes from
+    /// `REPAIR_SORT_PARTITION_LADDER`: a bin that exhausted the pool is retried with fewer
+    /// partitions because the unspillable merge operator is per-partition. Cached per
+    /// parallelism.
     fn repair_session_state(&self, partitions: usize) -> datafusion::execution::session_state::SessionState {
         self.repair_session_states
             .entry(partitions)
@@ -12371,25 +12297,12 @@ impl Database {
 
     /// Order one drain pass and split off the work it will not do.
     ///
-    /// NEWEST-FIRST: recent partitions are the ones queries actually read, so
-    /// dedup there pays immediately; ancient duplicates are already invisible
-    /// (read-side `DedupExec` collapses them) and only cost storage. Boot
-    /// 2026-07-30 drained a 10-day backlog oldest-first and spent its whole
-    /// life rewriting 2026-07-20 while the hot window stayed dirty.
-    ///
-    /// COLD BINS LAST, never dropped: a date owned by the nightly consolidate
-    /// (`date_is_cold`) is bin-packed by `consolidate_date_binned`, which is a
-    /// pure compaction (`OptimizeType::Compact`/`SortBy`) and does NOT collapse
-    /// duplicates — so this drain remains their only physical dedup. They sink
-    /// to lowest priority (drained only when no hot bin is waiting) and the
-    /// remainder is counted + summarized once per pass, never one line per bin.
-    /// (`cold_optimize_after_days` defaults to 1 and the drain already skips
-    /// today, so today that split degenerates to "everything is cold" and the
-    /// newest-first order alone protects the hot window; the tier stays wired to
-    /// `date_is_cold` so raising the setting does the right thing.)
-    ///
-    /// Returns `(ready, deferred_cold)`; `deferred_cold` stays on the queue.
-    /// Dates are ISO-8601, so lexicographic order is chronological.
+    /// Newest-first: recent partitions are the ones queries read, so dedup there pays
+    /// immediately. Cold bins (owned by nightly consolidate, `date_is_cold`) go last and are
+    /// never dropped: `consolidate_date_binned` is pure compaction and does not collapse
+    /// duplicates, so this drain is their only physical dedup. They sink to lowest priority and
+    /// are counted/summarised once per pass. Returns `(ready, deferred_cold)`; `deferred_cold`
+    /// stays on the queue.
     fn select_drain_bins(mut candidates: Vec<DrainBin>, today: chrono::NaiveDate, after_days: u64, batch: usize) -> (Vec<DrainBin>, Vec<DrainBin>) {
         candidates.sort_by(|a, b| (&b.1, b.2).cmp(&(&a.1, a.2)));
         // An unparseable date sorts cold: it can't be shown to be hot, and the
@@ -14315,27 +14228,15 @@ impl Database {
         }
     }
 
-    /// RESUME a repair bin that a previous attempt already WROTE: return its
-    /// staged output as a ready [`StagedBin`] instead of spending another 40+
-    /// minutes rewriting the same file. A footer-repair bin is one 700MB-1GiB
-    /// whole-file rewrite, so a deploy — or the healthcheck replacing the swarm
-    /// task — used to discard the whole thing and make the next pass start over
-    /// (prod 2026-08-08 lost two passes in one morning). Loss is now bounded to
-    /// the bytes not yet written.
+    /// Resume a repair bin that a previous attempt already wrote.
     ///
-    /// Hooked at bin SELECTION rather than at boot, keyed on "an intent whose
-    /// inputs are exactly the bin we were about to stage". The restart case then
-    /// falls out for free — selection is deterministic given the snapshot, so
-    /// the first pass after a restart re-selects the killed pass's files — and
-    /// the same lookup also covers a stage whose commit lost an OCC race inside
-    /// one process. Returning a `StagedBin` means there is no second COMMIT path
-    /// either: `commit_wave` lands it with the same lock, flush priority,
-    /// liveness re-check and OCC ladder, and clears the intent on success.
-    ///
-    /// `None` is always safe: the caller stages normally, and the declined
-    /// entry's parquet falls to the boot-time reconcile / VACUUM. Staged parquet
-    /// is invisible to readers until the atomic commit, so the only thing these
-    /// checks stand in front of is a bad COMMIT.
+    /// Returns the staged output as a `StagedBin` instead of spending another 40+ minutes
+    /// rewriting the same file. Hooked at bin selection, keyed on an intent whose inputs exactly
+    /// match the bin we were about to stage. The restart case falls out for free because
+    /// selection is deterministic given the snapshot, and the same lookup covers a stage whose
+    /// commit lost an OCC race. `commit_wave` lands it with the same lock, flush priority, liveness
+    /// re-check and OCC ladder. `None` is always safe: the caller stages normally, and the
+    /// declined entry's parquet falls to boot-time reconcile / VACUUM.
     async fn resumable_staged_bin(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, files: &[String]) -> Option<StagedBin> {
         use deltalake::kernel::Action;
         use object_store::{ObjectStoreExt, path::Path as OsPath};
@@ -16274,29 +16175,15 @@ fn host_mem_available_bytes() -> Option<u64> {
 /// the newest candidate; the cap is load-bearing under frequent deploys.
 const REPAIR_RESELECT_ROUNDS: usize = 64;
 
-/// Wave cap for one tail pass. A wave serves each project at most one bin, so
-/// this is also the per-project file ceiling for the whole pass.
+/// Wave cap for one tail pass. A wave serves each project at most one bin, so this is also
+/// the per-project file ceiling.
 ///
-/// Packing keeps 12: its bins are minutes apart on TODAY's partition, it runs
-/// every few minutes, and a pack tick that never ends holds the light pool
-/// against the next flush.
-///
-/// Repair must NOT: its cap and its budget were describing different passes.
-/// `TIMEFUSION_FOOTER_REPAIR_BUDGET_SECS` is 8640s (2h24m) precisely so one pass
-/// can chew through a backlog, but 12 waves cap that pass at 12 files per
-/// project no matter how much of the budget is left — so a project with a large
-/// backlog converges at 12 files per PASS, i.e. per hour.
-///
-/// Measured, prod 2026-08-10: the whale (87576849) holds **663 footer-less files
-/// across 07-13 and 07-20..08-01** (486 GB). At 12 files/pass that is 56
-/// uninterrupted hourly passes — and process lifetime under deploy churn was
-/// 18-21 minutes on 2026-08-09, so in practice it never converges at all. One
-/// footer-less file voids the declared ordering for EVERY query window reaching
-/// its date, so the tenant stays on `full-set` dedup the entire time.
-///
-/// The deadline and the memory brake are the real bounds and both are already
-/// enforced every round inside `round_robin_bins`, so this only has to stop a
-/// runaway loop, not ration the budget.
+/// Packing keeps 12: bins are minutes apart on `today` and run frequently; a never-ending
+/// pack tick would hold the light pool against the next flush. Repair uses a much larger cap
+/// because its 8640s budget is meant to chew through a backlog; capping it at 12 files per
+/// pass would make a large backlog converge at only 12 files per hour and fail to outrun
+/// deploy churn. The real bounds are the deadline and memory brake enforced inside
+/// `round_robin_bins`; this constant only stops a runaway loop.
 const fn max_waves(pass: TailPass) -> usize {
     match pass {
         TailPass::Pack => 12,
@@ -16585,28 +16472,14 @@ pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) ->
 /// *consistently* impossible file is parked.
 const REPAIR_QUARANTINE_AFTER: u32 = 3;
 
-/// Sort parallelism a repair bin is retried at, in order, before its pool
-/// exhaustion is believed.
+/// Sort parallelism ladder a repair bin is retried at before its pool exhaustion is believed.
 ///
-/// `REPAIR_SORT_PARTITIONS` (16) is the fast setting, and the quarantine rule
-/// below used to treat one `Resources exhausted` at that setting as proof the
-/// file is impossible: "the working set of a whole-file sort is a function of
-/// the file's size and the pool's, so it recurs on every attempt". That premise
-/// is incomplete. The working set is *also* a function of parallelism, and
-/// parallelism is ours to choose — there is one `ExternalSorterMerge` PER
-/// PARTITION and it cannot spill, so 16 partitions means 16 unspillable merges
-/// competing for the same pool. A single-partition sort has no merge exec at
-/// all and spills within its fair share; `sort_flush_group` already made
-/// exactly this trade (2026-08-03) for exactly this reason.
-///
-/// So an exhaustion at 16 says nothing about 1. Prod 2026-08-09 quarantined
-/// five files this way — monoscope-self `date=2026-08-01` (which alone breaks
-/// every >8-day dashboard for that tenant with `mode=full` dedup), plus
-/// 98fdd4f3 `07-08`, 6297304f `07-08`, edb04135 `07-04` and be87ebc1 `07-02` —
-/// each after ONE failure, having never been tried at a parallelism that fits.
-///
-/// Descending, and the last entry is the floor: exhaustion THERE is believed,
-/// because there is nothing cheaper left to try.
+/// `REPAIR_SORT_PARTITIONS` (16) is the fast setting, but exhaustion there used to be treated
+/// as proof a file is impossible. The working set is a function of both file size and
+/// parallelism: each partition has an unspillable merge operator, so 16 partitions means 16
+/// unspillable merges competing for the pool. A single-partition sort has no merge and spills
+/// within its fair share. Exhaustion at 16 says nothing about 1, so the ladder descends
+/// through 16, 4, 1. Exhaustion at the floor is believed.
 const REPAIR_SORT_PARTITION_LADDER: [usize; 3] = [REPAIR_SORT_PARTITIONS, 4, 1];
 
 /// What a failed repair staging costs the candidate: the parallelism to retry
@@ -17007,19 +16880,15 @@ enum BinOutcome<T> {
     Retry,
 }
 
-/// Parallelism for ONE packing sort. Two independent budgets, whichever binds:
+/// Parallelism for one packing sort, bound by the tighter of two independent limits.
 ///
-/// * memory — `k` concurrent bins may spend at most a quarter of the pack pool
-///   on up-front reservations, which are UNSPILLABLE;
-/// * CPU — the `k` bins together may use at most half the box, leaving the rest
-///   for the read path (packing runs continuously, so this is a standing cost).
+/// * Memory: `k` concurrent bins may spend at most a quarter of the pack pool on
+///   unspillable up-front reservations.
+/// * CPU: `k` bins together may use at most half the box, leaving the rest for reads.
 ///
-/// Never below `MAINTENANCE_MAX_PARTITIONS`: this only ever LIFTS that cap,
-/// which is sized for the heavy path's 8 sibling sorters on a shared pool.
-///
-/// Derived rather than pinned because both terms move with the box. A width
-/// that is comfortable on prod's 7.5 GB / 48-core profile hands most of a small
-/// box's pool to reservations before a single row is sorted.
+/// Never below `MAINTENANCE_MAX_PARTITIONS`; this only lifts that cap. Derived from the box
+/// profile rather than pinned, because a fixed width that fits a large box would consume most
+/// of a small box's pool before sorting a single row.
 fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize {
     /// `maintenance_session_config`'s `sort_spill_reservation_bytes`.
     const DEFAULT_RESERVATION_BYTES: usize = 33_554_432;
@@ -17869,33 +17738,18 @@ impl ProjectRoutingTable {
         Ok(plans)
     }
 
-    /// Delta-only scan shared by `scan()`'s two Delta-alone callers: no
-    /// buffered layer configured, and "nothing above Delta" (mem ∪ hot legs
-    /// both empty). Re-derives `skip_dedup` against the RESOLVED table so the
-    /// fingerprint verdict applies to the exact snapshot being read (the
-    /// `pre_skip_dedup` passed in was decided above the projection, before
-    /// any table was resolved). When granted, restores the pushed `limit` —
-    /// sound only because nothing above a Delta-only scan drops rows unless
-    /// the tombstone filter does.
+    /// Delta-only scan shared by `scan()`'s two Delta-alone callers.
     ///
-    /// No `output_projection.is_none()` conjunct: it stood in for "the keys
-    /// are still in the scan", which is now unconditionally true. It also
-    /// never meant what it said — the TOMBSTONE marker alone turns
-    /// `output_projection` `Some`, so on any table declaring both
-    /// (otel_logs_and_spans declares both) it silently revoked every skip it
-    /// was supposed to allow.
+    /// Re-derives `skip_dedup` against the resolved table so the fingerprint verdict applies to
+    /// the exact snapshot being read. When granted, restores the pushed `limit` — sound
+    /// because nothing above a Delta-only scan drops rows except the tombstone filter.
     ///
-    /// `readmit_mutable_filters` controls whether a granted skip also
-    /// re-admits, from `unstripped_filters`, the version-mutable-column
-    /// predicates the leg-safety strip removed upstream: sound here because
-    /// `dedup_skip_allowed` is never granted while the MemBuffer leg is in
-    /// play, and MemBuffer is exactly where uncertified versions live. The
-    /// no-buffered-layer caller has no MemBuffer leg ever and passes `true`;
-    /// the "nothing above Delta" caller passes `false`, preserving that
-    /// branch's existing behavior of leaving `delta_only_filters` unextended.
-    ///
-    /// Returns `(skip_dedup, plans)` — the caller still owns `tag_shape` (the
-    /// scan-local `ScanShape` mutex) and `wrap_result`.
+    /// The old `output_projection.is_none()` check never meant what it said: the tombstone
+    /// marker alone makes `output_projection` `Some`, so it silently revoked every skip it
+    /// should have allowed. `readmit_mutable_filters` decides whether a granted skip also
+    /// re-admits version-mutable-column predicates removed upstream; safe because a granted
+    /// skip means no MemBuffer leg is in play. The no-buffered-layer caller passes `true`; the
+    /// "nothing above Delta" caller passes `false`. Returns `(skip_dedup, plans)`.
     #[allow(clippy::too_many_arguments)]
     async fn scan_delta_only(
         &self, state: &dyn Session, projection: Option<&Vec<usize>>, optimized_filters: &[Expr], unstripped_filters: &[Expr], project_id: &str,
