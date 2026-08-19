@@ -2190,3 +2190,77 @@ Measured on live counters, and independent of the journal-durability bug:
 
 Not established, and gated on the durability fix landing: that the queue is
 smaller. It is not, yet.
+
+---
+
+# Part VII — durable at last (2026-08-19)
+
+## 43. The collapse, verified against disk this time
+
+    pending_base_rollup   88,618 -> 10,296
+    journal on disk       84,734,124 -> 48,308,694 bytes   (173,901 -> 98,141 records)
+    coarsening            over_budget 266,506 -> 0
+    task completions      0.17/min -> ~6/min
+    claims                3.4/min -> ~18/min   (BaseRollup 1.1 -> ~10)
+
+The file shrinking is the proof §38 was missing. The gauge said the same thing an
+hour earlier and was wrong; the byte count cannot be.
+
+Current steady state is `candidates=27,323 blocked=27,323 fused=0 over_budget=0`,
+with subsume removing ~220/min. That is correct, not stuck: every candidate sits
+under a wider pending unit, so fusing there would duplicate claimed work and
+subsume is the mechanism that drains it. ~2 h to converge.
+
+## 44. Persisting facts instead of intentions
+
+Two changes, one principle.
+
+**`JournalRecord::Removed(key)`.** The WAL was upsert-only, so a pass that removed
+tasks could persist its work only by rewriting the whole 84 MB snapshot, and any
+caller that forgot lost the removal silently. Four call sites hand-rolled
+`tasks.retain(..)` plus an index rebuild and none recorded anything; they now go
+through `retain_tasks`, which records the tombstones. **Forgetting is no longer
+possible because there is nothing left to remember.** The 60 s pass returns to the
+cheap append; migrations keep `compact`.
+
+A real bug surfaced writing the test: `enqueue` does not route through `upsert`,
+so a key removed and re-created in the same window kept its tombstone — and
+`coarsen_to_width` does exactly that, dropping a bucket's members and writing a
+fused unit over the same span. It would have deleted the unit it exists to create.
+
+**HotPacking and SealedConsolidation are no longer persisted.**
+`plan_compaction_debt` derives them from a real file scan every 60 s, so the scan
+is authoritative and a durable copy can only go stale — which is precisely what
+produced `pending_sealed_consolidation = 2,218` against an audit finding 877 of
+1,033 partitions already compliant. Repair stays durable: day-wide rewrites that
+stage output before committing, which is what `TIMEFUSION_REPAIR_RESUME_ENABLED`
+resumes against.
+
+The rollup tier already got this right by tagging its own `Add` actions —
+`recover_rollup_coverage` restored 8,254 slices at boot today. **Persist the fact
+in the data; derive the intent.**
+
+## 45. Sized against the real journal, not against intuition
+
+Expected hygiene to be the bulk of the journal. It is 8,251 of 173,901 records —
+**4.7%**. The dominant term is 150,192 base-rollup records, roughly **63,000 of
+them `Complete`** and kept forever, largely duplicating coverage already provable
+from the identity tags.
+
+Retiring those is the next and much larger step in this direction, and it is
+deliberately NOT shipped: `dependencies_complete` reads them, so it needs tag
+coverage proven sufficient to stand alone before the fallback is deleted.
+
+## 46. What remains for the 30-day goal
+
+`rollup_min_contiguous_days = 2` against 30, and
+`dedup_denied_never_certified_pct = 100`. Both were gated on the queue draining
+and are now reachable rather than buried: **255 day-wide Dedup units are pending**,
+which is exactly what §30's certification path requires.
+
+The remaining risk is the one named in §30 — certification needs an *unmoved* file
+set, so a partition still being compacted cannot certify. shipbubble has 6 of 14
+sealed days at 10–384 files. Compaction and certification are one chain, and the
+compaction dashboard shows 08-13 frozen at 167 files for a fifth day on the
+newest-first ordering that #199 already fixed for rollups and never for hygiene.
+That ordering fix is the smallest remaining unblocked item.
