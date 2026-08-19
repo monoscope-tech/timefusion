@@ -1689,6 +1689,66 @@ Remaining queues are `pending_dedup` (14,816) and `pending_base_rollup` (65,934)
 both dominated by self-replenishing frontier work — see §19, which is the
 frontier unit model and the last structural item.
 
+## 21e. The derived tier is not blocked — it is correctly waiting
+
+#205's probe ended a four-fix guessing streak in one reading:
+
+```
+derived_pending=621  derived_sealed=401  derived_quarantined=0  derived_not_due=480
+derived_refusal="dependencies:87576849:2026-08-10"
+```
+
+`dependencies_complete` is refusing the whale's 1h unit for 2026-08-10 — **and it
+is right to**. The whale's 1m BASE tier genuinely lacks that day:
+
+```
+whale 1m tier:  08-05 08-06 08-09 08-11 08-12 08-13 …   (no 08-07, 08-08, 08-10)
+whale 1h tier:  08-13 08-14 08-15 …
+```
+
+You cannot derive an hour tier from a minute tier that does not exist. **The
+derived tier is not blocked by a defect; it is waiting on the base tier**, which
+is the correct behaviour and which four consecutive fixes (#197, #199, #202,
+#204) were each trying to force past. Every one of them was a real bug —
+`derived_quarantined` is now 0, `base_tier_ready` accumulates correctly, holes
+outrank re-derives — but none could have produced a sealed derived claim,
+because the thing they were unblocking was legitimately not ready.
+
+**Restating the remaining work honestly:** it is BASE rollup backfill, the
+expensive raw-scan kind, for the ~260 cells the census counts. The derived tier
+then follows almost for free, since it reads the built base tier.
+
+And that work has started. Base rollup claims over 12 minutes:
+
+```
+12 × DAY-wide  2026-08-18     sealed backfill
+ 6 × 10-minute 2026-08-10     history, reached for the first time
+```
+
+The 08-10 claims are #203's aging working — old days are finally being served.
+But note the **granularity**: 10-minute slices, not day units. A day rebuilt at
+frontier granularity is ~144 units instead of one, which is the enumerated-unit
+problem of §16.1 showing up in the backfill path. `coarsen_sealed_slices` exists
+for exactly this and is collapsing thousands of slices per pass, so these are
+most likely freshly re-invalidated rather than un-coarsened — worth confirming
+before treating it as a defect.
+
+**What this changes about the goal.** "Every historical backlog caught up" now
+decomposes cleanly:
+
+| class | state |
+|---|---|
+| live frontier | **caught up** (lag 0) |
+| hot packing | **caught up** (2,654 → 73) |
+| sealed consolidation | **caught up** (2,218 → 266) |
+| base rollup (history) | genuine compute, now running and correctly ordered |
+| derived rollup | waiting on base, correctly |
+| dedup / repair / tantivy | still outnumbered by frontier — §19 |
+
+Nothing in the first three rows is a queue any more. What remains is arithmetic:
+raw scans over ~260 partition-days, plus the frontier unit model (§19) which is
+what keeps dedup and repair outnumbered.
+
 ## 22. Ordering, and the one-line rationale for it
 
 1. **A** (local loop) — because every estimate below is currently a projection.
