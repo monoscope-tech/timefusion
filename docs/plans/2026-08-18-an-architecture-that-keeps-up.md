@@ -1006,6 +1006,32 @@ no behaviour and cost one deploy; it then resolved in a single pass a question
 that four behavioural fixes had each answered wrongly. When consecutive correct
 fixes produce no effect, the next change should be a measurement, not a fifth fix.
 
+### State at 04:30 UTC — frontier caught up, historical backfill still blocked
+
+**Frontier: DONE.** `eligible_watermark_lag_seconds` = 0 and stable for hours.
+New data is processed in real time; that half of "keeps up" is achieved.
+
+**Historical backfill: still blocked, cause now narrowed to one question.**
+#195 (day-scoped proof) did not unblock it either: over 20 minutes, zero
+`derived_base_tier_proven` events and every derived claim was a frontier hour
+for today. The census pair now in place answers the remaining question directly —
+#194 said the planner SEES all 475 missing cells and all are already queued;
+#196 reports, of the pending derived tasks, how many are unproven vs quarantined
+vs not-yet-due vs sealed. One of those four is the answer.
+
+**Scope, correctly stated.** The work left for the 30d goal is **475
+(project, date) cells** — 260 `otel_logs_and_spans` + 215 `otel_metrics` — NOT
+the 80,098 `tasks_pending`. That queue is dominated by self-replenishing frontier
+work and has gone 47k -> 55k -> 61k while the system got healthier; reading it as
+a backlog to drain is what produced two wrong throughput models earlier in this
+plan. **Never quote `tasks_pending` as remaining work.**
+
+**Estimate, labelled as such:** derived cells are cheap (they read the built 1m
+tier, no raw scan), so ~2-4h once claiming is fixed; shipbubble needs ~15 base
+day-units at ~800s on top, so 4-8h and it lands last. These are projections from
+unit cost — historical derived units have never once run, so there is no measured
+rate to quote yet.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
