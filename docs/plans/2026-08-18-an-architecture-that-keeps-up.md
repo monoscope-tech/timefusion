@@ -2104,3 +2104,89 @@ follow-up pass to finish (module renames since, `claim_next` arity, the
 `base_tier_present` field). Worth finishing: it is the only measured fix for
 restart-driven queue growth, and `sim` replaces 18-minute deploy cycles with
 seconds.
+
+---
+
+# Part VI — the collapse that never happened (2026-08-19)
+
+## 38. Retraction
+
+§33–35 fixed the estimate, the superseded trap and the stale stored numbers, and
+prod reported the result:
+
+    pending_base_rollup   88,618 -> 2,294        (-97%)
+    coarsening   candidates=266,530 blocked=249,786  ->  candidates=76 blocked=6
+
+Both were true of memory and false of the world. `checkpoint()` appends
+`dirty_tasks` to a WAL and `JournalRecord::Task` is an UPSERT — **there is no
+record meaning "this task is gone"**. Every pass that removed tasks wrote
+nothing. The next deploy restored 81k, and the on-disk journal was still
+byte-identical at 84,734,124 bytes with all 173,901 tasks.
+
+`compact()` exists for this and says so: *"Migrations that remove tasks cannot
+represent those deletions as append-only WAL records, so they must force this
+compaction."* Only the one-shot migrations obeyed it. The recurring pass added in
+§29 did not, and on a process that restarts several times a day an in-memory
+collapse never happened at all.
+
+## 39. A migration that outlived its own effect
+
+Worse, and found immediately after. `clear_stale_estimates` (v1) rewrote 85,047
+estimates in memory and persisted only its **cursor** — `checkpoint` does write
+dirty cursors. So the marker said "done" while the effect was discarded, and the
+migration could never retry: prod returned from the next restart with
+`over_budget=52,178` and nothing left that could clear it.
+
+**Rule worth more than the fix: a migration must never record its completion
+more durably than its effect.** If it can, a partial write becomes a permanent
+no-op that also disables its own retry. Key bumped to v2.
+
+## 40. How to verify a queue actually changed
+
+The gauges in `timefusion_stats` report the state of MEMORY. The journal on disk
+is the state of the world, and it is fetchable read-only without a shell in the
+distroless image and without writing to the host:
+
+```bash
+ssh ubuntu@captain.s.past3.tech \
+  'docker cp $(docker ps -q -f name=srv-captain--timefusion):/app/data/timefusion/.timefusion_meta/maintenance_tasks.json - \
+   | tar -xO' > journal.json
+```
+
+84 MB, 173,901 tasks, and it answers questions no counter can. It is what
+produced §41 — and a byte-identical file after a reported collapse is a complete
+diagnosis on its own.
+
+## 41. The width histogram, from the real journal
+
+    base_rollup pending, by slice width        distinct (project, table, day) cells
+       3 min   31,972                            repair                498
+       1 min   26,109   <- MIN_SLICE_MICROS      dedup                 256
+       2 min   22,298                            base_rollup           204
+       5 min    3,335                            sealed_consolidation  128
+      10 min    1,812   <- the mint width        derived_rollup        110
+       6 min    1,331                            hot_packing            56
+
+    base_rollup pending carrying a stale nonzero estimate:  85,047
+                                     with zero estimate:     1,927
+
+87,000 units over 204 cells — **427 per cell** — with the bulk *below* the
+ten-minute mint width, so they can only be split descendants. Eleven bisections
+deep: 1440 → 720 → … → 1. This is §34 measured rather than argued.
+
+Note also that `repair` has more real cells (498) than base rollup (204), and its
+units are day-wide 12–15 minute rewrites. Worker occupancy pressure comes from
+there, not from rollup.
+
+## 42. What is actually established
+
+Measured on live counters, and independent of the journal-durability bug:
+
+- The estimate fix works: completions **0.17/min → ~6/min**, sustained over two
+  clean same-process intervals; rollup output 2.19M rows on a 40-minute process
+  against 62k in a comparable earlier window.
+- Removing the superseded trap works: `blocked` 249,786 → 24.
+- Subsume works where a wider live unit exists: `pending_dedup` 14,519 → 3,753.
+
+Not established, and gated on the durability fix landing: that the queue is
+smaller. It is not, yet.
