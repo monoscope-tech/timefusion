@@ -14383,11 +14383,17 @@ impl Database {
             let target_schema = writer.arrow_schema();
             let mut rows_staged = 0usize;
             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
+            // Coverage identity to carry onto the outputs, when every input
+            // agrees on ALL of it. See `carried_coverage_tags`.
+            let carried = carried_coverage_tags(&targets);
             let tag_sorted = |mut add: deltalake::kernel::Add| {
                 // Tag the output so the next tick's selection treats it as a
                 // sorted run (folded only while under the sorted-run cap).
                 if sorted {
                     add.tags.get_or_insert_with(Default::default).insert(SORTED_RUN_TAG.to_string(), Some("true".to_string()));
+                }
+                if !carried.is_empty() {
+                    add.tags.get_or_insert_with(Default::default).extend(carried.iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
                 }
                 Action::Add(add)
             };
@@ -17068,6 +17074,44 @@ const REPAIR_VERIFIED_PERSIST_CAP: usize = 200_000;
 const COORDINATOR_L0_SORT_TARGET_BYTES: i64 = 16 * 1024 * 1024;
 
 const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
+
+/// The `timefusion.*` coverage identity to carry from a rewrite's inputs onto its
+/// outputs — but only when EVERY input agrees on every one of them.
+///
+/// A rewrite output is a new file, and `tag_sorted` used to give it the sorted-run
+/// tag and nothing else. That silently destroyed the coverage identity of rollup
+/// tier files: `recover_rollup_coverage` re-derives coverage from exactly these
+/// tags, so a consolidated tier partition stopped being recoverable from storage.
+/// Measured 2026-08-19 on prod, the counts are disjoint — 998 of 1,055 1m-tier
+/// files carry the six tags and 57 carry only `delta-rs.optimize.sort_by`
+/// (471 + 41 of 512 in the 1h tier). The interaction is perverse: the more
+/// successful compaction is, the more coverage it erases.
+///
+/// **Identical-only, never a union.** Merging files whose slices differ and
+/// tagging the output with their span would claim coverage of any gap between
+/// them — the silent-wrong-number failure. And it would not even help:
+/// `rollup_slice_complete` matches `task.key.slice == slice` EXACTLY, so a
+/// unioned slice finds no completed task and is discarded by recovery anyway.
+///
+/// What this does restore is the case that actually occurs: one publication cut
+/// into several files by `timefusion_writer_max_file_bytes`. Those files share
+/// every tag, so the merged output carries the same slice, matches the same
+/// completed task, and recovers.
+fn carried_coverage_tags(targets: &[deltalake::kernel::Add]) -> HashMap<String, String> {
+    use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
+    const COVERAGE_TAGS: [&str; 6] = [TAG_SOURCE, TAG_PROJECT, TAG_SLICE_START, TAG_SLICE_END, TAG_SOURCE_FINGERPRINT, TAG_GENERATION];
+    let Some(first) = targets.first() else { return HashMap::new() };
+    let value = |add: &deltalake::kernel::Add, tag: &str| add.tags.as_ref().and_then(|tags| tags.get(tag).cloned().flatten());
+    let mut carried = HashMap::new();
+    for tag in COVERAGE_TAGS {
+        let Some(expected) = value(first, tag) else { return HashMap::new() };
+        if targets.iter().any(|add| value(add, tag).as_deref() != Some(expected.as_str())) {
+            return HashMap::new();
+        }
+        carried.insert(tag.to_owned(), expected);
+    }
+    carried
+}
 
 fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
     tags.get(SORTED_RUN_TAG).is_some_and(|v| v.as_deref() == Some("true"))
@@ -21124,6 +21168,59 @@ mod tests {
         assert!((1..64).all(|jobs| others(jobs) <= others(jobs + 1)));
         // And the reserve never grows to swallow the pool.
         assert!((3..64).all(|jobs| others(jobs) >= jobs - 2));
+    }
+
+    /// A rewrite must carry coverage identity forward — and must NEVER invent it.
+    ///
+    /// `tag_sorted` gave outputs the sorted-run tag and nothing else, which
+    /// destroyed the `timefusion.*` identity that `recover_rollup_coverage`
+    /// re-derives coverage from. Prod 2026-08-19: 998 of 1,055 1m-tier files
+    /// carry the six tags and 57 carry only `delta-rs.optimize.sort_by`, the
+    /// counts disjoint — so the more compaction succeeded, the more coverage it
+    /// erased.
+    ///
+    /// Identical-only is the whole safety argument. Unioning slices would claim
+    /// coverage of any gap between the inputs, and `rollup_slice_complete`
+    /// matches `task.key.slice == slice` EXACTLY, so a unioned slice would be
+    /// discarded by recovery regardless — all risk, no benefit.
+    #[test]
+    fn a_rewrite_carries_coverage_identity_only_when_every_input_agrees() {
+        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
+        let add = |slice_start: &str, generation: &str| {
+            let mut a = deltalake::kernel::Add {
+                path: format!("f{slice_start}.parquet"),
+                partition_values: Default::default(),
+                size: 1,
+                modification_time: 0,
+                data_change: true,
+                ..Default::default()
+            };
+            a.tags = Some(HashMap::from([
+                (TAG_SOURCE.to_owned(), Some("otel_logs_and_spans".to_owned())),
+                (TAG_PROJECT.to_owned(), Some("p".to_owned())),
+                (TAG_SLICE_START.to_owned(), Some(slice_start.to_owned())),
+                (TAG_SLICE_END.to_owned(), Some("86400000000".to_owned())),
+                (TAG_SOURCE_FINGERPRINT.to_owned(), Some("77".to_owned())),
+                (TAG_GENERATION.to_owned(), Some(generation.to_owned())),
+            ]));
+            a
+        };
+
+        // One publication cut into two files by the size limit: identical tags.
+        let carried = super::carried_coverage_tags(&[add("0", "g1"), add("0", "g1")]);
+        assert_eq!(carried.get(TAG_SLICE_START).map(String::as_str), Some("0"), "identical inputs carry their identity forward");
+        assert_eq!(carried.len(), 6, "all six coverage tags travel together or not at all");
+
+        // Different slices: the union would claim the gap between them.
+        assert!(super::carried_coverage_tags(&[add("0", "g1"), add("3600000000", "g1")]).is_empty(), "differing slices must NOT be merged into a span");
+        // Different generations: different source state, not one publication.
+        assert!(super::carried_coverage_tags(&[add("0", "g1"), add("0", "g2")]).is_empty(), "differing generations must not be conflated");
+        // An untagged input means the output's coverage is unknown.
+        let mut untagged = add("0", "g1");
+        untagged.tags = None;
+        assert!(super::carried_coverage_tags(&[add("0", "g1"), untagged]).is_empty(), "an untagged input makes the merged coverage unknowable");
+        // And nothing is invented from nothing.
+        assert!(super::carried_coverage_tags(&[]).is_empty());
     }
 
     /// Consolidation admits on SIZE. An untagged-but-large file is not debt.
