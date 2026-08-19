@@ -187,9 +187,25 @@ and its numerator is genuinely narrow — `project_id, date, timestamp` plus
 **So the ~4.9 TB is real, projection-aware, irreducible decode.** Building 9 days
 of 1m rollups for this data means reading those bytes once. That leaves only:
 
-1. **Decode throughput** — bytes/sec actually achieved, which is where per-unit
-   phase timing (`scan_ms=481682` for 142 rows) still deserves attention: the
-   question is no longer "how many bytes" but "why so few bytes/sec".
+1. **Decode throughput — MEASURED, and it is the binding constraint.**
+   128 units published in 20 minutes carried 9.11 GB of estimated decode:
+
+   ```
+   effective decode throughput   7.6 MB/s      (0.027 TB/hour)
+     -> 4.9 TB gating work       ~179 hours    (~7.5 days uninterrupted)
+     -> 26 TB total              ~40 days
+   ```
+
+   That window spans a restart, so 7.6 MB/s is EFFECTIVE throughput including
+   restart overhead — the right basis for an ETA, though the instantaneous rate
+   is higher. Across 16 workers it is ~0.5 MB/s per worker, which is
+   pathologically slow: a single sequential object read should stream 50-100
+   MB/s. The bottleneck is therefore per-file REQUEST LATENCY, not CPU and not
+   bandwidth — consistent with the earlier measurement of ~408 file-opens/sec at
+   ~389 ms each, and with `scan_ms=481682` for a unit producing 142 rows.
+
+   This is the number to attack. Everything else in this document is downstream
+   of it.
 2. **Not being restarted.** Six deploys in 2.5 hours discards partial work on
    units that need 8-15 minutes. This is the cheapest available win and costs
    nothing but patience.
