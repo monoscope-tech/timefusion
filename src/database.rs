@@ -10959,30 +10959,40 @@ impl Database {
         // day into children and `coarsen_sealed_slices` (#134) fuses them back,
         // so this ordering is normal, not a corruption. The wider file already
         // holds these rows, so the unit is complete with nothing to write.
-        // DERIVED only. A base slice must always publish: it is the tier that
-        // absorbs late-arriving rows, and skipping it because a wider file
-        // overlaps drops them ("an incremental rebuild must carry the untouched
-        // hours forward exactly once"). A derived slice has no such role — it is
-        // a pure re-aggregation of the base tier, so a wider derived file
-        // already holds these rows.
-        let covered_by_wider = derived
-            .then(|| {
-                live_adds.iter().find_map(|add| {
-                    let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
-                    let (Some(start), Some(end)) = (
-                        tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                        tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                    ) else {
-                        return None;
-                    };
-                    (tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
-                        && (start, end) != (key.slice.start_micros, key.slice.end_micros)
-                        && start <= key.slice.start_micros
-                        && end >= key.slice.end_micros)
-                        .then_some((start, end))
-                })
-            })
-            .flatten();
+        // BOTH tiers. This was derived-only, on the reasoning that a base slice
+        // must always publish because it is the tier that absorbs late-arriving
+        // rows. That is an argument against silently COMPLETING the unit, and
+        // the branch below does not complete it — it escalates, rebuilding the
+        // covering slice, which includes exactly those late rows. Nothing is
+        // dropped.
+        //
+        // Exempting the base tier instead guaranteed the double count it exists
+        // to prevent. The replace-set below removes only files CONTAINED in this
+        // slice (`start >= .. && end <= ..`), so a base slice publishing after a
+        // wider one covering it can neither replace the wider file nor decline —
+        // both stay live and every dashboard SUMs both.
+        //
+        // It reproduces on a clock boundary, not under load, which is why it read
+        // as an intermittent CI flake for so long:
+        // `a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer`
+        // writes nine spans at fixed hours of "yesterday" and passes until those
+        // hours age out of the 24h live frontier, at which point coarsening fuses
+        // them and the republication double-counts. Run it at 11:20 UTC and it
+        // passes; run it at 12:30 UTC and it reports 14 where 9 is right.
+        let covered_by_wider = live_adds.iter().find_map(|add| {
+            let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
+            let (Some(start), Some(end)) = (
+                tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+            ) else {
+                return None;
+            };
+            (tag(crate::maintenance_coordinator::TAG_PROJECT) == Some(key.project_id.as_str())
+                && (start, end) != (key.slice.start_micros, key.slice.end_micros)
+                && start <= key.slice.start_micros
+                && end >= key.slice.end_micros)
+                .then_some((start, end))
+        });
         if let Some((covering_start, covering_end)) = covered_by_wider {
             // ESCALATE. This slice cannot publish — two overlapping files would
             // both stay live and a dashboard would SUM them — but completing it
