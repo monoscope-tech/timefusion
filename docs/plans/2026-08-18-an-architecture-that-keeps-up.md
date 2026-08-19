@@ -1763,3 +1763,146 @@ the last four were each individually correct and jointly inert. The lesson,
 stated once more because it is the expensive one: **when consecutive correct
 fixes produce no effect, the next change should be a measurement, not a fifth
 fix.**
+
+---
+
+# Part III — the per-unit constant (2026-08-19)
+
+§22 said the next change should be a measurement, not a fifth fix. It was, and
+the measurement invalidates §19's framing.
+
+## 23. 72% of a rollup unit is the commit
+
+Prod, 43 min uptime, 1,122 published base-rollup units. The four phase counters
+added in #174 decompose exactly (unit count =
+`rollup_rebuilds_full_total + rollup_rebuilds_incremental_total`):
+
+| phase | total ms | per unit | share |
+|---|---|---|---|
+| scan | 1,247,675 | 1.11 s | 21% |
+| stage | 393,498 | 0.35 s | 7% |
+| **commit** | **4,200,744** | **3.74 s** | **72%** |
+| end-to-end | 5,842,883 | 5.21 s | ✓ sums |
+
+`rollup_commit_actions_total ≈ unit count` — **one Add action per commit**. A
+3.74 s commit that writes one action is not the write. It is lock wait on the
+per-`(project, table)` `commit_lock`, plus `refresh_table_snapshot` and
+`swap_and_refresh_cache`.
+
+That cost is **fixed per unit and independent of the span the unit covers**.
+
+This reframes everything Part I did. Nine scheduler changes shipped; the last
+four were correct and jointly inert. They could not have worked: scheduling
+decides *who runs when*, and the constraint is a *per-unit constant*. The only
+lever that touches a constant-per-unit cost is **units per unit of work** —
+i.e. width.
+
+`rollup_shared_commits_total = 0` looks like a wave-commit path that never
+fires. It is not: `stage_rollup_wave` / `commit_rollup_wave` are documented dead
+code from the retired cohort path. Don't re-chase it.
+
+## 24. Why the width lever was jammed shut
+
+Base slices are `NORMAL_SLICE_MICROS` = 10 min, so a sealed day mints 144 units
+and pays 144 commits where one would do. `coarsen_sealed_slices` exists to undo
+exactly this — and had dead-ended.
+
+It was day-or-nothing: fuse a day's leftovers into one day unit, but only if the
+summed estimate fits `MAX_DECODED_BYTES` (512 MiB). Over budget → the group was
+dropped and the day kept all 144 slices.
+
+That fallback is **inverted, not merely slower**. On an uncompacted sealed
+partition every file spans the whole day, so timestamp-stat pruning skips
+nothing and a ten-minute slice reads exactly the files a day unit would — prod
+logged `scan_ms=481682 stage_ms=30 commit_ms=961 rows=142`. The rule answered
+"too expensive to scan once" with "scan it 144 times".
+
+**The signature to recognise it by:** `maintenance_sealed_slices_coarsened` logs
+a short decreasing run (12, 6, 3) and then nothing for the rest of the process's
+life, while `pending_base_rollup` sits at 84,834. A coarsener that looks
+*converged* with an enormous queue behind it is this bug. That is the seventh
+instance of this codebase's recurring failure shape — a cheap proxy read as the
+fact it stands for. Here: "collapsed nothing this tick" read as "nothing left to
+collapse".
+
+**Shipped (01caa46).** Fusion is a cascade over `COARSEN_WIDTHS` = [24 h, 6 h,
+1 h]; a span lands at the widest width that fits. The anti-loop guard became
+per-width *and* state-aware, and that combination is what makes the cascade
+terminate **usefully** rather than just terminate:
+
+| state | blocks fusion at width W when |
+|---|---|
+| `Running` | always — never race claimed work |
+| `Pending` / `Retry` | its width ≥ W (already queued at least this wide) |
+| `Superseded` | its width ≤ W (proven too big at a width no larger) |
+| `Complete` | never — built once ≠ too big |
+
+`split_time_task` supersedes what did not fit, so a superseded day frees 6 h, a
+superseded 6 h frees 1 h, and **each supersede strictly lowers the ceiling** —
+the split/fuse loop the guard exists to prevent still cannot run. Without the
+width comparison, a superseded day blocks its children at every width and they
+sit at ten minutes forever, which is precisely where prod was.
+
+Applies to Dedup, BaseRollup, DerivedRollup and HotPacking alike, so it should
+move `pending_dedup` (14,484) as well as `pending_base_rollup` (84,834).
+
+## 25. Where shipbubble actually is
+
+Measured from storage, not counters, via the new `scripts/maintenance_state.py`
+(§26). Sealed days 08-05 … 08-18:
+
+| dimension | state |
+|---|---|
+| compacted (≤2 active files) | 8 / 14 |
+| **deduped (no `DedupExec` in plan)** | **0 / 14** |
+| 1 m rollup present | 6 / 14 (08-13 onward) |
+| 1 h rollup present | 4 / 14 (08-15 onward) |
+
+Fleet-wide the certification picture matches: `dedup_denied_never_certified_pct
+= 99.9`. Nothing is certified, so `DedupExec` survives in every 30-day plan —
+which is the single biggest remaining term in the 30 d latency goal, ahead of
+rollup coverage. Routing itself is now healthy (4,248 hits vs 866 misses, 83%);
+the dominant miss is `rollup_miss_not_built_total = 746`, i.e. coverage, not
+matching. `rollup_min_contiguous_days = 2` against a target of 30.
+
+**Certification is produced only by `dedup_sweep`, and only 80 certifications
+exist, all loaded from disk at boot — the sweep has certified nothing new.** In
+43 min it logged no `dedup_sweep_truncated` at all. Next measurement: whether
+the sweep is reaching sealed days or being consumed by the drain half before
+`sweep_deadline`. Do not "fix" this before measuring it — that is the §22 rule.
+
+## 26. `scripts/maintenance_state.py`
+
+The compaction-chart work, generalised into a terminal tool, because every
+question in §25 was previously a hand-rolled one-off.
+
+```
+scripts/maintenance_state.py                       # fleet, per day
+scripts/maintenance_state.py --project 28f62f01    # all four dimensions
+scripts/maintenance_state.py --project 28f62f01 --footers
+```
+
+Each dimension comes from the cheapest source that is actually authoritative:
+active Adds in the Delta snapshot (not `aws s3 ls`, which counts unvacuumed
+tombstones and overstated by 24× on 2026-08-19); the parquet footer's
+`sorting_columns` (not the `delta-rs.optimize.sort_by` tag — only OPTIMIZE
+writes it, 1,593 of 1,648 adds carry no tags, and the flush path sorts and
+stamps a correct footer *without* the tag); the plan shape for dedup; the tier
+tables' own partitions for rollups.
+
+**Trap embedded in the tool, worth stating here too:** the project filter must
+resolve to a full UUID and use equality. `project_id LIKE 'prefix%'` pins
+nothing the router recognises and silently changes the plan shape — it reported
+**0** `DedupExec` for every shipbubble day where equality reports **1** for every
+day. That inversion is exactly the class of error §24 is about.
+
+## 27. Revised ordering
+
+§22's order stands with one change: **B (frontier width) is no longer last, and
+is no longer about scheduling.** §23 shows width is the only lever on the
+per-unit constant, and 01caa46 is the sealed half of it. What remains of B is
+the live-frontier half — whether the 10-minute mint width should widen, which is
+the freshness trade-off, and is the only part that needs a decision rather than
+a measurement.
+
+Still explicitly not next: more scheduler tweaks.
