@@ -10282,6 +10282,12 @@ impl Database {
                 derived_unproven,
                 derived_quarantined,
                 derived_not_due,
+                derived_refusal = {
+                    let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    journal
+                        .first_refused_sealed(crate::maintenance_coordinator::Operation::DerivedRollup, crate::clock::now_micros())
+                        .map_or_else(|| "none_pending".to_owned(), |(project, date, reason)| format!("{reason}:{project:.8}:{date}"))
+                },
                 cells_admitted = want.len().min(BACKFILL_PARTITIONS_PER_PASS),
                 defer_enqueue,
                 event = "rollup_backfill_census"
