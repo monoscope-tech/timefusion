@@ -10110,6 +10110,18 @@ impl Database {
                 journal.set_base_tier_ready(ready);
             }
             let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
+            // Publish the holes so `claim_next` can rank them ahead of days that
+            // already have tier output. Same coverage read, same 60s cadence.
+            {
+                let mut holes: HashSet<(String, String, String, String)> = HashSet::new();
+                for ((project, date), missing) in &missing_tiers {
+                    for index in missing {
+                        holes.insert((source.clone(), project.clone(), schema.rollups[*index].table_name(&source), date.to_string()));
+                    }
+                }
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.set_tier_holes(holes);
+            }
             let mut want: Vec<(String, chrono::NaiveDate)> = missing_tiers.keys().cloned().collect();
             let cells_missing = want.len();
             // Skip any day that already has ROLLUP work queued. `invalidate`
@@ -10244,6 +10256,10 @@ impl Database {
                 base_tier_ready = {
                     let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     journal.base_tier_ready_len()
+                },
+                tier_holes = {
+                    let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    journal.tier_holes_len()
                 },
                 derived_pending,
                 derived_sealed,
