@@ -297,14 +297,12 @@ impl ScanMetrics {
         self.decode_peak_batch_bytes.fetch_max(bytes, Relaxed);
     }
 
-    /// `dedup_skip` is the outcome of the swept-partition skip, which until now was decided on
-    /// every scan and reported by none of them. Split by WHY it was refused: a non-`Granted`
-    /// `verdict` means the window was never eligible, while `Granted` with no skip means a leg
-    /// refused one that was — overwhelmingly a MemBuffer leg, which cannot skip. The two have
-    /// different fixes and the aggregate hides which one you have.
+    /// Outcome of the swept-partition dedup skip.
     ///
-    /// Measured on prod 2026-08-11, `denied_by_leg` was flat zero: the legs are not what refuse.
-    /// Every denial is a verdict, which is why the verdict — not a bool — is what arrives here.
+    /// Split by why it was refused: a non-`Granted` verdict means the window was never eligible,
+    /// while `Granted` with no skip means a leg refused one that was. The two have different fixes
+    /// and the aggregate hides which one you have. Every denial is a verdict, so the verdict — not a
+    /// bool — is what arrives here.
     #[allow(clippy::too_many_arguments)] // one flag per counter; a struct would just rename them
     pub fn record_scan(
         &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool,
@@ -661,14 +659,12 @@ fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::P
     uri.strip_prefix(prefix).map(|rel| object_store::path::Path::from(rel.trim_start_matches('/')))
 }
 
-/// The table's path WITHIN its bucket (`"s3://bucket/tf/tbl"` → `"tf/tbl"`) —
-/// the namespace the cache keys full files under. Cache inserts happen BELOW
-/// delta-rs' `PrefixStore`, so keys are bucket-relative, while
-/// `relativize_to_prefix` output is table-relative; joining the two yields the
-/// key inserts actually used. Prod 2026-08-03: evict-after-compaction and the
-/// flush-confirm `contains_data` probe both addressed table-relative keys, so
-/// evictions were silent no-ops (47GB of unreachable tombstoned bodies) and
-/// every confirm re-downloaded bytes it had just uploaded.
+/// The table's path within its bucket (`"s3://bucket/tf/tbl"` → `"tf/tbl"`).
+///
+/// Cache inserts happen below delta-rs's `PrefixStore`, so keys are bucket-relative, while
+/// `relativize_to_prefix` output is table-relative. Joining the two yields the key inserts actually
+/// used. Evict-after-compaction and the flush-confirm probe used to address table-relative keys,
+/// so evictions were silent no-ops and every confirm re-downloaded bytes it had just uploaded.
 fn table_path_in_bucket(prefix: &str) -> &str {
     prefix.splitn(4, '/').nth(3).unwrap_or("").trim_matches('/')
 }
@@ -970,11 +966,9 @@ fn tiers_missing_per_day(
 }
 
 /// Parallelism cap for every maintenance session. Each partition's
-/// `ExternalSorter` reserves `sort_spill_reservation_bytes` up-front from the
-/// bounded maintenance pool, so the query-derived count (≈ CPU cores) exhausts it
-/// before the sort can even start (prod 2026-07-12: ~46 sorters × 64 MB > the
-/// 4.8 GB pool). Legacy and high-file-count partitions still blew the reservation
-/// at 4 partitions, hence 2.
+/// `ExternalSorter` reserves `sort_spill_reservation_bytes` up-front from the bounded maintenance
+/// pool, so a query-derived partition count exhausts it before the sort can start. Legacy and
+/// high-file-count partitions still exceeded the reservation at 4 partitions, hence 2.
 const MAINTENANCE_MAX_PARTITIONS: usize = 2;
 
 /// The `date=` partition a repair bin sits in, for ordering by how recent its
@@ -1088,12 +1082,11 @@ const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 pub(crate) const WIDE_ROW_DECODE_BATCH_SIZE: &str = "2048";
 
 /// Config tuning shared by every delta-rs maintenance session.
-/// `schema_force_view_types=false` keeps Variant columns as `Binary` (not
-/// `BinaryView`) so delta_kernel's unshredded-variant schema check passes; the
-/// sort-spill floor lets a sort spill instead of erroring under the bounded
-/// maintenance pool; `skip_physical_aggregate_schema_check` mirrors
-/// `create_session_context` (2026-07-31, 7d68f01) because maintenance reads the
-/// very files carrying the widened nullability.
+///
+/// `schema_force_view_types=false` keeps Variant columns as `Binary` (not `BinaryView`) so
+/// delta_kernel's unshredded-variant schema check passes. The sort-spill floor lets a sort spill
+/// instead of erroring under the bounded maintenance pool. `skip_physical_aggregate_schema_check`
+/// mirrors `create_session_context` because maintenance reads the files carrying the widened nullability.
 fn maintenance_session_config(base: datafusion::prelude::SessionConfig, batch_size: &str, target_partitions: usize) -> datafusion::prelude::SessionConfig {
     let mut cfg = base.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
     for (k, v) in [
@@ -1453,14 +1446,13 @@ fn max_watermark_across_commits<'a>(
     })
 }
 
-/// Base [`CommitProperties`] for every ingest/maintenance commit. Disables the
-/// delta-rs post-commit checkpoint + expired-log-cleanup hooks: those run AFTER
-/// `N.json` is durably written, but a hook failure (R2 500 on the checkpoint
-/// PUT or the bulk `?delete`) is surfaced as a commit error — which the flush/
-/// dedup error arms misread as "commit never landed" and then delete the parquet
-/// the landed commit references (2026-07-09 incident: 14 dangling Adds). Both
-/// hooks now run out-of-band in the maintenance scheduler, tolerant of R2 500s.
-/// `Some(false)` overrides the `enableExpiredLogCleanup` table property per-commit.
+/// Base [`CommitProperties`] for every ingest/maintenance commit.
+///
+/// Disables the delta-rs post-commit checkpoint and expired-log-cleanup hooks. Those run after
+/// `N.json` is durably written, but a hook failure is surfaced as a commit error, which the flush/
+/// dedup error arms misread as "commit never landed" and then delete the parquet the landed commit
+/// references. Both hooks now run out-of-band in the maintenance scheduler, tolerant of object-store
+/// 500s. `Some(false)` overrides the `enableExpiredLogCleanup` table property per-commit.
 fn base_commit_properties() -> CommitProperties {
     CommitProperties::default().with_create_checkpoint(false).with_cleanup_expired_logs(Some(false))
 }
@@ -1531,11 +1523,10 @@ pub(crate) fn is_occ_conflict_err(msg: &str) -> bool {
         || msg.contains("Transaction failed")
 }
 
-/// A Parquet file ends with `[footer_len: u32 LE][PAR1]`. Cheap structural
-/// check that catches the real-world checkpoint-corruption classes — an object
-/// overwritten with foreign bytes (an S3 XML error / SelectObjectContent body,
-/// 2026-07-17) or a truncated write — without reading the whole file. `tail`
-/// is the file's last 8 bytes.
+/// Cheap structural check that catches real-world checkpoint-corruption classes.
+///
+/// A Parquet file ends with `[footer_len: u32 LE][PAR1]`. This catches an object overwritten with
+/// foreign bytes or a truncated write without reading the whole file. `tail` is the file's last 8 bytes.
 fn parquet_tail_ok(tail: &[u8], file_len: u64) -> bool {
     tail.len() == 8 && &tail[4..] == b"PAR1" && {
         let footer_len = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64;
@@ -1802,12 +1793,12 @@ fn window_hour_masks(lo: i64, hi: i64) -> Option<Vec<(String, u32)>> {
 
 /// A `Remove` tombstone for `add` with `data_change: true` (the dedup rewrite
 /// drops rows, unlike optimize's data-preserving `data_change: false`).
-/// Whether a commit that returned an error actually landed. delta-rs surfaces a
-/// post-commit hook / snapshot-refresh failure as a commit `Err` even though
-/// `N.json` is already durably written (2026-07-09: an R2 500 on the checkpoint
-/// PUT / bulk log `?delete`). Deleting the staged parquet in that case orphans
-/// the Adds the landed commit references, so the flush path must tell the cases
-/// apart. See `Database::probe_commit_landed`.
+/// Whether a commit that returned an error actually landed.
+///
+/// delta-rs surfaces a post-commit hook or snapshot-refresh failure as a commit `Err` even though
+/// `N.json` is already durably written. Deleting the staged parquet in that case orphans the Adds
+/// the landed commit references, so the flush path must tell the cases apart. See
+/// `Database::probe_commit_landed`.
 enum CommitProbe {
     /// `N.json` landed; every staged Add is active. Treat as success + drain.
     Landed,
@@ -1836,9 +1827,8 @@ struct StagedUnit {
     stage_store: Arc<dyn object_store::ObjectStore>,
 }
 
-/// Marks a commit error where landing could NOT be confirmed. The staged
-/// parquet must be left in place (deleting files a landed commit references
-/// creates dangling Adds — the 2026-07-09 incident shape).
+/// Marks a commit error where landing could not be confirmed. The staged parquet must be left in
+/// place; deleting files a landed commit references creates dangling Adds.
 const INCONCLUSIVE_COMMIT_MARKER: &str = "landing-unconfirmed";
 
 /// Last-resort circuit breaker on a network await taken while a per-table commit lock is held.
@@ -2219,9 +2209,8 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 // write the file. Read by `recompress_partition` to skip files already
 // at-or-above the target tier without rewriting.
 /// What a `recompress_partition` call actually did. The CLI used to print
-/// "rewritten (sorted footer restored)" unconditionally, including on the
-/// tier-probe skip — which is how a poisoned partition looked repaired for
-/// hours while nothing had changed (2026-08-07). A skip must say so.
+/// "rewritten" unconditionally, including on the tier-probe skip — which made a poisoned partition
+/// look repaired while nothing had changed. A skip must say so.
 #[derive(Debug)]
 pub enum RecompressOutcome {
     Rewritten { files: usize },
@@ -2270,9 +2259,8 @@ pub struct Database {
     /// Hot-tail light-optimize slice carved out of the maintenance budget:
     /// heavy rewrites (dedup, recompress, Z-order) can hold the shared pool
     /// for minutes, and the small (≤target_size) hot-tail sorts starved
-    /// behind them every tick (prod 2026-07-22: 22 `Resources exhausted`
-    /// in 25 min with zero OCC conflicts). Separate pool ⇒ today's
-    /// compaction always has its reserve; total budget stays constant.
+    /// Runtime env for hot-tail packing. Separate from maintenance's pool so today's compaction
+    /// always has its reserve; total budget stays constant.
     light_optimize_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Footer repair's slice, disjoint from packing's above. Same argument one
     /// level down: repair sorts whole multi-hundred-MB files for minutes, and
@@ -2287,19 +2275,15 @@ pub struct Database {
     /// Flush-path sort pool, for buckets too large for the in-process sort.
     /// Its own slice, not maintenance's: flush is on the INGEST path and must
     /// not queue behind a Z-order holding the maintenance pool for minutes.
-    /// Bounded + spillable, which is the whole point — the in-process sort
-    /// allocates outside every pool, and authorising GBs of that on a 26 GB box
-    /// is what took prod down on 2026-08-01.
+    /// Bounded + spillable: the in-process sort allocates outside every pool, so an unbounded
+    /// sort can consume gigabytes on a small box.
     flush_sort_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Caps how many spilling flush sorts share `flush_sort_runtime_env` at
-    /// once. The pool is a `FairSpillPool`, so N concurrent sorts each get
-    /// ~pool/N; below a viable slice `ExternalSorterMerge` cannot merge its
-    /// spill files and the sort fails with "Not enough memory to continue
-    /// external sort" (prod, 2026-08-02). The caller then writes the group
-    /// UNSORTED, and a single file with no `sorting_columns` footer disables
-    /// the reader's all-or-nothing ordering for every scan touching that
-    /// partition — so pool starvation shows up as slow queries, not as an
-    /// error. Serialising a few oversized sorts is much cheaper than that.
+    /// once. The pool is a `FairSpillPool`, so N concurrent sorts each get ~pool/N; below a viable
+    /// slice `ExternalSorterMerge` cannot merge its spill files and the sort fails. The caller then
+    /// writes the group unsorted, and a single file with no `sorting_columns` footer disables the
+    /// reader's all-or-nothing ordering for every scan touching that partition — so pool starvation
+    /// shows up as slow queries, not an error. Serialising a few oversized sorts is much cheaper.
     flush_sort_gate: Arc<tokio::sync::Semaphore>,
     /// Memoized `build_optimize_session_state` results, one per runtime env.
     ///
@@ -2349,14 +2333,12 @@ pub struct Database {
     pub scan_metrics: Arc<ScanMetrics>,
     batch_queue: Option<Arc<crate::write::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
-    /// Cancels `maintenance_shutdown` when the LAST guard-holding `Database`
-    /// clone drops. Database is Clone, so a per-value `impl Drop` cancelling
-    /// the shared token killed every cron job / the DML coalescer / dedup
-    /// sweeps as soon as ANY transient clone dropped (2026-07-14 prod outage:
-    /// all maintenance silently dead minutes after boot). `None` in clones
-    /// handed to long-lived background tasks (see `background_clone`) —
-    /// otherwise a task waiting on the token would hold its own kill-switch
-    /// alive and the guard could never fire.
+    /// Cancels `maintenance_shutdown` when the last guard-holding `Database` clone drops.
+    ///
+    /// `Database` is `Clone`, so a per-value `Drop` cancelling the shared token killed every cron job,
+    /// DML coalescer, and dedup sweep as soon as any transient clone dropped. `None` in clones handed
+    /// to long-lived background tasks; otherwise a task waiting on the token would hold its own
+    /// kill-switch alive and the guard could never fire.
     _maintenance_cancel_guard: Option<Arc<tokio_util::sync::DropGuard>>,
     /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
     /// disjoint entry points today, but a second call must not double the
@@ -2434,10 +2416,10 @@ pub struct Database {
     /// a Delta append commits. In-memory by design: after restart the
     /// read-side DedupExec remains the correctness backstop.
     dedup_dirty_bins: Arc<dashmap::DashMap<(String, String, String, i64), ()>>,
-    /// Exponential failure backoff per (table, project, date) dedup target:
-    /// (attempts, earliest next try). Without it a failing partition re-runs
-    /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
-    /// pacing. Cleared on success; in-memory only (a restart retries once).
+    /// Exponential failure backoff per `(table, project, date)` dedup target.
+    ///
+    /// Without it a failing partition re-runs on every sweep tick forever. Cleared on success;
+    /// in-memory only, so a restart retries once.
     dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
     /// Repair candidates whose footer turned out to be sorted after all, so the pass stops
     /// re-selecting them.
@@ -2497,9 +2479,9 @@ pub struct Database {
     /// starved. Derived is cheap and builds the 1h tier that 14d/30d dashboards read, which is the
     /// actual coverage gap. The scarcity is slot-time, not attempt count.
     maintenance_derived_reserve: Arc<tokio::sync::Semaphore>,
-    /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the
-    /// time-windowed target to hash-join keys; ungated bursts starve reads on a
-    /// CPU-throttled box (prod 2026-07-19). Permits = `timefusion_dml_merge_concurrency`.
+    /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the time-windowed target
+    /// to hash-join keys; ungated bursts starve reads on a CPU-throttled box. Permits =
+    /// `timefusion_dml_merge_concurrency`.
     dml_merge_sem: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent Parquet batch-decodes for WIDE read scans (see
     /// `timefusion_max_concurrent_scan_readers`). Shared across all queries so a
@@ -2530,11 +2512,9 @@ pub struct Database {
     /// which stays free for readers and insert commits.
     dml_locks: DmlLocks,
     /// Last time each table's snapshot was persisted to disk (keyed by table
-    /// url). `persist_snapshot` throttles on this: the on-disk snapshot is only
-    /// a boot-recovery seed (restore V, replay commits > V), so rewriting the
-    /// whole 5k-file state on *every* commit is wasted CPU (13% in the
-    /// 2026-07-05 profile, serde_json + zstd). A slightly stale snapshot just
-    /// makes boot replay a few more (sub-second) commits.
+    /// url). `persist_snapshot` throttles on this: the on-disk snapshot is only a boot-recovery seed
+    /// (restore V, replay commits > V), so rewriting the whole state on every commit is wasted CPU.
+    /// A slightly stale snapshot just makes boot replay a few more (sub-second) commits.
     snapshot_persist_gate: Arc<dashmap::DashMap<String, std::time::Instant>>,
     /// Late-binding shared cell: boot must create the pgwire SessionContext
     /// (whose FunctionRegistry the WAL replay needs) BEFORE the layer exists,
@@ -5815,11 +5795,10 @@ impl Database {
     /// Light-optimize slice of the maintenance budget.
     ///
     /// Deferred to `light_share_bytes` rather than recomputed. The old
-    /// expression — `(pool/3 * max_k).min(pool * 3/4)` — happened to equal the
-    /// budget tree's own light share ONLY while `HEAVY_MIN_SHARE` was 0.25, so
-    /// the two agreed by coincidence and the same number had two definitions.
-    /// Moving the share (2026-08-13, 0.25 → 0.40) would silently have changed
-    /// `light_optimize_k` while leaving the actual pools where they were.
+    /// expression — `(pool/3 * max_k).min(pool * 3/4)` — happened to equal the budget tree's own
+    /// light share only while `HEAVY_MIN_SHARE` was 0.25, so the two agreed by coincidence. Moving
+    /// the heavy share would silently change `light_optimize_k` while leaving the actual pools
+    /// unchanged.
     fn light_optimize_pool_bytes(&self) -> usize {
         self.config.derived.light_share_bytes()
     }
@@ -8247,10 +8226,9 @@ impl Database {
     }
 
     /// The 10-minute duplicate probe: returns the bucket starts whose
-    /// dedup-key groups have count > 1 under `filter`. Aggregates group keys
-    /// only — bounded by key cardinality, not row width (a `SELECT *` +
-    /// collect() of a whole day partition transiently allocated tens of GB
-    /// outside any memory pool — prod's 2026-06-11 OOM crash loop).
+    /// dedup-key groups have count > 1 under `filter`. Aggregates group keys only — bounded by key
+    /// cardinality, not row width. A `SELECT *` + `collect()` of a whole day partition transiently
+    /// allocated tens of gigabytes outside any memory pool.
     async fn dup_bin_starts(ctx: &datafusion::prelude::SessionContext, filter: &str, keys_csv: &str) -> Result<Vec<chrono::NaiveDateTime>> {
         let probe = format!(
             "SELECT CAST(date_bin(INTERVAL '10 minutes', \"timestamp\", TIMESTAMP '1970-01-01T00:00:00') AS VARCHAR) FROM \
@@ -8293,11 +8271,11 @@ impl Database {
             .map(|a| a.value(0)))
     }
 
-    /// BATCH probe (2026-08-05): classify EVERY 10-minute bin of one
-    /// (project, date) with a single duplicate probe, returning the bin ids
-    /// that contain duplicates. A dup group shares one exact `timestamp` (it
-    /// is a dedup key), so the group's bin is derived exactly — only valid
-    /// when `timestamp` is a dedup key.
+    /// Batch probe: classify every 10-minute bin of one `(project, date)` with a single duplicate
+    /// probe, returning the bin ids that contain duplicates.
+    ///
+    /// A dup group shares one exact `timestamp` (it is a dedup key), so the group's bin is derived
+    /// exactly. Only valid when `timestamp` is a dedup key.
     async fn probe_dup_bins(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str,
     ) -> Result<std::collections::HashSet<i64>> {
@@ -12306,14 +12284,12 @@ impl Database {
         ready.into_iter().filter(|b| !clean.contains(b)).collect()
     }
 
-    /// Wave-commit gate: a pass can outlive its start-of-pass health check (a
-    /// full drain batch is minutes of rewrites), and dedup must not compete
-    /// with persistence for the commit lock — but ONE transient unhealthy
-    /// sample must not forfeit the batch either. Latching used to requeue
-    /// every remaining bin after a single bad sample, silently discarding an
-    /// entire 128-bin pass at boot (~75 min of staging, prod 2026-08-05).
-    /// Waits (bounded) for flush to recover; if it doesn't, requeues this
-    /// wave and returns false so the pass stops committing.
+    /// Wave-commit gate: waits (bounded) for flush to recover before committing a dedup wave.
+    ///
+    /// A pass can outlive its start-of-pass health check, and dedup must not compete with persistence
+    /// for the commit lock. One transient unhealthy sample must not forfeit the whole batch. Latching
+    /// used to requeue every remaining bin after a single bad sample, silently discarding an entire
+    /// pass. If flush does not recover, requeue the wave and return false so the pass stops committing.
     async fn commit_dedup_wave_when_flush_healthy(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, wave: &mut Vec<StagedBin>, flush_healthy: &(dyn Fn() -> bool + Sync),
         requeue: &(dyn Fn(DirtyBinKey, &std::sync::atomic::AtomicU64) + Sync),
@@ -13971,10 +13947,9 @@ impl Database {
     }
 
     /// Checkpoint after a tick's waves when the log has advanced enough since the
-    /// last checkpoint. Owned by the wave engine rather than left to the commit
-    /// count: waves cut compaction commits ~40x, so a per-N-versions cadence
-    /// would checkpoint ~40x less often exactly where the replay tail is the top
-    /// CPU cost (34.5% of process CPU in log replay, prod profile 2026-07-29).
+    /// last checkpoint. Owned by the wave engine rather than left to the commit count: waves cut
+    /// compaction commits ~40x, so a per-N-versions cadence would checkpoint far less often exactly
+    /// where the replay tail is the top CPU cost.
     async fn checkpoint_after_waves(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
         /// Small on purpose: a tick's waves add ~2-3 versions, so this
         /// checkpoints every few ticks instead of every tick.
@@ -14102,12 +14077,10 @@ impl Database {
         true
     }
 
-    /// Each pass is budgeted from its OWN cron period, because their units are
-    /// orders of magnitude apart: a packing bin is a handful of small files, a
-    /// repair bin is one 700 MB - 1 GiB whole-file rewrite. Sharing the 5-minute
-    /// period gave repair 240s for work that needs minutes, and `stage_hot_bin`
-    /// discards an over-budget bin — so repair could never finish, at any
-    /// backlog size (prod 2026-08-08).
+    /// Each pass is budgeted from its own cron period because their units are orders of magnitude
+    /// apart: a packing bin is a handful of small files, a repair bin is one large whole-file rewrite.
+    /// Sharing the same short period gave repair a slice it could not fit, and `stage_hot_bin` discards
+    /// an over-budget bin — so repair could never finish, at any backlog size.
     fn tail_pass_tick_budget(&self, pass: TailPass) -> std::time::Duration {
         match pass {
             TailPass::Pack => self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_light_optimize_schedule)),
@@ -14318,13 +14291,11 @@ impl Database {
     }
 
     /// Out-of-band checkpoint + expired-log cleanup for one table. Runs on the
-    /// maintenance schedule instead of in the delta-rs commit hook
-    /// (`base_commit_properties` disables the hook) so an R2 500 on the
-    /// checkpoint PUT or the bulk log `?delete` can never fail a landed commit
-    /// (2026-07-09 incident). Best-effort: any error is logged + counted and
-    /// retried next tick; ingest is never touched. Checkpoints only when the
-    /// version advanced by ≥ `checkpoint_interval` since the last checkpoint
-    /// (tracked in-memory per table URL), so idle tables are skipped.
+    /// maintenance schedule instead of in the delta-rs commit hook (`base_commit_properties`
+    /// disables the hook), so a checkpoint PUT or bulk log delete failure cannot fail a landed commit.
+    /// Best-effort: errors are logged, counted, and retried next tick; ingest is never touched.
+    /// Checkpoints only when the version advanced by at least `checkpoint_interval` since the last
+    /// checkpoint, tracked in-memory per table URL, so idle tables are skipped.
     async fn checkpoint_and_cleanup_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
         use std::sync::atomic::Ordering::Relaxed;
         // Checkpoint the latest committed version, not a stale clone.
@@ -14532,10 +14503,9 @@ impl Database {
     /// Flatten unified + custom project tables into one (project_id, name, handle)
     /// list — `project_id` empty for unified tables (shared by all default
     /// projects). A SNAPSHOT by design: every maintenance pass must iterate this
-    /// instead of `MAP.read().await.iter()`, because holding a table-map read
-    /// guard across the pass's awaits lets one queued writer (a first-touch table
-    /// load) block every subsequent reader — tokio's RwLock is write-preferring —
-    /// and wedge all maintenance jobs at once (2026-07-29 22:05).
+    /// instead of `MAP.read().await.iter()`, because holding a table-map read guard across the pass's
+    /// awaits lets one queued writer block every subsequent reader — tokio's RwLock is
+    /// write-preferring — and wedge all maintenance jobs.
     async fn all_tables(&self) -> Vec<(String, String, Arc<RwLock<DeltaTable>>)> {
         let mut out: Vec<(String, String, Arc<RwLock<DeltaTable>>)> =
             self.unified_tables.read().await.iter().map(|(n, t)| (String::new(), n.clone(), t.clone())).collect();
@@ -14578,9 +14548,8 @@ impl Database {
         self.maintenance_shutdown.cancel();
     }
 
-    /// True once maintenance/background tasks have been told to stop. Exposed
-    /// for tests — a `true` here on a live instance means every cron job is
-    /// dead (the 2026-07-14 outage signature).
+    /// True once maintenance/background tasks have been told to stop. Exposed for tests; on a
+    /// live instance `true` means every cron job is dead.
     pub fn is_maintenance_cancelled(&self) -> bool {
         self.maintenance_shutdown.is_cancelled()
     }
@@ -15166,10 +15135,9 @@ fn schema_optimize_sort_columns(schema: &crate::schema::TableSchema) -> Vec<delt
 /// (`delta.dataSkippingStatsColumns`). Deliberately narrow: the time column
 /// (every query and `light_optimize_tail`'s event-time binning read it), the
 /// declared sort keys (what file pruning is ordered by), and the dedup keys +
-/// tiebreak (what the dedup probes prune on). Partition columns are excluded —
-/// they're encoded in the path, not the stats. Writing stats for the whole 90+
-/// column schema instead cost 18.4% of process CPU in Add-stats `parse_json_impl`
-/// on every log replay (prod profile 2026-07-29).
+/// tiebreak. Partition columns are excluded — they're encoded in the path, not the stats. Writing
+/// stats for the whole wide schema instead cost a large share of process CPU in Add-stats
+/// `parse_json_impl` on every log replay.
 fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
     std::iter::once(schema.time_column_name())
         .chain(schema.sorting_columns.iter().map(|c| c.name.as_str()))
@@ -15726,14 +15694,10 @@ fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
     tags.get(SORTED_RUN_TAG).is_some_and(|v| v.as_deref() == Some("true"))
 }
 
-/// Files whose newest event is within SEAL_LAG of now may still receive appends
-/// / DV-merge rewrites, so compacting them (a) races concurrent commits → OCC
-/// abort (the wedged optimize on today's partition, prod 2026-07-20) and (b)
-/// would need re-compaction. Only sealed time slices are compacted.
-/// 15min: a 5min lag was tried (shrinks the recent file count faster) but
-/// THRASHED the Foyer cache — rewriting the recent window every 5min churns file
-/// IDs faster than 1h-window queries reuse the warm bodies, so 1h latency stuck
-/// at 2-7s and never warmed while 3h (stable older files) did (prod 2026-07-21).
+/// Files whose newest event is within `SEAL_LAG` of now may still receive appends or DV-merge
+/// rewrites, so compacting them races concurrent commits and would need re-compaction. Only sealed
+/// time slices are compacted. The 15-minute lag was chosen because a shorter lag churned the cache
+/// too fast for 1h-window queries to warm the bodies.
 fn seal_micros_now() -> i64 {
     const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
     crate::support::now_micros() - SEAL_LAG_MICROS
@@ -15753,12 +15717,12 @@ pub(crate) struct TailAdd {
 }
 
 impl TailAdd {
-    /// Parse the raw Add stats JSON: the snapshot's parsed-stats column
-    /// (`stats_parsed`) isn't materialized on this path, so the kernel
-    /// `stat_min_i64`/`stat_max_i64` accessors return None for every file — the
-    /// 2026-07-20 event-time binning read them and silently selected NOTHING
-    /// (hot compaction was a no-op in prod while today-partitions grew to 474+
-    /// files).
+    /// Parse the raw Add stats JSON.
+    ///
+    /// The snapshot's parsed-stats column is not materialized on this path, so the kernel
+    /// `stat_min_i64`/`stat_max_i64` accessors return `None` for every file. Event-time binning
+    /// previously trusted those accessors and silently selected nothing, so it now parses the raw
+    /// stats JSON instead.
     fn from_stats(path: String, size: i64, is_sorted_run: bool, stats: Option<&str>) -> Self {
         let range = stats.and_then(Database::event_time_range_from_stats);
         Self { path, size, is_sorted_run, event_range: range }
@@ -15878,21 +15842,18 @@ pub(crate) fn flush_sort_permits(pool_bytes: usize) -> usize {
     (pool_bytes / MIN_SPILL_SORT_BYTES).max(1)
 }
 
-/// Largest file a REPAIR pass will admit, derived from the time it actually has.
+/// Largest file a repair pass will admit, derived from the time it actually has.
 ///
-/// Measured on prod 2026-08-08: an uncontended rewrite of a 1.19 GB partition
-/// streamed its output in **43 minutes**, i.e. ~460 KB of input per second. A
-/// pass may therefore admit roughly `budget * 460 KB/s` and still finish, and
-/// that — not the five-minute-tick knob — is the honest ceiling. Never smaller
+/// A repair pass may admit roughly `budget * INPUT_BYTES_PER_SEC` and still finish. Never smaller
 /// than the configured value, so raising the knob still widens the reach.
 pub(crate) fn repair_reach_bytes(configured: i64, budget: std::time::Duration) -> i64 {
     configured.max(budget_bytes(budget))
 }
 
-/// Input bytes one hot-tail rewrite sustains per second. Measured on prod
-/// 2026-08-08: an uncontended rewrite of a 1.19 GB partition streamed its output
-/// in **43 minutes**. The same night's packing bins ran 0.65-3.1 MB/s under
-/// 5-way concurrency, so this stays the conservative floor for both users.
+/// Conservative input bytes one hot-tail rewrite sustains per second.
+///
+/// Measured on an uncontended 1.19 GB repair rewrite. Packing bins ran faster under concurrency,
+/// so this stays the conservative floor for both.
 const INPUT_BYTES_PER_SEC: i64 = 460_000;
 
 fn budget_bytes(budget: std::time::Duration) -> i64 {
@@ -16184,10 +16145,11 @@ mod decode_tests {
         assert!(super::window_hour_masks(HOUR, HOUR).is_none());
     }
 
-    /// Prod 2026-08-09 quarantined monoscope-self's `date=2026-08-01` file after
-    /// ONE `Resources exhausted` at 16 sort partitions, which alone forces
-    /// `mode=full` dedup and breaks every >8-day dashboard for that tenant. The
-    /// exhaustion was never retried at a parallelism that could fit.
+    /// A pool exhaustion must be retried at a parallelism that can fit before the candidate is
+    /// quarantined.
+    ///
+    /// A single `Resources exhausted` at the top parallelism forces `mode=full` dedup and breaks
+    /// large-window dashboards for that tenant, so the ladder retries cheaper parallelism first.
     #[test]
     fn a_pool_exhaustion_walks_down_the_parallelism_ladder_before_it_is_believed() {
         // Top of the ladder: buy a retry at lower parallelism, charge ONE strike
@@ -17741,9 +17703,10 @@ const VALVE_RATE_FLOOR_PCT: u64 = 50;
 /// so would raise the heap ceiling, which is the one thing the guard exists to hold down.
 const DECODE_UNITS_PER_READER: u32 = 16;
 
-/// The worst-case decoded batch one reader slot is sized for. 8192-row decode
-/// batches of wide otel rows measured up to 145 MB (2026-07-27) — the number
-/// the poll-counting gate was implicitly built around.
+/// Worst-case decoded batch size one reader slot is sized for.
+///
+/// 8192-row decode batches of wide OTel rows measured up to 145 MB; this is the number the
+/// poll-counting gate was implicitly built around.
 const NOMINAL_DECODE_BATCH_BYTES: u64 = 145 * 1024 * 1024;
 
 /// Units a poll must claim to cover `last_batch_bytes` of decoded Arrow.
@@ -19302,11 +19265,11 @@ mod tests {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
     }
 
-    /// A unit whose slice has not finished yet must back off past the slice, not
-    /// spin. Prod 2026-08-18 had one BaseRollup task at attempts=195 on today's
-    /// day-wide slice: `has_rows_in_range` is true until midnight, and a flat 5s
-    /// retry left it permanently eligible, monopolising `claim_next` ahead of
-    /// ~40,000 pending units that had never run once.
+    /// A unit whose slice has not finished yet must back off past the slice, not spin.
+    ///
+    /// A flat retry interval left a day-wide unit permanently eligible until midnight, monopolising
+    /// `claim_next` ahead of tens of thousands of pending units that had never run. Backing off
+    /// past the slice's end lets other work run.
     #[test]
     fn a_slice_that_has_not_finished_backs_off_past_its_own_end() {
         use crate::maintenance_coordinator::{FINALIZATION_DELAY_MICROS, TimeSlice};
@@ -19500,11 +19463,9 @@ mod tests {
 
     /// Derived work must keep workers no matter how busy the expensive units are.
     ///
-    /// #176 freed workers from debt for "the rollup chain", but a sealed
-    /// BaseRollup day unit is itself 801s (prod 2026-08-19), so it takes the
-    /// freed worker and DerivedRollup starves behind it exactly as it starved
-    /// behind debt. Derived is the cheap half — it aggregates the base TIER and
-    /// reads no raw data — and it builds the 1h tier 30d dashboards read.
+    /// Freeing workers from debt for "the rollup chain" is not uniform: a sealed BaseRollup day is
+    /// slow, so it takes the freed worker and DerivedRollup starves behind it. Derived is cheap and
+    /// builds the 1h tier that 30-day dashboards read.
     #[test]
     fn derived_work_keeps_workers_the_expensive_units_cannot_take() {
         // Mirrors the sizing in `Database::new`.
@@ -19829,8 +19790,7 @@ mod tests {
         Ok(())
     }
 
-    /// The debt cap must leave workers for the rollup chain without starving debt
-    /// entirely — file counts left ungoverned degraded every query on 2026-08-01.
+    /// The debt cap must leave workers for the rollup chain without starving debt entirely.
     #[test]
     fn the_debt_cap_reserves_workers_without_starving_debt() {
         // Mirrors the sizing in `Database::new`.
@@ -19848,9 +19808,8 @@ mod tests {
         assert!((1..64).all(|jobs| permits(jobs) <= permits(jobs + 1)));
     }
 
-    /// The reweighting must move slots to the rollup chain WITHOUT starving
-    /// anything: file debt left at zero is how file counts ran to 2-3k and
-    /// degraded every query (2026-08-01), so each operation keeps a slot.
+    /// The reweighting must move slots to the rollup chain without starving anything. Each
+    /// operation keeps a slot so file debt cannot drop to zero and let counts run away.
     #[test]
     fn the_coverage_short_cycle_favours_rollup_without_starving_file_work() {
         use crate::maintenance_coordinator::{CYCLE_BALANCED, CYCLE_COVERAGE_SHORT, Operation};
@@ -19883,11 +19842,9 @@ mod tests {
     }
 
     /// Which projects the coverage must hold for is decided by this test, and
-    /// coverage is INTERSECTED across them — so pulling in a dormant tenant that
-    /// wrote nothing in the window refuses the query for everyone. Prod
-    /// 2026-08-18: 13 projects hold tier partitions and one has a single day with
-    /// 4 rows, which is why `not_built` became the entire miss profile once
-    /// `missing_project` was fixed.
+    /// Coverage is intersected across projects, so a dormant tenant that wrote nothing in the window
+    /// refuses the query for everyone. A single project with a tiny partition can dominate the miss
+    /// profile once `missing_project` is fixed.
     #[test]
     fn a_partition_outside_the_window_does_not_join_the_coverage_requirement() {
         let stats = |min_ts, max_ts| PartitionStats { fingerprint: 0, min_ts, max_ts };
@@ -20003,11 +19960,9 @@ mod tests {
         }
     }
 
-    /// The QUERY session's decode buffers cost `batch_size × row width` per
-    /// partition per concurrent query and are invisible to the memory pool, so
-    /// the bound has to be the config. 2026-07-05 caught the coalescer at
-    /// 10-27GB with 65536; 2026-08-07 caught parquet's own byte-array decoders
-    /// at ~29GB (32% of live heap) with 8192.
+    /// Query-session decode buffers cost `batch_size × row width` per partition per concurrent
+    /// query and are invisible to the memory pool, so the bound has to be the config. Large batch
+    /// sizes for wide rows caused multi-gigabyte decoder allocations.
     #[tokio::test]
     async fn query_session_bounds_the_wide_row_decode_buffers() -> Result<()> {
         let db = Database::with_config(create_test_config("query-batch-size")).await?;
@@ -20107,11 +20062,12 @@ mod tests {
     /// Reconciling a missed commit must invalidate only the hours the commit's
     /// files actually span, never the whole partition-day. The old form
     /// enqueued `ALL_HOURS` per changed partition, and unified-table flush
-    /// commits name every active project — so every restart re-enqueued ~312
-    /// durable tasks per active stream AND reset the day's completed frontier
-    /// work. Prod 2026-08-18, one OOM restart: +5,876 pending base rollups in
-    /// an hour. This test's commit touches ONE hour: the reconcile must add
-    /// nothing beyond the write path's own one-hour invalidation (13 tasks).
+    /// Reconcile must enqueue only the hours a missed commit touched.
+    ///
+    /// Previously the reconcile re-enqueued durable tasks for every active project and reset the
+    /// day's completed frontier on every restart, inflating the queue by thousands of tasks. This
+    /// test's commit touches one hour, so the reconcile should add only the write path's own
+    /// one-hour invalidation.
     #[tokio::test]
     async fn reconcile_enqueues_only_the_hours_a_missed_commit_touched() -> Result<()> {
         let db = Database::with_config(create_test_config("reconcile-precise-hours")).await?;
@@ -20282,9 +20238,8 @@ mod tests {
 
     /// The repair sort runs 16 partitions, so its unspillable merge is 8x the
     /// 2-partition maintenance default. Reserving that share up-front is what
-    /// forces the sorter to spill instead of consuming the pool and stranding
-    /// the merge — the exact failure that quarantined shipbubble's blocking file
-    /// (9.4 GB sorter + 9.5 GB merge, short by 25.3 MB, prod 2026-08-09).
+    /// forces the sorter to spill instead of consuming the pool and stranding the merge — the
+    /// exact failure mode that quarantined a blocking repair file.
     #[test]
     fn repair_session_reserves_merge_memory_up_front() {
         let env = Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default());
@@ -20360,11 +20315,9 @@ mod tests {
     /// be queued — and queued for the coarse tier ALONE.
     ///
     /// The single set this replaced subtracted each tier in turn with
-    /// `want.retain(|k| !covered.contains(k))`, which is the UNION, so such a
-    /// day was removed by the fine tier's pass and never enqueued. Prod
-    /// 2026-08-17: the 1m tier held 22-32 days per project while 1h held 2-6,
-    /// and 1h only ever gained days that 1m was ALSO missing — the coarse tier
-    /// could not be backfilled at all for a day the fine tier already had.
+    /// The old code used set union, so a day missing only the coarse tier was removed by the fine
+    /// tier's pass and never enqueued. A day missing only a derived tier must be queued for that tier
+    /// alone, because the derived tier reads the base tier and needs no raw source scan.
     #[test]
     fn a_day_missing_only_the_coarse_tier_is_queued_for_that_tier_alone() {
         let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
@@ -20504,11 +20457,10 @@ mod tests {
         assert_eq!(vals, (0..8).collect::<Vec<_>>(), "every gated partition must yield its row");
     }
 
-    /// Parquet decode is outside every DataFusion pool, so its heap has never
-    /// been measured — a single wide scan's decode exceeded the box's whole
-    /// slack on 2026-07-20. GatedScanExec's permit window IS the decode window,
-    /// so it can account decoded Arrow bytes there. Accounting only: it must
-    /// never refuse a batch.
+    /// Parquet decode is outside every DataFusion pool, so its heap was never measured. A single
+    /// wide scan's decode can exceed the box's whole slack. `GatedScanExec`'s permit window is the
+    /// decode window, so it can account decoded Arrow bytes there. Accounting only: it must never
+    /// refuse a batch.
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_scan_exec_accounts_decoded_bytes() {
         use arrow::array::Int32Array;
@@ -20576,10 +20528,9 @@ mod tests {
 
     /// The hot tier's own reads must not read as memory pressure.
     ///
-    /// Verbatim `memory.stat` from prod 2026-08-15, where charging `active_file`
-    /// put the brake at 88% of an 80 GB budget and starved compaction. Only
-    /// `anon` + kernel is unreclaimable there; the 35.6 GB of file cache is the
-    /// tier being read, and the kernel drops it rather than kill the process.
+    /// Charging `active_file` as pressure put the brake near the budget and starved compaction. Only
+    /// `anon` + kernel is unreclaimable; file cache is the tier being read, and the kernel drops it
+    /// rather than kill the process.
     #[test]
     fn clean_page_cache_is_not_charged_as_memory_pressure() {
         const PROD: &str = "anon 54533181440\nfile 35626905600\nkernel 1233899520\nfile_mapped 526012416\n\
@@ -21183,11 +21134,11 @@ mod tests {
         assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(super::REPAIR_SLICE_TARGET_BYTES));
     }
 
-    /// Prod 2026-08-16 repeatedly selected 511 MiB of sealed sorted runs and
-    /// cancelled the rewrite at 300 seconds. The old 512 MiB target therefore
-    /// made zero durable progress. A physical run must still be at least
-    /// 256 MiB to meet the sealed-file-count contract, so reduce the unit and
-    /// give the conservative 460 KB/s rewrite floor enough time to commit it.
+    /// Coordinator sealed units must fit their deadline and file-count contract.
+    ///
+    /// A target too large was repeatedly cancelled mid-rewrite and made zero durable progress. A
+    /// physical run must still be at least 256 MiB to meet the sealed-file-count contract, so the unit
+    /// is reduced to give the conservative rewrite floor enough time to commit it.
     #[test]
     fn coordinator_sealed_units_fit_their_deadline_and_file_count_contract() {
         const MIB: i64 = 1024 * 1024;
@@ -21290,10 +21241,9 @@ mod tests {
         assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["poison"], "gap rule repairs today");
     }
 
-    /// Scope admission for the hot tail. The sealed-date arm is the 2026-08-06
-    /// regression guard: an unsorted file that survived midnight used to be
-    /// unreachable forever, which forced `full-set` dedup on every query whose
-    /// window crossed that date (prod project 6297304f: 130s vs 0.81s).
+    /// Scope admission for the hot tail. Sealed-date repair exists because an unsorted file that
+    /// survived midnight used to be unreachable forever, forcing full-set dedup on every query whose
+    /// window crossed that date.
     #[test]
     fn hot_bin_admits_repairs_sealed_dates_without_rebinning_them() {
         const TARGET: i64 = 1000; // → converged at 7/8 = 875
@@ -21726,9 +21676,8 @@ mod tests {
         assert_eq!(super::classify_resume(&entry, "logs", 100_000, &live), super::ResumeVerdict::AlreadyLanded);
     }
 
-    /// Stats trimming (2026-07-29): the Add stats column list must be the narrow
-    /// prune set, not the whole 90+ column schema (18.4% of CPU in stats JSON
-    /// parsing), and must never include partition columns.
+    /// The Add stats column list must be the narrow prune set, not the whole schema, and must never
+    /// include partition columns.
     #[test]
     fn stats_columns_are_the_prune_keys_only() {
         let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
@@ -21747,11 +21696,10 @@ mod tests {
 
     /// A repair pass must be bounded by its BUDGET, not by a wave count.
     ///
-    /// Prod 2026-08-10: the whale held 663 footer-less files. A wave serves one
-    /// bin per project, so the old flat `MAX_WAVES = 12` capped a pass at 12
-    /// files per project however much of the 2h24m budget remained — 56 hourly
-    /// passes to converge, against an 18-21 minute process lifetime under deploy
-    /// churn. Packing keeps 12 (short cron, holds the light pool against flush).
+    /// A repair pass must be bounded by its budget, not by a wave count.
+    ///
+    /// A wave serves one bin per project, so a flat wave cap could limit a pass to a handful of
+    /// files per project regardless of how much long budget remained.
     #[test]
     fn repair_waves_are_bounded_by_budget_not_by_the_pack_cap() {
         assert_eq!(super::max_waves(super::TailPass::Pack), 12, "packing's short-cron cap must not change");
@@ -21763,10 +21711,11 @@ mod tests {
         );
     }
 
-    /// Fairness guard for prod 2026-07-29: the old per-project drain gave the
-    /// most-fragmented project all 12 bins before project #2 got its first, so
-    /// on a 5-min cron most projects were never compacted. Every project must
-    /// get its Nth bin before any project gets its (N+1)th.
+    /// Round-robin fairness: every project must get its Nth bin before any project gets its
+    /// (N+1)th.
+    ///
+    /// The old per-project drain gave the most-fragmented project all bins before project #2 got
+    /// its first, so on a short cron most projects were never compacted.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_gives_every_project_a_bin_before_anyone_gets_a_second() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
@@ -21809,13 +21758,11 @@ mod tests {
         );
     }
 
-    /// A dedup sweep that can be cut by its deadline must still reach every
-    /// (date, project) item. Prod 2026-08-12 ran the sweep unbounded — 55+
-    /// minutes on a 5-minute schedule, holding `maintenance_job_sem` and
-    /// skipping 10 consecutive ticks — so bounding it is only safe if the
-    /// remainder is served next tick rather than dropped. A cursor that reset,
-    /// or one applied without the wrap, would re-serve the head forever and
-    /// starve the tail exactly as the unbounded pass starved the drain.
+    /// A dedup sweep cut by its deadline must still reach every `(date, project)` item across
+    /// ticks.
+    ///
+    /// Bounding it is only safe if the remainder is served next tick rather than dropped. A cursor
+    /// that resets, or one applied without wrap, would re-serve the head forever and starve the tail.
     #[test]
     fn a_truncated_dedup_sweep_walks_the_whole_work_list_across_ticks() {
         let (total, per_tick) = (386usize, 40usize); // prod's ~193 projects x 2 dates
@@ -21853,12 +21800,10 @@ mod tests {
         }
     }
 
-    /// The build SQL writes `date = '2026-08-01'` — a STRING literal against a
-    /// Date32 column. Everything above only works if DataFusion's type coercion
-    /// turns that into a `Date32` literal rather than casting the COLUMN to
-    /// Utf8; in the latter shape there is no Date32 literal to read and the fix
-    /// would silently do nothing. Asserted against a real optimized plan rather
-    /// than assumed.
+    /// The build SQL writes `date = '2026-08-01'` — a string literal against a `Date32` column.
+    ///
+    /// The predicate handling only works if DataFusion's type coercion turns the literal into a
+    /// `Date32` value rather than casting the column to `Utf8`. Asserted against a real optimized plan.
     #[tokio::test]
     async fn the_builds_string_date_literal_survives_as_a_date32_window() {
         use datafusion::{
@@ -21896,15 +21841,12 @@ mod tests {
         assert_eq!(window, Some((days * 86_400_000_000, (days + 1) * 86_400_000_000 - 1)));
     }
 
-    /// A rollup build filters `project_id = … AND date = …` and never mentions
-    /// `timestamp`, so the read-dedup skip saw no window, denied `NoWindow`, and
-    /// the scan ran an UNBOUNDED merge-on-read dedup. Prod 2026-08-13: every
-    /// otel_metrics backfill died on `unordered merge-on-read dedup exceeded its
-    /// 2048 MB`, so 207 partitions could never be built at all.
+    /// A rollup build filters on `project_id` and `date`, so the read-dedup skip must treat a date
+    /// equality as a one-day window. Otherwise the skip is denied and the scan runs an unbounded
+    /// merge-on-read dedup.
     ///
-    /// The window must cover its day EXACTLY. Reaching one microsecond into the
-    /// next date would ask `dedup_window_clean` about a date whose certification
-    /// was never established, and it would deny — silently costing the skip.
+    /// The window must cover its day exactly. Reaching one microsecond into the next date would ask
+    /// `dedup_window_clean` about an uncertified date and silently cost the skip.
     #[test]
     fn a_date_partition_equality_is_a_one_day_window() {
         use datafusion::prelude::{col, lit};
@@ -21926,15 +21868,10 @@ mod tests {
         assert_eq!(super::date_partition_window(&[col("timestamp").eq(lit(1_i64))]), None);
     }
 
-    /// A source whose partitions all fail expensively must not starve the
-    /// sources behind it.
+    /// A source whose partitions all fail expensively must not starve the sources behind it.
     ///
-    /// Prod 2026-08-13: one `otel_metrics` backfill tick logged `queued=207
-    /// attempted=3 built=0 failed=3 elapsed_ms=695402` — every attempt dying on
-    /// the 2048 MB merge-on-read dedup cap — and consumed the whole run, so
-    /// `otel_logs_and_spans` (the table the dashboards read, missing 08-12
-    /// entirely) was never reached. Each source has its OWN tick budget, so
-    /// bounding the budget cannot fix this; only rotation can.
+    /// Each source has its own tick budget, so bounding the budget cannot fix this; only rotation can.
+    /// A failing source that consumes the whole run would otherwise leave tables behind it unserved.
     #[test]
     fn a_failing_source_does_not_starve_the_sources_behind_it() {
         let sources = ["otel_metrics", "otel_logs_and_spans", "otel_traces"];
@@ -22581,9 +22518,10 @@ mod tests {
     ///
     /// The set was in-process only, so every boot re-probed thousands of
     /// correctly-sorted files before the walk could reach a poisoned one: prod
-    /// 2026-08-09 logged 626 `footer_repair_suspect_cleared` in 11 minutes while
-    /// restarts came every ~20, and shipbubble's blocking file was never reached
-    /// in six hours. Sound to persist because a Delta object path is immutable.
+    /// Persisted verified-sorted paths must survive a restart and prevent re-probing.
+    ///
+    /// Without persistence, every restart re-probes thousands of correctly sorted files before
+    /// reaching the blocking one. Sound to persist because a Delta object path is immutable.
     #[tokio::test]
     async fn a_verified_sorted_footer_survives_a_restart() -> Result<()> {
         let cfg = create_test_config("verified-sorted-persist");
