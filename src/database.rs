@@ -601,15 +601,11 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incr
     Ok(guard.version())
 }
 
-/// Reconcile table properties existing tables predate, idempotently (no
-/// commit when already set) and best-effort — a failed property commit must
-/// never block table load. Currently retrofits:
-/// - `delta.deletedFileRetentionDuration`: prod tables sat at delta's 7-day
-///   default; the unified checkpoint carried 38.5k Remove tombstones (93% of
-///   its 41.8k actions, 23.6MB) that every snapshot load and refresh replayed.
-/// - `delta.checkpointInterval`: pre-existing tables sat at delta's default
-///   of 100, so boot replay walked up to 100 commit JSONs past the
-///   checkpoint; new tables get the configured interval at creation.
+/// Reconcile table properties existing tables predate, idempotently and best-effort.
+///
+/// A failed property commit must never block table load. Currently retrofits:
+/// - `delta.deletedFileRetentionDuration`: reduce tombstone replay on snapshot load/refresh.
+/// - `delta.checkpointInterval`: new tables get the configured interval at creation.
 pub(crate) async fn ensure_table_properties(table: DeltaTable, desired: HashMap<String, String>) -> DeltaTable {
     let current = table.snapshot().ok().map(|s| s.metadata().configuration().clone()).unwrap_or_default();
     if desired.iter().all(|(k, v)| current.get(k) == Some(v)) {
@@ -2444,15 +2440,13 @@ pub struct Database {
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
     /// pacing. Cleared on success; in-memory only (a restart retries once).
     dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
-    /// Repair candidates whose footer turned out to be SORTED after all, so the
-    /// pass stops re-selecting them. The `delta-rs.optimize.sort_by` tag that
-    /// drives admission is not equivalent to "has a `sorting_columns` footer":
-    /// the flush path sorts and stamps a correct footer WITHOUT the tag, so an
-    /// untagged file is only a *suspect*. Measured on prod 2026-08-08, project
-    /// 6297304f: `date=2026-07-09` is untagged and its footer IS sorted, while
-    /// `2026-07-30` and `2026-07-08` are untagged and genuinely unsorted — so
-    /// admission by tag alone would rewrite a healthy 716 MB file for nothing.
-    /// One footer read per file per process, then it is excluded.
+    /// Repair candidates whose footer turned out to be sorted after all, so the pass stops
+    /// re-selecting them.
+    ///
+    /// The `delta-rs.optimize.sort_by` tag is not equivalent to having a `sorting_columns` footer:
+    /// the flush path sorts and stamps a correct footer without the tag, so untagged means suspect,
+    /// not unsorted. Admission by tag alone would rewrite healthy files. Verified files are excluded
+    /// after one footer read per process.
     repair_verified_sorted: Arc<dashmap::DashSet<String>>,
     /// Serializes appends to the persisted verified-sorted list.
     repair_verified_lock: Arc<std::sync::Mutex<()>>,
@@ -2524,15 +2518,12 @@ pub struct Database {
     /// and skip the checker. A process-wide mutex formerly serialized commits to different Delta
     /// logs needlessly, capping flush throughput.
     commit_locks: DmlLocks,
-    /// Flush/ingest committers currently QUEUED on each table's `commit_locks`
-    /// entry (same key). `tokio::sync::Mutex` is FIFO and every holder is
-    /// bounded, but a backlogged maintenance tick can still park SEVERAL
-    /// minutes-long wave commits (OCC ladders over a big log) ahead of a flush —
-    /// prod 2026-07-30: flush waited >600s to ACQUIRE and its watchdog killed
-    /// the attempt while `commit_lock_timeouts` stayed 0 (nobody hung; flush
-    /// starved in the queue). Durability outranks maintenance, so `commit_wave`
-    /// declines to enqueue while this is nonzero and flush latency is bounded by
-    /// at most ONE in-flight wave commit instead of a queue of them.
+    /// Flush/ingest committers currently queued on each table's `commit_locks` entry.
+    ///
+    /// A backlogged maintenance tick can park long wave commits ahead of a flush, starving it in the
+    /// queue even though no holder hangs. Durability outranks maintenance, so `commit_wave` declines
+    /// to enqueue while this is nonzero and flush latency is bounded by at most one in-flight wave
+    /// commit.
     flush_waiter_counts: FlushWaiterCounts,
     /// Per-table serialization for in-process DML (see `dml_lock`): concurrent
     /// merges on the same table would OCC-conflict and redo full parquet
@@ -5791,15 +5782,13 @@ impl Database {
         self.config.maintenance.timefusion_incremental_snapshot
     }
 
-    /// The process-wide `RuntimeEnv`: one memory pool + parquet-metadata cache
-    /// shared by EVERY session (pgwire, internal SQL, maintenance) so the
-    /// `TIMEFUSION_MEMORY_LIMIT_GB × fraction` cap is a real budget. Memory
-    /// pool: defaults to Greedy (single global cap, no per-consumer slicing)
-    /// for ingest-heavy workloads; opt into FairSpill via
-    /// `TIMEFUSION_MEMORY_POOL=fair_spill`. Maintenance jobs (optimize, dedup,
-    /// recompress) MUST run under this env — the 2026-07-04 crash-loop was the
-    /// dedup sweep materializing chunks in a fresh unpooled session and OOM-
-    /// killing the process instead of erroring.
+    /// The process-wide `RuntimeEnv`: one memory pool + parquet-metadata cache shared by every
+    /// session.
+    ///
+    /// Pool defaults to Greedy for ingest-heavy workloads; opt into FairSpill via
+    /// `TIMEFUSION_MEMORY_POOL=fair_spill`. Maintenance jobs must run under this env so the
+    /// configured memory cap is a real budget; an unpooled session can OOM-kill the process instead
+    /// of erroring.
     fn shared_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.runtime_env
             .get_or_init(|| {
@@ -7139,15 +7128,13 @@ impl Database {
         }
     }
 
-    /// Read the latest commit metadata for each WAL topic and fast-forward the
-    /// walrus persisted-read cursor to `max(local, delta)` per shard. Closes
-    /// the crash-mid-flush window where Delta committed but the watermark advance
-    /// didn't finish — without this, restart replays entries already in Delta
-    /// and the next flush writes them a second time.
+    /// Read the latest commit metadata for each WAL topic and fast-forward the walrus cursor to
+    /// `max(local, delta)` per shard.
     ///
-    /// Must run *before* `recover_from_wal`. Best-effort: any failure to read
-    /// metadata is logged and skipped (walrus's locally-fsynced cursor wins),
-    /// so this can't make recovery worse than today's at-least-once behaviour.
+    /// Closes the crash-mid-flush window where Delta committed but the watermark advance did not
+    /// finish, so restart does not replay entries already in Delta. Must run before
+    /// `recover_from_wal`. Best-effort: failures are logged and skipped, so this cannot make recovery
+    /// worse than at-least-once.
     pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::write::wal::WalManager) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
 
@@ -8199,15 +8186,12 @@ impl Database {
         Ok(())
     }
 
-    /// Cross-flush dedup: collapse a `(project_id, date)` partition by the
-    /// schema's `dedup_keys` (last-write-wins) and write back via
-    /// `replace_where`. No-op on no dedup_keys / no duplicates (avoids
-    /// gratuitous Foyer churn). Returns rows dropped.
-    /// Returns `(rows_dropped, complete)`. `complete=false` means duplicate-
-    /// bearing work was SKIPPED (unsealed chunks, rewrite budget, vanished
-    /// snapshot rows) — the partition must NOT be fingerprinted clean
-    /// (2026-07-05 review: a clean fp over skipped dupes let the read-side
-    /// dedup skip and the COUNT pushdown serve duplicates).
+    /// Cross-flush dedup: collapse a `(project_id, date)` partition by `dedup_keys` and write back
+    /// via `replace_where`. No-op on no dedup_keys or no duplicates.
+    ///
+    /// Returns `(rows_dropped, complete)`. `complete=false` means duplicate-bearing work was skipped
+    /// (unsealed chunks, rewrite budget, vanished snapshot rows) — the partition must not be
+    /// fingerprinted clean, or the read-side dedup skip would serve duplicates.
     pub async fn dedup_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
     ) -> Result<(u64, bool)> {
@@ -14466,15 +14450,14 @@ impl Database {
         }
     }
 
-    /// Reconcile a table's active Add entries against object-store truth and
-    /// commit `Remove` actions for any whose parquet is missing. Repairs
-    /// dangling Adds left by a commit-path parquet deletion (2026-07-09: an
-    /// R2-500 post-commit-hook failure made the flush delete files the landed
-    /// commit referenced). Those rows were re-flushed into fresh files, so the
-    /// Remove is lossless — it just stops queries 404-ing on the dead paths. A
-    /// nonzero removal count means committed data was destroyed elsewhere, so it
-    /// is logged loudly + counted (PAGE-worthy). delta-rs `filesystem_check`
-    /// does the list-and-diff; we only force hooks off and surface the count.
+    /// Reconcile a table's active Add entries against object-store truth and commit `Remove`
+    /// actions for any whose parquet is missing.
+    ///
+    /// Repairs dangling Adds left by a commit-path parquet deletion. The rows were re-flushed into
+    /// fresh files, so the `Remove` is lossless — it just stops queries 404-ing on dead paths. A
+    /// nonzero removal count means committed data was destroyed elsewhere, so it is logged and
+    /// counted. delta-rs `filesystem_check` does the list-and-diff; this forces hooks off and surfaces
+    /// the count.
     async fn reconcile_dangling_adds(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
         let _ = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
         let table = { table_ref.read().await.clone() };
@@ -15981,15 +15964,16 @@ pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) ->
     configured.min(budget_bytes(budget / PACK_BUDGET_FRACTION)).max(1)
 }
 
-/// Sizing + scope knobs for one hot-tail planning pass. Grouped because they
-/// Consecutive staging failures after which a repair candidate stops being offered for the
-/// rest of the process.
+/// Sizing + scope knobs for one hot-tail planning pass.
+
+/// Consecutive staging failures after which a repair candidate stops being offered for the rest
+/// of the process.
 ///
-/// A repair bin is one whole-file sort. If its working set does not fit the resources available
-/// the failure is deterministic, not transient. Without a quarantine that file would be
-/// re-selected identically on every pass and consume the wave, blocking every candidate behind
-/// it. Three attempts, not one, because staging can also fail for genuinely transient reasons
-/// (OCC race, concurrent rewrite, restart mid-stage). A success clears the count.
+/// A repair bin is one whole-file sort. If its working set does not fit, the failure is
+/// deterministic, not transient. Without quarantine that file would be re-selected identically
+/// on every pass and consume the wave. Three attempts, not one, because staging can also fail for
+/// transient reasons (OCC race, concurrent rewrite, restart mid-stage). A success clears the
+/// count.
 const REPAIR_QUARANTINE_AFTER: u32 = 3;
 
 /// Sort parallelism ladder a repair bin is retried at before its pool exhaustion is believed.
@@ -17321,15 +17305,11 @@ impl ProjectRoutingTable {
         }
     }
 
-    /// Selected file bytes above which one scan is worth recording as a
-    /// process-risk candidate. Not a limit: nothing is refused at this size.
+    /// Selected file bytes above which one scan is recorded as a process-risk candidate. Not a
+    /// limit: nothing is refused at this size.
     ///
-    /// Sized as roughly an order of magnitude above the release threshold
-    /// (`timefusion_wide_scan_max_mb`, 64 MB) so it names the genuinely large
-    /// scans rather than every dashboard that misses the fast path. A real one
-    /// measured 1.8 GB of selected files for a ONE-MINUTE window on an
-    /// uncompacted partition (prod 2026-08-17, shipbubble), which is the shape
-    /// that later reached anon-rss 125 GB on a 14-30 day window.
+    /// Sized above the release threshold so it names genuinely large scans rather than every
+    /// dashboard that misses the fast path.
     const WIDE_SCAN_OVERSIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
     /// Wrap a "wide" Delta scan — one reaching further back than the configured
@@ -19228,15 +19208,11 @@ mod writer_properties_tests {
         assert_eq!(p.statistics_enabled(&ColumnPath::from("body")), EnabledStatistics::Chunk);
     }
 
-    /// An exhausted MAINTENANCE pool must name its holders, not just its victim.
+    /// An exhausted maintenance pool must name its holders, not just its victim.
     ///
-    /// Prod 2026-08-09 00:13 reported only `Failed to allocate additional 2.5 MB
-    /// for SortPreservingMergeExec[0] ... 1188.5 KB remain available for the
-    /// total memory pool: fair(pool_size: 22.5 GB)`. The consumer asking for
-    /// 2.5 MB is the starved one; the 22.5 GB was held by something the message
-    /// never named, and hours went into guessing which pass it was. This pins
-    /// the DataFusion contract the fix depends on — a bare pool would report the
-    /// reservation and the total and stop there.
+    /// The error message only names the consumer asking for memory, not the holders of the rest
+    /// of the pool. This pins the DataFusion contract the fix depends on: a bare pool reports the
+    /// reservation and total and stops there, so callers must record who holds what.
     #[test]
     fn an_exhausted_maintenance_pool_names_the_consumers_holding_it() {
         use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer, MemoryPool, TrackConsumersPool};
@@ -19448,13 +19424,9 @@ mod tests {
 
     /// A partition of empty files must not read as coverage.
     ///
-    /// A rollup unit that aggregated nothing still commits a file. Pre-#169 that
-    /// was the normal outcome for history — a derived unit dropped base files it
-    /// could not read slice tags on and published rows=0 — and the resulting
-    /// zero-row partition made the day look COVERED, so it was never rebuilt, so
-    /// it stayed empty. Prod 2026-08-19: `94c5dc1f` had 34 contiguous days of 1m
-    /// tier, a 1h tier missing 2026-08-01..08-13, and a planner reporting
-    /// `queued=1 remaining=0` — blind to every one of those holes.
+    /// A rollup unit that aggregated nothing still commits a file. A zero-row partition made the
+    /// day look covered, so it was never rebuilt and stayed empty. Empty partitions must read as
+    /// uncovered so the coordinator re-queues them.
     #[test]
     fn an_empty_partition_file_is_not_coverage() {
         assert!(super::partition_file_is_empty(Some(0)), "an explicit zero-row file proves nothing was built");
@@ -19669,15 +19641,11 @@ mod tests {
         assert!(super::carried_coverage_tags(&[]).is_empty());
     }
 
-    /// Consolidation admits on SIZE. An untagged-but-large file is not debt.
+    /// Consolidation admits on size. An untagged-but-large file is not debt.
     ///
-    /// The tag `is_sorted_run` reads is not the fact it wants:
-    /// `repair_verified_sorted`'s comment records that the flush path sorts and
-    /// stamps a correct footer WITHOUT the tag, so untagged means *suspect*, not
-    /// unsorted — and Repair footer-checks before rewriting. Consolidation did
-    /// not, so it treated suspicion as proof and re-admitted every partition
-    /// forever. Measured over 381 commits of the prod Delta log: 1,593 of 1,648
-    /// add actions carry no tags at all.
+    /// The sorted-run tag is intent, not fact: the flush path can stamp a sorted footer without the
+    /// tag, so untagged means suspect, not unsorted. Repair footer-checks before rewriting; consolidation
+    /// did not, so it treated suspicion as proof and re-admitted every partition.
     #[tokio::test]
     async fn consolidation_admits_on_size_not_on_a_missing_sort_tag() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskState};
@@ -20215,15 +20183,11 @@ mod tests {
         Ok(())
     }
 
-    /// A tenant's first write must not manufacture a full day of empty and
-    /// future maintenance debt. One dirty hour is six ten-minute source units
-    /// plus one derived hour; dedup is shared by both rollup specs.
+    /// A tenant's first write must not manufacture a full day of empty and future maintenance debt.
     ///
-    /// No HotPacking: file hygiene is planned by DEBT in `plan_compaction_debt`
-    /// (one day-wide unit per project, and only when the partition really has
-    /// small or unsorted files), never per slice. Minting it per ten-minute
-    /// slice made it 22% of the prod journal with a count that tracked ingest
-    /// rather than fragmentation.
+    /// File hygiene is planned by debt in `plan_compaction_debt` (one day-wide unit per project, only
+    /// when the partition really has small or unsorted files), never per slice. Minting it per slice
+    /// made the journal track ingest rather than fragmentation.
     #[tokio::test]
     async fn first_rollup_invalidation_enqueues_only_the_touched_hour() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
