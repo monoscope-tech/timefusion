@@ -103,99 +103,8 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
 /// One bit per hour of a UTC day. `ALL_HOURS` is the conservative value: every
 /// invalidation means it unless the caller can prove a narrower set.
 pub(crate) const ALL_HOURS: u32 = (1 << 24) - 1;
-pub(crate) const ROLLUP_COHORT_MAX_PROJECTS: usize = 64;
-pub(crate) const ROLLUP_COHORT_MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
-pub(crate) const ROLLUP_WAVE_MAX_PROJECTS: usize = 1_024;
-pub(crate) const ROLLUP_WAVE_MAX_ACTIONS: usize = 4_096;
 
-pub(crate) fn commit_wave_ranges(action_counts: &[usize]) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let (mut start, mut actions) = (0, 0usize);
-    for (index, count) in action_counts.iter().copied().enumerate() {
-        let project_limit = index.saturating_sub(start) >= ROLLUP_WAVE_MAX_PROJECTS;
-        let action_limit = index > start && actions.saturating_add(count) > ROLLUP_WAVE_MAX_ACTIONS;
-        if project_limit || action_limit {
-            ranges.push(start..index);
-            start = index;
-            actions = 0;
-        }
-        actions = actions.saturating_add(count);
-    }
-    if start < action_counts.len() {
-        ranges.push(start..action_counts.len());
-    }
-    ranges
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RollupScanProject {
-    pub project_id: String,
-    pub estimated_decoded_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RollupScanCohort {
-    pub projects: Vec<RollupScanProject>,
-    pub estimated_decoded_bytes: u64,
-}
-
-pub(crate) fn pack_scan_cohorts(projects: impl IntoIterator<Item = RollupScanProject>) -> Vec<RollupScanCohort> {
-    let mut cohorts = Vec::new();
-    let mut current = RollupScanCohort { projects: Vec::new(), estimated_decoded_bytes: 0 };
-    for project in projects {
-        let exceeds_count = current.projects.len() >= ROLLUP_COHORT_MAX_PROJECTS;
-        let exceeds_bytes =
-            !current.projects.is_empty() && current.estimated_decoded_bytes.saturating_add(project.estimated_decoded_bytes) > ROLLUP_COHORT_MAX_DECODED_BYTES;
-        if exceeds_count || exceeds_bytes {
-            cohorts.push(current);
-            current = RollupScanCohort { projects: Vec::new(), estimated_decoded_bytes: 0 };
-        }
-        current.estimated_decoded_bytes = current.estimated_decoded_bytes.saturating_add(project.estimated_decoded_bytes);
-        current.projects.push(project);
-    }
-    if !current.projects.is_empty() {
-        cohorts.push(current);
-    }
-    cohorts
-}
-
-pub(crate) fn split_scan_cohort(cohort: RollupScanCohort) -> Option<(RollupScanCohort, RollupScanCohort)> {
-    if cohort.projects.len() < 2 {
-        return None;
-    }
-    let midpoint = cohort.projects.len() / 2;
-    let mut projects = cohort.projects;
-    let right = projects.split_off(midpoint);
-    let make = |projects: Vec<RollupScanProject>| RollupScanCohort {
-        estimated_decoded_bytes: projects.iter().map(|project| project.estimated_decoded_bytes).sum(),
-        projects,
-    };
-    Some((make(projects), make(right)))
-}
 const HOUR_MICROS: i64 = 3_600_000_000;
-
-/// Hours per chunk when a full rebuild is split. 6 → four chunks a day.
-///
-/// The point is the PEAK, not the total: a chunk scans a quarter of the day, so
-/// the aggregate holds a quarter of the groups and the scan a quarter of the
-/// decode. Total work is unchanged. Smaller chunks would bound it further but
-/// each is a separate Delta commit on the partition, and the carry-forward leg
-/// re-reads every already-built row, so the cost grows quadratically in chunk
-/// count.
-pub(crate) const BUILD_CHUNK_HOURS: u32 = 6;
-
-/// Split a whole day into the hour masks a chunked rebuild walks, in ascending
-/// order.
-///
-/// Ascending and CONTIGUOUS matters. Each chunk rebuilds its own hours and
-/// carries every other hour forward from the target, so the masks must partition
-/// the day exactly — overlap double-counts a bucket and a gap drops one, which
-/// is the failure mode `build_partition_sql_ranges` warns about and which no
-/// read-side guard can catch.
-pub(crate) fn build_chunk_masks(chunk_hours: u32) -> Vec<u32> {
-    let chunk_hours = chunk_hours.clamp(1, 24);
-    (0..24).step_by(chunk_hours as usize).map(|start| (start..(start + chunk_hours).min(24)).fold(0u32, |mask, hour| mask | (1 << hour))).collect()
-}
 
 /// The `[start, end)` ranges `hours` marks on the day beginning at `day_start`,
 /// with adjacent hours merged so a contiguous span costs one predicate.
@@ -287,15 +196,6 @@ pub(crate) fn build_partition_sql_ranges(
     ))
 }
 
-/// Aggregate one disjoint time range for a bounded set of projects. Unlike the
-/// per-project incremental SQL this never carries target rows forward: four calls
-/// cover the day and their staged union is the complete replacement.
-pub(crate) fn build_cohort_sql_range(
-    spec: &RollupSpec, source: &str, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64),
-) -> anyhow::Result<String> {
-    build_cohort_sql_range_mode(spec, source, from, project_ids, date, (start, end), from != source)
-}
-
 pub(crate) fn build_cohort_sql_range_mode(
     spec: &RollupSpec, _source: &str, from: &str, project_ids: &[String], date: &str, (start, end): (i64, i64), derived: bool,
 ) -> anyhow::Result<String> {
@@ -346,27 +246,6 @@ pub(crate) fn build_cohort_sql_range_mode(
          GROUP BY {group_by}",
         sql_literal(date)
     ))
-}
-
-pub(crate) fn build_cohort_carry_sql(spec: &RollupSpec, target: &str, date: &str, project_masks: &[(String, u32)], day_start: i64) -> anyhow::Result<String> {
-    if project_masks.is_empty() {
-        anyhow::bail!("rollup carry cohort has no projects");
-    }
-    let dimensions = if spec.dimensions.is_empty() { String::new() } else { format!(", {}", spec.dimensions.join(", ")) };
-    let measures = spec.measures.iter().map(|measure| measure.name.clone()).collect::<Vec<_>>().join(", ");
-    let predicates = project_masks
-        .iter()
-        .map(|(project, mask)| {
-            let dirty = dirty_ranges(day_start, *mask)
-                .into_iter()
-                .map(|(start, end)| format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            format!("(project_id = {} AND NOT ({dirty}))", sql_literal(project))
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    Ok(format!("SELECT project_id, timestamp{dimensions}, {measures} FROM {target} WHERE date = {} AND ({predicates})", sql_literal(date)))
 }
 
 fn generated_bucket_id(bucket: i64, grain: i64, generation: &str, dimensions: &[datafusion::scalar::ScalarValue]) -> String {
@@ -1851,84 +1730,6 @@ mod tests {
     }
 
     #[test]
-    fn selected_raw_view_does_not_turn_raw_measures_into_state_merges() {
-        let spec = spec();
-        let projects = vec!["p".to_owned()];
-        let raw = build_cohort_sql_range_mode(&spec, SOURCE, "__selected_raw", &projects, "2026-08-15", (0, 60_000_000), false).expect("raw SQL");
-        let states = build_cohort_sql_range_mode(&spec, SOURCE, "__states", &projects, "2026-08-15", (0, 60_000_000), true).expect("state SQL");
-        assert!(raw.contains("COUNT(*) AS request_count"), "{raw}");
-        assert!(states.contains("SUM(request_count) AS request_count"), "{states}");
-    }
-
-    /// The chunk masks must PARTITION the day exactly.
-    ///
-    /// Each chunk rebuilds its own hours and carries every other hour forward
-    /// from the target, so an overlap double-counts a bucket and a gap drops
-    /// one. Neither is visible to any read-side guard — the rollup simply
-    /// reports a wrong number forever.
-    #[test]
-    fn chunk_masks_partition_the_day_exactly() {
-        for chunk_hours in [1u32, 2, 5, 6, 7, 24] {
-            let masks = build_chunk_masks(chunk_hours);
-            assert_eq!(masks.iter().fold(0u32, |a, m| a | m), ALL_HOURS, "chunk_hours={chunk_hours}: must cover every hour");
-            assert_eq!(
-                masks.iter().map(|m| m.count_ones()).sum::<u32>(),
-                24,
-                "chunk_hours={chunk_hours}: hours counted twice — a bucket would be double-aggregated"
-            );
-            assert!(masks.iter().all(|m| *m != 0), "an empty chunk would commit a no-op rebuild");
-            assert_eq!(masks.len(), 24usize.div_ceil(chunk_hours as usize));
-        }
-        // Degenerate inputs clamp rather than panic or loop.
-        assert_eq!(build_chunk_masks(0), build_chunk_masks(1));
-        assert_eq!(build_chunk_masks(99), vec![ALL_HOURS]);
-        // The default splits the day into four contiguous six-hour spans.
-        let default = build_chunk_masks(BUILD_CHUNK_HOURS);
-        assert_eq!(default.len(), 4);
-        assert_eq!(dirty_ranges(0, default[0]), vec![(0, 6 * 3_600_000_000)], "a chunk must be ONE contiguous range, not six");
-    }
-
-    /// A chunk's two legs must be exact complements, and four chunks must
-    /// reconstruct the whole day.
-    ///
-    /// Each chunk re-aggregates its own hours and carries every OTHER hour
-    /// forward from the target. If the two predicates ever disagree, a bucket is
-    /// either aggregated twice or dropped — silently, and permanently, since no
-    /// read-side guard re-checks a built rollup.
-    #[test]
-    fn each_chunk_rebuilds_its_hours_and_carries_the_complement() {
-        let spec = spec();
-        let day_start = 1_754_000_000_000_000;
-        let masks = build_chunk_masks(BUILD_CHUNK_HOURS);
-        let mut rebuilt_hours = 0u32;
-
-        for mask in &masks {
-            let ranges = dirty_ranges(day_start, *mask);
-            let sql = build_partition_sql_ranges(&spec, SOURCE, SOURCE, "tgt", "project", "2026-08-01", &ranges).expect("valid SQL");
-            rebuilt_hours |= mask;
-
-            // Both legs are present, and the carried leg reads the TARGET.
-            assert!(sql.contains("UNION ALL"), "a chunk must carry the rest of the day forward: {sql}");
-            assert!(sql.contains("FROM tgt WHERE"), "the carried leg must read the target: {sql}");
-            // The rebuilt leg's predicate and the carried leg's NOT(...) must be
-            // the SAME text — complementarity by construction, not by accident.
-            // Rebuilt from `ranges` rather than scraped out of the SQL: the
-            // measures carry their own `FILTER (WHERE … AND (…))` clauses, so
-            // splitting on " AND (" finds one of those instead.
-            let predicate = ranges
-                .iter()
-                .map(|(start, end)| format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            assert!(sql.contains(&format!("AND ({predicate}) GROUP BY")), "rebuilt leg must filter to the chunk: {sql}");
-            assert!(sql.contains(&format!("AND NOT ({predicate})")), "carried leg must be the exact complement: {sql}");
-            // One contiguous span per chunk, so the predicate stays cheap.
-            assert_eq!(ranges.len(), 1, "a six-hour chunk is one range, not six");
-        }
-        assert_eq!(rebuilt_hours, ALL_HOURS, "the chunks together must rebuild every hour of the day");
-    }
-
-    #[test]
     fn build_sql_uses_exact_count_and_tdigest_states() {
         let sql = build_partition_sql(&spec(), SOURCE, "pro'ject", "2026-08-01").expect("valid SQL");
         assert!(sql.contains("COUNT(duration) AS duration_count"));
@@ -2841,64 +2642,6 @@ mod tests {
             batch.column_by_name("id").expect("id").as_any().downcast_ref::<StringViewArray>().expect("utf8 id").value(0),
             other[0].column_by_name("id").expect("id").as_any().downcast_ref::<StringViewArray>().expect("utf8 id").value(0),
             "generations must not share a dedup identity"
-        );
-    }
-
-    #[test]
-    fn cohort_packing_honors_project_and_byte_caps() {
-        let projects = (0..65).map(|index| RollupScanProject { project_id: format!("p{index}"), estimated_decoded_bytes: 1024 });
-        let cohorts = pack_scan_cohorts(projects);
-        assert_eq!(cohorts.iter().map(|cohort| cohort.projects.len()).collect::<Vec<_>>(), vec![64, 1]);
-
-        let half = ROLLUP_COHORT_MAX_DECODED_BYTES / 2 + 1;
-        let cohorts = pack_scan_cohorts([
-            RollupScanProject { project_id: "a".into(), estimated_decoded_bytes: half },
-            RollupScanProject { project_id: "b".into(), estimated_decoded_bytes: half },
-        ]);
-        assert_eq!(cohorts.len(), 2);
-    }
-
-    #[test]
-    fn commit_waves_honor_project_and_action_caps() {
-        let by_projects = commit_wave_ranges(&vec![1; ROLLUP_WAVE_MAX_PROJECTS + 1]);
-        assert_eq!(by_projects, vec![0..ROLLUP_WAVE_MAX_PROJECTS, ROLLUP_WAVE_MAX_PROJECTS..ROLLUP_WAVE_MAX_PROJECTS + 1]);
-        let by_actions = commit_wave_ranges(&[2_000, 2_000, 100]);
-        assert_eq!(by_actions, vec![0..2, 2..3]);
-        assert_eq!(commit_wave_ranges(&[]), Vec::<std::ops::Range<usize>>::new());
-    }
-
-    #[test]
-    fn cohort_sql_groups_project_id_and_bounds_the_scan() {
-        let sql = build_cohort_sql_range(&spec(), SOURCE, SOURCE, &["project-a".into(), "project'b".into()], "2026-08-15", (10, 20)).expect("cohort SQL");
-        assert!(sql.starts_with("SELECT project_id,"), "project identity must survive aggregation: {sql}");
-        assert!(sql.contains("project_id IN ('project-a', 'project''b')"), "project filter must be bounded and escaped: {sql}");
-        assert!(sql.contains("timestamp >= to_timestamp_micros(10) AND timestamp < to_timestamp_micros(20)"), "range must be half-open: {sql}");
-        assert!(sql.contains("GROUP BY 1, 2"), "project and bucket must both group: {sql}");
-    }
-
-    #[test]
-    fn cohort_carry_sql_keeps_only_clean_hours_per_project() {
-        let sql = build_cohort_carry_sql(&spec(), "rollup_target", "1970-01-01", &[("a".into(), 1), ("b".into(), 1 << 2)], 0).expect("carry SQL");
-        assert!(sql.contains("project_id = 'a' AND NOT ((timestamp >= to_timestamp_micros(0)"), "project a excludes hour zero: {sql}");
-        assert!(sql.contains("project_id = 'b' AND NOT ((timestamp >= to_timestamp_micros(7200000000)"), "project b excludes hour two: {sql}");
-        assert!(sql.starts_with("SELECT project_id, timestamp"), "carry rows retain project identity: {sql}");
-    }
-
-    #[test]
-    fn cohort_split_recomputes_estimates_and_isolates_singletons() {
-        let cohort = RollupScanCohort {
-            projects: (0..5).map(|index| RollupScanProject { project_id: format!("p{index}"), estimated_decoded_bytes: index + 1 }).collect(),
-            estimated_decoded_bytes: 15,
-        };
-        let (left, right) = split_scan_cohort(cohort).expect("splittable cohort");
-        assert_eq!((left.projects.len(), left.estimated_decoded_bytes), (2, 3));
-        assert_eq!((right.projects.len(), right.estimated_decoded_bytes), (3, 12));
-        assert!(
-            split_scan_cohort(RollupScanCohort {
-                projects: vec![RollupScanProject { project_id: "only".into(), estimated_decoded_bytes: 1 }],
-                estimated_decoded_bytes: 1,
-            })
-            .is_none()
         );
     }
 

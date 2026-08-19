@@ -1049,7 +1049,6 @@ const_default!(d_light_schedule: String = "0 */5 * * * *");
 // the same horizon, or a day is certified but never rolled up (or vice versa).
 const_default!(d_rollup_backfill_days: u16 = 35);
 const_default!(d_rollup_backfill_schedule: String = "0 */10 * * * *");
-const_default!(d_rollup_backfill_concurrency: usize = 3);
 const_default!(d_footer_repair_schedule: String = "0 30 * * * *");
 const_default!(d_footer_repair_budget_secs: u64 = 8640);
 const_default!(d_repair_lookback_days: u64 = 31);
@@ -2306,21 +2305,6 @@ pub struct MaintenanceConfig {
     pub timefusion_rollup_backfill_days: u16,
     #[serde(default = "d_rollup_backfill_schedule")]
     pub timefusion_rollup_backfill_schedule: String,
-    /// Backfill units in flight at once.
-    ///
-    /// Serial units were the binding constraint on convergence: prod 2026-08-15
-    /// logged `attempted=2 built=1`, `attempted=3 built=2` and `attempted=1
-    /// built=0` against `queued=355`, i.e. ~3 partitions an hour — five days to
-    /// cover a pool that is invalidated faster than that. One unit that runs to
-    /// its 24-minute deadline and commits nothing consumed the entire tick.
-    ///
-    /// The heavy work stays bounded by `maintenance_rewrite_sem` regardless, so
-    /// this widens how many units can be certifying or waiting, not how much
-    /// Arrow is resident at once. Above the rewrite pool it buys progressively
-    /// less; 3 against the default pool of 2 keeps one unit certifying while two
-    /// rewrite.
-    #[serde(default = "d_rollup_backfill_concurrency")]
-    pub timefusion_rollup_backfill_concurrency: usize,
     /// Skip the read-side DedupExec (and, since 4ecca05, its key projection) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged

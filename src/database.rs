@@ -1729,16 +1729,6 @@ fn is_transient_s3_err(msg: &str) -> bool {
         || msg.contains("timeout")
 }
 
-fn is_rollup_cohort_resource_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("resources exhausted")
-        || message.contains("memory") && (message.contains("limit") || message.contains("allocate"))
-        || message.contains("dedupexec")
-        || message.contains("deadline")
-        || message.contains("timed out")
-        || message.contains("timeout")
-}
-
 /// Synthetic per-row source-file column exposed on the dedup sweep's table
 /// provider (see `dedup_partition`): the targeted rewrite needs to know which
 /// FILES hold the duplicate window's rows so it can commit exact Remove+Add
@@ -1881,7 +1871,6 @@ fn batch_hours(batch: &RecordBatch) -> Option<HashMap<String, u32>> {
 }
 
 const DAY_MICROS: i64 = 86_400_000_000;
-const HOUR_MICROS: i64 = 3_600_000_000;
 
 /// The TF-owned stamp a table's writes overwrite, if it declares one.
 fn tiebreak_of(source: &str) -> Option<&'static str> {
@@ -1963,29 +1952,6 @@ struct StagedUnit {
     adds: Vec<deltalake::kernel::Action>,
     stage_store: Arc<dyn object_store::ObjectStore>,
 }
-
-struct RollupReplaceUnit {
-    project_id: String,
-    source: String,
-    date: String,
-    source_fp: u64,
-    source_epoch: u64,
-    generation: String,
-    covered_through: i64,
-    rows: u64,
-    target_paths: Vec<String>,
-    removes: Vec<deltalake::kernel::Action>,
-    adds: Vec<deltalake::kernel::Action>,
-    stage_store: Arc<dyn object_store::ObjectStore>,
-}
-
-struct RollupCommitWave {
-    table_ref: Arc<RwLock<DeltaTable>>,
-    target: String,
-    units: Vec<RollupReplaceUnit>,
-}
-type RollupStageInput = (String, u64, u64, String, i64, Vec<RecordBatch>);
-const ROLLUP_WAVE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Marks a commit error where landing could NOT be confirmed. The staged
 /// parquet must be left in place (deleting files a landed commit references
@@ -2711,19 +2677,6 @@ pub struct Database {
     /// The hot-tail WAVE engine deliberately does NOT share this semaphore —
     /// see [`Self::light_rewrite_sem`].
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
-    /// Caps concurrent rollup partition builds — and nothing else. SEPARATE
-    /// from `maintenance_rewrite_sem` for the same reason `light_rewrite_sem`
-    /// is (prod 2026-07-30): sharing made two independently-bounded engines
-    /// serialize against each other for no gain.
-    ///
-    /// Here it was mutual. Prod runs the heavy pool at 2, so the backfill could
-    /// never build more than two partitions at once however wide it fanned out
-    /// — against a 355-partition queue draining at ~3/hour — and every permit
-    /// it did take was one compaction could not have, on a box where light
-    /// compaction was already being cut off mid-round. A rollup chunk's peak is
-    /// a 6-hour aggregate, well under a compaction bin rewrite, so it does not
-    /// belong in the pool sized for those.
-    rollup_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent hot-tail WAVE staging (`stage_hot_bin`) — and nothing
     /// else. SEPARATE from `maintenance_rewrite_sem` on purpose: prod
     /// 2026-07-30, one dedup dirty-bin drain held the shared rewrite permits
@@ -2928,11 +2881,6 @@ pub struct Database {
     /// `dedup_table_cursor`: the tick budget is shared across every table, so
     /// without rotation the tail of the table list is never compacted.
     hot_compact_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// Which partition a rollup backfill tick starts with. The first unit runs
-    /// regardless of budget, so a partition too expensive to finish inside one
-    /// process lifetime would otherwise head-of-line block every cheaper one
-    /// behind it, forever.
-    rollup_backfill_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Which SOURCE TABLE a backfill run starts with. Each source gets its own
     /// tick budget, so a run walks them in sequence — and a source whose every
     /// partition fails expensively consumes the whole process lifetime, leaving
@@ -3332,7 +3280,6 @@ impl Database {
 
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.derived.rewrite_permits().max(1);
-        let rollup_rewrite_permits = cfg.maintenance.timefusion_rollup_backfill_concurrency.max(1);
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         // In UNITS, not polls: one reader slot is `DECODE_UNITS_PER_READER`
@@ -3429,7 +3376,6 @@ impl Database {
             repair_failures: Arc::new(dashmap::DashMap::new()),
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
-            rollup_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(rollup_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             // Three quarters to debt, so a quarter of the workers is always free
             // for the rollup chain. Not fewer: file counts left ungoverned is its
@@ -3472,7 +3418,6 @@ impl Database {
             // exactly the starvation the rotation exists to break. Seeding from
             // the clock makes successive PROCESSES start at different offsets,
             // so rotation works across restarts and not merely within one.
-            rollup_backfill_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(rotation_seed())),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
@@ -9562,16 +9507,6 @@ impl Database {
             .unwrap_or_default())
     }
 
-    /// Has the source partition moved out from under an in-flight rebuild?
-    ///
-    /// Both halves matter: the fingerprint catches rows appearing or leaving,
-    /// the epoch catches a DML invalidation that happens to preserve it.
-    async fn rollup_source_changed(&self, project_id: &str, source: &str, date: &str, source_fp: u64, source_epoch: u64, bound: i64) -> Result<bool> {
-        let key = (project_id.to_string(), source.to_string(), date.to_string());
-        Ok(self.rollup_source_fingerprint(project_id, source, date, bound).await? != source_fp
-            || self.rollup_source_epochs.get(&key).map_or(0, |entry| *entry.value()) != source_epoch)
-    }
-
     fn persist_rollup_journal(&self) -> std::io::Result<()> {
         let mut entries: Vec<_> = self
             .rollup_source_epochs
@@ -9899,6 +9834,36 @@ impl Database {
     /// partitions per pass. A whole horizon at once would add tens of thousands
     /// of invalidations to a journal that is already ~18k deep, and the point is
     /// to converge steadily without burying the live frontier.
+    /// Run coordinator rollup units until the queue stops yielding work or
+    /// `max_units` have run. Returns units run.
+    ///
+    /// Production drives these from the worker pool, which is concurrent and
+    /// deadline-bounded and therefore useless to assert against. Tests need a
+    /// synchronous equivalent that ends in a known state, and so does any
+    /// single-unit profiling tool.
+    ///
+    /// Deliberately does NOT plan: `plan_rollup_backfill` dates every unit it
+    /// mints `FINALIZATION_DELAY` into the future, so a caller that plans and
+    /// drains in one breath claims nothing. Plan, advance the clock past the
+    /// delay, then drain.
+    pub async fn drain_coordinator_rollups(&self, max_units: usize) -> Result<usize> {
+        use crate::maintenance_coordinator::Operation;
+        let mut ran = 0;
+        for _ in 0..max_units {
+            let mut progressed = false;
+            for operation in [Operation::BaseRollup, Operation::DerivedRollup] {
+                if self.run_coordinator_rollup_once(operation).await? {
+                    progressed = true;
+                    ran += 1;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(ran)
+    }
+
     pub async fn plan_rollup_backfill(&self) -> Result<usize> {
         /// Newest-first per pass, repeating on the same 60s cadence as
         /// compaction-debt planning.
@@ -11534,49 +11499,6 @@ impl Database {
         Ok(())
     }
 
-    fn rollup_retry_allowed(&self, project_id: &str, source: &str, date: &str) -> bool {
-        get_schema(source).is_none_or(|schema| {
-            schema.rollups.iter().all(|spec| {
-                self.rollup_backoff
-                    .get(&(project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string()))
-                    .is_none_or(|entry| std::time::Instant::now() >= entry.value().1)
-            })
-        })
-    }
-
-    fn record_rollup_failure(&self, project_id: &str, source: &str, date: &str) {
-        const MAX_ROLLUP_RETRIES: usize = 4096;
-        let Some(schema) = get_schema(source) else { return };
-        for spec in &schema.rollups {
-            let key = (project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string());
-            let attempts = self.rollup_backoff.get(&key).map_or(0, |entry| entry.value().0);
-            if attempts > 0 || self.rollup_backoff.len() < MAX_ROLLUP_RETRIES {
-                let attempts = attempts.saturating_add(1);
-                let delay = std::time::Duration::from_secs((600_u64 << attempts.saturating_sub(1).min(7)).min(21_600));
-                self.rollup_backoff.insert(key, (attempts, std::time::Instant::now() + delay));
-            }
-        }
-    }
-
-    fn clear_rollup_backoff(&self, project_id: &str, source: &str, date: &str) {
-        if let Some(schema) = get_schema(source) {
-            for spec in &schema.rollups {
-                self.rollup_backoff.remove(&(project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string()));
-            }
-        }
-    }
-
-    fn rollup_coverage_current(&self, project_id: &str, source: &str, date: &str, source_fp: u64) -> bool {
-        let epoch = self.rollup_source_epochs.get(&(project_id.to_string(), source.to_string(), date.to_string())).map_or(0, |entry| *entry.value());
-        get_schema(source).is_some_and(|schema| {
-            schema.rollups.iter().all(|spec| {
-                self.rollup_coverage
-                    .get(&(project_id.to_string(), source.to_string(), spec.table_name(source), date.to_string()))
-                    .is_some_and(|coverage| coverage.source_fp == source_fp && coverage.source_epoch == epoch)
-            })
-        })
-    }
-
     /// Invalidate only the partitions a DML statement can have changed.
     ///
     /// For merge-on-read tables the caller skips this entirely — the re-appended
@@ -11671,522 +11593,6 @@ impl Database {
             self.invalidate_rollup_hours(project_id, source, &date, hours)?;
         }
         Ok(())
-    }
-
-    /// True iff every (project, date) partition overlapping `window` carries
-    /// a clean fingerprint matching its CURRENT live file set (0-drop sweep
-    /// pass, unchanged since). Shared by the read-side DedupExec skip and the
-    /// COUNT(*) stats pushdown — both need duplicates provably absent.
-    /// Takes the SAME `table` guard the caller will scan/sum from, so the
-    /// fingerprint verdict and the data read share one snapshot (no
-    /// check-then-use window; 2026-07-05 review hardening).
-    async fn stage_rollup_wave(
-        &self, storage_project: &str, source: &str, target: &str, date: &str, inputs: Vec<RollupStageInput>,
-    ) -> Result<RollupCommitWave> {
-        use deltalake::{kernel::Action, writer::DeltaWriter};
-        let started = std::time::Instant::now();
-
-        let table_ref = self.get_or_create_table(storage_project, target).await?;
-        let schema = get_schema(target).ok_or_else(|| anyhow::anyhow!("rollup target `{target}` is not registered"))?;
-        let staging_table = table_ref.read().await.clone();
-        let stage_store = staging_table.log_store().object_store(None);
-        let mut all_batches = Vec::new();
-        let mut rows = HashMap::new();
-        for (project_id, _, _, _, _, batches) in &inputs {
-            rows.insert(project_id.clone(), batches.iter().map(|batch| batch.num_rows() as u64).sum::<u64>());
-            all_batches.extend(batches.iter().cloned());
-        }
-        let (batches, sorted) = self.sort_flush_group(schema, all_batches, UnsortedFallback::Forbid).await?;
-        let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
-            .map_err(|error| anyhow::anyhow!("rollup cohort writer: {error}"))?
-            .with_writer_properties(self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted));
-        let target_schema = writer.arrow_schema();
-        let mut staged = Vec::new();
-        for batch in batches {
-            let batch = batch?;
-            writer.write(deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?).await?;
-            if writer.buffer_len() >= self.config.maintenance.timefusion_writer_max_file_bytes {
-                staged.extend(writer.flush().await?.into_iter().map(Action::Add));
-            }
-        }
-        staged.extend(writer.flush().await?.into_iter().map(Action::Add));
-
-        let live_adds: Vec<_> = staging_table
-            .snapshot()?
-            .log_data()
-            .iter()
-            .map(|add| {
-                #[allow(deprecated)]
-                let action = add.add_action();
-                action
-            })
-            .collect();
-        let mut units = Vec::with_capacity(inputs.len());
-        for (project_id, source_fp, source_epoch, generation, covered_through, _) in inputs {
-            let target_paths = dedup_partition_paths(live_adds.iter().map(|add| add.path.clone()), &project_id, date);
-            let removes = live_adds.iter().filter(|add| target_paths.contains(&add.path)).map(|add| Action::Remove(remove_for_add(add, true))).collect();
-            let project_marker = format!("project_id={project_id}");
-            let mut adds: Vec<_> = staged
-                .iter()
-                .filter(|action| matches!(action, Action::Add(add) if add.path.split('/').any(|segment| segment == project_marker)))
-                .cloned()
-                .collect();
-            for action in &mut adds {
-                if let Action::Add(add) = action {
-                    add.data_change = true;
-                    let mut tags = add.tags.take().unwrap_or_default();
-                    tags.insert(crate::maintenance_coordinator::TAG_SOURCE.to_owned(), Some(source.to_owned()));
-                    tags.insert(crate::maintenance_coordinator::TAG_PROJECT.to_owned(), Some(project_id.clone()));
-                    tags.insert(crate::maintenance_coordinator::TAG_SLICE_START.to_owned(), date_start_micros(date).map(|value| value.to_string()));
-                    tags.insert(crate::maintenance_coordinator::TAG_SLICE_END.to_owned(), Some(covered_through.to_string()));
-                    tags.insert(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT.to_owned(), Some(source_fp.to_string()));
-                    tags.insert(crate::maintenance_coordinator::TAG_GENERATION.to_owned(), Some(generation.clone()));
-                    add.tags = Some(tags);
-                }
-            }
-            units.push(RollupReplaceUnit {
-                project_id: project_id.clone(),
-                source: source.to_string(),
-                date: date.to_string(),
-                source_fp,
-                source_epoch,
-                generation,
-                covered_through,
-                rows: rows.get(&project_id).copied().unwrap_or(0),
-                target_paths,
-                removes,
-                adds,
-                stage_store: Arc::clone(&stage_store),
-            });
-        }
-        let attributed: usize = units.iter().map(|unit| unit.adds.len()).sum();
-        if attributed != staged.len() {
-            Self::cleanup_orphaned_parquet(&stage_store, &staged).await;
-            anyhow::bail!("could not attribute {} of {} staged rollup files to a cohort project", staged.len().saturating_sub(attributed), staged.len());
-        }
-        let stats = crate::observability::maintenance_stats();
-        stats.rollup_staged_projects.fetch_add(units.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        stats.rollup_output_rows.fetch_add(rows.values().sum(), std::sync::atomic::Ordering::Relaxed);
-        stats.rollup_output_files.fetch_add(staged.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let staging_ms = started.elapsed().as_millis() as u64;
-        stats.rollup_staging_duration_ms.fetch_add(staging_ms, std::sync::atomic::Ordering::Relaxed);
-        if let Some(metrics) = crate::observability::registry() {
-            metrics.rollup_output_rows.add(rows.values().sum(), &[]);
-            metrics.rollup_output_files.add(staged.len() as u64, &[]);
-            metrics.rollup_staging_duration_ms.add(staging_ms, &[]);
-        }
-        if let Some(metrics) = crate::observability::registry() {
-            metrics.rollup_staged_projects.add(units.len() as u64, &[]);
-        }
-        Ok(RollupCommitWave { table_ref, target: target.to_string(), units })
-    }
-
-    async fn commit_rollup_wave(&self, wave: RollupCommitWave) -> Result<Vec<RollupReplaceUnit>> {
-        use deltalake::{
-            kernel::{Action, transaction::TableReference},
-            protocol::{DeltaOperation, SaveMode},
-        };
-
-        let started = std::time::Instant::now();
-        let commit_project = wave.units.first().map_or(String::new(), |unit| unit.project_id.clone());
-        let mut changed = Vec::new();
-        let mut current = Vec::new();
-        for unit in wave.units {
-            match self.rollup_source_changed(&unit.project_id, &unit.source, &unit.date, unit.source_fp, unit.source_epoch, unit.covered_through).await {
-                Ok(false) => current.push(unit),
-                Ok(true) | Err(_) => changed.push(unit),
-            }
-        }
-        for unit in &changed {
-            Self::cleanup_orphaned_parquet(&unit.stage_store, &unit.adds).await;
-        }
-        if current.is_empty() {
-            return Ok(Vec::new());
-        }
-        let commit_lock = self.commit_lock(&commit_project, &wave.target).await;
-        for attempt in 0..5 {
-            let commit_guard = commit_lock.lock().await;
-            let _ = refresh_table_snapshot(&wave.table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
-            let mut table = wave.table_ref.read().await.clone();
-            let live: HashSet<String> = table.snapshot()?.log_data().iter().map(|add| add.path().into_owned()).collect();
-            let (fresh, stale): (Vec<_>, Vec<_>) = current.into_iter().partition(|unit| unit.target_paths.iter().all(|path| live.contains(path)));
-            drop(commit_guard);
-            for unit in &stale {
-                Self::cleanup_orphaned_parquet(&unit.stage_store, &unit.adds).await;
-            }
-            if fresh.is_empty() {
-                return Ok(Vec::new());
-            }
-            let commit_guard = commit_lock.lock().await;
-            let _ = refresh_table_snapshot(&wave.table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
-            table = wave.table_ref.read().await.clone();
-            let actions: Vec<Action> = fresh.iter().flat_map(|unit| unit.removes.iter().chain(unit.adds.iter()).cloned()).collect();
-            let action_count = actions.len() as u64;
-            let adds: Vec<Action> = fresh.iter().flat_map(|unit| unit.adds.iter().cloned()).collect();
-            let op = DeltaOperation::Write {
-                mode: SaveMode::Overwrite,
-                partition_by: get_schema(&wave.target).map(|schema| schema.partitions.clone()),
-                predicate: None,
-            };
-            let result =
-                deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                    .with_actions(actions)
-                    .build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op)
-                    .await;
-            match result {
-                Ok(finalized) => {
-                    table.state = Some(finalized.snapshot());
-                    drop(commit_guard);
-                    self.swap_and_refresh_cache(&wave.table_ref, table, None, &[&format!("date={}", fresh[0].date)]).await;
-                    let stats = crate::observability::maintenance_stats();
-                    stats.rollup_shared_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    stats.rollup_commit_actions.fetch_add(action_count, std::sync::atomic::Ordering::Relaxed);
-                    let commit_ms = started.elapsed().as_millis() as u64;
-                    stats.rollup_commit_duration_ms.fetch_add(commit_ms, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(metrics) = crate::observability::registry() {
-                        metrics.rollup_commit_duration_ms.add(commit_ms, &[]);
-                    }
-                    if let Some(metrics) = crate::observability::registry() {
-                        metrics.rollup_shared_commits.add(1, &[]);
-                        metrics.rollup_commit_actions.add(action_count, &[]);
-                    }
-                    return Ok(fresh);
-                }
-                Err(error) if is_occ_conflict_err(&error.to_string()) && attempt < 4 => {
-                    crate::observability::maintenance_stats().rollup_occ_retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(metrics) = crate::observability::registry() {
-                        metrics.rollup_occ_retries.add(1, &[]);
-                    }
-                    drop(commit_guard);
-                    current = fresh;
-                    tokio::time::sleep(occ_backoff(attempt)).await;
-                }
-                Err(error) => {
-                    drop(commit_guard);
-                    match self.probe_commit_landed_bounded(&wave.table_ref, &adds).await {
-                        CommitProbe::Landed => {
-                            crate::observability::maintenance_stats().rollup_ambiguous_landings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(metrics) = crate::observability::registry() {
-                                metrics.rollup_ambiguous_landings.add(1, &[]);
-                            }
-                            return Ok(fresh);
-                        }
-                        CommitProbe::NotLanded => {
-                            for unit in &fresh {
-                                Self::cleanup_orphaned_parquet(&unit.stage_store, &unit.adds).await;
-                            }
-                            return Err(anyhow::anyhow!("rollup wave commit failed: {error}"));
-                        }
-                        CommitProbe::Inconclusive => return Err(anyhow::anyhow!("{INCONCLUSIVE_COMMIT_MARKER}: rollup wave commit failed: {error}")),
-                    }
-                }
-            }
-        }
-        Ok(Vec::new())
-    }
-
-    async fn commit_bounded_rollup_wave(&self, wave: RollupCommitWave) -> Result<Vec<RollupReplaceUnit>> {
-        let counts = wave.units.iter().map(|unit| unit.removes.len().saturating_add(unit.adds.len())).collect::<Vec<_>>();
-        let ranges = crate::rollup::commit_wave_ranges(&counts);
-        let mut units = wave.units.into_iter();
-        let mut landed = Vec::new();
-        for range in ranges {
-            let chunk = units.by_ref().take(range.len()).collect::<Vec<_>>();
-            landed
-                .extend(self.commit_rollup_wave(RollupCommitWave { table_ref: Arc::clone(&wave.table_ref), target: wave.target.clone(), units: chunk }).await?);
-        }
-        Ok(landed)
-    }
-
-    async fn stage_and_commit_rollup_inputs(
-        &self, storage_project: &str, source: &str, target: &str, date: &str, inputs: Vec<RollupStageInput>,
-    ) -> Result<Vec<RollupReplaceUnit>> {
-        let mut inputs = inputs.into_iter();
-        let mut pending: Option<(RollupCommitWave, std::time::Instant)> = None;
-        let mut landed = Vec::new();
-        loop {
-            if pending.as_ref().is_some_and(|(_, since)| since.elapsed() >= ROLLUP_WAVE_MAX_AGE)
-                && let Some((wave, _)) = pending.take()
-            {
-                landed.extend(self.commit_bounded_rollup_wave(wave).await?);
-            }
-            let chunk = inputs.by_ref().take(crate::rollup::ROLLUP_COHORT_MAX_PROJECTS).collect::<Vec<_>>();
-            if chunk.is_empty() {
-                break;
-            }
-            let staged = self.stage_rollup_wave(storage_project, source, target, date, chunk).await?;
-            let staged_at = std::time::Instant::now();
-            let staged_actions: usize = staged.units.iter().map(|unit| unit.removes.len().saturating_add(unit.adds.len())).sum();
-            let must_flush = pending.as_ref().is_some_and(|(wave, _)| {
-                let pending_actions: usize = wave.units.iter().map(|unit| unit.removes.len().saturating_add(unit.adds.len())).sum();
-                wave.units.len().saturating_add(staged.units.len()) > crate::rollup::ROLLUP_WAVE_MAX_PROJECTS
-                    || pending_actions.saturating_add(staged_actions) > crate::rollup::ROLLUP_WAVE_MAX_ACTIONS
-            });
-            if must_flush && let Some((wave, _)) = pending.take() {
-                landed.extend(self.commit_bounded_rollup_wave(wave).await?);
-            }
-            match &mut pending {
-                Some((wave, _)) => wave.units.extend(staged.units),
-                None => pending = Some((staged, staged_at)),
-            }
-        }
-        if let Some((wave, _)) = pending {
-            landed.extend(self.commit_bounded_rollup_wave(wave).await?);
-        }
-        Ok(landed)
-    }
-
-    async fn rebuild_rollup_cohort(&self, storage_project: &str, source: &str, date: &str, cohort: crate::rollup::RollupScanCohort) -> Result<Vec<String>> {
-        let scan_started = std::time::Instant::now();
-        let stats = crate::observability::maintenance_stats();
-        stats.rollup_scan_cohorts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        stats.rollup_scan_projects.fetch_add(cohort.projects.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        stats.rollup_scan_estimated_bytes.fetch_add(cohort.estimated_decoded_bytes, std::sync::atomic::Ordering::Relaxed);
-        if let Some(metrics) = crate::observability::registry() {
-            metrics.rollup_scan_cohorts.add(1, &[]);
-            metrics.rollup_scan_projects.add(cohort.projects.len() as u64, &[]);
-            metrics.rollup_scan_estimated_bytes.add(cohort.estimated_decoded_bytes, &[]);
-        }
-        let Some(schema) = get_schema(source) else { return Ok(Vec::new()) };
-        let day_start = date_start_micros(date).ok_or_else(|| anyhow::anyhow!("invalid rollup date `{date}`"))?;
-        let day_end = day_start.saturating_add(DAY_MICROS);
-        let estimates: HashMap<_, _> = cohort.projects.iter().map(|project| (project.project_id.clone(), project.estimated_decoded_bytes)).collect();
-        let mut state = Vec::with_capacity(cohort.projects.len());
-        for project in &cohort.projects {
-            let bound = self.buffered_layer().and_then(|layer| layer.min_buffered_micros(&project.project_id, source, day_start, day_end)).unwrap_or(day_end);
-            let fp = self.rollup_source_fingerprint(&project.project_id, source, date, bound).await?;
-            let epoch = self.rollup_source_epochs.get(&(project.project_id.clone(), source.to_string(), date.to_string())).map_or(0, |entry| *entry.value());
-            let dirty = self
-                .rollup_dirty
-                .get(&(project.project_id.clone(), source.to_string(), date.to_string()))
-                .map(|entry| *entry.value())
-                .filter(|mask| *mask != 0 && *mask != crate::rollup::ALL_HOURS);
-            state.push((project.project_id.clone(), fp, epoch, bound, dirty));
-        }
-        let mut specs: Vec<_> = schema.rollups.iter().collect();
-        specs.sort_by_key(|spec| spec.derive_from.is_some());
-        let mut active: Vec<String> = state.iter().map(|(project, ..)| project.clone()).collect();
-        for spec in specs {
-            if active.is_empty() {
-                break;
-            }
-            let target = spec.table_name(source);
-            let from = spec
-                .derive_from
-                .as_ref()
-                .and_then(|base| schema.rollups.iter().find(|candidate| candidate.name.as_deref() == Some(base.as_str())))
-                .map_or_else(|| source.to_string(), |base| base.table_name(source));
-            let generations: HashMap<_, _> = state
-                .iter()
-                .filter(|(project, ..)| active.contains(project))
-                .map(|(project, fp, ..)| (project.clone(), crate::rollup::generation_id(spec, source, project, date, *fp)))
-                .collect();
-            // One session per spec wave. Its table registrations are reused by
-            // all four range scans; the derived spec gets a fresh session after
-            // the base wave commits, so it observes that generation.
-            let ctx = self.rollup_maintenance_context()?;
-            let mut shaped: HashMap<String, Vec<RecordBatch>> = active.iter().map(|project| (project.clone(), Vec::new())).collect();
-            let precise: Option<Vec<(String, u32)>> = state
-                .iter()
-                .filter(|(project, ..)| active.contains(project))
-                .map(|(project, _, _, _, dirty)| dirty.map(|mask| (project.clone(), mask)))
-                .collect();
-            let incremental = precise.is_some();
-            if let Some(project_masks) = precise {
-                let mut by_mask: HashMap<u32, Vec<String>> = HashMap::new();
-                for (project, mask) in &project_masks {
-                    by_mask.entry(*mask).or_default().push(project.clone());
-                }
-                for (mask, projects) in by_mask {
-                    let scan_cohorts = crate::rollup::pack_scan_cohorts(projects.into_iter().map(|project_id| crate::rollup::RollupScanProject {
-                        estimated_decoded_bytes: estimates.get(&project_id).copied().unwrap_or(0),
-                        project_id,
-                    }));
-                    for scan_cohort in scan_cohorts {
-                        let projects = scan_cohort.projects.into_iter().map(|project| project.project_id).collect::<Vec<_>>();
-                        for range in crate::rollup::dirty_ranges(day_start, mask) {
-                            let sql = crate::rollup::build_cohort_sql_range(spec, source, &from, &projects, date, range)?;
-                            let rows = ctx.sql(&sql).await?.collect().await?;
-                            for (project, batches) in crate::rollup::to_rollup_batches_by_project(spec, source, date, &generations, &rows)? {
-                                shaped.entry(project).or_default().extend(batches);
-                            }
-                        }
-                    }
-                }
-                for masks in project_masks.chunks(crate::rollup::ROLLUP_COHORT_MAX_PROJECTS) {
-                    let carry_sql = crate::rollup::build_cohort_carry_sql(spec, &target, date, masks, day_start)?;
-                    let carried = ctx.sql(&carry_sql).await?.collect().await?;
-                    for (project, batches) in crate::rollup::to_rollup_batches_by_project(spec, source, date, &generations, &carried)? {
-                        shaped.entry(project).or_default().extend(batches);
-                    }
-                }
-            } else {
-                let scan_cohorts = crate::rollup::pack_scan_cohorts(active.iter().map(|project_id| crate::rollup::RollupScanProject {
-                    project_id: project_id.clone(),
-                    estimated_decoded_bytes: estimates.get(project_id).copied().unwrap_or(0),
-                }));
-                for scan_cohort in scan_cohorts {
-                    let projects = scan_cohort.projects.into_iter().map(|project| project.project_id).collect::<Vec<_>>();
-                    for ranges in crate::rollup::build_chunk_masks(crate::rollup::BUILD_CHUNK_HOURS) {
-                        for range in crate::rollup::dirty_ranges(day_start, ranges) {
-                            let sql = crate::rollup::build_cohort_sql_range(spec, source, &from, &projects, date, range)?;
-                            let rows = ctx.sql(&sql).await?.collect().await?;
-                            for (project, batches) in crate::rollup::to_rollup_batches_by_project(spec, source, date, &generations, &rows)? {
-                                shaped.entry(project).or_default().extend(batches);
-                            }
-                        }
-                    }
-                }
-            }
-            let inputs = state
-                .iter()
-                .filter(|(project, ..)| active.contains(project))
-                .map(|(project, fp, epoch, bound, _)| {
-                    (project.clone(), *fp, *epoch, generations[project].clone(), *bound, shaped.remove(project).unwrap_or_default())
-                })
-                .collect();
-            let landed = self.stage_and_commit_rollup_inputs(storage_project, source, &target, date, inputs).await?;
-            let mut current_landed = Vec::new();
-            for unit in landed {
-                if self.rollup_source_changed(&unit.project_id, source, date, unit.source_fp, unit.source_epoch, unit.covered_through).await.unwrap_or(true) {
-                    continue;
-                }
-                self.rollup_coverage.insert(
-                    (unit.project_id.clone(), source.to_string(), target.clone(), date.to_string()),
-                    RollupCoverage {
-                        source_fp: unit.source_fp,
-                        source_epoch: unit.source_epoch,
-                        generation: unit.generation,
-                        rows: unit.rows,
-                        covered_through: unit.covered_through,
-                    },
-                );
-                let counter = if incremental {
-                    &crate::observability::maintenance_stats().rollup_rebuilds_incremental
-                } else {
-                    &crate::observability::maintenance_stats().rollup_rebuilds_full
-                };
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let hours = if incremental {
-                    state
-                        .iter()
-                        .find(|(project, ..)| project == &unit.project_id)
-                        .and_then(|(_, _, _, _, dirty)| *dirty)
-                        .map_or(0, |mask| u64::from(mask.count_ones()))
-                } else {
-                    u64::try_from(unit.covered_through.saturating_sub(day_start).saturating_add(HOUR_MICROS - 1) / HOUR_MICROS).unwrap_or(0).min(24)
-                };
-                let hours_counter = if incremental { &stats.rollup_incremental_hours_rebuilt } else { &stats.rollup_full_hours_rebuilt };
-                hours_counter.fetch_add(hours, std::sync::atomic::Ordering::Relaxed);
-                if let Some(metrics) = crate::observability::registry() {
-                    if incremental {
-                        metrics.rollup_incremental_hours_rebuilt.add(hours, &[]);
-                    } else {
-                        metrics.rollup_full_hours_rebuilt.add(hours, &[]);
-                    }
-                }
-                info!(project_id = unit.project_id, date, target, rows = unit.rows, cohort_projects = cohort.projects.len(), event = "rollup_partition_built");
-                current_landed.push(unit.project_id);
-            }
-            active = current_landed;
-        }
-        if !active.is_empty() {
-            let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            active.retain(|project| {
-                let key = (project.clone(), source.to_string(), date.to_string());
-                let built_epoch = state.iter().find(|(candidate, ..)| candidate == project).map(|(_, _, epoch, _, _)| *epoch).unwrap_or(0);
-                if self.rollup_source_epochs.get(&key).map_or(0, |epoch| *epoch.value()) != built_epoch {
-                    return false;
-                }
-                self.clear_rollup_backoff(project, source, date);
-                self.rollup_dirty.insert(key, 0);
-                self.rollup_invalidated_at.remove(&(project.clone(), source.to_string(), date.to_string()));
-                true
-            });
-            if let Err(error) = self.persist_rollup_journal() {
-                warn!(source, date, %error, "failed to clear durable cohort invalidations");
-            }
-        }
-        let elapsed_ms = scan_started.elapsed().as_millis() as u64;
-        stats.rollup_scan_duration_ms.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
-        stats.rollup_end_to_end_duration_ms.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
-        if let Some(metrics) = crate::observability::registry() {
-            metrics.rollup_scan_duration_ms.add(elapsed_ms, &[]);
-            metrics.rollup_end_to_end_duration_ms.add(elapsed_ms, &[]);
-        }
-        Ok(active)
-    }
-
-    async fn rebuild_rollup_cohorts(&self, storage_project: &str, source: &str, date: &str, cohorts: Vec<crate::rollup::RollupScanCohort>) -> usize {
-        let mut queue: std::collections::VecDeque<_> = cohorts.into();
-        let mut built = 0;
-        while let Some(cohort) = queue.pop_front() {
-            let projects: Vec<_> = cohort.projects.iter().map(|project| project.project_id.clone()).collect();
-            match self.rebuild_rollup_cohort(storage_project, source, date, cohort.clone()).await {
-                Ok(landed) => {
-                    built += landed.len();
-                    for project in projects.iter().filter(|project| !landed.contains(project)) {
-                        self.record_rollup_failure(project, source, date);
-                    }
-                }
-                Err(error) if cohort.projects.len() > 1 && is_rollup_cohort_resource_error(&error.to_string()) => {
-                    crate::observability::maintenance_stats().rollup_cohort_splits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(metrics) = crate::observability::registry() {
-                        metrics.rollup_cohort_splits.add(1, &[]);
-                    }
-                    if let Some((left, right)) = crate::rollup::split_scan_cohort(cohort) {
-                        warn!(source, date, projects = projects.len(), %error, event = "rollup_cohort_split");
-                        queue.push_front(right);
-                        queue.push_front(left);
-                    }
-                }
-                Err(error) => {
-                    if projects.len() == 1 {
-                        crate::observability::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(metrics) = crate::observability::registry() {
-                            metrics.rollup_singleton_failures.add(1, &[]);
-                        }
-                    }
-                    for project in &projects {
-                        self.record_rollup_failure(project, source, date);
-                    }
-                    warn!(source, date, projects = projects.len(), %error, event = "rollup_cohort_failed");
-                }
-            }
-        }
-        built
-    }
-
-    /// Live DATA fingerprints for every `(project_id, date)` partition, in ONE
-    /// pass over the add actions.
-    ///
-    /// Deliberately NOT a fingerprint of the file list. Rollup coverage asks
-    /// "does this partition still hold the rows the rollup was built from?", and
-    /// the file list answers a different question — it changes whenever
-    /// compaction repacks the partition without touching a single row. Prod ran
-    /// Consolidate 18 times in 40 minutes, so file-identity coverage was
-    /// invalidated continuously and routed queries fell back to raw scans
-    /// forever (2026-08-11).
-    ///
-    /// Row count plus the timestamp span moves on every change that matters and
-    /// on no change that does not: an append raises the count (a merge-on-read
-    /// DELETE is itself an append, so it does too), a physical dedup rewrite
-    /// lowers it, and compaction leaves all three identical.
-    ///
-    /// `partition_file_fp` still backs `dedup_clean_fp`, which genuinely does
-    /// mean "this exact file set" — the two must not be conflated.
-    /// `tiebreak` is the schema's `dedup_tiebreak` — the TF-owned stamp every
-    /// write overwrites. Folding its per-partition MAX into the fingerprint is
-    /// what makes this an identity rather than a statistic: (rows, min_ts,
-    /// max_ts) alone can be preserved by an append paired with a removal, and a
-    /// rollup served across that would be a silently wrong dashboard number.
-    /// The stamp only ever increases, so any append moves it; compaction rewrites
-    /// the same rows and leaves it alone, which is the whole point.
-    /// Whole-partition fingerprints — every file folded in, whatever its
-    /// timestamps. This is the right question for a SEALED partition, and the
-    /// only one the sweep, the backfill's candidate scan and recovery ask.
-    fn partition_fingerprints(table: &DeltaTable, tiebreak: Option<&str>) -> Result<HashMap<(String, String), u64>> {
-        Self::partition_fingerprints_bounded(table, tiebreak, &|_, _| i64::MAX)
     }
 
     /// `bound_for` gives, per (project, date), an EXCLUSIVE upper bound on the row
@@ -12428,160 +11834,6 @@ impl Database {
             self.scan_metrics.record_cert_dwell(prev.since);
         }
         Ok(None)
-    }
-
-    /// Build rollups for sealed past days, newest-first, until the unit budget
-    /// is spent.
-    ///
-    /// Certification only ever reaches today plus the dedup lookback, so
-    /// everything older is invisible to `dedup_today_partitions` and stays
-    /// uncovered forever. Routing needs a contiguous certified prefix from the
-    /// START of the window, so one uncovered old day disqualifies the entire
-    /// query — which is why 7d and 30d windows never routed while 24h did.
-    ///
-    /// Newest-first for the same reason the dedup drain is: recent days are what
-    /// dashboards actually read, and an oldest-first pass spends a whole process
-    /// lifetime on data nobody queries.
-    pub async fn rollup_backfill_tick(&self, source: &str) -> Result<usize> {
-        self.rollup_backfill_tick_for("default", source).await
-    }
-
-    async fn rollup_backfill_tick_for(&self, storage_project: &str, source: &str) -> Result<usize> {
-        let horizon = self.config.maintenance.timefusion_rollup_backfill_days;
-        if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
-            return Ok(0);
-        }
-        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
-            return Ok(0);
-        }
-        let table_ref = self.resolve_table(storage_project, source).await?;
-        let (mut fingerprints, mut decoded_estimates) = {
-            let table = table_ref.read().await;
-            let fingerprints = Self::partition_fingerprints(&table, tiebreak_of(source))?;
-            let mut estimates: HashMap<(String, String), u64> = HashMap::new();
-            for add in table.snapshot()?.log_data().iter() {
-                let path = add.path();
-                let project = path.split('/').find_map(|segment| segment.strip_prefix("project_id=")).unwrap_or("default");
-                let Some(date) = path.split('/').find_map(|segment| segment.strip_prefix("date=")) else { continue };
-                #[allow(deprecated)]
-                let action = add.add_action();
-                let by_rows =
-                    action.get_stats().ok().flatten().map_or(0, |stats| u64::try_from(stats.num_records.max(0)).unwrap_or(0).saturating_mul(4 * 1024));
-                let by_size = u64::try_from(action.size.max(0)).unwrap_or(0).saturating_mul(12);
-                let estimate = estimates.entry((project.to_string(), date.to_string())).or_default();
-                *estimate = estimate.saturating_add(by_rows.max(by_size));
-            }
-            (fingerprints, estimates)
-        };
-        if storage_project != "default" {
-            fingerprints = fingerprints.into_iter().map(|((_, date), fingerprint)| ((storage_project.to_string(), date), fingerprint)).collect();
-            decoded_estimates = decoded_estimates.into_iter().map(|((_, date), bytes)| ((storage_project.to_string(), date), bytes)).collect();
-        }
-
-        let today = Utc::now().date_naive();
-        // TODAY is claimed too, now that a build records the bound it read to
-        // (`RollupCoverage::covered_through`) and is fingerprinted only below
-        // that bound. A flush lands files ABOVE the bound, which no longer moves
-        // the fingerprint, so today's coverage survives the flush that used to
-        // invalidate it within minutes.
-        //
-        // This is the whole point: sealed history already answers a 7-day window
-        // in ~0.3s, but a ROLLING window pays a raw scan for today at roughly a
-        // second per elapsed hour, so by evening it dominates. Covering today up
-        // to the buffer boundary leaves only the last few minutes raw.
-        //
-        // `interiors` clips every covered range at the buffered horizon anyway,
-        // so a partial day needs no special handling on the read side.
-        //
-        // The dedup lookback used to be skipped too, as "the sweep's job". But
-        // the sweep builds a rollup only at its CERTIFICATION point, and
-        // certification is exactly what large tenants can never reach — so
-        // yesterday stayed uncovered for them however long the process ran.
-        // Measured 2026-08-15 after the certification gate came off here:
-        // shipbubble had 08-08..08-13 covered and a 6-day query answered in
-        // 0.35s, while the rolling 7-day window still took 21.3s — all of it the
-        // raw fringe over the ONE uncovered day, yesterday. A rolling window is
-        // the only shape a dashboard sends, so leaving yesterday to a path that
-        // cannot build it forfeits the whole benefit.
-        //
-        // Yesterday is sealed for writes, so its fingerprint is stable; and a
-        // build that does lose the race now aborts at its first chunk.
-        let sealed_from = 0i64;
-        let mut candidates: Vec<(String, chrono::NaiveDate)> = (sealed_from..=sealed_from + horizon as i64)
-            .map(|back| today - chrono::Duration::days(back))
-            .flat_map(|date| {
-                let date_key = date.to_string();
-                fingerprints.keys().filter(move |(_, d)| *d == date_key).map(move |(project, _)| (project.clone(), date)).collect::<Vec<_>>()
-            })
-            .collect();
-        // Why a partition was NOT queued, tallied. An empty candidate list is the
-        // one outcome with no evidence attached: prod 2026-08-12 logged ZERO
-        // backfill ticks for 40 minutes while sealed days 08-01..08-08 held only
-        // the canary project, and "converged" and "the filter dropped everything"
-        // were indistinguishable from outside.
-        let pool = candidates.len();
-        let (mut backoff, mut covered) = (0usize, 0usize);
-        candidates.retain(|(project, date)| {
-            let date_key = date.to_string();
-            if !self.rollup_retry_allowed(project, source, &date_key) {
-                backoff += 1;
-                return false;
-            }
-            let fresh = fingerprints.get(&(project.clone(), date_key.clone())).is_some_and(|fp| !self.rollup_coverage_current(project, source, &date_key, *fp));
-            if !fresh {
-                covered += 1;
-            }
-            fresh
-        });
-        // Newest sealed date first — it is the one a dashboard is most likely to
-        // ask for — then ROTATE, because the first unit runs regardless of budget.
-        // Prod 2026-08-13: the process lifetime was ~50 min and the head partition
-        // took longer than that, so every tick restarted the same unit and NO
-        // partition was ever built (08-12 missing entirely). Rotation costs the
-        // newest date its permanent front-of-queue seat and buys every other
-        // partition a turn at the one slot that is allowed to overrun.
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        rotate_head_window(&mut candidates, self.rollup_backfill_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        if pool > 0 && candidates.is_empty() {
-            info!(source, pool, backoff, covered, event = "rollup_backfill_idle", "every sealed partition was filtered out of the backfill");
-        }
-
-        let mut by_date: std::collections::BTreeMap<chrono::NaiveDate, Vec<crate::rollup::RollupScanProject>> = std::collections::BTreeMap::new();
-        for (project_id, date) in candidates {
-            let estimated_decoded_bytes = decoded_estimates.get(&(project_id.clone(), date.to_string())).copied().unwrap_or(0);
-            by_date.entry(date).or_default().push(crate::rollup::RollupScanProject { project_id, estimated_decoded_bytes });
-        }
-        let mut built = 0;
-        for (date, projects) in by_date.into_iter().rev() {
-            let (oversized, projects): (Vec<_>, Vec<_>) =
-                projects.into_iter().partition(|project| project.estimated_decoded_bytes > crate::rollup::ROLLUP_COHORT_MAX_DECODED_BYTES);
-            for project in oversized {
-                crate::observability::maintenance_stats().rollup_singleton_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(metrics) = crate::observability::registry() {
-                    metrics.rollup_singleton_failures.add(1, &[]);
-                }
-                self.record_rollup_failure(&project.project_id, source, &date.to_string());
-                warn!(
-                    source,
-                    date = %date,
-                    project_id = project.project_id,
-                    estimated_bytes = project.estimated_decoded_bytes,
-                    event = "rollup_cohort_singleton_oversized",
-                    "rollup project exceeds the cohort decoded-input cap"
-                );
-            }
-            let scan_cohorts = crate::rollup::pack_scan_cohorts(projects);
-            let cohorts = scan_cohorts
-                .chunks(crate::rollup::ROLLUP_WAVE_MAX_PROJECTS / crate::rollup::ROLLUP_COHORT_MAX_PROJECTS)
-                .map(|cohorts| {
-                    let projects = cohorts.iter().flat_map(|cohort| cohort.projects.iter().cloned()).collect::<Vec<_>>();
-                    crate::rollup::RollupScanCohort { estimated_decoded_bytes: projects.iter().map(|project| project.estimated_decoded_bytes).sum(), projects }
-                })
-                .collect();
-            let _permit = self.rollup_rewrite_sem.acquire().await.map_err(|error| anyhow::anyhow!("rollup rewrite semaphore closed: {error}"))?;
-            built += self.rebuild_rollup_cohorts(storage_project, source, &date.to_string(), cohorts).await;
-        }
-        Ok(built)
     }
 
     /// Is every partition in the window certified duplicate-free, and if not, why not?
@@ -17835,35 +17087,6 @@ fn pack_sort_partitions(pack_pool_bytes: usize, k: usize, cores: usize) -> usize
     let memory_bound = pack_pool_bytes / (4 * k * DEFAULT_RESERVATION_BYTES);
     let cpu_bound = cores / 2 / k;
     memory_bound.min(cpu_bound).max(MAINTENANCE_MAX_PARTITIONS)
-}
-
-/// Starting offset for the backfill rotation cursors, varying per PROCESS.
-///
-/// `sweep_resume_offset` takes this modulo the work-list length, so any value
-/// spreads; what matters is only that two consecutive processes do not pick the
-/// same one. Seconds-since-epoch does that and is monotonic, so a restart loop
-/// walks forward through the work list rather than re-picking its head.
-fn rotation_seed() -> usize {
-    usize::try_from(crate::support::now_micros().unsigned_abs() / 1_000_000).unwrap_or(0)
-}
-
-/// How many of the newest candidates share the one overrun-allowed slot.
-///
-/// Rotating the WHOLE list would walk 200+ candidates before returning to the
-/// newest date — at 4 units per tick and a 10-minute cron, most of a day — which
-/// throws away the recency priority the sort exists to provide. Rotating only a
-/// head window keeps the tick working on recent dates while still guaranteeing
-/// no single partition owns the slot forever. The window slides on its own:
-/// `candidates` only ever holds partitions that still need work, so a built date
-/// drops out and the next one moves up.
-const BACKFILL_ROTATION_WINDOW: usize = 16;
-
-/// Rotate the newest [`BACKFILL_ROTATION_WINDOW`] candidates by `cursor`,
-/// leaving the rest of the (date-descending) list in place.
-fn rotate_head_window<T>(candidates: &mut [T], cursor: usize) {
-    let window = candidates.len().min(BACKFILL_ROTATION_WINDOW);
-    let head = &mut candidates[..window];
-    head.rotate_left(sweep_resume_offset(window, cursor));
 }
 
 /// Where a deadline-truncated dedup sweep resumes: the served-item cursor
@@ -23399,64 +22622,6 @@ mod tests {
         assert!(seen.iter().all(|s| *s), "a bounded sweep must still cover every partition; the tail was never served");
         // An empty list must not panic on the modulo.
         assert_eq!(super::sweep_resume_offset(0, 7), 0);
-    }
-
-    /// Rotation must survive a RESTART, not merely a tick.
-    ///
-    /// The cursors used to start at 0 on every construction. With prod's ~30-min
-    /// process lifetime and ticks that can take 24, a cursor barely advances
-    /// before the process dies — so every lifetime picked the same head
-    /// partition and the same first source, and the rotation fixes did nothing
-    /// at all. Seeding per process is what makes them work.
-    #[test]
-    fn the_rotation_cursor_starts_somewhere_new_each_process() {
-        let seed = super::rotation_seed();
-        assert!(seed > 0, "a zero seed is the bug this exists to prevent");
-
-        // Two processes a minute apart must not pick the same head of a 16-entry
-        // window — the head-window size the backfill rotates over.
-        let later = seed + 60;
-        let window = super::BACKFILL_ROTATION_WINDOW;
-        assert_ne!(
-            super::sweep_resume_offset(window, seed),
-            super::sweep_resume_offset(window, later),
-            "restarts a minute apart must not re-pick the same head"
-        );
-        // And the offset is always a legal index, whatever the clock says.
-        for len in [1usize, 2, 16, 207] {
-            assert!(super::sweep_resume_offset(len, seed) < len);
-        }
-    }
-
-    /// Rotation must not cost recency. Rotating the WHOLE candidate list would
-    /// walk 200+ entries before coming back to the newest date — at 4 units per
-    /// tick and a 10-minute cron, most of a day — so a dashboard asking for
-    /// yesterday would wait behind a 31-day-old partition. Rotate only a head
-    /// window: recent dates keep the slot, and no single one owns it forever.
-    #[test]
-    fn rotation_shares_the_head_slot_without_reaching_into_old_dates() {
-        let pool: Vec<usize> = (0..207).collect(); // index 0 = newest, as the sort leaves it
-        let window = super::BACKFILL_ROTATION_WINDOW;
-
-        let mut served = std::collections::HashSet::new();
-        for cursor in 0..window * 3 {
-            let mut candidates = pool.clone();
-            super::rotate_head_window(&mut candidates, cursor);
-            served.insert(candidates[0]);
-            assert!(candidates[0] < window, "the overrun slot must stay on recent dates, got index {}", candidates[0]);
-        }
-        assert_eq!(served.len(), window, "every candidate in the window must get a turn at the slot");
-
-        // The tail keeps its date order, so nothing is reordered into the past.
-        let mut candidates = pool.clone();
-        super::rotate_head_window(&mut candidates, 5);
-        assert_eq!(&candidates[window..], &pool[window..], "only the head window may be rotated");
-
-        // Shorter-than-window and empty lists must not panic.
-        let mut short = vec![1, 2, 3];
-        super::rotate_head_window(&mut short, 7);
-        assert_eq!(short.len(), 3);
-        super::rotate_head_window(&mut Vec::<usize>::new(), 3);
     }
 
     /// The window and its CONSUMER must agree: `dedup_window_clean` turns the

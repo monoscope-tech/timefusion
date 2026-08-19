@@ -215,7 +215,13 @@ async fn a_rollup_built_over_an_uncertified_duplicated_partition_matches_the_ded
     let deduped_raw = scalar(format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?;
     assert_eq!(deduped_raw, 3, "precondition: 4 physical rows, 3 distinct ids");
 
-    let built = db.rollup_backfill_tick("otel_logs_and_spans").await?;
+    let built = {
+        // Plan, then step past FINALIZATION_DELAY: units are minted with a
+        // deadline in the future, so draining immediately claims nothing.
+        db.plan_rollup_backfill().await?;
+        timefusion::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?
+    };
     assert!(built > 0, "the backfill must build an UNCERTIFIED partition — that is the whole point of dropping the gate");
 
     let rolled =
@@ -326,7 +332,13 @@ async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_ans
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("b{i}"), 900 + i as i64, midnight + offset)?], true, None).await?;
     }
 
-    let built = db.rollup_backfill_tick("otel_logs_and_spans").await?;
+    let built = {
+        // Plan, then step past FINALIZATION_DELAY: units are minted with a
+        // deadline in the future, so draining immediately claims nothing.
+        db.plan_rollup_backfill().await?;
+        timefusion::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?
+    };
     assert!(built > 0, "the backfill must claim TODAY — otherwise this test proves nothing about partial-day coverage");
 
     let rollup_rows: i64 = {
@@ -2447,17 +2459,32 @@ async fn backfill_covers_sealed_days_and_legacy_coverage_falls_back_after_restar
     };
     assert_eq!(covered(Arc::clone(&db)).await?, 0, "the sweep must NOT reach sealed days — that gap is what the backfill exists to close");
 
-    let built = db.rollup_backfill_tick("otel_logs_and_spans").await?;
-    assert_eq!(built, 2, "the backfill must certify and build both sealed days");
+    let built = {
+        // Plan, then step past FINALIZATION_DELAY: units are minted with a
+        // deadline in the future, so draining immediately claims nothing.
+        db.plan_rollup_backfill().await?;
+        timefusion::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?
+    };
+    // Units run, not days built — the coordinator splits a day across slices,
+    // so only the coverage assertion below states the property. This one just
+    // stops the test passing vacuously on a drain that claimed nothing.
+    assert!(built > 0, "the backfill must actually run units");
     assert_eq!(covered(Arc::clone(&db)).await?, 2, "both sealed spans must be rolled up");
 
-    // Restart over the SAME config (same storage prefix). This legacy writer
-    // did not attach slice identity Add tags, so recovery must not issue a
-    // grouped data scan. Exact reads remain on raw data until tagged slices are
-    // published by the coordinator.
+    // Restart over the SAME config (same storage prefix). Coverage is proved
+    // from the slice identity tags on the Add actions, so what the coordinator
+    // published must still be provable in a process that swept nothing — TF
+    // deploys several times a day and re-earning coverage from scratch each
+    // time is what kept `rollup_min_contiguous_days` pinned near zero.
+    //
+    // This assertion used to require 0, because the builder it covered was the
+    // orphaned `rollup_backfill_tick`, whose output carried no tags. That
+    // writer is gone; requiring its weakness of its replacement would assert
+    // the opposite of what the system needs.
     let restarted = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let recovered = restarted.recover_rollup_coverage("otel_logs_and_spans").await?;
-    assert_eq!(recovered, 0, "untagged legacy coverage must remain unproved after restart");
+    assert!(recovered > 0, "tagged coverage must survive a restart without a fresh sweep");
     Ok(())
 }
 
