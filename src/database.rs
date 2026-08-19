@@ -10032,17 +10032,50 @@ impl Database {
             // replace it: every task start for 30 minutes was today's, rollup
             // coverage froze at three days, and 7d/14d queries fell back to a
             // full raw scan (`rollup_miss_not_built`).
-            {
+            //
+            // Scoped to the TABLE, not the day. A day is not one unit of rollup
+            // work — it is one per tier plus a dedup — and they are independent:
+            // the 1h tier's unit reads the 1m TIER, so a pending unit for the 1m
+            // tier says nothing about whether the 1h tier can be planned.
+            //
+            // Keyed on the day alone, one pending ten-minute frontier BaseRollup
+            // slice vetoed every tier of that whole day. With ~47,000 pending
+            // BaseRollup tasks — overwhelmingly frontier slices — that vetoed
+            // essentially every day, so the derived tier could never be planned
+            // at all. Prod 2026-08-19 01:30 UTC with all of #181-#191 live: the
+            // planner reported `queued=2 remaining=0` while `94c5dc1f` sat at 34
+            // days of 1m tier against 17 of 1h, and ZERO sealed-day derived units
+            // were claimed in 25 minutes — all 84 derived claims were frontier
+            // hours, because no historical derived task had ever been created.
+            //
+            // This is the same over-broad-veto bug the comment above records
+            // being fixed once already (file debt disqualifying a day forever),
+            // one level finer: narrowing from "any task" to "any rollup task"
+            // was not narrow enough, because the rollup tiers do not block each
+            // other either.
+            //
+            // The original rationale is also spent: it names `invalidate`'s
+            // `deadline.max(...)` pushing an eligible task out of reach, but this
+            // planner enqueues day-sized units through `enqueue`, which takes
+            // `deadline.min(...)` and can only pull a deadline IN.
+            let queued_tables: HashSet<(String, chrono::NaiveDate, String)> = {
                 let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let queued: HashSet<(String, chrono::NaiveDate)> = journal
+                journal
                     .tasks()
                     .filter(|task| task.key.source == source && crate::maintenance_coordinator::blocks_rollup_backfill(task))
                     .filter_map(|task| {
-                        chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| (task.key.project_id.clone(), time.date_naive()))
+                        chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
+                            .map(|time| (task.key.project_id.clone(), time.date_naive(), task.key.physical_table.clone()))
                     })
-                    .collect();
-                want.retain(|key| !queued.contains(key));
-            }
+                    .collect()
+            };
+            // A cell is still wanted while ANY of its missing tiers is unqueued;
+            // the per-table tests at the enqueue sites decide which to mint.
+            want.retain(|(project_id, date)| {
+                missing_tiers.get(&(project_id.clone(), *date)).is_some_and(|missing| {
+                    missing.iter().any(|index| !queued_tables.contains(&(project_id.clone(), *date, schema.rollups[*index].table_name(&source))))
+                })
+            });
             // The days just filtered out are the ones that most need the proof:
             // a derived unit blocked by `dependencies_complete` stays queued
             // forever, which makes its day permanently ineligible for the
@@ -10144,7 +10177,7 @@ impl Database {
                     // derived tier needs no source scan and no dedup — which is
                     // the common case here: 1m is 22-32 days deep while 1h is
                     // 2-6, so most queued days need the coarse tier alone.
-                    if needs_source_scan {
+                    if needs_source_scan && !queued_tables.contains(&(project_id.clone(), *date, source.clone())) {
                         enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup, false);
                     }
                     for index in missing {
@@ -10170,8 +10203,12 @@ impl Database {
                         // mints it per hour with its base slices right there in
                         // the journal), so it loses nothing and keeps the strict
                         // check where the strict check is cheap and correct.
+                        let physical_table = spec.table_name(&source);
+                        if queued_tables.contains(&(project_id.clone(), *date, physical_table.clone())) {
+                            continue;
+                        }
                         let base_proven = operation == crate::maintenance_coordinator::Operation::DerivedRollup && !needs_source_scan && *date < today;
-                        enqueue(spec.table_name(&source), operation, base_proven);
+                        enqueue(physical_table, operation, base_proven);
                     }
                     queued = queued.saturating_add(1);
                 }
@@ -20698,6 +20735,69 @@ mod tests {
         // applies, so ordinary frontier work keeps retrying promptly.
         let sealed = TimeSlice::new(0, HOUR).expect("sealed slice");
         assert_eq!(super::buffered_source_retry_delay(sealed, now).as_secs(), 5, "an already-sealed slice keeps the fast retry");
+    }
+
+    /// A pending unit for ONE tier must not veto planning another tier of the
+    /// same day.
+    ///
+    /// A day is not one unit of rollup work — it is one per tier plus a dedup,
+    /// and they are independent: the 1h tier reads the 1m TIER, so a pending 1m
+    /// unit says nothing about whether 1h can be planned. Keyed on the day
+    /// alone, one pending ten-minute frontier BaseRollup slice vetoed every tier
+    /// of that day, and with ~47,000 pending BaseRollup tasks that was
+    /// essentially every day.
+    ///
+    /// Prod 2026-08-19 01:30 UTC with #181-#191 all live: the planner reported
+    /// `queued=2 remaining=0` while `94c5dc1f` sat at 34 days of 1m tier against
+    /// 17 of 1h, and ZERO sealed-day derived units were claimed in 25 minutes —
+    /// all 84 derived claims were frontier hours, because no historical derived
+    /// task had ever been created.
+    #[tokio::test]
+    async fn a_queued_unit_for_one_tier_does_not_veto_planning_another() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
+        let mut cfg = (*create_test_config("per-tier-veto")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let project = format!("veto_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        db.insert_records_batch(
+            &project,
+            "otel_logs_and_spans",
+            vec![json_to_batch(vec![test_span_ts("a", "op", &project, day.timestamp_micros())])?],
+            true,
+            None,
+        )
+        .await?;
+
+        // Exactly the prod shape: the day carries a pending frontier slice for
+        // ONE tier, and nothing at all for the others.
+        let blocking_table = {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in &keys {
+                journal.complete(key);
+            }
+            let blocking = keys.iter().find(|key| key.operation == Operation::BaseRollup).cloned().expect("the write path queues a base rollup for the day");
+            let start = day.date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+            journal.enqueue(TaskKey { slice: TimeSlice::new(start, start + 600_000_000)?, ..blocking.clone() }, 0, 0, 0);
+            blocking.physical_table
+        };
+
+        db.plan_rollup_backfill().await?;
+
+        let (blocked, others) = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            let day_tasks: Vec<_> = journal
+                .tasks()
+                .filter(|task| task.key.project_id == project && task.state != crate::maintenance_coordinator::TaskState::Complete)
+                .map(|task| task.key.physical_table.clone())
+                .collect();
+            (day_tasks.iter().filter(|t| **t == blocking_table).count(), day_tasks.iter().filter(|t| **t != blocking_table).count())
+        };
+        assert_eq!(blocked, 1, "the tier that already has work queued must not be enqueued twice");
+        assert!(others > 0, "a sibling tier of the same day must still be planned, got {others}");
+        Ok(())
     }
 
     /// While coverage is short, the goal outranks the ceiling.
