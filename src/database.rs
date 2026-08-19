@@ -933,9 +933,10 @@ fn build_optimize_session_state_tuned(
 /// Equal to the 30d dashboard goal: 30 means a 30d panel is fully answerable.
 const CONTIGUITY_HORIZON_DAYS: u64 = 30;
 
+/// `(worst, worst_project, median)` contiguous answered days across projects.
 fn min_contiguous_days<'a>(
     covered: &HashSet<(String, chrono::NaiveDate)>, source: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&'a str>,
-) -> (u64, Option<&'a str>) {
+) -> (u64, Option<&'a str>, u64) {
     // A day the SOURCE never held counts as covered. A rollup cannot exist for
     // rows that do not exist, and a query over that day correctly returns
     // nothing whether or not a tier partition is there — so an absent day is
@@ -960,7 +961,7 @@ fn min_contiguous_days<'a>(
     // row: without a cap a quiet tenant scores the age of the epoch. 30 is the
     // goal itself, so the gauge reads as progress toward it and saturates exactly
     // when a 30d panel is fully answerable.
-    active_projects
+    let mut per_project = active_projects
         .iter()
         .map(|project| {
             let days = (1u64..=CONTIGUITY_HORIZON_DAYS)
@@ -968,10 +969,28 @@ fn min_contiguous_days<'a>(
                 .count() as u64;
             (days, Some(*project))
         })
-        // Tie-break on the name so the reported laggard is stable across sweeps
-        // rather than flipping between equally-bad projects.
-        .min_by_key(|(days, project)| (*days, *project))
-        .unwrap_or((0, None))
+        .collect::<Vec<_>>();
+    // Tie-break on the name so the reported laggard is stable across sweeps
+    // rather than flipping between equally-bad projects.
+    let (worst_days, worst) = per_project.iter().copied().min_by_key(|(days, project)| (*days, *project)).unwrap_or((0, None));
+    // The MEDIAN alongside it, because the minimum is the honest goal metric and
+    // a terrible control signal.
+    //
+    // `coverage_is_short` selects `CYCLE_COVERAGE_SHORT`, which gives Dedup 1 of
+    // 10 slots instead of 3 — and Dedup is what certifies partitions, without
+    // which every query is a hybrid that scans raw. Prod 2026-08-19 measured the
+    // whole chain: `5ce1c976` holds ONE file per day at 0.00 GB and has zero
+    // rows in the 1h tier, so it scored 2 and pinned the fleet, while shipbubble
+    // sat at 12/14 and otel_metrics' 1m tier had reached the full 30. One
+    // negligible tenant therefore held the entire fleet in coverage-short mode
+    // indefinitely, starving the very operation that would end it.
+    //
+    // The minimum still gets published as the goal — "can EVERY tenant answer a
+    // 30d panel" is the right thing to aim at. It is just not the right thing to
+    // steer by, because a single outlier can pin it forever.
+    per_project.sort_unstable_by_key(|(days, _)| *days);
+    let median = per_project.get(per_project.len() / 2).map_or(0, |(days, _)| *days);
+    (worst_days, worst, median)
 }
 
 /// Which declared tiers each candidate day is MISSING.
@@ -1786,7 +1805,20 @@ pub const COVERAGE_SHORT_DAYS: u64 = 14;
 /// yesterday. That is exactly the number a 14d/30d query needs, and it is
 /// already computed once per backfill sweep, so this costs an atomic load.
 fn coverage_is_short() -> bool {
-    crate::observability::maintenance_stats().rollup_min_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
+    // The MEDIAN, not the minimum. The minimum is the goal metric — "can every
+    // tenant answer a 30d panel" is the right thing to aim at — and a terrible
+    // control signal, because one negligible tenant pins it forever.
+    //
+    // Prod 2026-08-19 measured the full chain: `5ce1c976` holds ONE file per day
+    // at 0.00 GB and has zero rows in the 1h tier, so it scored 2 and pinned the
+    // fleet gauge, while shipbubble was at 12/14 and otel_metrics' 1m tier had
+    // reached the full 30. That kept `CYCLE_COVERAGE_SHORT` selected
+    // indefinitely, which gives Dedup 1 of 10 slots instead of 3 — and Dedup is
+    // what certifies partitions. Without certification `rollup_hits_full_total`
+    // stays 0, every query is a hybrid that unions a raw scan, and a 7d
+    // aggregate over fully compacted, fully rolled-up days still timed out at
+    // 60s. One trivial tenant was holding the whole fleet's query latency.
+    crate::observability::maintenance_stats().rollup_median_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
 }
 
 /// Sort and coalesce half-open ranges, merging any that touch or overlap.
@@ -10199,7 +10231,11 @@ impl Database {
                 // the window sends it to a raw scan — which is why `MIN(date)`
                 // and `tasks_pending` both read as progress on 2026-08-17 while
                 // 14d/30d queries stayed unroutable.
-                let (contiguous, worst_project) = min_contiguous_days(&covered, &source_partitions, today, &active_projects);
+                let (contiguous, worst_project, median_contiguous) = min_contiguous_days(&covered, &source_partitions, today, &active_projects);
+                let median_gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
+                let previous_median = median_gauge.load(std::sync::atomic::Ordering::Relaxed);
+                median_gauge
+                    .store(if first_tier_of_sweep { median_contiguous } else { previous_median.min(median_contiguous) }, std::sync::atomic::Ordering::Relaxed);
                 let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
                 let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
                 // Every tier folds into one number, so take the worst; reset
@@ -20592,7 +20628,7 @@ mod tests {
                 );
             }
         }
-        let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
+        let gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
         let restore = gauge.load(Relaxed);
         gauge.store(30, Relaxed);
         let healthy = db.plan_rollup_backfill().await?;
@@ -20611,7 +20647,7 @@ mod tests {
     /// ceiling — and the live frontier alone keeps it above that indefinitely —
     /// so `plan_rollup_backfill` returned at its first statement every 60s for
     /// hours. That silently took THREE other things with it, none of which mint
-    /// any work: the `rollup_min_contiguous_days` gauge that `coverage_is_short`
+    /// any work: the `rollup_median_contiguous_days` gauge that `coverage_is_short`
     /// reads to weight the entire scheduling cycle (stale at 0 the whole time),
     /// the per-project `rollup_coverage_contiguity` log, and #186's base-tier
     /// proof for already-queued derived units.
@@ -20645,7 +20681,7 @@ mod tests {
                 );
             }
         }
-        let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
+        let gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
         let restore = gauge.load(Relaxed);
         // A value the pass cannot legitimately produce for this fixture, so only
         // a pass that actually RAN can overwrite it.
@@ -20871,6 +20907,48 @@ mod tests {
         Ok(())
     }
 
+    /// One negligible tenant must not pin the control signal.
+    ///
+    /// `min_contiguous_days` returns the worst project — the honest GOAL metric,
+    /// "can every tenant answer a 30d panel" — and the median, which is what
+    /// `coverage_is_short` steers by. Prod 2026-08-19: `5ce1c976` holds one file
+    /// per day at 0.00 GB and has zero rows in the 1h tier, so it scored 2 and
+    /// pinned the fleet while shipbubble was at 12/14 and otel_metrics' 1m tier
+    /// had reached the full 30. That held `CYCLE_COVERAGE_SHORT` selected
+    /// indefinitely, giving Dedup 1 of 10 slots instead of 3 — and Dedup is what
+    /// certifies partitions, without which every query unions a raw scan.
+    #[test]
+    fn a_single_lagging_tenant_pins_the_goal_but_not_the_control_signal() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 20).expect("date");
+        let day = |back: u64| today.checked_sub_days(chrono::Days::new(back)).expect("date");
+        // Four healthy tenants covered for 10 days back, one laggard covered for 2.
+        let healthy = ["a", "b", "c", "d"];
+        let mut covered = HashSet::new();
+        let mut source = HashSet::new();
+        // Source rows on every day in the horizon, so a project's score is
+        // decided by COVERAGE rather than running off the end of its data — a
+        // day the source never held counts as answered.
+        for back in 1..=CONTIGUITY_HORIZON_DAYS {
+            for project in healthy.into_iter().chain(std::iter::once("laggard")) {
+                source.insert((project.to_owned(), day(back)));
+            }
+        }
+        for back in 1..=10 {
+            for project in healthy {
+                covered.insert((project.to_owned(), day(back)));
+            }
+        }
+        for back in 1..=2 {
+            covered.insert(("laggard".to_owned(), day(back)));
+        }
+        let active: HashSet<&str> = healthy.into_iter().chain(std::iter::once("laggard")).collect();
+
+        let (worst, worst_project, median) = min_contiguous_days(&covered, &source, today, &active);
+        assert_eq!(worst, 2, "the goal metric still reports the worst tenant");
+        assert_eq!(worst_project, Some("laggard"), "and still names it");
+        assert_eq!(median, 10, "the control signal must reflect the fleet, not its worst member");
+    }
+
     /// A long-sealed fragmented partition must be aged from its SEAL time.
     ///
     /// `scheduling_class` escalates work that has waited past
@@ -21027,7 +21105,7 @@ mod tests {
     #[test]
     fn the_reweighting_switches_off_once_coverage_is_healthy() {
         use std::sync::atomic::Ordering::Relaxed;
-        let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
+        let gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
         let restore = gauge.load(Relaxed);
         gauge.store(0, Relaxed);
         assert!(coverage_is_short(), "zero contiguous days is short");

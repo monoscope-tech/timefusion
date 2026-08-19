@@ -1031,6 +1031,7 @@ impl StatsTableProvider {
             "rollup_skipped_covered_by_wider" => m.rollup_skipped_covered_by_wider,
             "rollup_untagged_inputs" => m.rollup_untagged_inputs,
             "rollup_min_contiguous_days" => m.rollup_min_contiguous_days,
+            "rollup_median_contiguous_days" => m.rollup_median_contiguous_days,
             "rollup_oldest_invalidation_age_seconds" => m.rollup_oldest_invalidation_age_secs,
             "rollup_scan_cohorts_total" => m.rollup_scan_cohorts,
             "rollup_scan_projects_total" => m.rollup_scan_projects,

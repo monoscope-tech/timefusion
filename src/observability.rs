@@ -748,6 +748,7 @@ atomic_stats! {
     /// raw scan. Minimised, not averaged: a single uncovered project is a
     /// customer whose dashboard is slow.
     rollup_min_contiguous_days,
+    rollup_median_contiguous_days,
     rollup_oldest_invalidation_age_secs,
     rollup_scan_cohorts,
     rollup_scan_projects,
