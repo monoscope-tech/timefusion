@@ -735,6 +735,44 @@ rollup builds planned at 48 partitions OOM-killed prod four times in ninety
 minutes on 2026-08-13. That lever is closed; the file count is the one that is
 open.
 
+### After the ceiling opened: the frontier took every derived claim (#189)
+
+#188 landed and the planner ran for the first time:
+`rollup_derived_base_tier_proven` fired with **proven=175** and **proven=212** —
+387 historical derived units unblocked. Throughput went to `tasks_complete`
+**+84.9/min** and `rollup_output_rows_total` **+259,702/min**.
+
+And the 1h tier day count still did not move for any project. Every derived unit
+claimed in the following twelve minutes was a **one-hour frontier slice for today
+or yesterday**:
+
+```
+19  8100121c  2026-08-18  width=60min
+ 6  87576849  2026-08-17  width=60min
+ 5  6297304f  2026-08-17  width=60min
+```
+
+Class is strict priority and ingest regenerates the frontier continuously, so a
+sealed unit runs only on a reserved turn — and that reservation *halves* to
+one-in-four exactly when the frontier is behind, which it is. So the units that
+had just been unblocked could still never be claimed.
+
+#189 gives `DerivedRollup` a standing sealed reservation. The reservation exists
+to stop sealed work starving the frontier, and for derived that premise does not
+hold: the frontier mints derived work at `DERIVED_SLICE_MICROS` — one unit per
+stream per HOUR, ~24/day — against 144 Dedup + 144 BaseRollup for the same
+stream-day. Derived is ~3% of frontier creation, so preferring sealed for it
+cannot meaningfully starve the frontier, while it is the only operation whose
+sealed backlog directly builds the tier the goal is stated in.
+
+**Four fixes deep, the same shape each time:** the work was queued, every gauge
+said it was pending and eligible, and a predicate decided it would never run.
+Capacity (#181), backoff (#182), dependency (#184–#186), admission (#188), and
+now priority (#189). Each one was invisible until the previous was removed —
+which is the real lesson: **these do not show up in parallel, they queue behind
+each other**, so "measure, fix one, re-measure" is not merely good practice here,
+it is the only method that terminates.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
