@@ -1774,8 +1774,10 @@ impl PartitionStats {
 ///
 /// A 14d panel is the most common wide dashboard window and the cheapest useful
 /// target; 30d follows once 14 holds. Set at the goal rather than at 1 so the
-/// weighting does not flap the moment the first day lands.
-const COVERAGE_SHORT_DAYS: u64 = 14;
+/// weighting does not flap the moment the first day lands. Pub for the journal
+/// simulator (`maintenance_sim`), which drives the same switch from its own
+/// contiguity model.
+pub const COVERAGE_SHORT_DAYS: u64 = 14;
 
 /// Is contiguous rollup coverage short enough to be worth reweighting for?
 ///
@@ -2966,6 +2968,43 @@ fn fair_tantivy_backfill_work(mut queues: Vec<(String, VecDeque<(String, String)
         if !added {
             return work;
         }
+    }
+}
+
+/// What a single `run-unit` execution produced. The phase counters are deltas
+/// of the global `maintenance_stats` atomics over the unit's run; the CLI owns
+/// the process, so nothing else is moving them.
+pub struct UnitRunReport {
+    pub operation: crate::maintenance_coordinator::Operation,
+    pub project_id: String,
+    pub date: chrono::NaiveDate,
+    pub wall_ms: u64,
+    pub scan_ms: u64,
+    pub staging_ms: u64,
+    pub commit_ms: u64,
+    pub end_to_end_ms: u64,
+    pub cohorts: u64,
+    pub state: Option<crate::maintenance_coordinator::TaskState>,
+    pub retry_reason: Option<String>,
+}
+
+impl std::fmt::Display for UnitRunReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "run-unit: {:?} {} {} | wall {}ms | scan {}ms staging {}ms commit {}ms e2e {}ms | cohorts {} | state {:?}{}",
+            self.operation,
+            self.project_id,
+            self.date,
+            self.wall_ms,
+            self.scan_ms,
+            self.staging_ms,
+            self.commit_ms,
+            self.end_to_end_ms,
+            self.cohorts,
+            self.state,
+            self.retry_reason.as_deref().map_or(String::new(), |reason| format!(" | retry_reason {reason}")),
+        )
     }
 }
 
@@ -9650,31 +9689,58 @@ impl Database {
                 continue;
             }
             let cursor = current_cursor.expect("missing cursor handled above");
-            let mut partitions = HashSet::new();
+            // Per partition, the hours the missed commits can have touched —
+            // derived from the Add actions' timestamp stats. The naive form
+            // invalidated ALL_HOURS per changed partition: a unified-table
+            // flush commit names every active project, so EVERY restart
+            // re-enqueued ~312 durable tasks per active stream AND reset the
+            // day's completed frontier work to Pending (`invalidate` upsert
+            // semantics). Measured 2026-08-18 across the 14:05 OOM boot:
+            // +5,876 pending base rollups in one hour from ONE restart — the
+            // queue's dominant growth source under deploy churn.
+            let mut partition_hours: HashMap<(String, String), u32> = HashMap::new();
             for commit_version in cursor.saturating_add(1)..=version {
                 let bytes = log_store
                     .read_commit_entry(commit_version)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("source commit {commit_version} is unavailable for {cursor_key}; cursor remains at {cursor}"))?;
+                let mut partitions_with_adds = HashSet::new();
+                let mut remove_only: HashSet<(String, String)> = HashSet::new();
                 for action in deltalake::logstore::get_actions(commit_version, &bytes)? {
-                    let changed = match action {
+                    match action {
                         deltalake::kernel::Action::Add(add) if add.data_change => {
-                            Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values))
+                            let Some(partition) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values)) else { continue };
+                            let mask = chrono::NaiveDate::parse_from_str(&partition.1, "%Y-%m-%d")
+                                .ok()
+                                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                                .and_then(|day| {
+                                    add.stats.as_deref().and_then(|stats| crate::rollup::hours_from_stats_json(stats, day.and_utc().timestamp_micros()))
+                                })
+                                .unwrap_or(crate::rollup::ALL_HOURS);
+                            partitions_with_adds.insert(partition.clone());
+                            *partition_hours.entry(partition).or_insert(0) |= mask;
                         }
+                        // A Remove carries no stats; in a rewrite commit its
+                        // span is covered by the paired Adds. Only a partition
+                        // with removes and NO adds anywhere in the missed
+                        // commits (a deletion) needs the conservative day.
                         deltalake::kernel::Action::Remove(remove) if remove.data_change => {
-                            Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref())
+                            let Some(partition) = Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref()) else { continue };
+                            remove_only.insert(partition);
                         }
-                        _ => None,
-                    };
-                    if let Some(partition) = changed {
-                        partitions.insert(partition);
+                        _ => {}
+                    }
+                }
+                for partition in remove_only {
+                    if !partitions_with_adds.contains(&partition) {
+                        partition_hours.insert(partition, crate::rollup::ALL_HOURS);
                     }
                 }
             }
-            for (partition_project, date) in partitions {
+            for ((partition_project, date), hours) in partition_hours {
                 let project = if storage_project.is_empty() { partition_project } else { storage_project.clone() };
-                self.enqueue_maintenance_hours(&project, &source, &date, crate::rollup::ALL_HOURS)?;
-                queued = queued.saturating_add(24 * schema.rollups.len());
+                self.enqueue_maintenance_hours(&project, &source, &date, hours)?;
+                queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
             }
             let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             journal.set_source_cursor(cursor_key, version);
@@ -10578,6 +10644,109 @@ impl Database {
         Ok(true)
     }
 
+    /// Execute ONE maintenance unit end-to-end and report where its time went.
+    /// Backs the `run-unit` CLI: the per-unit cost decomposition (handover
+    /// §7.2, plan Phase 1.1) as a five-minute command instead of fleet-counter
+    /// inference. Point TIMEFUSION_DATA_DIR at a scratch dir: the journal must
+    /// hold no other claimable work, or the coordinator may claim that first.
+    pub async fn run_unit_once(
+        &self, source: &str, project_id: &str, date: chrono::NaiveDate, operation: crate::maintenance_coordinator::Operation, slice_hours: i64,
+    ) -> Result<UnitRunReport> {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, MaintenanceTask, Operation, TaskKey, TaskState, TimeSlice};
+        use std::sync::atomic::Ordering::Relaxed;
+        let schema = get_schema(source).ok_or_else(|| anyhow::anyhow!("unknown source table {source}"))?;
+        let base_table = || schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name(source));
+        let physical_table = match operation {
+            Operation::BaseRollup => base_table().ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?,
+            Operation::DerivedRollup => schema
+                .rollups
+                .iter()
+                .find(|spec| spec.derive_from.is_some())
+                .ok_or_else(|| anyhow::anyhow!("{source} declares no derived rollup"))?
+                .table_name(source),
+            _ => source.to_owned(),
+        };
+        let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid date {date}"))?.and_utc().timestamp_micros();
+        let slice = TimeSlice::new(day_start, day_start.saturating_add(slice_hours.saturating_mul(3_600_000_000)))?;
+        let key = TaskKey { physical_table, source: source.to_owned(), project_id: project_id.to_owned(), slice, operation };
+        let now = crate::support::now_micros();
+        {
+            let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if operation == Operation::DerivedRollup {
+                // A derived unit is unclaimable until its base generation is
+                // Complete; a scratch journal has none. Seed the dependency
+                // with a synthetic completed base covering the whole day.
+                let base_key = TaskKey {
+                    physical_table: base_table().ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?,
+                    slice: TimeSlice::new(day_start, day_start.saturating_add(86_400_000_000))?,
+                    operation: Operation::BaseRollup,
+                    ..key.clone()
+                };
+                journal.upsert(MaintenanceTask {
+                    key: base_key,
+                    state: TaskState::Complete,
+                    deadline_micros: 0,
+                    estimated_decoded_bytes: 0,
+                    hash_shard: 0,
+                    hash_shards: 1,
+                    attempts: 0,
+                    created_unix_ms: 0,
+                    retry_reason: None,
+                    publication: None,
+                    // A synthetic COMPLETE base for the day is exactly the proof
+                    // `dependencies_complete` looks for, so say so.
+                    base_tier_present: true,
+                });
+            }
+            journal.enqueue(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());
+        }
+        let stats = crate::observability::maintenance_stats();
+        let counters = [
+            stats.rollup_scan_duration_ms.load(Relaxed),
+            stats.rollup_staging_duration_ms.load(Relaxed),
+            stats.rollup_commit_duration_ms.load(Relaxed),
+            stats.rollup_end_to_end_duration_ms.load(Relaxed),
+            stats.rollup_scan_cohorts.load(Relaxed),
+        ];
+        let started = std::time::Instant::now();
+        match operation {
+            Operation::Dedup => {
+                self.run_coordinator_dedup_once().await?;
+            }
+            Operation::BaseRollup | Operation::DerivedRollup => {
+                self.run_coordinator_rollup_once(operation).await?;
+            }
+            _ => {
+                self.run_coordinator_compaction_once(operation).await?;
+            }
+        }
+        let wall = started.elapsed();
+        let after = [
+            stats.rollup_scan_duration_ms.load(Relaxed),
+            stats.rollup_staging_duration_ms.load(Relaxed),
+            stats.rollup_commit_duration_ms.load(Relaxed),
+            stats.rollup_end_to_end_duration_ms.load(Relaxed),
+            stats.rollup_scan_cohorts.load(Relaxed),
+        ];
+        let (state, retry_reason) = {
+            let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            journal.tasks().find(|task| task.key == key).map(|task| (Some(task.state), task.retry_reason.clone())).unwrap_or((None, None))
+        };
+        Ok(UnitRunReport {
+            operation,
+            project_id: project_id.to_owned(),
+            date,
+            wall_ms: u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+            scan_ms: after[0] - counters[0],
+            staging_ms: after[1] - counters[1],
+            commit_ms: after[2] - counters[2],
+            end_to_end_ms: after[3] - counters[3],
+            cohorts: after[4] - counters[4],
+            state,
+            retry_reason,
+        })
+    }
+
     async fn run_coordinator_rollup_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources, TaskState};
         use deltalake::{
@@ -11408,49 +11577,12 @@ impl Database {
             }
         }
         // Interleave dependent publication with dedup instead of draining the
-        // entire historical dedup backlog first. Dedup/base receive three
-        // slots each; derived and file work each receive one. `claim_next`
-        // still applies deadline, recent-slice, dependency, and project fairness.
-        const CYCLE: [Operation; 10] = [
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::DerivedRollup,
-            Operation::HotPacking,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::SealedConsolidation,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::Repair,
-        ];
-        // While contiguous coverage is short, the rollup chain takes the slots.
-        //
-        // `dependencies_complete` makes BaseRollup depend on NOTHING — base
-        // publication does its own bounded dedup before aggregating — so of the
-        // balanced cycle above, six slots in ten go to work that cannot advance
-        // the metric governing 14d/30d latency. Measured 2026-08-18: 15,799
-        // pending base+derived rollup tasks against 19,351 of dedup, packing,
-        // consolidation and repair, with the 1h tier holding 3-6 days per project
-        // and `rollup_min_contiguous_days` at 0.
-        //
-        // The trade is explicit and is the one the goal asks for: deferring dedup
-        // leaves more duplicates for read-side `DedupExec` to collapse, which
-        // costs raw scans time — but a day the rollup covers is not raw-scanned at
-        // all. Every operation keeps at least one slot, so nothing starves, and
-        // this reverts to the balanced cycle by itself once coverage is healthy.
-        const COVERAGE_SHORT_CYCLE: [Operation; 10] = [
-            Operation::BaseRollup,
-            Operation::DerivedRollup,
-            Operation::BaseRollup,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::DerivedRollup,
-            Operation::HotPacking,
-            Operation::BaseRollup,
-            Operation::SealedConsolidation,
-            Operation::Repair,
-        ];
-        let cycle = if coverage_is_short() { &COVERAGE_SHORT_CYCLE } else { &CYCLE };
+        // entire historical dedup backlog first. The cycles live in
+        // `maintenance_coordinator` (one definition shared with the journal
+        // simulator); the coverage-short reweighting is self-limiting via
+        // `coverage_is_short`. `claim_next` still applies deadline,
+        // recent-slice, dependency, and project fairness.
+        let cycle = crate::maintenance_coordinator::operation_cycle(coverage_is_short());
         let start = self.maintenance_schedule_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cycle.len();
         let mut attempted = [false; 6];
         for offset in 0..cycle.len() {
@@ -20793,43 +20925,17 @@ mod tests {
     /// degraded every query (2026-08-01), so each operation keeps a slot.
     #[test]
     fn the_coverage_short_cycle_favours_rollup_without_starving_file_work() {
-        use crate::maintenance_coordinator::Operation;
-        // Mirrors the two cycles in `run_coordinator_maintenance_once`. Kept here
-        // as data so the ratios are asserted rather than merely intended.
-        let balanced = [
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::DerivedRollup,
-            Operation::HotPacking,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::SealedConsolidation,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::Repair,
-        ];
-        let coverage_short = [
-            Operation::BaseRollup,
-            Operation::DerivedRollup,
-            Operation::BaseRollup,
-            Operation::Dedup,
-            Operation::BaseRollup,
-            Operation::DerivedRollup,
-            Operation::HotPacking,
-            Operation::BaseRollup,
-            Operation::SealedConsolidation,
-            Operation::Repair,
-        ];
+        use crate::maintenance_coordinator::{CYCLE_BALANCED, CYCLE_COVERAGE_SHORT, Operation};
         let count = |cycle: &[Operation; 10], op: Operation| cycle.iter().filter(|candidate| **candidate == op).count();
         let chain = |cycle: &[Operation; 10]| count(cycle, Operation::BaseRollup) + count(cycle, Operation::DerivedRollup);
 
-        assert_eq!(chain(&balanced), 4, "precondition: the balanced cycle gives the rollup chain 4 of 10");
-        assert_eq!(chain(&coverage_short), 6, "the coverage-short cycle must give the rollup chain 6 of 10");
+        assert_eq!(chain(&CYCLE_BALANCED), 4, "precondition: the balanced cycle gives the rollup chain 4 of 10");
+        assert_eq!(chain(&CYCLE_COVERAGE_SHORT), 6, "the coverage-short cycle must give the rollup chain 6 of 10");
         // Nothing starves. Each of these has its own incident behind it.
         for op in [Operation::Dedup, Operation::HotPacking, Operation::SealedConsolidation, Operation::Repair] {
-            assert!(count(&coverage_short, op) >= 1, "{op:?} must keep at least one slot");
+            assert!(count(&CYCLE_COVERAGE_SHORT, op) >= 1, "{op:?} must keep at least one slot");
         }
-        assert_eq!(balanced.len(), coverage_short.len(), "same length, so the rotating cursor behaves identically");
+        assert_eq!(CYCLE_BALANCED.len(), CYCLE_COVERAGE_SHORT.len(), "same length, so the rotating cursor behaves identically");
     }
 
     /// The reweighting is self-limiting: it must switch off once coverage reaches
@@ -21071,6 +21177,43 @@ mod tests {
 
         assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
         assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), Some(version));
+        Ok(())
+    }
+
+    /// Reconciling a missed commit must invalidate only the hours the commit's
+    /// files actually span, never the whole partition-day. The old form
+    /// enqueued `ALL_HOURS` per changed partition, and unified-table flush
+    /// commits name every active project — so every restart re-enqueued ~312
+    /// durable tasks per active stream AND reset the day's completed frontier
+    /// work. Prod 2026-08-18, one OOM restart: +5,876 pending base rollups in
+    /// an hour. This test's commit touches ONE hour: the reconcile must add
+    /// nothing beyond the write path's own one-hour invalidation (13 tasks).
+    #[tokio::test]
+    async fn reconcile_enqueues_only_the_hours_a_missed_commit_touched() -> Result<()> {
+        let db = Database::with_config(create_test_config("reconcile-precise-hours")).await?;
+        // The reconcile inspects cached handles only, so the table must exist
+        // before the cursor baselines.
+        db.get_or_create_unified_table("otel_logs_and_spans").await?;
+        assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0, "first reconcile baselines the cursor");
+
+        let project = format!("recon_{}", uuid::Uuid::new_v4().simple());
+        let ts = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+        let day = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
+        let day_start = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let hour_start = ts.div_euclid(3_600_000_000) * 3_600_000_000;
+        for id in ["a", "b"] {
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, "op", &project, ts)])?], true, None).await?;
+        }
+        let queued = db.reconcile_maintenance_task_cursors().await?;
+
+        let journal = db.maintenance_tasks.lock().unwrap();
+        let tasks = journal.tasks().filter(|task| task.key.project_id == project).collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 13, "one touched hour: 6 dedup + 6 base + 1 derived, not 312 for the whole day");
+        assert!(
+            tasks.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + 3_600_000_000),
+            "every reconciled task must lie inside the touched hour; day {day} starts {day_start}"
+        );
+        assert_eq!(queued, 2, "one dirty hour x two rollup specs");
         Ok(())
     }
 

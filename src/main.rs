@@ -132,12 +132,19 @@ fn main() -> anyhow::Result<()> {
     if subcommand.as_deref() == Some("encrypt-secret") {
         return config::run_cli();
     }
+    // `timefusion sim <journal.json|data-dir>` — replays a prod maintenance
+    // journal through the real scheduler on virtual time. Pure and config-free:
+    // the whole point is answering scheduler questions WITHOUT a deploy, so it
+    // must not need a bucket, a config, or a running anything.
+    if subcommand.as_deref() == Some("sim") {
+        return run_sim_cli();
+    }
 
     // Maintenance CLIs get the maintenance-heavy budget shape (the server
     // shape strands a small cgroup's memory in query/ingest slices a one-shot
     // CLI never uses). Must precede init_config, which snapshots the tree.
     // SAFETY: no threads exist yet - we're before the Tokio runtime is built.
-    if matches!(subcommand.as_deref(), Some("optimize" | "redrive-dml" | "migrate-columns")) {
+    if matches!(subcommand.as_deref(), Some("optimize" | "redrive-dml" | "migrate-columns" | "run-unit")) {
         unsafe { std::env::set_var("TIMEFUSION_BUDGET_PROFILE", "maintenance-cli") };
     }
 
@@ -152,6 +159,7 @@ fn main() -> anyhow::Result<()> {
         Some("redrive-dml") => rt.block_on(run_redrive_dml_cli(cfg)),
         Some("optimize") => rt.block_on(run_optimize_cli(cfg)),
         Some("migrate-columns") => rt.block_on(run_migrate_columns_cli(cfg)),
+        Some("run-unit") => rt.block_on(run_unit_cli(cfg)),
         _ => {
             let result = rt.block_on(async_main(cfg));
             // The server path must END THE PROCESS here: dropping the runtime
@@ -266,6 +274,122 @@ fn init_cli_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
         .try_init();
+}
+
+/// `timefusion sim <journal.json | data-dir> [--hours N] [--workers N]
+/// [--streams N] [--scale F] [--seed N] [--no-mint] [--json]`
+///
+/// Replay a copied-out prod maintenance journal through the real scheduler on
+/// virtual time (`timefusion::maintenance_sim`). The answer to "does this
+/// policy keep up" without a deploy. Fetch the input with e.g.
+/// `ssh ubuntu@captain.s.past3.tech 'docker cp <container>:/data/.timefusion_meta/maintenance_tasks.json -'`.
+fn run_sim_cli() -> anyhow::Result<()> {
+    use timefusion::maintenance_sim::{SimConfig, load_sandboxed, run};
+    let mut it = std::env::args().skip(2);
+    let usage = "usage: timefusion sim <journal.json|data-dir> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--json]";
+    let input = it.next().context(usage)?;
+    let mut cfg = SimConfig::default();
+    let mut json = false;
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
+        match a.as_str() {
+            "--hours" => cfg.horizon_micros = (value("--hours")?.parse::<f64>().context("--hours must be a number")? * 3_600_000_000.0) as i64,
+            "--workers" => cfg.workers = value("--workers")?.parse().context("--workers must be an integer")?,
+            "--streams" => cfg.streams = Some(value("--streams")?.parse().context("--streams must be an integer")?),
+            "--scale" => cfg.duration_scale = value("--scale")?.parse().context("--scale must be a number")?,
+            "--seed" => cfg.seed = u64::from_str_radix(value("--seed")?.trim_start_matches("0x"), 16).context("--seed must be hex")?,
+            "--restarts-every-hours" => {
+                cfg.restart_every_micros =
+                    (value("--restarts-every-hours")?.parse::<f64>().context("--restarts-every-hours must be a number")? * 3_600_000_000.0) as i64
+            }
+            "--restart-at-hours" => {
+                cfg.restart_at_micros =
+                    Some((value("--restart-at-hours")?.parse::<f64>().context("--restart-at-hours must be a number")? * 3_600_000_000.0) as i64)
+            }
+            "--no-mint" => cfg.mint_frontier = false,
+            "--json" => json = true,
+            other => anyhow::bail!("unknown argument: {other} ({usage})"),
+        }
+    }
+    let (journal, _sandbox) = load_sandboxed(std::path::Path::new(&input))?;
+    let report = run(journal, &cfg, support::now_micros())?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "sim: {:.1}h virtual | {} workers | scale {:.2} | {} streams | seed {:#x}",
+        report.hours,
+        cfg.workers,
+        cfg.duration_scale,
+        cfg.streams.map_or("journal".to_owned(), |n| n.to_string()),
+        cfg.seed
+    );
+    println!("pending: {} -> {} | executions: {} | splits: {}", report.pending_start, report.pending_end, report.executions, report.splits);
+    let mut completions = report.completions.iter().collect::<Vec<_>>();
+    completions.sort();
+    println!("completions: {}", completions.iter().map(|(op, n)| format!("{op}={n}")).collect::<Vec<_>>().join(" "));
+    if !report.timeouts.is_empty() {
+        let mut timeouts = report.timeouts.iter().collect::<Vec<_>>();
+        timeouts.sort();
+        println!("timeouts:    {}", timeouts.iter().map(|(op, n)| format!("{op}={n}")).collect::<Vec<_>>().join(" "));
+    }
+    println!("frontier lag max: {}s", report.frontier_lag_secs_max);
+    println!(
+        "min contiguous days at end: {} (14d at {}, 30d at {})",
+        report.min_contiguous_days_end,
+        report.hours_to_contiguous_14.map_or("never".to_owned(), |h| format!("{h:.1}h")),
+        report.hours_to_contiguous_30.map_or("never".to_owned(), |h| format!("{h:.1}h"))
+    );
+    for sample in &report.samples {
+        println!("  h={:5.1} pending={:>7} lag={:>6}s contiguous={}", sample.hour, sample.pending, sample.frontier_lag_secs, sample.min_contiguous_days);
+    }
+    Ok(())
+}
+
+/// `timefusion run-unit --project ID [--source TABLE] [--date YYYY-MM-DD]
+/// [--op base|derived|dedup|hot|sealed|repair] [--slice-hours N]`
+///
+/// Execute ONE maintenance unit against the configured storage and print where
+/// its time went (scan/stage/commit/end-to-end deltas + wall). The per-unit
+/// cost decomposition as a command, not a fleet-counter inference. Point
+/// TIMEFUSION_DATA_DIR at a scratch dir so the journal holds no other
+/// claimable work.
+async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
+    init_cli_tracing();
+    let mut source = "otel_logs_and_spans".to_string();
+    let mut project: Option<String> = None;
+    let mut date: Option<chrono::NaiveDate> = None;
+    let mut operation = timefusion::maintenance_coordinator::Operation::BaseRollup;
+    let mut slice_hours: i64 = 24;
+    let mut it = std::env::args().skip(2);
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
+        match a.as_str() {
+            "--source" => source = value("--source")?,
+            "--project" => project = Some(value("--project")?),
+            "--date" => date = Some(value("--date")?.parse().context("--date must be YYYY-MM-DD")?),
+            "--slice-hours" => slice_hours = value("--slice-hours")?.parse().context("--slice-hours must be an integer")?,
+            "--op" => {
+                operation = match value("--op")?.as_str() {
+                    "base" => timefusion::maintenance_coordinator::Operation::BaseRollup,
+                    "derived" => timefusion::maintenance_coordinator::Operation::DerivedRollup,
+                    "dedup" => timefusion::maintenance_coordinator::Operation::Dedup,
+                    "hot" => timefusion::maintenance_coordinator::Operation::HotPacking,
+                    "sealed" => timefusion::maintenance_coordinator::Operation::SealedConsolidation,
+                    "repair" => timefusion::maintenance_coordinator::Operation::Repair,
+                    other => anyhow::bail!("unknown --op {other}: base|derived|dedup|hot|sealed|repair"),
+                }
+            }
+            other => anyhow::bail!("unknown argument: {other} (usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N])"),
+        }
+    }
+    let project = project.context("--project is required")?;
+    let date = date.unwrap_or_else(|| support::today_utc() - chrono::Duration::days(1));
+    let db = Database::with_config(Arc::new(cfg.clone())).await?;
+    let report = db.run_unit_once(&source, &project, date, operation, slice_hours).await?;
+    println!("{report}");
+    Ok(())
 }
 
 /// `timefusion redrive-dml [--dir PATH] [--dry-run]` — replay parked quarantine/dml

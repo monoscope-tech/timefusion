@@ -170,6 +170,50 @@ impl Operation {
     }
 }
 
+/// The operation mix a maintenance worker rotates through. One definition for
+/// the server loop (`run_coordinator_maintenance_once`) and the journal-replay
+/// simulator (`maintenance_sim`) — the sim exists to evaluate changes to this
+/// mix, so the two must never be able to drift apart.
+///
+/// BALANCED interleaves dependent publication with dedup: dedup/base receive
+/// three slots each; derived and file work each receive one. `claim_next`
+/// still applies deadline, recent-slice, dependency, and project fairness.
+///
+/// COVERAGE_SHORT gives the rollup chain the slots while
+/// `rollup_min_contiguous_days` is below goal: `dependencies_complete` makes
+/// BaseRollup depend on NOTHING, so of the balanced cycle six slots in ten go
+/// to work that cannot advance the metric governing 14d/30d latency (measured
+/// 2026-08-18). Every operation keeps at least one slot — file debt left at
+/// zero is how file counts ran to 2-3k and degraded every query (2026-08-01).
+pub const CYCLE_BALANCED: [Operation; 10] = [
+    Operation::Dedup,
+    Operation::BaseRollup,
+    Operation::DerivedRollup,
+    Operation::HotPacking,
+    Operation::Dedup,
+    Operation::BaseRollup,
+    Operation::SealedConsolidation,
+    Operation::Dedup,
+    Operation::BaseRollup,
+    Operation::Repair,
+];
+pub const CYCLE_COVERAGE_SHORT: [Operation; 10] = [
+    Operation::BaseRollup,
+    Operation::DerivedRollup,
+    Operation::BaseRollup,
+    Operation::Dedup,
+    Operation::BaseRollup,
+    Operation::DerivedRollup,
+    Operation::HotPacking,
+    Operation::BaseRollup,
+    Operation::SealedConsolidation,
+    Operation::Repair,
+];
+
+pub fn operation_cycle(coverage_short: bool) -> &'static [Operation; 10] {
+    if coverage_short { &CYCLE_COVERAGE_SHORT } else { &CYCLE_BALANCED }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct TimeSlice {
     pub start_micros: i64,

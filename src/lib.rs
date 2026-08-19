@@ -5,6 +5,7 @@ pub mod database;
 pub mod dml;
 pub mod hot_tier;
 pub mod maintenance_coordinator;
+pub mod maintenance_sim;
 pub mod observability;
 pub mod read;
 pub mod rollup;
