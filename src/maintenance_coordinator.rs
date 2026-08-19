@@ -928,6 +928,9 @@ impl TaskJournal {
         let mut report = CoarsenReport::default();
         let mut groups: HashMap<(String, String, String, Operation, i64), u64> = HashMap::new();
         let mut members: HashMap<(String, String, String, Operation, i64), usize> = HashMap::new();
+        // The OLDEST member's creation time, because the fused unit inherits its
+        // members' work and must inherit their age with it.
+        let mut oldest: HashMap<(String, String, String, Operation, i64), u64> = HashMap::new();
         for task in self.snapshot.tasks.iter().filter(|task| coarsenable(task)) {
             report.candidates += 1;
             let group = (
@@ -942,7 +945,8 @@ impl TaskJournal {
                 continue;
             }
             *groups.entry(group.clone()).or_default() += task.estimated_decoded_bytes;
-            *members.entry(group).or_default() += 1;
+            *members.entry(group.clone()).or_default() += 1;
+            oldest.entry(group).and_modify(|at| *at = (*at).min(task.created_unix_ms)).or_insert(task.created_unix_ms);
         }
         // Only fuse a span that will actually FIT. Coarsening is a win because
         // one unit does one scan where 144 slices each did the same scan — but a
@@ -990,6 +994,10 @@ impl TaskJournal {
         });
         for ((physical_table, source, project_id, operation, bucket), bytes) in groups {
             let Ok(slice) = TimeSlice::new(bucket, bucket.saturating_add(width)) else { continue };
+            let oldest_member = oldest
+                .get(&(physical_table.clone(), source.clone(), project_id.clone(), operation, bucket))
+                .copied()
+                .unwrap_or_else(|| u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default());
             self.upsert(MaintenanceTask {
                 key: TaskKey { physical_table, source, project_id, slice, operation },
                 state: TaskState::Pending,
@@ -998,7 +1006,22 @@ impl TaskJournal {
                 hash_shard: 0,
                 hash_shards: 1,
                 attempts: 0,
-                created_unix_ms: u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default(),
+                // NOT `now`. `scheduling_class` escalates a task that has waited
+                // past STARVATION_MICROS, so stamping the fused unit with the
+                // current time makes it permanently fresh — and the narrow
+                // leftovers it did not fuse keep their real, older creation time
+                // and therefore outrank it forever.
+                //
+                // Prod 2026-08-19, over 316 claims in 35 minutes: Dedup and
+                // BaseRollup claimed ZERO day-wide units while Repair (34/34),
+                // HotPacking (29/41) and SealedConsolidation (19/20) claimed
+                // almost nothing else. Those three are planned day-wide and
+                // never fused; the two that fuse were starving their own output.
+                //
+                // Inheriting the oldest member's age is what makes the fused unit
+                // represent the work rather than the moment of fusion. Same
+                // defect as ageing a re-derived hygiene task from the rescan.
+                created_unix_ms: oldest_member,
                 retry_reason: None,
                 publication: None,
                 base_tier_present: false,
@@ -3506,6 +3529,42 @@ mod tests {
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         assert_eq!(reloaded.tasks().count(), 1, "the re-created task must be present exactly once");
         assert_eq!(reloaded.state(&key), Some(TaskState::Pending));
+    }
+
+    /// A fused unit inherits its members' AGE, not the moment of fusion.
+    ///
+    /// `scheduling_class` escalates work that has waited past
+    /// `STARVATION_MICROS`. Stamping the fused unit with `now` makes it
+    /// permanently fresh, so the narrow leftovers that were not fused keep their
+    /// real, older creation time and outrank it forever — coarsening starves its
+    /// own output.
+    ///
+    /// Prod 2026-08-19, 316 claims in 35 minutes: Dedup and BaseRollup claimed
+    /// ZERO day-wide units, while Repair (34/34), HotPacking (29/41) and
+    /// SealedConsolidation (19/20) claimed almost nothing else. Those three are
+    /// planned day-wide and never fused; the two that fuse were the two starving.
+    #[test]
+    fn a_fused_unit_inherits_the_age_of_the_work_it_replaces() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let day = 3 * DAY_MICROS;
+        // Members created five days ago, in milliseconds.
+        let old_ms = u64::try_from((now - 5 * DAY_MICROS).div_euclid(1_000)).expect("positive");
+
+        for slot in 0..(DAY_MICROS / NORMAL_SLICE_MICROS) {
+            let start = day + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, old_ms + u64::try_from(slot).unwrap_or(0));
+        }
+        assert!(journal.coarsen_sealed_slices(now) > 0, "the day must fuse");
+
+        let fused: Vec<_> =
+            journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup && matches!(t.state, TaskState::Pending | TaskState::Retry)).collect();
+        assert_eq!(fused.len(), 1, "one day-wide unit should remain");
+        assert_eq!(
+            fused[0].created_unix_ms, old_ms,
+            "the fused unit must carry the OLDEST member's age; stamped with `now` it can never escalate past STARVATION_MICROS"
+        );
     }
 
     /// A day-wide unit must SUBSUME the ten-minute units inside it.
