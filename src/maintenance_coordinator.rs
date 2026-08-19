@@ -22,6 +22,10 @@ pub const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 /// the mint width stands. Each divides the one above, so an aligned unit at any
 /// width sits inside exactly one bucket at every coarser width.
 pub const COARSEN_WIDTHS: [i64; 3] = [DAY_MICROS, 6 * 60 * 60 * 1_000_000, 60 * 60 * 1_000_000];
+/// Widths a unit can be SUBSUMED at, finest first — the mint width plus every
+/// fusion width. Each divides the next, so an aligned unit at any of them sits
+/// wholly inside one bucket of every coarser one.
+pub const SUBSUME_WIDTHS: [i64; 4] = [NORMAL_SLICE_MICROS, 60 * 60 * 1_000_000, 6 * 60 * 60 * 1_000_000, DAY_MICROS];
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
@@ -595,7 +599,81 @@ impl TaskJournal {
     /// per-width, so a superseded day blocks only the day — its children still
     /// fuse at six hours, which is the point of the cascade.
     pub fn coarsen_sealed_slices(&mut self, now_micros: i64) -> usize {
-        COARSEN_WIDTHS.iter().map(|&width| self.coarsen_to_width(width, now_micros)).sum()
+        // SUBSUME before fusing. Fusion cannot touch a bucket that a wider
+        // pending unit already covers — it would duplicate claimed work — so on
+        // its own it leaves exactly the redundancy it exists to remove.
+        self.subsume_covered_units(now_micros) + COARSEN_WIDTHS.iter().map(|&width| self.coarsen_to_width(width, now_micros)).sum::<usize>()
+    }
+
+    /// Drop sealed units wholly covered by a WIDER non-complete unit for the
+    /// same (table, source, project, operation).
+    ///
+    /// A rollup or dedup unit rebuilds its entire slice, so a ten-minute unit
+    /// sitting inside a queued day-wide unit for the same cell is not work — it
+    /// is the same work, listed 144 times. It still costs a full scan when
+    /// claimed (a sealed partition's files span the whole day, so nothing
+    /// prunes), and it costs `claim_next` a scan of the task set on every tick.
+    ///
+    /// This is the other half of `coarsen_to_width`, and without it that half
+    /// converges to nothing. Fusion refuses any bucket already covered by a
+    /// pending unit at least as wide — correctly, since fusing there would
+    /// duplicate work — but a pending day-wide unit is *precisely* the condition
+    /// under which the narrow units are redundant. So the fuse pass collapsed
+    /// only the cells that had no day unit and then went quiet, which is exactly
+    /// what prod showed: `maintenance_sealed_slices_coarsened` logged 12, 6, 3
+    /// and then nothing for the rest of the process's life while
+    /// `pending_base_rollup` sat at 88,100.
+    ///
+    /// The scale of the redundancy is measured, not assumed. The same process's
+    /// backfill census reported `cells_missing=260 cells_wanted=0` — 260 real
+    /// (project, date) cells behind 88,100 queued units, about 339 units per
+    /// cell, and the planner declining to add more because every cell was
+    /// already queued.
+    ///
+    /// Only NON-COMPLETE covering units subsume. A complete one is not evidence
+    /// the span is still queued — it was built once, and a narrower unit inside
+    /// it is a later invalidation that must run.
+    fn subsume_covered_units(&mut self, now_micros: i64) -> usize {
+        type Group = (String, String, String, Operation);
+        let group_of =
+            |task: &MaintenanceTask| -> Group { (task.key.physical_table.clone(), task.key.source.clone(), task.key.project_id.clone(), task.key.operation) };
+        // For each subsume width, the buckets wholly inside some non-complete
+        // unit STRICTLY wider than it. Membership therefore means "contained in
+        // a wider live unit", which is the whole predicate.
+        let mut covered: [HashSet<(Group, i64)>; SUBSUME_WIDTHS.len()] = Default::default();
+        for task in self.snapshot.tasks.iter().filter(|task| task.state != TaskState::Complete) {
+            let group = group_of(task);
+            for (index, &width) in SUBSUME_WIDTHS.iter().enumerate() {
+                if task.key.slice.width() <= width {
+                    continue;
+                }
+                let mut bucket = task.key.slice.start_micros.div_euclid(width) * width;
+                while bucket.saturating_add(width) <= task.key.slice.end_micros {
+                    if bucket >= task.key.slice.start_micros {
+                        covered[index].insert((group.clone(), bucket));
+                    }
+                    bucket = bucket.saturating_add(width);
+                }
+            }
+        }
+        let before = self.snapshot.tasks.len();
+        self.snapshot.tasks.retain(|task| {
+            if !matches!(task.state, TaskState::Pending | TaskState::Retry) || is_live_frontier(task.key.slice, now_micros) {
+                return true;
+            }
+            // The coarsest ladder width this unit fits inside; a unit wider than
+            // every entry can only be subsumed by something wider still, which
+            // the loop above never records.
+            let Some(index) = SUBSUME_WIDTHS.iter().rposition(|&width| width <= task.key.slice.width()) else { return true };
+            let width = SUBSUME_WIDTHS[index];
+            !covered[index].contains(&(group_of(task), task.key.slice.start_micros.div_euclid(width) * width))
+        });
+        let removed = before - self.snapshot.tasks.len();
+        if removed != 0 {
+            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
+            self.dirty_tasks.clear();
+        }
+        removed
     }
 
     /// One pass of `coarsen_sealed_slices` at a single width.
@@ -2990,6 +3068,67 @@ mod tests {
         // or a partition whose rollup is genuinely expensive — the one the 30d
         // goal needs most — would never gain coverage at all.
         assert_eq!(journal.claim_next(Operation::BaseRollup, 0, true).expect("quarantined work still runs").key, key);
+    }
+
+    /// A day-wide unit must SUBSUME the ten-minute units inside it.
+    ///
+    /// This is the shape prod was actually in on 2026-08-19, and the reason the
+    /// fuse pass alone converged to nothing. `coarsen_to_width` refuses any
+    /// bucket already covered by a pending unit at least as wide — correctly,
+    /// because fusing there would duplicate claimed work — but a pending
+    /// day-wide unit is exactly the condition under which the narrow units are
+    /// redundant. So fusion collapsed the cells that had no day unit, logged
+    /// 12, 6, 3, and went quiet, while `pending_base_rollup` sat at 88,100
+    /// against a backfill census of `cells_missing=260 cells_wanted=0` — 260
+    /// real (project, date) cells, ~339 queued units each.
+    #[test]
+    fn a_pending_day_unit_subsumes_the_ten_minute_units_inside_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let day = 3 * DAY_MICROS;
+
+        for slot in 0..(DAY_MICROS / NORMAL_SLICE_MICROS) {
+            let start = day + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
+        }
+        journal.enqueue(task("p", day, day + DAY_MICROS, Operation::BaseRollup).key, 0, 16, 0);
+        assert_eq!(journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup).count(), 145, "144 slices plus the day unit");
+
+        journal.coarsen_sealed_slices(now);
+
+        let live = journal
+            .tasks()
+            .filter(|t| t.key.operation == Operation::BaseRollup && matches!(t.state, TaskState::Pending | TaskState::Retry))
+            .map(|t| t.key.slice.width())
+            .collect::<Vec<_>>();
+        assert_eq!(live, vec![DAY_MICROS], "the day unit must absorb all 144 slices, leaving one unit for the cell; got {live:?}");
+    }
+
+    /// ...but a COMPLETE day unit subsumes nothing.
+    ///
+    /// Built once is not the same as queued. A narrower unit inside a completed
+    /// day is a later invalidation — the day is dirty again, which is why the
+    /// slice exists — and dropping it would lose that rebuild silently.
+    #[test]
+    fn a_complete_day_unit_does_not_subsume_a_later_invalidation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let day = 3 * DAY_MICROS;
+
+        let parent = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
+        journal.enqueue(parent.clone(), 0, 16, 0);
+        journal.complete(&parent);
+        let start = day + 5 * NORMAL_SLICE_MICROS;
+        journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
+
+        journal.coarsen_sealed_slices(now);
+
+        assert!(
+            journal.tasks().any(|t| t.state == TaskState::Pending && t.key.operation == Operation::BaseRollup),
+            "a later invalidation inside a COMPLETE day must survive"
+        );
     }
 
     /// A sealed day too big to scan as one unit lands at a narrower width,
