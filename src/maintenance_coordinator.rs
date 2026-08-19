@@ -2091,6 +2091,21 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// newest-first; anything that has waited past the threshold escalates ahead of
 /// it, and the escalated set is finite, so it cannot swallow the budget.
 const STARVATION_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+/// ...and an UPPER bound, because an escape valve everything fits through is
+/// not an escape valve.
+///
+/// Ageing sealed hygiene from its seal time (e8645a6) is correct, and it made
+/// every sealed partition older than a day qualify — at which point "starved"
+/// stops discriminating and ordering falls back to newest-first, leaving
+/// 2026-08-13 exactly where it was. Making everything starved is the same as
+/// making nothing starved.
+///
+/// Beyond this bound a task is deliberately NOT starved. `scheduling_class`'s
+/// own history records why: plain oldest-first sent 10 of 10 historical starts
+/// to data months old while the last 30 days went untouched. 45 days sits
+/// comfortably outside `timefusion_rollup_backfill_days` (35), so the entire
+/// window the 30-day goal needs can escalate, and nothing older can.
+const STARVATION_HORIZON_MICROS: i64 = 45 * 24 * 60 * 60 * 1_000_000;
 
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64) {
     if is_live_frontier(task.key.slice, now_micros) {
@@ -2130,8 +2145,21 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         //
         // Starved work leads, then width, then recency — see `STARVATION_MICROS`.
         let waited = now_micros.saturating_sub(i64::try_from(task.created_unix_ms).unwrap_or(i64::MAX).saturating_mul(1_000));
-        let starved = u8::from(waited < STARVATION_MICROS);
-        (1, starved, -task.key.slice.width(), -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        let starved = u8::from(!(STARVATION_MICROS..=STARVATION_HORIZON_MICROS).contains(&waited));
+        // Starved work drains OLDEST-first; fresh work stays newest-first.
+        //
+        // This is the half that was missing. Escalating a starved task above
+        // newer sealed work does nothing if, once escalated, it is ordered by
+        // recency again — it merely joins a larger set that is still drained
+        // newest-first, which is why 2026-08-13 stayed at 167 files for five
+        // days while seven younger sealed days converged past it.
+        //
+        // Oldest-first is right HERE and wrong in general: the starved set is
+        // the backlog, and a backlog has to drain from its old end to restore
+        // contiguity, while fresh work is what dashboards read and belongs
+        // newest-first. `STARVATION_HORIZON_MICROS` is what keeps the two apart.
+        let recency = task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS);
+        (1, starved, -task.key.slice.width(), if starved == 0 { recency } else { -recency })
     }
 }
 
@@ -2704,13 +2732,19 @@ mod tests {
 
     #[test]
     fn historical_debt_runs_newest_slice_first() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
+        let now: i64 = 10 * 24 * 60 * 60 * 1_000_000;
         // Older slice, and the older deadline too — under the previous ordering
         // this ran first purely because it had been waiting longest.
+        // Both freshly planned. The claim is about which SLICE a dashboard
+        // needs, so neither may be starved — starved work drains oldest-first
+        // by design, and that is a different question.
+        let fresh = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
         let mut older_slice = task("a", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
         older_slice.deadline_micros = now - 2 * 60 * 1_000_000;
+        older_slice.created_unix_ms = fresh;
         let mut newer_slice = task("b", MIN_SLICE_MICROS, 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
         newer_slice.deadline_micros = now - 60 * 1_000_000;
+        newer_slice.created_unix_ms = fresh;
         let ready = fair_ready_tasks([&older_slice, &newer_slice], now);
         assert_eq!(ready.first().expect("ready task").key.project_id, "b", "the more recent slice is the one a dashboard query needs");
     }
@@ -3124,7 +3158,10 @@ mod tests {
     #[test]
     fn sealed_work_ages_out_of_starvation_without_becoming_oldest_first() {
         const DAY: i64 = 24 * 3_600_000_000;
-        let now = 40 * DAY;
+        // Well past STARVATION_HORIZON_MICROS, so 'created 60 days ago' is a
+        // positive instant rather than clamping to 0 and reading as maximally
+        // starved — which is the opposite of what that case is testing.
+        let now = 100 * DAY;
         let sealed = |day: i64, created_days_ago: i64| {
             let mut t = task("p", day * DAY, day * DAY + DAY, Operation::SealedConsolidation);
             t.created_unix_ms = u64::try_from((now - created_days_ago * DAY).div_euclid(1_000)).unwrap_or_default();
@@ -3143,6 +3180,21 @@ mod tests {
         // And starvation never lets sealed work outrank the live frontier.
         let frontier = super::scheduling_class(&task("p", now - 600_000_000, now, Operation::BaseRollup), now);
         assert!(frontier < starved_old, "class still leads: the frontier outranks even starved sealed work");
+
+        // WITHIN the starved set, oldest drains first. Without this, escalating
+        // merely joins a larger set that is still ordered newest-first, which is
+        // why 2026-08-13 stayed at 167 files for five days after ageing sealed
+        // hygiene from its seal time made every old partition "starved".
+        let starved_older = super::scheduling_class(&sealed(13, 4), now);
+        let starved_newer = super::scheduling_class(&sealed(30, 4), now);
+        assert!(starved_older < starved_newer, "a backlog drains from its OLD end: the older starved day must lead");
+
+        // ...and past the horizon a task stops escalating, so months-old data
+        // can never take the sealed budget. `scheduling_class`'s own history:
+        // plain oldest-first sent 10 of 10 historical starts to data months old
+        // while the last 30 days went untouched.
+        let ancient = super::scheduling_class(&sealed(20, 60), now);
+        assert!(fresh_new < ancient, "past STARVATION_HORIZON_MICROS a task no longer escalates");
     }
 
     /// A hole must be claimed before a day that already has tier output.
@@ -3164,6 +3216,10 @@ mod tests {
             let mut t = task(project, day * DAY, day * DAY + DAY, Operation::DerivedRollup);
             t.key.physical_table = "rollup_1h".to_owned();
             t.deadline_micros = 0;
+            // Freshly planned, so neither is starved — this test is about
+            // hole-vs-recency, and leaving `created_unix_ms` at 0 would make
+            // both maximally starved and decide the order on age instead.
+            t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
             t
         };
         // Both are SEALED (day 38+ would fall inside the live-frontier window
