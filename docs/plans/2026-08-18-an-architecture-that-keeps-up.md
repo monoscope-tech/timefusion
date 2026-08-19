@@ -812,6 +812,42 @@ one was found the same way: diff two `timefusion_stats` snapshots for what is
 NOT moving, then histogram `maintenance_task_started` by `operation`, by
 `attempts`, and by slice width.
 
+### Final state, 2026-08-19 ~01:00 UTC
+
+**Maintenance (G3): fixed.** Stalled → functioning.
+
+| metric | before | after |
+|---|---|---|
+| `tasks_complete` | +0.67/min | **+84.9/min** |
+| `rollup_output_rows_total` | +5.7/min | **+259,702/min** |
+| unit timeouts | 47/hour | **0** |
+| claims to fresh work (attempts 0-1) | 18% | **61%** |
+| starts at 100+ attempts | 134 per 90min | **7 per 20min** |
+
+**Memory/OOM (G4): trending right.** Container RSS 25.4 GiB → **15.2 GiB**, and
+**no `exit 137` since these changes began** — every shutdown in the window is a
+clean deploy restart, against two OOM kills in the seven hours before.
+
+**Queries (G2): improved where coverage exists, NOT met for shipbubble.**
+
+| query | before | after |
+|---|---|---|
+| `94c5dc1f` 14d (17 days of 1h tier) | 9.8s | **6.0s** |
+| `94c5dc1f` 30d | — | **13.1s** (completes) |
+| shipbubble 1d / 7d / 30d | timeout | **still timeout** |
+
+So a project WITH coverage now answers a 30-day dashboard query in 13s instead
+of failing. shipbubble does not, and the reason is specific and known: its base
+1m tier holds only **14 of 30 days**, so there is nothing for the cheap derived
+path to aggregate. Closing it needs ~16 sealed-day BaseRollup units — the
+expensive raw-scan kind, ~800s each — which is hours of drain now that capacity
+exists, and is queued.
+
+**The honest headline: the goal is not met.** What was achieved is that the
+machine that builds coverage went from producing nothing to producing 260k
+rollup rows a minute, and every defect between here and the goal is now named,
+measured, and either fixed or written down below.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
