@@ -750,7 +750,7 @@ impl TaskJournal {
             pending += 1;
             sealed += usize::from(!is_live_frontier(task.key.slice, now_micros));
             unproven += usize::from(!task.base_tier_present);
-            quarantined += usize::from(task.attempts >= Self::QUARANTINE_ATTEMPTS);
+            quarantined += usize::from(Self::is_quarantined(task));
             not_due += usize::from(task.deadline_micros > now_micros);
         }
         (pending, sealed, unproven, quarantined, not_due)
@@ -997,6 +997,32 @@ impl TaskJournal {
     /// already uses to decide a unit is oversized rather than unlucky.
     pub const QUARANTINE_ATTEMPTS: u32 = 2;
 
+    /// The `retry_reason` `abandon_running` writes when a WORKER gave a unit
+    /// back — a deadline it could not meet, or an error inside the unit.
+    pub const WORKER_FAILURE_REASON: &'static str = "worker_error";
+
+    /// Has this unit PROVEN it cannot fit its deadline?
+    ///
+    /// Attempts alone is not that proof, and using it as the proxy quarantined
+    /// the wrong work. A task is claimed and its attempt counted before anything
+    /// about its cost is known, so a unit that was handed back for a reason
+    /// unrelated to cost — `source_not_flushed`, `resolve_input`, a dependency
+    /// that was not yet satisfiable — accumulates attempts identically to one
+    /// that burned a 900s deadline.
+    ///
+    /// Measured on prod 2026-08-19: of 162 SEALED derived units — precisely the
+    /// historical backfill the 30d goal needs — **109 were quarantined**, held
+    /// to 2 of 16 workers. They had failed repeatedly while their base-tier
+    /// dependency was unprovable, which #197/#202 then fixed. Their attempt
+    /// count was stale evidence about a condition that no longer existed, and
+    /// the quarantine kept punishing them for it.
+    ///
+    /// So require the worker's own verdict: only a unit `abandon_running` gave
+    /// back is evidence about cost. Anything else retries normally.
+    pub fn is_quarantined(task: &MaintenanceTask) -> bool {
+        task.attempts >= Self::QUARANTINE_ATTEMPTS && task.retry_reason.as_deref() == Some(Self::WORKER_FAILURE_REASON)
+    }
+
     /// Claim one unit. `allow_quarantined` admits units that have already timed
     /// out [`Self::QUARANTINE_ATTEMPTS`] times; the caller gates it on a small
     /// occupancy permit so proven-unfittable work cannot hold the whole pool.
@@ -1140,7 +1166,7 @@ impl TaskJournal {
             task.key.operation == operation
                 && matches!(task.state, TaskState::Pending | TaskState::Retry)
                 && task.deadline_micros <= now_micros
-                && (allow_quarantined || task.attempts < Self::QUARANTINE_ATTEMPTS)
+                && (allow_quarantined || !Self::is_quarantined(task))
         };
         // `(class, hole_rank, width, recency)`. Class still leads, so the live
         // frontier keeps strict priority over sealed work. `hole_rank` orders
@@ -1326,7 +1352,7 @@ impl TaskJournal {
         } else {
             backoff_micros
         };
-        self.retry(key, "worker_error".to_owned(), now_micros.saturating_add(delay_micros));
+        self.retry(key, Self::WORKER_FAILURE_REASON.to_owned(), now_micros.saturating_add(delay_micros));
     }
 
     /// A unit that failed because its input did not FIT will fail identically
@@ -2624,7 +2650,7 @@ mod tests {
         journal.prove_base_tier_for_day(&doomed, now - 11 * 24 * HOUR, now - 10 * 24 * HOUR);
         for _ in 0..TaskJournal::QUARANTINE_ATTEMPTS {
             assert!(journal.mark_running(&doomed));
-            journal.retry(&doomed, "timed_out".to_owned(), 0);
+            journal.retry(&doomed, TaskJournal::WORKER_FAILURE_REASON.to_owned(), 0);
         }
 
         let (pending, sealed, unproven, quarantined, not_due) = journal.claimability_census(Operation::DerivedRollup, now);
@@ -2821,6 +2847,39 @@ mod tests {
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "a later uninformed enqueue must not clear the proof");
     }
 
+    /// Attempts alone must not quarantine. Only the worker's own verdict does.
+    ///
+    /// A task is claimed and its attempt counted before anything about its cost
+    /// is known, so a unit handed back for a reason unrelated to cost —
+    /// `source_not_flushed`, `resolve_input`, an unsatisfiable dependency —
+    /// accumulates attempts identically to one that burned a 900s deadline.
+    ///
+    /// Prod 2026-08-19: of 162 SEALED derived units, the historical backfill the
+    /// 30d goal needs, **109 were quarantined** and held to 2 of 16 workers.
+    /// They had failed while their base-tier dependency was unprovable, which
+    /// #197/#202 then fixed — stale evidence about a condition that no longer
+    /// existed.
+    #[test]
+    fn only_a_worker_verdict_quarantines_a_unit() {
+        let mut over = task("p", 0, MIN_SLICE_MICROS, Operation::DerivedRollup);
+        over.attempts = TaskJournal::QUARANTINE_ATTEMPTS + 3;
+
+        // Handed back for a reason that says nothing about cost.
+        over.retry_reason = Some("source_not_flushed".to_owned());
+        assert!(!TaskJournal::is_quarantined(&over), "a dependency-shaped failure is not evidence about cost");
+        over.retry_reason = None;
+        assert!(!TaskJournal::is_quarantined(&over), "no recorded reason is not evidence either");
+
+        // The worker's own verdict, which IS about cost.
+        over.retry_reason = Some(TaskJournal::WORKER_FAILURE_REASON.to_owned());
+        assert!(TaskJournal::is_quarantined(&over), "a unit the worker gave back, repeatedly, is quarantined");
+
+        // One such failure is still a blip, not proof.
+        let mut once = over.clone();
+        once.attempts = 1;
+        assert!(!TaskJournal::is_quarantined(&once), "a single worker failure is a blip");
+    }
+
     /// A unit that has proven it cannot fit its deadline must not be able to
     /// crowd out work that can.
     ///
@@ -2851,7 +2910,7 @@ mod tests {
         // setup does not also rotate the project-fairness cursor.
         for _ in 0..TaskJournal::QUARANTINE_ATTEMPTS {
             assert!(journal.mark_running(&key));
-            journal.retry(&key, "timed_out".to_owned(), 0);
+            journal.retry(&key, TaskJournal::WORKER_FAILURE_REASON.to_owned(), 0);
         }
 
         // Without a quarantine slot the worker must skip it and run the unit
