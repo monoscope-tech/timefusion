@@ -9875,10 +9875,26 @@ impl Database {
         // alone keeps it there indefinitely — so the pass had not run at all,
         // the gauge everything reads was a stale 0, and #186's proof could never
         // fire. A ceiling that is permanently closed is not a safety valve.
+        //
+        // Exception: while `coverage_is_short()`, the goal outranks the ceiling.
+        // The live frontier alone holds the journal at ~43,000 against a 25,000
+        // ceiling, and it is REPLENISHED by ingest, so waiting for it to fall is
+        // waiting forever — prod 2026-08-19 01:00 UTC had the derived backlog
+        // draining and the 1h tier day counts still frozen, because the only
+        // historical cells in the journal were ones enqueued before the ceiling
+        // shut and none of them were the missing days.
+        //
+        // Bounded and self-limiting, which is what makes it safe: the pass
+        // admits at most `BACKFILL_PARTITIONS_PER_PASS` (24) cells, contiguity
+        // ordering aims them at the worst project's earliest hole, and coverage
+        // reaching `COVERAGE_SHORT_DAYS` restores the ceiling. The cost the
+        // ceiling exists to bound — `claim_next` scanning a longer task set — is
+        // 24 cells per 60s against 43,000, which is noise next to never building
+        // the coverage at all.
         let defer_enqueue = {
             let journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let pending = journal.tasks().filter(|task| task.state != crate::maintenance_coordinator::TaskState::Complete).count();
-            let defer = pending >= BACKFILL_PENDING_CEILING;
+            let defer = pending >= BACKFILL_PENDING_CEILING && !coverage_is_short();
             if defer {
                 debug!(pending, ceiling = BACKFILL_PENDING_CEILING, event = "rollup_backfill_enqueue_deferred");
             }
@@ -20682,6 +20698,66 @@ mod tests {
         // applies, so ordinary frontier work keeps retrying promptly.
         let sealed = TimeSlice::new(0, HOUR).expect("sealed slice");
         assert_eq!(super::buffered_source_retry_delay(sealed, now).as_secs(), 5, "an already-sealed slice keeps the fast retry");
+    }
+
+    /// While coverage is short, the goal outranks the ceiling.
+    ///
+    /// The live frontier alone holds the journal at ~43,000 against a 25,000
+    /// ceiling and is REPLENISHED by ingest, so waiting for it to fall is
+    /// waiting forever. Prod 2026-08-19 01:00 UTC: the derived backlog drained
+    /// to 601 and every one of 132 derived claims in the window was a frontier
+    /// hour — there was no historical work left to claim, because the ceiling
+    /// had never let the missing days be enqueued.
+    ///
+    /// Self-limiting in both directions, which is what makes it safe: a pass
+    /// admits at most `BACKFILL_PARTITIONS_PER_PASS` cells, and coverage
+    /// reaching `COVERAGE_SHORT_DAYS` restores the ceiling.
+    #[tokio::test]
+    async fn coverage_short_backfill_outranks_the_pending_ceiling() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cfg = (*create_test_config("backfill-ceiling-bypass")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
+        let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, ts)])?], true, None).await?;
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            // The write path already queued this day; complete it so the planner
+            // re-derives the day from the (missing) tier coverage.
+            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in keys {
+                journal.complete(&key);
+            }
+            // Stuff the journal past the ceiling with unrelated debt.
+            for i in 0..25_100i64 {
+                journal.enqueue(
+                    TaskKey {
+                        physical_table: "debt".to_owned(),
+                        source: "debt".to_owned(),
+                        project_id: format!("dummy{i}"),
+                        slice: TimeSlice::new(i * 60_000_000, (i + 1) * 60_000_000)?,
+                        operation: Operation::Repair,
+                    },
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
+        let gauge = &crate::metrics::maintenance_stats().rollup_min_contiguous_days;
+        let restore = gauge.load(Relaxed);
+        gauge.store(30, Relaxed);
+        let healthy = db.plan_rollup_backfill().await?;
+        gauge.store(0, Relaxed);
+        let short = db.plan_rollup_backfill().await?;
+        gauge.store(restore, Relaxed);
+
+        assert_eq!(healthy, 0, "at the ceiling with healthy coverage, the backfill still defers");
+        assert!(short > 0, "coverage-short goal work outranks the ceiling, got {short}");
+        Ok(())
     }
 
     /// The backfill ceiling must defer only the ENQUEUE, never the whole pass.
