@@ -1256,3 +1256,285 @@ loop — sim, `run-unit`, and staging first (Phase 0); one change per deploy;
 >= 2h quiet before believing a throughput number; never run an unbounded
 ad-hoc query against the largest tenant; every PR states which goal metric it
 moves and how that will be measured — a PR that cannot name one does not merge.
+
+---
+
+# PART II — Catching every historical backlog up with today
+
+**Written 2026-08-19 ~07:00 UTC**, after thirteen changes shipped overnight
+(#181–#197). Part I above is the record of getting maintenance to *run at all*.
+This part is the plan to get every class *caught up*, and it starts by
+correcting two framings in Part I that the measurements do not support.
+
+## 14. Where every class actually is
+
+Measured on prod over a 450s rate window at 04:45 UTC, image `9d7ac74`:
+
+| class | pending | rate | ETA |
+|---|---|---|---|
+| **Hot packing** (today's compaction) | 2,654 | **−17.5/min** | **~2.5h** ✅ |
+| **Sealed consolidation** (historical compaction) | 2,218 | −0.27/min | ~5.7 days ⚠️ |
+| **Dedup** | 12,955 | −0.27/min | ~33 days ❌ |
+| **Repair** (sorting / footers) | 584 | **+0.13/min** | not converging ❌ |
+| **Derived rollup** | 619 | −0.27/min | blocked (mid-fix) |
+| **Tantivy index** | 4,761 uncovered | growing (3,031 at handover) | ❌ |
+
+Byte-level debt, **growing**:
+
+```
+backlog_bytes                 38.4 TB   +291 MB/min
+sealed_compaction_debt_bytes   8.18 TB   +34 MB/min
+dirty_bin_queue_depth          8,105     +1.2/min
+oldest_task_age_seconds      241,526     (2.8 days)
+```
+
+Frontier, by contrast, is **caught up**: `eligible_watermark_lag_seconds` = 0,
+stable for hours. Live data is processed in real time. That half of "keeps up"
+is achieved and is not at risk.
+
+### The claim mix explains all of it at once
+
+60 minutes of `maintenance_task_started`, by operation and slice width:
+
+```
+299  BaseRollup           10-min frontier
+ 34  HotPacking           10-min frontier
+ 23  DerivedRollup        hour frontier
+ 21  SealedConsolidation  day  (historical)
+ 18  Repair               day  (historical)
+  7  Dedup                10-min frontier
+  1  BaseRollup           day  (historical)
+```
+
+**~87% of every claim is frontier work.** The historical classes are not broken —
+sealed consolidation and repair each run ~20/hour — they are simply outnumbered,
+and new debt arrives about as fast as they retire it. This is §3's arithmetic
+arriving on schedule: each stream mints 144 Dedup + 144 BaseRollup units per
+day, so at 26 streams ~8,100 frontier units/day must be claimed before anything
+historical gets a turn.
+
+## 15. Two corrections to Part I — the problem is much smaller than stated
+
+### 15.1 Fragmentation is in the last ~3 days, NOT across history
+
+Part I asserted "~1 MB files against a 256 MB target, two orders of magnitude
+off", generalised from scan-time file counts. Listing the object store directly
+says otherwise:
+
+| partition | objects | size | avg file |
+|---|---|---|---|
+| `00000000` 2026-08-05 | **1** | 251 MB | ✅ |
+| `98fdd4f3` 2026-08-05 | **1** | 190 MB | ✅ |
+| `be87ebc1` 2026-08-10 | **1** | 137 MB | ✅ |
+| `87576849` 2026-08-05 | **1** | 244 MB | ✅ |
+| `28f62f01` 2026-08-05 | **2** | 997 MB | ✅ |
+| `28f62f01` 2026-08-16 | **602** | 5.47 GB | ❌ |
+| `28f62f01` 2026-08-17 | **971** | 5.74 GB | ❌ |
+| `28f62f01` 2026-08-18 | **722** | 2.23 GB | ❌ |
+| `00000000` 2026-08-18 | **705** | 872 MB | ❌ |
+| `87576849` 2026-08-18 | **454** | 1.69 GB | ❌ |
+
+**Every sealed day older than ~3 days is already a single file.** Historical
+compaction is, for these projects, *done*. The fragmentation is a rolling
+~3-day tail.
+
+The consequence for G2 is large and was previously mis-stated: a 30-day query
+reads ~27 compacted days (~27 files) plus ~3 fragmented days (~2,300 files).
+**The recent tail is ~98% of the file count.** So *hot packing* — the class that
+is already converging at −17.5/min — is the query-latency lever, and sealed
+consolidation is not. The earlier "337 files per scan" figure was measured on
+recent windows and generalised to history it does not describe.
+
+**Therefore `pending_sealed_consolidation` = 2,218 and
+`sealed_compaction_debt_bytes` = 8.18 TB need auditing before being worked:**
+if the days they name are already single-file, they are stale tasks, and
+draining them is a no-op that costs capacity the other classes need. Audit
+first, drain second.
+
+### 15.2 `tasks_pending` is not a backlog
+
+`tasks_pending` went 47k → 55k → 61k → 80k while the system got measurably
+healthier. It is dominated by self-replenishing frontier work. **Never quote it
+as remaining work**; doing so produced two wrong throughput models in Part I.
+The bounded, goal-relevant number is **475 (project, date) cells** — 260
+`otel_logs_and_spans` + 215 `otel_metrics` — from #194's census.
+
+## 16. Is the implementation faulty, or just behind?
+
+Both, in separable ways.
+
+### 16.1 Faulty: the frontier mints durable work proportional to time × streams
+
+`invalidate()` creates one durable task per 10-minute slice per operation per
+stream. That is 312 tasks per stream-day, ~8,100/day at current scale, each
+requiring a claim, a journal write, and an object-store round trip whose cost is
+**independent of how little data the slice covers**. The unit exists so a crash
+cannot lose work — but the WAL already guarantees the data. The unit is only a
+trigger, and a trigger does not need to be durable, enumerated, or per-slice.
+
+This is the single structural fault. Everything in §14 is downstream of it.
+
+### 16.2 Faulty: `dependencies_complete` asks the journal a question about data
+
+It requires COMPLETE `BaseRollup` *tasks* to prove a base tier exists. Journal
+bookkeeping is not the authority on what is in the tier; coverage is. Four
+changes (#184, #186, #195, #197) were needed to route around this, and only the
+last — keying the fact on the DAY and reading it from coverage — is robust.
+**Generalise it: no scheduler predicate should answer a question about data by
+consulting bookkeeping.**
+
+### 16.3 Faulty: presence substituted for completeness, three times
+
+`partitions_of` counted an empty file as coverage; `missing_tiers` treated one
+file as a built day; `blocks_rollup_backfill` treated one queued task as a
+planned day. Any predicate answering "is X done?" with "does something for X
+exist?" is suspect on sight.
+
+### 16.4 Not faulty, just outnumbered
+
+Sealed consolidation, repair and dedup all work. They run ~20/hour each and
+complete. They do not converge because 87% of claims go to the frontier. Fixing
+them is a *scheduling share* problem, not a correctness problem — and the share
+cannot be fixed by reweighting the cycle, because #167 proved attempt share and
+slot-time share differ by two orders of magnitude when unit costs differ by two
+orders of magnitude.
+
+## 17. What everyone else does (and where we differ)
+
+| system | frontier trigger | compaction | dedup / upsert | rollups |
+|---|---|---|---|---|
+| **Druid** | segment handoff per time chunk; no per-slice durable task | background **auto-compaction** picks intervals by a *policy scan* over segment metadata | none at read; dedup at ingest via rollup key | ingestion-time rollup + optional reindex |
+| **ClickHouse** | `MergeTree` background merges triggered by *part count*, not by time | continuous, level/size-tiered; merge selector scans parts | `ReplacingMergeTree` collapses on merge | materialized views maintained on insert |
+| **Iceberg / Delta** | no frontier concept; `OPTIMIZE`/`rewrite_data_files` is an explicit job | operator-scheduled or auto, selects by *file size histogram* | `MERGE`/deletion vectors at write | downstream jobs (Spark) on a schedule |
+| **BigQuery / Snowflake** | opaque; storage engine merges micro-partitions continuously | continuous, size-driven | primary-key merge at write | materialized views with incremental refresh |
+| **TimeFusion (today)** | **one durable task per 10-min slice per op per stream** | day-sized units planned per (project, date) | dedup as a scheduled unit + read-side `DedupExec` | rollup tiers as scheduled units with a dependency graph |
+
+**The pattern everywhere else: compaction is driven by a cheap scan over
+metadata that selects work by file-size/count, and it is *stateless* — there is
+no durable queue of pending compaction tasks.** ClickHouse's merge selector and
+Druid's auto-compaction both re-derive what to do from current state on every
+tick. Nothing accumulates; nothing can be stale; a restart loses nothing.
+
+TimeFusion instead maintains a durable journal of enumerated future work. That
+is what produced 80k pending tasks, tasks 2.8 days old, stale tasks for days
+that are already compacted, and nine separate ways for work to be queued but
+never claimed. **The industry-standard design would have made most of Part I's
+bugs unrepresentable.**
+
+Where TimeFusion is *right* to differ: rollup tiers with a dependency graph is a
+real requirement (Druid's ingestion-time rollup is not invertible and this plan
+already rejects that at §12), and read-side dedup is needed because we accept
+late/duplicate writes. Those stay.
+
+**The recommendation is therefore not "become ClickHouse", it is: keep the
+durable journal ONLY for work that is genuinely stateful (rollup tiers, whose
+dependency and generation identity must survive restarts), and make file hygiene
+— HotPacking, SealedConsolidation, Repair — stateless and re-derived per tick
+from the file list, exactly like `plan_compaction_debt` already does for
+enqueueing.** It already scans the real file list every 60s; it just then writes
+the answer into a durable queue that can go stale. Delete the queue, keep the
+scan.
+
+## 18. Phase A — local replication and profiling (do this first)
+
+Nothing below should be evaluated on prod. The whole of Part I was diagnosed at
+~20 minutes per deploy cycle; the measurements in §15 took minutes because they
+read object storage directly. Build the local loop before changing behaviour.
+
+**A.1 — Corpus.** Copy a debt-shaped slice from prod to local MinIO. Sizing is
+now known, so this is cheap and targeted:
+
+```bash
+# the fragmented tail (the real problem): ~5.5 GB, 971 files
+aws s3 sync s3://$BUCKET/timefusion/otel_logs_and_spans/project_id=28f62f01…/date=2026-08-17/ \
+            s3://local/…  --endpoint-url $OVH
+# a compacted control: 1 file, 244 MB
+aws s3 sync …/project_id=87576849…/date=2026-08-05/ …
+# plus the _delta_log for both tables
+```
+Total corpus ≈ 15 GB, which fits locally and reproduces both the fragmented and
+the healthy shape.
+
+→ verify: local TF serves a 1-day query over the copied partition.
+
+**A.2 — Restore `sim` and `run-unit`.** Both are described in §4 as landed but
+are **not on master** (they live on another branch). They are the single biggest
+turnaround win available: `run-unit` answers "where do the 800 seconds go" in
+minutes without a deploy. Port them forward first.
+
+→ verify: `timefusion run-unit --op sealed --project 28f62f01 --date 2026-08-17`
+prints a scan/stage/commit decomposition.
+
+**A.3 — Profile the three heavy classes on the local corpus.** SealedConsolidation
+(271–767s), HotPacking (289–895s) and Repair are all unprofiled — nobody has
+ever decomposed where their time goes. Do it with the pprof sampler already in
+the binary.
+
+→ verify: a flamegraph per class, and a stated per-unit cost model
+(fixed cost vs per-file vs per-byte).
+
+**A.4 — Replay harness.** With A.1–A.3, a policy change is evaluated in ~10
+minutes locally instead of ~40 on prod (build 18 + deploy + boot + a quiet
+window). That is the number that decides how many iterations remain possible.
+
+## 19. Phase B — make the frontier stop crowding everything out
+
+The claim mix (§14) says this is the whole game. Two options, in increasing
+order of change:
+
+**B.1 — Widen frontier units from 10 minutes to 1 hour.** Cuts frontier unit
+creation ~6x immediately. Cost: the live tail a hybrid rollup query must scan
+grows from ~10 min to ~1 h, and `raw_tail_duration_secs` is paid by every such
+query — so this trades query freshness for maintenance capacity, and must be
+measured, not assumed. **Validate in the sim (A.2) before shipping.**
+
+**B.2 — Cursor-based frontier (§8.1's Phase 4.1).** Per stream keep a durable
+high-water cursor; materialise at most one in-flight unit per stream per
+operation covering `[cursor, now − FINALIZATION_DELAY)`. Creation becomes
+O(streams) rather than O(streams × slices × ops), and the 10-minute granularity
+is preserved because the unit's *width* is decoupled from its *frequency*.
+This is the correct answer and matches how every system in §17 works.
+
+→ verify (both): claim mix inverts — historical classes reach ≥50% of claims;
+`eligible_watermark_lag_seconds` stays < 600.
+
+## 20. Phase C — make file hygiene stateless
+
+Per §17. `plan_compaction_debt` already scans the real file list every 60s and
+knows exactly which (project, date) have small or unsorted files. Stop writing
+that answer into a durable queue:
+
+- Compute the work set per tick; claim directly from it.
+- No `pending_hot_packing` / `pending_sealed_consolidation` / `pending_repair`
+  to go stale, to be 2.8 days old, or to name days that are already one file.
+- A restart re-derives everything; nothing is lost, nothing is duplicated.
+
+This deletes an entire class of the bugs in Part I by construction, and it is
+the smaller half of the work — the scan already exists.
+
+→ verify: the three pending gauges are replaced by "partitions currently out of
+policy", which by definition cannot exceed the number of partitions.
+
+## 21. Phase D — audit before draining
+
+Before spending capacity on the 2,218 sealed-consolidation and 12,955 dedup
+tasks, establish how many name partitions that are *already* compliant (§15.1
+suggests most). A stale task drained is capacity stolen from a real one.
+
+→ verify: a count of pending tasks whose partition already meets policy. If it
+is the majority, Phase C subsumes this entirely.
+
+## 22. Ordering, and the one-line rationale for it
+
+1. **A** (local loop) — because every estimate below is currently a projection.
+2. **D** (audit) — because it may delete most of the remaining work for free.
+3. **C** (stateless hygiene) — because it makes three classes converge by
+   construction and removes the staleness that D just measured.
+4. **B** (frontier) — the largest and riskiest; it is the only one that needs a
+   freshness trade-off decided, so it should be decided with A's numbers in hand.
+
+**Explicitly NOT first:** more scheduler tweaks. Part I shipped nine of them;
+the last four were each individually correct and jointly inert. The lesson,
+stated once more because it is the expensive one: **when consecutive correct
+fixes produce no effect, the next change should be a measurement, not a fifth
+fix.**
