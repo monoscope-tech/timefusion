@@ -46,6 +46,29 @@ impl CoarsenReport {
     }
 }
 
+/// Is this operation fully re-derivable from a storage scan, and therefore not
+/// worth persisting?
+///
+/// `plan_compaction_debt` scans the real file list of every (project, date)
+/// every 60 s and mints HotPacking for today and SealedConsolidation once the
+/// day seals, from the files themselves — `small.len() >= 2 || any !sorted`. The
+/// scan is authoritative; a durable record of it is a second, weaker copy that
+/// can only disagree.
+///
+/// And it did. Prod 2026-08-19 carried `pending_sealed_consolidation = 2,218`
+/// while an audit of object storage found 877 of 1,033 partitions already
+/// compliant and only 108 sealed ones out of policy — a queue 20x inflated with
+/// work already done, draining at -0.27/min forever. Persisting derived state
+/// buys nothing and costs staleness.
+///
+/// Repair is deliberately NOT here. Its units are day-wide rewrites that run for
+/// 12-15 minutes and stage output before committing, so a durable record is what
+/// `TIMEFUSION_REPAIR_RESUME_ENABLED` resumes against rather than redoing the
+/// work.
+pub const fn is_derived_operation(operation: Operation) -> bool {
+    matches!(operation, Operation::HotPacking | Operation::SealedConsolidation)
+}
+
 pub const SUBSUME_WIDTHS: [i64; 4] = [NORMAL_SLICE_MICROS, 60 * 60 * 1_000_000, 6 * 60 * 60 * 1_000_000, DAY_MICROS];
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
@@ -370,7 +393,25 @@ struct Snapshot {
 #[serde(rename_all = "snake_case")]
 enum JournalRecord {
     Task(MaintenanceTask),
-    SourceCursor { source: String, delta_version: u64 },
+    SourceCursor {
+        source: String,
+        delta_version: u64,
+    },
+    /// This task no longer exists.
+    ///
+    /// Without it the WAL is upsert-only, and a pass that removes tasks can
+    /// persist its work ONLY by rewriting the whole snapshot. Prod 2026-08-19
+    /// shows what that costs when a caller forgets: coarsening took
+    /// `pending_base_rollup` 88,618 -> 2,294, every gauge agreed, and the
+    /// on-disk journal was still byte-identical at 84,734,124 bytes with all
+    /// 173,901 tasks. The collapse existed only in memory and the next restart
+    /// undid it.
+    ///
+    /// `compact` remains correct and is still what a large migration should
+    /// use; this exists so that the CHEAP path can express a deletion at all,
+    /// and so forgetting is no longer possible — `retain_tasks` records the
+    /// tombstones for every caller.
+    Removed(TaskKey),
 }
 
 /// Crash-safe task journal. `checkpoint` uses the same fsync + atomic rename
@@ -385,6 +426,8 @@ pub struct TaskJournal {
     /// updates and WAL replay stay O(1) even with a production-sized backlog.
     task_indices: HashMap<TaskKey, usize>,
     dirty_tasks: HashSet<TaskKey>,
+    /// Keys removed since the last write, pending a `Removed` tombstone.
+    removed_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
     fair_cursors: HashMap<Operation, String>,
     /// `(source, project_id, date)` whose BASE tier is already built, as read
@@ -514,6 +557,19 @@ impl TaskJournal {
                     JournalRecord::SourceCursor { source, delta_version } => {
                         snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
                     }
+                    // `swap_remove` keeps this O(1); the entry swapped into the
+                    // hole needs its index corrected. Snapshot ORDER carries no
+                    // meaning — every consumer sorts or filters — and `compact`
+                    // rewrites it anyway. A later `Task` record for the same key
+                    // simply re-inserts, so remove-then-readd replays correctly.
+                    JournalRecord::Removed(key) => {
+                        if let Some(index) = task_indices.remove(&key) {
+                            snapshot.tasks.swap_remove(index);
+                            if let Some(moved) = snapshot.tasks.get(index) {
+                                task_indices.insert(moved.key.clone(), index);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -523,6 +579,7 @@ impl TaskJournal {
             snapshot,
             task_indices,
             dirty_tasks: HashSet::new(),
+            removed_tasks: HashSet::new(),
             dirty_cursors: HashSet::new(),
             fair_cursors: HashMap::new(),
             base_tier_ready: HashSet::new(),
@@ -585,13 +642,7 @@ impl TaskJournal {
         }
         let mut removed = 0;
         if self.snapshot.tasks.len() > limit {
-            self.snapshot.tasks.retain(|task| {
-                let keep = task.state == TaskState::Complete;
-                removed += usize::from(!keep);
-                keep
-            });
-            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
-            self.dirty_tasks.clear();
+            removed = self.retain_tasks(|task| task.state == TaskState::Complete);
         }
         self.snapshot.source_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned(), 1);
         self.dirty_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned());
@@ -658,8 +709,7 @@ impl TaskJournal {
         if self.snapshot.source_cursors.get(Self::COARSE_BACKFILL_MIGRATION).copied().unwrap_or_default() >= 1 {
             return None;
         }
-        let mut removed = 0usize;
-        self.snapshot.tasks.retain(|task| {
+        let removed = self.retain_tasks(|task| {
             let coarse_planned = matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking);
             let drop = task.state != TaskState::Complete
                 && coarse_planned
@@ -667,13 +717,8 @@ impl TaskJournal {
                 // A day-sized unit is what replaces these; anything already that
                 // wide came from the coarse planner and must survive.
                 && task.key.slice.width() < 24 * 60 * 60 * 1_000_000;
-            removed += usize::from(drop);
             !drop
         });
-        if removed != 0 {
-            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
-            self.dirty_tasks.clear();
-        }
         self.snapshot.source_cursors.insert(Self::COARSE_BACKFILL_MIGRATION.to_owned(), 1);
         self.dirty_cursors.insert(Self::COARSE_BACKFILL_MIGRATION.to_owned());
         Some(removed)
@@ -794,8 +839,7 @@ impl TaskJournal {
                 }
             }
         }
-        let before = self.snapshot.tasks.len();
-        self.snapshot.tasks.retain(|task| {
+        self.retain_tasks(|task| {
             if !matches!(task.state, TaskState::Pending | TaskState::Retry) || is_live_frontier(task.key.slice, now_micros) {
                 return true;
             }
@@ -817,13 +861,7 @@ impl TaskJournal {
                 return true;
             }
             !covered[index].contains(&(group_of(task), bucket))
-        });
-        let removed = before - self.snapshot.tasks.len();
-        if removed != 0 {
-            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
-            self.dirty_tasks.clear();
-        }
-        removed
+        })
     }
 
     /// One pass of `coarsen_sealed_slices` at a single width.
@@ -940,8 +978,7 @@ impl TaskJournal {
         if groups.is_empty() {
             return report;
         }
-        let collapsed = self.snapshot.tasks.len();
-        self.snapshot.tasks.retain(|task| {
+        report.fused = self.retain_tasks(|task| {
             !coarsenable(task)
                 || !groups.contains_key(&(
                     task.key.physical_table.clone(),
@@ -951,8 +988,6 @@ impl TaskJournal {
                     bucket_of(task.key.slice.start_micros),
                 ))
         });
-        report.fused = collapsed - self.snapshot.tasks.len();
-        self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
         for ((physical_table, source, project_id, operation, bucket), bytes) in groups {
             let Ok(slice) = TimeSlice::new(bucket, bucket.saturating_add(width)) else { continue };
             self.upsert(MaintenanceTask {
@@ -1146,6 +1181,12 @@ impl TaskJournal {
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
+        // A key removed earlier in this write window and re-created now must not
+        // still carry a tombstone; the upsert is the later truth. Every path
+        // that re-creates a task — enqueue, invalidate, the fused unit
+        // `coarsen_to_width` writes over the members it just dropped — goes
+        // through here, so this is the one place it needs saying.
+        self.removed_tasks.remove(&task.key);
         self.dirty_tasks.insert(task.key.clone());
         if let Some(index) = self.task_indices.get(&task.key).copied() {
             self.snapshot.tasks[index] = task;
@@ -1164,6 +1205,13 @@ impl TaskJournal {
     /// exists — see the field on [`MaintenanceTask`]. Only `plan_rollup_backfill`
     /// can prove it, because only it reads actual tier coverage.
     pub fn enqueue_with_base_tier(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool) {
+        // Same rule as `upsert`, and it needs stating twice because this path
+        // does not go through it: a key removed earlier in this write window and
+        // enqueued again is CREATED, not removed. `coarsen_to_width` does
+        // exactly that in a single pass — it drops a bucket's members and writes
+        // a fused unit whose key can be one of them — so without this the pass
+        // would delete the unit it exists to create.
+        self.removed_tasks.remove(&key);
         if let Some(index) = self.task_indices.get(&key).copied() {
             let task = &mut self.snapshot.tasks[index];
             if task.state != TaskState::Running {
@@ -1205,6 +1253,38 @@ impl TaskJournal {
             publication: None,
             base_tier_present,
         });
+    }
+
+    /// Drop every task the predicate rejects, recording a tombstone for each.
+    ///
+    /// THE way to remove tasks. Four call sites used to hand-roll
+    /// `snapshot.tasks.retain(..)` plus an index rebuild, and none of them
+    /// recorded anything — the WAL had no way to say "this task is gone", so
+    /// the removals lived only in memory and came back on the next load. Prod
+    /// 2026-08-19: `pending_base_rollup` 88,618 -> 2,294 with the on-disk
+    /// journal still byte-identical at 84,734,124 bytes.
+    ///
+    /// Centralising it is the actual fix. A caller can no longer forget,
+    /// because there is nothing left to remember.
+    fn retain_tasks(&mut self, mut keep: impl FnMut(&MaintenanceTask) -> bool) -> usize {
+        let before = self.snapshot.tasks.len();
+        let removed = &mut self.removed_tasks;
+        let dirty = &mut self.dirty_tasks;
+        self.snapshot.tasks.retain(|task| {
+            if keep(task) {
+                return true;
+            }
+            // A key that was pending a write and is now gone must not also be
+            // upserted; the tombstone is the whole story.
+            dirty.remove(&task.key);
+            removed.insert(task.key.clone());
+            false
+        });
+        let dropped = before - self.snapshot.tasks.len();
+        if dropped != 0 {
+            self.task_indices = self.snapshot.tasks.iter().enumerate().map(|(index, task)| (task.key.clone(), index)).collect();
+        }
+        dropped
     }
 
     /// Record all maintenance consequences of a source mutation. Repeated
@@ -1780,10 +1860,13 @@ impl TaskJournal {
         if let Some(parent) = self.wal_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        if !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() {
+        if !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() || !self.removed_tasks.is_empty() {
             let mut wal = OpenOptions::new().create(true).append(true).open(&self.wal_path)?;
             let mut records = Vec::new();
             for key in self.dirty_tasks.drain() {
+                if is_derived_operation(key.operation) {
+                    continue;
+                }
                 if let Some(index) = self.task_indices.get(&key).copied() {
                     let task = &self.snapshot.tasks[index];
                     serde_json::to_writer(&mut records, &JournalRecord::Task(task.clone()))?;
@@ -1795,6 +1878,17 @@ impl TaskJournal {
                     serde_json::to_writer(&mut records, &JournalRecord::SourceCursor { source, delta_version })?;
                     records.push(b'\n');
                 }
+            }
+            // AFTER the upserts, so a key removed and re-created in the same
+            // window keeps the re-creation. `retain_tasks` already drops such a
+            // key from `removed_tasks` when it reappears, but ordering makes the
+            // record stream correct on its own terms rather than by convention.
+            for key in self.removed_tasks.drain() {
+                if is_derived_operation(key.operation) {
+                    continue;
+                }
+                serde_json::to_writer(&mut records, &JournalRecord::Removed(key))?;
+                records.push(b'\n');
             }
             wal.write_all(&records)?;
             wal.sync_all()?;
@@ -1814,11 +1908,20 @@ impl TaskJournal {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = serde_json::to_vec(&self.snapshot)?;
+        // Derived work is left out of the authoritative snapshot too, so a
+        // reload starts with none of it and `plan_compaction_debt` re-derives
+        // exactly what storage says is needed within its next 60 s pass.
+        let durable = Snapshot {
+            version: self.snapshot.version,
+            tasks: self.snapshot.tasks.iter().filter(|task| !is_derived_operation(task.key.operation)).cloned().collect(),
+            source_cursors: self.snapshot.source_cursors.clone(),
+        };
+        let bytes = serde_json::to_vec(&durable)?;
         crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
         let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
         wal.sync_all()?;
         self.dirty_tasks.clear();
+        self.removed_tasks.clear();
         self.dirty_cursors.clear();
         Ok(())
     }
@@ -3314,6 +3417,95 @@ mod tests {
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         let live = reloaded.tasks().filter(|t| t.key.operation == Operation::BaseRollup && matches!(t.state, TaskState::Pending | TaskState::Retry)).count();
         assert_eq!(live, 1, "the collapse must survive the reload; got {live} units back");
+    }
+
+    /// Derived hygiene work is never persisted; durable work always is.
+    ///
+    /// `plan_compaction_debt` scans the real file list every 60 s and mints
+    /// HotPacking / SealedConsolidation from the files themselves, so the scan
+    /// is authoritative and a durable copy can only go stale. It did: prod
+    /// 2026-08-19 carried `pending_sealed_consolidation = 2,218` while an audit
+    /// of object storage found 877 of 1,033 partitions already compliant and
+    /// only 108 sealed ones out of policy — 20x inflated with work already done.
+    ///
+    /// Repair must still persist: its units are day-wide rewrites that stage
+    /// output before committing, and losing one means redoing 12-15 minutes.
+    #[test]
+    fn derived_hygiene_is_not_persisted_but_durable_work_is() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let day = 3 * DAY_MICROS;
+        let of = |operation| task("p", day, day + DAY_MICROS, operation).key;
+        {
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            for operation in [Operation::HotPacking, Operation::SealedConsolidation, Operation::Repair, Operation::BaseRollup] {
+                journal.enqueue(of(operation), 0, 16, 0);
+            }
+            assert_eq!(journal.tasks().count(), 4, "all four exist in memory");
+            journal.checkpoint().expect("persist");
+        }
+        let reloaded = TaskJournal::load(dir.path()).expect("reload");
+        let survived: Vec<_> = reloaded.tasks().map(|t| t.key.operation).collect();
+        assert!(survived.contains(&Operation::Repair), "Repair must survive: it stages output before committing");
+        assert!(survived.contains(&Operation::BaseRollup), "BaseRollup must survive");
+        assert!(!survived.contains(&Operation::HotPacking), "HotPacking is re-derived from the file scan, not reloaded");
+        assert!(!survived.contains(&Operation::SealedConsolidation), "SealedConsolidation is re-derived from the file scan");
+        assert_eq!(survived.len(), 2, "exactly the durable operations, got {survived:?}");
+    }
+
+    /// A removal must survive a reload through `checkpoint` ALONE.
+    ///
+    /// The WAL used to be upsert-only: `JournalRecord` had `Task` and
+    /// `SourceCursor` and nothing meaning "this task is gone", so a pass that
+    /// removed tasks could persist its work only by rewriting the entire 84 MB
+    /// snapshot. Every caller that forgot silently lost the removal. Prod
+    /// 2026-08-19: `pending_base_rollup` 88,618 -> 2,294 while the on-disk
+    /// journal stayed byte-identical at 84,734,124 bytes with all 173,901
+    /// tasks, and the next restart undid the lot.
+    ///
+    /// `compact` still exists and is still right for a large migration. This
+    /// pins the cheap path, because the cheap path is the one callers reach for.
+    #[test]
+    fn a_removal_survives_a_reload_without_compacting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let day = 3 * DAY_MICROS;
+        {
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            for slot in 0..6 {
+                let start = day + slot * NORMAL_SLICE_MICROS;
+                journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
+            }
+            journal.checkpoint().expect("persist the slices");
+            let dropped = journal.retain_tasks(|t| t.key.slice.start_micros != day);
+            assert_eq!(dropped, 1, "exactly one unit should have been dropped");
+            journal.checkpoint().expect("persist the REMOVAL — no compact");
+        }
+        let reloaded = TaskJournal::load(dir.path()).expect("reload");
+        assert_eq!(reloaded.tasks().count(), 5, "the removal must survive; a tombstone-less WAL replays all 6");
+        assert!(!reloaded.tasks().any(|t| t.key.slice.start_micros == day), "the removed unit specifically must be gone, not merely some unit");
+    }
+
+    /// Remove-then-recreate replays as CREATED, not as removed.
+    ///
+    /// `coarsen_to_width` does exactly this in one pass: it drops a bucket's
+    /// members and writes a fused unit over the same span, and a fused unit at
+    /// day width can collide with a key that was just dropped. If the tombstone
+    /// won, the pass would delete the very unit it exists to create.
+    #[test]
+    fn a_task_recreated_after_removal_survives_the_reload() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let day = 3 * DAY_MICROS;
+        let key = task("p", day, day + NORMAL_SLICE_MICROS, Operation::BaseRollup).key;
+        {
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            journal.enqueue(key.clone(), 0, 16, 0);
+            journal.checkpoint().expect("persist");
+            journal.retain_tasks(|t| t.key != key);
+            journal.enqueue(key.clone(), 0, 32, 0);
+            journal.checkpoint().expect("persist both the removal and the re-creation");
+        }
+        let reloaded = TaskJournal::load(dir.path()).expect("reload");
+        assert_eq!(reloaded.tasks().count(), 1, "the re-created task must be present exactly once");
+        assert_eq!(reloaded.state(&key), Some(TaskState::Pending));
     }
 
     /// A day-wide unit must SUBSUME the ten-minute units inside it.
