@@ -3276,6 +3276,38 @@ mod tests {
         assert_eq!(widths, vec![DAY_MICROS], "one day-wide unit should remain, got {widths:?}");
     }
 
+    /// A collapse must SURVIVE a reload.
+    ///
+    /// `checkpoint` appends dirty tasks to a WAL, and `JournalRecord::Task` can
+    /// only upsert — there is no record meaning "this task is gone". So a pass
+    /// that removes tasks and then checkpoints persists nothing, and every
+    /// removed task returns when the journal is next loaded.
+    ///
+    /// Prod 2026-08-19 ran the whole loop invisibly: coarsening took
+    /// `pending_base_rollup` from 88,618 to 2,294, the next deploy restored 81k,
+    /// and the on-disk journal was still byte-identical at 84,734,124 bytes with
+    /// all 173,901 tasks. On a process that restarts several times a day, an
+    /// in-memory-only collapse never happened at all.
+    #[test]
+    fn a_collapsed_queue_stays_collapsed_across_a_reload() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let day = 3 * DAY_MICROS;
+        let now = 10 * DAY_MICROS;
+        {
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            for slot in 0..(DAY_MICROS / NORMAL_SLICE_MICROS) {
+                let start = day + slot * NORMAL_SLICE_MICROS;
+                journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
+            }
+            journal.checkpoint().expect("persist the fine slices");
+            assert!(journal.coarsen_sealed_slices(now) > 0, "the day must collapse");
+            journal.compact().expect("a pass that REMOVES must rewrite the snapshot");
+        }
+        let reloaded = TaskJournal::load(dir.path()).expect("reload");
+        let live = reloaded.tasks().filter(|t| t.key.operation == Operation::BaseRollup && matches!(t.state, TaskState::Pending | TaskState::Retry)).count();
+        assert_eq!(live, 1, "the collapse must survive the reload; got {live} units back");
+    }
+
     /// A day-wide unit must SUBSUME the ten-minute units inside it.
     ///
     /// This is the shape prod was actually in on 2026-08-19, and the reason the

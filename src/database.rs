@@ -4247,6 +4247,11 @@ impl Database {
                             // One-shot: collapse the fine-grained sealed backfill
                             // so the coarse planner can re-derive it day-sized.
                             if let Some(cleared) = journal.clear_stale_estimates() {
+                                // Rewrites every pending task in place; the WAL
+                                // would carry it, but a full rewrite is cheaper
+                                // than 85k append records and is what the
+                                // following migrations need anyway.
+                                journal.compact()?;
                                 info!(cleared, event = "maintenance_stale_estimates_cleared");
                             }
                             let coarsened = journal.migrate_fine_grained_backfill(crate::support::now_micros()).unwrap_or_default();
@@ -11544,7 +11549,23 @@ impl Database {
                 let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let report = journal.coarsen_sealed_slices_reporting(crate::support::now_micros());
                 if report.total() != 0 {
-                    journal.checkpoint()?;
+                    // COMPACT, not checkpoint. `checkpoint` appends dirty tasks
+                    // to a WAL and `JournalRecord::Task` can only upsert — there
+                    // is no record that says "this task is gone". A pass that
+                    // REMOVES tasks therefore persists nothing, and every
+                    // removed task returns on the next restart.
+                    //
+                    // Prod 2026-08-19 showed it exactly: coarsening took
+                    // `pending_base_rollup` 88,618 -> 2,294, the next deploy
+                    // restored 81k, and the on-disk journal was still
+                    // byte-identical at 84,734,124 bytes with all 173,901 tasks.
+                    // The collapse was real in memory and never durable, which
+                    // on a process that restarts several times a day means it
+                    // never happened at all.
+                    //
+                    // `compact`'s own doc states this rule for migrations; the
+                    // recurring pass needs it for the same reason.
+                    journal.compact()?;
                 }
                 report
             };
