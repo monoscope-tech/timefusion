@@ -328,6 +328,20 @@ pub struct TaskJournal {
     /// journalled: the planner rebuilds it from coverage each pass, so a restart
     /// costs one pass and it self-heals if coverage changes underneath it.
     base_tier_ready: HashSet<(String, String, String)>,
+    /// `(source, project_id, physical_table, date)` the tier is MISSING, from
+    /// the same coverage read that fills `base_tier_ready`.
+    ///
+    /// `scheduling_class` ranks a hole ahead of a re-derive. Without that,
+    /// sealed rollup work is strictly newest-first, and recent days are
+    /// continuously re-invalidated by ongoing publication — so the claim never
+    /// walks backwards far enough to reach an old hole. Prod 2026-08-19 09:00:
+    /// `94c5dc1f` had 1h-tier dates jumping 2026-07-31 -> 08-14 for a second
+    /// day running while day-wide derived units for 08-17 were claimed over and
+    /// over. Newest-first is right for freshness and wrong for CONTIGUITY, and
+    /// 30d coverage is a contiguity goal.
+    ///
+    /// Runtime only, rebuilt from coverage every 60s, same as `base_tier_ready`.
+    tier_holes: HashSet<(String, String, String, String)>,
     /// Rotates so a fixed share of claims is reserved for sealed work. Runtime
     /// only — never journalled; losing it across a restart costs nothing.
     claim_tick: u64,
@@ -428,6 +442,7 @@ impl TaskJournal {
             dirty_cursors: HashSet::new(),
             fair_cursors: HashMap::new(),
             base_tier_ready: HashSet::new(),
+            tier_holes: HashSet::new(),
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
         })
@@ -751,6 +766,28 @@ impl TaskJournal {
 
     pub fn base_tier_ready_len(&self) -> usize {
         self.base_tier_ready.len()
+    }
+
+    /// Publish which `(source, project, tier table, date)` are MISSING, so
+    /// `claim_next` can rank holes ahead of re-derives. Replaced wholesale for
+    /// the same reason as `base_tier_ready`.
+    pub fn set_tier_holes(&mut self, holes: HashSet<(String, String, String, String)>) {
+        self.tier_holes = holes;
+    }
+
+    pub fn tier_holes_len(&self) -> usize {
+        self.tier_holes.len()
+    }
+
+    /// Is this task filling a hole rather than re-deriving a day that already
+    /// has tier output? Only meaningful for rollup operations.
+    fn fills_a_hole(&self, task: &MaintenanceTask) -> bool {
+        if !matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup) {
+            return false;
+        }
+        chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
+            self.tier_holes.contains(&(task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), time.date_naive().to_string()))
+        })
     }
 
     pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
@@ -1095,10 +1132,26 @@ impl TaskJournal {
                 && task.deadline_micros <= now_micros
                 && (allow_quarantined || task.attempts < Self::QUARANTINE_ATTEMPTS)
         };
-        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, i64, i64)> {
-            let mut class: Option<(u8, i64, i64)> = None;
+        // `(class, hole_rank, width, recency)`. Class still leads, so the live
+        // frontier keeps strict priority over sealed work. `hole_rank` orders
+        // WITHIN a class: a cell whose tier output is missing outranks one that
+        // already has output and is merely being re-derived.
+        //
+        // Without it, sealed rollup work is strictly newest-first, and recent
+        // days are re-invalidated continuously by ongoing publication — so the
+        // claim never walks back far enough to reach an old hole. Prod
+        // 2026-08-19 09:00: `94c5dc1f`'s 1h tier jumped 2026-07-31 -> 08-14 for
+        // a second day running, while day-wide derived units for 08-17 were
+        // claimed repeatedly. Newest-first is right for FRESHNESS and wrong for
+        // CONTIGUITY, and 30 contiguous days is a contiguity goal.
+        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, i64, i64) {
+            let (class, width, order) = scheduling_class(task, now_micros);
+            (class, u8::from(!journal.fills_a_hole(task)), width, order)
+        };
+        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, i64, i64)> {
+            let mut class: Option<(u8, u8, i64, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_live_frontier(task.key.slice, now_micros))) {
-                let candidate = scheduling_class(task, now_micros);
+                let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
                     class = Some(candidate);
                 }
@@ -1109,8 +1162,7 @@ impl TaskJournal {
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
         let mut fallback: Option<&MaintenanceTask> = None;
         let mut next: Option<&MaintenanceTask> = None;
-        for task in self.snapshot.tasks.iter().filter(|task| claimable(task) && scheduling_class(task, now_micros) == class && self.dependencies_complete(task))
-        {
+        for task in self.snapshot.tasks.iter().filter(|task| claimable(task) && rank(self, task) == class && self.dependencies_complete(task)) {
             if fallback.is_none_or(|current| {
                 (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
             }) {
@@ -2545,6 +2597,56 @@ mod tests {
         assert_eq!(unproven, 1, "only the one without a base-tier proof is dependency-blocked");
         assert_eq!(quarantined, 1, "only the one that burned its attempts is quarantined");
         assert_eq!(not_due, 1, "only the one with a future deadline is not yet due");
+    }
+
+    /// A hole must be claimed before a day that already has tier output.
+    ///
+    /// Sealed rollup work is otherwise strictly newest-first, and recent days
+    /// are re-invalidated continuously by ongoing publication, so the claim
+    /// never walks back far enough to reach an old hole. Prod 2026-08-19 09:00:
+    /// `94c5dc1f`'s 1h tier jumped 2026-07-31 -> 08-14 for a second day running
+    /// while day-wide derived units for 08-17 were claimed over and over.
+    /// Newest-first is right for FRESHNESS and wrong for CONTIGUITY, and 30
+    /// contiguous days is a contiguity goal.
+    #[test]
+    fn a_hole_outranks_a_day_that_already_has_tier_output() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        let at = |project: &str, day: i64| {
+            let mut t = task(project, day * DAY, day * DAY + DAY, Operation::DerivedRollup);
+            t.key.physical_table = "rollup_1h".to_owned();
+            t.deadline_micros = 0;
+            t
+        };
+        // Both are SEALED (day 38+ would fall inside the live-frontier window
+        // and never reach the sealed turn). Day 35 is the newer of the two, so
+        // newest-first takes it; day 20 is the old hole.
+        journal.upsert(at("recent", 35));
+        journal.upsert(at("oldhole", 20));
+        journal.set_base_tier_ready(HashSet::from([
+            ("source".to_owned(), "recent".to_owned(), "1970-02-05".to_owned()),
+            ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
+        ]));
+
+        // With no hole information, newest-first wins — the status quo.
+        assert_eq!(journal.claim_next(Operation::DerivedRollup, now, true).expect("claim").key.project_id, "recent");
+
+        // Told which cell is a hole, the hole goes first instead.
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        journal.upsert(at("recent", 35));
+        journal.upsert(at("oldhole", 20));
+        journal.set_base_tier_ready(HashSet::from([
+            ("source".to_owned(), "recent".to_owned(), "1970-02-05".to_owned()),
+            ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
+        ]));
+        journal.set_tier_holes(HashSet::from([("source".to_owned(), "oldhole".to_owned(), "rollup_1h".to_owned(), "1970-01-21".to_owned())]));
+        assert_eq!(
+            journal.claim_next(Operation::DerivedRollup, now, true).expect("claim").key.project_id,
+            "oldhole",
+            "a missing day must outrank a newer day that already has output"
+        );
     }
 
     /// The day-keyed ready set must unblock a derived task of ANY width.
