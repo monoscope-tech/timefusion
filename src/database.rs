@@ -23275,9 +23275,16 @@ mod tests {
         cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
         cfg.aws.aws_default_region = Some("us-east-1".to_string());
         cfg.aws.aws_allow_http = Some("true".to_string());
-        // Core settings - unique per test
-        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
-        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-db-{}", test_id));
+        // Unique per RUN, not merely per test name. Keying storage on the name
+        // alone means every run of a test reads the objects its previous runs
+        // left behind, so results depend on history: on 2026-08-19 two tests
+        // failed in a full suite, passed in isolation, and passed again in the
+        // suite once `s3://timefusion-tests` was emptied. That is a false alarm
+        // in the good case and a hidden regression in the bad one — and it cost
+        // an hour chasing a subsume "regression" that did not exist.
+        let unique = format!("{test_id}-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        cfg.core.timefusion_table_prefix = format!("test-{unique}");
+        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-db-{unique}"));
         // Disable Foyer cache for tests
         cfg.cache.timefusion_foyer_disabled = true;
         Arc::new(cfg)
