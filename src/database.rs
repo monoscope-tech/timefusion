@@ -935,13 +935,6 @@ fn min_contiguous_days<'a>(
     (worst_days, worst, median)
 }
 
-/// Which declared tiers each candidate day is missing.
-///
-/// The old code subtracted the union, but the intent is the intersection (days not covered by every
-/// tier). Returning which tiers are missing lets the caller enqueue only the absent tier: a derived
-/// tier reads the base tier, so a day missing only its derived tier needs no raw source scan or
-/// dedup.
-
 /// Does this file prove its partition holds no rows?
 ///
 /// Only an explicit zero counts. Missing stats is unknown and must read as non-empty; otherwise
@@ -951,6 +944,12 @@ fn partition_file_is_empty(num_records: Option<i64>) -> bool {
     num_records == Some(0)
 }
 
+/// Which declared tiers each candidate day is missing.
+///
+/// The old code subtracted the union, but the intent is the intersection (days not covered by every
+/// tier). Returning which tiers are missing lets the caller enqueue only the absent tier: a derived
+/// tier reads the base tier, so a day missing only its derived tier needs no raw source scan or
+/// dedup.
 fn tiers_missing_per_day(
     candidates: &[(String, chrono::NaiveDate)], covered_per_tier: &[(usize, HashSet<(String, chrono::NaiveDate)>)],
 ) -> HashMap<(String, chrono::NaiveDate), Vec<usize>> {
@@ -6055,12 +6054,6 @@ impl Database {
             .clone()
     }
 
-    /// The DML serialization mutex for the physical table backing `(project_id, table_name)`.
-    ///
-    /// Unified tables are one shared Delta table across all default projects, so their key drops
-    /// the project; otherwise two projects' merges would OCC-conflict and redo full rewrites.
-    /// Custom-storage tables are physically isolated and keep the full key.
-
     /// Physical Delta log lock key.
     ///
     /// Collapses all default projects sharing a unified table onto one key (empty project_id is
@@ -8939,12 +8932,6 @@ impl Database {
         Ok(m)
     }
 
-    /// Data fingerprint of one source partition.
-    ///
-    /// Same identity `partition_fingerprints` computes, so a build and a later read agree. The file
-    /// list used to change under compaction and invalidate coverage; row count plus timestamp span
-    /// is the stable identity.
-
     /// Exclusive upper bound the coverage was built to. `i64::MAX` means whole-partition.
     ///
     /// Must be the bound stored with the coverage, never one recomputed here — for a day still
@@ -9132,7 +9119,38 @@ impl Database {
         let today = crate::support::today_utc();
         let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
         let mut planned = Vec::new();
+        // Every table EXCEPT a rollup tier. Packing a tier destroys the coverage
+        // it exists to prove.
+        //
+        // A tier file carries the identity tags `recover_rollup_coverage` reads —
+        // source, project, generation, source_fingerprint, slice_start,
+        // slice_end — and that function skips any file missing ANY of them.
+        // Packing merges files from different slices, so `carried_coverage_tags`
+        // finds the inputs disagree and emits nothing: the packed file proves no
+        // coverage, and the slices it absorbed are no longer represented by any
+        // tagged file either. Coverage for that range is not weakened, it is
+        // gone, and the router answers `not_built` and falls back to a raw scan.
+        //
+        // Prod 2026-08-19 was spending half of file hygiene on exactly this — 58
+        // of 119 HotPacking/SealedConsolidation claims targeted tier tables — and
+        // the 1m tier had 79 untagged live files on 08-19 and 9 on 08-18 while
+        // every older day was fully tagged. A 10-day historical window then
+        // reported `rollup_miss_not_built_total +45` as its sole miss reason.
+        //
+        // The tier does not need packing anyway: its writer publishes one file
+        // per unit, and units are day-wide since the coarsening cascade. The
+        // small-file counts that made tiers look like debt came from the
+        // ten-minute slices that over-splitting produced.
+        let tiers: HashSet<String> = crate::schema::registry()
+            .list_tables()
+            .into_iter()
+            .filter_map(|name| get_schema(&name).map(|schema| (name, schema)))
+            .flat_map(|(name, schema)| schema.rollups.iter().map(|spec| spec.table_name(&name)).collect::<Vec<_>>())
+            .collect();
         for (storage_project, source, table_ref) in self.all_tables().await {
+            if tiers.contains(&source) {
+                continue;
+            }
             let schema = get_schema(&source).unwrap_or_else(get_default_schema);
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<CompactionDebtFile>> = HashMap::new();
             {
@@ -13654,14 +13672,6 @@ impl Database {
         self.clear_staged_intent(&bins.iter().map(|b| b.wave_id.as_str()).collect::<Vec<_>>());
     }
 
-    /// Local-disk record of staged-but-uncommitted parquet, so a crash between staging and the wave
-    /// commit does not leave unreferenced objects behind.
-    ///
-    /// Lives on the WAL volume, which is durable-by-design for this class of intent. Written after
-    /// the writer flush because `RecordBatchWriter` mints object names itself, so intended paths are
-    /// not knowable earlier. The remaining crash-mid-PUT window is VACUUM's job. This closes the
-    /// longer staging → wave commit window.
-
     /// Path where verified-sorted paths are remembered across restarts.
     fn repair_verified_path(&self) -> PathBuf {
         let wal_dir = self.config.core.wal_dir();
@@ -14628,15 +14638,6 @@ fn build_query_runtime_env(
         .expect("Failed to create runtime environment")
 }
 
-/// Sort `batches` by the table's declared `sorting_columns` and report `(batches, sorted)`.
-///
-/// `sorted == true` means rows are globally ordered by the sort keys and the caller may set
-/// the parquet `SortingColumn` footer. `sorted == false` means there are no sort keys or the
-/// bucket mixed schemas within the window, so `concat_batches` could not combine it; the rows
-/// are written unsorted and the caller must pass `declare_sorted=false` so the footer never
-/// claims an order we didn't write. A single batch skips the concat copy; an already-ordered
-/// batch skips the `take` copy.
-
 /// Number of buckets the sharded dedup rewrite hashes into.
 ///
 /// Shards partition `[0, DEDUP_BUCKET_COUNT)` into contiguous ranges, so more shards than buckets
@@ -15142,9 +15143,6 @@ fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
         })
         .join(",")
 }
-
-/// SQL `ORDER BY` clause matching the schema's sort order, for rewrite paths that stream through
-/// a `SELECT` rather than delta-rs optimize. Empty when no sort order is declared.
 
 /// Input bytes one repair slice may cover.
 ///
@@ -15875,8 +15873,6 @@ pub(crate) fn pack_target_bytes(configured: i64, budget: std::time::Duration) ->
     configured.min(budget_bytes(budget / PACK_BUDGET_FRACTION)).max(1)
 }
 
-/// Sizing + scope knobs for one hot-tail planning pass.
-
 /// Consecutive staging failures after which a repair candidate stops being offered for the rest
 /// of the process.
 ///
@@ -16250,15 +16246,6 @@ fn concat_landed(mut landed: Vec<StagedBin>, more: Vec<StagedBin>) -> Vec<Staged
     landed.extend(more);
     landed
 }
-
-/// Drive one bin per project per round (a wave). Every project gets its Nth bin before any
-/// project gets its (N+1)th. Bins are staged in parallel without committing, and the whole
-/// round lands in one `commit_wave` call. Batching commits is what collapses the OCC ladder.
-///
-/// Stops when every tail is converged, the round cap is hit, the deadline passes, or a safety
-/// brake engages. In every stop case the in-flight wave still finishes and commits — brakes
-/// only prevent starting more work. Generic over the per-bin operation and wave commit so the
-/// fairness invariant is unit-testable without a Delta table.
 
 /// Per-project outcome of one round's staging. `Result<Option<T>>` overloaded `None`: "converged"
 /// (drop for the tick) vs "bin vanished under a concurrent rewrite" (project still has work —
@@ -17332,14 +17319,6 @@ impl ProjectRoutingTable {
     pub(crate) fn references_tombstone(table_name: &str, f: &Expr) -> bool {
         crate::schema::get_schema(table_name).and_then(|s| s.tombstone_column.as_deref()).is_some_and(|t| f.column_refs().iter().any(|c| c.name == t))
     }
-
-    /// Drop rows whose winning version is a tombstone (merge-on-read `DELETE`).
-    ///
-    /// Sits above the dedup deliberately: the tombstone must first beat the older live version of
-    /// its key on `dedup_tiebreak`, then remove the row. Filtering below the dedup would delete the
-    /// tombstone and let the stale live version survive. `marker IS DISTINCT FROM true` treats NULL
-    /// and `false` as live, so an all-NULL tombstone column has no effect. `keep` strips the marker
-    /// back off when it was projected only for this filter.
 
     /// `(column, name)` pairs for an identity projection over `idxs` — each index
     /// kept as-is, by position, with its own field name. Shared by `project_indices`
@@ -19725,6 +19704,53 @@ mod tests {
             "a partition sealed six days ago must read as waiting >24h so it can escalate; got {waited_hours}h — \
              aged from the rescan it would read as 0 and starve forever"
         );
+        Ok(())
+    }
+
+    /// File hygiene must not pack a rollup TIER.
+    ///
+    /// A tier file carries the identity tags `recover_rollup_coverage` reads,
+    /// and that function skips any file missing ANY of them. Packing merges
+    /// files from different slices, so `carried_coverage_tags` finds the inputs
+    /// disagree and emits nothing — the packed file proves no coverage, and the
+    /// slices it absorbed lose their only representation.
+    ///
+    /// Prod 2026-08-19 spent half of file hygiene doing this: 58 of 119
+    /// HotPacking/SealedConsolidation claims targeted tier tables, the 1m tier
+    /// carried 79 untagged live files on 08-19 against zero on every older day,
+    /// and a 10-day historical query reported `rollup_miss_not_built_total +45`
+    /// as its only miss reason.
+    #[tokio::test]
+    async fn compaction_debt_skips_rollup_tier_tables() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        let mut cfg = (*create_test_config("debt-skips-tiers")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let project = format!("tier_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(4);
+        for id in ["a", "b"] {
+            db.insert_records_batch(
+                &project,
+                "otel_logs_and_spans",
+                vec![json_to_batch(vec![test_span_ts(id, "op", &project, day.timestamp_micros())])?],
+                true,
+                None,
+            )
+            .await?;
+        }
+        db.plan_compaction_debt().await?;
+
+        let (on_source, on_tier) = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            let hygiene =
+                |task: &crate::maintenance_coordinator::MaintenanceTask| matches!(task.key.operation, Operation::HotPacking | Operation::SealedConsolidation);
+            (
+                journal.tasks().filter(|t| hygiene(t) && t.key.physical_table == "otel_logs_and_spans").count(),
+                journal.tasks().filter(|t| hygiene(t) && t.key.physical_table.contains("_rollup_")).count(),
+            )
+        };
+        assert!(on_source > 0, "the scan must still plan hygiene for the source table");
+        assert_eq!(on_tier, 0, "a rollup tier must never be packed — packing it erases the coverage it proves");
         Ok(())
     }
 
@@ -22452,7 +22478,12 @@ mod tests {
     /// in exactly one slice.
     fn assert_tiles(bounds: &[(i64, Option<i64>)], lo: i64, hi: i64, samples: &[i64]) {
         assert_eq!(bounds[0].0, lo, "first slice starts at lo");
-        assert!(bounds.last().expect("non-empty").1.is_none(), "last slice is open so hi is never dropped");
+        let last = *bounds.last().expect("non-empty");
+        assert!(last.1.is_none(), "last slice is open so hi is never dropped");
+        // The doc's claim about `hi`, actually checked. Without this the
+        // parameter was unused, which is how it read as dead rather than as an
+        // unasserted invariant.
+        assert!(last.0 <= hi, "the open last slice must start at or before hi ({:?} vs {hi})", last.0);
         for w in bounds.windows(2) {
             assert_eq!(w[0].1.expect("only the last is open"), w[1].0, "{:?} must abut {:?}", w[0], w[1]);
         }
