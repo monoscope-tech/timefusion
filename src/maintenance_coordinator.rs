@@ -1154,12 +1154,12 @@ impl TaskJournal {
         // a second day running, while day-wide derived units for 08-17 were
         // claimed repeatedly. Newest-first is right for FRESHNESS and wrong for
         // CONTIGUITY, and 30 contiguous days is a contiguity goal.
-        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, i64, i64) {
-            let (class, width, order) = scheduling_class(task, now_micros);
-            (class, u8::from(!journal.fills_a_hole(task)), width, order)
+        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, i64, i64) {
+            let (class, starved, width, order) = scheduling_class(task, now_micros);
+            (class, starved, u8::from(!journal.fills_a_hole(task)), width, order)
         };
-        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, i64, i64)> {
-            let mut class: Option<(u8, u8, i64, i64)> = None;
+        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, i64, i64)> {
+            let mut class: Option<(u8, u8, u8, i64, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_live_frontier(task.key.slice, now_micros))) {
                 let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
@@ -1556,7 +1556,7 @@ impl TaskJournal {
 
 /// `(class, operation priority, -width, -recency)` -> project -> that project's
 /// queue. Ordered so smaller tuples run first; see `scheduling_class`.
-type ReadyGroups<'a> = BTreeMap<(u8, u8, i64, i64), HashMap<&'a str, VecDeque<&'a MaintenanceTask>>>;
+type ReadyGroups<'a> = BTreeMap<(u8, u8, u8, i64, i64), HashMap<&'a str, VecDeque<&'a MaintenanceTask>>>;
 
 /// Deadline ordering with round-robin selection among projects at the same
 /// operation priority. This prevents one whale from consuming an entire pass.
@@ -1564,8 +1564,13 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
     let mut groups: ReadyGroups<'_> = BTreeMap::new();
     for task in tasks {
         if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
-            let (class, width_key, order_key) = scheduling_class(task, now_micros);
-            groups.entry((class, task.key.operation.priority(), width_key, order_key)).or_default().entry(&task.key.project_id).or_default().push_back(task);
+            let (class, starved, width_key, order_key) = scheduling_class(task, now_micros);
+            groups
+                .entry((class, starved, task.key.operation.priority(), width_key, order_key))
+                .or_default()
+                .entry(&task.key.project_id)
+                .or_default()
+                .push_back(task);
         }
     }
     let mut ready = Vec::new();
@@ -1597,12 +1602,29 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// This is intentionally based on event time, not mutation deadline. A late
 /// correction to old data is a bounded historical hole; treating its recent
 /// mutation as live-tail work would let backfill displace current coverage.
-fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64, i64) {
+/// A sealed task that has waited this long outranks newer sealed work.
+///
+/// Newest-first is right for freshness and starves anything old, because newer
+/// sealed days keep arriving and never let the head of the queue advance.
+/// Prod 2026-08-19, from the compaction dashboard: 2026-08-13 sat at 167 files
+/// for FOUR DAYS — the same count, the same four tenants — while six younger
+/// sealed days converged past it. Six successors overtaking a partition is not a
+/// queue draining slowly; it is a partition the order never reaches.
+///
+/// Oldest-first is not the answer either, and this codebase has already tried
+/// it: `scheduling_class`'s own comment records 10 of 10 historical starts
+/// landing on data months old while the last 30 days went untouched. So age
+/// tasks instead — the standard fix for exactly this. Normal ordering stays
+/// newest-first; anything that has waited past the threshold escalates ahead of
+/// it, and the escalated set is finite, so it cannot swallow the budget.
+const STARVATION_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+
+fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64) {
     if is_live_frontier(task.key.slice, now_micros) {
         // Smaller tuples run first. Negating makes the newest minute the most
         // urgent while keeping all projects in that minute deadline-equivalent.
         // Width is not a frontier concern — these are all one slice wide.
-        (0, 0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        (0, 0, 0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     } else {
         // Newest slice first here too, for the same reason the dedup drain and
         // the rollup backfill are newest-first: recent days are what dashboards
@@ -1632,7 +1654,11 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, i64, i64) {
         //
         // Newest-first still breaks ties, so among backfill units recent
         // history is still built first.
-        (1, -task.key.slice.width(), -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        //
+        // Starved work leads, then width, then recency — see `STARVATION_MICROS`.
+        let waited = now_micros.saturating_sub(i64::try_from(task.created_unix_ms).unwrap_or(i64::MAX).saturating_mul(1_000));
+        let starved = u8::from(waited < STARVATION_MICROS);
+        (1, starved, -task.key.slice.width(), -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     }
 }
 
@@ -2607,6 +2633,43 @@ mod tests {
         assert_eq!(unproven, 1, "only the one without a base-tier proof is dependency-blocked");
         assert_eq!(quarantined, 1, "only the one that burned its attempts is quarantined");
         assert_eq!(not_due, 1, "only the one with a future deadline is not yet due");
+    }
+
+    /// Sealed work that has waited too long must overtake newer sealed work —
+    /// and only then.
+    ///
+    /// Prod 2026-08-19, from the compaction dashboard: 2026-08-13 sat at 167
+    /// files for FOUR DAYS, the same count and the same four tenants, while six
+    /// younger sealed days converged past it. Six successors overtaking a
+    /// partition is not a queue draining slowly; it is one the order never
+    /// reaches.
+    ///
+    /// Both halves matter. Oldest-first was tried and is recorded in
+    /// `scheduling_class`'s own comment as sending 10 of 10 historical starts to
+    /// data months old while the last 30 days went untouched — so fresh work
+    /// must STILL be newest-first, and only genuinely starved tasks escalate.
+    #[test]
+    fn sealed_work_ages_out_of_starvation_without_becoming_oldest_first() {
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        let sealed = |day: i64, created_days_ago: i64| {
+            let mut t = task("p", day * DAY, day * DAY + DAY, Operation::SealedConsolidation);
+            t.created_unix_ms = u64::try_from((now - created_days_ago * DAY).div_euclid(1_000)).unwrap_or_default();
+            t
+        };
+
+        // Both minted just now: newest day wins, exactly as before.
+        let fresh_new = super::scheduling_class(&sealed(35, 0), now);
+        let fresh_old = super::scheduling_class(&sealed(20, 0), now);
+        assert!(fresh_new < fresh_old, "among fresh tasks the newest sealed day still leads");
+
+        // The old day's task has now waited four days: it overtakes.
+        let starved_old = super::scheduling_class(&sealed(20, 4), now);
+        assert!(starved_old < fresh_new, "a task starved past the threshold overtakes newer sealed work");
+
+        // And starvation never lets sealed work outrank the live frontier.
+        let frontier = super::scheduling_class(&task("p", now - 600_000_000, now, Operation::BaseRollup), now);
+        assert!(frontier < starved_old, "class still leads: the frontier outranks even starved sealed work");
     }
 
     /// A hole must be claimed before a day that already has tier output.
