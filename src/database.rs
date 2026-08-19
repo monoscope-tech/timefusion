@@ -9750,7 +9750,13 @@ impl Database {
                     });
                 }
             }
+            // Every partition this scan examined, and every (partition, op) it
+            // decided needs work. Anything seen-but-not-planned is COMPLIANT,
+            // which is what retires the stale queue below.
+            let mut seen: HashSet<(String, chrono::NaiveDate)> = HashSet::new();
+            let mut planned_keys: HashSet<(String, chrono::NaiveDate, Operation)> = HashSet::new();
             for ((project_id, date), files) in partitions {
+                seen.insert((project_id.clone(), date));
                 // Future event timestamps are neither hot nor sealed. Treating
                 // them as sealed debt lets maintenance rewrite a partition as
                 // soon as it appears, racing foreground repair/DML and wasting
@@ -9765,6 +9771,7 @@ impl Database {
                 let small = files.iter().filter(|file| file.size < small_target || !file.sorted).collect::<Vec<_>>();
                 if small.len() >= 2 || small.iter().any(|file| !file.sorted) {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
+                    planned_keys.insert((project_id.clone(), date, operation));
                     let estimate =
                         small.iter().fold(0u64, |bytes, file| bytes.saturating_add(u64::try_from(file.size.max(0)).unwrap_or_default().saturating_mul(12)));
                     planned.push(MaintenanceTask {
@@ -9784,6 +9791,7 @@ impl Database {
                 if date < today && !schema.sorting_columns.is_empty() {
                     let suspects = files.iter().filter(|file| !self.repair_verified_sorted.contains(&file.path)).collect::<Vec<_>>();
                     if !suspects.is_empty() {
+                        planned_keys.insert((project_id.clone(), date, Operation::Repair));
                         let estimate = suspects
                             .iter()
                             .fold(0u64, |bytes, file| bytes.saturating_add(u64::try_from(file.size.max(0)).unwrap_or_default().saturating_mul(12)));
@@ -9808,6 +9816,45 @@ impl Database {
                         });
                     }
                 }
+            }
+            // Retire hygiene tasks for partitions this scan proved compliant.
+            //
+            // File hygiene is STATELESS work stated as a durable queue, and the
+            // two disagree: the scan above re-derives the truth every 60s, while
+            // the queue accumulates whatever was true whenever a task was minted.
+            // Audited against object storage 2026-08-19: of 1,033 partitions,
+            // 877 are already compliant and only 108 SEALED ones are out of
+            // policy — against `pending_sealed_consolidation` = 2,218. A 20x
+            // inflated queue, whose stale entries are claimed at the same ~21/h
+            // as real ones, so ~95% of that budget rewrites nothing. The real
+            // work is about five hours; it just cannot get a turn.
+            //
+            // Only partitions this pass actually SAW are retired. A partition
+            // absent from the snapshot is unknown, not clean, and unknown must
+            // never retire work — that is the direction that silently drops
+            // compaction.
+            let retired = {
+                let mut journal = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let stale: Vec<_> = journal
+                    .tasks()
+                    .filter(|task| {
+                        matches!(task.key.operation, Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair)
+                            && task.key.source == source
+                            && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                    })
+                    .filter_map(|task| {
+                        let date = chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)?.date_naive();
+                        let cell = (task.key.project_id.clone(), date);
+                        (seen.contains(&cell) && !planned_keys.contains(&(cell.0, date, task.key.operation))).then(|| task.key.clone())
+                    })
+                    .collect();
+                for key in &stale {
+                    journal.complete(key);
+                }
+                stale.len()
+            };
+            if retired != 0 {
+                info!(source, retired, event = "maintenance_hygiene_tasks_retired");
             }
         }
         let count = planned.len();
@@ -21045,6 +21092,71 @@ mod tests {
         assert!((1..64).all(|jobs| others(jobs) <= others(jobs + 1)));
         // And the reserve never grows to swallow the pool.
         assert!((3..64).all(|jobs| others(jobs) >= jobs - 2));
+    }
+
+    /// A hygiene task for a partition the scan proved compliant must be retired,
+    /// and a partition the scan never saw must NOT be.
+    ///
+    /// File hygiene is stateless work stated as a durable queue, and the two
+    /// disagree. Audited against object storage 2026-08-19: of 1,033 partitions
+    /// 877 were already compliant and only 108 sealed ones were out of policy,
+    /// against `pending_sealed_consolidation` = 2,218 — a 20x inflated queue
+    /// whose stale entries consume the same ~21/h claim budget as real work.
+    ///
+    /// The second half is the safety property: a partition absent from the
+    /// snapshot is UNKNOWN, not clean, and retiring its work would silently drop
+    /// compaction.
+    #[tokio::test]
+    async fn compliant_partitions_retire_their_hygiene_tasks_but_unseen_ones_do_not() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TaskState, TimeSlice};
+        let db = Database::with_config(create_test_config("retire-compliant")).await?;
+        let project = format!("retire_{}", uuid::Uuid::new_v4().simple());
+        // One well-formed partition: a single flushed day, hence compliant.
+        let day = Utc::now() - chrono::Duration::days(3);
+        db.insert_records_batch(
+            &project,
+            "otel_logs_and_spans",
+            vec![json_to_batch(vec![test_span_ts("a", "op", &project, day.timestamp_micros())])?],
+            true,
+            None,
+        )
+        .await?;
+
+        let slice_for = |d: chrono::DateTime<Utc>| -> Result<TimeSlice> {
+            let start = d.date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+            TimeSlice::new(start, start + DAY_MICROS)
+        };
+        let task_for = |d: chrono::DateTime<Utc>, operation| -> Result<TaskKey> {
+            Ok(TaskKey {
+                physical_table: "otel_logs_and_spans".to_owned(),
+                source: "otel_logs_and_spans".to_owned(),
+                project_id: project.clone(),
+                slice: slice_for(d)?,
+                operation,
+            })
+        };
+        // The real staleness shape: a HotPacking task minted while the day was
+        // TODAY, on a day that has since sealed. The scan sees that partition
+        // and plans SealedConsolidation for it, never HotPacking — so the
+        // HotPacking task can never be right again.
+        let seen_key = task_for(day, Operation::HotPacking)?;
+        // And a day with no data at all, which the scan never sees.
+        let unseen_key = task_for(Utc::now() - chrono::Duration::days(400), Operation::SealedConsolidation)?;
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            journal.enqueue(seen_key.clone(), 0, 1, 0);
+            journal.enqueue(unseen_key.clone(), 0, 1, 0);
+        }
+
+        db.plan_compaction_debt().await?;
+
+        let (seen_state, unseen_state) = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            (journal.state(&seen_key), journal.state(&unseen_key))
+        };
+        assert_eq!(seen_state, Some(TaskState::Complete), "a partition the scan proved compliant retires its stale task");
+        assert_ne!(unseen_state, Some(TaskState::Complete), "a partition the scan never saw is unknown, not clean, and keeps its task");
+        Ok(())
     }
 
     /// The debt cap must leave workers for the rollup chain without starving debt
