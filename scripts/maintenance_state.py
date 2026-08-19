@@ -144,6 +144,12 @@ def footer_sorted(source: str, path: str) -> bool | None:
     import pyarrow.parquet as pq
     from pyarrow import fs as pafs
 
+    # OVH rejects `x-amz-checksum-mode`, which the bundled AWS SDK sends by
+    # default: every footer read failed with "Value for x-amz-checksum-mode
+    # header is invalid". That is what made this report `sorted 0/14` for a
+    # project whose files declare five sorting columns.
+    os.environ.setdefault("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
+    os.environ.setdefault("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
     endpoint = os.environ["AWS_S3_ENDPOINT"]
     try:
         s3 = pafs.S3FileSystem(
@@ -288,7 +294,11 @@ def main() -> int:
         totals["deduped"] += bool(ded)
         totals["1m"] += has_1m
         totals["1h"] += has_1h
-        totals["sorted"] += bool(srt)
+        # `None` is UNREADABLE, not unsorted, and the two must never be summed
+        # together — counting a failed read as a negative measurement is how
+        # this tool reported `sorted 0/14` for a project that was fully sorted.
+        totals["sorted"] += srt is True
+        totals["sort_unknown"] += srt is None
 
     n = totals["days"]
     print(f"\nsealed days: {n}")
@@ -297,7 +307,12 @@ def main() -> int:
         colour = GOOD if got == n else (WARN if got else BAD)
         print(f"  {label:<11} {_color(f'{got}/{n}', colour)}")
     if args.footers:
-        print(f"  {'sorted':<11} {totals['sorted']}/{n}")
+        unknown = totals["sort_unknown"]
+        checked = n - unknown
+        colour = GOOD if checked and totals["sorted"] == checked else (WARN if totals["sorted"] else BAD)
+        suffix = f"  ({unknown} unreadable — NOT counted as unsorted)" if unknown else ""
+        ratio = "{}/{}".format(totals["sorted"], checked)
+        print(f"  {'sorted':<11} {_color(ratio, colour)}{suffix}")
     else:
         print(f"  {'sorted':<11} not checked — pass --footers (the tag column is not the property)")
 
