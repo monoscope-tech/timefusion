@@ -10139,13 +10139,17 @@ impl Database {
                         if spec.derive_from.is_none() {
                             continue;
                         }
-                        proven += usize::from(journal.prove_base_tier(&crate::maintenance_coordinator::TaskKey {
-                            physical_table: spec.table_name(&source),
-                            source: source.clone(),
-                            project_id: project_id.clone(),
-                            slice,
-                            operation: crate::maintenance_coordinator::Operation::DerivedRollup,
-                        }));
+                        proven += journal.prove_base_tier_for_day(
+                            &crate::maintenance_coordinator::TaskKey {
+                                physical_table: spec.table_name(&source),
+                                source: source.clone(),
+                                project_id: project_id.clone(),
+                                slice,
+                                operation: crate::maintenance_coordinator::Operation::DerivedRollup,
+                            },
+                            day_start,
+                            day_start.saturating_add(DAY_MICROS),
+                        );
                     }
                 }
                 if proven != 0 {

@@ -670,15 +670,50 @@ impl TaskJournal {
     /// that most need the proof are the ones `enqueue` can never reach: prod
     /// 2026-08-18 22:50 UTC, `pending_derived_rollup` still did not move after
     /// #184 shipped, because all 759 of them predated it.
-    pub fn prove_base_tier(&mut self, key: &TaskKey) -> bool {
-        let Some(index) = self.task_indices.get(key).copied() else { return false };
-        let task = &mut self.snapshot.tasks[index];
-        if task.base_tier_present {
-            return false;
+    /// Applies to EVERY derived task in the day, at whatever width.
+    ///
+    /// Keyed on one exact day-wide `TaskKey`, this proved nothing on prod. The
+    /// queued historical work is not day-wide: `invalidate` mints derived units
+    /// at `DERIVED_SLICE_MICROS` (one hour), and `coarsen_sealed_slices` refuses
+    /// to fuse a day whose day-wide unit already exists in ANY state — including
+    /// `Complete`, which is exactly what a legacy rows=0 publication left behind.
+    /// So the day carries hour-wide pending tasks plus a completed day-wide one,
+    /// and a proof aimed at the day-wide key landed on the completed task, which
+    /// is never claimed.
+    ///
+    /// Measured 2026-08-19 03:00 UTC by #194's census:
+    ///
+    ///     cells_missing=264  cells_wanted=0  defer_enqueue=false
+    ///
+    /// — the planner saw every hole, every one was vetoed as already-queued, and
+    /// `rollup_derived_base_tier_proven` had not fired once. The tasks existed,
+    /// were pending, and could not be claimed because `dependencies_complete`
+    /// still had no proof for THEM.
+    ///
+    /// The fact being recorded is a property of the DAY — "the tier this derives
+    /// from is already built" — so it belongs on every task covering that day.
+    pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
+        let mut proven = 0;
+        for task in &mut self.snapshot.tasks {
+            // Only work that can still run. A completed task matches its own
+            // day and proving it is a no-op that would make `proven` read as
+            // progress when nothing became claimable.
+            if !matches!(task.state, TaskState::Pending | TaskState::Retry)
+                || task.base_tier_present
+                || task.key.operation != key.operation
+                || task.key.source != key.source
+                || task.key.project_id != key.project_id
+                || task.key.physical_table != key.physical_table
+                || task.key.slice.start_micros < day_start
+                || task.key.slice.end_micros > day_end
+            {
+                continue;
+            }
+            task.base_tier_present = true;
+            self.dirty_tasks.insert(task.key.clone());
+            proven += 1;
         }
-        task.base_tier_present = true;
-        self.dirty_tasks.insert(key.clone());
-        true
+        proven
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
@@ -2392,9 +2427,54 @@ mod tests {
         journal.enqueue(key.clone(), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: blocked by the dependency gate");
 
-        assert!(journal.prove_base_tier(&key), "the proof lands on an existing task");
-        assert!(!journal.prove_base_tier(&key), "and is idempotent");
+        let day = (0, 24 * 3_600_000_000i64);
+        assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 1, "the proof lands on an existing task");
+        assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 0, "and is idempotent");
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "the unit becomes claimable without being re-enqueued");
+    }
+
+    /// The proof must reach the tasks that actually exist, at their own width.
+    ///
+    /// Prod's shape, not a hypothetical: `invalidate` mints derived units one
+    /// HOUR wide, and `coarsen_sealed_slices` will not fuse a day whose day-wide
+    /// unit already exists in any state — including `Complete`, which is what a
+    /// legacy rows=0 publication leaves behind. So the day carries hour-wide
+    /// pending tasks *and* a completed day-wide one, and a proof aimed at the
+    /// day-wide key lands on the completed task, which is never claimed.
+    ///
+    /// Measured 2026-08-19 03:00 UTC by #194's census:
+    /// `cells_missing=264 cells_wanted=0 defer_enqueue=false` — every hole seen,
+    /// every one vetoed as already-queued, and the proof had never fired once.
+    #[test]
+    fn the_proof_reaches_hour_wide_tasks_under_a_completed_day_unit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const HOUR: i64 = 3_600_000_000;
+        const DAY: i64 = 24 * HOUR;
+        let at = |start: i64, width: i64| TaskKey {
+            physical_table: "rollup_1h".to_owned(),
+            source: "source".to_owned(),
+            project_id: "p".to_owned(),
+            slice: TimeSlice::new(start, start + width).expect("slice"),
+            operation: Operation::DerivedRollup,
+        };
+
+        // The legacy rows=0 publication: a COMPLETE day-wide unit.
+        let day_unit = at(0, DAY);
+        journal.enqueue(day_unit.clone(), 0, 1, 0);
+        journal.complete(&day_unit);
+        // And the hour-wide work that is actually pending underneath it.
+        journal.enqueue(at(0, HOUR), 0, 1, 0);
+        journal.enqueue(at(HOUR, HOUR), 0, 1, 0);
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: the hour units are dependency-blocked");
+
+        // Proving the DAY must reach the hour units, not just the completed key.
+        assert_eq!(journal.prove_base_tier_for_day(&day_unit, 0, DAY), 2, "both pending hour units are proven");
+        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "an hour unit becomes claimable");
+
+        // Scoped to the day: a task in the NEXT day must not be swept up.
+        journal.enqueue(at(DAY, HOUR), 0, 1, 0);
+        assert_eq!(journal.prove_base_tier_for_day(&day_unit, 0, DAY), 0, "the following day is a different fact and stays unproven");
     }
 
     /// The proof latches. The frontier re-enqueues the same key without it, and
