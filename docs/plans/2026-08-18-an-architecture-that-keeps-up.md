@@ -773,6 +773,45 @@ which is the real lesson: **these do not show up in parallel, they queue behind
 each other**, so "measure, fix one, re-measure" is not merely good practice here,
 it is the only method that terminates.
 
+### …and then the expensive rollup units took the derived workers (#190)
+
+#189 worked — sealed day-wide derived units started winning claims for the first
+time (`2a39bd83`, 2026-08-17, width 1440). But the rate was **8 derived claims
+in 25 minutes, 2 of them sealed**, which is 145 hours for the ~700-unit backlog.
+
+Wall clock again, not attempts. The cycle already gives `DerivedRollup` 2 of 10
+slots, but a worker that picks HotPacking is gone for 578s and one that picks a
+sealed BaseRollup for 801s. **This is #176's finding one level below where #176
+applied it:** that change freed workers from *debt* for "the rollup chain", but
+the chain is not uniform — BaseRollup's sealed day units are as expensive as the
+debt they replaced, so they take the freed workers and derived starves behind
+them precisely as it starved behind debt.
+
+#190 holds 2 of 16 workers reachable only by derived work while coverage is
+short. Derived is the cheap half: it aggregates the base tier and reads no raw
+data.
+
+### The one-line summary of the whole night
+
+**Six defects, one shape.** Work was queued, every gauge said pending and
+eligible, and something refused to run it:
+
+| # | refusal | fix |
+|---|---|---|
+| 1 | capacity burned by units that time out | #181 |
+| 2 | 5s backoff spinning forever on unsatisfiable slices | #182 |
+| 3 | dependency gate demanding journal records history lacks | #184/#185/#186 |
+| 4 | admission ceiling permanently closed, disabling the whole planner | #188 |
+| 5 | frontier outranking sealed derived work on every claim | #189 |
+| 6 | expensive rollup units taking the workers freed for cheap ones | #190 |
+
+Each was invisible until the previous was removed. They queue behind each other
+rather than appearing in parallel, so **measure → fix exactly one → re-measure**
+is not just good practice here, it is the only procedure that terminates. Every
+one was found the same way: diff two `timefusion_stats` snapshots for what is
+NOT moving, then histogram `maintenance_task_started` by `operation`, by
+`attempts`, and by slice width.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
