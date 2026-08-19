@@ -641,7 +641,14 @@ impl TaskJournal {
         // unit STRICTLY wider than it. Membership therefore means "contained in
         // a wider live unit", which is the whole predicate.
         let mut covered: [HashSet<(Group, i64)>; SUBSUME_WIDTHS.len()] = Default::default();
-        for task in self.snapshot.tasks.iter().filter(|task| task.state != TaskState::Complete) {
+        // Pending/Retry/Running only. NOT Superseded, and that exclusion is
+        // load-bearing: `split_time_task` supersedes a unit too big to finish
+        // and replaces it with children that tile its range, so a superseded
+        // parent subsuming its own children would delete exactly the work the
+        // split just created and leave the cell with nothing. NOT Complete
+        // either — built once is not still queued, and a narrower unit inside a
+        // completed span is a later invalidation that must run.
+        for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)) {
             let group = group_of(task);
             for (index, &width) in SUBSUME_WIDTHS.iter().enumerate() {
                 if task.key.slice.width() <= width {
@@ -661,12 +668,24 @@ impl TaskJournal {
             if !matches!(task.state, TaskState::Pending | TaskState::Retry) || is_live_frontier(task.key.slice, now_micros) {
                 return true;
             }
-            // The coarsest ladder width this unit fits inside; a unit wider than
-            // every entry can only be subsumed by something wider still, which
-            // the loop above never records.
-            let Some(index) = SUBSUME_WIDTHS.iter().rposition(|&width| width <= task.key.slice.width()) else { return true };
+            // The NARROWEST ladder width this unit fits inside, so that every
+            // unit recorded against it is strictly wider than this one.
+            //
+            // Taking the widest that fits instead is subtly wrong and reads as
+            // correct: `split_time_task` BISECTS, so it produces 12-hour
+            // children, and 12h is not a ladder width. Mapped down to the 6h
+            // bucket, a 12-hour unit finds the entry its OWN expansion wrote —
+            // a unit subsuming itself, deleting both halves of every split and
+            // leaving the cell with nothing queued.
+            let Some(index) = SUBSUME_WIDTHS.iter().position(|&width| width >= task.key.slice.width()) else { return true };
             let width = SUBSUME_WIDTHS[index];
-            !covered[index].contains(&(group_of(task), task.key.slice.start_micros.div_euclid(width) * width))
+            let bucket = task.key.slice.start_micros.div_euclid(width) * width;
+            // An unaligned unit can straddle two buckets; one bucket covering it
+            // is the claim being made, so check it rather than assume alignment.
+            if bucket > task.key.slice.start_micros || task.key.slice.end_micros > bucket.saturating_add(width) {
+                return true;
+            }
+            !covered[index].contains(&(group_of(task), bucket))
         });
         let removed = before - self.snapshot.tasks.len();
         if removed != 0 {
@@ -3103,6 +3122,35 @@ mod tests {
             .map(|t| t.key.slice.width())
             .collect::<Vec<_>>();
         assert_eq!(live, vec![DAY_MICROS], "the day unit must absorb all 144 slices, leaving one unit for the cell; got {live:?}");
+    }
+
+    /// ...and a SUPERSEDED day unit subsumes nothing either.
+    ///
+    /// `split_time_task` supersedes a unit too big to finish and replaces it
+    /// with children tiling its range. If a superseded parent could subsume,
+    /// it would delete the children the split just created and leave the cell
+    /// with no queued work at all — strictly worse than the redundancy this
+    /// pass exists to remove.
+    #[test]
+    fn a_superseded_day_unit_does_not_subsume_the_children_that_replaced_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let day = 3 * DAY_MICROS;
+
+        let parent = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
+        journal.enqueue(parent.clone(), 0, 0, 0);
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1));
+        assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "the parent must be superseded for this to prove anything");
+        let children = journal.tasks().filter(|t| t.state == TaskState::Pending && t.key.operation == Operation::BaseRollup).count();
+        assert!(children > 0, "the split must have produced children");
+
+        journal.coarsen_sealed_slices(now);
+
+        assert!(
+            journal.tasks().any(|t| matches!(t.state, TaskState::Pending | TaskState::Retry) && t.key.operation == Operation::BaseRollup),
+            "the split's children must survive; a superseded parent is not queued work"
+        );
     }
 
     /// ...but a COMPLETE day unit subsumes nothing.
