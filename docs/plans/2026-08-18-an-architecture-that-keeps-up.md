@@ -870,6 +870,45 @@ aims them at the worst project's earliest hole, and coverage reaching
 work. The list in §"one-line summary" should be read as evidence for the method,
 not as a claim that it is finished.
 
+### Routing measured properly (2026-08-19 01:30 UTC) — partial coverage buys NOTHING
+
+All seven fixes live (`60fc0b0`). #191 confirmed working: `backfilled=5`,
+`queued=2 remaining=0` — the planner is enqueueing past the ceiling for the
+first time. Frontier healthy (`eligible_watermark_lag_seconds` = 0).
+
+**Do not test routing with `EXPLAIN`.** It does not exercise the router — every
+window width on a covered project showed zero tier references in the plan while
+`rollup_hits_full_total` was climbing +84/min from real traffic. Test by
+snapshotting `rollup_hits_*` / `rollup_miss_*`, running ONE query, and diffing.
+
+Done that way, on `94c5dc1f` (17 days of 1h tier) with a 30d query:
+
+```
+rollup_miss_not_built_total   13 -> 143   (+130)
+rollup_hits_full / hybrid      0 ->   0
+                                            ...and the query timed out at 60s
+```
+
+`covered.is_empty()` for that project, i.e. it produced no covered range from
+EITHER the date-level map or the slice map. Boot recovery is not the culprit —
+`rollup_coverage_recovered` re-adopted **8,589** slices for `otel_logs_and_spans`.
+The 1h tier holds 17 days of *data* whose *coverage* is not registered, which is
+consistent with those files predating tagging (`maintenance_rollup_untagged_input`
+fires continuously against the 1m tier).
+
+**The consequence is a planning rule, and it is the most useful thing learned
+tonight:** a 30d query needs the whole window; 17 of 30 days yields a full raw
+scan, not a 17/30 speed-up. **Coverage must be built DEPTH-FIRST per project.**
+Breadth-first spreads days across projects and buys exactly nothing until some
+project crosses 30 — which retroactively justifies the contiguity-targeted
+ordering (§6) that has still never actually run on prod.
+
+It also means the untagged-legacy interaction deserves a check: `missing_tiers`
+is computed from partition PRESENCE, so a day holding untagged (hence
+unrecoverable) tier data counts as covered and is never rebuilt — which would
+make those days permanently unroutable. Not yet confirmed; it is the first thing
+to test next.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
