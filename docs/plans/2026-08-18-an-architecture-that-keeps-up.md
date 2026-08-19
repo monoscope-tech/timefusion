@@ -909,6 +909,36 @@ unrecoverable) tier data counts as covered and is never rebuilt — which would
 make those days permanently unroutable. Not yet confirmed; it is the first thing
 to test next.
 
+### The eighth: one tier's queued unit vetoed every other tier (#192)
+
+02:00 UTC. All of #181-#191 live, and the derived tier STILL could not be
+planned:
+
+- backfill planner: `queued=2 remaining=0`
+- `94c5dc1f`: **34 days of 1m tier against 17 of 1h**
+- **zero** sealed-day derived claims in 25 minutes; all **84** were frontier hours
+
+No historical derived task had ever been *created* — which is why #186's proof,
+#189's reservation and #190's worker reserve all appeared to do nothing. They
+were competing over a population that did not exist.
+
+`blocks_rollup_backfill` is keyed on the DAY. But a day is not one unit of
+rollup work — it is one per tier plus a dedup, and they are independent: the 1h
+tier's unit reads the 1m TIER. Keyed that way, one pending ten-minute frontier
+BaseRollup slice vetoed every tier of that whole day, and with ~47,000 pending
+BaseRollup tasks that vetoed essentially every day.
+
+The code comment above it already records this exact bug being fixed once —
+unrelated file debt disqualifying a day forever. Narrowing from "any task" to
+"any rollup task" was not narrow enough. Now keyed on
+`(project, date, physical_table)`.
+
+**Pattern note, and it is the useful one:** three consecutive fixes (#186, #189,
+#190) targeted a queue that was empty. Each was individually correct and none
+could have worked. **Before fixing how a queue is served, verify the queue has
+the items you think it has** — `pending_derived_rollup` was ~900 the whole time
+and every one of them was frontier work.
+
 ### Still open at hand-off, in priority order
 
 1. **The frontier queue starves the sealed backfill.** `pending_base_rollup` is
