@@ -70,13 +70,13 @@ td.na{opacity:.28}
 </style>
 <div class="wrap">
 <h1>Active parquet files per project × day — otel_logs_and_spans</h1>
-<p class="sub">unified table on OVH · snapshot v481359 · 2026-08-14 22:22 UTC · 08-14 is the OPEN partition (fragmentation there is expected)</p>
+<p class="sub">unified table on OVH · snapshot v488974 · 2026-08-19 11:05 UTC · 08-19 is the OPEN partition (fragmentation there is expected)</p>
 
 <div class="tiles">
-  <div class="tile"><div class="k">Sealed-day backlog</div><div class="v" style="color:var(--danger)">231 <span class="dim">files / 4.1 GB</span></div><div class="d">08-13 sealed fragmented across 11 of 13 projects. A converged day is ~14 files for the same ~3 GB, so 08-13 is ~16× its floor — compaction has not swept it</div></div>
-  <div class="tile"><div class="k">Converged reference</div><div class="v" style="color:var(--good)">14–15 <span class="dim">files/day</span></div><div class="d">08-10 and 08-11 are what healthy looks like: ~1 file per project per day at ~1 GB target. 08-06 matches too</div></div>
-  <div class="tile"><div class="k">Hot tier</div><div class="v">437 <span class="dim">GB / 6535 files</span></div><div class="d">uncompressed since 0709263; grew ~346 GB in ~8 h toward the 600 GB cap. Disk 982 G used of 1.8 T</div></div>
-  <div class="tile"><div class="k">⚠ Memory</div><div class="v" style="color:var(--danger)">106% <span class="dim">of budget</span></div><div class="d">charged 90.9 GB vs 85.9 GB limit; 3 × exit 137 in the last 3 h. Demotion skips restarted (19)</div></div>
+  <div class="tile"><div class="k">Newly sealed — 08-18</div><div class="v" style="color:var(--danger)">979 <span class="dim">files / 4.3 GB</span></div><div class="d">28f62f01 404, 6297304f 214, dcad860a 196, whale 82. Same four tenants as every previous sealing day — the volume producers</div></div>
+  <div class="tile"><div class="k">08-17 draining</div><div class="v" style="color:var(--good)">414 <span class="dim">was 923</span></div><div class="d">−55% in 26 h. The first sealed day this dashboard has recorded actually converging after it sealed</div></div>
+  <div class="tile"><div class="k">Compaction queue</div><div class="v" style="color:var(--good)">266 <span class="dim">was 2,218</span></div><div class="d">sealed consolidation, after #200 stopped the policy re-admitting every partition and #198 retired 4,290 stale tasks. Hot packing 2,654 → 73</div></div>
+  <div class="tile"><div class="k">08-13 — still frozen</div><div class="v" style="color:var(--warn)">167 <span class="dim">files, 4 days</span></div><div class="d">byte-identical to the 08-18 snapshot. Six younger days converged past it. Not slow — skipped</div></div>
 </div>
 
 <div class="legend">
@@ -94,35 +94,35 @@ td.na{opacity:.28}
 </table>
 </div>
 
-<p class="note"><b>08-13 is the finding.</b> It is a <i>sealed</i> day still carrying <b>231 files for 4.1 GB</b> — against 14–15 files for ~3 GB on 08-10/08-11, which is what a swept day looks like. The fragmentation is broad, not one tenant: 28f62f01 52, 6297304f 49, whale 46, dcad860a 23, 00000000 35. That is the signature of maintenance not completing a pass, and it lines up with the day's restart rate — a partition only converges if a sweep runs to completion, and the process was being OOM-killed repeatedly. 08-07/08-08 (28f62f01, 51–53) and 08-12 (28f62f01 50) are the same story on earlier days, never cleaned up. <b>08-14 is the open partition</b> at 22:22 UTC, so its 248 files are the day still being written, not a backlog.<br><br><b>⚠ Watch, not yet diagnosed:</b> the box is <b>over its memory budget</b> (charged 90.9 GB vs an 85.9 GB limit) with <b>three exit-137 kills in three hours</b>, and <code>demote_skipped_total</code> has gone 0 → 19, so the hot tier is starting to drop writes again. The hot tier went uncompressed today and is at 437 GB / 6535 files; TF's own memory accounting is <code>memory.current − inactive_file</code>, which does <i>not</i> discount recently-read (active) page cache — so a large uncompressed tier can inflate the governor's view of usage even though the kernel could reclaim it. That interaction is the prime suspect and needs confirming before more disk is bought.</p>
+<p class="note"><b>Consolidation is working again — for the first time on this dashboard, a sealed day converged after sealing.</b> <b>08-17 has gone 923 → 414 files</b> in 26 hours (−55%), and the sealed-consolidation queue <b>2,218 → 266</b>. The previous snapshot called 08-17 "the worst sealed day ever recorded here"; it is now draining. 08-12 is the floor at <b>20 files / 3.1 GB</b>, and 08-14/08-15/08-16 sit at 47–67.<br><br><b>Why it had stopped, and it was not throughput.</b> <code>plan_compaction_debt</code> admitted a partition whenever any file was <code>!is_sorted_run()</code> — but that tag is written only by the OPTIMIZE path. Across 381 commits of the prod Delta log, <b>1,593 of 1,648 add actions carry no tags at all</b>. So every partition holding a flush-written file — which is every partition — was permanently admitted, and ingest recreated the condition faster than consolidation could clear it. A <i>treadmill</i>, not a backlog. The codebase already knew: <code>repair_verified_sorted</code>'s comment records that "the flush path sorts and stamps a correct footer WITHOUT the tag, so an untagged file is only a <i>suspect</i>", and Repair footer-checks before rewriting — consolidation did not, and read suspicion as proof. <b>#200</b> gives consolidation file <i>size</i>, which is unambiguous, and leaves sortedness to Repair; <b>#198</b> retires tasks for partitions the scan proves compliant, clearing <b>4,290</b> in its first pass.<br><br><b>08-13 is now the sharpest signal on this page.</b> It reads <b>167 files</b> — byte-for-byte the same count as the 08-18 snapshot, and the same four tenants (whale 47, dcad860a 43, 00000000 35, 28f62f01 32). It has not moved in <b>four days</b> while <b>six younger sealed days converged past it</b>. That is not a queue draining slowly; a partition skipped by six successors is not in the order the sweep reads. The mechanism is <code>scheduling_class</code>: sealed work is ranked strictly <b>newest-first</b>, and newer sealed days keep arriving, so 08-13 never reaches the head. Newest-first is right for freshness and wrong for a backlog — which is exactly the ordering <b>#199</b> changed for the rollup tiers, and the same fix has not yet been applied to file hygiene. 08-13 is the evidence that it should be.<br><br><b>What to watch next.</b> Whether 08-18 follows 08-17 down, and whether 08-13 finally moves. Those two questions separate "the fix works and the queue is merely ordered wrong" from "there is a second blocker behind it". No heavy maintenance class has ever been profiled, so if 08-18 stalls the next step is unit cost, not admission.</p>
 
-<p class="note" style="margin-top:12px"><b>Previously (closed 2026-08-05).</b> The drain-partition-filter data-loss incident is <b>resolved</b>: the final audit certified <b>all clean across 36 partition-dates</b>, with ~28M+ drain-dropped keys re-appended through the live writer and file-verified. <b>Permanently written off</b>: ~7.3M keys in whale/08-02 plus ~2,000 oversize rows (whale/08-03, 98fdd4f3/08-02) — a vacuum cron fired during a deploy-wiped-env window and destroyed the recovery source. All of it was TF self-observability or drain-orphaned rows held nowhere else. Hardening shipped as <code>981ea6d</code> (drain partition filter), <code>e583beb</code> (DML tombstones exempt from the event-time bound) and <code>e30e0da</code> (vacuum default 24h→72h). Still open from that review: the CapRover app-def should carry <code>stop-first</code> update order and a persisted <code>VACUUM_RETENTION</code>, so an env wipe can never re-arm that landmine. Note also that <b>the whale no longer needs its old ×10 threshold</b> — it ran 53–99 files/day in late July and now sealed-day converges to 1–3, same as everyone else.</p>
+<p class="note" style="margin-top:12px"><b>On reading these numbers.</b> Counts are <i>active</i> Adds in the Delta snapshot. An <code>aws s3 ls</code> of the same table returns <b>24,637 objects</b> and suggests 350–600 files per project on 08-16 — that listing is dominated by tombstones not yet vacuumed, and the active count for those same partitions is 1–35. Worth naming because the physical listing is the easier measurement to reach for and it is wrong by an order of magnitude.<br><br><b>Resolved since 08-18.</b> The <code>dirty_bin_queue_depth</code> alarm (5,629 bins, <code>dirty_bin_processed_total = 0</code>) and the deploy-cadence starvation theory are both superseded: the sealed path was not starved of runtime, it was re-admitting work it had already done. Memory is not the constraint either — charged <b>34%</b> of budget, <b>zero exit 137</b> since these changes began, against two in the seven hours before. Frontier lag is <b>0 s</b>.<br><br><b>Previously (closed 2026-08-05).</b> The drain-partition-filter data-loss incident is resolved: the final audit certified all clean across 36 partition-dates, ~28M+ drain-dropped keys re-appended and file-verified. Permanently written off: ~7.3M keys in whale/08-02 plus ~2,000 oversize rows, destroyed when a vacuum cron fired during a deploy-wiped-env window. Hardening shipped as <code>981ea6d</code>, <code>e583beb</code>, <code>e30e0da</code>. Still open: the CapRover app-def should carry <code>stop-first</code> update order and a persisted <code>VACUUM_RETENTION</code>. The whale no longer needs its old ×10 threshold — it converges like everyone else.</p>
 
-<p class="foot">Counts = active Adds in the Delta snapshot (tombstones excluded) · healthy ≈ file count matches partition GB at the 1 GB target · <code>date=None</code> (8 files) excluded · whale thresholds are no longer scaled — it converges like the rest now</p>
+<p class="foot">Counts = active Adds in the Delta snapshot (tombstones excluded) · healthy ≈ file count matches partition GB at the 1 GB target · <code>date=None</code> (8 files) excluded · ratio column compares 08-18, the newest sealed day, against the ~1-file floor</p>
 </div>
 
 <script>
-const days=["08-06","08-07","08-08","08-09","08-10","08-11","08-12","08-13","08-14"];
+const days=["08-12","08-13","08-14","08-15","08-16","08-17","08-18","08-19"];
 const rows=[
- ["00000000","",[[1,0.2],[1,0.2],[1,0.2],[9,0.3],[1,0.2],[1,0.2],[1,0.2],[35,0.3],[28,0.3]]],
- ["28f62f01","",[[2,0.9],[53,1.3],[51,1.2],[2,0.9],[2,0.8],[2,0.8],[50,1.2],[52,1.1],[44,1.2]]],
- ["2a39bd83","",[[1,0],[1,0],[1,0],[3,0],[1,0],[1,0],[1,0],[1,0],[10,0]]],
- ["4f020cf8","new",[null,null,null,null,null,null,[4,0],[2,0],[4,0]]],
- ["5ce1c976","",[[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0]]],
- ["6297304f","",[[2,0.6],[1,0.3],[1,0],[1,0.2],[2,0.9],[1,0.4],[4,0.4],[49,0.4],[26,0.5]]],
- ["8100121c","",[[1,0],[1,0],[1,0],[3,0],[1,0],[1,0],[4,0],[4,0],[5,0]]],
- ["87576849","whale",[[1,0.3],[1,0.4],[2,0.8],[11,0.9],[1,0.3],[3,1.2],[11,0.9],[46,1.3],[29,0.7]]],
- ["94c5dc1f","",[[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[3,0],[13,0]]],
- ["98fdd4f3","",[[1,0.2],[1,0.2],[1,0.1],[3,0.2],[1,0.2],[1,0.2],[1,0.2],[7,0.2],[17,0.2]]],
- ["be87ebc1","",[[1,0.1],[1,0.1],[1,0.1],[5,0.1],[1,0.1],[1,0.1],[1,0.1],[5,0.1],[20,0.2]]],
- ["d062e010","",[[1,0.1],[1,0.1],[1,0],[2,0.1],[1,0.1],[1,0.2],[1,0.1],[3,0.1],[21,0.2]]],
- ["dcad860a","",[[1,0.4],[1,0.3],[1,0.4],[4,0.1],[1,0.4],[1,0.4],[1,0.4],[23,0.6],[30,0.7]]],
+ ["00000000","",[[1,0.21],[35,0.34],[1,0.22],[1,0.22],[2,0.25],[2,0.25],[41,0.27],[47,0.09]]],
+ ["28f62f01","",[[2,0.87],[32,0.97],[10,0.93],[2,0.70],[20,0.99],[35,1.17],[404,1.40],[304,0.45]]],
+ ["2a39bd83","",[[1,0.01],[1,0],[1,0.01],[1,0],[1,0],[1,0],[1,0],[69,0]]],
+ ["4f020cf8","",[[1,0],[1,0],[1,0],null,[1,0],null,[1,0],null]],
+ ["5ce1c976","",[[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0]]],
+ ["6297304f","",[[2,0.42],[2,0.35],[15,0.46],[1,0.05],[1,0.12],[275,0.84],[214,0.51],[221,0.06]]],
+ ["8100121c","",[[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[18,0]]],
+ ["87576849","whale",[[6,0.90],[47,1.27],[16,0.71],[19,0.88],[35,0.74],[81,1.22],[82,0.91],[132,0.51]]],
+ ["94c5dc1f","",[[1,0],[1,0],[1,0],[1,0],[1,0],[1,0],[15,0],[162,0.01]]],
+ ["98fdd4f3","",[[1,0.16],[1,0.17],[1,0.21],[1,0.19],[1,0.22],[1,0.22],[6,0.21],[256,0.08]]],
+ ["be87ebc1","",[[1,0.11],[1,0.12],[1,0.17],[1,0.09],[1,0.10],[1,0.13],[2,0.13],[196,0.05]]],
+ ["d062e010","",[[1,0.07],[1,0.12],[1,0.19],[1,0.10],[1,0.10],[1,0.12],[15,0.14],[149,0.03]]],
+ ["dcad860a","",[[1,0.41],[43,0.67],[2,0.55],[17,0.46],[1,0.13],[14,0.79],[196,0.73],[184,0.04]]],
 ];
 const cls=n=>n>=50?"c4":n>=10?"c3":n>=2?"c2":"c1";
 document.getElementById("hdr").innerHTML =
-  "<th>project</th>"+days.map((d,i)=>`<th class="${i===days.length-1?"openh":""}">${d}${i===days.length-1?" open":""}</th>`).join("")+"<th>08-13 vs floor</th>";
+  "<th>project</th>"+days.map((d,i)=>`<th class="${i===days.length-1?"openh":""}">${d}${i===days.length-1?" open":""}</th>`).join("")+"<th>08-18 vs floor</th>";
 document.getElementById("rows").innerHTML = rows.map(([p,tag,cells])=>{
-  const sealed=cells[7];
+  const sealed=cells[6];
   const ratio = sealed ? (sealed[0]<=1?"—":`${sealed[0]}×`) : "—";
   const last=cells.length-1;
   return `<tr><td class="proj">${p}<span class="tag">${tag?" "+tag:""}</span></td>`+
