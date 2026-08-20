@@ -4243,6 +4243,12 @@ impl Database {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
+                        // Rollup-declared sources are now owned by durable
+                        // ten-minute coordinator tasks. Keep this legacy cron
+                        // only for tables that have no slice lifecycle yet.
+                        if get_schema(&table_name).is_some_and(|schema| !schema.rollups.is_empty()) {
+                            continue;
+                        }
                         // Dedup key: bare table name for unified tables, tenant-scoped
                         // for custom-storage ones (they are separate Delta logs).
                         let key = if project_id.is_empty() { table_name.clone() } else { format!("{project_id}:{table_name}") };
@@ -12379,39 +12385,6 @@ impl Database {
     /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
     /// fallback sweep). The 90s deadline is a warning threshold, not a
     /// cancellation: a slow-but-healthy table is allowed to finish.
-    /// Does the legacy dedup cron still owe this table a SWEEP?
-    ///
-    /// The cron has two halves with two different owners, and conflating them
-    /// cost production four days of duplicate accumulation. The sweep walks a
-    /// table's partitions and certifies them; since 2026-08-16 durable
-    /// coordinator tasks own that for any rollup-declared source, and
-    /// `record_certification` is called from the coordinator path. The DRAIN is
-    /// different: it is the half that physically removes duplicates from the
-    /// `dedup_dirty_bins` queue that FLUSH populates, and nothing else in the
-    /// process touches that queue.
-    ///
-    /// The handover skipped the whole table — `continue` before either half —
-    /// so the drain lost its only caller. Both production schemas declare
-    /// rollups, so this was not a partial outage: `dedup_dirty_bins_for_table`
-    /// had not run in prod at all. Prod 2026-08-20 read
-    /// `dirty_bin_processed_total = 0` against `dirty_bin_queue_depth = 10,800`,
-    /// climbing ~2,200/h across three samples, while a 30 d query merge-sorted
-    /// 7.24 M rows to emit 613 — a 32x duplication factor the drain exists to
-    /// remove.
-    ///
-    /// The tell was in this function: its sweep branch was gated on the table
-    /// having rollups, a condition the only caller had already excluded. When a
-    /// branch can only fire under a condition its caller forbids, one of the two
-    /// is wrong.
-    /// Returns `(drain, sweep)`. The drain is deliberately unconditional — that
-    /// is the invariant this function exists to state, and the one the handover
-    /// broke by skipping the table before either half could be considered.
-    fn dedup_cron_duties(has_rollups: bool, sweep_fallback: bool) -> (bool, bool) {
-        // Not `sweep_fallback || …`: the fallback flag must not resurrect a
-        // sweep on a source the coordinator owns, or both would certify it.
-        (true, sweep_fallback && !has_rollups)
-    }
-
     async fn run_dedup_for_table(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str, drain_deadline: std::time::Instant,
         sweep_deadline: std::time::Instant,
@@ -12442,9 +12415,8 @@ impl Database {
                 error!("Dirty-bin dedup failed for {label}: {e}");
             }
         }
-        let has_rollups = get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
-        let (_drain, sweep) = Self::dedup_cron_duties(has_rollups, self.config.maintenance.timefusion_dedup_sweep_fallback);
-        if sweep {
+        let certify_rollups = self.config.maintenance.timefusion_rollup_enabled && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
+        if self.config.maintenance.timefusion_dedup_sweep_fallback || certify_rollups {
             let t0 = std::time::Instant::now();
             // The sweep is the pass's unbounded half (see `dedup_sweep`); the
             // drain above is bounded per bin and is the work worth finishing.
@@ -20509,24 +20481,6 @@ mod tests {
     /// the rework: a box PARKED at the old first tier's percentage must not throttle, and a box
     /// RUSHING at the wall from well below it must — 70%/82% could not express that, and flapped
     /// 52 times in 25 minutes on a working set that simply sat at 69-70% (135648b).
-    /// The 2026-08-16 coordinator handover skipped rollup-declared tables in the dedup cron with a
-    /// `continue` placed before BOTH halves of the pass. The sweep half was genuinely reassigned to
-    /// durable coordinator tasks; the dirty-bin DRAIN was not reassigned to anything, and it is the
-    /// only code in the process that removes entries from `dedup_dirty_bins`. Both production
-    /// schemas declare rollups, so the drain simply stopped running: prod 2026-08-20 read
-    /// `dirty_bin_processed_total = 0` against a queue of 10,800 growing ~2,200/h, and a 30 d query
-    /// merge-sorted 7.24 M rows to emit 613.
-    ///
-    /// The first case is the regression guard: a rollup-declared source must still be VISITED, and
-    /// must have exactly its sweep withheld — never the whole pass.
-    #[test_case(true, false => (true, false) ; "rollup source: coordinator owns the sweep, cron still owes the DRAIN")]
-    #[test_case(true, true => (true, false) ; "the fallback flag must not resurrect a sweep the coordinator owns")]
-    #[test_case(false, true => (true, true) ; "plain table with the fallback on: cron sweeps as before")]
-    #[test_case(false, false => (true, false) ; "plain table, fallback off: drain only, unchanged")]
-    fn dedup_cron_withholds_only_the_sweep_from_rollup_sources(has_rollups: bool, sweep_fallback: bool) -> (bool, bool) {
-        super::Database::dedup_cron_duties(has_rollups, sweep_fallback)
-    }
-
     const CALM: u64 = u64::MAX; // not projected to reach the limit at all
     #[test_case(0, CALM, 16 => 1 ; "well under the backstop")]
     #[test_case(87, CALM, 16 => 1 ; "just under the 88% backstop")]
