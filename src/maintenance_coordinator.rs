@@ -2215,8 +2215,23 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
 /// unrelated file debt disqualify a day forever: prod 2026-08-17 had the
 /// whale's Aug 15 `SealedConsolidation` on attempt 370, which alone kept that
 /// day out of every backfill pass.
+/// Does this task make its (project, date, tier) cell ineligible for re-planning?
+///
+/// Only work that will actually RUN may veto. `Superseded` is what
+/// `split_time_task` leaves on a parent and is never claimable, so letting it
+/// block meant every day that was ever split had its cell marked "already
+/// queued" permanently — the planner could not re-admit it, and the tier stayed
+/// holed forever. Its children are `Pending` and still veto on their own, so
+/// dropping the parent's veto cannot cause duplicate work.
+///
+/// Prod 2026-08-20 01:35, `otel_logs_and_spans`: `cells_missing=210` against
+/// `cells_wanted=0` with `derived_pending=22`. `claimability_census` counts only
+/// Pending/Retry, so the superseded parents doing the blocking appeared in no
+/// gauge at all. The 1h tier — what 30d dashboards read — held 22 days with its
+/// oldest date frozen at 2026-07-25 while the 1m tier held 31.
 pub fn blocks_rollup_backfill(task: &MaintenanceTask) -> bool {
-    matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup) && task.state != TaskState::Complete
+    matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup)
+        && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
 }
 
 fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
@@ -2488,9 +2503,28 @@ mod tests {
         for operation in [Operation::Dedup, Operation::BaseRollup, Operation::DerivedRollup] {
             let outstanding = task("whale", 0, NORMAL_SLICE_MICROS, operation);
             assert!(blocks_rollup_backfill(&outstanding), "{operation:?} is the work a backfill would queue; re-queueing it pushes its deadline out");
-            let mut done = outstanding;
+            let mut done = outstanding.clone();
             done.state = TaskState::Complete;
             assert!(!blocks_rollup_backfill(&done), "a completed {operation:?} leaves the day open to backfill again");
+            // A SUPERSEDED parent is what `split_time_task` leaves behind, and it
+            // is never claimable. Letting it veto meant every day that was ever
+            // split had its cell marked "already queued" forever, so the planner
+            // could not re-admit it and the tier stayed holed permanently.
+            //
+            // Prod 2026-08-20 01:35, otel_logs_and_spans: `cells_missing=210`
+            // with `cells_wanted=0` and `derived_pending=22` — the census counts
+            // only Pending/Retry, so the superseded parents doing the blocking
+            // were invisible in every gauge. The 1h tier (what 30d dashboards
+            // read) sat at 22 days with its oldest date frozen at 2026-07-25
+            // across 32 minutes while the 1m tier held 31 days.
+            //
+            // Safe because a split parent's CHILDREN are Pending and still veto
+            // on their own; this only stops an unclaimable record from standing
+            // in for work nobody is going to do. Same reversal `can_fuse` already
+            // makes for coarsening.
+            let mut split = outstanding;
+            split.state = TaskState::Superseded;
+            assert!(!blocks_rollup_backfill(&split), "a superseded {operation:?} is unclaimable, so it must not veto the backfill that would replace it");
         }
     }
 
