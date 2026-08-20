@@ -78,36 +78,50 @@ a day-wide publish, and asserts the partition ends with exactly one version per
 
 *Cost:* small, one function. *Risk:* low, and bounded by the two guards above.
 
-## Phase 2 — clear the existing damage
+## Phase 2 — clear the existing damage — **80% DONE 2026-08-20**
 
-With Phase 1 in place the repair needs **no new tooling**: rebuilding a damaged
-day retires its immortal files as a side effect.
+| tier | before | after |
+| --- | --- | --- |
+| 1h | 104 | **0** |
+| 1m | 248 | **70** |
 
-Per `(project, date)` with untagged files, oldest tier first:
+278 units run from a local build, every one verified to have executed the unit
+it was asked for. The 1h tier is completely clean across the whole 30-day
+history.
 
-```
-run-unit --project <id> --source otel_logs_and_spans --date <D> --op base
-run-unit --project <id> --source otel_logs_and_spans --date <D> --op derived
-```
+Three defects had to be fixed before the repair worked at all, each found by the
+repair failing rather than by reading code:
 
-~250 base + ~104 derived units. Measured cost is ~18 s/unit (scan 12.9 s,
-staging 4.4 s, commit 0.3 s), so ≈ 1.8 h serial — run it a few at a time to stay
-off prod's maintenance capacity.
+- **`run-unit` ran the wrong unit.** It enqueued its key then called the ordinary
+  runner, which claims whatever ranks first — and a Database built against prod
+  storage plans prod's whole queue into its journal. 28 of the first 100 units
+  ran someone else's slice and reported success, because the summary line echoes
+  the REQUESTED key. Fixed by retiring every other task first (`ac3111b`).
+- **Width alone cannot prove reproduction.** A day over `MAX_DECODED_BYTES` is
+  split BEFORE execution, so a large tenant has no day-wide slice in any
+  environment. Retirement now also accepts a file's own statistics, and the
+  union of live tagged slices (`5082242`, `af05c0e`).
+- **A slice always started at midnight**, so a day could not be tiled and
+  18:00–24:00 was unpublishable. Added `--offset-hours` (`7a93798`).
 
-*Gate before fanning out:* repair ONE `(project, date)` and confirm
-`versions_per_id == 1.00` for that partition. Without Phase 1 this exact check
-already failed once — the rebuild published a correct 8,892-row file and the
-22,505-row untagged file survived, leaving the partition unchanged. Do not skip
-the gate.
+### The remaining 70 need prod, not a laptop
 
-*Verify per day:* `versions_per_id == 1.00` in the 1m tier, and the 1h tier's
-latest-version sum within a few percent of `count(distinct id)` on raw.
+They belong to five large tenants. Their days split before executing, and the
+split recurses: for `87576849`, 24h, 6h, 2h and 1h slices ALL split, because the
+estimate is prorated per file and an hour of that tenant still exceeds
+`MAX_DECODED_BYTES`. Driving it manually would mean running the split children
+down to minute-wide units — roughly 11 hours of local wall clock to remove 5.6%
+of one tier's files.
 
-**`run-unit` needs its own fix first** (already made, unmerged elsewhere):
-`main.rs` forced `TIMEFUSION_BUDGET_PROFILE=maintenance-cli`, under which
-`coordinator_share_bytes()` is a hard 0 — while `run_unit_once` builds its
-session from `coordinator_runtime_env()`, which *is* that pool. Every invocation
-died at `pool_size: 0.0 B` before reading a row. It has never worked.
+That is the wrong trade. The repair mechanism now lives in the publish path, so
+**prod's own coordinator retires these as it rebuilds**, at capacity, with no
+tooling. 12 of the 70 are already covered by live tagged slices and will go on
+the very next publish in their partition; the rest follow as the coordinator
+tiles those days.
+
+Correctness no longer waits on it either: both tiers declare their identity, so
+reads collapse versions regardless. What remains is scan volume, which Phase 4
+removes wholesale.
 
 ## Phase 3 — make this impossible to miss again
 
