@@ -23,7 +23,11 @@ async fn dml_update_rewrites_are_zstd_not_snappy() -> anyhow::Result<()> {
 
     // Simple UPDATE routes to perform_delta_update (UpdateBuilder), executed
     // immediately (dml_coalesce_secs defaults to 0). It rewrites the matched file.
-    client.execute("UPDATE otel_logs_and_spans SET status_code = 'ERR' WHERE project_id = 'e2e_project' AND id = 'u-1'", &[]).await?;
+    // `hashes` is the one column declared `mutable: true`; the rest are immutable
+    // so their read filters can be pushed below the merge-on-read dedup. Which
+    // column is assigned is incidental here — this test is about the codec the
+    // rewrite emits.
+    client.execute("UPDATE otel_logs_and_spans SET hashes = make_array('ERR') WHERE project_id = 'e2e_project' AND id = 'u-1'", &[]).await?;
 
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
     let uris: Vec<String> = { table_ref.read().await.get_file_uris()?.collect() };
