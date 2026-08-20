@@ -2637,3 +2637,282 @@ slope is not yet.
 At the observed ~2,600 bins/h the 10.5 k backlog clears in roughly four hours.
 **Do not re-measure the 30 d query until it has** — the duplication it is meant to
 remove is retired last, in the 2.5 % that actually rewrite.
+
+---
+
+## Part XIV — a hypothesis about tier compaction that needs falsifying first
+
+**Status: NOT a conclusion. It contradicts a comment backed by prod evidence, so
+it gets verified before anything is built on it.**
+
+The goal scorecard now reads: coverage DONE (30 d, all tiers), routing DONE
+(91.5 % hit rate), **latency NOT MET** — 4.5–8.4 s for 38 k rows reading the 1 h
+tier directly. The cause is that rollup tiers are excluded from compaction on
+purpose: every unit publishes its own file, nothing consolidates them, and
+`plan_compaction_debt` skips tiers because packing strips the identity tags.
+
+### What the code actually does
+
+`recover_rollup_coverage` fills `rollup_slice_coverage` in two passes:
+
+1. From `journal().published_rollups(source, target)` — **unconditionally**.
+2. From Delta `Add` tags — but each tagged entry is gated on
+   `rollup_slice_complete(...)`, which searches `snapshot.tasks` for a
+   `Complete` `BaseRollup`/`DerivedRollup` with an **exact** slice match:
+
+```rust
+let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
+if !complete || generation_id(...) != generation { continue; }
+```
+
+Both passes insert under the same key `(project, source, target, start, end)`.
+
+**So a tag cannot establish coverage the journal does not already have.** It can
+only confirm it, and refresh `rows`/generation. On this reading, packing a tier
+loses no coverage *while the journal still holds the `Complete` records* — and it
+does: retiring the ~63 k redundant base-rollup records is still an open task,
+explicitly blocked on "tag coverage proven sufficient first".
+
+If that holds, the ordering is inverted from how it has been treated: **tags are
+today redundant with the journal, not the other way round**, and tier compaction
+is far cheaper than "tag-preserving merge with containment semantics".
+
+### Why I do not believe it yet
+
+The exclusion comment cites real measurements: 58 of 119 hygiene claims targeted
+tier tables, the 1 m tier carried 79 untagged live files on 08-19, and a 10-day
+window reported `rollup_miss_not_built_total +45` as its **sole** miss reason.
+Untagged files demonstrably caused misses. That is not compatible with "tags are
+redundant" unless something else also consults them.
+
+So exactly one of these is true:
+
+- coverage is rebuilt from tags somewhere **other** than boot recovery, or
+- the miss path consults tags directly rather than `rollup_slice_coverage`, or
+- the journal records for those slices were already gone (checkpoint/compaction),
+  making tags the only source in practice — which would make the redundancy
+  argument circular.
+
+### The falsification, before any code
+
+1. Find every writer of `rollup_slice_coverage` and every reader that decides
+   `not_built`. If boot recovery is the only writer, hypothesis survives.
+2. On prod, take a slice known to have untagged tier files and check whether the
+   journal holds a `Complete` record for it. If it does and the router still
+   says `not_built`, the journal is not sufficient and the hypothesis is dead.
+3. Only then decide between: compact tiers and keep journal records forever;
+   or carry a **set** of slice bounds on merged files (a `slices` tag holding
+   the union, expanded by `recover_rollup_coverage` into one entry per original
+   slice) — which preserves exact-match semantics with no containment change.
+
+Option 3's second form is the safe design regardless of how (1) and (2) resolve,
+because it keeps every original slice individually represented. It is more code
+than option 1 and immune to the failure that option 1 risks.
+
+**Do not skip step 2.** The last three defects in this document were all "a
+predicate refuses for a reason the gauges do not show", and this hypothesis is
+one measurement away from being either a large simplification or a repeat.
+
+### Part XIV result — hypothesis REFUTED, and replaced by a precise rule
+
+Step 1 of the falsification ran. **The strong form ("tags are redundant with the
+journal") is wrong**, and the reason is a two-line asymmetry I had not noticed.
+
+**What step 1 established, and it is worth keeping:** no reader consults Delta
+tags. `rollup_slice_coverage` has exactly three writers — the live publish path,
+`recover_rollup_coverage` at boot, and two invalidating `retain`s — and the
+routing decision reads only that map. So tags reach routing through boot recovery
+and nowhere else. That much of the hypothesis survives, and it kills two of the
+three explanations offered for the prod evidence.
+
+**Where it breaks.** Boot recovery runs two passes that do *not* have the same
+precondition:
+
+| pass | requires |
+| --- | --- |
+| `published_rollups` | `state == Complete` **and `publication.is_some()`** |
+| tag-derived | `state == Complete` and an exact slice match — **publication irrelevant** |
+
+So the tag pass is not a subset of the journal pass. It is the **sole** coverage
+source for any slice that is `Complete` but carries no `publication` — and
+`publication` is cleared at several sites in `maintenance_coordinator.rs`
+(1256, 1380, 1820), including on the children `split_time_task` mints.
+
+That is exactly how untagged tier files produced `rollup_miss_not_built_total
++45` while the journal still "knew" the work was done. The prod evidence in the
+exclusion comment is correct, and my simplification would have re-broken coverage
+for precisely the split-heavy slices that dominate after the 87 k-unit explosion.
+
+**Consequence for the design.** Option 1 (compact tiers, rely on journal records)
+is **dead** — it silently drops coverage for publication-less Complete slices, and
+that class is common here rather than exotic. The remaining design is the one
+that was already the safe choice:
+
+> merge tier files only within a `(source, project, generation, fingerprint)`
+> group, and carry a **set** of `(slice_start, slice_end)` pairs on the merged
+> file — expanded by `recover_rollup_coverage` into one coverage entry per
+> original slice.
+
+Exact-match semantics are preserved per slice, `rollup_slice_complete` needs no
+change, and no coverage depends on a publication surviving.
+
+**Method note, since this is the third time it has paid.** The hypothesis was
+plausible, code-grounded, and would have been a large simplification. It was also
+wrong, and one grep for "who writes this map, who reads it" settled it before any
+code existed. *The cheap step is enumerating writers and readers; the expensive
+step is discovering the asymmetry after shipping.*
+
+---
+
+## Part XV — tier consolidation: step 1 on a branch, step 2 specified
+
+Branch `fix/tier-merge-slice-set`, **not merged**. Step 1 is behaviour-preserving:
+tiers are still excluded from compaction, so nothing yet merges differing slices.
+
+### Step 1 (done, tested)
+
+`carried_coverage_tags` now separates the two kinds of tag it was conflating:
+
+- the four **identity** tags (source, project, fingerprint, generation) carry
+  only on full agreement, exactly as before — disagreement means the inputs are
+  not one publication and nothing is carried;
+- the **slice bounds** may differ, and when they do the output carries a SET
+  (`TAG_MERGED_SLICES`, canonical `start:end` pairs) instead of nothing.
+
+`recover_rollup_coverage` expands the set into one coverage entry per original
+slice, each still matched EXACTLY — so `rollup_slice_complete` is untouched and
+no coverage depends on a `publication` surviving, which is the trap Part XIV
+found. A span was never an option: it claims the gap, and recovery would discard
+it anyway.
+
+Checked before committing: `coverage.rows` is read by a single `debug!` and by no
+decision, so a merged file's inability to attribute rows per slice costs nothing.
+
+The codec is canonical (sorted, deduped) so re-merging is idempotent; malformed
+and inverted pairs are dropped rather than guessed; one unprovable input aborts
+the whole carry, because a partial set is a silent hole rather than a visible
+absence. 812 lib tests pass, `cargo lint` clean.
+
+### Step 2 (specified, NOT written)
+
+Admit tiers to `plan_compaction_debt` and group candidates by tag identity.
+
+**The grouping key is simpler than expected.** `generation_id` hashes
+`(spec, source, project_id, date)` and **ignores `source_fp`** despite taking it
+as a parameter, so generation is CONSTANT within one tier partition. Source and
+project are fixed by the partition. The key therefore collapses to one field:
+
+> within a tier's `(project_id, date)` partition, merge only files that share
+> `timefusion.source_fingerprint`.
+
+A rebuilt day is the only thing that puts two fingerprints in one partition, and
+those must not merge — the ticket re-check distinguishes their coverage entries
+by exactly that field.
+
+**Untagged files must be excluded from every group.** A tier partition can hold
+untagged files (79 on the 1 m tier for 08-19). Merging one into a tagged group
+makes `carried_coverage_tags` abort and emit an untagged output, converting
+proven coverage into none. They may only merge with each other, or be left alone
+— and a known separate hazard is that an untagged tier file cannot be removed by
+the replace-set at all, so leaving them alone is the safe default until that is
+resolved.
+
+**Risk, stated plainly.** This adds work to `plan_compaction_debt`, the same
+scheduling path that wedged the maintenance tier tonight. It wants a kill switch,
+one tenant first, and a verdict taken from a second sample at least one full cron
+period after deploy — not from the first reading. That is the lesson of Part XIII
+and it cost a production incident to learn.
+
+### Where this sits against the goal
+
+| component | status |
+| --- | --- |
+| rollups up to date | DONE — 30 d contiguity, `min = median = 30` |
+| rollups always used | DONE — 91.5 % routing hit rate |
+| dashboards ~1 s | NOT MET — 4.5-8.4 s on the tier; step 2 is the lever |
+| duplicates removed | NOT MET — drain reverted, queue ~11 k and growing |
+
+The last row is the other open front: the Part XIII diagnosis is correct and its
+fix is reverted, waiting on resumable staging and its own budget.
+
+---
+
+## Part XVI — prod still OOMs every 8-20 h, and peak anon is back to 124 GB
+
+2026-08-20 10:39:27 UTC, on `d5688fd`:
+
+```
+Memory cgroup out of memory: Killed process (timefusion)
+  total-vm:319880836kB  anon-rss:124598712kB  file-rss:161240kB
+```
+
+**124.6 GB anon, 161 MB file.** The documented shape exactly — cache is not the
+cause and never has been on this box.
+
+Not caused by anything shipped tonight. `d5688fd` is the revert, functionally the
+pre-drain-fix build, and the kill cadence predates it:
+
+```
+Aug 18 14:26 · Aug 18 18:01 · Aug 19 11:30 · Aug 19 15:34 · Aug 20 10:39
+```
+
+A single kill each time, self-recovered, ~8-20 h apart. Not a crashloop.
+
+**Why this belongs in this document.** It is not a side issue — it is a direct
+tax on "maintenance keeps up". Every kill destroys in-flight maintenance units,
+and after a restart the box needs ~2 h of quiet before any throughput number
+means anything. At one kill per ~12 h, a meaningful fraction of all maintenance
+time is spent re-approaching a steady state it never reaches. It also makes
+before/after measurement of any scheduling change unreliable, which is part of
+why tonight's readings needed a second sample.
+
+**What is new, and troubling.** The 2026-08-14 attribution work drove peak anon
+from 96 GB to ~37 GB across seven fixes. It is now **124 GB** — higher than
+before that work started. So either a regression has undone it, or the workload
+has grown into a new dominant term. That question is unanswered and should be
+answered before more memory fixes are attempted, because the previous round's
+value came entirely from attributing first.
+
+**Deliberately not acted on tonight.** A speculative memory fix on a box that
+OOMs every 12 h, after already wedging the maintenance tier once this session, is
+how a bad night becomes a bad week. The next step is attribution — a heap profile
+taken while RSS is high, not at boot — and that wants a waking operator.
+
+### Part XVI addendum — the OOM is a SPIKE, not the steady climb
+
+Sampled `process_rss_mb` (the in-process gauge, not `docker stats`) after the
+10:39 restart, on `d5688fd` under ~800 queries/min of real traffic:
+
+| UTC | uptime | `process_rss_mb` | buffer lag |
+| --- | --- | --- | --- |
+| 10:43:09 | ~7 m | 23,532 | 3,473,284 |
+| 10:46:56 | ~9 m | **13,804** | 219,981 |
+| 11:18:09 | ~39 m | 14,187 | 510,991 |
+
+Two things fall out.
+
+**WAL replay's working set releases cleanly.** RSS *fell* 23.5 → 13.8 GB as the
+buffer lag drained. Boot is not where the memory goes.
+
+**Steady-state growth cannot reach the kill.** Between the two post-replay
+samples the slope is **~766 MB/h**. From 14.2 GB, climbing to the 124.6 GB at
+which the kernel actually killed it would take **~144 hours**. The observed kill
+cadence is **8-20 hours** — a 7-18× discrepancy.
+
+So the process does not gradually leak into the wall. **Something allocates tens
+of gigabytes in a burst**, and everything between bursts is a slow, survivable
+drift. That reframes the search: stop looking for a leak, start looking for the
+event.
+
+**Caveat, stated because the slope is thin.** Two samples 31 minutes apart is a
+weak basis for a rate, and the climb need not be uniform. But the conclusion
+survives large sampling error: even if the true slope were **three times** my
+estimate, it would still imply ~48 h to reach the wall against an 8-20 h cadence.
+The order of magnitude is what carries this, not the precision.
+
+**Where to look first**, from prior attribution already in memory — all bursty,
+all previously measured on this box: a single scan selecting 514 files / 32.8 GB
+(the guard bounds concurrency, not size); bulk INSERT sustaining 1.2-1.8 GB/s;
+and the budget tree handing maintenance the remainder with three ceilings
+uncounted. A heap profile taken **while RSS is high** would settle it, and that
+wants a waking operator rather than a 12 h wait for the next burst.

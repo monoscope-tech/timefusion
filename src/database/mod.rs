@@ -4138,6 +4138,23 @@ impl Database {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
+                        // Rollup-declared sources are now owned by durable
+                        // ten-minute coordinator tasks. Keep this legacy cron
+                        // only for tables that have no slice lifecycle yet.
+                        //
+                        // Re-enabling the drain here (954d516) WEDGED the tier and
+                        // was reverted in d5688fd: drain_deadline bounds admission
+                        // only, so a bin already admitted runs to
+                        // DEDUP_BIN_STAGE_DEADLINE = 3600s while holding
+                        // maintenance_job_sem — two permits can hold the pass an
+                        // hour past its ~144s budget and every other maintenance
+                        // job is skipped. A timed-out bin discards its staged
+                        // work, so the hour buys nothing. Staging must become
+                        // resumable, and the drain needs its own budget rather
+                        // than the shared job semaphore, before this comes back.
+                        if get_schema(&table_name).is_some_and(|schema| !schema.rollups.is_empty()) {
+                            continue;
+                        }
                         // Dedup key: bare table name for unified tables, tenant-scoped
                         // for custom-storage ones (they are separate Delta logs).
                         let key = if project_id.is_empty() { table_name.clone() } else { format!("{project_id}:{table_name}") };
@@ -11654,24 +11671,6 @@ mod tests {
         assert_eq!(metrics.decode.decode_peak_batch_bytes.load(Relaxed), want);
         assert_eq!(metrics.decode.decode_polls_inflight.load(Relaxed), 0, "in-flight gauge must return to zero");
         assert_eq!(metrics.decode.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
-    }
-
-    /// The 2026-08-16 coordinator handover skipped rollup-declared tables in the dedup cron with a
-    /// `continue` placed before BOTH halves of the pass. The sweep half was genuinely reassigned to
-    /// durable coordinator tasks; the dirty-bin DRAIN was not reassigned to anything, and it is the
-    /// only code in the process that removes entries from `dedup_dirty_bins`. Both production
-    /// schemas declare rollups, so the drain simply stopped running: prod 2026-08-20 read
-    /// `dirty_bin_processed_total = 0` against a queue of 10,800 growing ~2,200/h, and a 30 d query
-    /// merge-sorted 7.24 M rows to emit 613.
-    ///
-    /// The first case is the regression guard: a rollup-declared source must still be VISITED, and
-    /// must have exactly its sweep withheld — never the whole pass.
-    #[test_case(true, false => (true, false) ; "rollup source: coordinator owns the sweep, cron still owes the DRAIN")]
-    #[test_case(true, true => (true, false) ; "the fallback flag must not resurrect a sweep the coordinator owns")]
-    #[test_case(false, true => (true, true) ; "plain table with the fallback on: cron sweeps as before")]
-    #[test_case(false, false => (true, false) ; "plain table, fallback off: drain only, unchanged")]
-    fn dedup_cron_withholds_only_the_sweep_from_rollup_sources(has_rollups: bool, sweep_fallback: bool) -> (bool, bool) {
-        super::Database::dedup_cron_duties(has_rollups, sweep_fallback)
     }
 
     /// The decode pressure valve. ABSOLUTE backstop tiers: full concurrency until 88% of the
