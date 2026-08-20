@@ -377,31 +377,8 @@ pub struct TableSchema {
     pub version_append: bool,
 }
 
-// ─── ADDING A COLUMN TO A SHIPPED TABLE (read this before editing any YAML) ───
-//
-// A NEW table may declare whatever columns it likes — `mor_versioned` declares
-// `updated_at` and `deleted` from birth, and nothing is wrong with that because
-// no Delta table with the old column set exists anywhere.
-//
-// An EXISTING shipped table MUST NOT gain a column without an explicit migration
-// path. `otel_logs_and_spans` gained `updated_at` + `deleted` in 7d68f01 and
-// prod took 268 flush failures and rejected pgwire INSERTs within minutes:
-//
-//     Arrow error: Invalid argument error: number of columns(94) must match
-//     number of fields(92)
-//
-// The YAML is only one of TWO schemas. The other is the one physically stored in
-// each live Delta table's transaction log, and it is NOT derived from the YAML —
-// it is whatever was there when the table was created, months ago, per project.
-// Editing the YAML makes the write path build batches to the new shape while
-// every existing Delta table still declares the old one, and nullability buys
-// nothing: the mismatch is arity, not nulls.
-//
-// Every local suite passes anyway, because tests create their tables from
-// scratch and the two schemas therefore always agree. That is precisely the
-// blind spot — a green test run is NOT evidence that a column addition is safe.
-// See `dedup_compaction_test::adding_a_column_to_an_existing_table_is_caught`,
-// which creates a table at an old column set and then writes the new one.
+// Existing tables need an explicit column migration: their Delta schema is not
+// derived from YAML, and new-table tests cannot detect an upgrade mismatch.
 //
 // So: a column addition to a shipped table needs a migration that evolves the
 // stored Delta schema of every live table (all projects, unified + custom)

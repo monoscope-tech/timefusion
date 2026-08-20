@@ -35,8 +35,7 @@ use crate::{
     write::BufferedWriteLayer,
 };
 
-/// Hard cap on the number of source rows we'll materialize for an `UPDATE ... FROM`.
-/// Beyond this we error rather than blowing memory; the caller must page or pre-aggregate.
+/// Reject larger `UPDATE ... FROM` sources before materializing them.
 const MAX_UPDATE_SOURCE_ROWS: usize = 1_000_000;
 const SLOW_DML_PHASE_US: u64 = 1_000_000;
 /// Maximum source rows in one merge-on-read scan. Each chunk becomes bounded
@@ -49,7 +48,6 @@ const SLOW_DML_PHASE_US: u64 = 1_000_000;
 // larger process/thread stack.
 const MOR_KEY_PUSHDOWN_ROWS: usize = 256;
 
-/// Emit the shared `dml.slow_phase` line when `started` has exceeded the threshold.
 fn log_slow_phase(phase: &'static str, table_name: &str, project_id: &str, started: Instant, rows: Option<u64>) {
     let duration_us = started.elapsed().as_micros() as u64;
     if duration_us >= SLOW_DML_PHASE_US {
@@ -130,7 +128,6 @@ pub struct UpdateSourcePlan {
     pub join_keys: Vec<(String, String)>,
 }
 
-/// Custom query planner that intercepts DML operations
 #[derive(derive_more::Debug)]
 pub struct DmlQueryPlanner {
     #[debug(skip)]

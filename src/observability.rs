@@ -273,10 +273,7 @@ pub fn init_metrics(
         .with_timeout(Duration::from_secs(10))
         .build()?;
 
-    // 30s export interval is the OTLP/Prometheus convention.
     let reader = PeriodicReader::builder(exporter).with_interval(Duration::from_secs(30)).build();
-
-    // The global registry owns the provider for the rest of the process.
     opentelemetry::global::set_meter_provider(SdkMeterProvider::builder().with_reader(reader).with_resource(resource).build());
 
     let meter = opentelemetry::global::meter("timefusion");

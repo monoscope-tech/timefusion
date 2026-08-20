@@ -90,63 +90,11 @@ pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 /// type-erased. The two strings are DataFusion's own — `ResourcesExhausted`'s
 /// `Display` and the `ExternalSorter`'s message — and both are asserted against
 /// verbatim prod text in `capacity_failures_are_recognised_from_prod_text`.
-/// Seconds a unit of this operation is allowed to run before the coordinator
-/// abandons it. Defined here, beside `Operation`, because the retry backoff and
-/// the deadline have to agree: a unit that ran to its deadline burned that much
-/// of a worker, and retrying it sooner than that lets a permanently oversized
-/// unit hold a slot almost continuously.
+/// Operation deadlines also bound retry backoff so oversized units cannot
+/// monopolize a worker.
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
-        // Dedup used to get 5 minutes because it held a rewrite permit and its
-        // memory was bounded by INPUT SIZE, unlike a rollup. #161 removed the
-        // hash-sharded passes, so the streaming branch is now a
-        // `BoundedWindowAggExec(mode=Sorted)` over a spillable `SortExec` —
-        // bounded by one key group, not by input — and that argument no longer
-        // holds.
-        //
-        // 5 minutes is also simply below what this class of work costs. Measured
-        // 2026-08-18 with `maintenance_unit_slow`, the comparable file rewrites
-        // complete at 320-440s against their 900s deadline (51-64% headroom):
-        //
-        //     SealedConsolidation  440s, 363s, 335s
-        //     HotPacking           320s
-        //
-        // Dedup over the same window logged 12 timeouts and NOT ONE slow
-        // completion — nothing finished between 75s and 300s. Its units are
-        // bimodal: quick, or past the deadline. And a minimum-width unit cannot
-        // be shrunk to fit: `byte_bounded_units` bisects in time only while the
-        // slice is wider than MIN_SLICE_MICROS, below which it emits hash shards,
-        // which `split_time_task` refuses. So the unit retries whole, forever, at
-        // full cost — the same trap #168 fixed for repair.
-        //
-        // REVERTED 2026-08-18, ~15 minutes after it shipped. Prod took a 125.1 GB
-        // OOM (exit 137, `tokio-rt-worker`) at 11:38 UTC, and the interval
-        // between OOMs had shortened from 15 hours to 4.2:
-        //
-        //     08-17 09:39 -> 16:39   7h
-        //     08-18 07:27           15h
-        //     08-18 11:38          4.2h   <- with the 900s deadline live
-        //
-        // Not proven — this OOM signature predates the change and its likeliest
-        // driver is a query-side join (see the handover, section 6.4). But the
-        // mechanism is precisely what the original 5 minutes was protecting: a
-        // dedup unit holds a rewrite permit AND its Arrow decode is OUTSIDE the
-        // DataFusion memory pool, so tripling the deadline triples how long that
-        // untracked memory is held, times the concurrent units.
-        //
-        // The argument for raising it was that #161 made the streaming branch a
-        // `BoundedWindowAggExec` over a spillable sort. That is true of the
-        // STREAMING branch; the collecting branch still materialises. Overriding
-        // a comment that named this exact risk, on a partial reading of which
-        // branch runs, was the mistake.
-        //
-        // The measurement that motivated it still stands and is still worth
-        // acting on — dedup units are bimodal, and 5 minutes is below what
-        // comparable file rewrites (320-440s) cost. The right fix is to make the
-        // units FIT, not to let them run longer: `byte_bounded_units` bisects in
-        // time only above MIN_SLICE_MICROS and emits hash shards below it, which
-        // `split_time_task` refuses outright. Teaching it to accept hash-sharded
-        // children would let an oversized unit shrink instead of retrying whole.
+        // Dedup may use an unpooled collecting path; keep its exposure shorter.
         Operation::Dedup => 5 * 60,
         Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
     }

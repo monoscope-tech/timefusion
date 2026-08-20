@@ -177,8 +177,7 @@ fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let write_ms = stage(&mut mark);
     wrote.inspect_err(|e| println!("probe stage=write connect_ms={connect_ms} ms={write_ms} result=error err={e}"))?;
 
-    // The stage that actually costs: the server has to schedule the handshake
-    // task and answer. Starvation shows up here, not in connect.
+    // Auth latency exposes server task starvation that connect latency misses.
     let mut tag = [0u8; 1];
     let read = stream.read_exact(&mut tag);
     let auth_ms = stage(&mut mark);
