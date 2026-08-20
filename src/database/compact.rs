@@ -489,8 +489,7 @@ impl Database {
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let scope: Vec<String> = std::iter::once(format!("date={date}/")).chain(project_id.map(|pid| format!("project_id={pid}/"))).collect();
         let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
-        let pre_uris: Option<HashSet<String>> =
-            if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
+        let pre_uris: Option<HashSet<String>> = if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
         let mut scope_files = scoped_file_uris(&*table_ref.read().await, &scope).len();
         let (mut attempt, mut total_attempts) = (0usize, 0usize);
         loop {
@@ -1080,9 +1079,7 @@ impl Database {
     ///
     /// A dup group shares one exact `timestamp` (it is a dedup key), so the group's bin is derived
     /// exactly. Only valid when `timestamp` is a dedup key.
-    pub(crate) async fn probe_dup_bins(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str,
-    ) -> Result<HashSet<i64>> {
+    pub(crate) async fn probe_dup_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str) -> Result<HashSet<i64>> {
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
         let schema = schema_or_default(table_name);
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;

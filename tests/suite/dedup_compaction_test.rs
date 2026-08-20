@@ -2529,11 +2529,7 @@ async fn a_certification_survives_a_restart_and_still_grants_the_skip() -> Resul
     db.query_delta_only(&sql).await?; // warm `try_fast_resolve`; cold it declines as Unresolved
     let before = counter_value(scan_metric_names::DEDUP_SKIPPED);
     db.query_delta_only(&sql).await?;
-    assert_eq!(
-        counter_value(scan_metric_names::DEDUP_SKIPPED) - before,
-        1,
-        "the reloaded certification must grant the skip; a fresh process swept nothing"
-    );
+    assert_eq!(counter_value(scan_metric_names::DEDUP_SKIPPED) - before, 1, "the reloaded certification must grant the skip; a fresh process swept nothing");
     Ok(())
 }
 

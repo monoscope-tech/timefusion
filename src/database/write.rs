@@ -1221,8 +1221,8 @@ impl Database {
     /// work runs once for the commit.
     #[allow(clippy::too_many_arguments)]
     async fn record_committed_write(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, new_table: DeltaTable,
-        pre_uris: &HashSet<String>, warm: bool,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, new_table: DeltaTable, pre_uris: &HashSet<String>,
+        warm: bool,
     ) -> Vec<String> {
         // Jitter anchor + logging identity: any member of the physical group is
         // equivalent (they all commit to the same log).
