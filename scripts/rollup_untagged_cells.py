@@ -33,11 +33,20 @@ import sys
 
 import pyarrow.parquet as pq
 
-TIERS = ["otel_logs_and_spans_rollup_dashboard_1m_v3", "otel_logs_and_spans_rollup_dashboard_1h_v2"]
-OPS = {TIERS[0]: "base", TIERS[1]: "derived"}
+# Every tier directory present, NOT a hardcoded list. A hardcoded pair covering
+# only otel_logs_and_spans reported 67 untagged files on 2026-08-20 while the
+# in-process gauge said 200 — the difference was otel_metrics, a whole second
+# source with 130 untagged files that had never been measured or repaired. The
+# gauge was right and the script was blind.
+root = sys.argv[1]
+TIERS = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
 SOURCE = "otel_logs_and_spans"
 
-root = sys.argv[1]
+
+def op_for(tier):
+    """`base` builds from raw, `derived` from the base tier — the 1h/1d grains."""
+    return "derived" if "_1h_" in tier or "_1d_" in tier else "base"
+
 UNTAGGED = "timefusion.slice_start_micros"
 
 
@@ -86,7 +95,7 @@ if "--commands" in sys.argv:
     # Oldest first: settled days are cheap to check a mistake against before
     # touching the recent ones dashboards actually read.
     for tier, project, date in sorted(cells, key=lambda cell: (cell[2], cell[1])):
-        print(f"timefusion run-unit --project {project} --source {SOURCE} --date {date} --op {OPS[tier]}")
+        print(f"timefusion run-unit --project {project} --source {SOURCE} --date {date} --op {op_for(tier)}")
 else:
     for date in sorted({d for _, _, d in cells}):
         print(f"  {date}  files={sum(n for (_, _, d), n in cells.items() if d == date):4d}  cells={len([1 for _, _, d in cells if d == date])}")
