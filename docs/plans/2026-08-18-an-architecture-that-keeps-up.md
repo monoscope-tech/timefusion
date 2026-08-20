@@ -2496,3 +2496,108 @@ have deliberately not taken it unilaterally:
 A second, independent question: **should `otel_metrics` really get 85 % of rollup
 capacity?** If its dashboards matter less than `otel_logs_and_spans`, a per-source
 share would buy the goal directly and cheaply.
+
+---
+
+## Part XIII — the dirty-bin drain has not run in production since 2026-08-16
+
+Part XII named steady-state maintenance cost as the binding constraint and put
+frontier width forward as the lever. That was measured under load and it was not
+wrong, but it was aimed one level too high. A concurrent session profiled the 30 d
+query directly and found where the time actually goes:
+
+```
+DeltaScanExec              7.23 M rows, 30 files
+UnionExec (hot + delta)    7.24 M rows, 637 MB
+SortPreservingMergeExec    7.24 M rows, 723.3 MB, elapsed_compute 1.10s
+DedupExec keys=[timestamp,id]  ->  221.7 K rows      <-- 32.6x reduction
+FilterExec/Aggregate           ->      613 rows      <-- the actual answer
+```
+
+The query merge-sorts **723 MB to emit 613 rows**. ~97 % of everything scanned is
+duplicate versions that `DedupExec` then discards. That is not plan cost and it is
+not slice width — it is storage holding 32× more rows than it should.
+
+### The refusal
+
+`dirty_bin_processed_total = 0`, against `dirty_bin_queue_depth = 10,800` growing
+~2,200/h across three samples (5,629 → 8,613 → 10,800). Zero is not "slow"; zero
+is a predicate.
+
+The chain, all four links verified in the source:
+
+1. Every removal from `dedup_dirty_bins` happens inside
+   `dedup_dirty_bins_for_table`. Nothing else in the process dequeues.
+2. Its only production caller is `run_dedup_for_table`.
+3. Its only caller is the `Dedup` cron's table loop.
+4. That loop began with
+   `if get_schema(&table_name).is_some_and(|s| !s.rollups.is_empty()) { continue; }`
+
+`otel_logs_and_spans` and `otel_metrics` are the only production schemas and
+**both declare rollups**. So this was never a partial outage or a slow path — the
+dirty-bin drain had no reachable caller in production at all. Flush kept enqueuing;
+nothing ever dequeued.
+
+### Why it was invisible
+
+The 2026-08-16 handover moved slice work to durable coordinator tasks, and the
+`continue` was written to express that. But the cron has **two halves with two
+different owners**: the *sweep* (walk partitions, certify) genuinely moved to the
+coordinator, which now calls `record_certification` itself. The *drain* — the half
+that physically removes duplicates — moved nowhere. The `continue` sat before both,
+so reassigning one silently retired the other.
+
+This is the second duty lost in the same handover. The first was certification, and
+its own fix comment already records the pattern: *"the dedup cron skips every
+rollup-declared table … so certification became unreachable the day the coordinator
+took ownership and this path did not take the duty with it."* Nobody then asked what
+**else** was behind that `continue`.
+
+**The tell was inside the function the caller had excluded.** `run_dedup_for_table`
+gates its sweep on `certify_rollups` — a condition that requires the table to declare
+rollups — while its only caller skipped exactly those tables. *When a branch can only
+fire under a condition its caller forbids, one of the two is wrong.* That
+contradiction sat in the code, compiling and passing tests, for four days.
+
+### The fix
+
+Replace the wholesale skip with an explicit statement of the two duties:
+
+```rust
+/// Returns `(drain, sweep)`. The drain is deliberately unconditional — that is
+/// the invariant this function exists to state, and the one the handover broke.
+fn dedup_cron_duties(has_rollups: bool, sweep_fallback: bool) -> (bool, bool) {
+    (true, sweep_fallback && !has_rollups)
+}
+```
+
+The cron no longer skips any table; `run_dedup_for_table` withholds only the sweep.
+`sweep_fallback && !has_rollups` rather than `||`, so the fallback flag cannot
+resurrect a sweep on a source the coordinator owns and have both certify it.
+
+Guarded by a four-case table. Verified by reverting to pre-fix semantics: the two
+rollup-source cases fail with `left: (true, false)` vs `right: (false, true)` —
+drain withheld, sweep resurrected — while both plain-table cases stay green, so the
+guard discriminates the regression and not merely the refactor.
+
+### What to watch after deploy, and the risk
+
+`dirty_bin_processed_total` must leave zero. If it does, the duplication that makes
+the 30 d query scan 7.24 M rows for 613 starts coming down, and Part XII's frontier
+question should be **re-measured before it is answered** — a box no longer carrying
+32× duplicates is a different box.
+
+The risk is real and worth stating plainly: this restarts a genuinely expensive
+pass on a memory-tight instance that has not run it in four days, against a 10,800
+-bin backlog. The bounds it runs under are pre-existing and were load-bearing before
+08-16 (`DIRTY_BIN_STAGE_BATCH = 64`, flush-health yields, the rewrite semaphore,
+per-bin and per-pass deadlines), and `timefusion_dirty_bin_dedup_enabled` is an
+existing kill switch that disables it without a rollback. Watch RSS and
+`exit 137` on the first pass.
+
+### Status of Part XII
+
+Not retracted — the frontier-width numbers stand as measurements. But its framing
+("the binding constraint is steady-state maintenance cost") is **demoted**: the
+larger term was duplicates nothing was removing. Answer the width question after
+the drain has run.
