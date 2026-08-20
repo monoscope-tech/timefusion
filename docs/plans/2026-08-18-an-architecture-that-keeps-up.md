@@ -2408,3 +2408,36 @@ instance instead.
    hit/miss decision per plan rather than by counter delta.
 2. Hot-tail fragmentation: 08-18/08-19 at 250-460 files each.
 3. Certification, to drop `DedupExec` from the plan.
+
+## Part XI — 2026-08-20 03:30: read latency cannot be measured under a running backfill
+
+**Retraction of the Part X inference.** I concluded the routed read path costs
+~1.3 s per day of window "independent of data volume", from a near-empty tenant
+taking 6.8 s / 38.5 s at 7 d / 29 d. That number is not structural. The identical
+direct-tier query — same SQL, same rows returned (1,145 / 53,370,390) — measured
+**0.68 s at 02:40 and 7.35 s at 03:25**, while the tier's file layout was
+unchanged (611 → 617 files, 28 MB, shipbubble 38 files across 32 days).
+
+What changed is load: container at **1431 % CPU (14.3 cores)**, host load average
+29.5/48, driven by the backfill draining 6,349 pending base rollups. The
+maintenance scan volume also churns the Foyer cache, so rollup-tier reads fall
+back to full OVH S3 latency (~390 ms/file) — 38 files at low effective
+concurrency is seconds.
+
+**Rule this establishes:** *query-latency numbers taken while maintenance is
+saturating the box measure the backlog, not the query.* Read-path work must be
+evaluated either after the queue drains or on an instance that is not
+concurrently rebuilding history. This is the third measurement trap of the night,
+after `+84 full hits` (concurrent traffic) and `EXPLAIN` not exercising routing.
+
+**What still holds from Part X**, because it does not depend on timings:
+- Coverage is met: `rollup_min_contiguous_days = rollup_median_contiguous_days = 30`.
+- Routing SUCCEEDS on these queries — no `rollup_miss_sampled`, no
+  `rollup_rewrite_failed` was logged for a 29-day query that took 62 s.
+- The generated SQL builds FEW legs (rollup + optional fringe + raw), not one per
+  date, so a per-date union is not the mechanism.
+- `DedupExec` still appears in raw plans, and recent partitions carry 250-460
+  files each.
+
+**Next, in order:** let the backfill drain; re-measure the 30 d query cold and
+warm on a quiet box; only then decide whether the read path needs work at all.
