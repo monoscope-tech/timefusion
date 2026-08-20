@@ -2441,3 +2441,58 @@ after `+84 full hits` (concurrent traffic) and `EXPLAIN` not exercising routing.
 
 **Next, in order:** let the backfill drain; re-measure the 30 d query cold and
 warm on a quiet box; only then decide whether the read path needs work at all.
+
+## Part XII — 2026-08-20 04:30: the binding constraint is now steady-state maintenance cost
+
+Coverage is met and holding (`min = median = 30` contiguous days for two hours).
+Routing succeeds. The tier is 28 MB in 617 files. And a 30 d query is still slow —
+because maintenance never stops.
+
+**The floor, measured directly on the tier** (clean partition pruning, no routing),
+30 days, five consecutive runs: **11.15 s cold, then 5.06 / 5.02 / 3.79 / 4.18 s**.
+The same shape over 14 days measured **0.68 s at 02:40**, when the box was quieter.
+Container sits at **1161-1431 % CPU (12-14 cores)**, host load 35/48, continuously.
+
+So the read path is not obviously broken; it is being starved, and the Foyer cache
+is being churned, by maintenance that has no end state.
+
+### Where the steady-state cost actually is
+
+15 minutes of task starts, rollup operations only:
+
+| | |
+|---|---|
+| slice date | **08-20 (today) 48**, 08-05…08-07 24 |
+| tier | **otel_metrics 1m 53**, otel_metrics 1h 9, logs 1m 7, logs 1h 4 |
+| width | **10 min ×33**, 60 min ×13, 180 min ×18, 360 min ×3 |
+
+Two facts follow:
+1. `pending_base_rollup ≈ 6,256` is **not** historical backfill. It is mostly
+   TODAY's frontier, re-minted continuously. Net drain is ~1.6/min, which is why
+   the number looks stuck while coverage is complete.
+2. **`otel_metrics` takes ~85 % of rollup capacity**; `otel_logs_and_spans` — the
+   table every dashboard reads — gets ~15 %.
+
+At 10-minute width the frontier mints ~144 units/day/stream. With ~13 projects ×
+2 sources × 2 tiers that is ~7,500 units/day, each paying the fixed ~3.74 s commit
+that [[tf_rollup_unit_cost_is_the_commit]] measured. That is the treadmill.
+
+### THE DECISION WAITING FOR YOU
+
+The lever is frontier slice **width**, and it is a genuine product trade-off, so I
+have deliberately not taken it unilaterally:
+
+- **Keep 10 min.** Raw tail stays ~15 min; recent dashboards are maximally fresh;
+  maintenance keeps consuming 12-14 cores and 30 d queries stay ~4-11 s.
+- **Widen to 1 h.** ~6× fewer commits, frontier cost drops roughly in proportion.
+  Raw tail grows to ~1 h 15 min — but a 1-hour raw window measured **1.0 s**, so
+  the read cost of that is small.
+- **Hybrid (my recommendation).** Mint 10-minute slices only for the last ~2 hours
+  and hourly slices for the rest of the 24 h frontier window. Freshness is
+  preserved exactly where anyone looks at it, and ~90 % of frontier units vanish.
+  More code than the flat change, and it touches the most load-bearing scheduling
+  path, which is why it should be written with you awake rather than at 04:30.
+
+A second, independent question: **should `otel_metrics` really get 85 % of rollup
+capacity?** If its dashboards matter less than `otel_logs_and_spans`, a per-source
+share would buy the goal directly and cheaply.
