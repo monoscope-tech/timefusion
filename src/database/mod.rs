@@ -9488,8 +9488,7 @@ impl TableProvider for ProjectRoutingTable {
             // leg contributes no rows; drop it before the union. Keep one leg if
             // all are empty so the single-plan path stays valid.
             fn provably_empty(plan: &dyn ExecutionPlan) -> bool {
-                plan.is::<datafusion::physical_plan::empty::EmptyExec>()
-                    || matches!(plan.children().as_slice(), [child] if provably_empty(child.as_ref()))
+                plan.is::<datafusion::physical_plan::empty::EmptyExec>() || matches!(plan.children().as_slice(), [child] if provably_empty(child.as_ref()))
             }
             if legs.len() > 1 && legs.iter().any(|(p, _)| provably_empty(p.as_ref())) {
                 match legs.iter().any(|(p, _)| !provably_empty(p.as_ref())) {
