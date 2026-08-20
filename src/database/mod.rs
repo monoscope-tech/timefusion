@@ -4903,8 +4903,7 @@ impl Database {
     /// the write lock, alongside the insert) when this call did the inserting, `None` on a
     /// cache hit — so callers can log a "cached" line exactly on a fresh insert, as before.
     async fn get_or_create_cached<K: Eq + std::hash::Hash + Clone>(
-        &self, cache: &RwLock<HashMap<K, Arc<RwLock<DeltaTable>>>>, key: K, storage_uri: &str, storage_options: &HashMap<String, String>,
-        table_name: &str,
+        &self, cache: &RwLock<HashMap<K, Arc<RwLock<DeltaTable>>>>, key: K, storage_uri: &str, storage_options: &HashMap<String, String>, table_name: &str,
     ) -> Result<(Arc<RwLock<DeltaTable>>, Option<usize>)> {
         if let Some(table) = cache.read().await.get(&key) {
             return Ok((Arc::clone(table), None));
@@ -4988,9 +4987,8 @@ impl Database {
         // the load targets a TENANT's BYO bucket, so one unreachable endpoint or
         // stale credential set can pin this map's write guard indefinitely and
         // wedge every maintenance job that walks the map.
-        let (table_arc, fresh_count) = self
-            .get_or_create_cached(&self.custom_project_tables, table_key(project_id, table_name), &storage_uri, &storage_options, table_name)
-            .await?;
+        let (table_arc, fresh_count) =
+            self.get_or_create_cached(&self.custom_project_tables, table_key(project_id, table_name), &storage_uri, &storage_options, table_name).await?;
         if let Some(count) = fresh_count {
             info!("Cached custom table for project '{}' table '{}', cache now contains {} entries", project_id, table_name, count);
         }
@@ -7826,8 +7824,7 @@ impl ProjectRoutingTable {
     #[allow(clippy::too_many_arguments)]
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
-        include_files: Option<&HashSet<String>>, exclude_files: Option<&HashSet<String>>,
-        row_selections: Option<&HashMap<String, Vec<u64>>>,
+        include_files: Option<&HashSet<String>>, exclude_files: Option<&HashSet<String>>, row_selections: Option<&HashMap<String, Vec<u64>>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Extract project_id from filters for the provider cache key.
         // Falls back to table_name-only key if absent (multi-project queries).
@@ -8026,8 +8023,8 @@ impl ProjectRoutingTable {
     #[allow(clippy::too_many_arguments)]
     async fn scan_delta_with_tantivy(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>, id_filter: Option<&Expr>,
-        covered_files: Option<&HashSet<String>>, zero_hit_files: Option<&HashSet<String>>,
-        row_selections: Option<&HashMap<String, Vec<u64>>>, query_time_range: Option<(i64, i64)>,
+        covered_files: Option<&HashSet<String>>, zero_hit_files: Option<&HashSet<String>>, row_selections: Option<&HashMap<String, Vec<u64>>>,
+        query_time_range: Option<(i64, i64)>,
     ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
         let narrow = |filters: &[Expr]| filters.iter().cloned().chain(id_filter.cloned()).collect::<Vec<_>>();
         let Some(covered) = covered_files else {
@@ -8081,9 +8078,8 @@ impl ProjectRoutingTable {
     async fn scan_delta_only(
         &self, state: &dyn Session, projection: Option<&Vec<usize>>, optimized_filters: &[Expr], unstripped_filters: &[Expr], project_id: &str,
         query_time_range: Option<(i64, i64)>, dedup_keys: &[String], pre_skip_dedup: bool, tombstone: &Option<String>, orig_limit: Option<usize>,
-        limit: Option<usize>, readmit_mutable_filters: bool, tantivy_id_filter: Option<&Expr>,
-        tantivy_covered_files: Option<&HashSet<String>>, tantivy_exclude: Option<&HashSet<String>>,
-        tantivy_row_selections: Option<&HashMap<String, Vec<u64>>>,
+        limit: Option<usize>, readmit_mutable_filters: bool, tantivy_id_filter: Option<&Expr>, tantivy_covered_files: Option<&HashSet<String>>,
+        tantivy_exclude: Option<&HashSet<String>>, tantivy_row_selections: Option<&HashMap<String, Vec<u64>>>,
     ) -> DFResult<(bool, Vec<Arc<dyn ExecutionPlan>>)> {
         let mut delta_only_filters = optimized_filters.to_vec();
         let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
@@ -8265,8 +8261,7 @@ impl ProjectRoutingTable {
     /// runs above it. `None` for tables that append no versions.
     fn version_mutable_columns(table_name: &str) -> Option<HashSet<String>> {
         let schema = crate::schema::get_schema(table_name).filter(|s| s.version_append)?;
-        let immutable: HashSet<&str> =
-            schema.dedup_keys.iter().map(String::as_str).chain(schema.partitions.iter().map(String::as_str)).collect();
+        let immutable: HashSet<&str> = schema.dedup_keys.iter().map(String::as_str).chain(schema.partitions.iter().map(String::as_str)).collect();
         Some(schema.schema_ref().fields().iter().map(|f| f.name().clone()).filter(|n| !immutable.contains(n.as_str())).collect())
     }
 
@@ -10821,7 +10816,7 @@ mod tests {
             journal.enqueue(decoy, 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
         }
 
-        let report = db.run_unit_once("otel_logs_and_spans", &wanted, day, Operation::BaseRollup, 24).await?;
+        let report = db.run_unit_once("otel_logs_and_spans", &wanted, day, Operation::BaseRollup, 24, 0).await?;
         // THE assertion. Under the bug the runner claimed the decoy and the
         // requested key was left untouched at Pending — which is exactly what
         // prod reported for 28 of 100 targeted repair units, while the CLI's own
@@ -11294,7 +11289,10 @@ mod tests {
     #[test]
     fn maintenance_reconciliation_extracts_only_the_changed_partition() {
         let values = HashMap::from([("project_id".to_owned(), Some("customer-a".to_owned())), ("date".to_owned(), Some("2026-08-16".to_owned()))]);
-        assert_eq!(Database::maintenance_partition_from_action("ignored.parquet", Some(&values), "default"), Some(("customer-a".to_owned(), "2026-08-16".to_owned())));
+        assert_eq!(
+            Database::maintenance_partition_from_action("ignored.parquet", Some(&values), "default"),
+            Some(("customer-a".to_owned(), "2026-08-16".to_owned()))
+        );
 
         // Older writers may omit partitionValues on Remove. The file path is
         // still sufficient, so a delete cannot advance the cursor without

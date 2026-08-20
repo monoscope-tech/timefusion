@@ -9,80 +9,23 @@
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // jemalloc reads this symbol at startup — bakes the profiler config into the
-// binary so no MALLOC_CONF env (host is read-only) is needed. prof_active
-// samples live allocations; lg_prof_sample:19 = ~512KiB sampling (low
-// overhead); lg_prof_interval:35 auto-dumps a .heap every ~32GiB allocated so
-// the retained dump window spans the whole boot→OOM RSS climb (at :33 prod
-// churned ~80 dumps/min and rotation kept only the last minute — useless for
-// growth diffs, 2026-07-31);
+// binary so no MALLOC_CONF env (host is read-only) is needed.
 // prof_prefix points into the data-dir volume we can read off the host.
 // Analyze: `jeprof --svg <binary> <prof_prefix>.*.heap`.
 #[cfg(all(feature = "profiling", target_os = "linux"))]
 #[unsafe(export_name = "malloc_conf")]
-// background_thread + 1s dirty decay: without background threads jemalloc only
-// purges dirty pages on allocation events per-arena, so 4-8GB/min of write-path
-// churn retained ~2/3 of RSS as freed-but-unreturned pages (2026-07-29: 26GB
-// live heap vs 115GB RSS at the cgroup OOM kill).
-// `prof_active:false` since 2026-08-02: the attribution this was deployed for is
-// DONE (giant-INSERT parse ASTs, snapshot refresh, RowConverter — 2026-07-31), and
-// leaving sampling on costs CPU and heap on a box whose memory headroom is the
-// binding constraint on compaction: the maintenance brake fires at 70% of the
-// cgroup (84GB) and RSS oscillates 51-99GB, so every GB back is brake headroom.
-// `lg_prof_interval:35` also dumps a .heap file every 32GB allocated, onto the
-// same volume that has twice filled with maintenance spill.
+// `prof:true, prof_active:false`: sampling stays compiled in but off by default —
+// re-arm at runtime via the `prof.active` mallctl (no rebuild) when heap
+// attribution is next needed. lg_prof_sample:19 = ~512KiB sampling; keeping it
+// off saves CPU/heap on this box, whose memory headroom gates compaction.
 //
-// `prof:true` is KEPT so profiling can be re-armed at runtime via the
-// `prof.active` mallctl without a rebuild — flip this to `prof_active:true` (or
-// set it via mallctl) whenever heap attribution is needed again.
-//
-// Re-armed 2026-08-03: the OOMs did NOT stop after the 07-31 attribution fixes
-// (70 cgroup kills over 08-01/02, ~hourly under dashboard load) and the 00:45Z
-// kill was 125GB of pure anon — a regime the 07-31 dumps never covered. Flip
-// back to false once the current eater is named.
-// `dirty_decay_ms:10000` since 2026-08-18, from 0 — the A/B below asked for.
-//
-// decay 0 madvise(MADV_DONTNEED)s every freed page back to the kernel
-// immediately. The note below accepted that cost on the explicit premise that
-// "this box is IO-bound, not CPU-bound", and asked for a re-run under
-// maintenance load before raising it. This is that measurement: `perf record`
-// on the live process, 83,399 samples, 2026-08-18, with 23 of 48 cores busy on
-// maintenance threads:
-//
-//   5.41%  native_queued_spin_lock_slowpath   (mmap_lock / page-table locks)
-//   3.97%  clear_page_erms                    (re-faulting what we just freed)
-//   3.60%  smp_call_function_many_cond        (TLB shootdown IPIs, 48 cores)
-//   1.96%  flush_tlb_func
-//   1.36%  do_anonymous_page
-//   1.01%  __handle_mm_fault
-//
-// ~18% of all CPU in the fault/shootdown cycle decay 0 creates, and
-// `clear_page_erms` traces to `DeltaScanStream::poll_next` — Arrow scan buffers
-// freed and immediately re-faulted. The premise has inverted: the box IS
-// CPU-bound now, and the memory pressure that justified decay 0 is gone (RSS
-// 12.6 GB against a 120 GB cgroup, where 2026-08-03 was ~125 GB at the kill,
-// because the actual eaters were since named and fixed — unbounded query scans
-// and DedupExec charging whole parquet column chunks).
-//
-// 10s, not unbounded: long enough to reuse buffers across a scan, short enough
-// that idle memory still returns. The 85% maintenance brake remains the
-// backstop, and RSS is the metric to watch on rollback.
-//
-// `prof_active:false` again: it was re-armed 2026-08-03 to name "the current
-// eater", and that attribution is done. Sampling every 512 KB costs CPU on the
-// hottest allocation path in the process and had written 2.7 GB of dumps onto
-// the volume that has twice filled with maintenance spill. `prof:true` stays,
-// so it re-arms at runtime via the `prof.active` mallctl with no rebuild.
-//
-// HISTORICAL, the reasoning this replaces:
-// `dirty_decay_ms:0` since 2026-08-03: return freed dirty pages to the OS
-// IMMEDIATELY. Six cgroup OOM kills tonight at anon-rss ~125GB were, per the
-// 2026-07-31 attribution ratio (live 31GB vs RSS 82GB) and tonight's clean
-// A/B, dominated by freed-but-unreturned churn that decay=1000 never caught
-// up with (maintenance planning replays ~34k files' stats per query; Foyer
-// still copies every parquet range). With decay 0 + the dirty-bin drain
-// paused, RSS held ~30GB at 45min where every prior boot hit 60-100GB. The
-// madvise cost is real but this box is IO-bound, not CPU-bound; do NOT raise
-// this back without re-running that A/B under maintenance load.
+// `dirty_decay_ms:10000` (was 0): decay 0 madvise()s every freed page back to
+// the kernel immediately, which under maintenance load (2026-08-18 perf trace)
+// cost ~18% CPU in page-fault/TLB-shootdown churn from Arrow scan buffers being
+// freed and re-faulted. 10s amortizes that while still returning idle memory;
+// the 85% maintenance brake remains the OOM backstop. Don't drop this back to 0
+// without re-measuring under maintenance load — it was set there in 2026-08-03
+// to fight OOMs from since-fixed causes (unbounded scans, DedupExec).
 pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19,lg_prof_interval:35,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
 
 use std::sync::Arc;
@@ -101,68 +44,53 @@ use tracing::{error, info, warn};
 
 /// Stack size for every Tokio worker.
 ///
-/// Tokio's default is 2 MiB, and on 2026-08-16 that was not enough to plan a
-/// merge-on-read UPDATE: recursing over the wide otel schema joined against the
-/// key-pushdown IN-lists overflowed a worker mid-optimize, and a stack overflow
-/// aborts the *process*, not the task — production restart-looped on exit 134.
-/// Capping the pushdown (`dml::MOR_KEY_PUSHDOWN_ROWS`) shortens that recursion
-/// but cannot bound it, because plan depth also follows schema width and the
-/// shape of the user's predicate. This is the bound that does not depend on
-/// guessing how deep the deepest plan gets. Worker stacks are reserved lazily,
-/// so the untouched pages cost address space rather than RSS against the cgroup.
+/// Tokio's default (2 MiB) overflowed planning a merge-on-read UPDATE on
+/// 2026-08-16 (deep recursion over a wide schema + IN-list pushdown), which
+/// aborts the whole process, not just the task — prod restart-looped on exit
+/// 134. Plan depth follows schema width and predicate shape, not just pushdown
+/// size, so this bounds the stack directly rather than the recursion. Reserved
+/// lazily, so untouched pages cost address space, not RSS.
 const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
 // Planning depth follows schema width and predicate shape, not just the
 // pushdown cap, so keep real headroom over Tokio's 2 MiB default.
 const _: () = assert!(WORKER_STACK_BYTES >= 8 * 2 * 1024 * 1024);
 
 fn main() -> anyhow::Result<()> {
-    // Initialize environment before any threads spawn
     dotenv().ok();
-    // Before the runtime, so every worker thread and listener socket inherits
-    // the raised limit. `bootstrap()` calls it too, for the e2e harness — which
-    // does NOT go through main().
+    // Before the runtime, so every worker thread/listener inherits the raised
+    // limit. `bootstrap()` calls it too, for the e2e harness (skips main()).
     server::raise_file_limit();
 
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("healthcheck") {
         return run_pgwire_healthcheck();
     }
-    // CLI helper: `timefusion encrypt-secret <plaintext>` — prints ciphertext
-    // for use in `timefusion_projects` rows, then exits. Needs no config.
     if subcommand.as_deref() == Some("encrypt-secret") {
         return config::run_cli();
     }
-    // `timefusion sim <journal.json|data-dir>` — replays a prod maintenance
-    // journal through the real scheduler on virtual time. Pure and config-free:
-    // the whole point is answering scheduler questions WITHOUT a deploy, so it
-    // must not need a bucket, a config, or a running anything.
+    // Replays a prod maintenance journal through the real scheduler on virtual
+    // time — must stay config/bucket-free, that's what lets it answer
+    // scheduler questions without a deploy.
     if subcommand.as_deref() == Some("sim") {
         return run_sim_cli();
     }
 
-    // Maintenance CLIs get the maintenance-heavy budget shape (the server
-    // shape strands a small cgroup's memory in query/ingest slices a one-shot
-    // CLI never uses). Must precede init_config, which snapshots the tree.
+    // Maintenance CLIs get the maintenance-heavy budget shape (the server shape
+    // strands cgroup memory in query/ingest slices a one-shot CLI never uses).
+    // Must precede init_config, which snapshots the tree.
     //
-    // `run-unit` is deliberately NOT in this list. It runs a COORDINATOR unit —
-    // `run_unit_once` builds its session from `coordinator_runtime_env()`, whose
-    // pool is `coordinator_share_bytes()`, and that returns a hard 0 under
-    // `MaintenanceCli` ("the CLI drives engines directly; no coordinator runs").
-    // So the one profile it was given zeroed the only pool it uses, and every
-    // invocation died in the aggregate with `pool_size: 0.0 B` before reading a
-    // row. Found 2026-08-20 trying to repair rollup tiers with it.
+    // `run-unit` excluded: it drives a coordinator unit whose pool comes from
+    // `coordinator_share_bytes()`, which is a hard 0 under this profile
+    // ("no coordinator runs under MaintenanceCli") — every invocation died at
+    // `pool_size: 0.0 B`. Found 2026-08-20.
     //
     // SAFETY: no threads exist yet - we're before the Tokio runtime is built.
     if matches!(subcommand.as_deref(), Some("optimize" | "redrive-dml" | "migrate-columns")) {
         unsafe { std::env::set_var("TIMEFUSION_BUDGET_PROFILE", "maintenance-cli") };
     }
 
-    // Initialize global config from environment - validates all settings upfront
     let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
 
-    // (No WALRUS_DATA_DIR here any more: `WalManager` passes `cfg.core.wal_dir()`
-    // to `Walrus::with_root`, so the WAL location is a parameter rather than a
-    // process-global. Same on-disk path, minus the global.)
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(WORKER_STACK_BYTES).build()?;
     match subcommand.as_deref() {
         Some("redrive-dml") => rt.block_on(run_redrive_dml_cli(cfg)),
@@ -171,12 +99,10 @@ fn main() -> anyhow::Result<()> {
         Some("run-unit") => rt.block_on(run_unit_cli(cfg)),
         _ => {
             let result = rt.block_on(async_main(cfg));
-            // The server path must END THE PROCESS here: dropping the runtime
-            // waits on lingering blocking/detached threads, and twice on
-            // 2026-08-06 that hang left a post-"Shutdown complete." zombie
-            // container that blocked swarm from starting the replacement
-            // (pgwire outage until a manual `docker stop`). Everything durable
-            // is already on disk by now, so skip teardown and exit.
+            // Must END THE PROCESS here: dropping the runtime waits on
+            // lingering blocking/detached threads, and that hang left a
+            // zombie container blocking swarm's replacement (2026-08-06
+            // pgwire outage). Everything durable is already on disk.
             match result {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
@@ -357,7 +283,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
 }
 
 /// `timefusion run-unit --project ID [--source TABLE] [--date YYYY-MM-DD]
-/// [--op base|derived|dedup|hot|sealed|repair] [--slice-hours N]`
+/// [--op base|derived|dedup|hot|sealed|repair] [--slice-hours N] [--offset-hours N]`
 ///
 /// Execute ONE maintenance unit against the configured storage and print where
 /// its time went (scan/stage/commit/end-to-end deltas + wall). The per-unit
@@ -371,6 +297,7 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut date: Option<chrono::NaiveDate> = None;
     let mut operation = timefusion::maintenance_coordinator::Operation::BaseRollup;
     let mut slice_hours: i64 = 24;
+    let mut offset_hours: i64 = 0;
     let mut it = std::env::args().skip(2);
     while let Some(a) = it.next() {
         let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
@@ -379,6 +306,7 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
             "--project" => project = Some(value("--project")?),
             "--date" => date = Some(value("--date")?.parse().context("--date must be YYYY-MM-DD")?),
             "--slice-hours" => slice_hours = value("--slice-hours")?.parse().context("--slice-hours must be an integer")?,
+            "--offset-hours" => offset_hours = value("--offset-hours")?.parse().context("--offset-hours must be an integer")?,
             "--op" => {
                 operation = match value("--op")?.as_str() {
                     "base" => timefusion::maintenance_coordinator::Operation::BaseRollup,
@@ -390,13 +318,15 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
                     other => anyhow::bail!("unknown --op {other}: base|derived|dedup|hot|sealed|repair"),
                 }
             }
-            other => anyhow::bail!("unknown argument: {other} (usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N])"),
+            other => anyhow::bail!(
+                "unknown argument: {other} (usage: timefusion run-unit --project ID [--source T] [--date D] [--op OP] [--slice-hours N] [--offset-hours N])"
+            ),
         }
     }
     let project = project.context("--project is required")?;
     let date = date.unwrap_or_else(|| support::today_utc() - chrono::Duration::days(1));
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
-    let report = db.run_unit_once(&source, &project, date, operation, slice_hours).await?;
+    let report = db.run_unit_once(&source, &project, date, operation, slice_hours, offset_hours).await?;
     println!("{report}");
     Ok(())
 }
@@ -888,27 +818,17 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One-off compaction CLI (`timefusion optimize [...]`). Compacts old `date=`
-/// partitions — those outside the scheduled 48h Z-order window that the periodic
-/// job never reaches — using `Database::compact_date` per partition. Intended to
-/// run off-box against prod storage so it doesn't load the live server's memory —
-/// it commits via the same S3/R2 conditional-put (If-None-Match) coordination as the
-/// live server, so concurrent commits conflict-detect safely (OCC retry).
-/// Evolve a live table's STORED Delta schema to include new nullable columns,
-/// WITHOUT changing any YAML.
+/// Adds nullable columns to a live table's STORED Delta schema, without
+/// touching the YAML.
 ///
-/// This exists because a shipped table cannot gain a column by editing the YAML
-/// alone. The YAML is only one of two schemas; the other lives in each Delta
-/// table's transaction log and is whatever was there at creation. Editing the
-/// YAML makes the write path build wider batches while storage still declares
-/// the old shape, which is how 7d68f01 produced `number of columns(94) must
-/// match number of fields(92)`, 268 flush failures and rejected INSERTs within
-/// minutes of deploy. See the doc block at the top of `schema_loader.rs`.
+/// A shipped table can't gain a column via YAML alone — the YAML and the
+/// Delta transaction log are two separate schemas, and a mismatch produces
+/// batch/field count errors and rejected INSERTs (see 7d68f01, and the doc
+/// block atop `schema_loader.rs`). Run this against prod first; only once
+/// every live table has the columns may the YAML declare them.
 ///
-/// Run this against prod FIRST; only once every live table carries the columns
-/// may the YAML declare them. It writes a ZERO-ROW batch at the widened schema
-/// with `SchemaMode::Merge`, so it adds metadata and no data, and re-running it
-/// is a no-op.
+/// Writes a ZERO-ROW batch at the widened schema (`SchemaMode::Merge`), so
+/// it's metadata-only and idempotent.
 ///
 ///   timefusion migrate-columns --table otel_logs_and_spans \
 ///       --add updated_at:timestamp --add deleted:boolean [--dry-run]
@@ -945,6 +865,11 @@ async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// One-off compaction CLI (`timefusion optimize [...]`): compacts old `date=`
+/// partitions outside the scheduled 48h Z-order window via `Database::compact_date`
+/// per partition. Meant to run off-box against prod storage so it doesn't load
+/// the live server's memory; commits use the same S3/R2 conditional-put
+/// coordination as the live server, so concurrent commits OCC-retry safely.
 async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
 
@@ -1018,7 +943,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // --dry-run: list candidate partitions + file counts, mutate nothing.
     if dry_run {
-        let uris: Vec<String> = table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+        let uris: Vec<String> = timefusion::database::file_uris(&*table_ref.read().await);
         println!("DRY RUN — {} candidate partition(s) of '{}' ({}):", dates.len(), table, scope);
         let pid_frag = project.as_deref().map_or(String::new(), |p| format!("project_id={p}/"));
         let total: usize = dates

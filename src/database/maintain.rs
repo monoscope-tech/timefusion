@@ -1106,6 +1106,7 @@ impl Database {
     /// hold no other claimable work, or the coordinator may claim that first.
     pub async fn run_unit_once(
         &self, source: &str, project_id: &str, date: chrono::NaiveDate, operation: crate::maintenance_coordinator::Operation, slice_hours: i64,
+        offset_hours: i64,
     ) -> Result<UnitRunReport> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, MaintenanceTask, Operation, TaskKey, TaskState, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
@@ -1122,7 +1123,13 @@ impl Database {
             _ => source.to_owned(),
         };
         let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid date {date}"))?.and_utc().timestamp_micros();
-        let slice = TimeSlice::new(day_start, day_start.saturating_add(slice_hours.saturating_mul(3_600_000_000)))?;
+        // Offset from midnight, so a day can be TILED. Without it every slice
+        // starts at 00:00 and successive widths merely replace one another —
+        // there is no way to publish 18:00-24:00 at all, and a tenant whose day
+        // exceeds MAX_DECODED_BYTES has no day-wide slice either, so the late
+        // hours of such a day were unreachable by any invocation.
+        let start = day_start.saturating_add(offset_hours.saturating_mul(3_600_000_000));
+        let slice = TimeSlice::new(start, start.saturating_add(slice_hours.saturating_mul(3_600_000_000)))?;
         let key = TaskKey { physical_table, source: source.to_owned(), project_id: project_id.to_owned(), slice, operation };
         let now = crate::support::now_micros();
         {
