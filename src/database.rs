@@ -15724,8 +15724,7 @@ const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
 /// inputs sharing every tag, and the merged output keeping all six.
 fn carried_coverage_tags(targets: &[deltalake::kernel::Add]) -> HashMap<String, String> {
     use crate::maintenance_coordinator::{
-        TAG_GENERATION, TAG_MERGED_SLICES, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT, encode_merged_slices,
-        file_slices,
+        TAG_GENERATION, TAG_MERGED_SLICES, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT, encode_merged_slices, file_slices,
     };
     const IDENTITY_TAGS: [&str; 4] = [TAG_SOURCE, TAG_PROJECT, TAG_SOURCE_FINGERPRINT, TAG_GENERATION];
     let Some(first) = targets.first() else { return HashMap::new() };
@@ -15734,8 +15733,7 @@ fn carried_coverage_tags(targets: &[deltalake::kernel::Add]) -> HashMap<String, 
         let expected = value(first, tag)?;
         targets.iter().all(|add| value(add, tag).as_deref() == Some(expected.as_str())).then_some(expected)
     };
-    let Some(mut carried) = IDENTITY_TAGS.into_iter().map(|tag| agreed(tag).map(|found| (tag.to_owned(), found))).collect::<Option<HashMap<_, _>>>()
-    else {
+    let Some(mut carried) = IDENTITY_TAGS.into_iter().map(|tag| agreed(tag).map(|found| (tag.to_owned(), found))).collect::<Option<HashMap<_, _>>>() else {
         return HashMap::new();
     };
     if let (Some(start), Some(end)) = (agreed(TAG_SLICE_START), agreed(TAG_SLICE_END)) {
@@ -19543,7 +19541,9 @@ mod tests {
     /// the coverage the tier exists to prove.
     #[test]
     fn a_rewrite_carries_coverage_identity_only_when_every_input_agrees() {
-        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_MERGED_SLICES, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
+        use crate::maintenance_coordinator::{
+            TAG_GENERATION, TAG_MERGED_SLICES, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT,
+        };
         let add = |slice_start: &str, generation: &str| {
             let mut a = deltalake::kernel::Add {
                 path: format!("f{slice_start}.parquet"),
