@@ -2761,3 +2761,76 @@ plausible, code-grounded, and would have been a large simplification. It was als
 wrong, and one grep for "who writes this map, who reads it" settled it before any
 code existed. *The cheap step is enumerating writers and readers; the expensive
 step is discovering the asymmetry after shipping.*
+
+---
+
+## Part XV — tier consolidation: step 1 on a branch, step 2 specified
+
+Branch `fix/tier-merge-slice-set`, **not merged**. Step 1 is behaviour-preserving:
+tiers are still excluded from compaction, so nothing yet merges differing slices.
+
+### Step 1 (done, tested)
+
+`carried_coverage_tags` now separates the two kinds of tag it was conflating:
+
+- the four **identity** tags (source, project, fingerprint, generation) carry
+  only on full agreement, exactly as before — disagreement means the inputs are
+  not one publication and nothing is carried;
+- the **slice bounds** may differ, and when they do the output carries a SET
+  (`TAG_MERGED_SLICES`, canonical `start:end` pairs) instead of nothing.
+
+`recover_rollup_coverage` expands the set into one coverage entry per original
+slice, each still matched EXACTLY — so `rollup_slice_complete` is untouched and
+no coverage depends on a `publication` surviving, which is the trap Part XIV
+found. A span was never an option: it claims the gap, and recovery would discard
+it anyway.
+
+Checked before committing: `coverage.rows` is read by a single `debug!` and by no
+decision, so a merged file's inability to attribute rows per slice costs nothing.
+
+The codec is canonical (sorted, deduped) so re-merging is idempotent; malformed
+and inverted pairs are dropped rather than guessed; one unprovable input aborts
+the whole carry, because a partial set is a silent hole rather than a visible
+absence. 812 lib tests pass, `cargo lint` clean.
+
+### Step 2 (specified, NOT written)
+
+Admit tiers to `plan_compaction_debt` and group candidates by tag identity.
+
+**The grouping key is simpler than expected.** `generation_id` hashes
+`(spec, source, project_id, date)` and **ignores `source_fp`** despite taking it
+as a parameter, so generation is CONSTANT within one tier partition. Source and
+project are fixed by the partition. The key therefore collapses to one field:
+
+> within a tier's `(project_id, date)` partition, merge only files that share
+> `timefusion.source_fingerprint`.
+
+A rebuilt day is the only thing that puts two fingerprints in one partition, and
+those must not merge — the ticket re-check distinguishes their coverage entries
+by exactly that field.
+
+**Untagged files must be excluded from every group.** A tier partition can hold
+untagged files (79 on the 1 m tier for 08-19). Merging one into a tagged group
+makes `carried_coverage_tags` abort and emit an untagged output, converting
+proven coverage into none. They may only merge with each other, or be left alone
+— and a known separate hazard is that an untagged tier file cannot be removed by
+the replace-set at all, so leaving them alone is the safe default until that is
+resolved.
+
+**Risk, stated plainly.** This adds work to `plan_compaction_debt`, the same
+scheduling path that wedged the maintenance tier tonight. It wants a kill switch,
+one tenant first, and a verdict taken from a second sample at least one full cron
+period after deploy — not from the first reading. That is the lesson of Part XIII
+and it cost a production incident to learn.
+
+### Where this sits against the goal
+
+| component | status |
+| --- | --- |
+| rollups up to date | DONE — 30 d contiguity, `min = median = 30` |
+| rollups always used | DONE — 91.5 % routing hit rate |
+| dashboards ~1 s | NOT MET — 4.5-8.4 s on the tier; step 2 is the lever |
+| duplicates removed | NOT MET — drain reverted, queue ~11 k and growing |
+
+The last row is the other open front: the Part XIII diagnosis is correct and its
+fix is reverted, waiting on resumable staging and its own budget.
