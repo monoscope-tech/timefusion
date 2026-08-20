@@ -1164,6 +1164,18 @@ where
     });
 }
 
+/// `spawn_cron_job` for the common "clone `db`, run an async method on it" shape — owns
+/// both the per-tick and per-run clone so call sites write `|db| async move { .. }` once
+/// instead of `{ let db = db.clone(); move || { let db = db.clone(); async move { .. } } }`.
+fn spawn_db_cron<F, Fut>(db: &Arc<Database>, name: &'static str, schedule: &str, cancel: Arc<CancellationToken>, job: F)
+where
+    F: Fn(Arc<Database>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let db = Arc::clone(db);
+    spawn_cron_job(name, schedule, cancel, move || job(Arc::clone(&db)));
+}
+
 /// On-disk key for the WAL watermark stored in `commitInfo.info`. Constant so
 /// the writer (this file) and reader (`derive_wal_cursor_for_table`) can't
 /// drift, and the roundtrip test below pins the format.
@@ -3980,29 +3992,23 @@ impl Database {
             // bounded by the wave engine's OWN light_rewrite_sem (+ the light pool
             // slice it is sized from), never the heavy maintenance_rewrite_sem:
             // sharing that one re-couples the two engines (prod 2026-07-30).
-            spawn_cron_job("Hot compact", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
-                let db = db.clone();
-                move || {
-                    let db = db.clone();
-                    async move {
-                        if !db.config.maintenance.timefusion_light_optimize_enabled {
-                            return;
-                        }
-                        info!("Running scheduled hot-tail compaction on today's small files");
-                        db.run_hot_compact_sweep(TailPass::Pack).await;
-                        // Hot compaction only ever touches TODAY's partition, so a
-                        // sealed day the daily cold sweep failed to finish stays
-                        // fragmented forever. Piggy-back a bounded catch-up slice on
-                        // this tick, which actually runs often enough to converge.
-                        let passes = db.config.maintenance.timefusion_consolidate_catchup_passes;
-                        for (_, table_name, table) in db.all_tables().await {
-                            if db.maintenance_shutdown.is_cancelled() || passes == 0 {
-                                return;
-                            }
-                            if let Err(e) = db.consolidate_catchup(&table, &table_name, passes).await {
-                                warn!("consolidate-catchup failed for '{}': {}", table_name, e);
-                            }
-                        }
+            spawn_db_cron(&db, "Hot compact", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), |db| async move {
+                if !db.config.maintenance.timefusion_light_optimize_enabled {
+                    return;
+                }
+                info!("Running scheduled hot-tail compaction on today's small files");
+                db.run_hot_compact_sweep(TailPass::Pack).await;
+                // Hot compaction only ever touches TODAY's partition, so a
+                // sealed day the daily cold sweep failed to finish stays
+                // fragmented forever. Piggy-back a bounded catch-up slice on
+                // this tick, which actually runs often enough to converge.
+                let passes = db.config.maintenance.timefusion_consolidate_catchup_passes;
+                for (_, table_name, table) in db.all_tables().await {
+                    if db.maintenance_shutdown.is_cancelled() || passes == 0 {
+                        return;
+                    }
+                    if let Err(e) = db.consolidate_catchup(&table, &table_name, passes).await {
+                        warn!("consolidate-catchup failed for '{}': {}", table_name, e);
                     }
                 }
             });
@@ -4147,20 +4153,14 @@ impl Database {
         if !COORDINATOR_OWNS_SLICE_MAINTENANCE {
             // Kept only as a migration fallback. The coordinator plans the same
             // packing debt by snapshot and must be its sole writer once active.
-            spawn_cron_job("Optimize", &self.config.maintenance.timefusion_optimize_schedule, cancel.clone(), {
-                let db = db.clone();
-                move || {
-                    let db = db.clone();
-                    async move {
-                        let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
-                            return;
-                        };
-                        info!("Running scheduled optimize on all tables");
-                        for (project_id, table_name, table) in db.all_tables().await {
-                            if let Err(e) = db.optimize_table(&table, &table_name, None).await {
-                                error!("Optimize failed for {}: {}", Self::table_label(&project_id, &table_name), e);
-                            }
-                        }
+            spawn_db_cron(&db, "Optimize", &self.config.maintenance.timefusion_optimize_schedule, cancel.clone(), |db| async move {
+                let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
+                    return;
+                };
+                info!("Running scheduled optimize on all tables");
+                for (project_id, table_name, table) in db.all_tables().await {
+                    if let Err(e) = db.optimize_table(&table, &table_name, None).await {
+                        error!("Optimize failed for {}: {}", Self::table_label(&project_id, &table_name), e);
                     }
                 }
             });
@@ -4169,18 +4169,12 @@ impl Database {
         if !COORDINATOR_OWNS_SLICE_MAINTENANCE {
             // Consolidate — daily cold sweep bin-packing sealed partitions (older than
             // cold_optimize_after_days) to the 512MB cold target, beyond the 48h warm window.
-            spawn_cron_job("Consolidate", &self.config.maintenance.timefusion_consolidate_schedule, cancel.clone(), {
-                let db = db.clone();
-                move || {
-                    let db = db.clone();
-                    async move {
-                        info!("Running scheduled cold consolidation on sealed partitions");
-                        let targets = db.all_maintenance_targets().await;
-                        for (name, table) in &targets {
-                            if let Err(e) = db.consolidate_sealed_partitions(table, name).await {
-                                error!("Consolidate (cold tier) failed for '{}': {}", name, e);
-                            }
-                        }
+            spawn_db_cron(&db, "Consolidate", &self.config.maintenance.timefusion_consolidate_schedule, cancel.clone(), |db| async move {
+                info!("Running scheduled cold consolidation on sealed partitions");
+                let targets = db.all_maintenance_targets().await;
+                for (name, table) in &targets {
+                    if let Err(e) = db.consolidate_sealed_partitions(table, name).await {
+                        error!("Consolidate (cold tier) failed for '{}': {}", name, e);
                     }
                 }
             });
@@ -4193,18 +4187,12 @@ impl Database {
         // Cold sweep upper bound — older partitions fall under vacuum.
         let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
         if !COORDINATOR_OWNS_SLICE_MAINTENANCE {
-            spawn_cron_job("Recompress", &self.config.maintenance.timefusion_recompress_schedule, cancel.clone(), {
-                let db = db.clone();
-                move || {
-                    let db = db.clone();
-                    async move {
-                        info!("Running scheduled tier recompression (warm→cold@{}d zstd={})", cold_cutoff, zstd_cold);
-                        let targets = db.all_maintenance_targets().await;
-                        for (name, table) in &targets {
-                            if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
-                                error!("Recompress (cold tier) failed for '{}': {}", name, e);
-                            }
-                        }
+            spawn_db_cron(&db, "Recompress", &self.config.maintenance.timefusion_recompress_schedule, cancel.clone(), move |db| async move {
+                info!("Running scheduled tier recompression (warm→cold@{}d zstd={})", cold_cutoff, zstd_cold);
+                let targets = db.all_maintenance_targets().await;
+                for (name, table) in &targets {
+                    if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
+                        error!("Recompress (cold tier) failed for '{}': {}", name, e);
                     }
                 }
             });
@@ -4212,17 +4200,11 @@ impl Database {
 
         // Vacuum — expired-file removal (default: daily at 2AM).
         let vacuum_retention = self.config.maintenance.timefusion_vacuum_retention_hours;
-        spawn_cron_job("Vacuum", &self.config.maintenance.timefusion_vacuum_schedule, cancel.clone(), {
-            let db = db.clone();
-            move || {
-                let db = db.clone();
-                async move {
-                    info!("Running scheduled vacuum on all tables");
-                    for (project_id, table_name, table) in db.all_tables().await {
-                        info!("Vacuuming {} (retention: {}h)", Self::table_label(&project_id, &table_name), vacuum_retention);
-                        db.vacuum_table(&project_id, &table_name, &table, vacuum_retention).await;
-                    }
-                }
+        spawn_db_cron(&db, "Vacuum", &self.config.maintenance.timefusion_vacuum_schedule, cancel.clone(), move |db| async move {
+            info!("Running scheduled vacuum on all tables");
+            for (project_id, table_name, table) in db.all_tables().await {
+                info!("Vacuuming {} (retention: {}h)", Self::table_label(&project_id, &table_name), vacuum_retention);
+                db.vacuum_table(&project_id, &table_name, &table, vacuum_retention).await;
             }
         });
 
@@ -4232,21 +4214,15 @@ impl Database {
         // across every per-uuid manifest. Gated at tick time: the indexer is
         // attached after construction, and may be absent entirely (no indexed
         // tables / no bucket).
-        spawn_cron_job("Tantivy reconcile", &self.config.maintenance.timefusion_tantivy_reconcile_schedule, cancel.clone(), {
-            let db = db.clone();
-            move || {
-                let db = db.clone();
-                async move {
-                    let Some(svc) = db.tantivy_indexer().cloned() else { return };
-                    for table_name in svc.config.indexed_tables() {
-                        match db.tantivy_reconcile_table(&table_name).await {
-                            Ok((0, 0, 0)) => {}
-                            Ok((built, removed, blobs)) => {
-                                info!("tantivy nightly reconcile: table={} built={} entries_removed={} blobs_deleted={}", table_name, built, removed, blobs);
-                            }
-                            Err(e) => warn!("tantivy nightly reconcile failed for {}: {}", table_name, e),
-                        }
+        spawn_db_cron(&db, "Tantivy reconcile", &self.config.maintenance.timefusion_tantivy_reconcile_schedule, cancel.clone(), |db| async move {
+            let Some(svc) = db.tantivy_indexer().cloned() else { return };
+            for table_name in svc.config.indexed_tables() {
+                match db.tantivy_reconcile_table(&table_name).await {
+                    Ok((0, 0, 0)) => {}
+                    Ok((built, removed, blobs)) => {
+                        info!("tantivy nightly reconcile: table={} built={} entries_removed={} blobs_deleted={}", table_name, built, removed, blobs);
                     }
+                    Err(e) => warn!("tantivy nightly reconcile failed for {}: {}", table_name, e),
                 }
             }
         });
@@ -4256,86 +4232,60 @@ impl Database {
         // entries and object-store blobs, but never the local extraction, and
         // that tree shares a volume with the WAL. Uses the search service (the
         // reader, which owns the cache), not the indexer.
-        spawn_cron_job("Tantivy cache reap", &self.config.tantivy.timefusion_tantivy_cache_reap_schedule, cancel.clone(), {
-            let db = db.clone();
-            move || {
-                let db = db.clone();
-                async move {
-                    let Some(svc) = db.tantivy_search().cloned() else { return };
-                    let budget = db.config.tantivy.cache_disk_bytes();
-                    // Walks the whole cache tree and unlinks — never on the runtime's worker threads.
-                    let Ok(report) = tokio::task::spawn_blocking(move || svc.reap_disk_cache(budget)).await else { return };
-                    crate::observability::record_tantivy_cache_bytes(report.bytes_before - report.bytes_removed);
-                    if report.dirs_removed > 0 || report.errors > 0 {
-                        info!(
-                            "tantivy cache reap: scanned={} before={}MB removed={} freed={}MB errors={} budget={}MB",
-                            report.dirs_scanned,
-                            report.bytes_before / 1024 / 1024,
-                            report.dirs_removed,
-                            report.bytes_removed / 1024 / 1024,
-                            report.errors,
-                            budget / 1024 / 1024
-                        );
-                    }
-                }
+        spawn_db_cron(&db, "Tantivy cache reap", &self.config.tantivy.timefusion_tantivy_cache_reap_schedule, cancel.clone(), |db| async move {
+            let Some(svc) = db.tantivy_search().cloned() else { return };
+            let budget = db.config.tantivy.cache_disk_bytes();
+            // Walks the whole cache tree and unlinks — never on the runtime's worker threads.
+            let Ok(report) = tokio::task::spawn_blocking(move || svc.reap_disk_cache(budget)).await else { return };
+            crate::observability::record_tantivy_cache_bytes(report.bytes_before - report.bytes_removed);
+            if report.dirs_removed > 0 || report.errors > 0 {
+                info!(
+                    "tantivy cache reap: scanned={} before={}MB removed={} freed={}MB errors={} budget={}MB",
+                    report.dirs_scanned,
+                    report.bytes_before / 1024 / 1024,
+                    report.dirs_removed,
+                    report.bytes_removed / 1024 / 1024,
+                    report.errors,
+                    budget / 1024 / 1024
+                );
             }
         });
 
         // Checkpoint + expired-log cleanup — runs the post-commit hooks out-of-band
         // (see the 2026-07-09 incident) so R2 500s on the checkpoint PUT / bulk log
         // delete never fail a landed commit; faster cadence keeps the log bounded.
-        spawn_cron_job("Checkpoint", &self.config.maintenance.timefusion_checkpoint_schedule, cancel.clone(), {
-            let db = db.clone();
-            move || {
-                let db = db.clone();
-                async move { db.run_checkpoint_maintenance().await }
-            }
+        spawn_db_cron(&db, "Checkpoint", &self.config.maintenance.timefusion_checkpoint_schedule, cancel.clone(), |db| async move {
+            db.run_checkpoint_maintenance().await
         });
 
         // Reconcile — repair dangling Add entries (committed parquet deleted by a
         // past commit-path failure) by Remove'ing them via filesystem_check.
-        spawn_cron_job("Reconcile", &self.config.maintenance.timefusion_reconcile_schedule, cancel.clone(), {
-            let db = db.clone();
-            move || {
-                let db = db.clone();
-                async move { db.run_reconcile_maintenance().await }
-            }
+        spawn_db_cron(&db, "Reconcile", &self.config.maintenance.timefusion_reconcile_schedule, cancel.clone(), |db| async move {
+            db.run_reconcile_maintenance().await
         });
 
         // Cache stats — every 5 minutes.
-        spawn_cron_job("Cache stats", "0 */5 * * * *", cancel.clone(), {
-            let db = db.clone();
-            move || {
-                let db = db.clone();
-                async move {
-                    if let Some(ref cache) = db.object_store_cache {
-                        cache.log_stats().await;
-                    }
-                    let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
-                    info!("Statistics cache: {}/{} entries used", used, capacity);
-                }
+        spawn_db_cron(&db, "Cache stats", "0 */5 * * * *", cancel.clone(), |db| async move {
+            if let Some(ref cache) = db.object_store_cache {
+                cache.log_stats().await;
             }
+            let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
+            info!("Statistics cache: {}/{} entries used", used, capacity);
         });
 
         // Statistics refresh — every 15 minutes.
-        spawn_cron_job("Statistics refresh", "0 */15 * * * *", cancel.clone(), {
-            let db = db.clone();
-            move || {
-                let db = db.clone();
-                async move {
-                    info!("Refreshing Delta Lake statistics cache");
-                    db.statistics_extractor.clear_cache().await;
-                    // Unified tables pre-warm under an empty project_id — they're shared.
-                    for (project_id, table_name, table) in db.all_tables().await {
-                        let label = Self::table_label(&project_id, &table_name);
-                        let table = table.read().await;
-                        let current_version = table.version().unwrap_or(0);
-                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, &project_id, &table_name).await {
-                            error!("Failed to refresh statistics for {}: {}", label, e);
-                        } else {
-                            debug!("Refreshed statistics for {} (version {})", label, current_version);
-                        }
-                    }
+        spawn_db_cron(&db, "Statistics refresh", "0 */15 * * * *", cancel.clone(), |db| async move {
+            info!("Refreshing Delta Lake statistics cache");
+            db.statistics_extractor.clear_cache().await;
+            // Unified tables pre-warm under an empty project_id — they're shared.
+            for (project_id, table_name, table) in db.all_tables().await {
+                let label = Self::table_label(&project_id, &table_name);
+                let table = table.read().await;
+                let current_version = table.version().unwrap_or(0);
+                if let Err(e) = db.statistics_extractor.extract_statistics(&table, &project_id, &table_name).await {
+                    error!("Failed to refresh statistics for {}: {}", label, e);
+                } else {
+                    debug!("Refreshed statistics for {} (version {})", label, current_version);
                 }
             }
         });
