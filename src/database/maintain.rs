@@ -1457,6 +1457,25 @@ impl Database {
         let provider = Self::narrow_provider(log_store, snapshot, selected, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
         const RAW: &str = "__maintenance_slice_raw";
         ctx.register_table(RAW, provider)?;
+        // The schema of whatever is registered as RAW — which is NOT `source_schema`
+        // for a derived tier. A derived rollup reads the BASE TIER, and that tier is
+        // merge-on-read: a rebuilt bucket appends a new version rather than replacing
+        // the old one, so several rows share an `id` and differ only by `updated_at`.
+        //
+        // This branch used to be `if derived || …` — derived tiers read their source
+        // with a bare `SELECT *` and no dedup, on the assumption that a rollup tier
+        // already holds one row per bucket. It does not, and the derived aggregate
+        // SUMs every superseded version. Prod 2026-08-20, project 98fdd4f3, hour
+        // 08-18 10:00: the 1m tier held 2,453 rows for 342 distinct ids (7.17
+        // versions each) and the 1h tier that reads it reported 157,110 requests
+        // where the truth was 31,018 — every measure inflated by the SAME factor,
+        // which is the fingerprint of summing versions rather than rows. A day whose
+        // base tier had been compacted to one version per id (08-13) was exact, so
+        // the error tracks version multiplicity at build time and is FROZEN into the
+        // tier: unlike a raw-side over-count it never self-heals, it only goes away
+        // when that day is rebuilt.
+        let input_schema = if derived { get_schema(&from).unwrap_or(source_schema) } else { source_schema };
+        let tier_dedup = derived.then(|| crate::rollup::rollup_tier_dedup(input_schema)).flatten();
         let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp);
         let target_schema = get_schema(&key.physical_table).ok_or_else(|| anyhow::anyhow!("rollup target schema missing"))?;
         let mut shard_keys = if derived {
@@ -1486,31 +1505,25 @@ impl Database {
                 let upper = if hi < MAINTENANCE_SLICE_BUCKETS { format!(" AND {shard_hash} < {hi}") } else { String::new() };
                 format!(" AND {shard_hash} >= {lo}{upper}")
             };
-            let input_sql = if derived || source_schema.dedup_keys.is_empty() {
-                format!(
-                    "SELECT * FROM {RAW} WHERE project_id = '{}' AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}){shard_predicate}",
-                    key.project_id.replace('\'', "''"),
-                    key.slice.start_micros,
-                    key.slice.end_micros
-                )
-            } else {
-                let columns = source_schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
-                let keys = source_schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
-                let order =
-                    source_schema.dedup_tiebreak.as_ref().map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", crate::rollup::quoted(field)));
-                let tombstone = source_schema
-                    .tombstone_column
-                    .as_ref()
-                    .map_or_else(String::new, |field| format!(" AND COALESCE({}, false) = false", crate::rollup::quoted(field)));
-                format!(
-                    "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn FROM {RAW} \
-                     WHERE project_id = '{}' AND timestamp >= to_timestamp_micros({}) AND timestamp < to_timestamp_micros({}){shard_predicate}) \
-                     WHERE __tf_rn = 1{tombstone}",
-                    key.project_id.replace('\'', "''"),
-                    key.slice.start_micros,
-                    key.slice.end_micros
-                )
+            let dedup = match (&tier_dedup, derived) {
+                (Some((keys, tiebreak, tombstone)), _) => Some(crate::rollup::SliceDedup { keys, tiebreak: Some(tiebreak), tombstone: *tombstone }),
+                // A derived tier whose schema lacks the identity columns has no
+                // safe collapse; a base slice uses its raw source's own keys.
+                (None, true) => None,
+                (None, false) => Some(crate::rollup::SliceDedup {
+                    keys: &source_schema.dedup_keys,
+                    tiebreak: source_schema.dedup_tiebreak.as_deref(),
+                    tombstone: source_schema.tombstone_column.as_deref(),
+                }),
             };
+            let input_sql = crate::rollup::slice_input_sql(
+                input_schema,
+                dedup,
+                RAW,
+                &key.project_id,
+                (key.slice.start_micros, key.slice.end_micros),
+                &shard_predicate,
+            );
             let frame = ctx.sql(&input_sql).await?;
             ctx.register_table(&input, Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input_sql))))?;
             let aggregate_sql = crate::rollup::build_cohort_sql_range_mode(
@@ -2503,6 +2516,20 @@ impl Database {
     pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> DedupSkipVerdict {
         let Some(dates) = window_dates(lo, hi) else { return DedupSkipVerdict::NoWindow };
         let mut verdict = DedupSkipVerdict::Granted;
+        // Did any partition actually produce evidence? `Granted` is the loop's
+        // seed, and every `continue` below leaves it untouched — so a window in
+        // which EVERY date is skipped (no Delta files under this project's key)
+        // used to return `Granted` having certified nothing. That is granting a
+        // "provably duplicate-free" verdict from an absence of evidence, and the
+        // skip it authorises removes DedupExec from the whole scan, not just the
+        // Delta leg: the MemBuffer and hot-tier legs are unioned in and can hold
+        // superseded merge-on-read versions of their own. A `count(*)` over such
+        // a window then reports physical rows.
+        //
+        // Declining costs a fast path on a window that has no Delta files to
+        // read anyway. Granting wrongly over-counts, silently, on every
+        // dashboard tile — so the default must be to decline.
+        let mut certified_any = false;
         for date in dates {
             let Ok(mut by_pid) = Self::partition_files_by_pid(table, &format!("date={date}")) else { return DedupSkipVerdict::Unresolved };
             // The sweep keys custom-project tables (no project_id= path
@@ -2518,7 +2545,10 @@ impl Database {
             // stale arm below removes from the same shard — a self-deadlock.
             let certified = self.dedup_clean_fp.get(&fp_key).map(|entry| *entry.value());
             match certified {
-                Some(cert) if cert.fp == partition_file_fp(files) => continue,
+                Some(cert) if cert.fp == partition_file_fp(files) => {
+                    certified_any = true;
+                    continue;
+                }
                 Some(cert) => {
                     // Provably stale: this fingerprint can never match again until a
                     // sweep re-certifies. Drop it so the dwell is recorded exactly
@@ -2533,7 +2563,7 @@ impl Database {
                 None => verdict = DedupSkipVerdict::NeverCertified,
             }
         }
-        verdict
+        if certified_any { verdict } else { DedupSkipVerdict::NeverCertified }
     }
 
     pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, Vec<String>)> {

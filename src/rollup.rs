@@ -627,6 +627,61 @@ pub(crate) fn quoted(alias: &str) -> String {
     format!("\"{}\"", alias.replace('"', "\"\""))
 }
 
+/// How a slice input collapses duplicate rows: `keys` identify a row, the
+/// greatest `tiebreak` wins, and a true `tombstone` drops it.
+pub(crate) struct SliceDedup<'a> {
+    pub keys: &'a [String],
+    pub tiebreak: Option<&'a str>,
+    pub tombstone: Option<&'a str>,
+}
+
+/// The identity a generated rollup tier is physically written with.
+///
+/// A tier's own `TableSchema` deliberately declares NO `dedup_keys` — see
+/// `RollupSpec::synthesize`, where doing so made every routed read plan a
+/// `DedupExec` over columns the rewrite does not project ("DedupExec key `id`
+/// not in input schema") and dropped every query back to a raw scan. That is a
+/// statement about the QUERY path. It is not true of the tier's bytes: a
+/// rebuild appends a new version of a bucket, and the replace-set that is meant
+/// to retire the old file skips any file carrying no slice tags — so partitions
+/// really do hold several versions of one `id` (prod 2026-08-20: 7.17 per id).
+///
+/// So a MAINTENANCE read of a tier must collapse versions explicitly, without
+/// declaring keys the query planner would then act on.
+pub(crate) fn rollup_tier_dedup(schema: &crate::schema::TableSchema) -> Option<(Vec<String>, &'static str, Option<&str>)> {
+    let has = |name: &str| schema.fields.iter().any(|field| field.name == name);
+    (has("timestamp") && has("id") && has("updated_at"))
+        .then(|| (vec!["timestamp".to_owned(), "id".to_owned()], "updated_at", schema.tombstone_column.as_deref()))
+}
+
+/// The SELECT a rollup slice reads its input through, collapsing duplicates
+/// when `dedup` says how.
+///
+/// `schema` describes whatever is registered as `raw` — for a DERIVED tier that
+/// is the BASE TIER, not the raw source. With `dedup` as `None` this emits a
+/// bare `SELECT *`, which is what the derived path used to do: because a tier
+/// holds superseded versions, the aggregate above then SUMs all of them. See
+/// `a_merge_on_read_input_is_deduped_before_the_rollup_aggregate`.
+pub(crate) fn slice_input_sql(
+    schema: &crate::schema::TableSchema, dedup: Option<SliceDedup<'_>>, raw: &str, project_id: &str, (start, end): (i64, i64), shard_predicate: &str,
+) -> String {
+    let window = format!(
+        "WHERE project_id = '{}' AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}){shard_predicate}",
+        project_id.replace('\'', "''")
+    );
+    let Some(dedup) = dedup.filter(|dedup| !dedup.keys.is_empty()) else {
+        return format!("SELECT * FROM {raw} {window}");
+    };
+    let columns = schema.fields.iter().map(|field| quoted(&field.name)).collect::<Vec<_>>().join(", ");
+    let keys = dedup.keys.iter().map(|field| quoted(field)).collect::<Vec<_>>().join(", ");
+    let order = dedup.tiebreak.map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", quoted(field)));
+    let tombstone = dedup.tombstone.map_or_else(String::new, |field| format!(" AND COALESCE({}, false) = false", quoted(field)));
+    format!(
+        "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn FROM {raw} \
+         {window}) WHERE __tf_rn = 1{tombstone}"
+    )
+}
+
 impl RoutedRollup {
     /// A half-open range predicate. Only `>=`/`<` are ever emitted: an inclusive
     /// bound on either side of a shared boundary double counts a whole bucket.
@@ -1762,6 +1817,43 @@ mod tests {
         assert_eq!(canonical_and([&left, &right, &left]), once, "a repeated conjunct must not change the canonical form");
         assert_eq!(canonical_and([&right, &left, &right, &left]), once, "order and multiplicity must both be canonical");
         assert!(!once.contains(" AND ") || once.matches(" AND ").count() == 1, "two distinct conjuncts join exactly once: {once}");
+    }
+
+    /// A derived tier reads the BASE TIER, which is merge-on-read: a rebuilt
+    /// bucket appends a new version instead of replacing the old one. If that
+    /// input is not deduped, the derived aggregate SUMs every superseded
+    /// version and the tier is permanently wrong until the day is rebuilt.
+    ///
+    /// Prod 2026-08-20, project 98fdd4f3, hour 08-18 10:00: the 1m tier held
+    /// 2,453 rows across 342 distinct ids (7.17 versions each), and the 1h tier
+    /// derived from it reported 157,110 requests against a true 31,018 — every
+    /// measure inflated by the same factor. A day whose base tier held one
+    /// version per id (08-13) was exact, which is what identifies version
+    /// multiplicity rather than the source data as the cause.
+    #[test]
+    fn a_merge_on_read_input_is_deduped_before_the_rollup_aggregate() {
+        let base = crate::schema::get_schema("otel_logs_and_spans_rollup_dashboard_1m_v3").expect("the 1m tier is a declared rollup target");
+        // The tier deliberately declares none, so the maintenance read cannot
+        // get its collapse from the schema — that is the whole point of
+        // `rollup_tier_dedup`, and asserting it here stops a future change from
+        // declaring them and silently re-breaking query planning instead.
+        assert!(base.dedup_keys.is_empty(), "a rollup tier must NOT declare dedup keys; the query planner acts on them");
+        let (keys, tiebreak, tombstone) = rollup_tier_dedup(base).expect("a generated tier carries timestamp/id/updated_at");
+
+        let dedup = SliceDedup { keys: &keys, tiebreak: Some(tiebreak), tombstone };
+        let sql = slice_input_sql(base, Some(dedup), "__raw", "p", (0, 60_000_000), "");
+        assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY"), "a merge-on-read input must be collapsed to one row per key, got: {sql}");
+        assert!(sql.contains("__tf_rn = 1"), "the collapse must keep exactly one version per key, got: {sql}");
+        assert!(
+            sql.contains("\"updated_at\" DESC NULLS LAST"),
+            "it must keep the GREATEST version — keeping an arbitrary one is a different wrong answer, got: {sql}"
+        );
+
+        // The shape that actually ran in production: `derived` passed no dedup at
+        // all, so the aggregate above summed every version. Kept as an explicit
+        // contrast so the regression stays legible.
+        let undeduped = slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "");
+        assert!(!undeduped.contains("__tf_rn"), "no dedup means a bare SELECT; this is the shape that over-counted");
     }
 
     #[test]

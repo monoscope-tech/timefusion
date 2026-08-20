@@ -2647,6 +2647,50 @@ async fn a_denied_skip_says_whether_it_was_never_certified_or_written_to_since()
     Ok(())
 }
 
+/// A window with no certified partition must NOT be granted the skip.
+///
+/// `dedup_window_clean` seeds its verdict with `Granted` and every `continue`
+/// leaves it untouched, so a window whose dates all lack Delta files under this
+/// project's key returned `Granted` having examined nothing — a
+/// "provably duplicate-free" verdict derived from an absence of evidence. The
+/// skip it authorises removes `DedupExec` from the WHOLE scan, not just the
+/// Delta leg, and the MemBuffer and hot-tier legs unioned in can hold
+/// superseded merge-on-read versions of their own.
+///
+/// Written after prod 2026-08-20, where `count(*)` and `count(distinct id)`
+/// disagreed 4x on the same snapshot in the same second (112,595 vs 27,909) —
+/// the shape of a count that skipped dedup while a scan did not.
+#[serial]
+#[tokio::test]
+async fn an_uncertified_window_is_never_granted_the_dedup_skip() -> Result<()> {
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let mut cfg = (*TestConfigBuilder::new("dedup_empty_window").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Rows for ONE day, then query a window whose dates are all EARLIER — so
+    // every date resolves to no files for this project and the loop skips them
+    // all without ever consulting a certification.
+    let batch = json_to_batch((0..40).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect())?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+
+    let (lo, hi) = (ts - 10 * 86_400_000_000, ts - 7 * 86_400_000_000);
+    let sql = format!(
+        "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+         AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+    );
+    // Warm `try_fast_resolve`: cold, the skip declines as `Unresolved` before it
+    // reaches the verdict this test is about.
+    db.query_delta_only(&sql).await?;
+    let before = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed);
+    db.query_delta_only(&sql).await?;
+    let skipped = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed) - before;
+
+    assert_eq!(skipped, 0, "a window that certified nothing must not be granted the skip — that is granting from an absence of evidence");
+    Ok(())
+}
+
 /// COUNT parity — the precondition `timefusion_read_dedup_skip_swept`'s own doc
 /// names ("off by default until COUNT parity is validated on prod-shaped
 /// data"). The skip removes `DedupExec` and its key projection, so if the
@@ -2721,5 +2765,78 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
     assert_eq!(control_skips, 0, "the control must run with the skip genuinely off");
     assert!(skips > 0, "the skip never engaged, so this proves nothing about it — check the window and the fast-resolve warm-up");
     assert_eq!(skipped, authoritative, "the dedup skip must not change COUNT — a mismatch here is silent over-counting on every dashboard");
+    Ok(())
+}
+
+/// `count(*)` itself must agree with the rows a scan returns, over a window
+/// spanning several days.
+///
+/// The parity test above deliberately counts SCAN ROWS rather than `count(*)`,
+/// because a bare count is answered by `count_pushdown` from Delta statistics
+/// without building a scan — so nothing in this file ever asserted that the
+/// pushdown's answer is right. Prod 2026-08-20 (project 94c5dc1f, measured
+/// against `count(distinct id)` as the authority):
+///
+/// | span   | `count(*)` | truth  |
+/// | ------ | ---------- | ------ |
+/// | 1 hour |        360 |    360 |
+/// | 1 day  |      8,919 |  8,919 |
+/// | 3 days |    112,595 | 27,909 |
+/// | 10 days|    173,287 | 88,601 |
+///
+/// One day is right and three days is 4x wrong, which is why a single-day
+/// fixture cannot catch it: the duplicates have to be spread across partitions
+/// so the window covers more than one `date=`. Every dashboard tile that counts
+/// over a week reads the inflated number.
+#[serial]
+#[tokio::test]
+async fn count_star_matches_the_scan_over_a_multi_day_window() -> Result<()> {
+    const DAYS: i64 = 4;
+    const PER_DAY: usize = 60;
+    let cfg = TestConfigBuilder::new("count_star_multi_day").with_buffer_mode(BufferMode::Enabled).build();
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Noon on each of the last DAYS days: distinct `date=` partitions, and far
+    // enough from midnight that a UTC rollover mid-test cannot move a row.
+    let noon = |back: i64| (chrono::Utc::now().date_naive() - chrono::Duration::days(back)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    for back in 1..=DAYS {
+        let base = noon(back);
+        let batch = || -> Result<_> {
+            json_to_batch((0..PER_DAY).map(|i| test_span_ts(&format!("d{back}k{i}"), "n", &project_id, base + i as i64)).collect())
+        };
+        // Written twice through separate commits, so the copies land in
+        // different Delta files: flush-time dedup is per-bucket and cannot see
+        // across files, which is how duplicates survive in production.
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
+    }
+
+    // BOTH branches of `try_count_pushdown`. The logical-count index only
+    // answers spans of at most 3 days; a wider span declines and falls back to
+    // a real scan. Prod disagreed at 3 days AND at 10, so covering one branch
+    // would leave the other free to regress.
+    for (label, back) in [("within the logical-count span", 3), ("wider than the logical-count span", DAYS)] {
+        let (lo, hi) = (noon(back) - 1, noon(1) + PER_DAY as i64 + 1);
+        let window = format!("project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})");
+
+        // The authority is the scan: the rows `SELECT id` actually returns,
+        // after DedupExec has collapsed the versions. `count(*)` must equal it.
+        let scanned = db
+            .query_delta_only(&format!("SELECT id FROM otel_logs_and_spans WHERE {window}"))
+            .await?
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>() as i64;
+        let counted = db
+            .query_delta_only(&format!("SELECT count(*) FROM otel_logs_and_spans WHERE {window}"))
+            .await?
+            .first()
+            .map(|b| b.column(0).as_primitive::<Int64Type>().value(0))
+            .unwrap_or_default();
+
+        assert_eq!(scanned, back * PER_DAY as i64, "the control itself must be right {label}: every key counted exactly once");
+        assert_eq!(counted, scanned, "count(*) disagreed with the scan {label} — silent over-counting on every dashboard tile");
+    }
     Ok(())
 }
