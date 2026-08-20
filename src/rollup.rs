@@ -1804,6 +1804,32 @@ mod tests {
         assert!(!slice_retires(&file, &publish));
     }
 
+    /// The untagged gauge must not be masked by a sibling tier.
+    ///
+    /// It is one exported slot and the tiers publish independently, so storing each publish's own
+    /// count overwrote it: prod 2026-08-20 read `rollup_tier_untagged_found = 0` — after a publish
+    /// to the already-clean 1h tier — while the 1m tier still held 67 untagged files across 39
+    /// cells. A gauge that reads clean over live damage is worse than no gauge, and this one exists
+    /// precisely to catch a month of silent accumulation.
+    #[test]
+    fn the_untagged_gauge_sums_tiers_rather_than_letting_one_mask_another() {
+        let per_tier: dashmap::DashMap<String, u64> = dashmap::DashMap::new();
+        let exported = || -> u64 { per_tier.iter().map(|entry| *entry.value()).sum() };
+
+        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(), 67);
+        assert_eq!(exported(), 67);
+
+        // The clean tier publishes next. Under the shared-slot version this
+        // reported 0 and the 1m tier's 67 files became invisible.
+        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1h_v2".to_owned(), 0);
+        assert_eq!(exported(), 67, "a clean tier's publish must not hide another tier's damage");
+
+        // Zero is reached only when EVERY tier is clean — which is what makes
+        // "alarm on > 0" a statement about the whole tier population.
+        per_tier.insert("otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(), 0);
+        assert_eq!(exported(), 0);
+    }
+
     #[test]
     fn ranges_cover_needs_an_unbroken_run_past_the_inclusive_end() {
         // Out of order, and adjacent rather than overlapping: both are normal

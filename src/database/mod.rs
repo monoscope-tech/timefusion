@@ -2318,6 +2318,15 @@ pub struct Database {
     /// Certified rollup generations keyed by `(project, source, target, date)`.
     rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
+    /// Untagged live files per tier table, as of that tier's last publish.
+    ///
+    /// Per TABLE, because the exported gauge is one slot and the tiers publish
+    /// independently: a single shared slot is overwritten by whichever tier
+    /// published last, so a publish to an already-clean tier reported ZERO while
+    /// another tier still held 67 untagged files. A gauge that reads clean while
+    /// the damage is present is worse than none — it is the exact failure this
+    /// metric was added to catch. The exported value is the SUM over tiers.
+    rollup_tier_untagged: Arc<dashmap::DashMap<String, u64>>,
     /// Hours changed since this `(project, source, date)` was last rolled up, as
     /// a 24-bit mask. PRESENCE is the claim that every change since that build
     /// was observed; absence means "unknown", which forces a full rebuild. Only
@@ -3015,6 +3024,7 @@ impl Database {
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
+            rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
             rollup_dirty,
             rollup_invalidated_at,
             rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),

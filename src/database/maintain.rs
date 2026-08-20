@@ -1679,7 +1679,13 @@ impl Database {
         {
             let untagged = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
             let stats = crate::observability::maintenance_stats();
-            stats.rollup_tier_untagged_found.store(live_adds.iter().filter(|add| untagged(add)).count() as u64, Relaxed);
+            // Record per TABLE and export the SUM. One shared slot was
+            // overwritten by whichever tier published last, so a publish to an
+            // already-clean tier reported 0 while another still held 67 untagged
+            // files — a gauge reading clean over live damage is the exact
+            // failure it exists to catch.
+            self.rollup_tier_untagged.insert(key.physical_table.clone(), live_adds.iter().filter(|add| untagged(add)).count() as u64);
+            stats.rollup_tier_untagged_found.store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), Relaxed);
             let retired = replaced.iter().filter(|add| untagged(add)).count() as u64;
             if retired > 0 {
                 stats.rollup_tier_untagged_retired.fetch_add(retired, Relaxed);
