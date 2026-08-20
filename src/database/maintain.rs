@@ -2,7 +2,21 @@
 //! hot-tail packing/repair passes, vacuum, checkpoint/reconcile, shutdown.
 use super::*;
 
+/// Estimated decoded (in-memory) bytes for a Parquet file of `compressed_size` on
+/// disk — a fixed 12x compression-ratio guess used for budgeting, not measurement.
+fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
+    u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
+}
+
 impl Database {
+    /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
+    fn retry_task(&self, key: &crate::maintenance_coordinator::TaskKey, reason: String, delay: std::time::Duration) -> Result<()> {
+        let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+        let mut journal = self.journal();
+        journal.retry(key, reason, crate::support::now_micros().saturating_add(delay_micros));
+        journal.checkpoint()
+    }
+
     /// Exclusive upper bound the coverage was built to. `i64::MAX` means whole-partition.
     ///
     /// Must be the bound stored with the coverage, never one recomputed here — for a day still
@@ -133,7 +147,7 @@ impl Database {
                 for action in deltalake::logstore::get_actions(commit_version, &bytes)? {
                     match action {
                         deltalake::kernel::Action::Add(add) if add.data_change => {
-                            let Some(partition) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values)) else { continue };
+                            let Some(partition) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default") else { continue };
                             let mask = chrono::NaiveDate::parse_from_str(&partition.1, "%Y-%m-%d")
                                 .ok()
                                 .and_then(|date| date.and_hms_opt(0, 0, 0))
@@ -149,7 +163,7 @@ impl Database {
                         // with removes and NO adds anywhere in the missed
                         // commits (a deletion) needs the conservative day.
                         deltalake::kernel::Action::Remove(remove) if remove.data_change => {
-                            let Some(partition) = Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref()) else { continue };
+                            let Some(partition) = Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref(), "default") else { continue };
                             remove_only.insert(partition);
                         }
                         _ => {}
@@ -173,11 +187,13 @@ impl Database {
         Ok(queued)
     }
 
-    pub(crate) fn maintenance_partition_from_action(path: &str, partition_values: Option<&HashMap<String, Option<String>>>) -> Option<(String, String)> {
+    pub(crate) fn maintenance_partition_from_action(
+        path: &str, partition_values: Option<&HashMap<String, Option<String>>>, default_project: &str,
+    ) -> Option<(String, String)> {
         let value = |name: &str| partition_values.and_then(|values| values.get(name)).and_then(Option::as_deref).map(str::to_owned);
         let path_value = |name: &str| path_partition_value(path, name).map(str::to_owned);
         let date = value("date").or_else(|| path_value("date"))?;
-        let project = value("project_id").or_else(|| path_value("project_id")).unwrap_or_else(|| "default".to_owned());
+        let project = value("project_id").or_else(|| path_value("project_id")).unwrap_or_else(|| default_project.to_owned());
         Some((project, date))
     }
 
@@ -226,18 +242,14 @@ impl Database {
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<CompactionDebtFile>> = HashMap::new();
             {
                 let table = table_ref.read().await;
+                let default_project = if storage_project.is_empty() { "default" } else { storage_project.as_str() };
                 for file in table.snapshot()?.log_data().iter() {
                     let path = file.path();
-                    let Some(date) =
-                        path.split('/').find_map(|segment| segment.strip_prefix("date=")).and_then(|value| value.parse::<chrono::NaiveDate>().ok())
+                    let Some((project, date)) = Self::maintenance_partition_from_action(&path, None, default_project)
+                        .and_then(|(project, date)| Some((project, date.parse::<chrono::NaiveDate>().ok()?)))
                     else {
                         continue;
                     };
-                    let project = path
-                        .split('/')
-                        .find_map(|segment| segment.strip_prefix("project_id="))
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| if storage_project.is_empty() { "default".to_owned() } else { storage_project.clone() });
                     partitions.entry((project, date)).or_default().push(CompactionDebtFile { size: file.size(), path: path.to_string() });
                 }
             }
@@ -285,7 +297,7 @@ impl Database {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
                     let estimate =
-                        small.iter().fold(0u64, |bytes, file| bytes.saturating_add(u64::try_from(file.size.max(0)).unwrap_or_default().saturating_mul(12)));
+                        small.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
                     // A sealed partition's age is measured from when it SEALED,
                     // not from when this scan happened to notice it again.
                     //
@@ -328,7 +340,7 @@ impl Database {
                         planned_keys.insert((project_id.clone(), date, Operation::Repair));
                         let estimate = suspects
                             .iter()
-                            .fold(0u64, |bytes, file| bytes.saturating_add(u64::try_from(file.size.max(0)).unwrap_or_default().saturating_mul(12)));
+                            .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
                         planned.push(MaintenanceTask {
                             key: TaskKey {
                                 physical_table: source.clone(),
@@ -540,6 +552,7 @@ impl Database {
             // Missing stats mean UNKNOWN, so they count as covered: undercounting
             // coverage re-plans work that may already be done, which is wasteful
             // but safe, while this direction is only taken on an explicit zero.
+            let default_project = if storage_project.is_empty() { "default" } else { storage_project.as_str() };
             let partitions_of = |table: &DeltaTable| -> Result<HashSet<(String, chrono::NaiveDate)>> {
                 Ok(table
                     .snapshot()?
@@ -551,15 +564,8 @@ impl Database {
                         if partition_file_is_empty(add.get_stats().ok().flatten().map(|stats| stats.num_records)) {
                             return None;
                         }
-                        let path = file.path();
-                        let date =
-                            path.split('/').find_map(|segment| segment.strip_prefix("date=")).and_then(|value| value.parse::<chrono::NaiveDate>().ok())?;
-                        let project = path
-                            .split('/')
-                            .find_map(|segment| segment.strip_prefix("project_id="))
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| if storage_project.is_empty() { "default".to_owned() } else { storage_project.clone() });
-                        Some((project, date))
+                        let (project, date) = Self::maintenance_partition_from_action(&file.path(), None, default_project)?;
+                        Some((project, date.parse::<chrono::NaiveDate>().ok()?))
                     })
                     .collect())
             };
@@ -958,12 +964,7 @@ impl Database {
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
-        let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
-            let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-            let mut journal = self.journal();
-            journal.retry(&key, reason, crate::support::now_micros().saturating_add(delay_micros));
-            journal.checkpoint()
-        };
+        let retry = |reason: String, delay: std::time::Duration| -> Result<()> { self.retry_task(&key, reason, delay) };
 
         if self.buffered_layer().is_some_and(|layer| layer.has_rows_in_range(&key.project_id, &key.source, key.slice.start_micros, key.slice.end_micros)) {
             retry("source_not_flushed".to_owned(), buffered_source_retry_delay(key.slice, crate::support::now_micros()))?;
@@ -1016,7 +1017,7 @@ impl Database {
                     {
                         return None;
                     }
-                    let decoded = u64::try_from(add.size.max(0)).unwrap_or(0).saturating_mul(12);
+                    let decoded = estimated_decoded_bytes(add.size);
                     let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
                     let (share, whole) = slice_share_of_file(min, max, key.slice, estimated_row_groups(add.size));
                     Some(projected.saturating_mul(share).div_ceil(whole.max(1)))
@@ -1242,12 +1243,7 @@ impl Database {
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
-        let retry = |reason: String, delay: std::time::Duration| -> Result<()> {
-            let delay = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
-            let mut journal = self.journal();
-            journal.retry(&key, reason, crate::support::now_micros().saturating_add(delay));
-            journal.checkpoint()
-        };
+        let retry = |reason: String, delay: std::time::Duration| -> Result<()> { self.retry_task(&key, reason, delay) };
         let Some(source_schema) = get_schema(&key.source) else {
             retry("source_schema_missing".to_owned(), std::time::Duration::from_secs(300))?;
             return Ok(true);
@@ -1388,7 +1384,7 @@ impl Database {
                         }
                     }
                 }
-                let decoded = u64::try_from(add.size.max(0)).unwrap_or(0).saturating_mul(12);
+                let decoded = estimated_decoded_bytes(add.size);
                 let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
                 let (file_min, file_max) = add
                     .get_stats()
@@ -1646,7 +1642,7 @@ impl Database {
         let replaced = live_adds
             .iter()
             .filter(|add| {
-                let partition = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values));
+                let partition = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default");
                 let file = crate::rollup::LiveFile {
                     slice: slice_tag_range(add),
                     project: tag_project(add),
@@ -1675,37 +1671,19 @@ impl Database {
                 );
             }
         }
-        // A slice already covered by a STRICTLY WIDER live publication must not
-        // publish: both files would stay live (the replace-set only removes what
-        // this slice contains, and removing a wider file would drop the range
-        // outside this one), and a dashboard SUMs every live file — the test
-        // caught 10 rows where 9 was right, from a day-wide file and an
-        // hour-wide file inside it.
+        // A slice covered by a STRICTLY WIDER live file must not publish: the
+        // replace-set only removes files CONTAINED in this slice, so both would
+        // stay live and a dashboard SUMs both. Widths are not stable for a range
+        // (`split_time_task` cuts a day into children, `coarsen_sealed_slices`
+        // #134 fuses them back), so this ordering is normal, not corruption.
         //
-        // Widths are not stable for a range: `split_time_task` cuts a published
-        // day into children and `coarsen_sealed_slices` (#134) fuses them back,
-        // so this ordering is normal, not a corruption. The wider file already
-        // holds these rows, so the unit is complete with nothing to write.
-        // BOTH tiers. This was derived-only, on the reasoning that a base slice
-        // must always publish because it is the tier that absorbs late-arriving
-        // rows. That is an argument against silently COMPLETING the unit, and
-        // the branch below does not complete it — it escalates, rebuilding the
-        // covering slice, which includes exactly those late rows. Nothing is
-        // dropped.
+        // Applies to BOTH tiers, not base-exempt: escalate (rebuild the covering
+        // slice, which includes any late-arriving rows) rather than silently
+        // complete — exempting the base tier guaranteed the double count this
+        // check exists to prevent.
         //
-        // Exempting the base tier instead guaranteed the double count it exists
-        // to prevent. The replace-set below removes only files CONTAINED in this
-        // slice (`start >= .. && end <= ..`), so a base slice publishing after a
-        // wider one covering it can neither replace the wider file nor decline —
-        // both stay live and every dashboard SUMs both.
-        //
-        // It reproduces on a clock boundary, not under load, which is why it read
-        // as an intermittent CI flake for so long:
-        // `a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer`
-        // writes nine spans at fixed hours of "yesterday" and passes until those
-        // hours age out of the 24h live frontier, at which point coarsening fuses
-        // them and the republication double-counts. Run it at 11:20 UTC and it
-        // passes; run it at 12:30 UTC and it reports 14 where 9 is right.
+        // Regression: `a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer`
+        // (reproduces on a 24h live-frontier clock boundary, not under load).
         let covered_by_wider = live_adds.iter().find_map(|add| {
             let (start, end) = slice_tag_range(add)?;
             (tag_project(add) == Some(key.project_id.as_str())
@@ -1915,11 +1893,7 @@ impl Database {
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
-        let retry = |reason: String, seconds: u64| -> Result<()> {
-            let mut journal = self.journal();
-            journal.retry(&key, reason, crate::support::now_micros().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX).saturating_mul(1_000_000)));
-            journal.checkpoint()
-        };
+        let retry = |reason: String, seconds: u64| -> Result<()> { self.retry_task(&key, reason, std::time::Duration::from_secs(seconds)) };
         let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 })
         else {
             retry("resource_admission".to_owned(), 1)?;
@@ -1947,7 +1921,7 @@ impl Database {
                 .log_data()
                 .iter()
                 .filter(|file| selected.contains(file.path().as_ref()))
-                .fold(0u64, |bytes, file| bytes.saturating_add(u64::try_from(file.size().max(0)).unwrap_or_default().saturating_mul(12)))
+                .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size())))
         };
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
             let remaining = !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty();
@@ -2367,7 +2341,6 @@ impl Database {
         };
         let dates = Some(dates);
         // (rows, min_ts, max_ts, max_stamp) per partition.
-        let mut by_partition: HashMap<(String, String), (i64, i64, i64, i64)> = HashMap::new();
         let min_ts = crate::read::ts_micros_column(&actions, "min.timestamp");
         let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
         // The stamp is a timestamp on every current schema, but read an integer
@@ -2376,18 +2349,18 @@ impl Database {
             crate::read::ts_micros_column(&actions, &name)
                 .or_else(|| actions.column_by_name(&name)?.as_any().downcast_ref::<arrow::array::Int64Array>().cloned())
         });
-        for row in 0..actions.num_rows() {
-            let Some(date) = string_at(&dates, row) else { continue };
+        let by_partition: HashMap<(String, String), (i64, i64, i64, i64)> = (0..actions.num_rows()).fold(HashMap::new(), |mut acc, row| {
+            let Some(date) = string_at(&dates, row) else { return acc };
             // Custom-project tables carry no `project_id` partition; the sweep
             // groups those under "default", so match it exactly.
             let project = string_at(&projects, row).unwrap_or_else(|| "default".to_string());
             // A file whose rows all sit at or above this partition's bound is not
             // part of what was aggregated, so it must not perturb the fingerprint.
             if max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))).is_some_and(|hi| hi >= bound_for(&project, &date)) {
-                continue;
+                return acc;
             }
             let key = (project, date);
-            let entry = by_partition.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN));
+            let entry = acc.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN));
             entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
             if let Some(lo) = min_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
                 entry.1 = entry.1.min(lo);
@@ -2398,7 +2371,8 @@ impl Database {
             if let Some(written) = stamp.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
                 entry.3 = entry.3.max(written);
             }
-        }
+            acc
+        });
         Ok(by_partition
             .into_iter()
             .map(|(key, identity)| {
@@ -3463,15 +3437,16 @@ impl Database {
         markers.dedup();
         let result = self.commit_wave(table, table_name, &markers, true, units, 0).await;
         let stats = crate::observability::maintenance_stats();
-        let mut landed_bins: std::collections::HashSet<DirtyBinKey> = std::collections::HashSet::new();
-        for unit in &result.landed {
-            let Some(d) = &unit.dedup else { continue };
-            info!(table_name, chunk = d.label, dropped = d.dropped(), before = d.before, after = d.after, event = "dirty_bin_chunk_complete");
-            stats.dirty_bin_dropped_rows.fetch_add(d.dropped(), Relaxed);
-            if let Some(key) = d.key.clone() {
-                landed_bins.insert(key);
-            }
-        }
+        let mut landed_bins: HashSet<DirtyBinKey> = result
+            .landed
+            .iter()
+            .filter_map(|unit| {
+                let d = unit.dedup.as_ref()?;
+                info!(table_name, chunk = d.label, dropped = d.dropped(), before = d.before, after = d.after, event = "dirty_bin_chunk_complete");
+                stats.dirty_bin_dropped_rows.fetch_add(d.dropped(), Relaxed);
+                d.key.clone()
+            })
+            .collect();
         for unit in &result.failed {
             let Some(key) = unit.dedup.as_ref().and_then(|d| d.key.clone()) else { continue };
             landed_bins.remove(&key);
@@ -3484,9 +3459,6 @@ impl Database {
         self.persist_dirty_bins();
     }
 
-    /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
-    /// fallback sweep). The 90s deadline is a warning threshold, not a
-    /// cancellation: a slow-but-healthy table is allowed to finish.
     /// Does the legacy dedup cron still owe this table a SWEEP?
     ///
     /// The cron has two halves with two different owners, and conflating them
@@ -3520,6 +3492,9 @@ impl Database {
         (true, sweep_fallback && !has_rollups)
     }
 
+    /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
+    /// fallback sweep). The 90s deadline is a warning threshold, not a
+    /// cancellation: a slow-but-healthy table is allowed to finish.
     pub(crate) async fn run_dedup_for_table(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str, drain_deadline: std::time::Instant,
         sweep_deadline: std::time::Instant,
@@ -4840,10 +4815,15 @@ impl Database {
         self.clear_staged_intent(&bins.iter().map(|b| b.wave_id.as_str()).collect::<Vec<_>>());
     }
 
+    /// A maintenance state file living beside the WAL dir (not in it).
+    fn maintenance_state_path(&self, filename: &str) -> PathBuf {
+        let wal_dir = self.config.core.wal_dir();
+        wal_dir.parent().map(|p| p.to_path_buf()).unwrap_or(wal_dir).join(filename)
+    }
+
     /// Path where verified-sorted paths are remembered across restarts.
     fn repair_verified_path(&self) -> PathBuf {
-        let wal_dir = self.config.core.wal_dir();
-        wal_dir.parent().map(|p| p.to_path_buf()).unwrap_or(wal_dir).join("repair_verified_sorted.txt")
+        self.maintenance_state_path("repair_verified_sorted.txt")
     }
 
     /// Persist footers already probed as sorted, so a restart does not re-probe them.
@@ -4892,8 +4872,7 @@ impl Database {
     }
 
     fn staged_intent_path(&self) -> PathBuf {
-        let wal_dir = self.config.core.wal_dir();
-        wal_dir.parent().map(|p| p.to_path_buf()).unwrap_or(wal_dir).join("staged_intent.jsonl")
+        self.maintenance_state_path("staged_intent.jsonl")
     }
 
     /// Append one bin's staged paths. Best-effort: a manifest write failure

@@ -11284,21 +11284,28 @@ mod tests {
     #[test]
     fn maintenance_reconciliation_extracts_only_the_changed_partition() {
         let values = HashMap::from([("project_id".to_owned(), Some("customer-a".to_owned())), ("date".to_owned(), Some("2026-08-16".to_owned()))]);
-        assert_eq!(Database::maintenance_partition_from_action("ignored.parquet", Some(&values)), Some(("customer-a".to_owned(), "2026-08-16".to_owned())));
+        assert_eq!(Database::maintenance_partition_from_action("ignored.parquet", Some(&values), "default"), Some(("customer-a".to_owned(), "2026-08-16".to_owned())));
 
         // Older writers may omit partitionValues on Remove. The file path is
         // still sufficient, so a delete cannot advance the cursor without
         // invalidating the affected slice.
         assert_eq!(
-            Database::maintenance_partition_from_action("project_id=customer-b/date=2026-08-15/part-000.parquet", None,),
+            Database::maintenance_partition_from_action("project_id=customer-b/date=2026-08-15/part-000.parquet", None, "default"),
             Some(("customer-b".to_owned(), "2026-08-15".to_owned()))
         );
 
         assert_eq!(
-            Database::maintenance_partition_from_action("date=2026-08-14/part-000.parquet", None),
+            Database::maintenance_partition_from_action("date=2026-08-14/part-000.parquet", None, "default"),
             Some(("default".to_owned(), "2026-08-14".to_owned()))
         );
-        assert_eq!(Database::maintenance_partition_from_action("part-000.parquet", None), None);
+        assert_eq!(Database::maintenance_partition_from_action("part-000.parquet", None, "default"), None);
+
+        // `default_project` is the fallback for a custom-project table's storage
+        // project, not always the literal string "default".
+        assert_eq!(
+            Database::maintenance_partition_from_action("date=2026-08-14/part-000.parquet", None, "customer-c"),
+            Some(("customer-c".to_owned(), "2026-08-14".to_owned()))
+        );
     }
 
     /// Today is swept on every tick; only the sealed tail rotates.
