@@ -108,7 +108,7 @@ Monitor cache effectiveness through:
 
 ### Foyer Cache Implementation
 
-The `FoyerObjectStoreCache` (`src/object_store_cache.rs`) provides:
+The `FoyerObjectStoreCache` (`src/storage.rs`) provides:
 - Implements `ObjectStore` trait for transparent integration
 - Serializable cache entries with metadata
 - Automatic TTL checking on access

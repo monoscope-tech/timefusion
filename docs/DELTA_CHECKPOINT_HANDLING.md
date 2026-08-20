@@ -76,7 +76,7 @@ export TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS=30
 
 ## Implementation Details
 
-The cache implementation in `src/object_store_cache.rs` includes:
+The cache implementation in `src/storage.rs` includes:
 
 1. **Path Detection**: Methods to identify Delta metadata and checkpoint files
 2. **Conditional Caching**: Based on file type and configuration

@@ -247,7 +247,7 @@ The WAL is **single-writer**. walrus tracks per-topic block/offset state and the
 
 If two processes run against the same WAL directory at once — e.g. an old and a new container during an overlapping (start-first) redeploy that share one persistent WAL volume — the WAL **forks**: the newer process recovers only the prefix present at its start, while the older process's concurrent appends *after* that point are never replayed and are then trimmed by the cursor watermark / boot GC. Because those writes were already acked to the client, nothing errors and nothing reaches a dead-letter path — the result is **silent data loss**. (This is the failure mode observed on 2026-07-12.)
 
-To enforce the invariant at the OS level, startup acquires an exclusive advisory `flock` on `${TIMEFUSION_DATA_DIR}/wal/.timefusion_meta/wal.lock` (`WalDirLock`, `src/wal.rs`) **before any WAL access** — boot GC, recovery, or writes — and holds it for the whole process lifetime. A second process blocks (with backoff, logging `WAL dir ... is locked by another TimeFusion process`) until the first exits.
+Startup acquires an exclusive advisory `flock` on `${TIMEFUSION_DATA_DIR}/wal/.timefusion_meta/wal.lock` before WAL access. `WalDirLock` is in `src/write/wal.rs`. The process holds the lock for its lifetime. A second process waits until the first process exits.
 
 Properties:
 
@@ -338,5 +338,5 @@ data/
 
 | File | Purpose |
 |------|---------|
-| `src/wal.rs` | WalManager implementation |
-| `src/buffered_write_layer.rs` | WAL integration with buffer |
+| `src/write/wal.rs` | `WalManager` implementation |
+| `src/write/mod.rs` | WAL integration with the buffer |

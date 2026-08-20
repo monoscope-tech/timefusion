@@ -1,7 +1,7 @@
 # TimeFusion Operations Runbook
 
-Production playbook. Pair this with the alerting recipe in your OTel
-backend and the architecture overview in `CLAUDE.md`.
+This runbook contains the production procedures. Read
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the system design.
 
 ---
 
@@ -13,17 +13,15 @@ manifest, never commit them.
 | Var | Purpose |
 |---|---|
 | `PGWIRE_PASSWORD` | SQL endpoint password. Empty/unset rejects startup. |
-| `GRPC_TOKEN` | Bearer token for gRPC ingest (`Authorization: Bearer <token>`). |
 | `AWS_S3_BUCKET` | Delta + tantivy sidecar storage. |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | S3 credentials. |
 | `AWS_S3_ENDPOINT` | Required for non-AWS S3 (R2, MinIO, etc.). |
 
-**Local dev escape hatch**: set `TIMEFUSION_ALLOW_INSECURE_AUTH=true` to
-skip the password/token checks. Logs a loud warning. Never in production.
+For local development, set `TIMEFUSION_ALLOW_INSECURE_AUTH=true` to skip the
+password check. Never use this setting in production.
 
-Most other knobs auto-tune from host RAM/disk/CPU at startup —
-see `src/autotune.rs`. The startup log line `Auto-tune applied: ...`
-prints what was derived.
+TimeFusion derives many other values from the available memory, disk, and CPU.
+The startup log contains the derived values.
 
 ---
 
@@ -67,19 +65,18 @@ prints what was derived.
 - Delta tables on S3 — the authoritative store. Use S3 versioning + lifecycle
   rules for retention. Tantivy sidecar indexes are derivable; if they're
   lost, queries fall back to full scan (correctness preserved).
-- WAL on local disk — durable up to the fsync cadence (default 200ms).
-  Lost on host failure unless you ship segments to durable storage.
+- WAL on local disk — the default `sync_each` mode syncs each entry before
+  acknowledgment. A host failure can still destroy the local disk.
 
 **What's NOT durable**:
-- MemBuffer rows that haven't flushed AND haven't been fsync'd to WAL
-  yet. Default loss window: ≤200ms on hard crash.
+- Rows that the process did not acknowledge.
+- Acknowledged rows if the host loses its local WAL disk before a flush.
 
 **Backup strategy**:
 - Enable S3 versioning on `AWS_S3_BUCKET`. Delta time-travel + bucket
   versioning give point-in-time recovery without an explicit backup job.
-- Retain WAL segments off-host (S3 upload as a background task) if your
-  durability SLA can't tolerate the fsync window. Not implemented today
-  — track the work item.
+- Store the WAL on durable local storage if the host-loss risk exceeds the
+  durability target. TimeFusion does not upload WAL segments to S3.
 
 **Restore**:
 - New TimeFusion instance pointed at the same `AWS_S3_BUCKET` +
@@ -99,11 +96,10 @@ prints what was derived.
 The process handles SIGINT (`Ctrl-C`) and SIGTERM (k8s rolling restart).
 Drain sequence:
 
-1. gRPC server stops accepting new connections; existing streams drain
-   up to `TIMEFUSION_SHUTDOWN_TIMEOUT_SECS` (default 5s, plus 1s per
-   100MB of buffered data).
-2. BufferedWriteLayer flushes remaining buckets to Delta.
-3. Database shuts down — releases foyer cache, log store handles.
+1. TimeFusion rejects new writes and cancels maintenance.
+2. The PGWire listener stops and active connections get a short drain period.
+3. The buffered write layer flushes remaining buckets to Delta.
+4. The database closes the cache and storage handles.
 
 If drain exceeds the timeout, the process exits anyway. In-flight
 requests may see connection resets. `TIMEFUSION_STOP_GRACE_SECS` defaults
@@ -235,9 +231,8 @@ upgrading.
 
 ## Monitoring
 
-All metrics export via OTel to `OTEL_EXPORTER_OTLP_ENDPOINT`. Page-level
-and warn-level alert thresholds are in
-`~/.claude/projects/...memory/alerting_recipe.md`. Critical metrics:
+All metrics export through OTel to `OTEL_EXPORTER_OTLP_ENDPOINT`. Configure
+alerts for these critical metrics:
 
 - `timefusion.mem_buffer.oldest_bucket_age_seconds` — staleness signal.
   Alert at `> 2× flush_interval_secs`.
@@ -375,9 +370,6 @@ shutdown grace period accordingly.
 
 ## Reference
 
-- Architecture overview: `CLAUDE.md`
-- Source-of-truth for env vars: `src/config.rs`
-- Auto-tune logic: `src/autotune.rs`
+- Architecture overview: `docs/ARCHITECTURE.md`
+- Configuration and derived defaults: `src/config.rs`
 - Schemas: `schemas/*.yaml`
-- Alerting recipe: stored in personal memory at
-  `~/.claude/projects/.../memory/alerting_recipe.md`

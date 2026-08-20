@@ -198,10 +198,9 @@ Variant columns naturally support schema evolution:
 
 | File | Purpose |
 |------|---------|
-| `src/schema_loader.rs` | `is_variant_type()` detection, schema parsing |
-| `src/optimizers/variant_insert_rewriter.rs` | INSERT Utf8 → Variant rewriting |
-| `src/optimizers/variant_select_rewriter.rs` | SELECT Variant → JSON rewriting |
-| `src/functions.rs` | `VariantAwareExprPlanner` for `->` and `->>` |
+| `src/schema.rs` | `is_variant_type()` detection and schema parsing |
+| `src/read/optimizers.rs` | INSERT and SELECT Variant rewrites |
+| `src/read/functions.rs` | `VariantAwareExprPlanner` for `->` and `->>` |
 | `datafusion-variant` crate | UDF implementations |
 
 ## Example Session

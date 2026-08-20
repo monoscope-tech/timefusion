@@ -33,7 +33,7 @@ TimeFusion implements an InfluxDB-inspired in-memory buffer with Write-Ahead Log
 
 ## Components
 
-### 1. Write-Ahead Log (WAL) - `src/wal.rs`
+### 1. Write-Ahead Log (WAL) - `src/write/wal.rs`
 
 Uses [walrus-rust](https://github.com/nubskr/walrus/) for durable, topic-based logging.
 
@@ -63,7 +63,7 @@ INSERT → WAL.append() → MemBuffer.insert() → Response to client
                                               WAL.checkpoint()
 ```
 
-### 2. In-Memory Buffer - `src/mem_buffer.rs`
+### 2. In-Memory Buffer - `src/write/mem_buffer.rs`
 
 Flattened, time-bucketed storage for recent data optimized for high insert throughput.
 
@@ -111,7 +111,7 @@ pub struct TimeBucket {
 - `query()` - Returns all batches as a flat `Vec<RecordBatch>`
 - `query_partitioned()` - Returns `Vec<Vec<RecordBatch>>` with one partition per time bucket (enables parallel execution)
 
-### 3. Buffered Write Layer - `src/buffered_write_layer.rs`
+### 3. Buffered Write Layer - `src/write/mod.rs`
 
 Orchestrates WAL, MemBuffer, and Delta Lake writes.
 
@@ -360,10 +360,10 @@ pub async fn shutdown(&self) -> anyhow::Result<()> {
 
 | File | Purpose |
 |------|---------|
-| `src/wal.rs` | WAL manager using walrus-rust |
-| `src/mem_buffer.rs` | In-memory buffer with time buckets |
-| `src/buffered_write_layer.rs` | Orchestration layer |
-| `src/database.rs` | Modified `ProjectRoutingTable::scan()` for unified queries |
+| `src/write/wal.rs` | WAL manager using walrus-rust |
+| `src/write/mem_buffer.rs` | In-memory buffer with time buckets |
+| `src/write/mod.rs` | Orchestration layer |
+| `src/database/mod.rs` | `ProjectRoutingTable::scan()` for unified queries |
 
 ## Future Improvements
 
