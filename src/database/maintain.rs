@@ -163,7 +163,9 @@ impl Database {
                         // with removes and NO adds anywhere in the missed
                         // commits (a deletion) needs the conservative day.
                         deltalake::kernel::Action::Remove(remove) if remove.data_change => {
-                            let Some(partition) = Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref(), "default") else { continue };
+                            let Some(partition) = Self::maintenance_partition_from_action(&remove.path, remove.partition_values.as_ref(), "default") else {
+                                continue;
+                            };
                             remove_only.insert(partition);
                         }
                         _ => {}
@@ -296,8 +298,7 @@ impl Database {
                 if small.len() >= 2 {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
-                    let estimate =
-                        small.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
+                    let estimate = small.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
                     // A sealed partition's age is measured from when it SEALED,
                     // not from when this scan happened to notice it again.
                     //
@@ -338,9 +339,7 @@ impl Database {
                     let suspects = files.iter().filter(|file| !self.repair_verified_sorted.contains(&file.path)).collect::<Vec<_>>();
                     if !suspects.is_empty() {
                         planned_keys.insert((project_id.clone(), date, Operation::Repair));
-                        let estimate = suspects
-                            .iter()
-                            .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
+                        let estimate = suspects.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
                         planned.push(MaintenanceTask {
                             key: TaskKey {
                                 physical_table: source.clone(),
@@ -1629,9 +1628,28 @@ impl Database {
         // republished; until it is, the coverage check sees an incomplete tier
         // and the query falls back to raw rather than reading a hole.
         //
-        // `slice_retires` also retires UNTAGGED files on a day-wide publish —
-        // see there for why that is sound, and for the damage it undoes.
+        // `slice_retires` also retires UNTAGGED files — see there for the three
+        // proofs it accepts and for the damage it undoes.
         let date_string = date.to_string();
+        let in_partition = |add: &deltalake::kernel::Add| {
+            Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default")
+                .is_some_and(|(project, date)| project == key.project_id && date == date_string)
+        };
+        // Every tagged range that will be LIVE here after this commit, this
+        // slice included. Ranges CONTAINED in this slice are omitted on purpose:
+        // those files are the ones being replaced, and this slice already covers
+        // their span. Their union is the only proof available for a tenant whose
+        // day is too big to publish whole.
+        let covered = std::iter::once((key.slice.start_micros, key.slice.end_micros))
+            .chain(live_adds.iter().filter(|add| in_partition(add)).filter_map(slice_tag_range))
+            .collect::<Vec<_>>();
+        let publish = crate::rollup::SlicePublish {
+            project_id: &key.project_id,
+            date: &date_string,
+            slice: (key.slice.start_micros, key.slice.end_micros),
+            rows,
+            covered: &covered,
+        };
         let replaced = live_adds
             .iter()
             .filter(|add| {
@@ -1642,7 +1660,7 @@ impl Database {
                     partition: partition.as_ref().map(|(project, date)| (project.as_str(), date.as_str())),
                     stats: add.stats.as_deref().and_then(crate::rollup::stats_time_range),
                 };
-                crate::rollup::slice_retires(&file, &key.project_id, &date_string, (key.slice.start_micros, key.slice.end_micros), rows)
+                crate::rollup::slice_retires(&file, &publish)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4936,8 +4954,7 @@ impl Database {
         }
         // Only the paths in play — the snapshot holds ~26k files and this must
         // not parse every one of their stats blobs.
-        let interest: HashSet<&str> =
-            candidates.iter().flat_map(|e| e.target_paths.iter().chain(e.adds.iter().map(|a| &a.path))).map(String::as_str).collect();
+        let interest: HashSet<&str> = candidates.iter().flat_map(|e| e.target_paths.iter().chain(e.adds.iter().map(|a| &a.path))).map(String::as_str).collect();
         let (live, target_adds, store) = {
             let table = table_ref.read().await;
             let snapshot = table.snapshot().ok()?;
@@ -5255,8 +5272,7 @@ impl Database {
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let (pid_marker, date_marker) = (format!("project_id={project_id}/"), format!("date={today}/"));
         let scope = [pid_marker.as_str(), date_marker.as_str()];
-        let pre_uris: Option<HashSet<String>> =
-            if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
+        let pre_uris: Option<HashSet<String>> = if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
         for attempt in 0..MAX_RETRIES {
             let table_clone = {
                 let table = table_ref.read().await;
