@@ -2834,3 +2834,46 @@ and it cost a production incident to learn.
 
 The last row is the other open front: the Part XIII diagnosis is correct and its
 fix is reverted, waiting on resumable staging and its own budget.
+
+---
+
+## Part XVI — prod still OOMs every 8-20 h, and peak anon is back to 124 GB
+
+2026-08-20 10:39:27 UTC, on `d5688fd`:
+
+```
+Memory cgroup out of memory: Killed process (timefusion)
+  total-vm:319880836kB  anon-rss:124598712kB  file-rss:161240kB
+```
+
+**124.6 GB anon, 161 MB file.** The documented shape exactly — cache is not the
+cause and never has been on this box.
+
+Not caused by anything shipped tonight. `d5688fd` is the revert, functionally the
+pre-drain-fix build, and the kill cadence predates it:
+
+```
+Aug 18 14:26 · Aug 18 18:01 · Aug 19 11:30 · Aug 19 15:34 · Aug 20 10:39
+```
+
+A single kill each time, self-recovered, ~8-20 h apart. Not a crashloop.
+
+**Why this belongs in this document.** It is not a side issue — it is a direct
+tax on "maintenance keeps up". Every kill destroys in-flight maintenance units,
+and after a restart the box needs ~2 h of quiet before any throughput number
+means anything. At one kill per ~12 h, a meaningful fraction of all maintenance
+time is spent re-approaching a steady state it never reaches. It also makes
+before/after measurement of any scheduling change unreliable, which is part of
+why tonight's readings needed a second sample.
+
+**What is new, and troubling.** The 2026-08-14 attribution work drove peak anon
+from 96 GB to ~37 GB across seven fixes. It is now **124 GB** — higher than
+before that work started. So either a regression has undone it, or the workload
+has grown into a new dominant term. That question is unanswered and should be
+answered before more memory fixes are attempted, because the previous round's
+value came entirely from attributing first.
+
+**Deliberately not acted on tonight.** A speculative memory fix on a box that
+OOMs every 12 h, after already wedging the maintenance tier once this session, is
+how a bad night becomes a bad week. The next step is attribution — a heap profile
+taken while RSS is high, not at boot — and that wants a waking operator.
