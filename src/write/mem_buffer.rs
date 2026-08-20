@@ -580,8 +580,8 @@ fn compact_view_arrays(arr: &ArrayRef) -> ArrayRef {
 }
 
 /// Copy an array into freshly-allocated exact-size buffers when its current
-/// buffers are mostly someone else's bytes. Arrow IPC decode (WAL replay,
-/// gRPC ingest) reads the whole message body into one allocation and hands
+/// buffers are mostly someone else's bytes. Arrow IPC decode during WAL replay
+/// reads the whole message body into one allocation and hands
 /// every column a slice of it — `Buffer::capacity()` reports the full body,
 /// so a replayed batch is charged ~n_cols × message size (prod 2026-06-11
 /// night: 6,546 replayed entries charged 772.5GB inside a 66.6GiB cgroup).

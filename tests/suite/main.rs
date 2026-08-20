@@ -14,7 +14,6 @@ mod connection_pressure_test;
 mod dedup_compaction_test;
 mod delta_checkpoint_cache_test;
 mod delta_rs_api_test;
-mod grpc_ingest_test;
 mod integration_test;
 mod jsonb_oid_test;
 mod kill_recovery;

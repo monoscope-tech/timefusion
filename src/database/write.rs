@@ -621,8 +621,8 @@ impl Database {
 
         // Stamp the schema's TF-owned version column. This is the single funnel
         // every *inbound* write passes through — pgwire INSERT (`write_all`),
-        // the `__bulk` direct-to-Delta alias, gRPC ingest, the legacy batch
-        // queue — regardless of whether the buffered layer is configured, and it
+        // the `__bulk` direct-to-Delta alias, and the legacy batch queue —
+        // regardless of whether the buffered layer is configured, and it
         // runs before the WAL append so the durable record carries the value.
         //
         // A `watermark` marks the one caller that is NOT inbound: the flush of

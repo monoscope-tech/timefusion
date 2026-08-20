@@ -57,7 +57,6 @@ tokio-rustls = "0.26.1"
 datafusion-postgres = "0.17"
 datafusion-functions-json = "0.54"
 anyhow = "1.0.100"
-subtle = "2"
 sha2 = "0.10"
 fastrand = "2"
 fnv = "1"
@@ -112,9 +111,6 @@ parquet-variant = "58.3"
 sql-json-path = "0.1"
 base64 = "0.22"
 aes-gcm = "0.10"
-tonic = "0.14"
-tonic-prost = "0.14"
-prost = "0.14"
 tantivy = "0.22"
 tar = "0.4"
 zstd = "0.13"
@@ -123,9 +119,6 @@ sysinfo = { version = "0.32", default-features = false, features = ["system", "d
 num_cpus = "1.16"
 scopeguard = "1.2.0"
 memmap2 = "0.9.10"
-
-[build-dependencies]
-tonic-prost-build = "0.14"
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
@@ -137,8 +130,6 @@ rand = "0.10.0"
 tempfile = "3"
 test-case = "3.3"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
-tower = { version = "0.5", features = ["util"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 # E2E harness: dynamic MinIO per test, snapshot assertions, proptest.
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio"] }

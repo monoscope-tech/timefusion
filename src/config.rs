@@ -630,7 +630,7 @@ pub fn set_config_for_test(cfg: AppConfig) {
 }
 
 /// Whether the operator has opted into open auth for local dev via
-/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
+/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`.
 /// paths gate their fail-secure defaults on this flag.
 pub fn is_insecure_auth_allowed() -> bool {
     std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
@@ -661,7 +661,6 @@ const_default!(d_tantivy_build_concurrency: usize = 2);
 const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
 const_default!(d_data_dir: PathBuf = "./data");
 const_default!(d_pgwire_port: u16 = 5432);
-const_default!(d_grpc_port: u16 = 50051);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
 const_default!(d_pgwire_user: String = "postgres");
@@ -695,7 +694,7 @@ const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
 // Total graceful-shutdown budget shared by ALL serial shutdown phases
-// (PGWire drain → gRPC drain → buffered-layer flush + cursor snapshot).
+// (PGWire drain → buffered-layer flush + cursor snapshot).
 // Set to ~80% of the orchestrator's SIGTERM→SIGKILL grace (Docker/CapRover
 // `StopGracePeriod`; prod is 90s) so the clean cursor snapshot always lands
 // before SIGKILL — the previous per-phase 180s ceilings assumed grace nobody
@@ -1322,10 +1321,6 @@ pub struct CoreConfig {
     pub timefusion_pgwire_max_statement_secs: u64,
     #[serde(default)]
     pub timefusion_otel_scan_guard: OtelScanGuard,
-    #[serde(default = "d_grpc_port")]
-    pub grpc_port: u16,
-    #[serde(default)]
-    pub grpc_token: Option<String>,
 }
 
 impl CoreConfig {

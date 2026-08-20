@@ -1173,7 +1173,7 @@ impl BufferedWriteLayer {
         }
         // Memory pressure no longer triggers a synchronous flush_all_now in the
         // insert path — that violated the "inserts return fast, Delta happens on
-        // a routine" invariant by stalling pgwire/gRPC threads on S3 commits
+        // a routine" invariant by stalling pgwire threads on S3 commits
         // (and worse, holding the global flush_lock so one slow tenant froze
         // ingest for everyone). The safety nets are: (a) `try_reserve_memory`
         // rejects inserts past the 120% hard limit, surfacing backpressure to
@@ -6597,8 +6597,8 @@ fn stamp_column(table: &str) -> Option<(FieldRef, Option<Arc<str>>)> {
 /// row as the winner forever). A missing column is appended.
 ///
 /// This sits on `BufferedWriteLayer::insert`, the single funnel every live write
-/// passes through (pgwire INSERT → `write_all` → `insert_records_batch`, gRPC
-/// ingest, DML-driven appends). WAL replay deliberately bypasses it: those rows
+/// passes through (pgwire INSERT → `write_all` → `insert_records_batch` and
+/// DML-driven appends). WAL replay deliberately bypasses it: those rows
 /// were stamped on their original append and must keep that value; replay feeds
 /// `observe_stamp` instead.
 pub fn stamp_version(table: &str, batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
