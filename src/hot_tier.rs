@@ -541,16 +541,10 @@ impl HotTier {
         //   removal is immediate. `SortByDedup`-style collapse is safe for the
         //   same reason as compaction's: everything dropped loses to a kept
         //   survivor of the same key.
-        let stack: Vec<HotBucketMeta> = self
-            .index
-            .get(&key)
-            .map(|e| e.values().filter(|m| m.bucket_id == bucket_id).cloned().collect())
-            .unwrap_or_default();
+        let stack: Vec<HotBucketMeta> = self.index.get(&key).map(|e| e.values().filter(|m| m.bucket_id == bucket_id).cloned().collect()).unwrap_or_default();
         let schema_def = crate::schema::get_schema(table_name).filter(|s| s.version_append && !s.dedup_keys.is_empty());
-        let merged: Option<(Vec<RecordBatch>, i64, i64, bool)> = (self.limits.merge_demote && !stack.is_empty())
-            .then_some(())
-            .and(schema_def)
-            .and_then(|schema| {
+        let merged: Option<(Vec<RecordBatch>, i64, i64, bool)> =
+            (self.limits.merge_demote && !stack.is_empty()).then_some(()).and(schema_def).and_then(|schema| {
                 let old: anyhow::Result<Vec<RecordBatch>> = stack.iter().try_fold(Vec::new(), |mut acc, m| {
                     let f = fs::File::open(&m.path)?;
                     for b in arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(f), None)? {
@@ -566,13 +560,10 @@ impl HotTier {
                     }
                 };
                 all.extend_from_slice(batches);
-                let collapsed =
-                    crate::write::mem_buffer::dedup_batches(all, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None).ok()?;
+                let collapsed = crate::write::mem_buffer::dedup_batches(all, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None).ok()?;
                 let merged_min = stack.iter().map(|m| m.min_ts).min().unwrap_or(min_ts).min(min_ts);
                 let merged_end = stack.iter().map(|m| m.end_ts).max().unwrap_or(0).max(max_ts + 1);
-                let covers = covers_window
-                    && stack.iter().all(|m| m.covers_window)
-                    && !self.uncovered.contains(&(key.clone(), bucket_id));
+                let covers = covers_window && stack.iter().all(|m| m.covers_window) && !self.uncovered.contains(&(key.clone(), bucket_id));
                 Some((collapsed, merged_min, merged_end, covers))
             });
         let write = match &merged {
@@ -1617,12 +1608,8 @@ mod tests {
         // Bucket 1 demoted twice: base complete at stamp 100, late drain at 200.
         // Bucket 2 has one file MemBuffer still owns and one served — not whole,
         // so its low stamp must not drag the gate down.
-        let metas = vec![
-            meta(1, 0, 0, 10, Some(100), true),
-            meta(1, 1, 0, 10, Some(200), true),
-            meta(2, 2, 20, 30, Some(5), true),
-            meta(2, 3, 31, 40, Some(5), true),
-        ];
+        let metas =
+            vec![meta(1, 0, 0, 10, Some(100), true), meta(1, 1, 0, 10, Some(200), true), meta(2, 2, 20, 30, Some(5), true), meta(2, 3, 31, 40, Some(5), true)];
         let plan = plan_leg(&metas, &[(20, 30)], true, true, &|_| true);
         assert_eq!(plan.served, vec![0, 1, 3]);
         assert!(plan.ranges.contains(&(0, 10)));
@@ -1663,7 +1650,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tier = open(&dir);
         // Base drain: A@v100, B@v100. Late drain: A@v200 (the enrichment).
-        tier.demote("p1", "mor_versioned", Bucket { bucket_id: 1, batches: &[rows(vec![("a", 1000, 100), ("b", 1001, 100)])], min_ts: 1000, max_ts: 1001, covers_window: true });
+        tier.demote(
+            "p1",
+            "mor_versioned",
+            Bucket { bucket_id: 1, batches: &[rows(vec![("a", 1000, 100), ("b", 1001, 100)])], min_ts: 1000, max_ts: 1001, covers_window: true },
+        );
         tier.demote("p1", "mor_versioned", Bucket { bucket_id: 1, batches: &[rows(vec![("a", 1000, 200)])], min_ts: 1000, max_ts: 1000, covers_window: true });
 
         let metas = tier.buckets_in_range("p1", "mor_versioned", None);
