@@ -165,6 +165,75 @@ pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
 pub const TAG_SLICE_END: &str = "timefusion.slice_end_micros";
 pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
 pub const TAG_GENERATION: &str = "timefusion.generation";
+/// Every slice a MERGED tier file proves, as sorted `start:end` pairs.
+///
+/// A tier file normally proves exactly one slice via `TAG_SLICE_START`/`_END`,
+/// and `carried_coverage_tags` drops a tag its inputs disagree on — so merging
+/// two slices yields a file that proves nothing, which is why tiers are excluded
+/// from compaction. That exclusion is what leaves the 1 h tier at one file per
+/// unit and a 30 d read at 4.5-8.4 s for 38 k rows.
+///
+/// Carrying the SET instead keeps every input slice individually represented, so
+/// `recover_rollup_coverage` still emits one exact-match entry per original
+/// slice and `rollup_slice_complete` needs no containment semantics. Merging
+/// must therefore never span differing source/project/generation/fingerprint —
+/// only the slice bounds may differ.
+pub const TAG_MERGED_SLICES: &str = "timefusion.merged_slices";
+
+/// Encode the slices a merged tier file proves. Sorted and deduplicated, so the
+/// tag is a canonical set and re-merging an already-merged file is idempotent.
+///
+/// ```
+/// use timefusion::maintenance_coordinator::{encode_merged_slices, decode_merged_slices};
+/// let tag = encode_merged_slices(&[(30, 40), (10, 20), (30, 40)]);
+/// assert_eq!(tag, "10:20,30:40");
+/// assert_eq!(decode_merged_slices(&tag), vec![(10, 20), (30, 40)]);
+/// // Round-trips, so merging a merged file neither loses nor duplicates coverage.
+/// assert_eq!(encode_merged_slices(&decode_merged_slices(&tag)), tag);
+/// ```
+pub fn encode_merged_slices(slices: &[(i64, i64)]) -> String {
+    let mut sorted: Vec<(i64, i64)> = slices.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted.iter().map(|(start, end)| format!("{start}:{end}")).collect::<Vec<_>>().join(",")
+}
+
+/// Decode [`TAG_MERGED_SLICES`]. Malformed pairs are DROPPED, never guessed:
+/// a slice that cannot be parsed must not become a coverage claim.
+///
+/// ```
+/// use timefusion::maintenance_coordinator::decode_merged_slices;
+/// assert_eq!(decode_merged_slices("10:20,bad,30:40"), vec![(10, 20), (30, 40)]);
+/// assert_eq!(decode_merged_slices(""), vec![]);
+/// // An inverted or empty range proves nothing and is refused.
+/// assert_eq!(decode_merged_slices("40:30,10:10"), vec![]);
+/// ```
+pub fn decode_merged_slices(value: &str) -> Vec<(i64, i64)> {
+    let mut slices: Vec<(i64, i64)> = value
+        .split(',')
+        .filter_map(|pair| {
+            let (start, end) = pair.split_once(':')?;
+            let (start, end) = (start.trim().parse::<i64>().ok()?, end.trim().parse::<i64>().ok()?);
+            (start < end).then_some((start, end))
+        })
+        .collect();
+    slices.sort_unstable();
+    slices.dedup();
+    slices
+}
+
+/// Every slice one tier file proves — its own pair, or the set if it is already merged.
+///
+/// Returns `None` when the file proves nothing, which must abort the whole merge:
+/// carrying a partial set would silently drop the missing inputs' coverage.
+pub fn file_slices(slice_start: Option<&str>, slice_end: Option<&str>, merged: Option<&str>) -> Option<Vec<(i64, i64)>> {
+    if let Some(merged) = merged {
+        let slices = decode_merged_slices(merged);
+        return (!slices.is_empty()).then_some(slices);
+    }
+    let (start, end) = (slice_start?.parse::<i64>().ok()?, slice_end?.parse::<i64>().ok()?);
+    (start < end).then_some(vec![(start, end)])
+}
 const JOURNAL_VERSION: u32 = 1;
 const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 static THROUGHPUT_SAMPLE: std::sync::OnceLock<Mutex<(i64, u64)>> = std::sync::OnceLock::new();

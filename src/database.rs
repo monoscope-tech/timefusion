@@ -11355,18 +11355,31 @@ impl Database {
                         if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
                             continue;
                         }
-                        let (Some(project), Some(generation), Some(source_fp), Some(slice_start), Some(slice_end)) = (
+                        let (Some(project), Some(generation), Some(source_fp)) = (
                             tag(crate::maintenance_coordinator::TAG_PROJECT),
                             tag(crate::maintenance_coordinator::TAG_GENERATION),
                             tag(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse::<u64>().ok()),
-                            tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                            tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
                         ) else {
                             continue;
                         };
+                        // One entry per slice the file proves. A merged tier file
+                        // carries a SET, and each member is still matched EXACTLY
+                        // below, so consolidating tier files costs no coverage.
+                        let Some(slices) = crate::maintenance_coordinator::file_slices(
+                            tag(crate::maintenance_coordinator::TAG_SLICE_START),
+                            tag(crate::maintenance_coordinator::TAG_SLICE_END),
+                            tag(crate::maintenance_coordinator::TAG_MERGED_SLICES),
+                        ) else {
+                            continue;
+                        };
+                        // Rows are per FILE and cannot be split across a merged
+                        // file's slices. Only a debug log reads them, so they are
+                        // attributed to the first slice rather than multiplied.
                         let rows = action.get_stats().ok().flatten().map_or(0, |stats| u64::try_from(stats.num_records.max(0)).unwrap_or(0));
-                        let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp)).or_default();
-                        *entry = entry.saturating_add(rows);
+                        for (index, (slice_start, slice_end)) in slices.into_iter().enumerate() {
+                            let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp)).or_default();
+                            *entry = entry.saturating_add(if index == 0 { rows } else { 0 });
+                        }
                     }
                     groups
                 }
@@ -15694,26 +15707,55 @@ const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
 
 /// Coverage identity tags to carry from a rewrite's inputs onto its outputs.
 ///
-/// Tags are only carried when every input agrees on every one of them. `tag_sorted` used to
-/// copy only the sorted-run tag, which silently erased rollup tier coverage because
-/// `recover_rollup_coverage` reads exactly these tags. A union of disagreeing slices would
-/// claim coverage over gaps, and `rollup_slice_complete` requires an exact slice match anyway,
-/// so identical-only is correct. The common case is one publication split by
-/// `timefusion_writer_max_file_bytes`, where all inputs share the same tags and the merged
-/// output keeps them.
+/// The four IDENTITY tags — source, project, fingerprint, generation — carry forward only when
+/// every input agrees, and disagreement on any of them means the inputs are not one publication,
+/// so nothing is carried at all. `tag_sorted` used to copy only the sorted-run tag, which silently
+/// erased rollup tier coverage because `recover_rollup_coverage` reads exactly these tags.
+///
+/// The SLICE BOUNDS are the exception. A span over disagreeing bounds would claim coverage of the
+/// gap between them, and `rollup_slice_complete` matches `task.key.slice` exactly, so a spanned
+/// slice would be discarded by recovery anyway. Dropping them instead is what made a merged tier
+/// file prove nothing — the reason `plan_compaction_debt` excludes tiers, and the reason the 1 h
+/// tier sits at one file per unit with a 30 d read costing 4.5-8.4 s for 38 k rows. So differing
+/// bounds are carried as a SET in [`TAG_MERGED_SLICES`], where each original slice is still matched
+/// exactly.
+///
+/// The common case is unchanged: one publication split by `timefusion_writer_max_file_bytes`, all
+/// inputs sharing every tag, and the merged output keeping all six.
 fn carried_coverage_tags(targets: &[deltalake::kernel::Add]) -> HashMap<String, String> {
-    use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
-    const COVERAGE_TAGS: [&str; 6] = [TAG_SOURCE, TAG_PROJECT, TAG_SLICE_START, TAG_SLICE_END, TAG_SOURCE_FINGERPRINT, TAG_GENERATION];
+    use crate::maintenance_coordinator::{
+        TAG_GENERATION, TAG_MERGED_SLICES, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT, encode_merged_slices,
+        file_slices,
+    };
+    const IDENTITY_TAGS: [&str; 4] = [TAG_SOURCE, TAG_PROJECT, TAG_SOURCE_FINGERPRINT, TAG_GENERATION];
     let Some(first) = targets.first() else { return HashMap::new() };
     let value = |add: &deltalake::kernel::Add, tag: &str| add.tags.as_ref().and_then(|tags| tags.get(tag).cloned().flatten());
-    COVERAGE_TAGS
-        .into_iter()
-        .map(|tag| {
-            let expected = value(first, tag)?;
-            targets.iter().all(|add| value(add, tag).as_deref() == Some(expected.as_str())).then_some((tag.to_owned(), expected))
-        })
-        .collect::<Option<HashMap<_, _>>>()
-        .unwrap_or_default()
+    let agreed = |tag: &str| -> Option<String> {
+        let expected = value(first, tag)?;
+        targets.iter().all(|add| value(add, tag).as_deref() == Some(expected.as_str())).then_some(expected)
+    };
+    let Some(mut carried) = IDENTITY_TAGS.into_iter().map(|tag| agreed(tag).map(|found| (tag.to_owned(), found))).collect::<Option<HashMap<_, _>>>()
+    else {
+        return HashMap::new();
+    };
+    if let (Some(start), Some(end)) = (agreed(TAG_SLICE_START), agreed(TAG_SLICE_END)) {
+        carried.insert(TAG_SLICE_START.to_owned(), start);
+        carried.insert(TAG_SLICE_END.to_owned(), end);
+        return carried;
+    }
+    // Aborting the whole carry on a single unprovable input is deliberate: a
+    // partial set would claim the merged file covers only what could be parsed,
+    // which is a silent hole rather than a visible absence.
+    let Some(slices) = targets
+        .iter()
+        .map(|add| file_slices(value(add, TAG_SLICE_START).as_deref(), value(add, TAG_SLICE_END).as_deref(), value(add, TAG_MERGED_SLICES).as_deref()))
+        .collect::<Option<Vec<_>>>()
+        .map(|per_file| per_file.concat())
+    else {
+        return HashMap::new();
+    };
+    carried.insert(TAG_MERGED_SLICES.to_owned(), encode_merged_slices(&slices));
+    carried
 }
 
 fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
@@ -19493,12 +19535,15 @@ mod tests {
     /// A rewrite must carry coverage identity forward and must never invent it.
     ///
     /// Dropping the `timefusion.*` identity during compaction destroys the identity that
-    /// `recover_rollup_coverage` derives coverage from. Carry it forward identically only; unioning
-    /// slices would claim coverage of any gap between inputs, and `rollup_slice_complete` matches
-    /// `task.key.slice` exactly, so a unioned slice would be discarded by recovery regardless.
+    /// `recover_rollup_coverage` derives coverage from. The four IDENTITY tags carry forward only
+    /// when every input agrees. The slice bounds are the exception: a SPAN would claim coverage of
+    /// any gap between inputs and `rollup_slice_complete` matches `task.key.slice` exactly, so
+    /// differing bounds become a SET (`TAG_MERGED_SLICES`) in which each original slice is still
+    /// matched exactly. That is what makes consolidating a rollup tier possible without losing
+    /// the coverage the tier exists to prove.
     #[test]
     fn a_rewrite_carries_coverage_identity_only_when_every_input_agrees() {
-        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
+        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_MERGED_SLICES, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START, TAG_SOURCE, TAG_SOURCE_FINGERPRINT};
         let add = |slice_start: &str, generation: &str| {
             let mut a = deltalake::kernel::Add {
                 path: format!("f{slice_start}.parquet"),
@@ -19524,8 +19569,29 @@ mod tests {
         assert_eq!(carried.get(TAG_SLICE_START).map(String::as_str), Some("0"), "identical inputs carry their identity forward");
         assert_eq!(carried.len(), 6, "all six coverage tags travel together or not at all");
 
-        // Different slices: the union would claim the gap between them.
-        assert!(super::carried_coverage_tags(&[add("0", "g1"), add("3600000000", "g1")]).is_empty(), "differing slices must NOT be merged into a span");
+        // Different slices: a SPAN would claim the gap between them, so the
+        // merged file carries the SET instead and each member is still matched
+        // exactly at recovery. This is what lets a tier be consolidated at all.
+        let spanning = super::carried_coverage_tags(&[add("0", "g1"), add("3600000000", "g1")]);
+        assert_eq!(spanning.get(TAG_SLICE_START), None, "differing slices must NOT be merged into a span");
+        assert_eq!(spanning.get(TAG_SLICE_END), None, "differing slices must NOT be merged into a span");
+        assert_eq!(
+            spanning.get(TAG_MERGED_SLICES).map(String::as_str),
+            Some("0:86400000000,3600000000:86400000000"),
+            "both original slices survive individually"
+        );
+        // Merging a merged file is idempotent — the set does not grow or drift.
+        let mut already = add("0", "g1");
+        already.tags.as_mut().map(|tags| {
+            tags.remove(TAG_SLICE_START);
+            tags.remove(TAG_SLICE_END);
+            tags.insert(TAG_MERGED_SLICES.to_owned(), Some("0:86400000000,3600000000:86400000000".to_owned()))
+        });
+        assert_eq!(
+            super::carried_coverage_tags(&[already.clone(), already]).get(TAG_MERGED_SLICES).map(String::as_str),
+            Some("0:86400000000,3600000000:86400000000"),
+            "re-merging an already-merged file must not duplicate or lose slices"
+        );
         // Different generations: different source state, not one publication.
         assert!(super::carried_coverage_tags(&[add("0", "g1"), add("0", "g2")]).is_empty(), "differing generations must not be conflated");
         // An untagged input means the output's coverage is unknown.
