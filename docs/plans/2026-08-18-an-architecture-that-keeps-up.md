@@ -3033,3 +3033,36 @@ looked like 766 MB/h in one window and 14,959 MB/h in the next.
 The rule that would have caught all three: *take the second sample before writing
 the sentence.* For anything on a cron, the second sample must be at least one
 full period later.
+
+### Part XVI, second addendum — a two-kill burst, then recovery
+
+```
+Aug 19 15:34  anon 125.4 GB
+Aug 20 10:39  anon 124.6 GB   <- 19h05m
+Aug 20 14:10  anon 124.8 GB   <-  3h31m
+Aug 20 14:20  anon 125.3 GB   <-  9m21s
+Aug 20 14:33  no further kill; RSS 11.9 GB at 15 min uptime, coverage 30
+```
+
+Two kills nine minutes apart on `bef6046`, then thirteen minutes clear with RSS
+at a normal level — *longer than the gap that defined the loop*. So the burst
+ended on its own rather than continuing.
+
+**Every kill lands in a 124.6-125.4 GB band**, across five kills, three images and
+two days. That is a hard ceiling being hit, not a distribution of outcomes: the
+process reaches essentially the same number every time and dies. Whatever
+allocates last is incidental — the interesting quantity is what holds ~120 GB
+steady beneath it.
+
+**On attribution.** Kills accelerated across `8ef9a3b` → `2d86de9` → `bef6046`,
+which is suggestive, but it stays correlation: no new image survived long enough
+to measure a rate, and the one clean rate (~8 GB/h) belongs to `d5688fd`. The
+deploys themselves are a confound in both directions — each restart both clears
+RSS and destroys in-flight work that then has to be redone.
+
+**Process note, because it nearly caused a wrong call.** I sampled 52.7 GB at
+"5 minutes uptime" and was about to read it as a 4× regression. It was the
+process that then died; my follow-up sample landed on a *fresh* one. Under a
+restart-heavy window, uptime must be re-read at every sample — two readings
+minutes apart are not necessarily the same process, and `queries_total` going
+DOWN is the cheap tell.
