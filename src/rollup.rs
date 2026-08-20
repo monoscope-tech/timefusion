@@ -39,6 +39,32 @@ pub enum MissReason {
 }
 
 impl MissReason {
+    /// Number of variants, for fixed-size per-reason arrays (see
+    /// `sample_rollup_miss`). `ALL` is declared `[Self; Self::COUNT]`, so adding
+    /// a variant without updating this fails the BUILD rather than silently
+    /// indexing out of range.
+    pub const COUNT: usize = 15;
+
+    /// Every variant. Exists so `COUNT` cannot drift, and so tests can sweep
+    /// reasons exhaustively.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::UnsupportedShape,
+        Self::MissingProject,
+        Self::UnboundedTime,
+        Self::UnknownGroupBy,
+        Self::UnknownFilter,
+        Self::FilterNotEligible,
+        Self::MissingMeasure,
+        Self::NonDecomposableAggregate,
+        Self::PartialBucket,
+        Self::NotBuilt,
+        Self::StaleCoverage,
+        Self::IncompleteCoverage,
+        Self::TinyInterior,
+        Self::TooManyBranches,
+        Self::RewriteSchemaMismatch,
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::UnsupportedShape => "unsupported_shape",

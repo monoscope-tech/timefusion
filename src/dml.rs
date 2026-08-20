@@ -265,7 +265,7 @@ impl QueryPlanner for DmlQueryPlanner {
                 // queries — the two need opposite fixes. Sampled so a
                 // multiple-per-second rate cannot flood the log, and the plan is
                 // only rendered when a sample is actually taken.
-                if crate::observability::sample_rollup_miss() {
+                if crate::observability::sample_rollup_miss(reason) {
                     warn!(
                         reason = reason.label(),
                         plan = %fmt_capped(&logical_plan.display_indent().to_string(), 1200),
