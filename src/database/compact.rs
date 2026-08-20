@@ -94,7 +94,7 @@ impl Database {
         let partition_filters: Vec<PartitionFilter> =
             kept_dates.iter().filter_map(|d| PartitionFilter::try_from(("date", "=", d.to_string().as_str())).ok()).collect();
 
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         // Sorting keeps rewritten files timestamp-local, so short ranges can
         // prune whole files and row groups. It remains an incident kill switch.
         let (optimize_type, declare_sorted) = full_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
@@ -468,7 +468,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>, max_concurrent: usize,
     ) -> Result<(u64, u64)> {
         let target_size = self.optimize_target_for_date(date);
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         let mut partition_filters = vec![PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?];
         // Scope to one tenant when asked: a whole date spans every project's
         // files (tens of GB on a busy day — doesn't fit in-process), one
@@ -724,7 +724,7 @@ impl Database {
 
         info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
 
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         // Sort and declare footer order when enabled; otherwise stream `SELECT *`.
         let order_by = if self.config.maintenance.timefusion_optimize_sort_by { schema_order_by_clause(schema) } else { String::new() };
         let declare_sorted = !order_by.is_empty();
@@ -894,7 +894,7 @@ impl Database {
     pub async fn consolidate_date_binned(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>, max_passes: usize,
     ) -> Result<()> {
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         // This path already bounds each rewrite to one event-time bin at the
         // cold target, so it does not share the whole-partition external-sort
         // hazard guarded by `timefusion_optimize_sort_by`. Its contract is to
@@ -1094,7 +1094,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str,
     ) -> Result<std::collections::HashSet<i64>> {
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;
         let safe_pid = project_id.replace('\'', "''");
         let filter = format!("project_id = '{safe_pid}' AND date = DATE '{date_str}'");
@@ -1111,7 +1111,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, options: DedupRangeOptions,
     ) -> Result<(Vec<StagedBin>, bool)> {
         let DedupRangeOptions { slice, dirty_key: key, limits } = options;
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         if schema.dedup_keys.is_empty() {
             return Ok((Vec::new(), true));
         }

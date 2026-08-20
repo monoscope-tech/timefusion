@@ -222,7 +222,7 @@ impl Database {
             if tiers.contains(&source) {
                 continue;
             }
-            let schema = get_schema(&source).unwrap_or_else(get_default_schema);
+            let schema = schema_or_default(&source);
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<CompactionDebtFile>> = HashMap::new();
             {
                 let table = table_ref.read().await;
@@ -987,7 +987,7 @@ impl Database {
         // ordinary no-duplicate probe occupied one worker for 235 seconds in
         // production while still reporting `estimated_decoded_bytes=0`.
         let estimated_bytes = {
-            let schema = get_schema(&key.source).unwrap_or_else(get_default_schema);
+            let schema = schema_or_default(&key.source);
             let required_columns = 3usize.saturating_add(schema.dedup_keys.len()).saturating_add(usize::from(schema.dedup_tiebreak.is_some()));
             let projected_numerator = u64::try_from(required_columns).unwrap_or(u64::MAX);
             let projected_denominator = u64::try_from(schema.fields.len().max(1)).unwrap_or(u64::MAX);
@@ -1651,6 +1651,7 @@ impl Database {
                     slice: slice_tag_range(add),
                     project: tag_project(add),
                     partition: partition.as_ref().map(|(project, date)| (project.as_str(), date.as_str())),
+                    stats: add.stats.as_deref().and_then(crate::rollup::stats_time_range),
                 };
                 crate::rollup::slice_retires(&file, &key.project_id, &date_string, (key.slice.start_micros, key.slice.end_micros), rows)
             })
@@ -2779,7 +2780,7 @@ impl Database {
     /// item is independent and idempotent, so truncation is safe; the cursor rotates so the next
     /// tick resumes where this one stopped rather than re-serving the same prefix forever.
     async fn dedup_sweep(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, deadline: Option<std::time::Instant>) -> Result<()> {
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         if schema.dedup_keys.is_empty() {
             return Ok(());
         }
@@ -3062,7 +3063,7 @@ impl Database {
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, flush_healthy: &(dyn Fn() -> bool + Sync), stage_deadline: std::time::Duration,
         pass_deadline: std::time::Instant,
     ) -> Result<()> {
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         if schema.dedup_keys.is_empty() {
             return Ok(());
         }
@@ -3730,7 +3731,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today_str: &str, policy: &HotBinPolicy<'_>,
     ) -> Result<Vec<(String, Vec<String>)>> {
         use std::sync::atomic::Ordering::Relaxed;
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
         // snapshot so a wave never re-selects the run it just wrote. Bins are
         // ordered by compaction debt.
@@ -3796,7 +3797,7 @@ impl Database {
         let policy = self.tail_pass_policy(pass, self.tail_pass_tick_budget(pass), &repair_dates);
         let planned = self.plan_tail_pass(table_ref, table_name, &today.to_string(), &policy).await?;
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         match self.stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None }).await? {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
             _ => Ok(None),
@@ -3849,7 +3850,7 @@ impl Database {
         let repair_dates = self.repair_dates(today, pass);
         let budget = self.tail_pass_tick_budget(pass);
         let policy = self.tail_pass_policy(pass, budget, &repair_dates);
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         let planned = self.plan_tail_pass(table_ref, table_name, &today_str, &policy).await?;
         if planned.is_empty() {
             return Ok(());
@@ -4663,7 +4664,7 @@ impl Database {
             }
             let actions: Vec<Action> = fresh.iter().flat_map(|b| b.removes.iter().chain(b.adds.iter()).cloned()).collect();
             let pre_uris: Option<std::collections::HashSet<String>> = track_files.then(|| scoped_file_uris(&new_table, &markers).into_iter().collect());
-            let partitions = get_schema(table_name).unwrap_or_else(get_default_schema).partitions.clone();
+            let partitions = schema_or_default(table_name).partitions.clone();
             let op = wave_operation(data_change, self.config.maintenance.timefusion_light_optimize_target_size, (!partitions.is_empty()).then_some(partitions));
             let snapshot_ref = match new_table.snapshot() {
                 Ok(s) => s as &dyn TableReference,

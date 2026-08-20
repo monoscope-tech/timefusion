@@ -751,6 +751,11 @@ pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
 }
 
+/// `get_schema(table_name)`, falling back to the default schema — the common case at every call site.
+pub fn schema_or_default(table_name: &str) -> &'static TableSchema {
+    get_schema(table_name).unwrap_or_else(get_default_schema)
+}
+
 /// Inner field names of the unshredded Variant struct
 /// (`delta_kernel::unshredded_variant()`). Centralized here so any writer or
 /// validator that constructs a Variant struct uses the same names; if

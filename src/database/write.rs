@@ -524,7 +524,7 @@ impl Database {
         let table_ref = self.get_or_create_table(project_id, table_name).await?;
 
         // Get the appropriate schema for this table
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
 
         let dirty_bins: Vec<(String, i64)> = if schema.dedup_keys.is_empty() {
             Vec::new()

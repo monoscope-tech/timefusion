@@ -46,7 +46,7 @@ use crate::{
     config::{self, AppConfig},
     observability::arrow_err,
     read::DeltaStatisticsExtractor,
-    schema::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type},
+    schema::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type, schema_or_default},
     storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
 };
 
@@ -2699,7 +2699,7 @@ impl Database {
     /// sorted by the schema's sort order); `false` for `UpdateBuilder`/`DeleteBuilder` because
     /// their output is scan order and a lying footer breaks `DedupExec`'s bounded mode.
     pub(crate) fn dml_writer_properties(&self, table_name: &str, sorted: bool) -> WriterProperties {
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_or_default(table_name);
         self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted)
     }
 
@@ -5106,7 +5106,7 @@ impl Database {
                     // precedence over the legacy `dataSkippingNumIndexedCols=-1`
                     // baked in at create (delta-rs reads stats_columns first), so
                     // the old key is left alone rather than removed.
-                    ("delta.dataSkippingStatsColumns".to_string(), stats_columns_for(get_schema(table_name).unwrap_or_else(get_default_schema))),
+                    ("delta.dataSkippingStatsColumns".to_string(), stats_columns_for(schema_or_default(table_name))),
                 ]);
                 // One-time protocol upgrade so merge-on-read UPDATE/DELETE can attach DVs.
                 // Only when opted in; ensure_table_properties is idempotent (no commit if set).
@@ -5118,7 +5118,7 @@ impl Database {
             Err(load_err) => {
                 info!("Table '{}' doesn't exist, creating new table. err: {:?}", table_name, load_err);
 
-                let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+                let schema = schema_or_default(table_name);
                 let mut create_attempts = 0;
 
                 loop {
@@ -12791,7 +12791,7 @@ mod tests {
     /// include partition columns.
     #[test]
     fn stats_columns_are_the_prune_keys_only() {
-        let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
+        let schema = schema_or_default("otel_logs_and_spans");
         let stats_columns = super::stats_columns_for(schema);
         let cols: Vec<&str> = stats_columns.split(',').collect();
         assert!(cols.contains(&schema.time_column_name()), "the time column drives every query and the event-time binning");
