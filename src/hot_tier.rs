@@ -71,11 +71,17 @@ const MIN_FILE_LEN: usize = 6 + 10;
 pub struct HotTierLimits {
     /// Directory cap; over it GC unlinks oldest-first.
     pub max_disk_bytes: u64,
+    /// Merge-on-demote: a versioned bucket that already has demoted files is
+    /// rewritten (old stack + new drain, keep-greatest) into ONE covering file
+    /// whose gate is the newest stamp. Kill switch falls back to STACKED files
+    /// (coverage still stands, gate still advances via `plan_leg`) — never to
+    /// the old coverage-voiding behaviour.
+    pub merge_demote: bool,
 }
 
 impl Default for HotTierLimits {
     fn default() -> Self {
-        Self { max_disk_bytes: 64 << 30 }
+        Self { max_disk_bytes: 64 << 30, merge_demote: true }
     }
 }
 
@@ -191,8 +197,10 @@ pub struct HotBucketMeta {
     /// Set by the writer when a FULL bucket drain produced the file. Absent on
     /// files from an older binary, which is the safe default: no claim, so the
     /// window falls through to Delta. Necessary but NOT sufficient — a bucket
-    /// demoted more than once has several files each covering part of the
-    /// span, so `read_leg` additionally requires the bucket to have exactly one.
+    /// demoted more than once holds its span across several files, and
+    /// `plan_leg` grants the window only when EVERY file of the bucket is
+    /// served and every one carries this mark (merge-on-demote collapses such
+    /// stacks back to one file when it can).
     pub covers_window: bool,
     pub path: PathBuf,
 }
@@ -297,6 +305,12 @@ pub struct HotTier {
     /// own several files: late arrivals into an already-drained bucket flush
     /// again and demote a second, disjoint row set.
     index: DashMap<TableKey, BTreeMap<(i64, u64), HotBucketMeta>>,
+    /// Paths replaced by a merge-on-demote rewrite, awaiting a DEFERRED unlink
+    /// in `gc`. Unlinking inline would race a scan that planned against the old
+    /// metas and opens files at EXECUTE time (GC's own unlinks target files old
+    /// enough to be out of every live plan; a just-merged bucket is exactly the
+    /// opposite). Index removal is immediate, so no new plan serves them.
+    retired: parking_lot::Mutex<Vec<PathBuf>>,
     /// Buckets whose demotion was SKIPPED, so no file of theirs may ever claim
     /// a window.
     ///
@@ -512,11 +526,76 @@ impl HotTier {
         if health.suppressed() {
             return;
         }
-        match self.write_bucket(project_id, table_name, Bucket { bucket_id, batches, min_ts, max_ts: max_ts + 1, covers_window }) {
+        // Merge-on-demote: a versioned bucket that already has demoted files is
+        // rewritten (existing stack + this drain, keep-greatest per dedup key)
+        // into ONE file, so the per-key version fan-out leaves the tier at
+        // write time and the gate advances to this drain's stamp. Soundness:
+        // - ANY decode failure aborts the whole merge and falls back to a plain
+        //   stacked write. A torn base treated as absent would otherwise mint a
+        //   `covers_window` file MISSING the base's rows — rows served from
+        //   nowhere, the one way this cache could break correctness.
+        // - The merged file claims coverage only if EVERY constituent did and
+        //   the bucket was never `uncovered` (a skipped demote is a gap no
+        //   merge can recover).
+        // - Old paths are retired to a DEFERRED unlink (see `retired`); index
+        //   removal is immediate. `SortByDedup`-style collapse is safe for the
+        //   same reason as compaction's: everything dropped loses to a kept
+        //   survivor of the same key.
+        let stack: Vec<HotBucketMeta> = self
+            .index
+            .get(&key)
+            .map(|e| e.values().filter(|m| m.bucket_id == bucket_id).cloned().collect())
+            .unwrap_or_default();
+        let schema_def = crate::schema::get_schema(table_name).filter(|s| s.version_append && !s.dedup_keys.is_empty());
+        let merged: Option<(Vec<RecordBatch>, i64, i64, bool)> = (self.limits.merge_demote && !stack.is_empty())
+            .then_some(())
+            .and(schema_def)
+            .and_then(|schema| {
+                let old: anyhow::Result<Vec<RecordBatch>> = stack.iter().try_fold(Vec::new(), |mut acc, m| {
+                    let f = fs::File::open(&m.path)?;
+                    for b in arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(f), None)? {
+                        acc.push(b?);
+                    }
+                    Ok(acc)
+                });
+                let mut all = match old {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("hot tier merge-on-demote aborted for {project_id}.{table_name} bucket {bucket_id} (stacked write instead): {e:#}");
+                        return None;
+                    }
+                };
+                all.extend_from_slice(batches);
+                let collapsed =
+                    crate::write::mem_buffer::dedup_batches(all, &schema.dedup_keys, schema.dedup_tiebreak.as_deref(), None).ok()?;
+                let merged_min = stack.iter().map(|m| m.min_ts).min().unwrap_or(min_ts).min(min_ts);
+                let merged_end = stack.iter().map(|m| m.end_ts).max().unwrap_or(0).max(max_ts + 1);
+                let covers = covers_window
+                    && stack.iter().all(|m| m.covers_window)
+                    && !self.uncovered.contains(&(key.clone(), bucket_id));
+                Some((collapsed, merged_min, merged_end, covers))
+            });
+        let write = match &merged {
+            Some((collapsed, merged_min, merged_end, covers)) => {
+                Bucket { bucket_id, batches: collapsed, min_ts: *merged_min, max_ts: *merged_end - 1, covers_window: *covers }
+            }
+            None => Bucket { bucket_id, batches, min_ts, max_ts, covers_window },
+        };
+        match self.write_bucket(project_id, table_name, Bucket { max_ts: write.max_ts + 1, ..write }) {
             Ok(Some(meta)) => {
                 self.writes.fetch_add(1, Relaxed);
                 health.demoted.fetch_add(1, Relaxed);
-                self.index.entry(key.clone()).or_default().insert((meta.bucket_id, meta.seq), meta);
+                let mut entry = self.index.entry(key.clone()).or_default();
+                entry.insert((meta.bucket_id, meta.seq), meta);
+                if merged.is_some() {
+                    for m in &stack {
+                        entry.remove(&(m.bucket_id, m.seq));
+                    }
+                    drop(entry);
+                    self.retired.lock().extend(stack.iter().map(|m| m.path.clone()));
+                } else {
+                    drop(entry);
+                }
                 self.judge(&key, &health);
             }
             Ok(None) => {}
@@ -950,6 +1029,14 @@ impl HotTier {
             }
             None => age_cutoff,
         };
+        // Merge-retired paths: their index entries are long gone, so any scan
+        // still holding them planned before the merge — by the next gc tick it
+        // has finished (or mmap'd the bytes, which survive the unlink).
+        let retired: Vec<PathBuf> = std::mem::take(&mut *self.retired.lock());
+        if !retired.is_empty() {
+            self.gc_deleted.fetch_add(retired.len() as u64, Relaxed);
+            self.unlink(&retired);
+        }
         // Collect under the shard guards but unlink AFTER dropping them — N
         // unlink syscalls inside a write guard block every concurrent query's
         // range lookup for the duration.
@@ -1147,21 +1234,38 @@ pub(crate) fn plan_leg(metas: &[HotBucketMeta], mem_ranges: &[(i64, i64)], versi
     };
 
     let mut plan = LegPlan { sorted: orders, ..Default::default() };
+    // The gate guards only the RANGES, and ranges come only from whole
+    // buckets. A whole stack is complete up to its NEWEST file's stamp:
+    // version stamps are per-table monotone (`next_stamp` is a hybrid clock),
+    // so every row that arrived between two drains carries a stamp in
+    // (s_prev, s_last] and sits in the later file — the union is complete at
+    // the stack MAX. The old per-file MIN pinned a stack's gate to its OLDEST
+    // drain, re-admitting from Delta the very versions the stack already
+    // holds (with monoscope enriching every row, that was ~every row, on
+    // every recent-window scan, forever). One file with an unknown stamp
+    // makes its whole stack unable to vouch (i64::MIN — admit everything).
+    // Files of non-whole buckets claim no ranges and must not drag the gate.
+    // One gate guards all ranges, so it is the MIN over whole-bucket gates.
+    let mut stack_gate: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for &i in &served {
         let m = &metas[i];
         plan.served.push(i);
         // One unmarked file retracts the claim for the whole leg:
         // `try_with_sort_information` declares ONE ordering for the source.
         plan.sorted &= m.sorted;
-        // The gate travels with the ranges it guards, so it is the MIN over
-        // every served file: an unknown stamp drops it to `i64::MIN`, which
-        // admits every stamped Delta row — the safe direction.
-        if versioned {
-            plan.version_gate = Some(plan.version_gate.unwrap_or(i64::MAX).min(m.max_stamp.unwrap_or(i64::MIN)));
-        }
         if whole(m.bucket_id) {
             plan.ranges.push(m.range());
+            if versioned {
+                let g = stack_gate.entry(m.bucket_id).or_insert(i64::MIN + 1);
+                *g = match m.max_stamp {
+                    Some(s) if *g != i64::MIN => (*g).max(s),
+                    _ => i64::MIN,
+                };
+            }
         }
+    }
+    if versioned && let Some(g) = stack_gate.values().min() {
+        plan.version_gate = Some(*g);
     }
     plan
 }
@@ -1228,7 +1332,7 @@ mod tests {
     }
 
     fn limits(max_disk_bytes: u64) -> HotTierLimits {
-        HotTierLimits { max_disk_bytes }
+        HotTierLimits { max_disk_bytes, merge_demote: true }
     }
 
     /// Run a leg's plan the way a query does. Tests assert on ROWS SERVED, not
@@ -1497,6 +1601,84 @@ mod tests {
     /// files it served — the conservative bound the caller weakens its Delta
     /// exclusion with. A file that cannot vouch for a stamp drops the gate to
     /// `i64::MIN`, which admits every stamped row rather than hiding one.
+    #[test]
+    fn stacked_bucket_gate_advances_to_the_stack_maximum() {
+        let meta = |bucket_id: i64, seq: u64, min_ts: i64, end_ts: i64, stamp: Option<i64>, covers: bool| HotBucketMeta {
+            bucket_id,
+            seq,
+            min_ts,
+            end_ts,
+            max_stamp: stamp,
+            sorted: true,
+            covers_window: covers,
+            bytes: 1,
+            path: PathBuf::from(format!("{seq}.arrow")),
+        };
+        // Bucket 1 demoted twice: base complete at stamp 100, late drain at 200.
+        // Bucket 2 has one file MemBuffer still owns and one served — not whole,
+        // so its low stamp must not drag the gate down.
+        let metas = vec![
+            meta(1, 0, 0, 10, Some(100), true),
+            meta(1, 1, 0, 10, Some(200), true),
+            meta(2, 2, 20, 30, Some(5), true),
+            meta(2, 3, 31, 40, Some(5), true),
+        ];
+        let plan = plan_leg(&metas, &[(20, 30)], true, true, &|_| true);
+        assert_eq!(plan.served, vec![0, 1, 3]);
+        assert!(plan.ranges.contains(&(0, 10)));
+        assert_eq!(
+            plan.version_gate,
+            Some(200),
+            "a whole stack is complete up to its NEWEST drain; the per-file MIN pinned the gate to the oldest and re-admitted every enriched row from Delta"
+        );
+        // One unknown stamp inside a whole stack collapses that stack to
+        // admit-everything — and with it the global gate.
+        let metas = vec![meta(1, 0, 0, 10, Some(100), true), meta(1, 1, 0, 10, None, true)];
+        assert_eq!(plan_leg(&metas, &[], true, true, &|_| true).version_gate, Some(i64::MIN));
+    }
+
+    #[test]
+    #[serial]
+    fn merge_on_demote_collapses_a_bucket_stack_into_one_covering_file() {
+        use arrow::{
+            array::TimestampMicrosecondArray,
+            datatypes::{Field, Schema, TimeUnit},
+        };
+        let s = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+        ]));
+        let rows = |ids: Vec<(&str, i64, i64)>| {
+            RecordBatch::try_new(
+                s.clone(),
+                vec![
+                    Arc::new(TimestampMicrosecondArray::from(ids.iter().map(|(_, ts, _)| *ts).collect::<Vec<_>>()).with_timezone("UTC")),
+                    Arc::new(StringArray::from(ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>())),
+                    Arc::new(TimestampMicrosecondArray::from(ids.iter().map(|(_, _, v)| *v).collect::<Vec<_>>()).with_timezone("UTC")),
+                ],
+            )
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let tier = open(&dir);
+        // Base drain: A@v100, B@v100. Late drain: A@v200 (the enrichment).
+        tier.demote("p1", "mor_versioned", Bucket { bucket_id: 1, batches: &[rows(vec![("a", 1000, 100), ("b", 1001, 100)])], min_ts: 1000, max_ts: 1001, covers_window: true });
+        tier.demote("p1", "mor_versioned", Bucket { bucket_id: 1, batches: &[rows(vec![("a", 1000, 200)])], min_ts: 1000, max_ts: 1000, covers_window: true });
+
+        let metas = tier.buckets_in_range("p1", "mor_versioned", None);
+        assert_eq!(metas.len(), 1, "merge-on-demote must leave ONE file per bucket, not a stack");
+        let m = &metas[0];
+        assert!(m.covers_window, "a merge of covering drains still covers");
+        assert_eq!(m.max_stamp, Some(200), "the merged file vouches up to the newest drain");
+        let rows_read: usize = decode_file(&m.path, false, None).unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows_read, 2, "A collapsed to its v200 winner, B retained");
+        // The replaced paths are retired, not gone — gc sweeps them.
+        assert_eq!(tier.retired.lock().len(), 1);
+        tier.gc(crate::support::now_micros());
+        assert!(tier.retired.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn version_gate_is_the_minimum_stamp_and_survives_restart() {
         use arrow::{

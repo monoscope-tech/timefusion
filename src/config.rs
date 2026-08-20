@@ -691,6 +691,7 @@ const_default!(d_hot_tier_enabled: bool = true);
 // more history; that is now the only knob that changes how far back the tier
 // reaches.
 const_default!(d_hot_tier_max_disk_gb: u64 = 600);
+const_default!(d_hot_tier_merge_demote: bool = true);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
@@ -1364,6 +1365,9 @@ pub struct BufferConfig {
     /// unbounded consumer, so this one is a real dial.
     #[serde(default = "d_hot_tier_max_disk_gb")]
     pub timefusion_hot_tier_max_disk_gb: u64,
+    /// Kill switch for hot-tier merge-on-demote (falls back to stacked files).
+    #[serde(default = "d_hot_tier_merge_demote")]
+    pub timefusion_hot_tier_merge_demote: bool,
     #[serde(default = "d_buffer_max_memory")]
     pub timefusion_buffer_max_memory_mb: usize,
     #[serde(default = "d_stop_grace")]
@@ -1476,7 +1480,10 @@ impl BufferConfig {
     /// The tier's only ceiling. Per-scan heap needs no knob: `HotTier::scan`
     /// streams its files inside the query's own memory pool.
     pub fn hot_tier_limits(&self) -> crate::hot_tier::HotTierLimits {
-        crate::hot_tier::HotTierLimits { max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GIB as u64) }
+        crate::hot_tier::HotTierLimits {
+            max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GIB as u64),
+            merge_demote: self.timefusion_hot_tier_merge_demote,
+        }
     }
 
     /// mtime age past which a WAL file is PRESUMED dead weight. Heuristic,
