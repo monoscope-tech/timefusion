@@ -173,7 +173,7 @@ impl Database {
         Ok(queued)
     }
 
-    fn maintenance_partition_from_action(path: &str, partition_values: Option<&HashMap<String, Option<String>>>) -> Option<(String, String)> {
+    pub(crate) fn maintenance_partition_from_action(path: &str, partition_values: Option<&HashMap<String, Option<String>>>) -> Option<(String, String)> {
         let value = |name: &str| partition_values.and_then(|values| values.get(name)).and_then(Option::as_deref).map(str::to_owned);
         let path_value = |name: &str| path_partition_value(path, name).map(str::to_owned);
         let date = value("date").or_else(|| path_value("date"))?;
@@ -181,7 +181,7 @@ impl Database {
         Some((project, date))
     }
 
-    async fn plan_compaction_debt(&self) -> Result<usize> {
+    pub(crate) async fn plan_compaction_debt(&self) -> Result<usize> {
         use crate::maintenance_coordinator::{MaintenanceTask, Operation, TaskKey, TaskState, TimeSlice};
         if !self.config.maintenance.timefusion_light_optimize_enabled {
             return Ok(0);
@@ -950,7 +950,7 @@ impl Database {
             estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
     }
 
-    async fn run_coordinator_dedup_once(&self) -> Result<bool> {
+    pub(crate) async fn run_coordinator_dedup_once(&self) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources};
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -2150,7 +2150,7 @@ impl Database {
         Ok(completed)
     }
 
-    fn invalidate_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
+    pub(crate) fn invalidate_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
         let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         // The mutation tells us exactly which hours became dirty. Expanding a
@@ -2536,7 +2536,7 @@ impl Database {
         verdict
     }
 
-    fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, Vec<String>)> {
+    pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, Vec<String>)> {
         let snapshot = table.snapshot()?.snapshot();
         let files = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), project_id, date);
         Ok((partition_file_fp(files.clone()), files))
@@ -2589,7 +2589,7 @@ impl Database {
         });
     }
 
-    async fn build_logical_count_partition(&self, key: &crate::read::CountPartition, force_refresh: bool) -> Result<()> {
+    pub(crate) async fn build_logical_count_partition(&self, key: &crate::read::CountPartition, force_refresh: bool) -> Result<()> {
         let _permit = tokio::select! {
             permit = self.logical_count_build_sem.acquire() => permit?,
             () = self.maintenance_shutdown.cancelled() => return Ok(()),
@@ -2974,7 +2974,7 @@ impl Database {
     /// duplicates, so this drain is their only physical dedup. They sink to lowest priority and
     /// are counted/summarised once per pass. Returns `(ready, deferred_cold)`; `deferred_cold`
     /// stays on the queue.
-    fn select_drain_bins(mut candidates: Vec<DrainBin>, today: chrono::NaiveDate, after_days: u64, batch: usize) -> (Vec<DrainBin>, Vec<DrainBin>) {
+    pub(crate) fn select_drain_bins(mut candidates: Vec<DrainBin>, today: chrono::NaiveDate, after_days: u64, batch: usize) -> (Vec<DrainBin>, Vec<DrainBin>) {
         candidates.sort_by(|a, b| (&b.1, b.2).cmp(&(&a.1, a.2)));
         // An unparseable date sorts cold: it can't be shown to be hot, and the
         // staging call will surface the parse error when it is finally served.
@@ -2996,7 +2996,7 @@ impl Database {
         (ready, deferred)
     }
 
-    async fn dedup_dirty_bins_for_table(
+    pub(crate) async fn dedup_dirty_bins_for_table(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, flush_healthy: &(dyn Fn() -> bool + Sync), stage_deadline: std::time::Duration,
         pass_deadline: std::time::Instant,
     ) -> Result<()> {
@@ -3282,7 +3282,7 @@ impl Database {
     /// re-queues the bin (the same ordering the per-bin path relies on). A
     /// singleton keeps the per-bin path — its bin-scoped probe prunes to ten
     /// minutes of files where the whole-date probe scans them all.
-    async fn batch_probe_classify(
+    pub(crate) async fn batch_probe_classify(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, deadline: std::time::Instant,
     ) -> Vec<(String, String, i64)> {
         use std::sync::atomic::Ordering::Relaxed;
@@ -4789,7 +4789,7 @@ impl Database {
     /// "this object carries a `sorting_columns` footer" is a permanent fact. A stale entry for a
     /// tombstoned path is harmless because admission never sees that path again. Best-effort:
     /// a write failure costs re-probing, never correctness.
-    fn persist_verified_sorted(&self, paths: &[String]) {
+    pub(crate) fn persist_verified_sorted(&self, paths: &[String]) {
         use std::io::Write;
         let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let file_path = self.repair_verified_path();
@@ -5078,7 +5078,7 @@ impl Database {
     /// and an OOM kill means WAL recovery and quarantine. Two levels because the failure modes differ.
     /// WAL backlog can be sustained, so the brake degrades to a service floor rather than stopping
     /// outright and starving compaction. Memory near the cgroup limit is an imminent OOM: hard stop.
-    fn light_optimize_brake(&self) -> Option<Brake> {
+    pub(crate) fn light_optimize_brake(&self) -> Option<Brake> {
         use std::sync::atomic::Ordering::Relaxed;
         // NOTE: packing is no longer braked by an in-flight repair. It was, for
         // as long as the two passes shared one memory pool — a repair sort
@@ -5185,7 +5185,7 @@ impl Database {
     /// apart: a packing bin is a handful of small files, a repair bin is one large whole-file rewrite.
     /// Sharing the same short period gave repair a slice it could not fit, and `stage_hot_bin` discards
     /// an over-budget bin — so repair could never finish, at any backlog size.
-    fn tail_pass_tick_budget(&self, pass: TailPass) -> std::time::Duration {
+    pub(crate) fn tail_pass_tick_budget(&self, pass: TailPass) -> std::time::Duration {
         match pass {
             TailPass::Pack => self.config.derived.tick_budget(cron_period(&self.config.maintenance.timefusion_light_optimize_schedule)),
             // Repair's run length is set OUTRIGHT, not derived from its period —

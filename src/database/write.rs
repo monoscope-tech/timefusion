@@ -86,7 +86,7 @@ impl Database {
     /// light share only while `HEAVY_MIN_SHARE` was 0.25, so the two agreed by coincidence. Moving
     /// the heavy share would silently change `light_optimize_k` while leaving the actual pools
     /// unchanged.
-    fn light_optimize_pool_bytes(&self) -> usize {
+    pub(crate) fn light_optimize_pool_bytes(&self) -> usize {
         self.config.derived.light_share_bytes()
     }
 
@@ -98,7 +98,7 @@ impl Database {
     /// ~4.5 GB plus sort reservations for 3 bins; repair needs up to its unspillable merge
     /// reservation ladder. Repair spills either way; the alternative was packing getting nothing
     /// at all.
-    fn pack_pool_bytes(&self) -> usize {
+    pub(crate) fn pack_pool_bytes(&self) -> usize {
         (self.light_optimize_pool_bytes() / 2).max(1)
     }
 
@@ -107,7 +107,7 @@ impl Database {
     /// merge share, and the partition ladder handles the rest. A repair sort
     /// peaked 14.3 GB of a 15.4 GB pool, but that is a spilling sort taking what
     /// it is offered, not what it needs — it spills either way.
-    fn repair_pool_bytes(&self) -> usize {
+    pub(crate) fn repair_pool_bytes(&self) -> usize {
         self.light_optimize_pool_bytes() - self.pack_pool_bytes()
     }
 
@@ -119,7 +119,7 @@ impl Database {
     /// it too, so coordinator + heavy + light came to 24 GiB of a 16 GiB pool.
     /// A residual definition cannot stay correct across a change to the tree,
     /// which is the same lesson `light_optimize_pool_bytes` already records.
-    fn heavy_pool_bytes(&self) -> usize {
+    pub(crate) fn heavy_pool_bytes(&self) -> usize {
         self.config.derived.heavy_share_bytes()
     }
 
@@ -128,12 +128,12 @@ impl Database {
     }
 
     /// Hot-tail PACKING: the reserved slice (see field doc).
-    fn light_optimize_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+    pub(crate) fn light_optimize_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.light_optimize_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.pack_pool_bytes(), "light_optimize_spill")).clone()
     }
 
     /// Footer REPAIR: its own pool, disjoint from packing's (see `pack_pool_bytes`).
-    fn repair_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+    pub(crate) fn repair_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.repair_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.repair_pool_bytes(), "repair_spill")).clone()
     }
 
@@ -319,7 +319,7 @@ impl Database {
             .clone()
     }
 
-    fn pack_sort_partitions(&self) -> usize {
+    pub(crate) fn pack_sort_partitions(&self) -> usize {
         pack_sort_partitions(self.pack_pool_bytes(), self.config.derived.max_light_optimize_k(), self.config.derived.cores)
     }
 
@@ -351,7 +351,7 @@ impl Database {
     /// Collapses all default projects sharing a unified table onto one key (empty project_id is
     /// not valid and cannot collide), while custom-storage tables keep per-project isolation. Shared
     /// by `dml_lock` and `commit_lock` so both serialize at physical-log granularity.
-    async fn table_lock_key(&self, project_id: &str, table_name: &str) -> (String, String) {
+    pub(crate) async fn table_lock_key(&self, project_id: &str, table_name: &str) -> (String, String) {
         let project_key = if self.has_custom_storage(project_id, table_name).await { project_id.to_string() } else { String::new() };
         (project_key, table_name.to_string())
     }
@@ -1186,7 +1186,7 @@ impl Database {
         }
     }
 
-    async fn probe_commit_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
+    pub(crate) async fn probe_commit_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
         use deltalake::kernel::Action;
         if refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await.is_err() {
             return CommitProbe::Inconclusive;

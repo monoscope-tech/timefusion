@@ -5886,7 +5886,7 @@ impl Iterator for FlushBatches {
 /// Rows that tie on every sort key may come out in a different relative order than the old path
 /// did, but that is not a regression — `lexsort_to_indices` is unstable, so its tie order was
 /// already arbitrary. The merge breaks ties by run index and nothing downstream reads tie order.
-struct SortMergeStream {
+pub(crate) struct SortMergeStream {
     schema: arrow_schema::SchemaRef,
     converter: arrow::row::RowConverter,
     /// Individually sorted runs, in input order. Drained runs are replaced by
@@ -7427,7 +7427,7 @@ impl Drop for InFlightGuard<'_> {
 /// (one project, concurrency 1, for the rest of the tick) so a chronic overload
 /// signal throttles compaction instead of starving it; `Stop` ends the tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Brake {
+pub(crate) enum Brake {
     Degrade(&'static str),
     Stop(&'static str),
 }

@@ -290,7 +290,7 @@ impl Database {
     /// given dates only. URIs not matching any of `dates` are ignored. Every
     /// requested date gets an entry (possibly empty) so the idempotence guard
     /// can tell "no files" from "not looked at".
-    fn filesets_for_dates(uris: &[String], dates: &[chrono::NaiveDate]) -> HashMap<chrono::NaiveDate, std::collections::HashSet<String>> {
+    pub(crate) fn filesets_for_dates(uris: &[String], dates: &[chrono::NaiveDate]) -> HashMap<chrono::NaiveDate, std::collections::HashSet<String>> {
         let markers: Vec<(chrono::NaiveDate, String)> = dates.iter().map(|d| (*d, format!("date={d}"))).collect();
         let mut out: HashMap<chrono::NaiveDate, std::collections::HashSet<String>> = dates.iter().map(|d| (*d, std::collections::HashSet::new())).collect();
         for uri in uris {
@@ -304,7 +304,7 @@ impl Database {
     /// Project IDs with live files in one hot `(project_id, date)` partition.
     /// A light optimize must use both partition predicates: filtering by `date`
     /// alone conflicts with every project's append to the active day.
-    fn hot_project_ids(uris: &[String], date: chrono::NaiveDate) -> Vec<String> {
+    pub(crate) fn hot_project_ids(uris: &[String], date: chrono::NaiveDate) -> Vec<String> {
         let date_marker = format!("/date={date}/");
         let counts = uris
             .iter()
