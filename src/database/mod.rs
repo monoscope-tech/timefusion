@@ -7457,11 +7457,16 @@ fn choose_optimize_type(schema: &crate::schema::TableSchema, allow_zorder: bool,
     if allow_sort && !sort_cols.is_empty() { (OptimizeType::SortBy(sort_cols), true) } else { (OptimizeType::Compact, false) }
 }
 
-/// Consolidation upgrades SortBy to SortByDedup: duplicates share every sort
-/// key (`id` is a content hash), so they're consecutive in the sorted stream
-/// and the fork drops them for free while writing. Tiebreak mirrors flush
-/// dedup's last-write-wins — greatest `dedup_tiebreak` (observed_timestamp)
-/// sorts first and survives, so the enriched re-emit beats the base row.
+/// Consolidation opportunistically upgrades SortBy to SortByDedup. Removing
+/// physically redundant versions preserves TimeFusion's logical DedupExec view,
+/// so the fork intentionally retains Optimize's `data_change=false` contract:
+/// concurrent appends remain outside the selected-file rewrite and visible,
+/// while concurrent removal of a source file still conflicts.
+///
+/// This is only a space/read-amplification optimization, not a convergence
+/// proof. Bin packing may strand versions of one key in different terminal
+/// output runs; authoritative physical collapse remains owned by the dedup
+/// engine, whose input scope contains every version of each rewritten key.
 fn consolidate_optimize_type(schema: &crate::schema::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     use deltalake::operations::optimize::{DedupConfig, OptimizeType, SortColumn};
     match choose_optimize_type(schema, false, allow_sort) {
@@ -13533,7 +13538,7 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_dedups_on_sorted_rewrite() {
+    fn consolidate_opportunistically_dedups_on_sorted_rewrite() {
         use deltalake::operations::optimize::OptimizeType;
         let schema = get_schema("otel_logs_and_spans").unwrap();
         let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, true);
@@ -13541,13 +13546,26 @@ mod tests {
         assert_eq!(cols[0].column, "timestamp");
         assert_eq!(dedup.columns, vec!["timestamp", "id"]);
         let tb = dedup.tiebreak.expect("tiebreak from schema");
-        // `updated_at` since the 2026-08-02 merge-on-read flip: the tiebreak had
-        // to move off the client-supplied `observed_timestamp`, which
-        // `stamp_version` would otherwise overwrite on every write.
         assert!(tb.column == "updated_at" && tb.descending);
         assert!(declare_sorted);
-        // sort disabled → plain Compact, no dedup claim
+        // Sort disabled → plain Compact, no opportunistic dedup.
         assert!(matches!(consolidate_optimize_type(schema, false), (OptimizeType::Compact, false)));
+    }
+
+    /// Opportunistic per-bin keep-greatest cannot certify convergence. Two
+    /// versions can already live in separate target-sized sorted runs; neither
+    /// run is ever selected again, so no number of normal consolidation passes
+    /// brings those versions into the same dedup stream.
+    #[test]
+    fn converged_sorted_runs_are_a_counterexample_to_compaction_dedup_convergence() {
+        const TARGET: i64 = 1000;
+        let run = |path: &str, min: i64| super::TailAdd { path: path.into(), size: 900, is_sorted_run: true, event_range: Some((min, min + 1)) };
+        let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
+
+        assert!(
+            super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack).is_empty(),
+            "target-sized runs are terminal, even when their key/time domains overlap"
+        );
     }
 
     /// A narrow slice of a day-spanning file must estimate a narrow share.
