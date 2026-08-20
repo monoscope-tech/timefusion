@@ -2409,6 +2409,49 @@ impl Database {
     /// the current source partition's generation, so a moved source fails to match and the
     /// partition is left uncovered. Unproved claims cost a raw scan; trusting one would make a
     /// rewrite read zero rows.
+    /// Queue a day-wide rebuild for every partition still holding a tier file
+    /// with no identity tags.
+    ///
+    /// `slice_retires` can retire such a file, but only when something PUBLISHES
+    /// that partition — and the coordinator publishes for the live frontier and
+    /// for coverage gaps, neither of which describes a sealed day that already
+    /// has coverage. Without this, the historical tail of the 2026-08-20 damage
+    /// (352 files, 26 days) would never be republished and would sit there
+    /// indefinitely; manual repair cannot reach it either, because a day over
+    /// `MAX_DECODED_BYTES` splits before executing at every width down to an
+    /// hour, so `run-unit` has no width that publishes for the largest tenants.
+    ///
+    /// Queued day-wide on purpose: the coordinator splits it as needed, and each
+    /// child that publishes widens the union `slice_retires` uses as proof, so a
+    /// tenant whose day cannot be published whole still converges.
+    ///
+    /// Self-limiting — the set is read from the log each recovery, so it shrinks
+    /// as partitions are repaired and reaches zero. `rollup_tier_untagged_found`
+    /// is the gauge that says whether it is converging.
+    fn enqueue_untagged_rebuilds(
+        &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, partitions: &std::collections::HashSet<(String, String)>,
+    ) {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
+        if partitions.is_empty() {
+            return;
+        }
+        let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
+        let now = crate::support::now_micros();
+        let created = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        let mut journal = self.journal();
+        let mut queued = 0usize;
+        for (project_id, date) in partitions {
+            let Ok(day) = date.parse::<chrono::NaiveDate>() else { continue };
+            let Some(start) = day.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
+            let Ok(slice) = TimeSlice::new(start, start.saturating_add(crate::maintenance_coordinator::DAY_MICROS)) else { continue };
+            let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice, operation };
+            journal.enqueue(key, now, MAX_DECODED_BYTES, created);
+            queued += 1;
+        }
+        let _ = journal.checkpoint();
+        warn!(source, target, queued, event = "rollup_tier_untagged_rebuild_queued", "partitions still hold tier files with no identity tags");
+    }
+
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
         if !self.config.maintenance.timefusion_rollup_enabled {
@@ -2417,6 +2460,7 @@ impl Database {
         let mut recovered = 0;
         for spec in &schema.rollups {
             let target = spec.table_name(source);
+            let mut untagged_partitions: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
@@ -2427,6 +2471,20 @@ impl Database {
                     for add in table.snapshot()?.log_data().iter() {
                         #[allow(deprecated)]
                         let action = add.add_action();
+                        // An untagged file proves no coverage, so this loop has
+                        // always skipped it. Skipping SILENTLY is what let 352 of
+                        // them accumulate over a month: `slice_retires` can now
+                        // retire one, but only when something publishes that
+                        // partition, and a sealed day that already has coverage is
+                        // never republished — nothing would ever enqueue it.
+                        // Remember the partition so the rebuild can be requested
+                        // below, which is what makes the tail self-healing rather
+                        // than a manual list someone has to keep.
+                        if action.tags.as_ref().is_none_or(|tags| !tags.contains_key(crate::maintenance_coordinator::TAG_SLICE_START))
+                            && let Some(partition) = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default")
+                        {
+                            untagged_partitions.insert(partition);
+                        }
                         let Some(tags) = action.tags.as_ref() else { continue };
                         let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
                         if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
@@ -2449,6 +2507,9 @@ impl Database {
                 }
                 Err(_) => HashMap::new(),
             };
+            // Before any `continue` below, so a partition still holding
+            // untagged files is queued whatever the coverage verdict is.
+            self.enqueue_untagged_rebuilds(source, spec, &target, &untagged_partitions);
             let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {
                 self.rollup_slice_coverage.insert(

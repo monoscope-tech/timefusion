@@ -10851,6 +10851,79 @@ mod tests {
         Ok(())
     }
 
+    /// A partition still holding an untagged tier file must be QUEUED for rebuild.
+    ///
+    /// `slice_retires` can retire such a file, but only when something publishes that partition,
+    /// and the coordinator publishes for the live frontier and for coverage gaps — neither of which
+    /// describes a sealed day that already has coverage. Recovery already sees these files and
+    /// skipped them silently, which is how 352 of them accumulated across 26 days unnoticed.
+    #[tokio::test]
+    async fn recovery_queues_a_rebuild_for_a_partition_holding_untagged_tier_files() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        use object_store::ObjectStoreExt as _;
+        let mut cfg = (*create_test_config("untagged-selfheal")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("heal_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        let key = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await.map(|report| report.date)?;
+        assert_eq!(key, day);
+
+        // Strip the identity from the published file, exactly as an OPTIMIZE does.
+        let tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+        let tier_ref = db.get_or_create_table(&project, &tier).await?;
+        {
+            let mut table = tier_ref.read().await.clone();
+            let live: Vec<_> = table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .map(|file| {
+                    #[allow(deprecated)]
+                    file.add_action()
+                })
+                .collect();
+            let store = table.log_store().object_store(None);
+            let mut actions = Vec::new();
+            for add in live {
+                let path = format!("{}-stripped.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            *tier_ref.write().await = table;
+        }
+
+        // Retire everything so only work THIS recovery creates is visible.
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in &keys {
+                journal.complete(key);
+            }
+        }
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let queued = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal.tasks().filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier).count()
+        };
+        assert!(queued > 0, "a partition holding an untagged tier file must be queued for rebuild, got {queued}");
+        Ok(())
+    }
+
     /// An untagged tier file must not be immortal.
     ///
     /// The replace-set matched on slice tags alone, so a file that had lost them — a delta-rs
