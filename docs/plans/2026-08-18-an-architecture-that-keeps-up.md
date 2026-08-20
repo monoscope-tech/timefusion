@@ -3066,3 +3066,38 @@ process that then died; my follow-up sample landed on a *fresh* one. Under a
 restart-heavy window, uptime must be re-read at every sample — two readings
 minutes apart are not necessarily the same process, and `queries_total` going
 DOWN is the cheap tell.
+
+### Part XV refinement — what step 2 actually touches, and why I stopped
+
+Read the implementation before writing it. Two things the earlier spec missed.
+
+**The task key does NOT need a fingerprint discriminator.** Units are planned as
+`(project_id, date, Operation)` with a day-wide slice, and a tier partition can
+hold two fingerprints (a rebuilt day). The obvious reading — "one unit per
+fingerprint group" — would require widening the task key, which is a large and
+risky change. It is also unnecessary: packing already **bin-packs** a partition
+into several outputs, so one unit can serve both groups provided **no bin spans
+two fingerprints**. Unit granularity stays as it is; the constraint lives in bin
+formation.
+
+**`CompactionDebtFile` carries no tags.** It is `{ size, path }`, built from
+`log_data()`, and admission counts `files.iter().filter(|f| f.size < target)`.
+Step 2 therefore needs the fingerprint plumbed onto that struct so both the
+admission count and the bin constraint can see it, and untagged tier files
+excluded from the count entirely — otherwise a partition is admitted on files
+that must not be merged.
+
+So step 2 is: plumb one tag onto `CompactionDebtFile`, exclude untagged files for
+tiers, constrain bin formation to one fingerprint per bin, and lift the
+`tiers.contains(&source) { continue; }` skip behind a kill switch.
+
+**Why I am not writing it tonight.** It modifies bin formation in
+`plan_compaction_debt` — the same path whose eligibility test rewrote converged
+files (`2efbcf5`) and whose sibling wedged the maintenance tier hours ago. Prod
+is currently unmeasurable: three deploys in forty minutes from another session,
+five OOM kills today, and no image living long enough to establish a baseline. A
+change of this shape written blind, unmeasurable, at the end of a long session, on
+the most incident-prone path in the system, is the worst combination available.
+
+The spec above is complete enough to implement in an hour with a clear head. That
+is a better hand-off than a half-finished branch.
