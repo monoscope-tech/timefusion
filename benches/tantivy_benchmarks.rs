@@ -42,7 +42,8 @@ fn table() -> TableSchema {
                 nullable: false,
                 tantivy: None,
                 dictionary: None,
-                bloom_filter: false, mutable: false,
+                bloom_filter: false,
+                mutable: false,
             },
             FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false, mutable: false },
             FieldDef {
@@ -51,7 +52,8 @@ fn table() -> TableSchema {
                 nullable: true,
                 tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
                 dictionary: None,
-                bloom_filter: false, mutable: false,
+                bloom_filter: false,
+                mutable: false,
             },
             FieldDef {
                 name: "message".into(),
@@ -59,7 +61,8 @@ fn table() -> TableSchema {
                 nullable: true,
                 tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), flatten: None }),
                 dictionary: None,
-                bloom_filter: false, mutable: false,
+                bloom_filter: false,
+                mutable: false,
             },
         ],
     }
