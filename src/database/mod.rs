@@ -10235,6 +10235,23 @@ mod tests {
         Ok(())
     }
 
+    /// Register a BYO-bucket (custom-storage) tenant on local MinIO, same bucket, distinct prefix.
+    async fn register_custom_storage(db: &Database, project_id: &str, table_name: &str, s3_prefix: &str) {
+        db.storage_configs.write().await.insert(
+            (project_id.to_string(), table_name.to_string()),
+            StorageConfig {
+                project_id: project_id.to_string(),
+                table_name: table_name.to_string(),
+                s3_bucket: "timefusion-tests".to_string(),
+                s3_prefix: s3_prefix.to_string(),
+                s3_region: "us-east-1".to_string(),
+                s3_access_key_id: "minioadmin".to_string(),
+                s3_secret_access_key: "minioadmin".to_string(),
+                s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
+            },
+        );
+    }
+
     /// A unit whose slice has not finished yet must back off past the slice, not spin.
     ///
     /// A flat retry interval left a day-wide unit permanently eligible until midnight, monopolising
@@ -14404,19 +14421,7 @@ mod tests {
         let (db, _ctx, prefix) = setup_test_database().await?;
         let t = "otel_logs_and_spans";
         let custom = format!("cust-{prefix}");
-        db.storage_configs.write().await.insert(
-            (custom.clone(), t.to_string()),
-            StorageConfig {
-                project_id: custom.clone(),
-                table_name: t.to_string(),
-                s3_bucket: "timefusion-tests".to_string(),
-                s3_prefix: format!("custom-{prefix}"),
-                s3_region: "us-east-1".to_string(),
-                s3_access_key_id: "minioadmin".to_string(),
-                s3_secret_access_key: "minioadmin".to_string(),
-                s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
-            },
-        );
+        register_custom_storage(&db, &custom, t, &format!("custom-{prefix}")).await;
 
         let (a, b) = (db.table_lock_key("proj_a", t).await, db.table_lock_key("proj_b", t).await);
         assert_eq!(a, b, "default-storage projects share a physical log → one coalesced commit");
@@ -14725,19 +14730,7 @@ mod tests {
             // pb is a BYO-bucket tenant: same MinIO, distinct prefix → its own Delta table.
             // config_pool is None under setup_test_database, so this injected config is
             // authoritative (no TTL reload overwrites it).
-            db.storage_configs.write().await.insert(
-                (pb.clone(), table.clone()),
-                StorageConfig {
-                    project_id: pb.clone(),
-                    table_name: table.clone(),
-                    s3_bucket: "timefusion-tests".to_string(),
-                    s3_prefix: format!("custom-{prefix}"),
-                    s3_region: "us-east-1".to_string(),
-                    s3_access_key_id: "minioadmin".to_string(),
-                    s3_secret_access_key: "minioadmin".to_string(),
-                    s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
-                },
-            );
+            register_custom_storage(&db, &pb, &table, &format!("custom-{prefix}")).await;
 
             // One batch, interleaved A/B/A so row 0 (pa) is not the only project.
             let batch = json_to_batch(vec![test_span("a1", "n", &pa), test_span("b1", "n", &pb), test_span("a2", "n", &pa)])?;
