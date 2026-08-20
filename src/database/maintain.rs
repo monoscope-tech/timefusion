@@ -1047,40 +1047,37 @@ impl Database {
         let limits = DedupExecutionLimits { max_decoded_bytes: MAX_DECODED_BYTES, max_concurrent_shards: 1, probe_hash_shards };
         // Certification is a property of the whole PARTITION — the read path keys
         // `dedup_clean_fp` on (project, table, date) and refuses the skip if ANY
-        // in-window partition lacks an entry — so only a unit covering the entire
-        // day can grant it, and only over a file set that did not move under it.
-        //
-        // Nothing else can grant it any more, which is why this exists.
-        // `dedup_sweep` is the sole caller of `record_certification`, and the
+        // in-window partition lacks an entry. This path is what grants it:
+        // `dedup_sweep` was the sole caller of `record_certification`, and the
         // dedup cron skips every rollup-declared table ("owned by durable
         // coordinator tasks", 2026-08-16) — so for `otel_logs_and_spans`, the
         // table every 30d query reads, certification became unreachable the day
-        // the coordinator took ownership and this path did not take the duty with
-        // it. Prod 2026-08-19: `dedup_denied_never_certified_pct = 99.9`, the
-        // whole fleet, with the only surviving entries the 80 reloaded from disk
-        // at boot. `DedupExec` then survives in every plan, which is the single
-        // largest term left in 30d query latency.
+        // the coordinator took ownership. `DedupExec` then survives in every
+        // plan, the single largest term left in 30d query latency.
         //
-        // Day-wide units are the normal shape for sealed days because
-        // `coarsen_sealed_slices` fuses them there; a narrower unit simply does
-        // not certify, exactly as a truncated sweep does not.
-        let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
-        let covers_day = key.slice.start_micros <= day_start && key.slice.end_micros >= day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
-        let pre_files = match covers_day {
-            true => {
-                let table = table.read().await;
-                Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default()
-            }
-            false => Vec::new(),
+        // Unit shape must NOT gate the grant: `coarsen_to_width` caps units at
+        // MAX_DECODED_BYTES (≈6h for otel_logs_and_spans) and true day-wide
+        // units die at the 300s Dedup deadline, so prod never produces a
+        // surviving day-wide unit (`cert_granted_total=0`, 2026-08-20). Instead
+        // each clean pass records its slice in `dedup_slice_coverage`; when the
+        // union covers the UTC day over one unmoved file fingerprint,
+        // `record_clean_slice` grants the certification. A day-wide unit is the
+        // degenerate single-slice case.
+        let pre_files = {
+            let table = table.read().await;
+            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default()
         };
         match self.dedup_partition_range_limited(&table, &key.source, &key.project_id, date, Some(key.slice), Some(limits)).await {
             Ok((dropped, true)) => {
-                // Before the journal lock: `record_certification` awaits, and the
+                // Before the journal lock: `record_clean_slice` awaits, and the
                 // journal guard is a std Mutex.
-                if covers_day
-                    && let Err(error) = self.record_certification(&table, &key.physical_table, &key.project_id, date, &pre_files, (dropped, true)).await
-                {
-                    warn!(%error, project_id = %key.project_id, %date, "certification bookkeeping failed after a clean day-wide dedup");
+                match self.record_clean_slice(&table, &key.physical_table, &key.project_id, date, (key.slice, dropped), &pre_files).await {
+                    // Coordinator-owned tables are excluded from `dedup_sweep`,
+                    // whose end-of-tick snapshot was otherwise the only
+                    // persistence site for this cache.
+                    Ok(Some(_)) => self.persist_certifications(),
+                    Ok(None) => {}
+                    Err(error) => warn!(%error, project_id = %key.project_id, %date, "certification bookkeeping failed after a clean dedup slice"),
                 }
                 let mut journal = self.journal();
                 journal.complete(&key);
@@ -2560,6 +2557,55 @@ impl Database {
         Ok(recovered)
     }
 
+    /// Fold one completed coordinator dedup unit into per-day clean-slice coverage,
+    /// granting certification once the accumulated slices cover the whole UTC day.
+    ///
+    /// A slice counts as clean evidence only when the pass dropped nothing AND the partition's
+    /// file fingerprint did not move across it. Evidence is per-fingerprint: a slice observed
+    /// under a different fp than the accumulation resets it to just that slice — a moved file
+    /// set (new write, compaction) voids what was proved over the old one. A dirty pass resets
+    /// coverage and voids any existing certification via `record_certification`'s removal arm.
+    /// The grant itself goes through `record_certification`, which recomputes the live fp one
+    /// final time — so the rule cannot drift from the sweep/backfill paths.
+    async fn record_clean_slice(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
+        (slice, dropped): (crate::maintenance_coordinator::TimeSlice, u64), pre: &[String],
+    ) -> Result<Option<u64>> {
+        let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
+        let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
+        let (start, end) = (slice.start_micros.max(day_start), slice.end_micros.min(day_end));
+        if start >= end {
+            return Ok(None); // a slice outside the day proves nothing about it
+        }
+        let key = (project_id.to_string(), table_name.to_string(), date.to_string());
+        let post = {
+            let table = table_ref.read().await;
+            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()
+        };
+        let fp = partition_file_fp(post.clone());
+        if dropped != 0 || post.is_empty() || partition_file_fp(pre.to_vec()) != fp {
+            self.dedup_slice_coverage.remove(&key);
+            return self.record_certification(table_ref, table_name, project_id, date, pre, (dropped, true)).await;
+        }
+        // Bind `covered` in its own block: the RefMut must drop before the
+        // remove/await below (same DashMap-shard self-deadlock documented at
+        // `dedup_window_clean`).
+        let covered = {
+            let mut entry = self.dedup_slice_coverage.entry(key.clone()).or_insert_with(|| SliceCoverage { fp, intervals: Vec::new() });
+            if entry.fp != fp {
+                *entry = SliceCoverage { fp, intervals: vec![(start, end)] };
+            } else {
+                merge_clean_interval(&mut entry.intervals, (start, end));
+            }
+            entry.intervals.iter().any(|&(s, e)| s <= day_start && e >= day_end)
+        };
+        if !covered {
+            return Ok(None);
+        }
+        self.dedup_slice_coverage.remove(&key);
+        self.record_certification(table_ref, table_name, project_id, date, &post, (0, true)).await
+    }
+
     /// Apply the certification rule to one finished dedup pass and record the verdict.
     ///
     /// Returns the clean fingerprint when a zero-drop pass over the still-live file set proves the
@@ -3029,6 +3075,7 @@ impl Database {
         if !self.config.maintenance.timefusion_dedup_certification_persist {
             return;
         }
+        let _persist = self.dedup_certification_persist_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now_ms = crate::storage::now_unix_ms();
         let mut entries: Vec<_> = self
             .dedup_clean_fp

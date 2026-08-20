@@ -2081,6 +2081,15 @@ pub struct MaintenanceConfig {
     /// ever doubted.
     #[serde(default = "d_true")]
     pub timefusion_read_dedup_skip_swept: bool,
+    /// Dedup-as-you-compact experiment (docs/plans/2026-08-20-dedup-and-sort
+    /// strategy §3): the on-demand compaction path (`compact_date`, i.e. pgwire
+    /// `OPTIMIZE` and the CLI) upgrades its SortBy rewrite to SortByDedup, so
+    /// merging files also collapses superseded merge-on-read versions
+    /// (keep-greatest `dedup_tiebreak` per dedup key). Sealed consolidation
+    /// already does this unconditionally; this flag extends it. No-op while
+    /// `timefusion_optimize_sort_by` is off (dedup needs the sorted stream).
+    #[serde(default)]
+    pub timefusion_compact_dedup_merge: bool,
     /// Persist sweep certifications to the data dir and reload at boot, so the
     /// read-side dedup skip doesn't restart cold on every deploy.
     ///
