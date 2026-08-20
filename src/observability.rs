@@ -659,13 +659,29 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
 /// arm, so `missing_project`, `unbounded_time`, `non_decomposable` and
 /// `rewrite_schema_mismatch` were indistinguishable in prod — 29 misses that
 /// could not be diagnosed without a deploy.
-/// True once every `ROLLUP_MISS_SAMPLE` misses, for logging one refused plan
-/// with context. Misses run at several per second on a busy node, so the
-/// counter is what you alert on and this is what you diagnose with.
-pub fn sample_rollup_miss() -> bool {
-    const ROLLUP_MISS_SAMPLE: u64 = 512;
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(ROLLUP_MISS_SAMPLE)
+/// True at most once per REASON per `SAMPLE_INTERVAL_SECS`, for logging one
+/// refused plan with context. The counter is what you alert on; this is what you
+/// diagnose with.
+///
+/// Was a fixed 1-in-512 ratio. That was right for the regime it was written in —
+/// the call site records ~2.7 misses/second, where 1:512 yields ~19 samples/hour
+/// — but a FIXED RATIO GOES SILENT EXACTLY WHEN THE DIAGNOSTIC BECOMES USEFUL.
+/// Prod 2026-08-21 ran ~170 misses/hour, so 1:512 fired about once every three
+/// hours and a 30-minute window contained nothing at all. The surviving misses
+/// at a low rate are the interesting ones, and the sampler was hiding them.
+///
+/// Per-reason, because the actionable reason is usually not the common one: that
+/// window was 27% `unknown_filter` (a gap in the matcher) against 37%
+/// `filter_not_eligible` (a correct refusal), and a global sampler spends its
+/// budget on whichever is loudest.
+pub fn sample_rollup_miss(reason: crate::rollup::MissReason) -> bool {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    const SAMPLE_INTERVAL_SECS: i64 = 60;
+    static LAST: [AtomicI64; crate::rollup::MissReason::COUNT] = [const { AtomicI64::new(i64::MIN) }; crate::rollup::MissReason::COUNT];
+    let now = crate::support::now_micros() / 1_000_000;
+    let slot = &LAST[reason as usize];
+    let last = slot.load(Ordering::Relaxed);
+    now.saturating_sub(last) >= SAMPLE_INTERVAL_SECS && slot.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
 }
 
 pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
@@ -1219,6 +1235,23 @@ pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<Str
         out.push('\n');
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use crate::rollup::MissReason;
+
+    /// A fixed 1-in-512 ratio went silent at low miss rates: prod 2026-08-21 ran
+    /// ~170 misses/hour, so it fired once per ~3h and a 30-minute diagnostic
+    /// window contained nothing. Every reason must yield a sample promptly, and
+    /// a loud reason must not consume another reason's budget.
+    #[test]
+    fn every_reason_samples_once_then_rate_limits_independently() {
+        for reason in MissReason::ALL {
+            assert!(super::sample_rollup_miss(reason), "{} never sampled", reason.label());
+            assert!(!super::sample_rollup_miss(reason), "{} sampled twice inside the interval", reason.label());
+        }
+    }
 }
 
 #[cfg(test)]

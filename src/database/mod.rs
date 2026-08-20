@@ -3680,7 +3680,7 @@ impl Database {
         // Sampled on the same limiter as `rollup_miss_sampled`, so a
         // multiple-per-second miss rate cannot flood the log.
         if let Some(project) = &first_uncovered
-            && crate::observability::sample_rollup_miss()
+            && crate::observability::sample_rollup_miss(crate::rollup::MissReason::IncompleteCoverage)
         {
             warn!(
                 project_id = %project,
@@ -3704,7 +3704,7 @@ impl Database {
             // it away, or that what survives is narrower than one grain. Those
             // want opposite fixes — build more coverage vs flush sooner vs widen
             // the window — and nothing outside the process can tell them apart.
-            if crate::observability::sample_rollup_miss() {
+            if crate::observability::sample_rollup_miss(crate::rollup::MissReason::TinyInterior) {
                 warn!(
                     lo = route.lo,
                     hi = route.hi,
