@@ -2877,3 +2877,42 @@ value came entirely from attributing first.
 OOMs every 12 h, after already wedging the maintenance tier once this session, is
 how a bad night becomes a bad week. The next step is attribution — a heap profile
 taken while RSS is high, not at boot — and that wants a waking operator.
+
+### Part XVI addendum — the OOM is a SPIKE, not the steady climb
+
+Sampled `process_rss_mb` (the in-process gauge, not `docker stats`) after the
+10:39 restart, on `d5688fd` under ~800 queries/min of real traffic:
+
+| UTC | uptime | `process_rss_mb` | buffer lag |
+| --- | --- | --- | --- |
+| 10:43:09 | ~7 m | 23,532 | 3,473,284 |
+| 10:46:56 | ~9 m | **13,804** | 219,981 |
+| 11:18:09 | ~39 m | 14,187 | 510,991 |
+
+Two things fall out.
+
+**WAL replay's working set releases cleanly.** RSS *fell* 23.5 → 13.8 GB as the
+buffer lag drained. Boot is not where the memory goes.
+
+**Steady-state growth cannot reach the kill.** Between the two post-replay
+samples the slope is **~766 MB/h**. From 14.2 GB, climbing to the 124.6 GB at
+which the kernel actually killed it would take **~144 hours**. The observed kill
+cadence is **8-20 hours** — a 7-18× discrepancy.
+
+So the process does not gradually leak into the wall. **Something allocates tens
+of gigabytes in a burst**, and everything between bursts is a slow, survivable
+drift. That reframes the search: stop looking for a leak, start looking for the
+event.
+
+**Caveat, stated because the slope is thin.** Two samples 31 minutes apart is a
+weak basis for a rate, and the climb need not be uniform. But the conclusion
+survives large sampling error: even if the true slope were **three times** my
+estimate, it would still imply ~48 h to reach the wall against an 8-20 h cadence.
+The order of magnitude is what carries this, not the precision.
+
+**Where to look first**, from prior attribution already in memory — all bursty,
+all previously measured on this box: a single scan selecting 514 files / 32.8 GB
+(the guard bounds concurrency, not size); bulk INSERT sustaining 1.2-1.8 GB/s;
+and the budget tree handing maintenance the remainder with three ceilings
+uncounted. A heap profile taken **while RSS is high** would settle it, and that
+wants a waking operator rather than a 12 h wait for the next burst.
