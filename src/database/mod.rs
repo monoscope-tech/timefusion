@@ -1718,14 +1718,13 @@ fn window_hour_masks(lo: i64, hi: i64) -> Option<Vec<(String, u32)>> {
     )
 }
 
-/// A `Remove` tombstone for `add` with `data_change: true` (the dedup rewrite
-/// drops rows, unlike optimize's data-preserving `data_change: false`).
 /// Whether a commit that returned an error actually landed.
 ///
 /// delta-rs surfaces a post-commit hook or snapshot-refresh failure as a commit `Err` even though
 /// `N.json` is already durably written. Deleting the staged parquet in that case orphans the Adds
 /// the landed commit references, so the flush path must tell the cases apart. See
 /// `Database::probe_commit_landed`.
+#[derive(Debug)]
 pub(crate) enum CommitProbe {
     /// `N.json` landed; every staged Add is active. Treat as success + drain.
     Landed,
@@ -1768,6 +1767,7 @@ const INCONCLUSIVE_COMMIT_MARKER: &str = "landing-unconfirmed";
 const COMMIT_LOCK_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A bounded in-guard commit await that did not succeed.
+#[derive(Debug)]
 struct CommitFailure {
     message: String,
     /// The await was ABANDONED mid-flight rather than returning an error. The
@@ -3747,13 +3747,6 @@ impl Database {
         datafusion_functions_json::register_all(&mut ctx)?;
         self.setup_session_udfs(&mut ctx)?;
         Ok(ctx)
-    }
-
-    /// Enable object store cache with foyer (deprecated - cache is now initialized in new())
-    /// This method is kept for backward compatibility but is now a no-op
-    pub async fn with_object_store_cache(self) -> Result<Self> {
-        // Cache is now initialized in new(), so this is a no-op
-        Ok(self)
     }
 
     /// Start background maintenance schedulers for optimize and vacuum operations
@@ -7040,9 +7033,8 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     // later ticks pack the next (strictly later) slice.
     let mut bytes = 0i64;
     let mut files: Vec<String> = vec![];
-    for (path, _, size, repair) in fresh.iter().filter(|(_, _, _, r)| !*r) {
+    for (path, _, size, _) in fresh.iter().filter(|(_, _, _, r)| !*r) {
         let (path, size) = (*path, *size);
-        let _ = repair;
         if !files.is_empty() && bytes + size > cap {
             // A lone-file slice is already a run — rewriting it is pure churn.
             // Skip past it to the next time slice instead of wedging the pass
@@ -9438,10 +9430,6 @@ impl TableProvider for ProjectRoutingTable {
                 None => Ok(plan),
             }
         };
-        let tag_shape = |f: &dyn Fn(&mut ScanShape)| {
-            f(&mut scan_state.lock());
-        };
-
         // Check if buffered layer is configured
         let has_layer = self.database.buffered_layer().is_some();
         debug!("ProjectRoutingTable::scan - buffered_layer present: {}, project_id: {}", has_layer, project_id);
@@ -9490,7 +9478,7 @@ impl TableProvider for ProjectRoutingTable {
                 )
                 .await?;
             if skip_dedup {
-                tag_shape(&|s| s.skip_dedup = true);
+                scan_state.lock().skip_dedup = true;
             }
             // This leg IS the Delta read, and until now it said so to nobody:
             // `record_scan` gates every dedup counter on `has_delta`, so a
@@ -9498,7 +9486,7 @@ impl TableProvider for ProjectRoutingTable {
             // however many it served. Prod runs with the buffer, which is why the
             // 2026-08-11 measurement was unaffected — but `query_delta_only`
             // (bypass_buffer) takes this path, so tests measured nothing at all.
-            tag_shape(&|s| s.has_delta = true);
+            scan_state.lock().has_delta = true;
             return wrap_result(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect());
         };
 
@@ -9523,7 +9511,7 @@ impl TableProvider for ProjectRoutingTable {
         // successful commit; never flipped back (compaction reduces files but
         // doesn't go to zero in steady state).
         let skip_delta = skip_delta || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
-        tag_shape(&|s| s.skipped_delta = skip_delta);
+        scan_state.lock().skipped_delta = skip_delta;
 
         // MemBuffer query. `query_partitioned_with_text_match` handles its
         // own atomic per-bucket prefilter inside the bucket lock — we must
@@ -9575,7 +9563,7 @@ impl TableProvider for ProjectRoutingTable {
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
         if mem_partitions.is_empty() && hot_plan.is_none() && hot_ranges.is_empty() {
             debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
-            tag_shape(&|s| s.has_delta = true);
+            scan_state.lock().has_delta = true;
             // Same guard for the dedup gate and the scan (see branch above, and
             // `scan_delta_only`'s doc comment). `readmit_mutable_filters: false`
             // here matches this branch's existing behavior of leaving
@@ -9601,7 +9589,7 @@ impl TableProvider for ProjectRoutingTable {
                 )
                 .await?;
             if skip_dedup {
-                tag_shape(&|s| s.skip_dedup = true);
+                scan_state.lock().skip_dedup = true;
             }
             return wrap_result(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect());
         }
@@ -9610,7 +9598,7 @@ impl TableProvider for ProjectRoutingTable {
         let mem_plan = match mem_partitions.is_empty() {
             true => None,
             false => {
-                tag_shape(&|s| s.has_mem = true);
+                scan_state.lock().has_mem = true;
                 Some(self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?)
             }
         };
@@ -9677,11 +9665,11 @@ impl TableProvider for ProjectRoutingTable {
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
         let delta_table = match self.database.try_fast_resolve(&project_id, &self.table_name) {
             Some(t) => {
-                tag_shape(&|s| s.fast_resolve_hit = Some(true));
+                scan_state.lock().fast_resolve_hit = Some(true);
                 t
             }
             None => {
-                tag_shape(&|s| s.fast_resolve_hit = Some(false));
+                scan_state.lock().fast_resolve_hit = Some(false);
                 self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?
             }
         };
@@ -9700,7 +9688,7 @@ impl TableProvider for ProjectRoutingTable {
                 query_time_range,
             )
             .await?;
-        tag_shape(&|s| s.has_delta = true);
+        scan_state.lock().has_delta = true;
 
         // Union the legs in recency order — mem, then hot tier, then Delta — so
         // DedupExec's keep-first favours the freshest copy of a row. The hot leg
