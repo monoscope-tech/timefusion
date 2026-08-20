@@ -1071,7 +1071,7 @@ impl Database {
             Ok((dropped, true)) => {
                 // Before the journal lock: `record_clean_slice` awaits, and the
                 // journal guard is a std Mutex.
-                match self.record_clean_slice(&table, &key.physical_table, &key.project_id, date, key.slice, &pre_files, dropped).await {
+                match self.record_clean_slice(&table, &key.physical_table, &key.project_id, date, (key.slice, dropped), &pre_files).await {
                     // Coordinator-owned tables are excluded from `dedup_sweep`,
                     // whose end-of-tick snapshot was otherwise the only
                     // persistence site for this cache.
@@ -2569,7 +2569,7 @@ impl Database {
     /// final time — so the rule cannot drift from the sweep/backfill paths.
     async fn record_clean_slice(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
-        slice: crate::maintenance_coordinator::TimeSlice, pre: &[String], dropped: u64,
+        (slice, dropped): (crate::maintenance_coordinator::TimeSlice, u64), pre: &[String],
     ) -> Result<Option<u64>> {
         let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
         let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
