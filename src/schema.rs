@@ -259,24 +259,39 @@ impl RollupSpec {
             z_order_columns: vec![],
             fields,
             time_column: Some("timestamp".into()),
-            // NO read-time dedup. A bucket is identified by time + dimension
-            // tuple hashed into `id`, but duplicates are impossible by
-            // construction: rollup waves commit Remove actions
-            // for every existing file in the (project, date) partition together
-            // with the new ones, so a partition only ever holds one build, and
-            // reads additionally pin `rollup_generation`.
+            // A tier declares its identity, so reads collapse superseded
+            // versions. This REVERSES an earlier "no read-time dedup" decision;
+            // both reasons it rested on were re-tested on 2026-08-20 and neither
+            // survives.
             //
-            // Declaring keys here made every read of a rollup plan a `DedupExec`
-            // over them — and the rewrite projects only dimensions and measures,
-            // so planning died with "DedupExec key `id` not in input schema" and
-            // every routed query fell back to a raw scan that then failed. Unit
-            // tests could not see it: they register the rollup as a `MemTable`,
-            // which has no dedup layer at all.
-            dedup_keys: vec![],
-            dedup_tiebreak: None,
+            // It claimed duplicates were impossible by construction, because
+            // rollup waves removed every file in a (project, date) partition as
+            // they wrote. That architecture is gone. The coordinator's
+            // replace-set removes only files whose slice is CONTAINED in the one
+            // being published, and (until `slice_retires`) untagged files never —
+            // so one measured prod partition held 45,483 rows for 7,923 buckets,
+            // 4 to 8 versions each, written by 320 separate passes.
+            //
+            // It also claimed declaring keys broke planning: "DedupExec key `id`
+            // not in input schema", every routed query falling back to a failing
+            // raw scan. That no longer reproduces anywhere in 1,031 tests, the
+            // routed rollup tests included.
+            //
+            // Both tiers declare the SAME keys, deliberately. The asymmetry this
+            // replaces — a derived tier protected by its maintenance-read
+            // collapse while the base tier had no read-time defence at all — is
+            // why one tier read 1.00 versions per id while the other read 5.64,
+            // with nothing at the schema level to say why.
+            //
+            // Clean bytes remain the goal, not this: a `DedupExec` over a
+            // partition holding one version per key is near-free, over one
+            // holding eight it is not. This is the safety net under the repair,
+            // not a substitute for it.
+            dedup_keys: vec!["timestamp".into(), "id".into()],
+            dedup_tiebreak: Some("updated_at".into()),
             tombstone_column: Some("deleted".into()),
-            // Never version_append: buckets are rebuilt wholesale, so there are
-            // no superseded versions and the read path pays no dedup ordering.
+            // Not version_append: that is for UPDATE/DELETE appending versions in
+            // place, which a tier never does — it is rebuilt wholesale.
             version_append: false,
             // A rollup of a rollup is a real design (1m -> 1h -> 1d) but it is
             // not this change: declaring it here would recurse at load.

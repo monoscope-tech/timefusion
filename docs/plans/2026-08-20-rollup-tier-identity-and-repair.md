@@ -151,13 +151,29 @@ is an optimisation rather than a rescue.
 
 ## Deliberately not doing
 
-**Declaring `dedup_keys` on the tier schema.** It looks like the obvious fix —
-reads would collapse versions and nothing above would matter. It was tried: it
-made every routed read plan a `DedupExec` over `id`, a column the rewrite does
-not project ("DedupExec key `id` not in input schema"), and every query fell back
-to a raw scan. It also taxes every tier read forever to defend against a state
-that should not exist. Prefer Phase 1 (make the state impossible) plus Phase 3
-(alarm if it happens) over paying per-read for it.
+**~~Declaring `dedup_keys` on the tier schema.~~ REVERSED 2026-08-20** — both
+reasons were re-tested and neither survives, which is why a "deliberately not
+doing" entry is worth re-verifying rather than inheriting.
+
+The schema comment claimed duplicates were impossible by construction, because
+rollup waves removed every file in a `(project, date)` partition as they wrote.
+That architecture is gone: the coordinator's replace-set removes only CONTAINED
+slices, so a measured prod partition held 45,483 rows for 7,923 buckets — 4 to 8
+versions each, from 320 write passes.
+
+It also claimed planning died with "DedupExec key `id` not in input schema". That
+no longer reproduces anywhere in 1,031 tests, routed rollup tests included.
+
+Both tiers now declare `(timestamp, id)` keep-greatest on `updated_at`. The
+asymmetry this removes was real and actively confusing: the derived tier was
+protected by its maintenance-read collapse while the base tier had no read-time
+defence at all, so 1h read 1.00 versions per id while 1m read 5.64 with nothing
+at the schema level to explain the difference.
+
+This does NOT replace Phases 1-2. A `DedupExec` over a partition holding one
+version per key is near-free; over one holding eight it is not, and the row count
+is the scan cost behind the 30d latency either way. Read-time dedup is the safety
+net under the repair, not a substitute for it.
 
 **Preserving tags through compaction.** Merging files from different slices
 produces genuinely disagreeing identities; `carried_coverage_tags` cannot invent

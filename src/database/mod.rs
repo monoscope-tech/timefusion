@@ -10892,14 +10892,25 @@ mod tests {
             table.state = Some(finalized.snapshot());
             *tier_ref.write().await = table;
         }
-        assert_eq!(tier_total(&db).await?, 6, "precondition: the untagged copy is live and every measure now double counts");
+        // Count FILES, not summed measures. Reads collapse versions now that a
+        // tier declares its identity, so a read-side sum would report the right
+        // answer over a partition that is still carrying the damage — which is
+        // exactly the confusion this whole area produced in the first place.
+        let live_files = async |db: &Database| -> Result<usize> {
+            let table = db.get_or_create_table(&project, &key.physical_table).await?;
+            let table = table.read().await.clone();
+            Ok(table.snapshot()?.log_data().iter().count())
+        };
+        assert_eq!(live_files(&db).await?, 2, "precondition: the untagged copy is live alongside the tagged one");
+        assert_eq!(tier_total(&db).await?, 3, "read-time dedup must already hide the duplicate from queries");
 
         // A late row makes the day genuinely re-eligible, which is how a rebuild
         // reaches a damaged partition in production.
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("s3", "op", &project, noon + 3)])?], true, None).await?;
         day_unit(&db)?;
         assert!(db.run_maintenance_units(1024).await? > 0, "the rebuild must run");
-        assert_eq!(tier_total(&db).await?, 4, "a day-wide rebuild must retire the untagged file, not stack a version beside it");
+        assert_eq!(live_files(&db).await?, 1, "a day-wide rebuild must RETIRE the untagged file, not stack a version beside it");
+        assert_eq!(tier_total(&db).await?, 4, "and the rebuilt partition counts each span once");
         Ok(())
     }
 

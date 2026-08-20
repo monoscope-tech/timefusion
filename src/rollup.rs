@@ -1904,11 +1904,13 @@ mod tests {
     #[test]
     fn a_merge_on_read_input_is_deduped_before_the_rollup_aggregate() {
         let base = crate::schema::get_schema("otel_logs_and_spans_rollup_dashboard_1m_v3").expect("the 1m tier is a declared rollup target");
-        // The tier deliberately declares none, so the maintenance read cannot
-        // get its collapse from the schema — that is the whole point of
-        // `rollup_tier_dedup`, and asserting it here stops a future change from
-        // declaring them and silently re-breaking query planning instead.
-        assert!(base.dedup_keys.is_empty(), "a rollup tier must NOT declare dedup keys; the query planner acts on them");
+        // A tier declares its identity, so reads collapse superseded versions
+        // the same way the maintenance read does — see `synthesize` for why the
+        // original "no read-time dedup" decision was reversed. `rollup_tier_dedup`
+        // still exists because the maintenance read registers the tier directly
+        // rather than through the routing table, so it cannot rely on the
+        // planner having inserted a `DedupExec`.
+        assert_eq!(base.dedup_keys, ["timestamp", "id"], "a rollup tier must declare its identity so reads collapse versions");
         let (keys, tiebreak, tombstone) = rollup_tier_dedup(base).expect("a generated tier carries timestamp/id/updated_at");
 
         let dedup = SliceDedup { keys: &keys, tiebreak: Some(tiebreak), tombstone };
@@ -1940,12 +1942,13 @@ mod tests {
         assert!(!target.version_append);
         // A rollup must declare NO dedup keys. `replace_rollup_partition` removes
         // every existing file in the partition in the same commit that adds the
-        // new ones, so duplicates are impossible — and declaring keys made every
-        // read plan a `DedupExec` over them, which the rewrite's
-        // dimensions-and-measures projection does not carry. In production that
-        // turned every routed query into "DedupExec key `id` not in input
-        // schema" and then a failed raw fallback.
-        assert!(target.dedup_keys.is_empty(), "a rollup must not require read-time dedup: {:?}", target.dedup_keys);
+        // Both tiers get the SAME identity, base and derived alike. The
+        // asymmetry that preceded this — a derived tier protected by its input
+        // collapse while the base tier had no read-time defence at all — is what
+        // let one tier read 1.00 versions per id while the other read 5.64 with
+        // no visible difference between them.
+        assert_eq!(target.dedup_keys, ["timestamp", "id"], "every rollup tier declares the same identity");
+        assert_eq!(target.dedup_tiebreak.as_deref(), Some("updated_at"), "keep-greatest needs the tiebreak");
     }
 
     #[test]
