@@ -2637,3 +2637,78 @@ slope is not yet.
 At the observed ~2,600 bins/h the 10.5 k backlog clears in roughly four hours.
 **Do not re-measure the 30 d query until it has** — the duplication it is meant to
 remove is retired last, in the 2.5 % that actually rewrite.
+
+---
+
+## Part XIV — a hypothesis about tier compaction that needs falsifying first
+
+**Status: NOT a conclusion. It contradicts a comment backed by prod evidence, so
+it gets verified before anything is built on it.**
+
+The goal scorecard now reads: coverage DONE (30 d, all tiers), routing DONE
+(91.5 % hit rate), **latency NOT MET** — 4.5–8.4 s for 38 k rows reading the 1 h
+tier directly. The cause is that rollup tiers are excluded from compaction on
+purpose: every unit publishes its own file, nothing consolidates them, and
+`plan_compaction_debt` skips tiers because packing strips the identity tags.
+
+### What the code actually does
+
+`recover_rollup_coverage` fills `rollup_slice_coverage` in two passes:
+
+1. From `journal().published_rollups(source, target)` — **unconditionally**.
+2. From Delta `Add` tags — but each tagged entry is gated on
+   `rollup_slice_complete(...)`, which searches `snapshot.tasks` for a
+   `Complete` `BaseRollup`/`DerivedRollup` with an **exact** slice match:
+
+```rust
+let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
+if !complete || generation_id(...) != generation { continue; }
+```
+
+Both passes insert under the same key `(project, source, target, start, end)`.
+
+**So a tag cannot establish coverage the journal does not already have.** It can
+only confirm it, and refresh `rows`/generation. On this reading, packing a tier
+loses no coverage *while the journal still holds the `Complete` records* — and it
+does: retiring the ~63 k redundant base-rollup records is still an open task,
+explicitly blocked on "tag coverage proven sufficient first".
+
+If that holds, the ordering is inverted from how it has been treated: **tags are
+today redundant with the journal, not the other way round**, and tier compaction
+is far cheaper than "tag-preserving merge with containment semantics".
+
+### Why I do not believe it yet
+
+The exclusion comment cites real measurements: 58 of 119 hygiene claims targeted
+tier tables, the 1 m tier carried 79 untagged live files on 08-19, and a 10-day
+window reported `rollup_miss_not_built_total +45` as its **sole** miss reason.
+Untagged files demonstrably caused misses. That is not compatible with "tags are
+redundant" unless something else also consults them.
+
+So exactly one of these is true:
+
+- coverage is rebuilt from tags somewhere **other** than boot recovery, or
+- the miss path consults tags directly rather than `rollup_slice_coverage`, or
+- the journal records for those slices were already gone (checkpoint/compaction),
+  making tags the only source in practice — which would make the redundancy
+  argument circular.
+
+### The falsification, before any code
+
+1. Find every writer of `rollup_slice_coverage` and every reader that decides
+   `not_built`. If boot recovery is the only writer, hypothesis survives.
+2. On prod, take a slice known to have untagged tier files and check whether the
+   journal holds a `Complete` record for it. If it does and the router still
+   says `not_built`, the journal is not sufficient and the hypothesis is dead.
+3. Only then decide between: compact tiers and keep journal records forever;
+   or carry a **set** of slice bounds on merged files (a `slices` tag holding
+   the union, expanded by `recover_rollup_coverage` into one entry per original
+   slice) — which preserves exact-match semantics with no containment change.
+
+Option 3's second form is the safe design regardless of how (1) and (2) resolve,
+because it keeps every original slice individually represented. It is more code
+than option 1 and immune to the failure that option 1 risks.
+
+**Do not skip step 2.** The last three defects in this document were all "a
+predicate refuses for a reason the gauges do not show", and this hypothesis is
+one measurement away from being either a large simplification or a repeat.
