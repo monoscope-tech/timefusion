@@ -4,6 +4,35 @@
 `9b4b64dad7af955fbad42fa8d43c90da`, project `6297304f`), measured live against
 `timefusion.s.past3.tech` on deployed `37c48f2`.
 
+## Prod baseline matrix (2026-08-20 night, deployed 493bb1b)
+
+Full shapes x windows matrix, serial with load controls (raw in scratchpad
+bench_baseline/). Targets: 30d<10s, 24h<1s. P1=busiest tenant, P2=incident
+project. Only ONE cell of 40 completes at 30d.
+
+| Shape | Proj | 1h | 24h | 7d | 30d |
+|---|---|---|---|---|---|
+| A trace lookup | P1 | 4,696 | TIMEOUT | TIMEOUT | skip |
+| A trace lookup | P2 | 1,323 | TIMEOUT | TIMEOUT | skip |
+| B email miss | P1 | 1,050 | 8,808 | 5,180 | 4,467 |
+| B email miss | P2 | 203 | TIMEOUT | TIMEOUT | skip |
+| C level=ERROR LIMIT 100 | P1 | TIMEOUT | TIMEOUT | TIMEOUT | skip |
+| C level=ERROR LIMIT 100 | P2 | 2,574 | TIMEOUT | TIMEOUT | skip |
+| D kind=SPAN count | P1 | 5,553 | TIMEOUT | TIMEOUT | skip |
+| D kind=SPAN count | P2 | 728 | TIMEOUT | TIMEOUT | skip |
+| E plain count | P1 | 1,248 | 12,235 | TIMEOUT | skip |
+| E plain count | P2 | 169 | TIMEOUT | TIMEOUT | skip |
+
+Attribution (EXPLAIN per shape, 24h): A/C carry the selective filter only in
+FilterExec bundled with the text_match hint — zero parquet predicate on any
+scan (the P0 in this doc; B is the positive control: its email predicate DOES
+push, and it is the only shape whose 30d completes, 4.5s, wider windows
+nearly free). D is the only full-set/Coalesce plan and has exactly one
+EmptyExec leg (the §4 EmptyExec-veto bug). Every plan pays a 427-file-group
+hot-tier leg (fragmentation, the fixed cost). cert_granted_total=0 /
+dedup_denied 100% (the §2 certification gap). The night's four fixes map 1:1
+onto these four causes.
+
 ## The measurement ladder (one project, otel_logs_and_spans)
 
 | query | result |
@@ -266,7 +295,22 @@ Original diagnosis checklist (retained):
       (`timefusion_dedup_certification_persist`).
 - [ ] Watch `cert_granted_total` / `dedup_skipped_pct` move after the fix.
 
-### 3. Duplicate removal at rest — prefer dedup-as-you-compact
+### 3. Duplicate removal at rest — RESOLVED 2026-08-20 night (both directions)
+Two independent results, reconciled:
+- `feat/dedup-as-you-compact` @ ca4983c: sealed consolidation ALREADY collapses
+  versions while merging (SortByDedup, since e69de6a); the flag
+  `timefusion_compact_dedup_merge` (default OFF) extends it to `compact_date`.
+- `work/dedup-parallel` df30961 proves the structural limit: two versions of a
+  key stranded in separate CONVERGED target-sized sorted runs are never
+  re-selected together, so compaction-time dedup can never certify
+  convergence. It is a space/read-amplification optimization; **authoritative
+  physical collapse stays with the dedup engine**, whose input scope contains
+  every version of a rewritten key.
+Consequence: the drain (or slice-covered coordinator dedup units, see §2) is
+NOT retirable. Certification comes from the dedup engine; compaction reduces
+how much it has to chew. The original retirement criterion is refuted.
+
+Original framing (superseded):
 - [ ] Test whether compaction can be the primary drain: collapse versions
       keep-greatest while merging overlap groups; outputs become unique-within
       by construction; certification follows clean compaction.
