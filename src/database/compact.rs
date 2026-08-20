@@ -507,7 +507,37 @@ impl Database {
             // SortBy path so those transition sorts can't stack and exhaust the
             // maintenance pool (the 2026-07-14 OOM multiplier); steady-state
             // SortBy is cheap SPM, so serializing partitions costs little.
-            let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
+            // Dedup-as-you-compact (`timefusion_compact_dedup_merge`, default
+            // off): upgrade SortBy to SortByDedup so the merge also collapses
+            // merge-on-read versions — the fork drops consecutive equal-key
+            // rows from the sorted stream, keeping the greatest
+            // `dedup_tiebreak` first (tiebreak DESC NULLS LAST is appended to
+            // the sort, so a NULL tiebreak always loses, matching
+            // `dedup_batches`). Versions of one key are consecutive because
+            // the sort leads with the dedup keys (`id` is a content hash
+            // shared by all versions), which is `DedupConfig`'s precondition.
+            //
+            // SOUNDNESS of per-merge-group keep-greatest: within one merge
+            // group the survivor is the greatest version of its key in the
+            // group. A version OUTSIDE the group is either newer (it beats our
+            // survivor at read time via DedupExec — unchanged) or older (our
+            // survivor already supersedes it). Dropping a version could only
+            // be wrong if that version could beat one surviving elsewhere,
+            // which is impossible: everything we drop loses to the survivor
+            // we keep. TOMBSTONES are retained by construction — SortByDedup
+            // emits >= 1 row per key and never drops a whole key, so a
+            // winning `deleted=true` version survives and keeps suppressing
+            // its base row (cf. stage_dedup_chunk's drop_tombstones=None).
+            //
+            // Known tension, accepted for the default-off experiment: the fork
+            // commits SortByDedup with data_change=false (as sealed
+            // consolidation already ships), while stage_dedup_chunk insists
+            // row-dropping rewrites carry data_change=true.
+            let (optimize_type, declare_sorted) = if self.config.maintenance.timefusion_compact_dedup_merge {
+                consolidate_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by)
+            } else {
+                choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by)
+            };
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
             // Serialise SortBy at in-server concurrency; explicit off-box
             // concurrency opts into parallel transition sorts.

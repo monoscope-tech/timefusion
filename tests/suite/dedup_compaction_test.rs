@@ -1801,6 +1801,67 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     Ok(())
 }
 
+/// Dedup-as-you-compact (docs/plans/2026-08-20 §3): with
+/// `timefusion_compact_dedup_merge` on, the on-demand compaction path
+/// (`compact_date`) must collapse merge-on-read versions WHILE merging files —
+/// one physical row per (timestamp, id) key, the greatest `updated_at` winning —
+/// and must RETAIN tombstones (a key whose winning version carries
+/// `deleted=true` keeps that row; dropping it would resurrect the base row).
+///
+/// Physical rows are asserted via the Delta log (`delta_physical_row_count`);
+/// the read-side DedupExec would mask exactly the property under test.
+#[serial]
+#[tokio::test]
+async fn compact_dedup_merge_collapses_versions_and_retains_tombstones() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("compact_dedup_merge").with_buffer_mode(BufferMode::Enabled).build()).clone();
+    cfg.maintenance.timefusion_compact_dedup_merge = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    // Yesterday noon UTC: sealed, and never straddles a midnight-UTC date flip.
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    // Key A: two versions across two files, differing only in `hashes` (the
+    // mutable column). `stamp_version` gives the second insert the greater
+    // `updated_at`, so it must be the survivor.
+    let versioned = |tag: &str| -> Result<_> {
+        let mut value = test_span_ts("mor_key", "span", &project_id, ts);
+        value["hashes"] = serde_json::json!([tag]);
+        json_to_batch(vec![value])
+    };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![versioned("original")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![versioned("updated")?], true, None).await?;
+    // Key B: a tombstone — its (single, winning) version marks deletion. The
+    // merge must carry it through verbatim, never drop it.
+    let tombstone = {
+        let mut value = test_span_ts("dead_key", "span", &project_id, ts + 1);
+        value["deleted"] = serde_json::json!(true);
+        json_to_batch(vec![value])?
+    };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![tombstone], true, None).await?;
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 3, "pre-compact: two versions of key A + the key B tombstone");
+
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+    db.compact_date(&table_ref, "otel_logs_and_spans", date, Some(&project_id)).await?;
+
+    // THE claim: the merged output is unique-within — one physical row per key.
+    // The 2 includes key B's tombstone: dropping it would have left 1.
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "post-compact: key A collapsed to its winner, key B's tombstone retained");
+    // Through the read path: key A's greatest-updated_at version is what a query
+    // gets; key B is invisible — its retained tombstone keeps suppressing it
+    // (which is exactly why the row must survive the merge physically).
+    let rows = db
+        .query_delta_only(&format!("SELECT id, array_element(hashes, 1) AS tag FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY id"))
+        .await?;
+    let got: Vec<(String, String)> = rows
+        .iter()
+        .flat_map(|b| (0..b.num_rows()).map(|i| (array_get_str(b.column(0).as_ref(), i), array_get_str(b.column(1).as_ref(), i))).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(got, vec![("mor_key".into(), "updated".into())], "the greatest-updated_at version wins and the tombstoned key stays suppressed");
+    Ok(())
+}
+
 /// Regression, prod 2026-08-09 → 08-11: every 5-minute service-map rollup failed with
 ///
 ///     Internal error: DedupExec key `id` not in input schema
