@@ -8,23 +8,19 @@ use timefusion::storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCa
 #[tokio::test]
 #[serial]
 async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
-    // Clean up any existing cache directory
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_delta_checkpoint_cache");
 
-    // Create config with checkpoint caching disabled (default)
     let config = FoyerCacheConfig::test_config("delta_checkpoint_cache");
 
     let inner = Arc::new(InMemory::new());
     let shared_cache = SharedFoyerCache::new(config).await?;
     let cache = FoyerObjectStoreCache::new_with_shared_cache(inner.clone(), &shared_cache);
 
-    // Test 1: Regular file should be cached
     let regular_path = Path::from("data/file.parquet");
     let regular_data = b"regular parquet data";
     // Put through cache will automatically cache the data
     cache.put(&regular_path, PutPayload::from(&regular_data[..])).await?;
 
-    // First get should hit the cache (because put caches the data)
     let stats1 = cache.get_stats().await;
     let _ = cache.get(&regular_path).await?;
     let stats2 = cache.get_stats().await;
@@ -35,12 +31,10 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let stats3 = cache.get_stats().await;
     assert_eq!(stats3.main.hits - stats2.main.hits, 1, "Second get should be a hit");
 
-    // Test 2: _last_checkpoint file should now be cached (with stale-while-revalidate)
     let checkpoint_path = Path::from("table/_delta_log/_last_checkpoint");
     let checkpoint_data = b"checkpoint metadata";
     inner.put(&checkpoint_path, PutPayload::from(&checkpoint_data[..])).await?;
 
-    // First get should miss the cache
     let stats4 = cache.get_stats().await;
     let _ = cache.get(&checkpoint_path).await?;
     let stats5 = cache.get_stats().await;
@@ -51,7 +45,6 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let stats6 = cache.get_stats().await;
     assert_eq!(stats6.main.hits - stats5.main.hits, 1, "Second checkpoint get should hit");
 
-    // Test 3: Writing a commit file should invalidate _last_checkpoint
     let commit_path = Path::from("table/_delta_log/00000001.json");
     let commit_data = b"commit data";
 
@@ -61,12 +54,10 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     // The checkpoint cache should have been invalidated
     // (though in this case it wasn't cached anyway due to cache_delta_checkpoints=false)
 
-    // Test 4: Delta metadata files should use shorter TTL
     let metadata_path = Path::from("table/_delta_log/00000000.json");
     let metadata_data = b"metadata";
     cache.put(&metadata_path, PutPayload::from(&metadata_data[..])).await?;
 
-    // First get should hit (because put caches the data)
     let stats7 = cache.get_stats().await;
     let _ = cache.get(&metadata_path).await?;
     let stats8 = cache.get_stats().await;
@@ -87,10 +78,8 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
-    // Clean up any existing cache directory
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_checkpoint_invalidation");
 
-    // Create config with checkpoint caching ENABLED to test invalidation
     let config = FoyerCacheConfig::test_config_with("checkpoint_invalidation", |c| {
         c.ttl = Duration::from_secs(60); // Longer TTL to test invalidation
     });
@@ -99,7 +88,6 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     let shared_cache = SharedFoyerCache::new(config).await?;
     let cache = FoyerObjectStoreCache::new_with_shared_cache(inner.clone(), &shared_cache);
 
-    // Setup: Create checkpoint file with unique path for this test
     let checkpoint_path = Path::from("test_invalidation_table/_delta_log/_last_checkpoint");
     let checkpoint_data = b"version: 10";
     inner.put(&checkpoint_path, PutPayload::from(&checkpoint_data[..])).await?;
@@ -160,7 +148,6 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
-    // Clean up any existing cache directory
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_delta_ttl");
 
     let config = FoyerCacheConfig::test_config_with("delta_ttl", |c| {
@@ -174,7 +161,6 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let shared_cache = SharedFoyerCache::new(config).await?;
     let cache = FoyerObjectStoreCache::new_with_shared_cache(inner.clone(), &shared_cache);
 
-    // Test both metadata and regular files with same TTL
     let metadata_path = Path::from("table/_delta_log/00000000.json");
     cache.put(&metadata_path, PutPayload::from(&b"metadata"[..])).await?;
 
@@ -188,7 +174,6 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let stats3 = cache.get_stats().await;
     assert_eq!(stats3.main.hits - stats2.main.hits, 1, "Should hit cache within TTL");
 
-    // Wait for TTL to expire (>2s TTL + margin)
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
     // Should miss cache after TTL
@@ -197,14 +182,12 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     assert_eq!(stats4.main.misses - stats3.main.misses, 1, "Should miss cache after TTL");
     assert_eq!(stats4.main.ttl_expirations - stats3.main.ttl_expirations, 1, "Should record TTL expiration");
 
-    // Test regular file with SAME TTL (unified caching)
     let regular_path = Path::from("data/file.parquet");
     cache.put(&regular_path, PutPayload::from(&b"data"[..])).await?;
 
     let _ = cache.get(&regular_path).await?;
     let _ = cache.get(&regular_path).await?;
 
-    // Wait same time as before
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
     // Should also miss cache after TTL (same TTL for all files)

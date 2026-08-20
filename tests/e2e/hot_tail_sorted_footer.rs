@@ -172,7 +172,6 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
     );
 
     // The repair must converge: once rewritten the output is a tagged sorted
-    // run, so further ticks must stop touching it. Without that this is an
     // infinite 1->1 rewrite loop.
     let settled: Vec<String> = {
         for _ in 0..3 {

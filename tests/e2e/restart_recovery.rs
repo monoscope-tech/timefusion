@@ -66,7 +66,6 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
         assert!(stats.mem_total_rows >= 3, "expected rows in MemBuffer pre-crash, got {stats:?}");
     }
 
-    // Wait long enough for the 200ms WAL fsync schedule to flush writes to
     // disk — otherwise crash_for_test() may drop unfsynced bytes.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -123,7 +122,6 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     let restart_elapsed = t0.elapsed();
 
     // The physical-history optimization scans the unified Delta log once and
-    // then derives each logical project's cursor independently. Verify that no
     // tenant inherited a co-tenant's cursor and that both the flushed prefix
     // and unflushed WAL tail survived for every project.
     let client = env.pg_client().await?;

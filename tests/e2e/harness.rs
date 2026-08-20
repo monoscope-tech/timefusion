@@ -19,31 +19,9 @@ use tokio::sync::Notify;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-/// MinIO image, pinned to a release that implements conditional PUT
-/// (`If-None-Match: *`).
-///
-/// 2026-07-30: `MinIO::default()` in testcontainers-modules 0.11 is
-/// `RELEASE.2022-02-07`, which predates S3 conditional writes and answers
-/// `If-None-Match: *` with a plain 200 + overwrite. Delta's whole OCC design
-/// rests on `write_commit_entry` being an atomic put-if-absent (delta-rs uses
-/// `PutMode::Create`, object_store maps it to that header), so on that image
-/// two writers racing for version N BOTH commit "successfully" and the later
-/// PUT silently clobbers the earlier commit file — destroying its actions and
-/// with them an acked, committed AddFile.
-///
-/// That is what made `append_during_dv_merge_is_not_dropped` flaky (~1 in 3):
-/// `tolerate_concurrent_appends` makes a DV merge rebase onto — and therefore
-/// race for the same version as — a concurrent flush commit, and one 1-row
-/// flush commit per failure lost its file. Real object stores (S3, R2) enforce
-/// the precondition, so this was never a production write-path bug; the test
-/// environment was silently non-atomic. Any bump must keep conditional PUT —
-/// `harness_object_store_enforces_atomic_commits` guards it.
-///
-/// Built as a [`GenericImage`], NOT `testcontainers_modules::minio::MinIO`:
-/// the module's ready condition waits for "API:" on STDOUT, which only the
-/// ancient default image satisfies — modern MinIO banners on STDERR, so the
-/// module + this tag times out on every container start (CI 2026-07-29:
-/// 30 min of 60s startup timeouts, one per test, then the job was killed).
+/// MinIO release with atomic conditional PUT support. The testcontainers
+/// module's older default can overwrite racing Delta commits. Modern MinIO
+/// prints its readiness banner on stderr, hence the custom image below.
 pub const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 
 pub fn pinned_minio_image() -> GenericImage {
@@ -499,9 +477,7 @@ impl Drop for E2eEnv {
     }
 }
 
-// ---------------------------------------------------------------------------
 // helpers
-// ---------------------------------------------------------------------------
 
 struct BuildCfgArgs<'a> {
     endpoint: &'a str,

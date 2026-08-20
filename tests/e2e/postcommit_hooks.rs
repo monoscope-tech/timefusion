@@ -115,7 +115,6 @@ async fn reconcile_removes_dangling_add() -> anyhow::Result<()> {
     assert!(maintenance_stats().dangling_removed.load(Relaxed) > before, "reconcile did not Remove the dangling Add");
 
     // Table is consistent again: planning a Delta scan must not error on the
-    // now-removed missing file.
     drain(&env).await?;
     let client = env.pg_client().await?;
     let _: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);

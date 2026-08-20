@@ -1,25 +1,8 @@
-//! SIGKILL durability suite — reproduction of the 2026-07-27 acked-write loss.
+//! SIGKILL durability regression for the 2026-07-27 acked-write loss.
 //!
-//! Incident: TimeFusion was OOM-killed (exit 137) at 01:45:25Z. Spans for
-//! 01:36–01:44Z were produced to Kafka, consumed, offsets committed, and NO
-//! dead-letter message was ever emitted — yet ~200k rows across 10 tenants are
-//! absent from Delta. Every layer reported success; the rows are simply gone.
-//!
-//! Why the existing `tests/e2e/restart_recovery.rs` cannot catch this: its
-//! `E2eEnv::restart` calls `crash_for_test`, which cancels background tasks and
-//! then DROPS the buffered layer / walrus handles in-process. Drop impls run —
-//! flushing writer state, persisting cursors — none of which a `kill -9` grants.
-//! Those tests therefore assert durability of a shutdown path prod never takes.
-//!
-//! This suite spawns the REAL `timefusion` binary as a child process, drives it
-//! over pgwire, and `SIGKILL`s it. The invariant under test is the only one that
-//! matters for the incident:
-//!
-//!   **If an INSERT returned success to the client, the rows MUST be queryable
-//!   after a SIGKILL + restart.**
-//!
-//! Anything less is silent data loss that no producer-side DLQ can catch,
-//! because the producer was told the write succeeded.
+//! Unlike the in-process restart tests, this suite kills the real pgwire server
+//! without running destructors. Every acknowledged insert must remain queryable
+//! after restart; rejected inserts carry no such durability promise.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -29,8 +12,6 @@ use tokio_postgres::{Client, NoTls};
 
 const LOCAL_MINIO: &str = "127.0.0.1:9000";
 const PROJECT: &str = "kill_test";
-
-// ---------------------------------------------------------------- MinIO setup
 
 /// An unused localhost port: bind :0, read the assignment, release it. The
 /// window between release and the child's bind is small enough in practice, and
@@ -97,8 +78,6 @@ async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
         }
     }
 }
-
-// ------------------------------------------------------------- TF subprocess
 
 /// Knobs that shape the crash window under test. Defaults give the plain
 /// "acked into WAL+MemBuffer, nothing flushed yet" case.
@@ -271,8 +250,6 @@ impl Drop for Tf {
     }
 }
 
-// ------------------------------------------------------------------- SQL bits
-
 /// One multi-row INSERT. Returns only after the server acked it — which is the
 /// precise moment the durability promise is made.
 async fn insert_rows(client: &Client, project: &str, tag: &str, n: usize, base_ts: i64) -> Result<()> {
@@ -313,8 +290,6 @@ async fn count_after_restart(tf: &Tf, project: &str) -> Result<i64> {
     }
     Err(last)
 }
-
-// ---------------------------------------------------------------- test matrix
 
 /// CASE 1 — the incident in its simplest form. Rows acked into WAL+MemBuffer,
 /// nothing flushed, process SIGKILLed. WAL replay must restore every acked row.

@@ -394,7 +394,6 @@ mod sqllogictest_tests {
             let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
             let auth_config = timefusion::server::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
 
-            // Wait for shutdown signal or server termination
             tokio::select! {
                 _ = shutdown_signal_clone.notified() => {},
                 res = timefusion::server::serve_with_logging(Arc::new(session_context), &opts, auth_config, None, None, std::future::pending::<()>()) => {

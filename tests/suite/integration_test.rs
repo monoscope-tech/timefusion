@@ -27,7 +27,6 @@ mod integration {
 
             let cfg = minio_test_config(&test_id, &format!("/tmp/timefusion-{test_id}"));
 
-            // Create database with explicit config - no global state
             let db = Database::with_config(cfg).await?;
             let db = Arc::new(db);
 
@@ -55,7 +54,6 @@ mod integration {
                 }
             });
 
-            // Wait for server readiness
             Self::connect(port).await?;
 
             Ok(Self { port, test_id, shutdown })
@@ -106,7 +104,6 @@ mod integration {
         let client = server.client().await?;
         let insert = TestServer::insert_sql();
 
-        // Insert and verify single record
         client
             .execute(&insert, &[&"test_project", &server.test_id, &"test_span_name", &"OK", &"Test integration", &"INFO", &vec!["Integration test summary"]])
             .await?;
@@ -115,7 +112,6 @@ mod integration {
             client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &server.test_id]).await?.get(0);
         assert_eq!(count, 1);
 
-        // Verify field values
         let row = client
             .query_one("SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &server.test_id])
             .await?;
@@ -140,7 +136,6 @@ mod integration {
                 .await?;
         }
 
-        // Verify total count
         let total: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
         assert_eq!(total, 6);
 
@@ -161,11 +156,9 @@ mod integration {
         let client = server.client().await?;
         let insert = TestServer::insert_sql();
 
-        // Insert test data
         let span_id = Uuid::new_v4().to_string();
         client.execute(&insert, &[&"test_project", &span_id, &"original_name", &"OK", &"Original message", &"INFO", &vec!["Original summary"]]).await?;
 
-        // Test single field update
         client
             .execute(
                 "UPDATE otel_logs_and_spans SET hashes = make_array($1) WHERE project_id = $2 AND id = $3",
@@ -178,7 +171,6 @@ mod integration {
             .await?;
         assert_eq!(row.get::<_, String>(0), "Updated message");
 
-        // Test multiple field update
         client
             .execute(
                 "UPDATE otel_logs_and_spans SET hashes = make_array($1, $2) WHERE project_id = $3 AND id = $4",
@@ -195,7 +187,6 @@ mod integration {
         assert_eq!(row.get::<_, String>(0), "ERROR");
         assert_eq!(row.get::<_, String>(1), "ERROR");
 
-        // Test conditional update
         for i in 0..3 {
             let status = if i % 2 == 0 { "OK" } else { "ERROR" };
             client.execute(&insert, &[&"test_project", &format!("update_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]]).await?;
@@ -224,11 +215,9 @@ mod integration {
         let client = server.client().await?;
         let insert = TestServer::insert_sql();
 
-        // Insert test data
         let span_id = Uuid::new_v4().to_string();
         client.execute(&insert, &[&"test_project", &span_id, &"to_delete", &"OK", &"Message", &"INFO", &vec!["Summary"]]).await?;
 
-        // Verify insertion
         let count: i64 =
             client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?.get(0);
         assert_eq!(count, 1);
@@ -236,12 +225,10 @@ mod integration {
         // Delete the record
         client.execute("DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
 
-        // Verify deletion
         let count: i64 =
             client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?.get(0);
         assert_eq!(count, 0);
 
-        // Test conditional delete
         for i in 0..4 {
             let status = match i % 3 {
                 0 => "OK",
@@ -349,8 +336,6 @@ mod integration {
     // BOTH a bound param and now() must re-evaluate now() on every execute (not
     // freeze it at parse). tokio-postgres caches prepared statements by SQL
     // text, so the second `query()` reuses the statement (Parse once, Bind/
-    // Execute twice) — the exact case that froze before the execute-time
-    // now()-injection hook (datafusion-postgres fork extra_execute_params).
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn mixed_now_and_param_prepared_statement_stays_fresh() -> Result<()> {
@@ -374,7 +359,6 @@ mod integration {
         assert_eq!(r1.get::<_, i64>("a"), 42);
         assert_eq!(r2.get::<_, i64>("a"), 7);
 
-        // now() is fresh per execute — the freeze bug would make these equal.
         let t1: std::time::SystemTime = r1.get("t");
         let t2: std::time::SystemTime = r2.get("t");
         assert!(t2 > t1, "now() must advance across executes of a reused prepared statement (t1={t1:?} t2={t2:?})");
