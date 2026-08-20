@@ -2310,3 +2310,49 @@ let it run.** Open questions that need that quiet window:
 1. Does 2026-08-13 finally take a SealedConsolidation claim?
 2. Does `rollup_median_contiguous_days` climb from 4 as the 6,860 base rollups drain?
 3. Does `rollup_hits_full_total` leave zero on a long-lived process?
+
+## Part IX — 2026-08-20: a superseded parent vetoed its own replacement
+
+The eighth defect of the same shape, and the one that gated 30d queries.
+
+**Symptom.** The 1h derived tier — what 30d dashboards read — held 22 days with
+its oldest date frozen at 2026-07-25, while the 1m base tier held 31 from 07-20.
+Over 32 minutes both tiers gained a day at the NEWEST end only (the live
+frontier); neither oldest date moved. Every routed query went hybrid: +2,482
+hybrid, +0 full. A 30d `time_bucket('1 hour')` query for shipbubble routed
+correctly, found 07-21…07-24 missing, unioned a raw scan of those days, and hit
+the 60 s timeout.
+
+**Cause.** `blocks_rollup_backfill` excluded only `Complete`. `Superseded` is what
+`split_time_task` leaves on a parent and is never claimable — so every day whose
+unit was ever split (most of them, after the 87k-unit explosion) had its
+(project, date, tier) cell marked "already queued" permanently. The planner could
+not re-admit it; the hole was frozen forever.
+
+**Why no gauge caught it.** `claimability_census` counts only Pending/Retry, so the
+superseded parents doing the blocking appeared in NO metric. `derived_pending=22`
+read as a healthy, nearly-empty queue. Only the pairing of `cells_missing=210`
+with `cells_wanted=0` — the census added after the last night this cost — made it
+visible at all. **A state that blocks scheduling but is excluded from every
+scheduling gauge is a permanent blind spot; count it somewhere.**
+
+**Fix** (`52e99aa`): `Superseded` no longer vetoes. Safe because a split parent's
+children are `Pending` and veto on their own; `can_fuse` already made exactly this
+reversal for coarsening, so the lesson was learned in one place and not the other.
+
+**Effect, within one minute of deploy:**
+
+| | pre-fix 01:35 | 02:01 |
+|---|---|---|
+| `cells_wanted` | **0** | **162** |
+| `cells_missing` | 210 | 179 |
+| `tier_holes` | 379 | 305 |
+| `derived_pending` | 22 | 172 |
+| `derived_refusal` | `dependencies:…` | `CLAIMABLE:…` |
+| `rollup_median_contiguous_days` | 5 | **8** |
+
+`rollup_backfill_planned` (`queued=24 remaining=138`) began printing at all — it
+only logs when there is something to queue.
+
+**Still to confirm:** the 1h tier's oldest date moving back from 2026-07-25. The
+units are queued, not yet finished.
