@@ -7,8 +7,19 @@
 ## Prod baseline matrix (2026-08-20 night, deployed 493bb1b)
 
 Full shapes x windows matrix, serial with load controls (raw in scratchpad
-bench_baseline/). Targets: 30d<10s, 24h<1s. P1=busiest tenant, P2=incident
-project. Only ONE cell of 40 completes at 30d.
+bench_baseline/). Targets: 30d<10s, 24h<1s. P1=busiest tenant
+(`dcad860a-9a98-4c9e-9e69-20d52dcf90e2`, 24.7k rows/10min), P2=incident
+project (`6297304f-89c0-48a9-9b5c-20bcac61f54e`). Only ONE cell of 40
+completes at 30d.
+
+Method (so a rerun is comparable): one query at a time; `SELECT 1` control
+between every cell (controls 20–211ms, median ~26ms — no load skew);
+statement_timeout 12s on 1h/24h, 30s on 7d/30d; TIMEOUT = one attempt, never
+retried; 30d skipped when the shape's 7d timed out. Point-lookup shapes are
+`SELECT timestamp,id,name,level … LIMIT 100`; counts are
+`SELECT count(1) FROM (SELECT id …) t` to dodge the count-pushdown
+over-report. Trace ids: P1 `4eef98285d8ce7f931724244dfe07f66`, P2
+`8776383c42b77d8043c4196968fafae1`.
 
 | Shape | Proj | 1h | 24h | 7d | 30d |
 |---|---|---|---|---|---|
@@ -22,6 +33,28 @@ project. Only ONE cell of 40 completes at 30d.
 | D kind=SPAN count | P2 | 728 | TIMEOUT | TIMEOUT | skip |
 | E plain count | P1 | 1,248 | 12,235 | TIMEOUT | skip |
 | E plain count | P2 | 169 | TIMEOUT | TIMEOUT | skip |
+
+**GOAL: zero TIMEOUT cells in this matrix.** Every one of these is a
+log-explorer shape a user actually runs; today 21 of 40 cells time out
+(12s/30s budgets), including a ONE-HOUR LIMIT-100 query (C/P1/1h). Success
+for this plan is re-running this exact matrix and every cell completing —
+then tighten toward 24h<1s / 30d<10s.
+
+Plan shape per cell (EXPLAIN, 24h, P1):
+
+| Shape | DedupExec | predicate= on scans | EmptyExec | file groups |
+|---|---|---|---|---|
+| A trace | bounded[timestamp]/greatest | 0 of 4 | 0 | 427 + 48 + 3 |
+| B email | bounded/greatest | 2 (row + stats) | 0 | 427 + 3 |
+| C level | bounded/greatest | 0 of 4 | 0 | 427 + 48 + 2 |
+| D kind | **full-set** + CoalescePartitions | 0 of 2 | 1 | 427 + 48 |
+| E plain | bounded/greatest | 2 | 0 | 427 + 3 |
+
+B's non-monotonic column (24h 8.8s > 7d 5.2s > 30d 4.5s) is the pushdown
+working: all B cells return 0 rows, the stats predicate prunes nearly every
+row group, so wider windows add pruned files, not scan work. Stats delta over
+the run: wide_scan_oversize_total 25→32, scan lat_p999 29.7→31.6s,
+cert_granted_total stayed 0.
 
 Attribution (EXPLAIN per shape, 24h): A/C carry the selective filter only in
 FilterExec bundled with the text_match hint — zero parquet predicate on any
