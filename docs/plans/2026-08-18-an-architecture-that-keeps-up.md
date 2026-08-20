@@ -2916,3 +2916,44 @@ all previously measured on this box: a single scan selecting 514 files / 32.8 GB
 and the budget tree handing maintenance the remainder with three ceilings
 uncounted. A heap profile taken **while RSS is high** would settle it, and that
 wants a waking operator rather than a 12 h wait for the next burst.
+
+### Part XVI correction — the "spike, not a leak" conclusion was WRONG
+
+A fourth sample refutes the addendum above. Retracting it rather than editing it,
+because the way it failed is the useful part.
+
+| UTC | uptime | `process_rss_mb` | window rate |
+| --- | --- | --- | --- |
+| 10:46:56 | ~9 m | 13,804 | — |
+| 11:18:09 | ~39 m | 14,187 | **766 MB/h** |
+| 11:50:15 | ~71 m | **22,165** | **14,959 MB/h** |
+
+The second window is **20× the first**. Averaged across both, growth is
+**~8,091 MB/h**, which from 22.2 GB reaches the 124.6 GB kill in **~12.7 hours** —
+squarely inside the observed 8-20 h cadence.
+
+So the claim that steady growth "cannot reach the wall" is dead. It rested
+entirely on the 766 MB/h window, and that window was simply the quiet half of a
+lumpy signal.
+
+**What I got wrong, precisely.** I stated the caveat — two samples, thin slope —
+and then reasoned as though a 3× error bound made the conclusion safe. The actual
+error was **20×**, because I had assumed the noise was symmetric measurement
+scatter around a true rate. It was not: the signal is intermittent, so a short
+window does not estimate a rate at all, it samples whichever regime it happened
+to land in. *An error bar assumes you are measuring the right kind of thing. Two
+samples cannot tell you whether a process is steady or bursty, and that question
+comes first.*
+
+**What survives.** WAL replay's working set still releases cleanly (23.5 → 13.8
+GB), so boot is still not where the memory goes. And growth is genuinely lumpy —
++383 MB in one 30-minute window against +7,978 MB in the next.
+
+**The real open question**, which neither reading answered: do the lumps
+**release** or **accumulate**? Replay's 10 GB released within two minutes. If the
++8 GB lump also releases, the process is bursty-but-bounded and the kill needs a
+coincidence of bursts; if it does not, it is a genuine ratchet and ~12.7 h to the
+wall is the whole story. That is one more sample away and it is the question
+worth asking — not the rate.
+
+No conclusion is being carried forward from this section until that is settled.
