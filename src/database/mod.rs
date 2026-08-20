@@ -10229,6 +10229,12 @@ mod tests {
         date.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros()
     }
 
+    /// Insert one `otel_logs_and_spans` span at `ts` micros, op name "op".
+    async fn insert_a_span(db: &Database, project: &str, id: &str, ts: i64) -> Result<()> {
+        db.insert_records_batch(project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, "op", project, ts)])?], true, None).await?;
+        Ok(())
+    }
+
     /// A unit whose slice has not finished yet must back off past the slice, not spin.
     ///
     /// A flat retry interval left a day-wide unit permanently eligible until midnight, monopolising
@@ -10268,14 +10274,7 @@ mod tests {
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("veto_{}", uuid::Uuid::new_v4().simple());
         let day = Utc::now() - chrono::Duration::days(3);
-        db.insert_records_batch(
-            &project,
-            "otel_logs_and_spans",
-            vec![json_to_batch(vec![test_span_ts("a", "op", &project, day.timestamp_micros())])?],
-            true,
-            None,
-        )
-        .await?;
+        insert_a_span(&db, &project, "a", day.timestamp_micros()).await?;
 
         // Exactly the prod shape: the day carries a pending frontier slice for
         // ONE tier, and nothing at all for the others.
@@ -10337,7 +10336,7 @@ mod tests {
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, ts)])?], true, None).await?;
+        insert_a_span(&db, &project, "a", ts).await?;
         {
             let mut journal = db.maintenance_tasks.lock().unwrap();
             // The write path already queued this day; complete it so the planner
@@ -10391,7 +10390,7 @@ mod tests {
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, ts)])?], true, None).await?;
+        insert_a_span(&db, &project, "a", ts).await?;
 
         // Stuff the journal past the ceiling with work unrelated to rollup.
         {
@@ -10441,7 +10440,7 @@ mod tests {
         let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
         // `all_tables` yields several unified tables, so the planner loop runs
         // more than once whatever we write to. Only this source has coverage.
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, ts)])?], true, None).await?;
+        insert_a_span(&db, &project, "a", ts).await?;
 
         db.plan_rollup_backfill().await?;
 
@@ -10517,14 +10516,7 @@ mod tests {
         // 256 MB target. One file is not two, so it is not consolidation debt
         // however untagged it is.
         let day = Utc::now() - chrono::Duration::days(3);
-        db.insert_records_batch(
-            &project,
-            "otel_logs_and_spans",
-            vec![json_to_batch(vec![test_span_ts("a", "op", &project, day.timestamp_micros())])?],
-            true,
-            None,
-        )
-        .await?;
+        insert_a_span(&db, &project, "a", day.timestamp_micros()).await?;
 
         db.plan_compaction_debt().await?;
 
@@ -10559,14 +10551,7 @@ mod tests {
         // the file set where it found it, which is exactly what certification
         // requires.
         let day = Utc::now() - chrono::Duration::days(3);
-        db.insert_records_batch(
-            &project,
-            "otel_logs_and_spans",
-            vec![json_to_batch(vec![test_span_ts("only", "op", &project, day.timestamp_micros())])?],
-            true,
-            None,
-        )
-        .await?;
+        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
 
         let date = day.date_naive();
         let day_start = midnight_micros(date);
@@ -10649,14 +10634,7 @@ mod tests {
         // debt, planned fresh by a scan running right now.
         let day = Utc::now() - chrono::Duration::days(6);
         for id in ["a", "b"] {
-            db.insert_records_batch(
-                &project,
-                "otel_logs_and_spans",
-                vec![json_to_batch(vec![test_span_ts(id, "op", &project, day.timestamp_micros())])?],
-                true,
-                None,
-            )
-            .await?;
+            insert_a_span(&db, &project, id, day.timestamp_micros()).await?;
         }
         db.plan_compaction_debt().await?;
 
@@ -10697,14 +10675,7 @@ mod tests {
         let project = format!("tier_{}", uuid::Uuid::new_v4().simple());
         let day = Utc::now() - chrono::Duration::days(4);
         for id in ["a", "b"] {
-            db.insert_records_batch(
-                &project,
-                "otel_logs_and_spans",
-                vec![json_to_batch(vec![test_span_ts(id, "op", &project, day.timestamp_micros())])?],
-                true,
-                None,
-            )
-            .await?;
+            insert_a_span(&db, &project, id, day.timestamp_micros()).await?;
         }
         db.plan_compaction_debt().await?;
 
@@ -10751,7 +10722,7 @@ mod tests {
             (&wanted, day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros()),
             (&other, (Utc::now() - chrono::Duration::minutes(30)).timestamp_micros()),
         ] {
-            db.insert_records_batch(project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", project, at)])?], true, None).await?;
+            insert_a_span(&db, project, "a", at).await?;
         }
 
         // Make the decoy ELIGIBLE. The write path stamps a future deadline
@@ -10884,7 +10855,7 @@ mod tests {
 
         // A late row makes the day genuinely re-eligible, which is how a rebuild
         // reaches a damaged partition in production.
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("s3", "op", &project, noon + 3)])?], true, None).await?;
+        insert_a_span(&db, &project, "s3", noon + 3).await?;
         day_unit(&db)?;
         assert!(db.run_maintenance_units(1024).await? > 0, "the rebuild must run");
         assert_eq!(live_files(&db).await?, 1, "a day-wide rebuild must RETIRE the untagged file, not stack a version beside it");
@@ -10904,14 +10875,7 @@ mod tests {
         let project = format!("retire_{}", uuid::Uuid::new_v4().simple());
         // One well-formed partition: a single flushed day, hence compliant.
         let day = Utc::now() - chrono::Duration::days(3);
-        db.insert_records_batch(
-            &project,
-            "otel_logs_and_spans",
-            vec![json_to_batch(vec![test_span_ts("a", "op", &project, day.timestamp_micros())])?],
-            true,
-            None,
-        )
-        .await?;
+        insert_a_span(&db, &project, "a", day.timestamp_micros()).await?;
 
         let slice_for = |d: chrono::DateTime<Utc>| -> Result<TimeSlice> {
             let start = midnight_micros(d.date_naive());
@@ -11206,7 +11170,7 @@ mod tests {
         let day_start = midnight_micros(day);
         let hour_start = ts.div_euclid(3_600_000_000) * 3_600_000_000;
         for id in ["a", "b"] {
-            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, "op", &project, ts)])?], true, None).await?;
+            insert_a_span(&db, &project, id, ts).await?;
         }
         let queued = db.reconcile_maintenance_task_cursors().await?;
 
