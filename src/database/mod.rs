@@ -10979,9 +10979,8 @@ mod tests {
 
         // Declared: monoscope's enrichment appends to it.
         // The columns production and clients actually assign.
-        for column in ["hashes", "duration", "status_message", "name", "level", "status_code"] {
-            assert!(mutable.contains(column), "{column} is declared mutable and must stay above the dedup");
-        }
+        // The ONLY column production rewrites after write.
+        assert!(mutable.contains("hashes"), "hashes is declared mutable and must stay above the dedup");
         // Mutable by construction, no declaration needed — `stamp_version`
         // rewrites the tiebreak on every append, and a delete appends a row
         // differing only in the tombstone.
@@ -10989,7 +10988,21 @@ mod tests {
         assert!(mutable.contains("deleted"), "the tombstone differs across versions");
 
         // Everything else is immutable and therefore leg-safe — that is the win.
-        for column in ["context___trace_id", "context___span_id", "kind", "parent_id", "timestamp", "id", "project_id", "date"] {
+        for column in [
+            "context___trace_id",
+            "context___span_id",
+            "kind",
+            "parent_id",
+            "timestamp",
+            "id",
+            "project_id",
+            "date",
+            "name",
+            "level",
+            "duration",
+            "status_code",
+            "status_message",
+        ] {
             assert!(!mutable.contains(column), "{column} is immutable and its filter must be pushable below the dedup");
         }
     }

@@ -116,17 +116,20 @@ debug_span1
 # UPDATE and DELETE tests
 # ============================================
 
-# Note: UPDATE operations only work on Delta tables like otel_logs_and_spans
+# Note: UPDATE operations only work on Delta tables like otel_logs_and_spans.
+# Columns are immutable by default so their filters can be pushed below the
+# merge-on-read dedup; `hashes` is the one declared `mutable: true`, so it is
+# what these UPDATEs target.
 # test_table is an in-memory table and doesn't support UPDATE operations
 
 # Test UPDATE on otel_logs_and_spans
 statement ok
 UPDATE otel_logs_and_spans 
-SET status_message = 'Updated via UPDATE statement' 
+SET hashes = make_array('Updated via UPDATE statement') 
 WHERE project_id = 'test_project' AND id = 'sql_span1'
 
 query T
-SELECT status_message FROM otel_logs_and_spans 
+SELECT array_element(hashes, 1) FROM otel_logs_and_spans 
 WHERE project_id = 'test_project' AND id = 'sql_span1'
 ----
 Updated via UPDATE statement
@@ -134,12 +137,12 @@ Updated via UPDATE statement
 # Test conditional UPDATE
 statement ok
 UPDATE otel_logs_and_spans 
-SET status_code = 'SUCCESS' 
+SET hashes = make_array('SUCCESS') 
 WHERE project_id = 'test_project' AND status_code = 'OK'
 
 query I
 SELECT COUNT(*) FROM otel_logs_and_spans 
-WHERE project_id = 'test_project' AND status_code = 'SUCCESS'
+WHERE project_id = 'test_project' AND array_element(hashes, 1) = 'SUCCESS'
 ----
 3
 

@@ -712,7 +712,7 @@ async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let sql = format!(
-        "UPDATE otel_logs_and_spans SET name = u.name \
+        "UPDATE otel_logs_and_spans SET hashes = make_array(u.name) \
          FROM (VALUES ('dup_id', 'enriched')) AS u(id, name) \
          WHERE project_id = '{project_id}' AND otel_logs_and_spans.id = u.id"
     );
@@ -722,7 +722,11 @@ async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
     // from the logical table rather than half-updated.
     let mut ctx2 = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx2)?;
-    let rows = ctx2.sql(&format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'")).await?.collect().await?;
+    let rows = ctx2
+        .sql(&format!("SELECT COALESCE(array_element(hashes, 1), name) AS name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'"))
+        .await?
+        .collect()
+        .await?;
     let total: usize = rows.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 1, "both copies resolve to one current version");
     assert_eq!(rows[0].column(0).as_string_view().value(0), "enriched", "and it is the updated one");
@@ -755,7 +759,7 @@ async fn update_from_duplicate_source_keys_applies_last_write_wins() -> Result<(
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let sql = format!(
-        "UPDATE otel_logs_and_spans SET name = u.name \
+        "UPDATE otel_logs_and_spans SET hashes = make_array(u.name) \
          FROM (VALUES ('dup_id', 'a'), ('dup_id', 'b')) AS u(id, name) \
          WHERE project_id = '{project_id}' AND otel_logs_and_spans.id = u.id"
     );
@@ -763,7 +767,11 @@ async fn update_from_duplicate_source_keys_applies_last_write_wins() -> Result<(
     assert_eq!(updated, 2, "both rounds applied to the single target row (last-write-wins), not aborted");
 
     // Last source row wins; the target stays a single logical row.
-    let rows = ctx.sql(&format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'")).await?.collect().await?;
+    let rows = ctx
+        .sql(&format!("SELECT COALESCE(array_element(hashes, 1), name) AS name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'"))
+        .await?
+        .collect()
+        .await?;
     let total: usize = rows.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 1, "target remains a single logical row");
     assert_eq!(rows[0].column(0).as_string_view().value(0), "b", "last source row wins");
@@ -1473,10 +1481,18 @@ async fn a_filter_on_an_updated_column_never_matches_the_superseded_version() ->
 
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    ctx.sql(&format!("UPDATE otel_logs_and_spans SET name = 'after' WHERE project_id = '{project_id}' AND id = 'row'")).await?.collect().await?;
+    ctx.sql(&format!("UPDATE otel_logs_and_spans SET hashes = make_array('after') WHERE project_id = '{project_id}' AND id = 'row'")).await?.collect().await?;
 
     let count = |ctx: datafusion::prelude::SessionContext, pid: String, name: &'static str| async move {
-        let rows = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}' AND name = '{name}'")).await?.collect().await?;
+        // Filter the column the UPDATE actually touched. `hashes` is the one
+        // declared-mutable column, so its predicate must stay ABOVE the dedup;
+        // filtering an immutable column here would prove nothing, since those
+        // are pushed to the legs precisely because no UPDATE can change them.
+        let rows = ctx
+            .sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}' AND array_element(hashes, 1) = '{name}'"))
+            .await?
+            .collect()
+            .await?;
         anyhow::Ok(rows[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0))
     };
     assert_eq!(count(ctx.clone(), project_id.clone(), "after").await?, 1, "the current version must match its own value");
@@ -1523,14 +1539,18 @@ async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let read = |ctx: datafusion::prelude::SessionContext, pid: String| async move {
-        let rows = ctx.sql(&format!("SELECT name FROM {TABLE} WHERE project_id = '{pid}' AND id = 'legacy'")).await?.collect().await?;
+        let rows = ctx
+            .sql(&format!("SELECT COALESCE(array_element(hashes, 1), name) AS name FROM {TABLE} WHERE project_id = '{pid}' AND id = 'legacy'"))
+            .await?
+            .collect()
+            .await?;
         anyhow::Ok(
             rows.iter().flat_map(|b| (0..b.num_rows()).map(|i| b.column(0).as_string_view().value(i).to_string()).collect::<Vec<_>>()).collect::<Vec<_>>(),
         )
     };
     assert_eq!(read(ctx.clone(), project_id.clone()).await?, vec!["before"], "precondition: the legacy row reads back");
 
-    ctx.sql(&format!("UPDATE {TABLE} SET name = 'after' WHERE project_id = '{project_id}' AND id = 'legacy'")).await?.collect().await?;
+    ctx.sql(&format!("UPDATE {TABLE} SET hashes = make_array('after') WHERE project_id = '{project_id}' AND id = 'legacy'")).await?.collect().await?;
 
     // The appended version carries a real stamp; the legacy row's is NULL. The
     // stamped version MUST win, and there must be exactly one logical row left.
@@ -1697,7 +1717,14 @@ async fn a_swept_mor_partition_holds_one_winning_row_per_key() -> Result<()> {
 
     // Two versions of ONE key, in separate flushes so they land in separate
     // files — the shape merge-on-read produces for an UPDATE.
-    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    // Two versions of ONE key differing only in `hashes` — the column declared
+    // `mutable: true`. Differing in an immutable column instead would violate the
+    // contract the pushdown rests on, which is what this test exists to police.
+    let row = |tag: &str| -> Result<_> {
+        let mut value = test_span_ts("mor_key", "span", &project_id, ts);
+        value["hashes"] = serde_json::json!([tag]);
+        json_to_batch(vec![value])
+    };
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
 
@@ -1737,7 +1764,14 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
 
-    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    // Two versions of ONE key differing only in `hashes` — the column declared
+    // `mutable: true`. Differing in an immutable column instead would violate the
+    // contract the pushdown rests on, which is what this test exists to police.
+    let row = |tag: &str| -> Result<_> {
+        let mut value = test_span_ts("mor_key", "span", &project_id, ts);
+        value["hashes"] = serde_json::json!([tag]);
+        json_to_batch(vec![value])
+    };
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
 
@@ -1746,7 +1780,7 @@ async fn dedup_skip_on_a_swept_mor_partition_returns_the_updated_row() -> Result
 
     // Through the routed scan, which is where a wrong skip would show up.
     let sql = format!(
-        "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+        "SELECT array_element(hashes, 1) FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
          AND timestamp >= {ts} AND timestamp <= {ts}",
         ts = format_args!("to_timestamp_micros({ts})")
     );
@@ -1856,7 +1890,14 @@ async fn a_pushed_mutable_predicate_on_a_swept_partition_cannot_match_the_supers
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
 
-    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    // Two versions of ONE key differing only in `hashes` — the column declared
+    // `mutable: true`. Differing in an immutable column instead would violate the
+    // contract the pushdown rests on, which is what this test exists to police.
+    let row = |tag: &str| -> Result<_> {
+        let mut value = test_span_ts("mor_key", "span", &project_id, ts);
+        value["hashes"] = serde_json::json!([tag]);
+        json_to_batch(vec![value])
+    };
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
 
@@ -1867,9 +1908,9 @@ async fn a_pushed_mutable_predicate_on_a_swept_partition_cannot_match_the_supers
     // now reach the Parquet scan on a certified window.
     let count_where = |val: &str| {
         let sql = format!(
-            "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+            "SELECT array_element(hashes, 1) FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
              AND timestamp >= to_timestamp_micros({ts}) AND timestamp <= to_timestamp_micros({ts}) \
-             AND name = '{val}'"
+             AND array_element(hashes, 1) = '{val}'"
         );
         let db = Arc::clone(&db);
         async move { db.query_delta_only(&sql).await.map(|bs| bs.iter().map(|b| b.num_rows()).sum::<usize>()) }
@@ -1901,7 +1942,14 @@ async fn an_uncertified_window_still_hides_the_superseded_row_from_a_mutable_pre
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
 
-    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("mor_key", name, &project_id, ts)]) };
+    // Two versions of ONE key differing only in `hashes` — the column declared
+    // `mutable: true`. Differing in an immutable column instead would violate the
+    // contract the pushdown rests on, which is what this test exists to police.
+    let row = |tag: &str| -> Result<_> {
+        let mut value = test_span_ts("mor_key", "span", &project_id, ts);
+        value["hashes"] = serde_json::json!([tag]);
+        json_to_batch(vec![value])
+    };
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("original")?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("updated")?], true, None).await?;
 
@@ -1911,9 +1959,9 @@ async fn an_uncertified_window_still_hides_the_superseded_row_from_a_mutable_pre
 
     let count_where = |val: &str| {
         let sql = format!(
-            "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+            "SELECT array_element(hashes, 1) FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
              AND timestamp >= to_timestamp_micros({ts}) AND timestamp <= to_timestamp_micros({ts}) \
-             AND name = '{val}'"
+             AND array_element(hashes, 1) = '{val}'"
         );
         let db = Arc::clone(&db);
         async move { db.query_delta_only(&sql).await.map(|bs| bs.iter().map(|b| b.num_rows()).sum::<usize>()) }
@@ -2323,7 +2371,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // `not_built` for every date while `otel_metrics` — which takes no DML —
     // routed the same shape in 1s.
     ctx.sql(&format!(
-        "UPDATE otel_logs_and_spans SET name = 'enriched' WHERE project_id = '{project_id}' \
+        "UPDATE otel_logs_and_spans SET hashes = make_array('enriched') WHERE project_id = '{project_id}' \
          AND timestamp >= to_timestamp_micros({midnight}) AND timestamp < to_timestamp_micros({})",
         midnight + 7_200_000_000i64
     ))
@@ -2358,7 +2406,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // precision here does not depend on the predicate's shape — which is the
     // difference between working and getting lucky, since monoscope's enrichment
     // happens to carry a time range but nothing guarantees the next writer will.
-    ctx.sql(&format!("UPDATE otel_logs_and_spans SET name = 'by-id' WHERE project_id = '{project_id}' AND id = 't0'")).await?.collect().await?;
+    ctx.sql(&format!("UPDATE otel_logs_and_spans SET hashes = make_array('by-id') WHERE project_id = '{project_id}' AND id = 't0'")).await?.collect().await?;
     let before = hits();
     let after_by_id = rows_of(ctx.sql(&query).await?.collect().await?);
     assert_eq!(hits(), before + 1, "an id-scoped DML on today's row must leave yesterday's coverage intact (misses +{})", misses() - misses_before);

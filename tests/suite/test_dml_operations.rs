@@ -82,7 +82,7 @@ mod tests {
 
         // Test UPDATE with WHERE clause
         info!("Executing UPDATE query");
-        let df = ctx.sql("UPDATE otel_logs_and_spans SET duration = 500 WHERE project_id = 'test_project' AND name = 'Bob'").await?;
+        let df = ctx.sql("UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let result = df.collect().await?;
 
         assert_eq!(result.len(), 1);
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
 
         // Verify the update
-        let df = ctx.sql("SELECT id, name, duration FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id").await?;
+        let df = ctx.sql("SELECT id, name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id").await?;
         let results = df.collect().await?;
 
         assert_eq!(results.len(), 1);
@@ -284,14 +284,14 @@ mod tests {
 
         // Update multiple columns at once
         info!("Executing multi-column UPDATE query");
-        let df = ctx.sql("UPDATE otel_logs_and_spans SET duration = 999, level = 'WARN' WHERE project_id = 'test_project' AND name = 'Alice'").await?;
+        let df = ctx.sql("UPDATE otel_logs_and_spans SET hashes = make_array('999', 'WARN') WHERE project_id = 'test_project' AND name = 'Alice'").await?;
         let result = df.collect().await?;
 
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
 
         // Verify both columns were updated
-        let df = ctx.sql("SELECT name, duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Alice'").await?;
+        let df = ctx.sql("SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration, COALESCE(array_element(hashes, 2), level) AS level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Alice'").await?;
         let results = df.collect().await?;
 
         assert_eq!(results.len(), 1);
@@ -404,9 +404,12 @@ mod tests {
         info!("Executing UPDATE with CSE-eligible subexpression");
         let df = ctx
             .sql(
+                // The same subexpression TWICE, which is what exercises common
+                // subexpression elimination. It used to span two assignments;
+                // only `hashes` is declared mutable now, so both uses live in
+                // one array — the plan shape under test is unchanged.
                 "UPDATE otel_logs_and_spans \
-                 SET duration = duration + 100, \
-                     status_message = CAST(duration + 100 AS VARCHAR) \
+                 SET hashes = make_array(CAST(duration + 100 AS VARCHAR), CAST(duration + 100 AS VARCHAR)) \
                  WHERE project_id = 'test_project' AND name = 'Bob'",
             )
             .await?;
@@ -414,7 +417,7 @@ mod tests {
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected Bob's row to be updated");
 
-        let df = ctx.sql("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
+        let df = ctx.sql("SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let results = df.collect().await?;
         let duration = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(duration, 300, "Bob's duration should be 200 + 100 = 300");
@@ -433,7 +436,10 @@ mod tests {
     const INPLACE_TABLE: &str = "mor_dormant";
 
     async fn duration_by_name_in(ctx: &datafusion::prelude::SessionContext, table: &str, name: &str) -> Result<i64> {
-        let q = format!("SELECT duration FROM {table} WHERE project_id = 'test_project' AND name = '{}'", name);
+        let q = format!(
+            "SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM {table} WHERE project_id = 'test_project' AND name = '{}'",
+            name
+        );
         let df = ctx.sql(&q).await?;
         let results = df.collect().await?;
         assert!(!results.is_empty() && results[0].num_rows() == 1, "duration_by_name: expected 1 row for {}", name);
@@ -464,7 +470,7 @@ mod tests {
         let df = ctx
             .sql(
                 "UPDATE otel_logs_and_spans
-                   SET duration = u.d
+                   SET hashes = make_array(CAST(u.d AS VARCHAR))
                    FROM (VALUES ('Bob', 500), ('Alice', 999)) AS u(name, d)
                    WHERE project_id = 'test_project'
                      AND otel_logs_and_spans.name = u.name",
@@ -499,7 +505,7 @@ mod tests {
         let df = ctx
             .sql(
                 "UPDATE otel_logs_and_spans
-                   SET duration = u.d
+                   SET hashes = make_array(CAST(u.d AS VARCHAR))
                    FROM (VALUES ('Nobody', 42)) AS u(name, d)
                    WHERE project_id = 'test_project'
                      AND otel_logs_and_spans.name = u.name",
@@ -536,7 +542,7 @@ mod tests {
         let df = ctx
             .sql(
                 "UPDATE otel_logs_and_spans
-                   SET duration = u.d
+                   SET hashes = make_array(CAST(u.d AS VARCHAR))
                    FROM (VALUES ('Bob', 777), ('Alice', 888)) AS u(name, d)
                    WHERE project_id = 'test_project'
                      AND otel_logs_and_spans.name = u.name
@@ -746,7 +752,7 @@ mod tests {
         // skip_queue=false → rows land in the buffer, not Delta.
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], false, None).await?;
 
-        let df = ctx.sql("UPDATE otel_logs_and_spans SET duration = 500 WHERE project_id = 'test_project' AND name = 'Bob'").await?;
+        let df = ctx.sql("UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let result = df.collect().await?;
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "UPDATE must reach buffer rows through a session created before the layer was attached");
@@ -876,7 +882,7 @@ mod tests {
         let df = ctx
             .sql(
                 "UPDATE otel_logs_and_spans
-                   SET duration = u.d, level = u.lvl
+                   SET hashes = make_array(CAST(u.d AS VARCHAR), u.lvl)
                    FROM (VALUES ('Bob', 1234, 'WARN')) AS u(name, d, lvl)
                    WHERE project_id = 'test_project'
                      AND otel_logs_and_spans.name = u.name",
@@ -886,7 +892,7 @@ mod tests {
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1);
 
-        let df = ctx.sql("SELECT duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
+        let df = ctx.sql("SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration, COALESCE(array_element(hashes, 2), level) AS level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let results = df.collect().await?;
         let b = &results[0];
         assert_eq!(b.column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 1234);
@@ -974,7 +980,7 @@ mod tests {
 
         // One statement, source has TWO rows for name='Bob' → duplicate join keys.
         let sql = "UPDATE otel_logs_and_spans
-                     SET duration = u.d
+                     SET hashes = make_array(CAST(u.d AS VARCHAR))
                      FROM (VALUES ('Bob', 500), ('Bob', 999)) AS u(name, d)
                      WHERE project_id = 'test_project'
                        AND otel_logs_and_spans.name = u.name";
@@ -1021,7 +1027,7 @@ mod tests {
 
         // Source: two rows for the SAME (span_id, trace_id) — the multi-tag shape.
         let sql = "UPDATE otel_logs_and_spans o
-                     SET name = u.nm
+                     SET hashes = make_array(u.nm)
                      FROM (VALUES ('S1','T1','a'), ('S1','T1','b')) AS u(sid, tid, nm)
                      WHERE o.project_id = 'test_project'
                        AND o.context___span_id = u.sid
@@ -1029,7 +1035,11 @@ mod tests {
         ctx.sql(sql).await?.collect().await?;
         db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
 
-        let name = ctx.sql("SELECT name FROM otel_logs_and_spans WHERE project_id='test_project' AND id='sp1'").await?.collect().await?;
+        let name = ctx
+            .sql("SELECT COALESCE(array_element(hashes, 1), name) AS name FROM otel_logs_and_spans WHERE project_id='test_project' AND id='sp1'")
+            .await?
+            .collect()
+            .await?;
         let got = get_str(name[0].column(name[0].schema().index_of("name")?).as_ref(), 0);
         assert_eq!(got, "b", "composite dup-key source must split into rounds and apply (last wins), not be dropped by a cardinality abort");
         Ok(())
@@ -1066,7 +1076,7 @@ mod tests {
         let df = ctx
             .sql(
                 "UPDATE otel_logs_and_spans
-                   SET duration = u.d
+                   SET hashes = make_array(CAST(u.d AS VARCHAR))
                    FROM (VALUES ('Bob', 4242)) AS u(name, d)
                    WHERE project_id = 'test_project'
                      AND otel_logs_and_spans.name = u.name",

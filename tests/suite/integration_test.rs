@@ -167,22 +167,31 @@ mod integration {
 
         // Test single field update
         client
-            .execute("UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3", &[&"Updated message", &"test_project", &span_id])
+            .execute(
+                "UPDATE otel_logs_and_spans SET hashes = make_array($1) WHERE project_id = $2 AND id = $3",
+                &[&"Updated message", &"test_project", &span_id],
+            )
             .await?;
 
-        let row = client.query_one("SELECT status_message FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
+        let row = client
+            .query_one("SELECT array_element(hashes, 1) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id])
+            .await?;
         assert_eq!(row.get::<_, String>(0), "Updated message");
 
         // Test multiple field update
         client
             .execute(
-                "UPDATE otel_logs_and_spans SET status_code = $1, level = $2 WHERE project_id = $3 AND id = $4",
+                "UPDATE otel_logs_and_spans SET hashes = make_array($1, $2) WHERE project_id = $3 AND id = $4",
                 &[&"ERROR", &"ERROR", &"test_project", &span_id],
             )
             .await?;
 
-        let row =
-            client.query_one("SELECT status_code, level FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
+        let row = client
+            .query_one(
+                "SELECT array_element(hashes, 1), array_element(hashes, 2) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?;
         assert_eq!(row.get::<_, String>(0), "ERROR");
         assert_eq!(row.get::<_, String>(1), "ERROR");
 
@@ -193,14 +202,17 @@ mod integration {
         }
 
         client
-            .execute("UPDATE otel_logs_and_spans SET status_code = $1 WHERE project_id = $2 AND status_code = $3", &[&"SUCCESS", &"test_project", &"OK"])
+            .execute("UPDATE otel_logs_and_spans SET hashes = make_array($1) WHERE project_id = $2 AND status_code = $3", &[&"SUCCESS", &"test_project", &"OK"])
             .await?;
 
         let count: i64 = client
-            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2", &[&"test_project", &"SUCCESS"])
+            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND array_element(hashes, 1) = $2", &[&"test_project", &"SUCCESS"])
             .await?
             .get(0);
-        assert_eq!(count, 2);
+        // THREE, not two: `status_code` is immutable now, so the multi-field
+        // UPDATE above no longer flips the first span away from 'OK' and it is
+        // caught by this conditional UPDATE too.
+        assert_eq!(count, 3);
 
         Ok(())
     }

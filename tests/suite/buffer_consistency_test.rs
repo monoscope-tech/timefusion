@@ -106,9 +106,12 @@ async fn test_update(mode: BufferMode) -> Result<()> {
     let batch = json_to_batch(records)?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
-    ctx.sql(&format!("UPDATE otel_logs_and_spans SET duration = 999 WHERE project_id = '{}' AND name = 'name_1'", project_id)).await?.collect().await?;
+    ctx.sql(&format!("UPDATE otel_logs_and_spans SET hashes = make_array('999') WHERE project_id = '{}' AND name = 'name_1'", project_id))
+        .await?
+        .collect()
+        .await?;
 
-    let result = ctx.sql(&format!("SELECT name, duration FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY name", project_id)).await?.collect().await?;
+    let result = ctx.sql(&format!("SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY name", project_id)).await?.collect().await?;
 
     let batch = &result[0];
     for i in 0..batch.num_rows() {
