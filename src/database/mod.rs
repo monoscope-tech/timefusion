@@ -7895,7 +7895,15 @@ impl ProjectRoutingTable {
                 );
             }
             let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
-            let mut builder = table.table_provider();
+            // Same DV opt-in as the cached-provider path below: without it,
+            // `parquet_pushdown_enabled` is false on any DeletionVectors-feature
+            // table, so every tantivy-split leg scanned the whole window with NO
+            // parquet predicate (prod 2026-08-20: a 4h delta leg emitted 2.11M
+            // rows for a trace_id equality matching 0; 24h SELECT * died at the
+            // full-set dedup 2 GiB cap). Actual DV-bearing FILES still disable
+            // the predicate per-file inside the fork — this only lifts the
+            // blanket feature-level gate, exactly like the cached path.
+            let mut builder = table.table_provider().with_pushdown_with_deletion_vectors(true);
             if let Some(selected) = file_selection {
                 builder = builder.with_file_selection(FileSelection::from_file_paths(selected).with_missing_file_policy(MissingSelectedFilePolicy::Ignore));
             }
@@ -9433,7 +9441,25 @@ impl TableProvider for ProjectRoutingTable {
         // mask: the mask has to stay index-aligned with a list built by
         // flattening three Options, and `LegKind::sortable()` derives the same
         // bit from the identity that can't drift out of step with it.
-        let wrap_result = |legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        let wrap_result = |mut legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>| -> DFResult<Arc<dyn ExecutionPlan>> {
+            // A leg pruned to nothing (tantivy split with zero surviving files,
+            // a date window outside the snapshot) bottoms out in an EmptyExec,
+            // which declares no output ordering — and Delta legs are unsortable,
+            // so ONE empty leg vetoed `merge_req` below: no SPM, DedupExec fell
+            // to full-set over a coalesce, and the most selective point lookups
+            // inherited the 2 GiB full-set ceiling (prod 2026-08-20). An empty
+            // leg contributes no rows; drop it before the union. Keep one leg if
+            // all are empty so the single-plan path stays valid.
+            fn provably_empty(plan: &dyn ExecutionPlan) -> bool {
+                plan.is::<datafusion::physical_plan::empty::EmptyExec>()
+                    || matches!(plan.children().as_slice(), [child] if provably_empty(child.as_ref()))
+            }
+            if legs.len() > 1 && legs.iter().any(|(p, _)| provably_empty(p.as_ref())) {
+                match legs.iter().any(|(p, _)| !provably_empty(p.as_ref())) {
+                    true => legs.retain(|(p, _)| !provably_empty(p.as_ref())),
+                    false => legs.truncate(1),
+                }
+            }
             let leg_sortable: Vec<bool> = legs.iter().map(|(_, k)| k.sortable()).collect();
             let legs: Vec<Arc<dyn ExecutionPlan>> = legs
                 .into_iter()

@@ -31,6 +31,77 @@ async fn explain_analyze(client: &tokio_postgres::Client, sql: &str) -> anyhow::
         .join("\n"))
 }
 
+/// Regression guard for the text_match conjunction-poisoning bug (2026-08-20).
+///
+/// The tantivy optimizer injects `text_match(col, val)` beside every string
+/// equality. delta-rs' `process_filters` deliberately includes that
+/// non-convertible UDF in the combined parquet predicate, and one failed bind
+/// of the conjunction discarded the WHOLE predicate — the equality and
+/// timestamp bounds too. Prod: a delta-only 4h window emitted 2.11M rows for a
+/// trace_id equality matching 0; at 24h the full-set dedup blew its 2 GiB cap.
+/// The convertible conjuncts must reach the parquet scan even when a
+/// text_match conjunct rides along.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Result<()> {
+    let bucket_secs = 60u64;
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_page_row_count_limit(50)
+        .start()
+        .await?;
+    env.db().cancel_maintenance();
+    let client = env.pg_client().await?;
+
+    let sec = 1_000_000i64;
+    for chunk in 0..2i64 {
+        for i in 0..100i64 {
+            let idx = chunk * 100 + i;
+            insert_at(&client, &format!("r-{idx:04}"), FROZEN_START_MICROS + idx * sec).await?;
+        }
+        env.advance(Duration::from_secs(bucket_secs * 2));
+        env.force_flush().await?;
+    }
+    // Drain MemBuffer so the query hits Delta only.
+    env.advance(Duration::from_secs(60 * 61));
+    env.force_evict().await?;
+
+    let start_ts = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().format("%Y-%m-%d %H:%M:%S%.f");
+    // Explicit text_match mirrors what the tantivy rewrite injects, without
+    // depending on the optimizer rule firing in this harness.
+    let sql = format!(
+        "SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' \
+         AND name = 'no-such-name' AND text_match(name, 'no-such-name') AND timestamp >= '{start_ts}'"
+    );
+    let matched: i64 = client.query_one(&sql, &[]).await?.get(0);
+    assert_eq!(matched, 0);
+
+    let plan = explain_analyze(&client, &sql).await?;
+    // The invariant is that the equality is applied AT the scan, not above the
+    // dedup: with it pushed, row-group stats (or the row filter) eliminate every
+    // row and DedupExec sees nothing. Broken (predicate=None on the tantivy
+    // split path), the scan decodes the whole window and dedup buffers it —
+    // the prod 2 GiB full-set abort shape.
+    let dedup_line = plan.lines().find(|l| l.contains("DedupExec")).unwrap_or_default();
+    let dedup_input = scan_metric(dedup_line, "input_rows=").unwrap_or(i64::MAX);
+    assert_eq!(
+        dedup_input, 0,
+        "rows reached DedupExec — the name equality was not applied at the parquet scan \
+         (the text_match conjunct poisoned the delta leg's predicate).\nplan:\n{plan}"
+    );
+    // Companion regression: a tantivy-pruned-to-empty leg (EmptyExec, no
+    // declared ordering) used to veto the merge requirement, dropping DedupExec
+    // to full-set — the mode whose 2 GiB ceiling killed prod point lookups.
+    // With empty legs dropped before the union, the ordered delta leg keeps
+    // bounded streaming dedup.
+    assert!(
+        dedup_line.contains("bounded["),
+        "DedupExec fell to full-set — an empty leg vetoed the declared ordering.\nplan:\n{plan}"
+    );
+    Ok(())
+}
+
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
