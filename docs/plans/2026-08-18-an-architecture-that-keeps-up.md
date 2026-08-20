@@ -2957,3 +2957,147 @@ wall is the whole story. That is one more sample away and it is the question
 worth asking — not the rate.
 
 No conclusion is being carried forward from this section until that is settled.
+
+---
+
+## Part XVII — re-landing the drain, and where the night ended
+
+### The drain fix, made concrete
+
+Part XIII's revert left one question: how does a bin's work survive not
+finishing? The machinery for it already exists and is not being used.
+
+`dedup_partition` stages a bin as a **stream of chunks** (`stage_dedup_chunk`
+per `chunk_filter`, driven at 8449), and `commit_wave` commits a `Vec<StagedBin>`
+at once. So there are already two granularities below "the whole pass":
+
+- **chunk**, within a bin;
+- **bin**, within a wave.
+
+What the timeout path does today is throw away *both*. A bin that exceeds
+`DEDUP_BIN_STAGE_DEADLINE` discards every chunk it had already staged, which is
+why 3600 s of work produced `dedup_bins_committed_total = 0` during the wedge.
+
+The fix follows from that, and needs no new machinery:
+
+1. **Commit the chunks that finished.** A bin that runs out of budget commits its
+   completed chunks and requeues with a cursor recording which remain. Chunks are
+   deterministic (shard *i* of *N*), so the cursor is a small integer set, not a
+   snapshot.
+2. **Bound the bin by the pass, not by a constant.** Once partial work survives,
+   `min(DEDUP_BIN_STAGE_DEADLINE, remaining_pass_budget)` stops being the
+   no-progress trap it is today — a short slice still makes progress rather than
+   discarding an hour.
+3. **Give the drain its own budget** rather than the shared `maintenance_job_sem`,
+   so an overrun starves only the drain. This is the part that actually prevents
+   the wedge; (1) and (2) prevent the futility.
+
+(3) alone would have prevented tonight's incident. (1) is what makes the drain
+converge on a 10 k backlog. They are separable and (3) is much the smaller change.
+
+### State of play
+
+**Done and in production:** a superseded parent no longer vetoes its own backfill
+replacement (`52e99aa`); packing no longer rewrites converged files (`2efbcf5`).
+Coverage reached and held `min = median = 30` days across all tiers, and routing
+sits at a 91.5 % hit rate.
+
+**Done, on a branch, awaiting review:** `fix/tier-merge-slice-set` — merged tier
+files carry a SET of slice bounds so a tier can be consolidated without losing
+coverage. Behaviour-preserving until step 2 admits tiers to compaction.
+
+**Diagnosed, not fixed:** the dirty-bin drain has had no caller in production
+since 2026-08-16 (Part XIII — the fix wedged the maintenance tier and was
+reverted); sealed compaction ranks candidates by age rather than benefit, sending
+the whole budget to work returning 0.42 files per GB rewritten while the recent
+tail offers 62.6 (Part on the compaction chart).
+
+**Open and unanswered:** prod OOMs every 8-20 h at ~124 GB anon, and whether its
+lumpy growth releases or accumulates is unmeasured — three deploys inside forty
+minutes meant no process lived long enough to sample. That question needs a ≥2 h
+quiet window on one image, not more sampling across builds.
+
+**What wants a decision rather than more work:** frontier slice width (Part XII),
+the `otel_metrics` share of rollup capacity, and whether step 2 of tier
+consolidation lands behind a kill switch on one tenant.
+
+### The night's methodological lesson, stated once
+
+Three conclusions were published and then retracted from this document in one
+session: a date-keyed cause for 08-13, "the drain fix is confirmed", and "the OOM
+is a spike, not a leak". All three shared a shape — **a first reading, taken
+before the system had reached the state being measured, treated as a result.**
+The drain looked healthy at +16 min and was frozen at +48 min. The OOM slope
+looked like 766 MB/h in one window and 14,959 MB/h in the next.
+
+The rule that would have caught all three: *take the second sample before writing
+the sentence.* For anything on a cron, the second sample must be at least one
+full period later.
+
+### Part XVI, second addendum — a two-kill burst, then recovery
+
+```
+Aug 19 15:34  anon 125.4 GB
+Aug 20 10:39  anon 124.6 GB   <- 19h05m
+Aug 20 14:10  anon 124.8 GB   <-  3h31m
+Aug 20 14:20  anon 125.3 GB   <-  9m21s
+Aug 20 14:33  no further kill; RSS 11.9 GB at 15 min uptime, coverage 30
+```
+
+Two kills nine minutes apart on `bef6046`, then thirteen minutes clear with RSS
+at a normal level — *longer than the gap that defined the loop*. So the burst
+ended on its own rather than continuing.
+
+**Every kill lands in a 124.6-125.4 GB band**, across five kills, three images and
+two days. That is a hard ceiling being hit, not a distribution of outcomes: the
+process reaches essentially the same number every time and dies. Whatever
+allocates last is incidental — the interesting quantity is what holds ~120 GB
+steady beneath it.
+
+**On attribution.** Kills accelerated across `8ef9a3b` → `2d86de9` → `bef6046`,
+which is suggestive, but it stays correlation: no new image survived long enough
+to measure a rate, and the one clean rate (~8 GB/h) belongs to `d5688fd`. The
+deploys themselves are a confound in both directions — each restart both clears
+RSS and destroys in-flight work that then has to be redone.
+
+**Process note, because it nearly caused a wrong call.** I sampled 52.7 GB at
+"5 minutes uptime" and was about to read it as a 4× regression. It was the
+process that then died; my follow-up sample landed on a *fresh* one. Under a
+restart-heavy window, uptime must be re-read at every sample — two readings
+minutes apart are not necessarily the same process, and `queries_total` going
+DOWN is the cheap tell.
+
+### Part XV refinement — what step 2 actually touches, and why I stopped
+
+Read the implementation before writing it. Two things the earlier spec missed.
+
+**The task key does NOT need a fingerprint discriminator.** Units are planned as
+`(project_id, date, Operation)` with a day-wide slice, and a tier partition can
+hold two fingerprints (a rebuilt day). The obvious reading — "one unit per
+fingerprint group" — would require widening the task key, which is a large and
+risky change. It is also unnecessary: packing already **bin-packs** a partition
+into several outputs, so one unit can serve both groups provided **no bin spans
+two fingerprints**. Unit granularity stays as it is; the constraint lives in bin
+formation.
+
+**`CompactionDebtFile` carries no tags.** It is `{ size, path }`, built from
+`log_data()`, and admission counts `files.iter().filter(|f| f.size < target)`.
+Step 2 therefore needs the fingerprint plumbed onto that struct so both the
+admission count and the bin constraint can see it, and untagged tier files
+excluded from the count entirely — otherwise a partition is admitted on files
+that must not be merged.
+
+So step 2 is: plumb one tag onto `CompactionDebtFile`, exclude untagged files for
+tiers, constrain bin formation to one fingerprint per bin, and lift the
+`tiers.contains(&source) { continue; }` skip behind a kill switch.
+
+**Why I am not writing it tonight.** It modifies bin formation in
+`plan_compaction_debt` — the same path whose eligibility test rewrote converged
+files (`2efbcf5`) and whose sibling wedged the maintenance tier hours ago. Prod
+is currently unmeasurable: three deploys in forty minutes from another session,
+five OOM kills today, and no image living long enough to establish a baseline. A
+change of this shape written blind, unmeasurable, at the end of a long session, on
+the most incident-prone path in the system, is the worst combination available.
+
+The spec above is complete enough to implement in an hour with a clear head. That
+is a better hand-off than a half-finished branch.
