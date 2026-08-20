@@ -10744,6 +10744,71 @@ mod tests {
         Ok(())
     }
 
+    /// `run-unit` must run the unit it was ASKED for.
+    ///
+    /// It enqueues its key and then calls the ordinary coordinator runner, which claims whatever
+    /// ranks FIRST — and the journal it claims from is not scratch: a Database built against real
+    /// storage plans that storage's whole outstanding queue into it. So the CLI ran other
+    /// projects' slices while the requested one stayed Pending, and reported success either way
+    /// because the report echoes the requested key. A 100-unit repair pass on 2026-08-20 spent 28
+    /// units that way and left every partition it named untouched.
+    #[tokio::test]
+    async fn run_unit_runs_the_requested_project_and_not_another() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        let mut cfg = (*create_test_config("run-unit-targeting")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        // The background coordinator would roll up BOTH projects on its own,
+        // which is exactly what this test must not mistake for the CLI's doing.
+        db.cancel_maintenance();
+        // The decoy sits in the LIVE FRONTIER, which `scheduling_class` ranks
+        // ahead of every sealed unit unconditionally — 30 minutes back, so it is
+        // past FINALIZATION_DELAY and genuinely claimable. Equal-priority
+        // projects would make which one runs a coin flip; the point here is that
+        // the CLI ignores ranking entirely.
+        let day = (Utc::now() - chrono::Duration::days(12)).date_naive();
+        let (wanted, other) = (format!("want_{}", uuid::Uuid::new_v4().simple()), format!("other_{}", uuid::Uuid::new_v4().simple()));
+        for (project, at) in [
+            (&wanted, day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros()),
+            (&other, (Utc::now() - chrono::Duration::minutes(30)).timestamp_micros()),
+        ] {
+            db.insert_records_batch(project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", project, at)])?], true, None).await?;
+        }
+
+        // Make the decoy ELIGIBLE. The write path stamps a future deadline
+        // (finalization delay), so in a fresh journal the CLI's own key is the
+        // only claimable one and the bug cannot show. Prod's journal is the
+        // opposite: thousands of units already past their deadline, ranked ahead
+        // of anything the CLI adds.
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let decoy = journal
+                .tasks()
+                .find(|task| task.key.project_id == other && task.key.operation == Operation::BaseRollup)
+                .map(|task| task.key.clone())
+                .expect("the write path queues a base rollup for the decoy");
+            journal.enqueue(decoy, 0, crate::maintenance_coordinator::MAX_DECODED_BYTES, 0);
+        }
+
+        let report = db.run_unit_once("otel_logs_and_spans", &wanted, day, Operation::BaseRollup, 24).await?;
+        // THE assertion. Under the bug the runner claimed the decoy and the
+        // requested key was left untouched at Pending — which is exactly what
+        // prod reported for 28 of 100 targeted repair units, while the CLI's own
+        // summary line echoed the requested key and read as success.
+        assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Complete), "the REQUESTED unit must be the one that ran");
+
+        // And the decoy must not have been published on the CLI's behalf. It is
+        // retired so it cannot be claimed, so `state` alone cannot tell the two
+        // apart — a publication is what proves work was actually done for it.
+        let decoy_published = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal.tasks().filter(|task| task.key.project_id == other).any(|task| task.publication.is_some())
+        };
+        assert!(!decoy_published, "a CLI unit must not run another project's work");
+        Ok(())
+    }
+
     /// An untagged tier file must not be immortal.
     ///
     /// The replace-set matched on slice tags alone, so a file that had lost them — a delta-rs

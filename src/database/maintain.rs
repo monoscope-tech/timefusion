@@ -1127,6 +1127,20 @@ impl Database {
         let now = crate::support::now_micros();
         {
             let mut journal = self.journal();
+            // A CLI unit must run the unit it was ASKED for. The runners below
+            // claim whatever ranks FIRST, and this journal is not scratch: a
+            // Database built against prod storage plans prod's whole outstanding
+            // queue into it. So `run-unit --project X --date D` silently ran
+            // someone else's slice — 2026-08-20, a repair pass of 100 targeted
+            // units spent 28 of them on a 6-hour slice of a different project
+            // while every requested day stayed Pending and its untagged files
+            // survived. The report printed the REQUESTED key, so it read as
+            // success. Retire everything else, so ours is the only claimable
+            // task and the report cannot lie.
+            let others = journal.tasks().map(|task| task.key.clone()).filter(|other| *other != key).collect::<Vec<_>>();
+            for other in &others {
+                journal.complete(other);
+            }
             if operation == Operation::DerivedRollup {
                 // A derived unit is unclaimable until its base generation is
                 // Complete; a scratch journal has none. Seed the dependency
