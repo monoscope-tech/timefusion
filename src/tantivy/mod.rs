@@ -347,6 +347,7 @@ mod builder_tests {
             tantivy: tv,
             dictionary: None,
             bloom_filter: false,
+            mutable: false,
         };
         TableSchema {
             rollups: vec![],

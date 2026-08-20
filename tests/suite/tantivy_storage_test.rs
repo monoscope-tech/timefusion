@@ -41,8 +41,9 @@ fn table() -> TableSchema {
                 tantivy: None,
                 dictionary: None,
                 bloom_filter: false,
+                mutable: false,
             },
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
+            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false, mutable: false },
             FieldDef {
                 name: "level".into(),
                 data_type: "Utf8".into(),
@@ -50,6 +51,7 @@ fn table() -> TableSchema {
                 tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
                 dictionary: None,
                 bloom_filter: false,
+                mutable: false,
             },
         ],
     }

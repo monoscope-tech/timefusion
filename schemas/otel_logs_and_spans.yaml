@@ -94,11 +94,19 @@ fields:
   - name: hashes
     data_type: "List(Utf8)"
     nullable: true
+    # The one column production UPDATEs on this table (monoscope's enrichment
+    # appends tags). Columns are immutable by DEFAULT, because a filter on an
+    # immutable column can be pushed below the merge-on-read dedup and pruned at
+    # the scan; a filter on this one must stay above it, or an older version
+    # could match a tag the winning version no longer carries.
+    mutable: true
   - name: name
     data_type: Utf8
     nullable: true
     bloom_filter: true
     tantivy: { indexed: true, tokenizer: ngram3 }
+    # Clients UPDATE it (enrichment renames spans), so its predicate must stay ABOVE the merge-on-read dedup.
+    mutable: true
   - name: kind
     data_type: Utf8
     nullable: true
@@ -107,14 +115,20 @@ fields:
     data_type: Utf8
     nullable: true
     tantivy: { indexed: true, tokenizer: raw }
+    # Clients UPDATE it (a span's status is revised after the fact).
+    mutable: true
   - name: status_message
     data_type: Utf8
     nullable: true
     tantivy: { indexed: true, tokenizer: ngram3 }
+    # Client-updatable payload — a status is revised after the fact. Immutable is the default; this opts out.
+    mutable: true
   - name: level
     data_type: Utf8
     nullable: true
     tantivy: { indexed: true, tokenizer: raw }
+    # Clients UPDATE it. Immutable is the default; this opts out.
+    mutable: true
   - name: severity
     data_type: Variant
     nullable: true
@@ -131,6 +145,8 @@ fields:
   - name: duration
     data_type: Int64
     nullable: true
+    # Client-updatable payload (enrichment revises it), so a filter on it stays ABOVE the merge-on-read dedup. Columns are immutable by default; see FieldDef::mutable.
+    mutable: true
   - name: start_time
     data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: true

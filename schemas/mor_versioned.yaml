@@ -42,6 +42,11 @@ fields:
   - name: name
     data_type: Utf8
     nullable: true
+    # The payload this fixture UPDATEs, which is the whole point of the schema.
+    # Columns are immutable by default so their filters can be pushed below the
+    # merge-on-read dedup; this one must not be, or a predicate could match the
+    # superseded version.
+    mutable: true
   # Nullable for the same reason as otel_logs_and_spans: delta-rs nulls out
   # partition columns in per-file stats.
   - name: project_id

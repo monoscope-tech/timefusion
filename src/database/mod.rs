@@ -8286,10 +8286,41 @@ impl ProjectRoutingTable {
     /// version from the input, and `keep-greatest` then returns the stale row. The filter must
     /// be `Unsupported` at the source so every version reaches `DedupExec` and the predicate
     /// runs above it. `None` for tables that append no versions.
+    /// Columns whose value can differ between versions of one row.
+    ///
+    /// A filter on anything NOT in this set is safe below the merge-on-read
+    /// `DedupExec`: all versions of a key agree, so the predicate keeps or drops
+    /// a key group whole and dedup-then-filter equals filter-then-dedup. A
+    /// filter on a column IN this set must stay above it, or a stale version
+    /// could match a predicate the winning version no longer satisfies.
+    ///
+    /// **Immutable is the default and mutable is declared**, which is the
+    /// opposite of what this did originally. Treating every non-key column as
+    /// mutable meant a `context___trace_id` point lookup could not reach the
+    /// scan, so 24h of spans were coalesced into one partition and materialised
+    /// keep-greatest before the predicate ran — ~4.5 GB/s, 84% to 93% of the
+    /// cgroup limit in ~1.5s, instance killed (prod 2026-08-20, exit 137). In
+    /// this table exactly one column is genuinely UPDATEd (`hashes`), so the old
+    /// default was withholding the pushdown from ~120 columns to protect one.
+    ///
+    /// The tiebreak and tombstone are mutable by construction and need no
+    /// declaration: `insert_coerce::stamp_version` rewrites the tiebreak on
+    /// every append, and a delete appends a row differing only in the tombstone.
+    ///
+    /// `extract_dml_info` refuses an UPDATE assigning anything not declared
+    /// mutable, so this is a checked contract rather than an assumption.
     fn version_mutable_columns(table_name: &str) -> Option<HashSet<String>> {
         let schema = crate::schema::get_schema(table_name).filter(|s| s.version_append)?;
-        let immutable: HashSet<&str> = schema.dedup_keys.iter().map(String::as_str).chain(schema.partitions.iter().map(String::as_str)).collect();
-        Some(schema.schema_ref().fields().iter().map(|f| f.name().clone()).filter(|n| !immutable.contains(n.as_str())).collect())
+        Some(
+            schema
+                .fields
+                .iter()
+                .filter(|field| field.mutable)
+                .map(|field| field.name.clone())
+                .chain(schema.dedup_tiebreak.clone())
+                .chain(schema.tombstone_column.clone())
+                .collect(),
+        )
     }
 
     /// Does `f` mention the table's tombstone marker? Such a predicate must never reach a scan leg.
@@ -9810,7 +9841,7 @@ mod writer_properties_tests {
     }
 
     fn field(name: &str, dt: &str) -> FieldDef {
-        FieldDef { name: name.into(), data_type: dt.into(), nullable: true, tantivy: None, dictionary: None, bloom_filter: false }
+        FieldDef { name: name.into(), data_type: dt.into(), nullable: true, tantivy: None, dictionary: None, bloom_filter: false, mutable: false }
     }
 
     fn schema_with(fields: Vec<FieldDef>, sort: Vec<&str>) -> TableSchema {
@@ -10932,6 +10963,35 @@ mod tests {
         };
         assert!(queued > 0, "a partition holding an untagged tier file must be queued for rebuild, got {queued}");
         Ok(())
+    }
+
+    /// Columns are IMMUTABLE by default; only declared ones are version-mutable.
+    ///
+    /// This decides whether a point lookup reaches the scan or is stranded above the merge-on-read
+    /// dedup. Stranded, the engine materialises the ENTIRE window keep-greatest before applying the
+    /// predicate: prod 2026-08-20, one `context___trace_id` lookup over 24h pulled 623 hot-tier
+    /// files plus the Delta legs into a single partition at ~4.5 GB/s, took the instance from 84%
+    /// to 93% of its cgroup limit in ~1.5s, and killed it (exit 137). Treating every non-key column
+    /// as mutable withheld the pushdown from ~120 columns to protect the one that is UPDATEd.
+    #[test]
+    fn only_declared_and_version_bearing_columns_are_mutable() {
+        let mutable = super::ProjectRoutingTable::version_mutable_columns("otel_logs_and_spans").expect("a version_append table");
+
+        // Declared: monoscope's enrichment appends to it.
+        // The columns production and clients actually assign.
+        for column in ["hashes", "duration", "status_message", "name", "level", "status_code"] {
+            assert!(mutable.contains(column), "{column} is declared mutable and must stay above the dedup");
+        }
+        // Mutable by construction, no declaration needed — `stamp_version`
+        // rewrites the tiebreak on every append, and a delete appends a row
+        // differing only in the tombstone.
+        assert!(mutable.contains("updated_at"), "the version tiebreak differs across versions");
+        assert!(mutable.contains("deleted"), "the tombstone differs across versions");
+
+        // Everything else is immutable and therefore leg-safe — that is the win.
+        for column in ["context___trace_id", "context___span_id", "kind", "parent_id", "timestamp", "id", "project_id", "date"] {
+            assert!(!mutable.contains(column), "{column} is immutable and its filter must be pushable below the dedup");
+        }
     }
 
     /// An untagged tier file must not be immortal.

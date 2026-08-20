@@ -802,6 +802,7 @@ mod reader_tests {
                     tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: (name == "level").then(|| "raw".to_string()), flatten: None }),
                     dictionary: None,
                     bloom_filter: false,
+                    mutable: false,
                 })
                 .collect(),
         };

@@ -47,8 +47,9 @@ fn schema_with(level_indexed: bool) -> TableSchema {
                 tantivy: None,
                 dictionary: None,
                 bloom_filter: false,
+                mutable: false,
             },
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
+            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false, mutable: false },
             FieldDef {
                 name: "level".into(),
                 data_type: "Utf8".into(),
@@ -56,6 +57,7 @@ fn schema_with(level_indexed: bool) -> TableSchema {
                 tantivy: level_indexed.then(|| TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
                 dictionary: None,
                 bloom_filter: false,
+                mutable: false,
             },
         ],
     }

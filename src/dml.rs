@@ -414,6 +414,31 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
     if project_id.is_empty() {
         return Err(DataFusionError::Plan(format!("{} requires a project_id filter in WHERE clause", if extract_assignments { "UPDATE" } else { "DELETE" })));
     }
+    // Columns are IMMUTABLE by default, and the read path pushes filters on them
+    // below the merge-on-read dedup on that basis — sound only while every
+    // version of a row agrees on their value. An UPDATE assigning an undeclared
+    // column would break that silently and at read time, surfacing a stale
+    // version that matches a predicate the winning version does not. Refuse at
+    // plan time so the declaration is enforced rather than trusted.
+    //
+    // The tiebreak and tombstone are exempt: `stamp_version` rewrites the
+    // tiebreak on every append and a delete appends a tombstone row, so both are
+    // mutable by construction and already excluded from the pushdown.
+    if let Some(assigned) = assignments.as_ref()
+        && let Some(schema) = crate::schema::get_schema(table_name).filter(|schema| schema.version_append)
+    {
+        let allowed = |column: &String| {
+            schema.fields.iter().any(|field| &field.name == column && field.mutable)
+                || schema.dedup_tiebreak.as_ref() == Some(column)
+                || schema.tombstone_column.as_ref() == Some(column)
+        };
+        if let Some((blocked, _)) = assigned.iter().find(|(column, _)| !allowed(column)) {
+            return Err(DataFusionError::Plan(format!(
+                "UPDATE cannot assign `{blocked}` on `{table_name}`: columns are immutable unless declared `mutable: true`, and read filters on \
+                 immutable columns are pushed below the merge-on-read dedup on that basis"
+            )));
+        }
+    }
 
     Ok(DmlInfo { table_name: table_name.to_string(), project_id, predicate, assignments, source_plan })
 }

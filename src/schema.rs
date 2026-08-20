@@ -220,6 +220,8 @@ impl RollupSpec {
             tantivy: None,
             dictionary: None,
             bloom_filter: false,
+            // A tier is rebuilt wholesale, never UPDATEd.
+            mutable: false,
         };
         let mut fields = vec![
             plain("project_id", "Utf8", true),
@@ -498,6 +500,32 @@ pub struct FieldDef {
     /// equality-lookup columns (ids, trace_ids, span_ids, session_ids).
     #[serde(default)]
     pub bloom_filter: bool,
+    /// Declares that an UPDATE may change this column, so versions of one row
+    /// can disagree on its value.
+    ///
+    /// **Columns are immutable by default.** That default is what makes point
+    /// lookups cheap: a filter on an immutable column is safe to push BELOW the
+    /// merge-on-read `DedupExec`, because every version of a key agrees, so the
+    /// predicate keeps or drops a key group whole and dedup-then-filter equals
+    /// filter-then-dedup. A filter on a MUTABLE column must stay above the
+    /// dedup, or a stale version could match a predicate the winning version no
+    /// longer satisfies.
+    ///
+    /// Getting this backwards is expensive. When every non-key column was
+    /// treated as mutable, a single `context___trace_id` lookup over 24h had its
+    /// predicate stranded above the dedup, so the engine coalesced 623 hot-tier
+    /// files plus the Delta legs into one partition and materialised the ENTIRE
+    /// window keep-greatest before discarding almost all of it — ~4.5 GB/s, 84%
+    /// to 93% of the cgroup limit in ~1.5s, and the instance was killed
+    /// (2026-08-20, exit 137).
+    ///
+    /// The declaration is ENFORCED, not trusted: `extract_dml_info` refuses at
+    /// plan time any UPDATE that assigns a column this does not mark, so the
+    /// read path's premise cannot be broken by a writer. The version tiebreak
+    /// and tombstone columns are always treated as mutable without declaring it
+    /// — they vary across versions by construction.
+    #[serde(default)]
+    pub mutable: bool,
 }
 
 /// Per-column tantivy index configuration. Drives `tantivy_index::schema`.
