@@ -1077,10 +1077,15 @@ impl Database {
             Ok((dropped, true)) => {
                 // Before the journal lock: `record_certification` awaits, and the
                 // journal guard is a std Mutex.
-                if covers_day
-                    && let Err(error) = self.record_certification(&table, &key.physical_table, &key.project_id, date, &pre_files, (dropped, true)).await
-                {
-                    warn!(%error, project_id = %key.project_id, %date, "certification bookkeeping failed after a clean day-wide dedup");
+                if covers_day {
+                    match self.record_certification(&table, &key.physical_table, &key.project_id, date, &pre_files, (dropped, true)).await {
+                        // Coordinator-owned tables are excluded from `dedup_sweep`,
+                        // whose end-of-tick snapshot was otherwise the only
+                        // persistence site for this cache.
+                        Ok(Some(_)) => self.persist_certifications(),
+                        Ok(None) => {}
+                        Err(error) => warn!(%error, project_id = %key.project_id, %date, "certification bookkeeping failed after a clean day-wide dedup"),
+                    }
                 }
                 let mut journal = self.journal();
                 journal.complete(&key);
@@ -3029,6 +3034,7 @@ impl Database {
         if !self.config.maintenance.timefusion_dedup_certification_persist {
             return;
         }
+        let _persist = self.dedup_certification_persist_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now_ms = crate::storage::now_unix_ms();
         let mut entries: Vec<_> = self
             .dedup_clean_fp

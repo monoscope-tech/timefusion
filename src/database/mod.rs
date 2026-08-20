@@ -2313,6 +2313,9 @@ pub struct Database {
     /// Any commit touching the partition changes its file set → mismatch →
     /// dedup stays on until the next clean sweep pass.
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>>,
+    /// Serializes snapshots of `dedup_clean_fp` with their shared atomic temp
+    /// path. Coordinator workers can grant different partitions concurrently.
+    dedup_certification_persist_lock: Arc<std::sync::Mutex<()>>,
     /// Monotonic invalidation epoch for each source `(project, table, date)`.
     rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
     /// Certified rollup generations keyed by `(project, source, target, date)`.
@@ -3021,6 +3024,7 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp,
+            dedup_certification_persist_lock: Arc::new(std::sync::Mutex::new(())),
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
@@ -10680,11 +10684,15 @@ mod tests {
     /// that granted it. The dedup cron skips rollup-declared tables, so for tables like
     /// `otel_logs_and_spans` the sweep stopped running and this path did not take over. This test
     /// pins that coordinator dedup must certify.
-    #[tokio::test]
+    #[test_case(true ; "persistence enabled")]
+    #[test_case(false ; "persistence disabled")]
     #[serial]
-    async fn a_clean_day_wide_coordinator_dedup_certifies_the_partition() -> Result<()> {
+    #[tokio::test]
+    async fn a_clean_day_wide_coordinator_dedup_certifies_the_partition(persist: bool) -> Result<()> {
         use crate::maintenance_coordinator::{DAY_MICROS, Operation, TaskKey, TimeSlice};
-        let db = Database::with_config(create_test_config("coord-dedup-certify")).await?;
+        let mut config = create_test_config("coord-dedup-certify");
+        Arc::make_mut(&mut config).maintenance.timefusion_dedup_certification_persist = persist;
+        let db = Database::with_config(config).await?;
         let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
         // A sealed day with NO duplicates: the pass must drop nothing and leave
         // the file set where it found it, which is exactly what certification
@@ -10714,6 +10722,12 @@ mod tests {
 
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
         assert!(db.dedup_clean_fp.contains_key(&key), "a clean day-wide unit must certify the partition; without it DedupExec survives in every 30d plan");
+        let stored = crate::storage::load_sidecar::<crate::storage::StoredCertification>(&db.config.core.timefusion_data_dir, crate::storage::CERTIFICATIONS);
+        let persisted = stored.iter().any(|entry| entry.project_id == project && entry.table_name == "otel_logs_and_spans" && entry.date == date.to_string());
+        assert_eq!(
+            persisted, persist,
+            "a coordinator-owned table never reaches the legacy sweep's persistence site, so its grant must honor the persistence flag here"
+        );
         Ok(())
     }
 
