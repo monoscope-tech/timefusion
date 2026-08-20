@@ -2601,3 +2601,39 @@ Not retracted — the frontier-width numbers stand as measurements. But its fram
 ("the binding constraint is steady-state maintenance cost") is **demoted**: the
 larger term was duplicates nothing was removing. Answer the width question after
 the drain has run.
+
+### Part XIII result — confirmed in production
+
+Deployed as `954d516`. First readings ~16 min after the container came up:
+
+| | pre-fix (4 days) | after |
+|---|---|---|
+| `dirty_bin_processed_total` | **0** | **660** |
+| `dirty_bin_batch_probe_clean_total` | 0 | 660 |
+| `dirty_bin_eligible_total` (staged, dup-bearing) | 0 | 17 |
+| `dirty_bin_rewrite_duration_ms_total` | 0 | 101,204 |
+| `dirty_bin_queue_depth` | 10,902 rising ~2,200/h | 10,529 falling |
+
+It left zero, which was the whole question.
+
+**The cost is small, and the reason is structural.** 660 of 677 bins classified
+**probe-clean** — 2.5 % dup-bearing, which matches the ~3 % this code's own
+comment records from prod ("601 probed clean vs 18 rewritten"). The batch probe
+retires most of a backlog in cheap group scans and only the dup-bearing minority
+pays a rewrite. Container sat at **11.71 GiB / 120 GiB (9.8 %)** at ~96 % CPU —
+one core — with no restart beyond the deploy itself. The memory risk flagged
+before shipping did not materialise, and the pre-existing bounds are why.
+
+Host load average fell **35 → 10** across the same window. Not attributed: the
+process also restarted, so some of that is a cold coordinator, and it should be
+re-read once uptime is measured in hours.
+
+**Caveat on the drain rate.** Depth fell 373 while 660 were processed and only 7
+were enqueued, so ~287 are unaccounted — the gauge is stored at pass boundaries
+and probably lags, but the arithmetic does not close and the rate should be taken
+from two clean samples rather than from this one. Direction is unambiguous; the
+slope is not yet.
+
+At the observed ~2,600 bins/h the 10.5 k backlog clears in roughly four hours.
+**Do not re-measure the 30 d query until it has** — the duplication it is meant to
+remove is retired last, in the 2.5 % that actually rewrite.
