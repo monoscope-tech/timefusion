@@ -114,9 +114,12 @@ pub(crate) const ALL_HOURS: u32 = (1 << 24) - 1;
 /// commit actually touched instead of all 24 (`enqueue_maintenance_hours`
 /// with `ALL_HOURS` was ~312 durable tasks per active project per restart,
 /// prod 2026-08-18 — the queue's dominant growth source under deploy churn).
-pub(crate) fn hours_from_stats_json(stats: &str, day_start_micros: i64) -> Option<u32> {
+/// The inclusive timestamp bounds a file's Delta statistics claim.
+///
+/// Writers spell them either as epoch micros or RFC 3339, so both are accepted.
+/// `None` means the file makes no claim — never treat that as an empty range.
+pub(crate) fn stats_time_range(stats: &str) -> Option<(i64, i64)> {
     let value: serde_json::Value = serde_json::from_str(stats).ok()?;
-    // Writers spell timestamp bounds either as epoch micros or RFC 3339.
     let parse_ts = |side: &str| -> Option<i64> {
         let v = value.get(side)?.get("timestamp")?;
         if let Some(micros) = v.as_i64() {
@@ -124,7 +127,11 @@ pub(crate) fn hours_from_stats_json(stats: &str, day_start_micros: i64) -> Optio
         }
         chrono::DateTime::parse_from_rfc3339(v.as_str()?).ok().map(|t| t.timestamp_micros())
     };
-    let (lo, hi) = (parse_ts("minValues")?, parse_ts("maxValues")?);
+    Some((parse_ts("minValues")?, parse_ts("maxValues")?))
+}
+
+pub(crate) fn hours_from_stats_json(stats: &str, day_start_micros: i64) -> Option<u32> {
+    let (lo, hi) = stats_time_range(stats)?;
     let (lo_h, hi_h) = ((lo - day_start_micros).div_euclid(HOUR_MICROS), (hi - day_start_micros).div_euclid(HOUR_MICROS));
     if hi_h < 0 || lo_h >= 24 || lo_h > hi_h {
         return None;
@@ -663,6 +670,9 @@ pub(crate) struct LiveFile<'a> {
     pub slice: Option<(i64, i64)>,
     pub project: Option<&'a str>,
     pub partition: Option<(&'a str, &'a str)>,
+    /// Inclusive timestamp bounds from the file's own Delta statistics, which
+    /// survive tag loss — a rewrite strips tags but still writes stats.
+    pub stats: Option<(i64, i64)>,
 }
 
 /// Whether publishing `slice` for `(project_id, date)`, having produced `rows`
@@ -691,7 +701,23 @@ pub(crate) struct LiveFile<'a> {
 pub(crate) fn slice_retires(file: &LiveFile<'_>, project_id: &str, date: &str, (start, end): (i64, i64), rows: u64) -> bool {
     match file.slice {
         Some((file_start, file_end)) => file.project == Some(project_id) && file_start >= start && file_end <= end,
-        None => rows > 0 && spans_whole_day(start, end) && file.partition == Some((project_id, date)),
+        None => {
+            // Either proof of redundancy will do, and a whole-day slice needs no
+            // statistics at all — files are partitioned by `(project_id, date)`,
+            // so one in `date=D` cannot hold rows outside `D`.
+            //
+            // The stats arm is what reaches a SPLIT day. `split_time_task` cuts a
+            // large day into sub-day children, and a child reproduces only its
+            // own range — so width alone can never justify retiring anything
+            // there, and the biggest tenants are exactly the ones that split.
+            // Measured 2026-08-20: of 39 untagged files left in the repaired
+            // window, ALL 39 belonged to the four tenants whose days split, and
+            // no day-wide rebuild would ever reach them. A file whose own
+            // statistics place it inside this slice IS reproduced by it,
+            // whatever the slice's width.
+            let contained = file.stats.is_some_and(|(lo, hi)| lo >= start && hi < end);
+            rows > 0 && file.partition == Some((project_id, date)) && (spans_whole_day(start, end) || contained)
+        }
     }
 }
 
@@ -1717,22 +1743,35 @@ mod tests {
 
     /// An untagged tier file used to be IMMORTAL — `slice_tag_range` returned
     /// `None`, the replace-set skipped it, and every rebuild stacked another
-    /// version of every `id` beside it forever. A day-wide publish retires it;
-    /// nothing narrower, and nothing that produced no rows, may.
-    #[test_case::test_case(Some((DAY, DAY + HOUR)), Some("p"), None, DAY, DAY + DAY_MICROS, 9, true; "tagged file contained by the slice")]
-    #[test_case::test_case(Some((DAY - HOUR, DAY + DAY_MICROS)), Some("p"), None, DAY, DAY + DAY_MICROS, 9, false; "tagged file wider than the slice")]
-    #[test_case::test_case(Some((DAY, DAY + HOUR)), Some("other"), None, DAY, DAY + DAY_MICROS, 9, false; "tagged file of another project")]
-    #[test_case::test_case(None, None, Some(("p", "2026-08-18")), DAY, DAY + DAY_MICROS, 9, true; "untagged file in the rebuilt partition")]
-    #[test_case::test_case(None, None, Some(("p", "2026-08-18")), DAY, DAY + HOUR, 9, false; "sub-day slice reproduces only part of the day")]
-    #[test_case::test_case(None, None, Some(("p", "2026-08-18")), DAY, DAY + DAY_MICROS, 0, false; "empty rebuild may be the only copy left")]
-    #[test_case::test_case(None, None, Some(("p", "2026-08-17")), DAY, DAY + DAY_MICROS, 9, false; "untagged file in another day")]
-    #[test_case::test_case(None, None, Some(("other", "2026-08-18")), DAY, DAY + DAY_MICROS, 9, false; "untagged file of another project")]
-    #[test_case::test_case(None, None, None, DAY, DAY + DAY_MICROS, 9, false; "untagged file with no readable partition")]
-    fn slice_retires_tagged_by_containment_and_untagged_only_on_a_whole_day(
-        slice: Option<(i64, i64)>, project: Option<&str>, partition: Option<(&str, &str)>, start: i64, end: i64, rows: u64, expected: bool,
+    /// version of every `id` beside it forever. A publish retires it when it can
+    /// PROVE it reproduces it: by covering the whole partition day, or by the
+    /// file's own statistics placing it inside the slice. Nothing that produced
+    /// no rows may, since an empty rebuild over aged-out raw may be deleting the
+    /// only copy.
+    #[test_case::test_case(Some((DAY, DAY + HOUR)), None, DAY, DAY + DAY_MICROS, 9, true; "tagged file contained by the slice")]
+    #[test_case::test_case(Some((DAY - HOUR, DAY + DAY_MICROS)), None, DAY, DAY + DAY_MICROS, 9, false; "tagged file wider than the slice")]
+    #[test_case::test_case(None, None, DAY, DAY + DAY_MICROS, 9, true; "untagged, whole-day slice needs no stats")]
+    #[test_case::test_case(None, None, DAY, DAY + HOUR, 9, false; "untagged, sub-day slice with no stats proves nothing")]
+    #[test_case::test_case(None, Some((DAY, DAY + HOUR - 1)), DAY, DAY + HOUR, 9, true; "untagged, stats place it inside a sub-day slice")]
+    #[test_case::test_case(None, Some((DAY, DAY + HOUR)), DAY, DAY + HOUR, 9, false; "untagged, stats touch the exclusive end")]
+    #[test_case::test_case(None, Some((DAY - 1, DAY + HOUR - 1)), DAY, DAY + HOUR, 9, false; "untagged, stats start before the slice")]
+    #[test_case::test_case(None, Some((DAY, DAY + HOUR - 1)), DAY, DAY + HOUR, 0, false; "empty rebuild may be the only copy left")]
+    fn slice_retires_tagged_by_containment_and_untagged_only_when_reproduced(
+        slice: Option<(i64, i64)>, stats: Option<(i64, i64)>, start: i64, end: i64, rows: u64, expected: bool,
     ) {
-        let file = LiveFile { slice, project, partition };
+        let project = slice.map(|_| "p");
+        let file = LiveFile { slice, project, partition: Some(("p", "2026-08-18")), stats };
         assert_eq!(slice_retires(&file, "p", "2026-08-18", (start, end), rows), expected);
+    }
+
+    /// Identity still gates it: another project's file, or another day's, is not
+    /// reproduced by this slice however wide it is.
+    #[test_case::test_case(Some(("other", "2026-08-18")); "another project")]
+    #[test_case::test_case(Some(("p", "2026-08-17")); "another day")]
+    #[test_case::test_case(None; "no readable partition")]
+    fn slice_never_retires_an_untagged_file_outside_its_own_partition(partition: Option<(&str, &str)>) {
+        let file = LiveFile { slice: None, project: None, partition, stats: Some((DAY, DAY + HOUR)) };
+        assert!(!slice_retires(&file, "p", "2026-08-18", (DAY, DAY + DAY_MICROS), 9));
     }
 
     #[test]
