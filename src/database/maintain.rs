@@ -1516,14 +1516,8 @@ impl Database {
                     tombstone: source_schema.tombstone_column.as_deref(),
                 }),
             };
-            let input_sql = crate::rollup::slice_input_sql(
-                input_schema,
-                dedup,
-                RAW,
-                &key.project_id,
-                (key.slice.start_micros, key.slice.end_micros),
-                &shard_predicate,
-            );
+            let input_sql =
+                crate::rollup::slice_input_sql(input_schema, dedup, RAW, &key.project_id, (key.slice.start_micros, key.slice.end_micros), &shard_predicate);
             let frame = ctx.sql(&input_sql).await?;
             ctx.register_table(&input, Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input_sql))))?;
             let aggregate_sql = crate::rollup::build_cohort_sql_range_mode(

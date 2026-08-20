@@ -2802,9 +2802,7 @@ async fn count_star_matches_the_scan_over_a_multi_day_window() -> Result<()> {
     let noon = |back: i64| (chrono::Utc::now().date_naive() - chrono::Duration::days(back)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     for back in 1..=DAYS {
         let base = noon(back);
-        let batch = || -> Result<_> {
-            json_to_batch((0..PER_DAY).map(|i| test_span_ts(&format!("d{back}k{i}"), "n", &project_id, base + i as i64)).collect())
-        };
+        let batch = || -> Result<_> { json_to_batch((0..PER_DAY).map(|i| test_span_ts(&format!("d{back}k{i}"), "n", &project_id, base + i as i64)).collect()) };
         // Written twice through separate commits, so the copies land in
         // different Delta files: flush-time dedup is per-bucket and cannot see
         // across files, which is how duplicates survive in production.
@@ -2822,12 +2820,8 @@ async fn count_star_matches_the_scan_over_a_multi_day_window() -> Result<()> {
 
         // The authority is the scan: the rows `SELECT id` actually returns,
         // after DedupExec has collapsed the versions. `count(*)` must equal it.
-        let scanned = db
-            .query_delta_only(&format!("SELECT id FROM otel_logs_and_spans WHERE {window}"))
-            .await?
-            .iter()
-            .map(|b| b.num_rows())
-            .sum::<usize>() as i64;
+        let scanned =
+            db.query_delta_only(&format!("SELECT id FROM otel_logs_and_spans WHERE {window}")).await?.iter().map(|b| b.num_rows()).sum::<usize>() as i64;
         let counted = db
             .query_delta_only(&format!("SELECT count(*) FROM otel_logs_and_spans WHERE {window}"))
             .await?
