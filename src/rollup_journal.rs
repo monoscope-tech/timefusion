@@ -42,23 +42,22 @@ fn path(data_dir: &Path) -> PathBuf {
 
 pub fn load(data_dir: &Path) -> Vec<RollupInvalidation> {
     let path = path(data_dir);
-    let snapshot = match fs::read(&path).map(|data| serde_json::from_slice::<Snapshot>(&data)) {
-        Ok(Ok(snapshot)) if snapshot.version == VERSION => snapshot,
+    match fs::read(&path).map(|data| serde_json::from_slice::<Snapshot>(&data)) {
+        Ok(Ok(snapshot)) if snapshot.version == VERSION => snapshot.entries,
         Ok(Ok(snapshot)) => {
             warn!(?path, version = snapshot.version, "discarding unsupported rollup invalidation journal");
-            return Vec::new();
+            Vec::new()
         }
         Ok(Err(error)) => {
             warn!(?path, %error, "discarding unreadable rollup invalidation journal");
-            return Vec::new();
+            Vec::new()
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => return Vec::new(),
+        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             warn!(?path, %error, "failed to load rollup invalidation journal");
-            return Vec::new();
+            Vec::new()
         }
-    };
-    snapshot.entries
+    }
 }
 
 /// Atomically and durably replace the journal.

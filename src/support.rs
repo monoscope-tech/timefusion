@@ -1,20 +1,11 @@
-//! Process-wide clock used by eviction/flush.
+//! Process-wide wall or frozen clock used by eviction and flush.
 //!
-//! Two modes, selected at runtime:
-//!   - **Wall** (default): `now_micros()` returns `chrono::Utc::now()`.
-//!   - **Frozen**: a fixed micros value is stored in an `AtomicI64`; tests
-//!     can step it forward to simulate long time windows in seconds.
-//!
-//! Backwards-compat: the previous env-only `TIMEFUSION_FROZEN_TIME` knob
-//! still works via `init_from_env()` — it just installs the initial frozen
-//! value. Runtime mutators (`set_micros`, `advance_micros`, `unfreeze`)
-//! are wired into SQL UDFs in `functions.rs` so test harnesses can drive
-//! the clock over a normal PGWire connection.
+//! Tests can control it through SQL UDFs or the compatible
+//! `TIMEFUSION_FROZEN_TIME` environment variable.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-/// Sentinel meaning "no frozen value installed; use wall clock". We pick
-/// `i64::MIN` because no realistic micros-since-epoch value can collide.
+/// An impossible epoch value marks wall-clock mode.
 const WALL_SENTINEL: i64 = i64::MIN;
 
 static FROZEN_NOW: AtomicI64 = AtomicI64::new(WALL_SENTINEL);
@@ -77,7 +68,6 @@ mod tests {
 
     #[test]
     fn set_and_advance() {
-        // Use a far-future timestamp so we never collide with wall-clock.
         let t0 = 4_000_000_000_000_000_i64;
         set_micros(t0);
         assert_eq!(now_micros(), t0);
@@ -89,9 +79,7 @@ mod tests {
     }
 }
 
-// ===== test_utils =====
-/// Initialize tracing for tests. Call at start of test functions.
-/// Uses try_init() so multiple calls are safe.
+/// Initializes tracing once for tests.
 pub fn init_test_logging() {
     use tracing_subscriber::{EnvFilter, filter::LevelFilter};
     let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into())).with_test_writer().try_init();
@@ -132,7 +120,6 @@ pub mod test_helpers {
             self
         }
 
-        /// Turn on the default-off rollup build and read gates.
         pub fn with_rollups(mut self) -> Self {
             self.rollups = true;
             self

@@ -1,41 +1,12 @@
-//! Local hot tier — "demote, don't drop" (P1 of
-//! `docs/plans/2026-07-31-local-hot-tier.md`).
+//! Local cache of committed MemBuffer buckets.
 //!
-//! A sealed MemBuffer bucket whose rows are already committed to Delta is
-//! written to local disk as an **uncompressed Arrow IPC file** instead of
-//! simply evaporating, and served back as a third scan leg (mem ∪ hot ∪
-//! delta). That converts the recent-window read from "open 50-325 R2 parquet
-//! files" into a local read with near-zero decode CPU.
+//! Files are immutable, uncompressed Arrow IPC written only after Delta commits.
+//! DataFusion decodes them at execution time inside the query memory pool. Disk
+//! pressure evicts the oldest files; there is no time-based retention.
 //!
-//! The leg is a PLAN, not rows: `HotTier::scan` hands DataFusion's own
-//! `ArrowSource` a `FileScanConfig`, so files decode at EXECUTE time, one batch
-//! at a time, in parallel, inside the query's memory pool. It used to decode
-//! every file while PLANNING (954 ms on 98% of prod scans, outside every pool).
-//!
-//! Size is bounded by DISK ALONE — there is no time retention. GC unlinks
-//! oldest-first to stay under `HotTierLimits::max_disk_bytes`, so buying disk
-//! buys history.
-//!
-//! Invariants:
-//! - **A file here is a cache, never a durability boundary.** Only
-//!   post-commit data is demoted; losing the whole directory costs latency,
-//!   not rows.
-//! - **Uncompressed IPC only** — compression breaks the zero-copy decode, and
-//!   with it the property that the tier's read memory is reclaimable page cache
-//!   rather than anon heap. (LZ4 was enabled 2026-08 to fit more hours under a
-//!   128 GB cap while this line still claimed otherwise; reverted 2026-08-14
-//!   once it was clear the box had 1.1 TB free and the cap was the wrong
-//!   constraint. `roundtrip_is_uncompressed_zero_copy_and_lossless` pins it.)
-//! - **Immutable files.** A demotion always writes a NEW file (tmp + fsync +
-//!   rename); nothing is ever rewritten in place, so an mmap held by an
-//!   in-flight query stays valid across GC (unlink only drops the link).
-//! - **Name-filtered GC over our own root** (lesson of ba8820e: never a
-//!   generic recursive deleter). Only `*.arrow` files matching our own
-//!   `{bucket}_{min}_{end}_{seq}.arrow` convention are ever unlinked.
-//!
-//! Every failure path is best-effort: a bad write is counted and dropped, a
-//! torn/unreadable file is treated as ABSENT so the window falls through to
-//! the Delta leg. Nothing here may fail a query.
+//! This tier is never a durability boundary. Writes are best effort, and an
+//! unreadable file is absent so reads fall through to Delta. GC only removes
+//! cache-named `*.arrow` files beneath its own root.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

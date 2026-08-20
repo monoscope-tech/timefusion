@@ -54,8 +54,7 @@ mod compact;
 mod maintain;
 mod write;
 
-// Unified tables: one Delta table per schema (table_name -> DeltaTable)
-// All default projects share the same table, with project_id as a partition column
+/// Delta tables shared by default projects and partitioned by `project_id`.
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
 /// Soft size at which the no-eviction table caches log a warning.

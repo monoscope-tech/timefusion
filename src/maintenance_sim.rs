@@ -1,28 +1,9 @@
-//! Journal-replay simulator: run a real production `TaskJournal` through the
-//! PRODUCTION scheduler (`claim_next`, `abandon_running`, the shared operation
-//! cycle) on virtual time, with unit durations drawn from measured
-//! distributions. This is the iteration loop for scheduler policy: questions
-//! like "does the queue diverge at 130 projects" or "does contiguity-targeted
-//! ordering reach 30 days first" are answered here in seconds, not by a prod
-//! deploy followed by two hours of quiet (plan:
-//! `docs/plans/2026-08-18-an-architecture-that-keeps-up.md`, Phase 0.1).
+//! Replays a production `TaskJournal` through the real scheduler on virtual
+//! time, using measured duration distributions.
 //!
-//! Fidelity, and where it deliberately stops:
-//! - REAL: task selection (`claim_next` with its sealed reservation, deadline
-//!   gating, dependency and fairness rules), timeout handling
-//!   (`abandon_running`: bisect-on-repeat, deadline-floored backoff), the
-//!   balanced/coverage-short cycle switch (driven by the sim's own contiguity
-//!   model), and frontier minting via `invalidate` (the same function the
-//!   write path calls).
-//! - MODELED: unit durations (uniform over a measured range per operation and
-//!   width class, `--scale` to stress), and the ingest mint cadence (one
-//!   10-minute invalidation per stream per 10 virtual minutes). Byte-driven
-//!   capacity splits (`retry_or_split`) and memory admission are NOT modeled —
-//!   a unit that would split on observed bytes in prod is a source of error
-//!   here, so day-sized whale units are the known fudge.
-//! - The real workers execute one unit per operation per call, sequentially;
-//!   the sim's workers claim one unit, run it, then claim again. Throughput is
-//!   equivalent; only intra-call op ordering is approximated.
+//! Task selection, timeout handling, cycle switching, and invalidation are
+//! real. Durations and ingest cadence are modeled. Byte-driven splits, memory
+//! admission, and intra-call operation order are outside the model.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -33,16 +14,13 @@ use crate::maintenance_coordinator::{Invalidation, MaintenanceTask, Operation, T
 
 const MICROS: i64 = 1_000_000;
 const DAY_MICROS: i64 = 86_400_000_000;
-/// Write path flushes a MemBuffer bucket every ten minutes; each flush
-/// invalidates its range. The sim mints on the same cadence.
+/// Matches the write path's bucket cadence.
 const MINT_INTERVAL_MICROS: i64 = crate::maintenance_coordinator::NORMAL_SLICE_MICROS;
-/// An idle worker re-polls at this cadence, so a task whose deadline matures
-/// while every worker is idle is still claimed promptly.
+/// Lets idle workers notice newly mature deadlines.
 const IDLE_POLL_MICROS: i64 = 5 * MICROS;
 
 #[derive(Clone, Debug)]
 pub struct SimConfig {
-    /// Coordinator jobs (prod: 16).
     pub workers: usize,
     /// Virtual time to simulate.
     pub horizon_micros: i64,
@@ -52,7 +30,6 @@ pub struct SimConfig {
     /// projects). Extra streams clone the first real stream's tables under
     /// synthetic project ids.
     pub streams: Option<usize>,
-    /// Multiplier on every sampled duration.
     pub duration_scale: f64,
     /// Model deploy/OOM restarts: re-invalidate the whole current day for
     /// every stream — exactly what `reconcile_maintenance_task_cursors` does
@@ -140,7 +117,7 @@ fn is_debt_op(operation: Operation) -> bool {
     matches!(operation, Operation::Dedup | Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair)
 }
 
-/// SplitMix64 — deterministic, dependency-free, good enough for a sim.
+/// Deterministic SplitMix64 generator for simulation.
 struct Rng(u64);
 
 impl Rng {
