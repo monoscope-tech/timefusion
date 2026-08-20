@@ -1030,6 +1030,8 @@ impl StatsTableProvider {
             "rollup_dirty_partitions" => m.rollup_dirty_partitions,
             "rollup_skipped_covered_by_wider" => m.rollup_skipped_covered_by_wider,
             "rollup_untagged_inputs" => m.rollup_untagged_inputs,
+            "rollup_tier_untagged_found" => m.rollup_tier_untagged_found,
+            "rollup_tier_untagged_retired_total" => m.rollup_tier_untagged_retired,
             "rollup_min_contiguous_days" => m.rollup_min_contiguous_days,
             "rollup_median_contiguous_days" => m.rollup_median_contiguous_days,
             "rollup_oldest_invalidation_age_seconds" => m.rollup_oldest_invalidation_age_secs,

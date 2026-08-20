@@ -1642,6 +1642,24 @@ impl Database {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Published from here because the information is already in hand — no
+        // extra listing — and because this is the only place that sees a tier's
+        // live set. `found` is the whole tier's untagged count, not just this
+        // partition's, so it reads as a backlog draining rather than a per-unit
+        // blip; `retired` proves this unit actually removed one.
+        {
+            let untagged = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
+            let stats = crate::observability::maintenance_stats();
+            stats.rollup_tier_untagged_found.store(live_adds.iter().filter(|add| untagged(add)).count() as u64, Relaxed);
+            let retired = replaced.iter().filter(|add| untagged(add)).count() as u64;
+            if retired > 0 {
+                stats.rollup_tier_untagged_retired.fetch_add(retired, Relaxed);
+                warn!(
+                    table = %key.physical_table, project_id = %key.project_id, date = %date_string, retired,
+                    event = "rollup_tier_untagged_files_retired"
+                );
+            }
+        }
         // A slice already covered by a STRICTLY WIDER live publication must not
         // publish: both files would stay live (the replace-set only removes what
         // this slice contains, and removing a wider file would drop the range

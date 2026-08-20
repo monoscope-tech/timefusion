@@ -184,35 +184,55 @@ impl metrics::HistogramFn for LocalHistogramHandle {
     }
 }
 
-/// Newtype over `Arc<LocalHistograms>` so `metrics::Recorder` (a foreign trait) can
-/// be implemented on it — the orphan rule doesn't allow implementing directly on
-/// `Arc<LocalHistograms>` since `Arc` isn't a fundamental type.
-#[derive(Clone)]
-struct LocalRecorder(Arc<LocalHistograms>);
+type CounterGaugeRegistry = metrics_util::registry::Registry<metrics::Key, metrics_util::registry::AtomicStorage>;
 
-/// Only `register_histogram` does anything; counters/gauges are left to the OTel
-/// bridge recorder in the `Fanout` — this recorder exists purely for histogram readback.
+/// Local recorder: histograms go through `LocalHistograms` (Summary/DDSketch,
+/// above); counters and gauges go through `metrics_util`'s own `Registry` +
+/// `AtomicStorage` — ready-made `Arc<AtomicU64>`-backed storage, so this needs
+/// no bespoke counter/gauge type of its own. Wrapping both in one newtype
+/// (rather than implementing `Recorder` on `Arc<LocalHistograms>` directly) is
+/// required by the orphan rule — `Arc` isn't a fundamental type.
+#[derive(Clone)]
+struct LocalRecorder {
+    histograms: Arc<LocalHistograms>,
+    registry: Arc<CounterGaugeRegistry>,
+}
+
 impl metrics::Recorder for LocalRecorder {
     fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
     fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
     fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
-    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
-        metrics::Counter::noop()
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::from_arc(self.registry.get_or_create_counter(key, Clone::clone))
     }
-    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
-        metrics::Gauge::noop()
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(self.registry.get_or_create_gauge(key, Clone::clone))
     }
     fn register_histogram(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
-        metrics::Histogram::from_arc(Arc::new(LocalHistogramHandle { histograms: self.0.clone(), name: key.name().to_owned() }))
+        metrics::Histogram::from_arc(Arc::new(LocalHistogramHandle { histograms: self.histograms.clone(), name: key.name().to_owned() }))
     }
 }
 
 static LOCAL_HISTOGRAMS: OnceLock<Arc<LocalHistograms>> = OnceLock::new();
+static LOCAL_REGISTRY: OnceLock<Arc<CounterGaugeRegistry>> = OnceLock::new();
 
 /// Read back a quantile (0.0-1.0) for a name recorded via `metrics::histogram!()`.
 /// `None` if metrics weren't initialized or the name has never recorded a value.
 pub fn histogram_quantile(name: &str, p: f64) -> Option<f64> {
     LOCAL_HISTOGRAMS.get()?.quantile(name, p)
+}
+
+/// Read back the current value of a name recorded via `metrics::counter!()`.
+/// 0 if metrics weren't initialized or the name has never recorded a value —
+/// matches how these were read before migration (`AtomicU64::load` on an
+/// unused field is also 0), so callers don't need an `Option`.
+pub fn counter_value(name: &'static str) -> u64 {
+    LOCAL_REGISTRY.get().and_then(|r| r.get_counter(&metrics::Key::from_name(name))).map_or(0, |c| c.load(Relaxed))
+}
+
+/// Read back the current value of a name recorded via `metrics::gauge!()`. See `counter_value`.
+pub fn gauge_value(name: &'static str) -> f64 {
+    LOCAL_REGISTRY.get().and_then(|r| r.get_gauge(&metrics::Key::from_name(name))).map_or(0.0, |g| f64::from_bits(g.load(Relaxed)))
 }
 
 /// Initialize OTel metrics. Idempotent (subsequent calls are no-ops).
@@ -248,21 +268,23 @@ pub fn init_metrics(
     let meter = opentelemetry::global::meter("timefusion");
 
     // Bridges the `metrics` facade (counter!/histogram!/gauge! macros) onto this
-    // same Meter/provider, so ad-hoc call-site metrics (e.g. latency histograms)
-    // don't need a hand-rolled Counter/instrument wired through a struct field —
-    // see database::ScanMetrics's record_scan/record_pgwire_query/record_cert_dwell.
-    // Fanned out to two recorders because the OTel bridge is push-only (no
-    // snapshot API): `local_histograms` also gets every call so `timefusion_stats`
-    // can read quantiles back in-process via `histogram_quantile()`.
+    // same Meter/provider, so ad-hoc call-site metrics (e.g. database::ScanMetrics's
+    // ~40 counters) don't need a hand-rolled Counter/instrument wired through a
+    // struct field. Fanned out to two recorders because the OTel bridge is
+    // push-only (no snapshot API): `local_histograms`/`local_registry` also get
+    // every call so `timefusion_stats` can read values back in-process via
+    // `histogram_quantile()`/`counter_value()`/`gauge_value()`.
     // Idempotent-guarded by the METRICS OnceLock above; ignore "already installed"
     // from a second init_metrics() call (tests, embedded use).
     let local_histograms = Arc::new(LocalHistograms(dashmap::DashMap::new()));
+    let local_registry = Arc::new(CounterGaugeRegistry::atomic());
     let fanout = metrics_util::layers::FanoutBuilder::default()
-        .add_recorder(LocalRecorder(local_histograms.clone()))
+        .add_recorder(LocalRecorder { histograms: local_histograms.clone(), registry: local_registry.clone() })
         .add_recorder(metrics_exporter_opentelemetry::Recorder::with_meter(meter.clone()))
         .build();
     if metrics::set_global_recorder(fanout).is_ok() {
         let _ = LOCAL_HISTOGRAMS.set(local_histograms);
+        let _ = LOCAL_REGISTRY.set(local_registry);
     }
 
     // Observable gauges polled from snapshot_stats() each export cycle. We
@@ -818,6 +840,23 @@ atomic_stats! {
     /// shrink as those partitions are rewritten; a rise means older history is
     /// being reached, which is the point.
     rollup_untagged_inputs,
+    /// Untagged files found LIVE IN A TIER at publish time (gauge, overwritten
+    /// per unit), and the running total this publish path has retired.
+    ///
+    /// A tier file with no identity tags used to be immortal — the replace-set
+    /// skipped it, so every rebuild stacked another version of every `id` beside
+    /// it. That ran for a MONTH unnoticed (352 files, 26 days, 7.17 versions per
+    /// id) purely because nothing counted it; it was found by hand while chasing
+    /// an inflated dashboard. After `slice_retires` the steady state is genuinely
+    /// zero, so `found` is alarmable at > 0: nonzero means some path is writing
+    /// or stripping tier tags again and should be named before it costs another
+    /// archaeology session.
+    ///
+    /// `retired` is how a repair is watched draining — the only proof a rebuild
+    /// REMOVED the old file rather than publishing a correct one beside it,
+    /// which is exactly what the first repair attempt did.
+    rollup_tier_untagged_found,
+    rollup_tier_untagged_retired,
     /// Contiguous sealed days of rollup coverage, counting back from yesterday,
     /// minimised over every (project, declared tier).
     ///
