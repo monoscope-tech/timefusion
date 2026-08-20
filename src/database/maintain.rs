@@ -1286,13 +1286,13 @@ impl Database {
         required_columns.extend(source_schema.tombstone_column.iter().map(String::as_str));
         required_columns.extend(spec.dimensions.iter().map(String::as_str));
         required_columns.extend(spec.measures.iter().filter_map(|measure| measure.column.as_deref()));
-        for filter in spec.measures.iter().filter_map(|measure| measure.filter.as_deref()) {
-            for token in filter.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_')) {
-                if source_schema.fields.iter().any(|field| field.name == token) {
-                    required_columns.insert(token);
-                }
-            }
-        }
+        required_columns.extend(
+            spec.measures
+                .iter()
+                .filter_map(|measure| measure.filter.as_deref())
+                .flat_map(|filter| filter.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_')))
+                .filter(|token| source_schema.fields.iter().any(|field| field.name == *token)),
+        );
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
@@ -1447,9 +1447,6 @@ impl Database {
         fingerprint_items.hash(&mut fingerprint);
         let source_fp = fingerprint.finish();
 
-        // This session registers the mergeable aggregate-state UDFs used by
-        // HLL and t-digest measures. The source itself is still replaced with
-        // the direct, byte-pruned provider below.
         // Phase timings for the LIVE coordinator unit. The existing
         // `rollup_*_duration_ms` counters were only ever written by
         // `stage_rollup_wave` / `commit_rollup_wave`, which belong to the older
@@ -1488,14 +1485,10 @@ impl Database {
         let tier_dedup = derived.then(|| crate::rollup::rollup_tier_dedup(input_schema)).flatten();
         let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp);
         let target_schema = get_schema(&key.physical_table).ok_or_else(|| anyhow::anyhow!("rollup target schema missing"))?;
-        let mut shard_keys = if derived {
-            std::iter::once("project_id".to_owned()).chain(std::iter::once("timestamp".to_owned())).chain(spec.dimensions.iter().cloned()).collect::<Vec<_>>()
-        } else {
-            source_schema.dedup_keys.clone()
-        };
+        let default_shard_keys = || ["project_id".to_owned(), "timestamp".to_owned()].into_iter().chain(spec.dimensions.iter().cloned()).collect::<Vec<_>>();
+        let mut shard_keys = if derived { default_shard_keys() } else { source_schema.dedup_keys.clone() };
         if shard_keys.is_empty() {
-            shard_keys =
-                std::iter::once("project_id".to_owned()).chain(std::iter::once("timestamp".to_owned())).chain(spec.dimensions.iter().cloned()).collect();
+            shard_keys = default_shard_keys();
         }
         let shard_key_sql = shard_keys.iter().map(|field| format!("CAST({} AS VARCHAR)", crate::rollup::quoted(field))).collect::<Vec<_>>().join(", ");
         // Same reasoning as the dedup rewrite's bucketing: an even, stable spread
@@ -4760,22 +4753,21 @@ impl Database {
         }
         let store = { table_ref.read().await.log_store().object_store(None) };
         let table = table_name.to_owned();
-        let mut jobs = futures::stream::iter(files.into_iter().map(|(project, rel, uri)| {
+        let (built, failed) = futures::stream::iter(files.into_iter().map(|(project, rel, uri)| {
             let (svc, store, table) = (svc.clone(), store.clone(), table.clone());
             async move { svc.build_index_for_file(&table, &project, &rel, &uri, store).await }
         }))
-        .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
-        let mut built = 0usize;
-        let mut failed = 0usize;
-        while let Some(result) = jobs.next().await {
+        .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1))
+        .fold((0usize, 0usize), |(built, failed), result| async move {
             match result {
-                Ok(()) => built += 1,
+                Ok(()) => (built + 1, failed),
                 Err(error) => {
-                    failed += 1;
                     warn!(table_name, %error, event = "tantivy_wave_reindex_failed");
+                    (built, failed + 1)
                 }
             }
-        }
+        })
+        .await;
         info!(table_name, built, failed, event = "tantivy_wave_reindex_complete");
     }
 
