@@ -14,23 +14,41 @@ Artifact tool from any session — never mint a new URL).
 Counts must come from the Delta snapshot (S3 listing overcounts tombstones).
 Python `deltalake` is installed; creds in `.env.prod`:
 
+Two OVH quirks are load-bearing here — both are baked into the snippet below,
+don't "simplify" them away:
+
+- `AWS_REGION` must be **`de`**, not `auto`. OVH rejects `auto` with
+  `AuthorizationHeaderMalformed … expecting 'de'`.
+- Export `AWS_REQUEST_CHECKSUM_CALCULATION` / `AWS_RESPONSE_CHECKSUM_VALIDATION`
+  as `when_required`. Otherwise the client sends `x-amz-checksum-mode`, OVH
+  rejects it, and reads fail — the failure mode that once made a probe report
+  shipbubble as 0/14 days sorted when it was 9/9.
+
 ```bash
 set -a; source .env.prod; set +a
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 python3 - <<'EOF'
 from deltalake import DeltaTable
 import os, collections
 st={"AWS_ACCESS_KEY_ID":os.environ["AWS_ACCESS_KEY_ID"],"AWS_SECRET_ACCESS_KEY":os.environ["AWS_SECRET_ACCESS_KEY"],
-    "AWS_ENDPOINT_URL":os.environ["AWS_S3_ENDPOINT"],"AWS_REGION":"auto"}
+    "AWS_ENDPOINT_URL":os.environ["AWS_S3_ENDPOINT"],"AWS_REGION":"de"}
 dt=DeltaTable(f"s3://{os.environ['AWS_S3_BUCKET']}/timefusion/otel_logs_and_spans", storage_options=st)
-c=collections.Counter()
+c=collections.Counter(); b=collections.Counter()
 for a in dt.get_add_actions(flatten=True).to_struct_array().to_pylist():
     d=str(a.get("partition.date"))
     if d>="2026-07-20":   # adjust window to the question at hand
-        c[((a.get("partition.project_id") or "NULL")[:8],d)]+=1
-for p in sorted({p for p,_ in c}): print(p, {d:n for (q,d),n in sorted(c.items()) if q==p})
+        k=((a.get("partition.project_id") or "NULL")[:8],d)
+        c[k]+=1; b[k]+=a.get("size_bytes",0)
+for p in sorted({p for p,_ in c}):
+    print(p, {d:(n, round(b[(p,d)]/1e9,2)) for (q,d),n in sorted(c.items()) if q==p})
 print("version:",dt.version())
 EOF
 ```
+
+Bytes matter as much as counts: the chart's yield column is
+`(files − ceil(GB)) / GB`, so pull `size_bytes` in the same pass.
+
+Rollup tables live at `timefusion/<table>`, **not** `timefusion/default/<table>`.
 
 ## 2. Update the template
 
