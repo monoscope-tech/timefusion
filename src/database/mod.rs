@@ -355,6 +355,30 @@ struct Certification {
     since: std::time::Instant,
 }
 
+/// Clean dedup slices accumulated toward certifying one (project, table, date)
+/// partition: disjoint sorted `[start, end)` intervals, all proved over `fp`.
+/// A unit that drops rows or a fingerprint move resets the accumulation —
+/// evidence over a moved file set is void. Memory-only: a restart just
+/// re-accumulates; certification itself persists.
+#[derive(Clone, Debug)]
+struct SliceCoverage {
+    fp: u64,
+    intervals: Vec<(i64, i64)>,
+}
+
+/// Merge `[start, end)` into a sorted vec of disjoint half-open intervals.
+fn merge_clean_interval(intervals: &mut Vec<(i64, i64)>, (start, end): (i64, i64)) {
+    intervals.push((start, end));
+    intervals.sort_unstable();
+    *intervals = intervals.iter().fold(Vec::new(), |mut merged, &(s, e)| {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+        merged
+    });
+}
+
 // Custom project tables: projects with their own S3 bucket get isolated tables
 // Key: (project_id, table_name) -> DeltaTable
 pub type CustomProjectTables = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
@@ -2316,6 +2340,9 @@ pub struct Database {
     /// Serializes snapshots of `dedup_clean_fp` with their shared atomic temp
     /// path. Coordinator workers can grant different partitions concurrently.
     dedup_certification_persist_lock: Arc<std::sync::Mutex<()>>,
+    /// (project, table, date) → clean-slice coverage accumulating toward a
+    /// `dedup_clean_fp` entry. See `SliceCoverage` and `record_clean_slice`.
+    dedup_slice_coverage: Arc<dashmap::DashMap<(String, String, String), SliceCoverage>>,
     /// Monotonic invalidation epoch for each source `(project, table, date)`.
     rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
     /// Certified rollup generations keyed by `(project, source, target, date)`.
@@ -3025,6 +3052,7 @@ impl Database {
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp,
             dedup_certification_persist_lock: Arc::new(std::sync::Mutex::new(())),
+            dedup_slice_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
@@ -10326,6 +10354,22 @@ mod writer_properties_tests {
         assert_eq!(window_dates(0, 400 * day), None, "wider than a year → keep DedupExec");
     }
 
+    // Slice-coverage merge: disjoint stays disjoint, touching/overlapping fuse,
+    // and out-of-order inserts still converge to one day-spanning interval.
+    #[test]
+    fn clean_interval_merge() {
+        let merged = |pairs: &[(i64, i64)]| {
+            let mut v = Vec::new();
+            pairs.iter().for_each(|&p| merge_clean_interval(&mut v, p));
+            v
+        };
+        assert_eq!(merged(&[(0, 10), (20, 30)]), vec![(0, 10), (20, 30)], "a gap must survive");
+        assert_eq!(merged(&[(0, 10), (10, 20)]), vec![(0, 20)], "half-open adjacency fuses");
+        assert_eq!(merged(&[(0, 15), (10, 20)]), vec![(0, 20)], "overlap fuses");
+        assert_eq!(merged(&[(12, 24), (0, 6), (6, 12)]), vec![(0, 24)], "order of arrival must not matter");
+        assert_eq!(merged(&[(0, 24), (5, 10)]), vec![(0, 24)], "a contained slice changes nothing");
+    }
+
     #[test]
     fn dedup_file_selection_is_exact_for_unified_and_custom_tables() {
         let paths = vec![
@@ -10754,6 +10798,73 @@ mod tests {
             persisted, persist,
             "a coordinator-owned table never reaches the legacy sweep's persistence site, so its grant must honor the persistence flag here"
         );
+        Ok(())
+    }
+
+    /// Enqueue one Dedup unit over `[start, end)` and run the coordinator once.
+    async fn run_dedup_slice(db: &Database, project: &str, start: i64, end: i64) -> Result<bool> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
+        let key = TaskKey {
+            physical_table: "otel_logs_and_spans".to_owned(),
+            source: "otel_logs_and_spans".to_owned(),
+            project_id: project.to_owned(),
+            slice: TimeSlice::new(start, end)?,
+            operation: Operation::Dedup,
+        };
+        db.maintenance_tasks.lock().unwrap().enqueue(key, 0, 1024, 0);
+        db.run_coordinator_dedup_once().await
+    }
+
+    /// Clean NARROW dedup units must accumulate into certification.
+    ///
+    /// Prod never produces surviving day-wide units: `coarsen_to_width` caps units at
+    /// `MAX_DECODED_BYTES` (≈6h for otel_logs_and_spans) and true day-wide units die at the
+    /// coordinator's Dedup deadline — so `cert_granted_total` stayed 0 forever (2026-08-20).
+    /// Certification is a property of the partition, not the unit shape: clean slices whose
+    /// union covers the UTC day over an unmoved file set prove what one day-wide pass does.
+    #[tokio::test]
+    #[serial]
+    async fn clean_slice_units_accumulate_to_certify_the_partition() -> Result<()> {
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let db = Database::with_config(create_test_config("slice-cov-certify")).await?;
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
+        let date = day.date_naive();
+        let day_start = midnight_micros(date);
+        let half = day_start + DAY_MICROS / 2;
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+
+        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
+        assert!(!db.dedup_clean_fp.contains_key(&key), "half a day proves nothing on its own");
+        assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run");
+        assert!(db.dedup_clean_fp.contains_key(&key), "two clean halves cover the day and must certify the partition");
+        Ok(())
+    }
+
+    /// A write between clean slices moves the fingerprint and voids accumulated coverage.
+    ///
+    /// The evidence is per-file-set: a slice proved clean over yesterday's files says nothing
+    /// about today's. Without the fp reset, a partition written mid-accumulation would certify
+    /// while duplicates could sit in the never-re-swept first half.
+    #[tokio::test]
+    #[serial]
+    async fn a_write_between_clean_slices_voids_accumulated_coverage() -> Result<()> {
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let db = Database::with_config(create_test_config("slice-cov-voided")).await?;
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
+        let date = day.date_naive();
+        let day_start = midnight_micros(date);
+        let half = day_start + DAY_MICROS / 2;
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+
+        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
+        // A new file lands in the partition: the fp the first slice was proved under is dead.
+        insert_a_span(&db, &project, "late", day.timestamp_micros() + 1).await?;
+        assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run");
+        assert!(!db.dedup_clean_fp.contains_key(&key), "a moved file set voids the first slice's evidence — no certification");
         Ok(())
     }
 
