@@ -719,7 +719,20 @@ fn select_warm_paths(
     (paths, dropped)
 }
 
-// Helper function to extract project_id from a batch
+/// Reads `project_id` from row 0 of a batch (Utf8View preferred, Utf8 fallback).
+/// For batches that may carry rows for several projects, use
+/// [`partition_batch_by_project`] instead — this only looks at row 0.
+///
+/// ```
+/// use std::sync::Arc;
+/// use datafusion::arrow::{record_batch::RecordBatch, array::StringViewArray, datatypes::{DataType, Field, Schema}};
+/// use timefusion::database::extract_project_id;
+///
+/// let schema = Arc::new(Schema::new(vec![Field::new("project_id", DataType::Utf8View, true)]));
+/// let batch = RecordBatch::try_new(schema, vec![Arc::new(StringViewArray::from(vec!["acme"]))])?;
+/// assert_eq!(extract_project_id(&batch), Some("acme".to_string()));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
 
@@ -743,6 +756,25 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 /// table. Rows with a null/absent `project_id` fall back to `default_project`.
 /// A homogeneous batch is returned as-is (no copy); mixed batches are split with
 /// `take`. Groups are keyed in sorted order for deterministic table writes.
+///
+/// ```
+/// use std::sync::Arc;
+/// use datafusion::arrow::{record_batch::RecordBatch, array::{Int64Array, StringViewArray}, datatypes::{DataType, Field, Schema}};
+/// use timefusion::database::partition_batch_by_project;
+///
+/// let schema = Arc::new(Schema::new(vec![
+///     Field::new("project_id", DataType::Utf8View, true),
+///     Field::new("id", DataType::Int64, false),
+/// ]));
+/// // Interleaved rows for two projects, plus one null (falls back to "default").
+/// let pid = StringViewArray::from(vec![Some("a"), Some("b"), Some("a"), None]);
+/// let batch = RecordBatch::try_new(schema, vec![Arc::new(pid), Arc::new(Int64Array::from(vec![1, 2, 3, 4]))])?;
+///
+/// let parts = partition_batch_by_project(batch, "default")?;
+/// let names: Vec<&str> = parts.iter().map(|(p, _)| p.as_str()).collect();
+/// assert_eq!(names, ["a", "b", "default"], "sorted, each project keeps only its own rows");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> DFResult<Vec<(String, RecordBatch)>> {
     use std::collections::BTreeMap;
 
@@ -20639,40 +20671,28 @@ mod tests {
         }
     }
 
-    // Regression: a single Arrow batch carrying rows for several projects (as a
-    // genuine multi-row pgwire INSERT produces) must split row-wise — each row to
-    // its own project. The old routing read only row 0 and dumped every row into
-    // the first row's project, silently corrupting the rest.
+    // The doctest on `partition_batch_by_project` covers the row-wise split and
+    // null→default fallback via the Utf8View path. This covers what it doesn't:
+    // the plain-Utf8 array path, and the homogeneous-batch no-split shortcut.
     #[test]
-    fn test_partition_batch_by_project_row_wise() {
+    fn partition_batch_by_project_utf8_and_homogeneous_paths() {
         use std::sync::Arc;
 
         use datafusion::arrow::{
-            array::{ArrayRef, AsArray, Int64Array, StringArray, StringViewArray},
+            array::{AsArray, Int64Array, StringArray},
             datatypes::{DataType, Field, Int64Type, Schema},
         };
 
-        let check = |pid_col: ArrayRef| {
-            let schema = Arc::new(Schema::new(vec![Field::new("project_id", pid_col.data_type().clone(), true), Field::new("id", DataType::Int64, false)]));
-            let ids = Int64Array::from(vec![1, 2, 3, 4]); // interleaved A/B/A + null→default
-            let batch = RecordBatch::try_new(schema, vec![pid_col, Arc::new(ids)]).unwrap();
-
-            // BTreeMap → deterministic sorted keys: A, B, default
-            let parts = partition_batch_by_project(batch, "default").unwrap();
-            let shape: Vec<(String, Vec<i64>)> = parts.iter().map(|(p, b)| (p.clone(), b.column(1).as_primitive::<Int64Type>().values().to_vec())).collect();
-            assert_eq!(
-                shape,
-                vec![("A".into(), vec![1, 3]), ("B".into(), vec![2]), ("default".into(), vec![4])],
-                "each project keeps exactly its own rows; null falls back to default"
-            );
-        };
-
-        check(Arc::new(StringViewArray::from(vec![Some("A"), Some("B"), Some("A"), None])));
-        check(Arc::new(StringArray::from(vec![Some("A"), Some("B"), Some("A"), None]))); // Utf8 path too
+        let schema = Arc::new(Schema::new(vec![Field::new("project_id", DataType::Utf8, true), Field::new("id", DataType::Int64, false)]));
+        let pid = StringArray::from(vec![Some("A"), Some("B"), Some("A"), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(pid), Arc::new(Int64Array::from(vec![1, 2, 3, 4]))]).unwrap();
+        let parts = partition_batch_by_project(batch, "default").unwrap();
+        let shape: Vec<(String, Vec<i64>)> = parts.iter().map(|(p, b)| (p.clone(), b.column(1).as_primitive::<Int64Type>().values().to_vec())).collect();
+        assert_eq!(shape, vec![("A".into(), vec![1, 3]), ("B".into(), vec![2]), ("default".into(), vec![4])], "Utf8 (non-View) array path");
 
         // Homogeneous batch: single group, whole batch (no split).
         let schema = Arc::new(Schema::new(vec![Field::new("project_id", DataType::Utf8View, false)]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringViewArray::from(vec!["A", "A", "A"]))]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(datafusion::arrow::array::StringViewArray::from(vec!["A", "A", "A"]))]).unwrap();
         let parts = partition_batch_by_project(batch, "default").unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!((parts[0].0.as_str(), parts[0].1.num_rows()), ("A", 3));
@@ -24026,33 +24046,6 @@ mod tests {
         Ok(())
     }
 
-    /// One transient flush-unhealthy sample mid-pass must not discard the
-    /// batch's staged work. The old latch requeued every remaining bin after a
-    /// single bad sample — at boot that silently forfeited an entire 128-bin
-    /// pass (~75 min of staging, prod 2026-08-05). A wave whose commit finds
-    /// flush unhealthy waits for recovery instead.
-    #[tokio::test]
-    async fn dirty_dedup_drain_survives_transient_flush_unhealthy() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-transient-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |id: &str, observed: &str| json_to_batch(vec![test_span_ts(id, observed, &project, old)]);
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
-
-        // Healthy at pass start, unhealthy for exactly one mid-pass sample.
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let flaky = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &flaky, std::time::Duration::MAX, far_future()).await?;
-        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2, "the unhealthy sample must have been consumed");
-        assert_eq!(delta_physical_row_count(&table).await?, 1, "a transient unhealthy flush sample must not forfeit the staged dedup work");
-        assert!(db.dedup_dirty_bins.is_empty(), "bin is consumed, not requeued");
-        Ok(())
-    }
-
     /// One whole-date probe classifies every queued bin of a (project, date):
     /// probe-clean bins are consumed WITHOUT per-bin staging scans (every
     /// flushed bin is enqueued, so in prod ~97% of queued bins carry no
@@ -24119,66 +24112,103 @@ mod tests {
         Ok(())
     }
 
-    /// A drain pass out of budget must stop admitting bins and leave them queued.
-    ///
-    /// Staging used to ignore the pass deadline: up to 64 bins, each with a long per-bin ceiling,
-    /// inside a tick whose entire budget was short. An over-running pass holds `maintenance_job_sem`
-    /// and drops overlapping ticks, costing every tick behind it and every other maintenance job.
-    /// Bins that cannot be admitted must stay queued so the next tick can serve them.
+    /// `dedup_dirty_bins_for_table` under every way a pass can be interrupted or bounded — each
+    /// case seals two duplicate rows into one dirty bin, then exercises one gate/deadline knob.
+    /// A #[serial] fn (not a case table) because two cases assert on process-global stat deltas.
+    #[serial]
     #[tokio::test]
-    async fn dedup_drain_out_of_budget_leaves_its_bins_queued() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-passbudget-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("sealed", observed, &project, old)]);
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+    async fn dedup_dirty_bins_for_table_survives_interruption() -> Result<()> {
+        // `age`: None = well beyond the seal lag (26h); Some picks the age relative to the fresh
+        // db's own config (the cold case needs `cold_optimize_after_days`, known only post-construction).
+        async fn sealed_dup_bin(label: &str, age: impl FnOnce(&Database) -> chrono::Duration) -> Result<(Database, Arc<RwLock<DeltaTable>>)> {
+            let cfg = create_test_config(&format!("dirty-dedup-{label}-{}", uuid::Uuid::new_v4().simple()));
+            let db = Database::with_config(cfg).await?;
+            let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+            let old = (Utc::now() - age(&db)).timestamp_micros();
+            let row = |observed: &str| json_to_batch(vec![test_span_ts("sealed", observed, &project, old)]);
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+            assert_eq!(db.dedup_dirty_bins.len(), 1);
+            let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+            Ok((db, table))
+        }
 
-        // An already-elapsed pass deadline with a generous per-bin ceiling: only
-        // the pass budget can stop this, and it must.
-        let started = std::time::Instant::now();
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_secs(3600), std::time::Instant::now()).await?;
-        assert!(started.elapsed() < std::time::Duration::from_secs(30), "the pass must return on its budget, not run the per-bin ceiling");
-        assert_eq!(db.dedup_dirty_bins.len(), 1, "an unadmitted bin stays queued for the next tick");
-        assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
+        // Case: one transient flush-unhealthy sample mid-pass must not discard the batch's staged
+        // work. The old latch requeued every remaining bin after a single bad sample — at boot
+        // that silently forfeited an entire 128-bin pass (~75 min of staging, prod 2026-08-05).
+        {
+            let (db, table) = sealed_dup_bin("transient", |_| chrono::Duration::hours(26)).await?;
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let flaky = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1; // unhealthy on the 2nd sample only
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &flaky, std::time::Duration::MAX, far_future()).await?;
+            assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2, "the unhealthy sample must have been consumed");
+            assert_eq!(delta_physical_row_count(&table).await?, 1, "a transient unhealthy sample must not forfeit staged dedup work");
+            assert!(db.dedup_dirty_bins.is_empty(), "bin is consumed, not requeued");
+        }
 
-        // And the bin is still perfectly drainable once a pass has budget.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
-        assert_eq!(delta_physical_row_count(&table).await?, 1, "the deferred bin dedups on a pass that has budget");
-        assert!(db.dedup_dirty_bins.is_empty());
-        Ok(())
-    }
+        // Case: a pass whose deadline has already elapsed must stop admitting bins and leave them
+        // queued, rather than running each bin's own generous per-bin ceiling. `maintenance_job_sem`
+        // is held for the whole pass, so an over-run here costs every tick behind it.
+        {
+            let (db, table) = sealed_dup_bin("passbudget", |_| chrono::Duration::hours(26)).await?;
+            let started = std::time::Instant::now();
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_secs(3600), std::time::Instant::now()).await?;
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "the pass must return on its own budget, not the per-bin ceiling");
+            assert_eq!(db.dedup_dirty_bins.len(), 1, "an unadmitted bin stays queued for the next tick");
+            assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+            assert_eq!(delta_physical_row_count(&table).await?, 1, "the deferred bin dedups fine once a pass has budget");
+            assert!(db.dedup_dirty_bins.is_empty());
+        }
 
-    /// A hung staging read must not wedge the drain: the per-bin deadline
-    /// converts the hang into an ordinary requeue and the pass moves on
-    /// (prod 2026-08-05: one unbounded read held the 1-permit maintenance
-    /// semaphore for 6.5h while the cron logged skips=77).
-    #[tokio::test]
-    async fn dirty_dedup_bin_staging_deadline_requeues_instead_of_wedging() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-deadline-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("sealed", observed, &project, old)]);
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        // Case: a hung per-bin staging read must requeue rather than wedge the drain (prod
+        // 2026-08-05: one unbounded read held the 1-permit maintenance semaphore for 6.5h while
+        // the cron logged skips=77). A 1ms deadline stands in for the hang.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (db, table) = sealed_dup_bin("staging-deadline", |_| chrono::Duration::hours(26)).await?;
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_millis(1), far_future()).await?;
+            assert!(crate::observability::maintenance_stats().dedup_bin_stage_timeouts.load(Relaxed) >= 1, "the per-bin deadline must fire");
+            assert_eq!(db.dedup_dirty_bins.len(), 1, "the timed-out bin is requeued, not lost");
+            assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+            assert_eq!(delta_physical_row_count(&table).await?, 1, "the requeued bin dedups under a sane deadline");
+            assert!(db.dedup_dirty_bins.is_empty());
+        }
 
-        // A 1ms deadline fires before any real staging read can complete —
-        // standing in for the hung GET.
-        use std::sync::atomic::Ordering::Relaxed;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::from_millis(1), far_future()).await?;
-        assert!(crate::observability::maintenance_stats().dedup_bin_stage_timeouts.load(Relaxed) >= 1, "the per-bin deadline must fire");
-        assert_eq!(db.dedup_dirty_bins.len(), 1, "the timed-out bin is requeued, not lost");
-        assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
+        // Case: cold-owned bins (past `cold_optimize_after_days`) are only ever DEFERRED, never
+        // dropped — the nightly consolidate bin-packs those partitions but does not collapse
+        // duplicates, so this drain is their only physical dedup. A batch of 1 still has room.
+        {
+            let (db, table) = sealed_dup_bin("cold", |db| chrono::Duration::days(db.config.parquet.cold_optimize_after_days() as i64 + 2)).await?;
+            let deferred_before = crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed);
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+            assert_eq!(
+                crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
+                deferred_before,
+                "nothing to defer when the batch has room"
+            );
+            assert_eq!(delta_physical_row_count(&table).await?, 1, "cold duplicates are physically collapsed, never silently abandoned");
+            assert!(db.dedup_dirty_bins.is_empty());
+        }
 
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
-        assert_eq!(delta_physical_row_count(&table).await?, 1, "the requeued bin dedups under a sane deadline");
-        assert!(db.dedup_dirty_bins.is_empty());
+        // Case: dedup yields to persistence — a permanently unhealthy flush path skips the whole
+        // pass, leaving the queue intact for a later tick, then drains normally once healthy again.
+        {
+            let (db, table) = sealed_dup_bin("flush-gate", |_| chrono::Duration::hours(26)).await?;
+            let yields_before = crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false, std::time::Duration::MAX, far_future()).await?;
+            assert_eq!(
+                crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
+                yields_before + 1,
+                "the skipped pass is counted, not silent"
+            );
+            assert_eq!(db.dedup_dirty_bins.len(), 1, "the bin stays queued for a healthier tick");
+            assert_eq!(delta_physical_row_count(&table).await?, 2, "no rewrite happened; read-side dedup keeps results correct");
+            db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+            assert_eq!(delta_physical_row_count(&table).await?, 1);
+        }
+
         Ok(())
     }
 
@@ -24249,70 +24279,6 @@ mod tests {
             "a bin-scoped re-read must never remove files whose adjacent rows were omitted"
         );
         assert!(!dedup_rewrite_counts_match(5_795_641, 5_795_641, 2_100_001, 2_100_000), "winner-count drift must also fail closed");
-    }
-
-    /// The cold cutoff must never DROP bins: the nightly consolidate bin-packs
-    /// those partitions but does not collapse duplicates, so this drain is
-    /// their only physical dedup.
-    #[serial]
-    #[tokio::test]
-    async fn dirty_dedup_cold_bins_are_deferred_not_dropped() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-cold-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let after_days = db.config.parquet.cold_optimize_after_days();
-        let ancient = (Utc::now() - chrono::Duration::days(after_days as i64 + 2)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("cold", observed, &project, ancient)]);
-
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-
-        let deferred_before = crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
-        // Batch of 1 with a cold-only queue still serves it (lowest priority ≠
-        // never), so the drain deduplicates rather than abandoning the rows.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
-        assert_eq!(
-            crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
-            deferred_before,
-            "nothing to defer when the batch has room"
-        );
-        assert_eq!(delta_physical_row_count(&table).await?, 1, "cold duplicates are physically collapsed, never silently abandoned");
-        assert!(db.dedup_dirty_bins.is_empty());
-        Ok(())
-    }
-
-    /// Dedup yields to persistence: an unhealthy flush path skips the pass
-    /// whole, leaving the queue intact for a later tick.
-    #[serial]
-    #[tokio::test]
-    async fn dirty_dedup_drain_yields_to_unhealthy_flush() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-gate-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("gated", observed, &project, old)]);
-
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-
-        let yields_before = crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false, std::time::Duration::MAX, far_future()).await?;
-        assert_eq!(
-            crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
-            yields_before + 1,
-            "the skipped pass is counted, not silent"
-        );
-        assert_eq!(db.dedup_dirty_bins.len(), 1, "the bin stays queued for a healthier tick");
-        assert_eq!(delta_physical_row_count(&table).await?, 2, "no rewrite happened; read-side dedup keeps results correct");
-
-        // Healthy again ⇒ the same bin drains normally.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
-        assert_eq!(delta_physical_row_count(&table).await?, 1);
-        Ok(())
     }
 
     /// `date = '…'` and `BETWEEN` bound a scan but are invisible to
