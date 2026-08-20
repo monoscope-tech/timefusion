@@ -14,15 +14,14 @@ Artifact tool from any session — never mint a new URL).
 Counts must come from the Delta snapshot (S3 listing overcounts tombstones).
 Python `deltalake` is installed; creds in `.env.prod`:
 
-Two OVH quirks are load-bearing here — both are baked into the snippet below,
-don't "simplify" them away:
+Two OVH quirks are load-bearing — both are in the snippet, don't "simplify" them away:
 
 - `AWS_REGION` must be **`de`**, not `auto`. OVH rejects `auto` with
   `AuthorizationHeaderMalformed … expecting 'de'`.
 - Export `AWS_REQUEST_CHECKSUM_CALCULATION` / `AWS_RESPONSE_CHECKSUM_VALIDATION`
-  as `when_required`. Otherwise the client sends `x-amz-checksum-mode`, OVH
-  rejects it, and reads fail — the failure mode that once made a probe report
-  shipbubble as 0/14 days sorted when it was 9/9.
+  as `when_required`, or the client sends `x-amz-checksum-mode`, OVH rejects it
+  and reads fail — the failure that once made a probe report shipbubble as 0/14
+  days sorted when it was 9/9.
 
 ```bash
 set -a; source .env.prod; set +a
@@ -45,8 +44,9 @@ print("version:",dt.version())
 EOF
 ```
 
-Bytes matter as much as counts: the chart's yield column is
-`(files − ceil(GB)) / GB`, so pull `size_bytes` in the same pass.
+Pull `size_bytes` in the same pass: the chart's yield column is
+`(files − ceil(GB)) / GB`, the return on rewriting a cell at the 1 GB target,
+and it is what distinguishes real debt from near-converged partitions.
 
 Rollup tables live at `timefusion/<table>`, **not** `timefusion/default/<table>`.
 
