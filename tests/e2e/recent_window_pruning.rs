@@ -95,10 +95,7 @@ async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Resul
     // to full-set — the mode whose 2 GiB ceiling killed prod point lookups.
     // With empty legs dropped before the union, the ordered delta leg keeps
     // bounded streaming dedup.
-    assert!(
-        dedup_line.contains("bounded["),
-        "DedupExec fell to full-set — an empty leg vetoed the declared ordering.\nplan:\n{plan}"
-    );
+    assert!(dedup_line.contains("bounded["), "DedupExec fell to full-set — an empty leg vetoed the declared ordering.\nplan:\n{plan}");
     Ok(())
 }
 
