@@ -4889,20 +4889,42 @@ impl Database {
             .map_err(|e| DataFusionError::Execution(format!("Failed to get or create custom table: {}", e)))
     }
 
+    /// Load-outside-write-lock, double-check-then-insert cache shape shared by
+    /// `get_or_create_unified_table`/`get_or_create_custom_table`.
+    ///
+    /// The load happens OUTSIDE the write lock: `create_delta_table_internal` replays the Delta
+    /// log over the network and is not time-bounded (a dead endpoint or a huge log can hold it
+    /// for minutes or forever); holding the map's write guard across it blocks EVERY reader of
+    /// the map, and because tokio's RwLock is write-preferring one queued writer also blocks
+    /// every later reader. That wedges all maintenance jobs on their first table lookup while
+    /// ingest/queries stay healthy on `fast_resolve_cache` — the 2026-07-29 22:05
+    /// total-maintenance-wedge shape. Two racing first touches may both load; the double-check
+    /// below keeps the first insert. Returns the post-insert cache size (taken atomically inside
+    /// the write lock, alongside the insert) when this call did the inserting, `None` on a
+    /// cache hit — so callers can log a "cached" line exactly on a fresh insert, as before.
+    async fn get_or_create_cached<K: Eq + std::hash::Hash + Clone>(
+        &self, cache: &RwLock<HashMap<K, Arc<RwLock<DeltaTable>>>>, key: K, storage_uri: &str, storage_options: &HashMap<String, String>,
+        table_name: &str,
+    ) -> Result<(Arc<RwLock<DeltaTable>>, Option<usize>)> {
+        if let Some(table) = cache.read().await.get(&key) {
+            return Ok((Arc::clone(table), None));
+        }
+        let table = self.create_delta_table_internal(storage_uri, storage_options, table_name).await?;
+        let mut tables = cache.write().await;
+        if let Some(table) = tables.get(&key) {
+            return Ok((Arc::clone(table), None));
+        }
+        let table_arc = Arc::new(RwLock::new(table));
+        tables.insert(key, Arc::clone(&table_arc));
+        Ok((table_arc, Some(tables.len())))
+    }
+
     #[instrument(
         name = "database.get_or_create_unified_table",
         skip(self),
         fields(table.name = %table_name)
     )]
     pub async fn get_or_create_unified_table(&self, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
-        // Check cache first
-        {
-            let tables = self.unified_tables.read().await;
-            if let Some(table) = tables.get(table_name) {
-                return Ok(Arc::clone(table));
-            }
-        }
-
         let Some(ref bucket) = self.default_s3_bucket else {
             return Err(anyhow::anyhow!("No default S3 bucket configured for unified table '{}'", table_name));
         };
@@ -4916,24 +4938,11 @@ impl Database {
 
         info!("Creating or loading unified table '{}' at: {}", table_name, storage_uri);
 
-        // Load OUTSIDE the write lock. `create_delta_table_internal` replays the
-        // Delta log over the network and is not time-bounded (a dead endpoint or a
-        // huge log can hold it for minutes or forever); holding the map's write
-        // guard across it blocks EVERY reader of the map, and because tokio's
-        // RwLock is write-preferring one queued writer also blocks every later
-        // reader. That wedges all maintenance jobs on their first table lookup
-        // while ingest/queries stay healthy on `fast_resolve_cache` — the
-        // 2026-07-29 22:05 total-maintenance-wedge shape. Two racing first
-        // touches may both load; the double-check below keeps the first insert.
-        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
-        let mut tables = self.unified_tables.write().await;
-        if let Some(table) = tables.get(table_name) {
-            return Ok(Arc::clone(table));
+        let (table_arc, fresh_count) =
+            self.get_or_create_cached(&self.unified_tables, table_name.to_string(), &storage_uri, &storage_options, table_name).await?;
+        if let Some(count) = fresh_count {
+            info!("Cached unified table '{}', cache now contains {} entries", table_name, count);
         }
-        let table_arc = Arc::new(RwLock::new(table));
-        tables.insert(table_name.to_string(), Arc::clone(&table_arc));
-        info!("Cached unified table '{}', cache now contains {} entries", table_name, tables.len());
-
         Ok(table_arc)
     }
 
@@ -4943,14 +4952,6 @@ impl Database {
         fields(project_id = %project_id, table.name = %table_name)
     )]
     pub async fn get_or_create_custom_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
-        // Check cache first
-        {
-            let tables = self.custom_project_tables.read().await;
-            if let Some(table) = tables.get(&table_key(project_id, table_name)) {
-                return Ok(Arc::clone(table));
-            }
-        }
-
         // Get custom storage config for this project
         let configs = self.storage_configs.read().await;
         let config = configs
@@ -4983,19 +4984,16 @@ impl Database {
 
         info!("Creating or loading custom table for project '{}' table '{}' at: {}", project_id, table_name, storage_uri);
 
-        // Load OUTSIDE the write lock — see `get_or_create_unified_table`. Worse
-        // here: the load targets a TENANT's BYO bucket, so one unreachable
-        // endpoint or stale credential set can pin this map's write guard
-        // indefinitely and wedge every maintenance job that walks the map.
-        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
-        let mut tables = self.custom_project_tables.write().await;
-        if let Some(table) = tables.get(&table_key(project_id, table_name)) {
-            return Ok(Arc::clone(table));
+        // Load OUTSIDE the write lock — see `get_or_create_cached`. Worse here:
+        // the load targets a TENANT's BYO bucket, so one unreachable endpoint or
+        // stale credential set can pin this map's write guard indefinitely and
+        // wedge every maintenance job that walks the map.
+        let (table_arc, fresh_count) = self
+            .get_or_create_cached(&self.custom_project_tables, table_key(project_id, table_name), &storage_uri, &storage_options, table_name)
+            .await?;
+        if let Some(count) = fresh_count {
+            info!("Cached custom table for project '{}' table '{}', cache now contains {} entries", project_id, table_name, count);
         }
-        let table_arc = Arc::new(RwLock::new(table));
-        tables.insert(table_key(project_id, table_name), Arc::clone(&table_arc));
-        info!("Cached custom table for project '{}' table '{}', cache now contains {} entries", project_id, table_name, tables.len());
-
         Ok(table_arc)
     }
 
