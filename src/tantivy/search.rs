@@ -1,25 +1,13 @@
-//! Read-side search: given (project_id, table, predicates), open every
-//! in-window manifest entry, download/cache the blob if needed, run ONE
-//! combined query per index, and return the union of hits.
+//! Searches in-window sidecar indexes and unions their hits.
 //!
 //! Disk cache layout (under `cache_root`):
 //!   tantivy_cache/{table}/{project_id}/{file_uuid}/  (extracted index dir)
 //!
-//! On-miss: download blob → unpack to a fresh tempdir → atomically rename
-//! into the cache path. Open the index from the cache path with mmap; the
-//! opened (Index, IndexReader) pair is kept in a process LRU keyed by the
-//! cache dir, which is 1:1 with the blob path (blobs are immutable — new
-//! data always lands at a new path — so entries never need invalidation,
-//! only eviction).
+//! Missing blobs are downloaded, unpacked, atomically installed, memory-mapped,
+//! and retained in a process LRU. Immutable blob paths need only eviction.
 //!
-//! The disk tree is bounded by [`TantivySearchService::reap_disk_cache`],
-//! run by the "Tantivy cache reap" cron: nothing else ever deletes from it.
-//! `gc_after_compaction` reaps manifest entries and their object-store blobs,
-//! but the *extracted* copy under `cache_root` is invisible to it, and
-//! compaction rewrites parquet constantly — so every compacted-away file
-//! leaves a dir behind that no query will open again. `cache_root` is
-//! `timefusion_data_dir`, which also holds the WAL, so unbounded growth ends
-//! in failed WAL appends rather than a merely cold cache.
+//! [`TantivySearchService::reap_disk_cache`] bounds extracted indexes because
+//! object-store GC cannot see them and the cache shares disk with the WAL.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -48,9 +36,7 @@ use crate::tantivy::{
 
 /// Open (Index, IndexReader) pairs kept hot across queries.
 const READER_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
-/// Staleness bound on the per-service parsed-manifest cache. A stale
-/// manifest only under-reports coverage (prefilter skipped, full scan) or
-/// points at a deleted blob (download error → full scan) — never wrong rows.
+/// Stale manifests degrade to full scans, never incorrect rows.
 const MANIFEST_CACHE_TTL: Duration = Duration::from_secs(5);
 /// Concurrent per-index download+search tasks within one query.
 const SEARCH_CONCURRENCY: usize = 8;
@@ -58,37 +44,15 @@ const SEARCH_CONCURRENCY: usize = 8;
 #[derive(Debug)]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
-    /// Sum of `rows` across all manifest entries that were queried. Lets the
-    /// caller compute hit_count / indexed_rows for the selectivity cutoff.
+    /// Rows covered by queried manifest entries.
     pub indexed_rows: u64,
-    /// Union of `covered_files` (parquet URIs) over every **successful**
-    /// manifest entry (index present, no build error), regardless of the
-    /// time-prune window. The read-side coverage gate intersects this with the
-    /// live Delta add-file set: if a live file overlapping the query can't be
-    /// found here, the `id IN (hits)` prefilter would silently drop its rows,
-    /// so the caller skips the prefilter (full scan). Collected over ALL
-    /// successful entries (not just opened ones) because a time-pruned entry
-    /// still legitimately covers its file — its rows are simply out of window.
+    /// Files covered by every successful entry, including time-pruned entries.
     pub covered_files: HashSet<String>,
-    /// Parquet URIs whose covering index was queried and returned ZERO hits,
-    /// minus any URI also covered by an entry that hit, was unqueried, or
-    /// lacked a field. With the coverage gate passed, these files provably
-    /// contain no matching rows — the scan can skip them entirely
-    /// (file-level pruning), a strictly stronger cut than the id IN-list.
+    /// Covered files proven to have no hits and safe to skip.
     pub zero_hit_files: HashSet<String>,
-    /// Per-parquet-URI matching row ordinals, for entries that (a) cover
-    /// exactly one file and (b) were built in parquet row order
-    /// (`ordinals_valid`). Feeds the scan's per-file `ParquetAccessPlan`
-    /// (row-selection pushdown) — files absent here simply scan normally
-    /// under the id IN-list, so this can only narrow, never drop.
+    /// Matching row ordinals for single-file, parquet-ordered indexes.
     pub row_selections: HashMap<String, Vec<u64>>,
-    /// True if any **in-window** index (one that wasn't time-pruned) lacks a
-    /// queried field. `covered_files` is field-independent (an entry covers its
-    /// file for all of the current schema's indexed columns), so it can't catch
-    /// the schema-evolution case where an older index predates a newly-indexed
-    /// column: that index still appears "covered" yet returns no hits for the
-    /// new field, and the `id IN (hits)` intersection would drop its file's
-    /// matching rows. When set, the caller must skip the prefilter (full scan).
+    /// Whether an in-window index lacks a queried field, requiring a full scan.
     pub field_coverage_gap: bool,
 }
 

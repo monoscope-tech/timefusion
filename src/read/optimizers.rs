@@ -7,14 +7,12 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-/// Explicit `Any` upcast for physical-plan nodes: `PhysicalExpr`'s `as_any`
-/// collides with downcast-rs's blanket method in this crate's scope, and
-/// `ExecutionPlan` exposes no `as_any` trait method in this build.
+/// Avoids the competing `as_any` methods in this crate's trait scope.
 pub fn downcast<T: 'static>(any: &dyn std::any::Any) -> Option<&T> {
     any.downcast_ref()
 }
 
-/// Extract the string from a Utf8/Utf8View/LargeUtf8 scalar literal.
+/// Extracts any UTF-8 scalar representation.
 pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
     match v {
         ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
@@ -22,10 +20,7 @@ pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
     }
 }
 
-/// True if `expr` references column `name`, seen through any `Cast`/`TryCast`
-/// wrapper. TypeCoercion wraps a column in a Cast when the compared literal's
-/// unit/type differs (e.g. a µs `timestamp` column vs an ns `NOW() - INTERVAL`
-/// bound), which otherwise hides the column from filter-shape matching.
+/// Matches a column through coercion casts.
 pub fn is_col_through_cast(expr: &Expr, name: &str) -> bool {
     match expr {
         Expr::Column(c) => c.name == name,
@@ -34,11 +29,7 @@ pub fn is_col_through_cast(expr: &Expr, name: &str) -> bool {
     }
 }
 
-/// Peel `Cast`/`TryCast` wrappers off a literal. Extended-protocol param
-/// binding plus TypeCoercion wraps a timestamp bound in a Cast when the param's
-/// unit differs from the µs column (e.g. `ts >= CAST($1 AS Timestamp(us))`),
-/// which otherwise hid the literal and silently disabled date pruning for
-/// ~6% of prod hash-enrichment merges (full 207 GB scans).
+/// Removes coercion casts that otherwise hide literals from pruning.
 pub fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
     match expr {
         Expr::Literal(scalar, _) => Some(scalar),
@@ -58,8 +49,7 @@ pub fn scalar_micros(v: &ScalarValue) -> Option<i64> {
     })
 }
 
-/// Reverse a comparison operator for swapped operands (`lit < col` ≡ `col > lit`).
-/// Non-comparison operators pass through unchanged.
+/// Reverses comparisons with swapped operands.
 pub fn swap_comparison(op: Operator) -> Operator {
     match op {
         Operator::Gt => Operator::Lt,
@@ -70,18 +60,11 @@ pub fn swap_comparison(op: Operator) -> Operator {
     }
 }
 
-/// Utilities for converting timestamp filters to date partition filters
-/// for better partition pruning in Delta Lake
+/// Converts timestamp filters to Delta date-partition filters.
 pub mod time_range_partition_pruner {
     use super::*;
 
-    /// Extract date predicates from a timestamp filter for partition pruning.
-    /// Accepts any timestamp unit — pgwire literals arrive as Microsecond, not Nanosecond,
-    /// so missing units silently disabled date pruning for point lookups.
-    ///
-    /// `time_column` is the schema-declared time column name (e.g. `"timestamp"`,
-    /// `"event_time"`). Non-matching columns are skipped — pruning only fires for
-    /// the table's declared time column.
+    /// Derives partition dates from bounds on the declared time column.
     pub fn timestamp_to_date_filters(expr: &Expr, time_column: &str) -> Vec<Expr> {
         let date_filter = |expr: &Expr, op: Operator| {
             let date = chrono::DateTime::from_timestamp_micros(scalar_micros(unwrap_literal(expr)?)?)?.date_naive();
@@ -113,16 +96,7 @@ pub mod time_range_partition_pruner {
         }
     }
 
-    /// AND `predicate` with `date`-partition filters derived from any
-    /// `time_column` bounds among its AND-conjuncts.
-    ///
-    /// Delta prunes files by the `date` partition column, but cannot map a raw
-    /// `timestamp` predicate onto it — so DML (UPDATE/DELETE/MERGE) filtering
-    /// only on `timestamp` scans *every* partition (the prod OOM: a narrow
-    /// hash-enrichment UPDATE scanning all 2704 files / 194 GB). The derived
-    /// `date` bounds are necessary conditions of the timestamp bounds, so
-    /// ANDing them prunes files without ever excluding a matching row.
-    /// Returns the predicate unchanged when no date filter can be derived.
+    /// Adds necessary date-partition bounds without excluding matching rows.
     pub fn with_date_partition_filters(predicate: Expr, time_column: &str) -> Expr {
         fn walk(expr: &Expr, time_column: &str) -> Vec<Expr> {
             match expr {
@@ -134,11 +108,7 @@ pub mod time_range_partition_pruner {
         date_filters.into_iter().fold(predicate, Expr::and)
     }
 
-    /// Collect every `date <op> Date32(day)` conjunct in an AND-tree — the
-    /// bounds `with_date_partition_filters` derived (or that were already
-    /// present). Used to log why a merge did/didn't prune: an empty result on a
-    /// predicate that has a time filter means the timestamp→date derivation
-    /// didn't fire (a shape gap → full partition scan).
+    /// Collects date bounds from an AND tree for pruning diagnostics.
     pub fn extract_date_bounds(expr: &Expr) -> Vec<(Operator, i32)> {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => [left, right].into_iter().flat_map(|e| extract_date_bounds(e)).collect(),
@@ -151,18 +121,7 @@ pub mod time_range_partition_pruner {
     }
 }
 
-/// Extract the literal `project_id` value from an expression tree.
-///
-/// Walks the same shapes `ProjectIdPushdown::contains_project_id` recognises:
-/// `project_id = 'x'` (either arg order, Utf8 / Utf8View) and through `AND`
-/// parents. Returns the first match. Used by both the SELECT-side router
-/// (`ProjectRoutingTable`) and DML extractor (`extract_dml_info` in
-/// `dml.rs`); keep them in sync by always going through this function.
-///
-/// `NOT` is intentionally not walked into: `NOT project_id = 'x'` excludes
-/// that project rather than selecting it, so returning it as the routing
-/// target would route to the wrong tenant. Matching the conservative
-/// `contains_project_id` shape ensures both helpers agree.
+/// Extracts the first positive `project_id = literal` AND-conjunct.
 pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
@@ -315,7 +274,6 @@ mod tests {
     }
 }
 
-// ===== variant_insert_rewriter =====
 use std::{collections::HashSet, sync::Arc};
 
 use crate::read::functions::json_to_variant_udf;
@@ -436,7 +394,6 @@ fn is_utf8_expr(expr: &Expr) -> bool {
     }
 }
 
-// ===== variant_select_rewriter =====
 // Variant-aware SELECT-plan post-processing.
 //
 // Two passes, both gated on the plan being a non-DML (SELECT-like) plan:
@@ -970,7 +927,6 @@ mod peel_tests {
     }
 }
 
-// ===== tantivy_rewriter =====
 // Transparent Tantivy acceleration for standard SQL predicates.
 //
 // Rewrites `col LIKE 'pattern'` and `col ILIKE 'pattern'` on tantivy-indexed
@@ -1494,7 +1450,6 @@ mod tantivy_rewriter_tests {
     }
 }
 
-// ===== pg_array_literal_rewriter =====
 // Rewrite Postgres array literals (`'{}'`, `'{a,b}'`) into typed list
 // literals where an array type is expected.
 //
@@ -1874,7 +1829,6 @@ mod pg_array_literal_rewriter_tests {
     }
 }
 
-// ===== ordered_union_for_topk =====
 // Order the unordered branches of a routed MemBuffer∪Delta union so an
 // `ORDER BY <sort-keys> LIMIT n` becomes a streaming, early-terminating TopK
 // instead of a full blocking sort over the whole window.
@@ -2196,7 +2150,6 @@ mod ordered_union_for_topk_tests {
     }
 }
 
-// ===== row_to_json_record =====
 // Rewrites `row_to_json(t)` — a bare relation alias standing for a whole row —
 // into `row_to_json(named_struct('c1', t.c1, …))`.
 //
@@ -2429,7 +2382,6 @@ mod row_to_json_record_tests {
     }
 }
 
-// ===== exists_in_projection =====
 // Rewrites `EXISTS(q)` in a projection to `(SELECT count(1) FROM q) > 0`.
 //
 // DataFusion decorrelates EXISTS only in filter position. An EXISTS in a
@@ -2631,7 +2583,6 @@ mod exists_in_projection_tests {
     }
 }
 
-// ===== wildcard_fn_arg_expander =====
 // Expand `qualifier.*` inside scalar function arguments into the explicit
 // column list.
 //
@@ -2804,7 +2755,6 @@ mod wildcard_fn_arg_expander_tests {
     }
 }
 
-// ===== defer_expensive_projection =====
 // Defer expensive scalar projections past TopK (Sort with fetch).
 //
 // `SELECT jsonb_build_array(...) FROM t WHERE ... ORDER BY ts DESC LIMIT 501`
@@ -2979,7 +2929,6 @@ mod defer_expensive_projection_tests {
     }
 }
 
-// ===== dedup_needs_ordered_input =====
 // Keep `DedupExec` fed by an order-PRESERVING merge, not an order-erasing coalesce.
 //
 // `DedupExec` requires `Distribution::SinglePartition` and declares the ordering

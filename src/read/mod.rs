@@ -1,70 +1,21 @@
-//! Read-side dedup operator (parity plan Defect 2 #1).
+//! Read-side merge-on-read deduplication for `(timestamp, id)` rows.
 //!
-//! TF's write path can leave physical duplicates of a `(id, timestamp)` row in
-//! Delta (cross-flush `SaveMode::Append`, late prior-day DLQ replays the
-//! background sweep hasn't reached yet), and under the merge-on-read model
-//! (`docs/plans/2026-08-01-merge-on-read-dml.md`) an `UPDATE` deliberately
-//! appends a *new version* of the row. `DedupExec` collapses those copies over
-//! the routed + pruned MemBuffer ∪ Delta union so `COUNT(*)` is correct at query
-//! time, and — when the table declares a `dedup_tiebreak` — so the surviving
-//! copy is the newest version, independent of sweep timing.
-//!
-//! Why a physical operator and not an `AnalyzerRule` wrapping the `TableScan`:
-//! a `Distinct::On` node between the `project_id` filter and
-//! `ProjectRoutingTable::scan` blocks `push_down_filter`, so routing falls back
-//! to `default_project` and time/partition pruning is lost (see the plan's
-//! reverted-blocker note). Deduping here, after routing, avoids all of that.
-//!
-//! Implementation: one input partition (DataFusion inserts a
-//! `CoalescePartitionsExec`) so a key can't be split across partitions, and a
-//! streaming filter per batch. Only the (tiny) encoded key rows are held — never
-//! the fat body/attributes payload — so it streams, supports downstream
-//! early-LIMIT, and never trips Arrow's 2 GB string-offset limit.
+//! The physical operator runs after routing so filter and partition pushdown
+//! remain intact. It stores encoded keys rather than wide payload rows.
 //!
 //! Two survivor policies:
 //!
-//! * **keep-first** (no tiebreak, or no usable input ordering): a `HashSet` of
-//!   seen key-rows filters each batch in place. "First" is only ever *arrival*
-//!   order — `CoalescePartitionsExec` interleaves the union's partitions
-//!   nondeterministically — so which physical copy survives is not a guarantee
-//!   (COUNT is).
-//! * **keep-greatest** (`dedup_tiebreak` present in the input *and* bounded mode
-//!   available): the row with the greatest tiebreak per key wins, NULL lowest,
-//!   so a pre-existing row always loses to any new version. Streaming survives
-//!   because equal dedup keys share the same `timestamp` (the key is
-//!   `(timestamp, id)`), so all versions of a key live inside one bound run
-//!   (`Bound`): candidates are held only until the run closes, then emitted in
-//!   input position order. A run's batches are held (Arc clones) while it is
-//!   open, capped by `RUN_BUFFER_MAX_BYTES`; on overflow the run is flushed
-//!   early and its tail degrades to keep-first — never unbounded, never worse
-//!   than the old behaviour.
+//! * **keep-first** stores seen keys. Arrival order chooses the physical copy.
+//! * **keep-greatest** keeps the greatest tiebreak per key, with NULL lowest.
+//!   Ordered input streams by timestamp run; each run is memory-capped.
 //!
-//! Without a bound, keep-greatest still runs but must buffer to end-of-stream
-//! (one candidate per distinct key, plus the batches they reference). That was
-//! previously refused as the 2026-07-21 wide-scan OOM shape, and unordered input
-//! degraded to keep-first instead — but keep-first serves the PRE-UPDATE row,
-//! which merge-on-read cannot tolerate. The planner's other option, forcing an
-//! ordering the Delta leg cannot provide (merge-on-read writes a row's ORIGINAL
-//! timestamp into a NEW file, so files overlap in time), inserted a blocking
-//! SortExec that exhausted the 27.5GB query pool on prod 2026-08-02. Buffering a
-//! hash is strictly cheaper than sorting the same rows, so unbounded
-//! keep-greatest is the better of the two — and the only correct one. The wide
-//! scans that motivated the original refusal are bounded upstream by the
-//! wide-scan admission gate and the hot-leg byte budget.
+//! Unordered keep-greatest buffers to end-of-stream. It cannot degrade to
+//! keep-first because doing so can return the pre-update version.
 //!
-//! Single-partition only, deliberately. A hash-partitioned mode existed and was
-//! deleted: a mode shootout over the real 89-column `otel_logs_and_spans`
-//! schema (counting allocator, release) measured it 2–4× slower and ~90× peak
-//! heap on wide rows (0% dup: 54ms/26MB serial vs 205ms/2383MB hash),
-//! because dedup cost is per-ROW (RowConverter + ahash probe) while the
-//! `RepartitionExec` that `Distribution::HashPartitioned` forces copies every
-//! byte of every column. It can only win on narrow rows with heavy duplication,
-//! which is not the steady state. Don't re-litigate.
+//! This stays single-partition: repartitioning copies every wide column and was
+//! slower and much larger in measured production-shaped benchmarks.
 //!
-//! Dedup keys (and the tiebreak) must be present in the input; the caller
-//! augments the pushed projection so they are, then `output_projection` restores
-//! the requested columns (via `RecordBatch::project`, which preserves row count
-//! for the empty `COUNT(*)` projection).
+//! The caller adds key/tiebreak columns, then restores the requested projection.
 
 pub mod functions;
 pub mod optimizers;
@@ -97,24 +48,13 @@ use futures::StreamExt;
 
 use crate::observability::arrow_err;
 
-/// Seen-key set for the streaming dedup. Arrow's `Row`/`OwnedRow` hash and
-/// compare purely on their encoded `data` bytes (the `RowConfig` is not part of
-/// identity), so we key directly on the raw bytes: `Box<[u8]>` drops the
-/// per-entry `RowConfig`/`Arc` word `.owned()` would carry, and `Borrow<[u8]>`
-/// lets us probe with a borrowed `&[u8]` and allocate only on a miss (never once
-/// per duplicate row). `ahash` replaces std's SipHash.
+/// Encoded Arrow keys, allocated only on first sight.
 type SeenSet = HashSet<Box<[u8]>, ahash::RandomState>;
 
-/// Cap on the batches held open for one keep-greatest run. A run is one
-/// `timestamp` value, normally a handful of rows; this only fires on pathological
-/// input (a whole scan at one timestamp), where it flushes the run early rather
-/// than growing without bound.
+/// Maximum retained bytes for one ordered timestamp run.
 const RUN_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-/// One unordered merge-on-read query may not monopolize the global query
-/// pool. Bounded inputs release at each timestamp run; only the unbounded
-/// correctness fallback needs this ceiling. Production previously had four
-/// such consumers retain 4.8-9.6GB each and exhaust the 30GB pool.
+/// Per-query ceiling for unordered keep-greatest state.
 const UNBOUNDED_GREATEST_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 fn check_unbounded_growth(current: usize, additional: usize) -> DFResult<()> {
@@ -129,19 +69,7 @@ fn check_unbounded_growth(current: usize, additional: usize) -> DFResult<()> {
     Ok(())
 }
 
-/// Bounded-window dedup state (parity plan Point 3, Tier 2). When the input is
-/// already sorted by a dedup-key column (`timestamp` leads the table sort
-/// order), duplicates of a key are confined to a single bound-value run: two
-/// rows with the same dedup key share the same `timestamp` (equal key ⇒ equal
-/// bound), so they arrive contiguously. Clearing state each time the bound
-/// *advances* past the current run caps it at O(distinct keys within one
-/// timestamp value) instead of O(distinct over the whole scan) — the fix for
-/// the multi-GB seen-set risk on wide historical scans, and the property that
-/// lets keep-greatest emit without buffering the stream. Opportunistic only: we
-/// never *require* the ordering (that could make EnforceSorting insert a
-/// blocking SortExec over unsorted MemBuffer partitions and break streaming);
-/// when the input isn't sorted, `detect_bound` returns `None` and dedup falls
-/// back to the full-set keep-first path — always sound.
+/// Tracks an ordered timestamp run so its dedup state can be released promptly.
 struct Bound {
     /// Bound column index within the input schema.
     idx: usize,
@@ -152,13 +80,7 @@ struct Bound {
 }
 
 impl Bound {
-    /// Move to row value `t`, returning true when doing so *closed* a previous
-    /// run (state built for the old run may then be dropped). A run opens on the
-    /// first row ever, or on a value strictly past `last` in the sort direction.
-    /// `advance`'s comparison, attributed to a leg instead of the global
-    /// counter. Kept beside it deliberately: two copies of this predicate that
-    /// could disagree is exactly how a diagnostic ends up exonerating the
-    /// guilty party.
+    /// Counts ordering violations for a specific union leg.
     fn advance_counting(&mut self, t: i64, leg: LegKind) {
         if let Some(l) = self.last
             && if self.desc { t > l } else { t < l }

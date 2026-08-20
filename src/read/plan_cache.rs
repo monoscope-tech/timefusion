@@ -1,32 +1,10 @@
 //! Cross-connection LRU cache for parsed `LogicalPlan`s.
 //!
-//! Background. `datafusion-postgres` already caches per-connection prepared
-//! statements via the pgwire `PortalStore`, so a well-behaved client (psql,
-//! hasql, pgbench) parses each prepared statement once per connection. The
-//! cost we still pay:
-//!   1. Short-lived connections (PgBouncer transaction pooling, monoscope's
-//!      hasql pool when it rotates) — every new connection re-parses the
-//!      same `INSERT INTO otel_logs_and_spans ...` statement, which is
-//!      ~hundreds of µs of sqlparser + datafusion analyzer work.
-//!   2. Anonymous prepared statements (Parse with empty name): the portal
-//!      store doesn't persist them, so each Bind round-trips the planner.
+//! Reuses canonicalized parameterized plans across connections, including
+//! anonymous statements that the per-connection portal store cannot retain.
 //!
-//! This hook short-circuits `parse_sql` by returning a cloned `LogicalPlan`
-//! from an LRU keyed on the *canonical* statement text. We only cache
-//! parameterised DML / SELECT statements — anything containing a literal
-//! value would explode the cache. The `to_string()` we key on is produced
-//! by sqlparser AFTER its own normalization, so `INSERT INTO t VALUES ($1)`
-//! and `insert into t values ($1)` collapse to one entry.
-//!
-//! Schema-staleness invariant. `LogicalPlan` embeds the table's `SchemaRef`
-//! at parse time. Caching across schema changes would silently serve plans
-//! built against the old shape. We rely on the fact that timefusion's
-//! `schema_loader::registry()` is loaded via `include_dir!` at compile time
-//! and is therefore immutable for the lifetime of the process — see
-//! `optimizers/tantivy_rewriter::indexed_columns_for` which makes the same
-//! assumption. If we ever add hot-reload of YAML schemas, this cache must
-//! also gain a schema-version token in the key (e.g. an `Arc<AtomicU64>`
-//! bumped on each reload) or a full flush on reload.
+//! Cached plans embed schemas. This is safe while the compile-time schema
+//! registry is immutable; schema hot reload must invalidate this cache.
 
 use std::sync::{
     Arc, OnceLock,
@@ -73,51 +51,26 @@ use tracing::{debug, warn};
 
 use crate::observability::{api_err, arrow_err};
 
-/// Soft size cap: once `cap` is reached, drop ~half the entries at random.
-/// Cheaper than an LRU clock and adequate while the steady-state working set
-/// fits well under `cap`.
+/// Randomly halves a map once it reaches its soft cap.
 fn soft_cap<K: Eq + std::hash::Hash, V>(map: &DashMap<K, V>, cap: usize) {
     if map.len() >= cap {
         map.retain(|_, _| fastrand::bool());
     }
 }
 
-/// Estimated retained bytes per `Expr` node in a cached plan.
-///
-/// Derived from what one node actually costs: the `Expr` enum itself, the `Box`
-/// its children hang off, the placeholder's `id` `String`, and the `DataType`
-/// clones — call it ~384 B. It only has to be right to an order of magnitude;
-/// its job is to stop a bound from being wrong by 20x, not to be exact.
-///
-/// Sanity check against the incident that produced it: a 350-row x 68-column
-/// metrics INSERT is ~23.8k placeholder nodes ≈ 9 MB, and prod held ~350 such
-/// shapes on each of 30 connections. That is the ~100 GB the box died at.
+/// Approximate retained bytes per expression, calibrated against production.
 const PLAN_BYTES_PER_EXPR: usize = 384;
 
-/// Plan bytes a cache may retain per slot of `capacity`.
-///
-/// The bound must be expressed in the units of the thing being bounded. The
-/// previous version weighed the CANONICAL SQL TEXT and assumed "~30x expansion"
-/// to plan bytes. Measured on prod 2026-08-14 the expansion was **~600x** —
-/// 16.8 MB of retained text against ~14 GiB of retained plan — so the cache
-/// believed it held 16 MiB while holding GiBs, and the byte bound bounded
-/// nothing. Weigh the plan.
+/// Retained plan budget per cache slot.
 const PLAN_CACHE_PLAN_BYTES_PER_SLOT: usize = 128 * 1024;
 
-/// After a byte crossing, sweep down to this fraction of the budget.
-///
-/// Without hysteresis the sweep evicts to `max_bytes - 1` and the very next
-/// insert re-crosses it: prod logged **1036 sweeps in 10 minutes** (~1.7/s),
-/// each one sorting the whole map, while `text_bytes` sat pinned just over the
-/// cap forever. A sweep that does not leave headroom is not a sweep, it is a
-/// per-insert full scan.
+/// Sweep to half the budget to avoid repeated boundary crossings.
 const SWEEP_LOW_WATER_NUM: usize = 1;
 const SWEEP_LOW_WATER_DEN: usize = 2;
 
 /// Estimated retained size of a plan, in bytes. See [`PLAN_BYTES_PER_EXPR`].
 fn plan_bytes(plan: &LogicalPlan) -> usize {
     let mut nodes = 0usize;
-    // Infallible: the closures never return Err.
     let _ = plan.apply_with_subqueries(|p| {
         p.apply_expressions(|e| {
             e.apply(|_| {
@@ -129,20 +82,13 @@ fn plan_bytes(plan: &LogicalPlan) -> usize {
     nodes.saturating_mul(PLAN_BYTES_PER_EXPR)
 }
 
-/// A `DashMap` bounded by BOTH entry count and total entry WEIGHT.
-///
-/// Counting entries bounds nothing when entry sizes vary by 1000x, which is
-/// exactly the plan-cache workload: a bulk INSERT's plan is millions of times
-/// bigger than a dashboard SELECT's. Each entry therefore carries the weight it
-/// was admitted with, so the sweep never has to re-walk the values it is
-/// ranking and the counter cannot drift from the map it bounds.
+/// A map bounded by entry count and retained weight.
 struct WeighedMap<V> {
     map: DashMap<String, (V, usize)>,
     capacity: usize,
     max_bytes: usize,
     bytes: AtomicUsize,
-    /// Single-flight guard: `sweep` write-locks each shard in turn, so an
-    /// unsynchronized stampede would serialize every reader behind N sweeps.
+    /// Prevents concurrent shard-locking sweeps.
     sweeping: AtomicBool,
 }
 

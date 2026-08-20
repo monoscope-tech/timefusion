@@ -1,10 +1,4 @@
-//! Shared server-bootstrap wiring used by both `main.rs` and the E2E test
-//! harness. Keeping this in one place guarantees the test path matches prod
-//! — the whole point of the E2E suite is to catch the class of bug that
-//! "CI doesn't reproduce because the harness skips half the wiring".
-//!
-//! Returns the fully wired pieces; the caller decides what to do with them
-//! (serve pgwire, expose for assertions, etc.).
+//! Shared production and E2E server bootstrap wiring.
 
 pub mod pg_compat;
 
@@ -21,30 +15,19 @@ use crate::{
     write::{BufferedWriteLayer, DeltaWatermark},
 };
 
-/// Everything a serving process needs after bootstrap is done.
+/// Fully initialized server state.
 pub struct Bootstrapped {
     pub db: Arc<Database>,
     pub buffered_layer: Arc<BufferedWriteLayer>,
-    /// The SessionContext used by the pgwire handlers — UDFs and table
-    /// providers are already registered.
+    /// Session context with providers and UDFs registered.
     pub session_ctx: Arc<SessionContext>,
-    /// Cancel to signal shutdown to anything we spawned.
+    /// Cancellation signal for spawned tasks.
     pub shutdown: CancellationToken,
 }
 
 /// Raise the open-file soft limit to the hard limit.
 ///
-/// Docker hands a process the daemon's default soft limit — 1024 in prod, against
-/// a 524288 hard limit — and a database that memory-maps parquet, holds a tantivy
-/// index per partition and serves pgwire exhausts that in seconds. On 2026-08-12
-/// prod spent its first 5.5 minutes after boot emitting 1.6M `Too many open files`
-/// lines and REFUSING pgwire connections (`Error accept socket`), which also
-/// pushed every other line out of the log ring buffer.
-///
-/// This belongs in the process, not the service definition: CapRover rewrites the
-/// service config on every deploy, so a ulimit set out of band does not survive.
-/// Best-effort by design — a platform that refuses the raise is not a reason to
-/// fail boot, and the log line is enough to diagnose it.
+/// Best-effort raises the open-file soft limit to support mmap indexes and WAL.
 pub fn raise_file_limit() {
     // SAFETY: both calls take a valid, fully-initialized `rlimit`, and neither
     // retains the pointer past the call.
@@ -62,13 +45,7 @@ pub fn raise_file_limit() {
     }
 }
 
-/// Build the BufferedWriteLayer + Database wiring exactly as `main.rs` does,
-/// minus listener binding / signal handling / telemetry init (the caller
-/// owns those — they differ between prod and test).
-///
-/// Side effects: spawns the flush + eviction background tasks, performs
-/// WAL recovery, and starts maintenance schedulers. The returned
-/// `CancellationToken` can be triggered to ask spawned work to wind down.
+/// Initializes storage, recovery, background work, and query providers.
 pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     crate::support::init_from_env();
     raise_file_limit();
@@ -83,8 +60,6 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<crate::read::functions::FnRegistry> = Arc::new(session_context.state());
 
-    // Pre-init WAL GC (gated + drained-flag consumption inside the helper —
-    // same call as main.rs so the e2e path mirrors prod).
     crate::write::wal::boot_wal_gc(&cfg.core.wal_dir());
 
     let t_layer = std::time::Instant::now();
@@ -93,8 +68,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         .with_coalesced_delta_writer(coalesced_delta_write_callback(&db));
     tracing::info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
 
-    // Optional tantivy sidecar (mirrors main.rs). Disabled when no indexed
-    // tables OR the bucket is unset (tests with foyer-only setups).
+    // The sidecar requires both indexed tables and object storage.
     let bucket = cfg.aws.aws_s3_bucket.clone().unwrap_or_default();
     if !cfg.tantivy.indexed_tables().is_empty() && !bucket.is_empty() {
         let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
@@ -138,10 +112,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
-    // Non-blocking: snapshot load + footer warm-up off the first query's path.
     db.preload_tables();
-    // Non-blocking: index live files no manifest entry covers (config-gated),
-    // and warm the local index cache with recent blobs (config-gated).
     db.spawn_tantivy_backfill();
     db.spawn_tantivy_prefetch();
     db.spawn_deferred_tantivy_reindex(Arc::clone(&buffered_layer));
@@ -149,28 +120,16 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     Ok(Bootstrapped { db, buffered_layer, session_ctx: Arc::new(session_context), shutdown: CancellationToken::new() })
 }
 
-/// The C3 coalescing flush writer: hands the whole tick's groups to
-/// The per-bucket Delta write a flush hands its rows to. Shared by `bootstrap`,
-/// `main` AND the test harnesses, because a layer built WITHOUT it does not
-/// fail — `flush_bucket` logs "No delta write callback configured, skipping
-/// flush" and drains the bucket anyway. A test layer missing this therefore
-/// silently discards every flushed row while `is_empty()` reports success
-/// (2026-08-02: `buffer_consistency_test` asserted exactly that and passed for
-/// as long as its DML never routed through a flush).
+/// Creates the per-bucket Delta writer shared by production and tests.
 pub fn delta_write_callback(db: &crate::database::Database) -> crate::write::DeltaWriteCallback {
     let db = db.clone();
     Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
         let db = db.clone();
-        // insert_records_batch warms the just-flushed files itself
-        // (watermark-gated) — warming here too would double the GETs.
         Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await })
     })
 }
 
-/// `insert_records_batches_coalesced`, which emits one Delta commit per
-/// PHYSICAL table. Shared by `bootstrap` and `main` so the e2e path and prod
-/// wire the identical callback. Only used when
-/// `TIMEFUSION_FLUSH_COALESCE_COMMITS` is on.
+/// Creates the optional one-commit-per-physical-table flush writer.
 pub fn coalesced_delta_write_callback(db: &crate::database::Database) -> crate::write::DeltaCoalescedWriteCallback {
     let db = db.clone();
     Arc::new(move |units: Vec<crate::write::FlushUnit>| {
@@ -186,18 +145,8 @@ pub fn coalesced_delta_write_callback(db: &crate::database::Database) -> crate::
                 })
                 .unzip();
             let results = db.insert_records_batches_coalesced(units).await;
-            // `insert_records_batches_coalesced` warms the flushed files itself
-            // (as insert_records_batch does) — no warm here, or every flush
-            // would issue the warm GETs twice.
-            // Mark on ANY settled commit, not just one with a non-empty added
-            // list: the flag means "this (project, table) has Delta files", which
-            // is true the moment the commit lands. Attribution can legitimately
-            // return an empty list for a project that did flush (e.g. a
-            // concurrent snapshot re-materialize makes the pre/post diff miss),
-            // and gating on it would leave `delta_scan_can_be_skipped` true —
-            // queries would skip Delta and read only MemBuffer. Tantivy indexing
-            // stays driven by the actual file list inside the insert path.
-            // Identical to the per-project callback in `main.rs`.
+            // Any successful commit proves this topic has Delta files, even when
+            // concurrent snapshot attribution returns an empty added-file list.
             topics
                 .iter()
                 .zip(&results)

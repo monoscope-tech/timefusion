@@ -1,13 +1,7 @@
 //! `text_match(col, 'query')` — returns BOOLEAN.
 //!
-//! Behavior: case-insensitive substring match across the column's string
-//! representation. This is the *correctness fallback* used when the tantivy
-//! prefilter isn't applied (e.g. on MemBuffer rows, or when the optimizer
-//! couldn't prune via the index). The query language understood here is
-//! intentionally tiny: any whitespace-separated token must appear (AND).
-//! Tantivy at the prefilter layer can interpret a richer syntax; results
-//! must remain a *superset* of what tantivy returns so post-filtering with
-//! this UDF preserves correctness.
+//! Case-insensitive AND-token fallback for rows not covered by an index.
+//! Its matches must remain a superset of the Tantivy prefilter.
 
 use std::sync::Arc;
 
@@ -22,30 +16,15 @@ use datafusion::{
 
 pub const TEXT_MATCH_NAME: &str = "text_match";
 
-/// Minimum literal length accelerable on ngram3. Tantivy's 3-gram tokenizer
-/// produces no tokens for shorter inputs, so a 2-char query would match every
-/// doc (degenerate) — bail to scan.
+/// Minimum literal length accepted by the trigram index.
 pub const NGRAM_MIN_QUERY_LEN: usize = 3;
 
-/// Conservative: only allow alnum, dot, dash, underscore, slash, `@`, and
-/// space. Outside this allowlist we leave the predicate alone (the original
-/// `=` / `LIKE` still applies — correctness preserved).
-///
-/// The reader no longer feeds routed literals to tantivy's `QueryParser`
-/// except for `*`-suffixed prefix queries on raw/default fields (see
-/// `reader::analyzed_conjunction_query`), so the allowlist is now about
-/// keeping ROUTING conservative rather than about parser safety — a char the
-/// analyzer treats unexpectedly would still only ever narrow the prefilter.
-/// Colon stays excluded for the remaining parser path (field-delimiter syntax).
+/// Accepts only characters whose analyzer behavior is safe for routing.
 pub fn is_tantivy_safe_term_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
 }
 
-/// Stricter than `is_tantivy_safe_term_char`, for exact `=` routing: the
-/// literal is fed to tantivy's `QueryParser` as a term against a raw-tokenized
-/// field (one token = the whole value). Whitespace AND-splits and punctuation
-/// is query syntax, either of which silently empties the hit set — restrict to
-/// chars that pass through unchanged (trace/span ids, UUIDs, enums).
+/// Accepts exact terms that pass through the raw query parser unchanged.
 pub fn is_eq_term_safe(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '_')
 }
@@ -101,10 +80,7 @@ pub fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: b
     })
 }
 
-/// POSIX-regex metacharacters. A pattern containing any of these *unescaped*
-/// is not a plain substring and is never routed. Deliberately the same set
-/// monoscope's `escapeRegex` escapes (`Pkg/DeriveUtils.hs`), so a KQL
-/// has/contains term round-trips exactly; anything else bails.
+/// Regex metacharacters escaped by Monoscope's literal-query encoder.
 const REGEX_META: &str = ".^$*+?()[]{}|\\";
 
 /// Decode a `~` / `~*` pattern that is a PLAIN LITERAL SUBSTRING into that
