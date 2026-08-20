@@ -46,7 +46,7 @@ use crate::{
     config::{self, AppConfig},
     observability::arrow_err,
     read::DeltaStatisticsExtractor,
-    schema::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type, schema_or_default},
+    schema::{create_insert_compatible_schema, get_schema, is_variant_type, schema_or_default},
     storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
 };
 
@@ -10280,7 +10280,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::{config::AppConfig, support::test_helpers::*};
+    use crate::{config::AppConfig, schema::get_default_schema, support::test_helpers::*};
 
     /// A pass deadline no test will reach, for the drain's bounding parameter.
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.
