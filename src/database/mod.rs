@@ -10224,6 +10224,11 @@ mod tests {
         std::time::Instant::now() + std::time::Duration::from_secs(86_400)
     }
 
+    /// Midnight UTC of `date`, in micros.
+    fn midnight_micros(date: chrono::NaiveDate) -> i64 {
+        date.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros()
+    }
+
     /// A unit whose slice has not finished yet must back off past the slice, not spin.
     ///
     /// A flat retry interval left a day-wide unit permanently eligible until midnight, monopolising
@@ -10281,7 +10286,7 @@ mod tests {
                 journal.complete(key);
             }
             let blocking = keys.iter().find(|key| key.operation == Operation::BaseRollup).cloned().expect("the write path queues a base rollup for the day");
-            let start = day.date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+            let start = midnight_micros(day.date_naive());
             journal.enqueue(TaskKey { slice: TimeSlice::new(start, start + 600_000_000)?, ..blocking.clone() }, 0, 0, 0);
             blocking.physical_table
         };
@@ -10564,7 +10569,7 @@ mod tests {
         .await?;
 
         let date = day.date_naive();
-        let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
+        let day_start = midnight_micros(date);
         let slice = TimeSlice::new(day_start, day_start + DAY_MICROS)?;
         {
             let mut journal = db.maintenance_tasks.lock().unwrap();
@@ -10803,7 +10808,7 @@ mod tests {
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("untag_{}", uuid::Uuid::new_v4().simple());
-        let day_start = (Utc::now() - chrono::Duration::days(3)).date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+        let day_start = midnight_micros((Utc::now() - chrono::Duration::days(3)).date_naive());
         let noon = day_start + DAY_MICROS / 2;
         for i in 0..3 {
             let span = test_span_ts(&format!("s{i}"), "op", &project, noon + i);
@@ -10909,7 +10914,7 @@ mod tests {
         .await?;
 
         let slice_for = |d: chrono::DateTime<Utc>| -> Result<TimeSlice> {
-            let start = d.date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+            let start = midnight_micros(d.date_naive());
             TimeSlice::new(start, start + DAY_MICROS)
         };
         let task_for = |d: chrono::DateTime<Utc>, operation| -> Result<TaskKey> {
@@ -11198,7 +11203,7 @@ mod tests {
         let project = format!("recon_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
         let day = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
-        let day_start = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let day_start = midnight_micros(day);
         let hour_start = ts.div_euclid(3_600_000_000) * 3_600_000_000;
         for id in ["a", "b"] {
             db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, "op", &project, ts)])?], true, None).await?;
