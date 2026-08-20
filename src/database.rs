@@ -20553,6 +20553,7 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), after_cancel, "no fires after cancel");
     }
 
+    /// `spawn_cron_job_on` must run the job body on the runtime handle passed in, not the caller's.
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_cron_job_on_runs_body_on_the_selected_runtime() {
         let isolated =
@@ -22369,29 +22370,24 @@ mod tests {
         }
     }
 
-    /// Quantile cuts must tile exactly like the uniform split — a gap drops rows
-    /// and an overlap duplicates them, putting two versions of one key in
-    /// different files where keep-greatest can no longer see them together.
+    /// Both bound-generating functions must tile `[lo, hi]` exactly — a gap drops rows, an overlap
+    /// duplicates them, putting two versions of one key where keep-greatest can no longer see them
+    /// together — checked with the same `assert_tiles` invariant.
     #[test]
-    fn repair_cut_bounds_tile_the_range_and_survive_skew() {
-        // Skewed cuts — the whole point: they may bunch anywhere in the range.
+    fn repair_and_cut_bounds_tile_the_range_and_survive_skew() {
+        // `repair_bounds_from_cuts`: quantile cuts, which may bunch anywhere in the range.
         let bounds = super::repair_bounds_from_cuts(0, 1000, &[997, 998, 999]);
         assert_eq!(bounds.len(), 4);
         assert_tiles(&bounds, 0, 1000, &[0, 1, 500, 999, 1000]);
-
         // Ties collapse to FEWER slices, never to an overlap.
         assert_eq!(super::repair_bounds_from_cuts(0, 100, &[50, 50, 50]), vec![(0, Some(50)), (50, None)]);
-
         // Cuts outside (lo, hi] are ignored; all-degenerate falls back to one pass.
         assert_eq!(super::repair_bounds_from_cuts(10, 20, &[5, 10, 99]), vec![(10, None)]);
         assert_eq!(super::repair_bounds_from_cuts(0, 100, &[]), vec![(0, None)]);
-
         // A cut exactly at hi is legal: it opens a final slice holding only hi.
         assert_tiles(&super::repair_bounds_from_cuts(0, 100, &[100]), 0, 100, &[0, 1, 50, 99, 100]);
-    }
 
-    #[test]
-    fn repair_slices_tile_the_range_without_gaps_or_overlaps() {
+        // `repair_slice_bounds`: uniform split, across several ranges/widths.
         for (lo, hi, n) in [(0i64, 100i64, 4usize), (-50, 50, 3), (1_700_000_000_000_000, 1_700_000_086_400_000, 8), (0, 1, 4), (5, 5, 4)] {
             let bounds = super::repair_slice_bounds(lo, hi, n);
             assert_tiles(&bounds, lo, hi, &[lo, hi, lo + (hi - lo) / 2]);
@@ -23818,84 +23814,94 @@ mod tests {
         .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
     }
 
-    // The three #[ignore]'d tests below stress real Delta-table concurrency against
-    // S3 (MinIO). They run cleanly in isolated environments (`make test-all`) but
-    // wedge in the shared GHA test process because `config::init_config()` uses a
-    // OnceLock — so every test inherits the *first* test's TIMEFUSION_TABLE_PREFIX.
-    // By the time a "concurrent" test runs, the table has accumulated versions
-    // from earlier tests and 3-way commit contention retries past any
-    // reasonable timeout. Run with `cargo test -- --ignored` locally.
+    /// Three shapes of real Delta-table concurrency against S3 (MinIO): same-project write
+    /// contention, per-project table-creation races, and mixed writes-then-reads across projects.
+    ///
+    /// `#[ignore]`d as a group: they run cleanly in isolated environments (`make test-all`) but
+    /// wedge in the shared GHA test process because `config::init_config()` uses a OnceLock — so
+    /// every test inherits the *first* test's TIMEFUSION_TABLE_PREFIX, the table accumulates
+    /// versions from earlier tests, and 3-way commit contention retries past any reasonable
+    /// timeout. Run with `cargo test -- --ignored` locally.
     #[serial]
-    #[ignore = "wedges under shared-state CI; see comment above. Run with cargo test -- --ignored"]
+    #[ignore = "wedges under shared-state CI; see doc comment. Run with cargo test -- --ignored"]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_concurrent_writes_same_project() -> Result<()> {
-        // Locally <3s; CI's MinIO + fresh Delta-table create-on-write under 3-way
-        // concurrent contention regularly exceeds 60s on the GHA runner. Headroom.
+    async fn concurrent_delta_writes_across_scenarios() -> Result<()> {
+        // Case: N concurrent writers, ONE project/table — Delta's real 3-way commit contention.
+        // Locally <3s; CI's MinIO + fresh Delta-table create-on-write under 3-way concurrent
+        // contention regularly exceeds 60s on the GHA runner, hence the 180s headroom throughout.
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            let db = Database::with_config(create_test_config("concurrent-writes-same-project")).await?;
-            let db = Arc::new(db);
+            let db = Arc::new(Database::with_config(create_test_config("concurrent-writes-same-project")).await?);
             let project_id = format!("concurrent_test_{}", uuid::Uuid::new_v4());
-
-            // Create 3 concurrent write tasks (reduced from 10 to minimize Delta conflicts)
             let tasks = (0..3).map(|i| {
-                let db = Arc::clone(&db);
-                let project = project_id.clone();
-
+                let (db, project) = (Arc::clone(&db), project_id.clone());
                 tokio::spawn(async move {
-                    let batch_id = format!("batch_{}", i);
-                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project)])?;
+                    let batch_id = format!("batch_{i}");
+                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{batch_id}"), &project)])?;
                     db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| batch_id)
                 })
             });
-
             let results: Vec<Result<String, _>> =
-                futures::future::join_all(tasks).await.into_iter().map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?).collect();
-
-            let successful_writes: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
-            assert_eq!(successful_writes.len(), 3, "All 3 concurrent writes should succeed");
-
+                futures::future::join_all(tasks).await.into_iter().map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {e}"))?).collect();
+            assert_eq!(results.into_iter().collect::<Result<Vec<_>>>()?.len(), 3, "all 3 concurrent writes to one project should succeed");
             db.shutdown().await?;
-
-            Ok(())
+            Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
-    }
+        .map_err(|_| anyhow::anyhow!("same-project case timed out after 180 seconds"))??;
 
-    #[serial]
-    #[ignore = "wedges under shared-state CI; see test_concurrent_writes_same_project comment"]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_concurrent_table_creation() -> Result<()> {
+        // Case: N projects racing to create their OWN table concurrently — the first-write path.
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            let db = Database::with_config(create_test_config("concurrent-table-creation")).await?;
-            let db = Arc::new(db);
-
-            // Create multiple projects concurrently - each will try to create its own table
+            let db = Arc::new(Database::with_config(create_test_config("concurrent-table-creation")).await?);
             let tasks = (0..5).map(|i| {
                 let db = Arc::clone(&db);
-                let project_id = format!("project_create_test_{}", i);
-
+                let project_id = format!("project_create_test_{i}");
                 tokio::spawn(async move {
-                    let batch_id = format!("init_batch_{}", i);
-                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project_id)])?;
+                    let batch_id = format!("init_batch_{i}");
+                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{batch_id}"), &project_id)])?;
                     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| project_id)
                 })
             });
-
-            // Wait for all tasks to complete
             let results: Vec<Result<String, _>> =
-                futures::future::join_all(tasks).await.into_iter().map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?).collect();
-
-            let created_projects: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
-            assert_eq!(created_projects.len(), 5, "All 5 projects should be created successfully");
-
-            // Shutdown database
+                futures::future::join_all(tasks).await.into_iter().map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {e}"))?).collect();
+            assert_eq!(results.into_iter().collect::<Result<Vec<_>>>()?.len(), 5, "all 5 first-write table creations should succeed");
             db.shutdown().await?;
-
-            Ok(())
+            Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
+        .map_err(|_| anyhow::anyhow!("table-creation case timed out after 180 seconds"))??;
+
+        // Case: writes to DIFFERENT projects (no conflicts), then concurrent reads across all of them.
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            let db = Arc::new(Database::with_config(create_test_config("concurrent-mixed-operations")).await?);
+            let write_handles = (0..3).map(|i| {
+                let (db, project_id) = (Arc::clone(&db), format!("project_{i}"));
+                tokio::spawn(async move {
+                    let batch = json_to_batch(vec![test_span(&format!("id_{i}"), &format!("span_{i}"), &project_id)])?;
+                    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+            });
+            for handle in write_handles {
+                handle.await??;
+            }
+            let read_handles = (0..3).map(|i| {
+                let (db, project_id) = (Arc::clone(&db), format!("project_{i}"));
+                tokio::spawn(async move {
+                    let ctx = db.clone().create_session_context();
+                    let _ = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await;
+                    Ok::<_, anyhow::Error>(())
+                })
+            });
+            for handle in read_handles {
+                handle.await??;
+            }
+            db.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("mixed-operations case timed out after 180 seconds"))??;
+
+        Ok(())
     }
 
     #[serial]
@@ -23931,55 +23937,6 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
-    }
-
-    #[serial]
-    #[ignore = "wedges under shared-state CI; see test_concurrent_writes_same_project comment"]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_concurrent_mixed_operations() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            let db = Database::with_config(create_test_config("concurrent-mixed-operations")).await?;
-            let db = Arc::new(db);
-
-            // Test concurrent writes to DIFFERENT projects (no conflicts)
-            let mut handles = Vec::new();
-            for i in 0..3 {
-                let db_clone = Arc::clone(&db);
-                let project_id = format!("project_{}", i);
-                handles.push(tokio::spawn(async move {
-                    let batch = json_to_batch(vec![test_span(&format!("id_{}", i), &format!("span_{}", i), &project_id)])?;
-                    db_clone.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-                    Ok::<_, anyhow::Error>(())
-                }));
-            }
-
-            // Wait for all writes
-            for handle in handles {
-                handle.await??;
-            }
-
-            // Now test concurrent reads across all projects
-            let mut read_handles = Vec::new();
-            for i in 0..3 {
-                let db_clone = Arc::clone(&db);
-                let project_id = format!("project_{}", i);
-                read_handles.push(tokio::spawn(async move {
-                    let ctx = db_clone.clone().create_session_context();
-                    let _ = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await;
-                    Ok::<_, anyhow::Error>(())
-                }));
-            }
-
-            for handle in read_handles {
-                handle.await??;
-            }
-
-            db.shutdown().await?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
     }
 
     #[serial]
