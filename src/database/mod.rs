@@ -1442,6 +1442,12 @@ fn scoped_file_uris(table: &DeltaTable, scope: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// `table.get_file_uris()`, collected into `C` — empty on an unloaded snapshot,
+/// matching every existing `unwrap_or_default()` call site.
+pub(crate) fn file_uris<C: Default + FromIterator<String>>(table: &DeltaTable) -> C {
+    table.get_file_uris().map(Iterator::collect).unwrap_or_default()
+}
+
 /// True for the retryable Delta OCC conflicts — a single retry on a refreshed
 /// snapshot resolves them. Shared by the flush, dedup, and light-optimize commit
 /// loops so they classify identically. Substrings match the real delta-rs
@@ -5462,7 +5468,7 @@ impl Database {
                             // would redundantly resolve_table a second time.
                             let (uris, store, table_uri) = {
                                 let table = table_ref.read().await;
-                                let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                                let uris: Vec<String> = file_uris(&table);
                                 (uris, table.log_store().object_store(None), table.table_url().to_string())
                             };
                             info!("bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}", uris.len(), t.elapsed().as_millis());

@@ -81,11 +81,8 @@ impl Database {
 
     /// Light-optimize slice of the maintenance budget.
     ///
-    /// Deferred to `light_share_bytes` rather than recomputed. The old
-    /// expression — `(pool/3 * max_k).min(pool * 3/4)` — happened to equal the budget tree's own
-    /// light share only while `HEAVY_MIN_SHARE` was 0.25, so the two agreed by coincidence. Moving
-    /// the heavy share would silently change `light_optimize_k` while leaving the actual pools
-    /// unchanged.
+    /// Deferred to `light_share_bytes` (not recomputed here) — a local formula
+    /// previously duplicated it by coincidence and drifted when the heavy share moved.
     pub(crate) fn light_optimize_pool_bytes(&self) -> usize {
         self.config.derived.light_share_bytes()
     }
@@ -250,34 +247,23 @@ impl Database {
             return None;
         }
 
-        // ONE pool consumer per gate permit — the invariant `flush_sort_gate`'s
-        // 512 MB-per-permit sizing assumes. With N>1 partitions this plan fans
-        // out to N ExternalSorters (32 MB merge reservation each) plus an
-        // UNSPILLABLE SortPreservingMergeExec, and concurrent escalations
-        // starved the FairSpillPool into the unsorted fallback (prod
-        // 2026-08-03). A single-partition sort is slower but has no merge exec
-        // and spills within its fair share, so the footer stays honest.
-        // Shared by BOTH callers of `sort_flush_group`: the flush path
-        // (`UnsortedFallback::Allow`) and the dedup rewrite path
-        // (`UnsortedFallback::Forbid`). They run on one 1 GB pool, so the
-        // batch size below governs a 6.25 GB rewrite group as much as a flush
-        // group — prod 2026-08-08 failed both within the same second.
+        // ONE pool consumer per gate permit — `flush_sort_gate`'s 512 MB-per-permit
+        // sizing assumes it. N>1 partitions fans out to N ExternalSorters plus an
+        // UNSPILLABLE SortPreservingMergeExec, and concurrent escalations starved
+        // the FairSpillPool into the unsorted fallback (prod 2026-08-03); a
+        // single-partition sort is slower but spills within its fair share, so the
+        // footer stays honest. Shared by both `sort_flush_group` callers (flush's
+        // `Allow` and the dedup rewrite's `Forbid`) on one 1 GB pool, so this batch
+        // size governs a 6.25 GB rewrite group as much as a flush group.
         //
-        // SMALL batches, for the same reason `repair_session_state` uses them
-        // (6ef5ccf): `ExternalSorterMerge` allocates per spill-run per batch, so
-        // its ask scales with `batch_size`. Prod 2026-08-08, AFTER the one-permit
-        // fix below had already given this sort the whole pool to itself:
-        //
-        //   Failed to allocate additional 545.4 MB for ExternalSorterMerge[0]
-        //   with 539.8 MB already allocated - 484.2 MB remain available
-        //
-        // 539.8 + 484.2 = the full 1024 MB pool, so contention was NOT the
-        // remaining cause — the merge simply tried to double a half-pool
-        // reservation. The group was 6252 MB, which spills into a wide merge,
-        // and 8192-row batches make every run's slice 32x what repair now uses.
-        // Shrinking the batch costs scan throughput on an already-slow path and
-        // buys the allocation; the alternative is writing the group UNSORTED,
-        // which poisons the partition's footer ordering for every later scan.
+        // SMALL batches, same reason as `repair_session_state` (6ef5ccf):
+        // `ExternalSorterMerge`'s ask scales with `batch_size`. Prod 2026-08-08,
+        // even with the whole pool to itself, a 6252 MB group at 8192-row batches
+        // still failed ("545.4 MB additional, 539.8 MB already allocated, 484.2 MB
+        // remain" — the full pool, so contention wasn't the cause; the merge just
+        // doubled a half-pool reservation). Shrinking the batch trades scan
+        // throughput for the allocation; the alternative — writing the group
+        // UNSORTED — poisons the partition's footer ordering for every later scan.
         let state = build_delta_write_session_state_with_batch(1, self.flush_sort_runtime_env(), "256");
         let ctx = SessionContext::new_with_state(state);
         let name = format!("flush_sort_{}", uuid::Uuid::new_v4().simple());
@@ -529,6 +515,8 @@ impl Database {
         let dirty_bins: Vec<(String, i64)> = if schema.dedup_keys.is_empty() {
             Vec::new()
         } else {
+            // Dirty-bin granularity, intentionally independent of MemBuffer's (configurable,
+            // currently 5-min) bucket duration — the two ideas coincide at "10 min" only historically.
             const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
             batches
                 .iter()
@@ -539,7 +527,7 @@ impl Database {
                         chrono::DateTime::from_timestamp_micros(timestamp).map(|time| (time.date_naive().to_string(), timestamp.div_euclid(BIN_MICROS)))
                     })
                 })
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<HashSet<_>>()
                 .into_iter()
                 .collect()
         };
@@ -559,7 +547,7 @@ impl Database {
             Ok(w) => {
                 let w = w.with_writer_properties(writer_properties.clone());
                 let arrow_schema = w.arrow_schema();
-                let table_fields: std::collections::HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+                let table_fields: HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
                 let evolves = batches.schemas().iter().any(|s| s.fields().iter().any(|f| !table_fields.contains(f.name().as_str())));
                 (!evolves).then_some(w)
             }
@@ -779,7 +767,7 @@ impl Database {
                         // pre-uris here (only on success) — before the state swap
                         // below makes `new_table` post-commit — so failed attempts
                         // don't pay the full-table file-URI walk.
-                        let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                        let pre_uris: HashSet<String> = file_uris(&new_table);
                         new_table.state = Some(finalized.snapshot());
                         drop(commit_guard);
                         let _t_record = std::time::Instant::now();
@@ -821,7 +809,7 @@ impl Database {
                         // Capture the pre-commit file set from the still-pre-commit
                         // clone (only on this rare branch — the OCC-retry path must
                         // not pay the full-table URI walk), then probe.
-                        let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                        let pre_uris: HashSet<String> = file_uris(&new_table);
                         match probe_after_timeout(self.probe_commit_landed_bounded(&table_ref, &adds).await, timed_out) {
                             CommitProbe::Landed => {
                                 warn!(
@@ -881,7 +869,7 @@ impl Database {
             };
             let (table, pre_uris) = {
                 let guard = table_ref.read().await;
-                let pre: std::collections::HashSet<String> = guard.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                let pre: HashSet<String> = file_uris(&guard);
                 (guard.clone(), pre)
             };
 
@@ -1005,7 +993,7 @@ impl Database {
             .await;
 
         // ---- Phase 3: one commit per PHYSICAL table.
-        let mut by_physical: std::collections::HashMap<(String, String), Vec<(usize, StagedUnit)>> = std::collections::HashMap::new();
+        let mut by_physical: HashMap<(String, String), Vec<(usize, StagedUnit)>> = HashMap::new();
         for (i, key, unit) in staged {
             match unit {
                 Err(e) => results[i] = Err(e),
@@ -1127,7 +1115,7 @@ impl Database {
             .await;
             match commit_res {
                 Ok(finalized) => {
-                    let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                    let pre_uris: HashSet<String> = file_uris(&new_table);
                     new_table.state = Some(finalized.snapshot());
                     drop(commit_guard);
                     let added = self.record_committed_write(table_ref, projects, table_name, new_table, &pre_uris, true).await;
@@ -1149,7 +1137,7 @@ impl Database {
                     // after N.json was written). Same three-way probe as the
                     // per-project path — never delete parquet a landed commit
                     // references.
-                    let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                    let pre_uris: HashSet<String> = file_uris(&new_table);
                     match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, &adds).await, timed_out) {
                         CommitProbe::Landed => {
                             warn!("coalesced commit for {} reported an error but LANDED (post-commit hook failed) — draining: {}", table_name, e);
@@ -1205,7 +1193,7 @@ impl Database {
         let Ok(snap) = guard.snapshot() else {
             return CommitProbe::Inconclusive;
         };
-        let active: std::collections::HashSet<String> = snap.log_data().iter().map(|f| f.path().into_owned()).collect();
+        let active: HashSet<String> = snap.log_data().iter().map(|f| f.path().into_owned()).collect();
         if our_paths.iter().all(|p| active.contains(*p)) { CommitProbe::Landed } else { CommitProbe::NotLanded }
     }
 
@@ -1234,7 +1222,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     async fn record_committed_write(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, new_table: DeltaTable,
-        pre_uris: &std::collections::HashSet<String>, warm: bool,
+        pre_uris: &HashSet<String>, warm: bool,
     ) -> Vec<String> {
         // Jitter anchor + logging identity: any member of the physical group is
         // equivalent (they all commit to the same log).
@@ -1365,7 +1353,7 @@ impl Database {
         // once per project made a dirty boot pay the same remote snapshot load
         // dozens of times. Custom-storage topics retain their isolated group.
         let custom = self.custom_storage_keys().await;
-        let mut physical: std::collections::HashMap<(String, String), Vec<(String, String)>> = std::collections::HashMap::new();
+        let mut physical: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
         for (project_id, table_name) in wal.list_topic_pairs() {
             let physical_project = if custom.contains(&(project_id.clone(), table_name.clone())) { project_id.clone() } else { String::new() };
             physical.entry((physical_project, table_name.clone())).or_default().push((project_id, table_name));

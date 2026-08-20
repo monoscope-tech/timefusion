@@ -34,7 +34,7 @@ impl Database {
 
         // Snapshot the current live file set once: drives both the ZOrder
         // idempotence guard (below) and PR #39's warm/evict (`pre_uris`).
-        let all_uris: Vec<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+        let all_uris: Vec<String> = file_uris(&table_clone);
         let table_url = table_clone.table_url().to_string();
         let current = Self::filesets_for_dates(&all_uris, &window_dates);
 
@@ -163,7 +163,7 @@ impl Database {
                 // even when we don't adopt the new handle (delta-rs has already
                 // committed the rewrite by this point regardless).
                 {
-                    let new_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                    let new_uris: Vec<String> = file_uris(&new_table);
                     let new_sets = Self::filesets_for_dates(&new_uris, &kept_dates);
                     let mut guard = self.zorder_filesets.write().await;
                     let entry = guard.entry(table_url.clone()).or_default();
@@ -585,7 +585,7 @@ impl Database {
     /// Distinct `date=YYYY-MM-DD` partitions present in the live file set,
     /// ascending. Drives the CLI/pgwire "compact old partitions" loop.
     pub async fn partition_dates(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<Vec<chrono::NaiveDate>> {
-        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        let uris: Vec<String> = { file_uris(&*table_ref.read().await) };
         let dates: std::collections::BTreeSet<chrono::NaiveDate> = uris
             .iter()
             .filter_map(|uri| {
@@ -599,7 +599,7 @@ impl Database {
     /// Projects present in `date`'s live file set, most-fragmented first.
     /// Drives the CLI's per-project consolidate/dedup loops.
     pub async fn partition_projects(&self, table_ref: &Arc<RwLock<DeltaTable>>, date: chrono::NaiveDate) -> Result<Vec<String>> {
-        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        let uris: Vec<String> = { file_uris(&*table_ref.read().await) };
         Ok(Self::hot_project_ids(&uris, date))
     }
 
@@ -751,7 +751,7 @@ impl Database {
             let table = table_ref.read().await;
             (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store(), table.clone())
         };
-        let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+        let pre_uris: std::collections::HashSet<String> = file_uris(&table_clone);
 
         let provider = deltalake::delta_datafusion::TableProviderBuilder::default()
             .with_log_store(log_store)
@@ -906,7 +906,7 @@ impl Database {
         let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, true);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
         let date_str = date.to_string();
-        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        let uris: Vec<String> = { file_uris(&*table_ref.read().await) };
         // Backstop against a selection that stops shrinking (e.g. a rewrite
         // that keeps losing OCC to a dedup); a normal day converges in
         // partition_bytes/target passes.
@@ -949,24 +949,14 @@ impl Database {
     /// Returns `(rows_dropped, complete)`. `complete=false` means duplicate-bearing work was skipped
     /// (unsealed chunks, rewrite budget, vanished snapshot rows) — the partition must not be
     /// fingerprinted clean, or the read-side dedup skip would serve duplicates.
+    ///
+    /// Stage-and-commit the whole partition as a SINGLE wave. Used by the fallback
+    /// sweep, which has no queue to batch across; the dirty-bin path stages with
+    /// [`Self::stage_dedup_partition_range`] directly so one wave can span many bins.
     pub async fn dedup_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
     ) -> Result<(u64, bool)> {
-        self.dedup_partition_range(table_ref, table_name, project_id, date, None).await
-    }
-
-    /// Stage-and-commit one partition (or one 10-minute bin of it) as a SINGLE
-    /// wave. Used by the fallback sweep, which has no queue to batch across; the
-    /// dirty-bin path stages with [`Self::stage_dedup_partition_range`] directly
-    /// so one wave can span many bins.
-    async fn dedup_partition_range(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>,
-    ) -> Result<(u64, bool)> {
-        let slice = bin.map(|bin| crate::maintenance_coordinator::TimeSlice {
-            start_micros: bin.saturating_mul(crate::maintenance_coordinator::NORMAL_SLICE_MICROS),
-            end_micros: bin.saturating_add(1).saturating_mul(crate::maintenance_coordinator::NORMAL_SLICE_MICROS),
-        });
-        self.dedup_partition_range_limited(table_ref, table_name, project_id, date, slice, None).await
+        self.dedup_partition_range_limited(table_ref, table_name, project_id, date, None, None).await
     }
 
     pub(crate) async fn dedup_partition_range_limited(
