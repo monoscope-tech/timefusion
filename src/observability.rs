@@ -235,6 +235,20 @@ pub fn gauge_value(name: &'static str) -> f64 {
     LOCAL_REGISTRY.get().and_then(|r| r.get_gauge(&metrics::Key::from_name(name))).map_or(0.0, |g| f64::from_bits(g.load(Relaxed)))
 }
 
+/// Test helper: installs just the local (non-OTel) side of `init_metrics()`'s recorder, so a
+/// unit/integration test can assert on `metrics::counter!()`/`histogram!()` values via
+/// `counter_value()`/`gauge_value()`/`histogram_quantile()` without a running OTLP collector.
+/// A no-op if a recorder is already installed (e.g. the test runs against a fully bootstrapped
+/// server) — matches `init_metrics()`'s own idempotence.
+pub fn init_local_metrics_for_test() {
+    let local_histograms = Arc::new(LocalHistograms(dashmap::DashMap::new()));
+    let local_registry = Arc::new(CounterGaugeRegistry::atomic());
+    if metrics::set_global_recorder(LocalRecorder { histograms: local_histograms.clone(), registry: local_registry.clone() }).is_ok() {
+        let _ = LOCAL_HISTOGRAMS.set(local_histograms);
+        let _ = LOCAL_REGISTRY.set(local_registry);
+    }
+}
+
 /// Initialize OTel metrics. Idempotent (subsequent calls are no-ops).
 ///
 /// `buffered_layer` is a Weak so the metrics callback doesn't extend its

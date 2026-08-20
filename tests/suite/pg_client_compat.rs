@@ -1,9 +1,6 @@
 //! Wire-level PostgreSQL client compatibility regressions.
 
-use std::{
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use datafusion_postgres::ServerOptions;
@@ -17,7 +14,6 @@ use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 struct TestServer {
-    db: Arc<Database>,
     port: u16,
     shutdown: Arc<Notify>,
 }
@@ -45,7 +41,7 @@ impl TestServer {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
             if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                return Ok(Self { db, port, shutdown });
+                return Ok(Self { port, shutdown });
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -103,11 +99,12 @@ async fn protocol_3_2_reports_unsupported_options_before_authentication() -> Res
 
 #[tokio::test(flavor = "multi_thread")]
 async fn catalog_query_does_not_create_a_routing_scan() -> Result<()> {
+    timefusion::observability::init_local_metrics_for_test();
     let server = TestServer::start().await?;
-    let before = server.db.scan_metrics.provider_scan_total.load(Ordering::Relaxed);
+    let before = timefusion::observability::counter_value(timefusion::database::scan_metric_names::PROVIDER_SCAN_TOTAL);
     let count: i64 = server.client().await?.query_one("SELECT COUNT(*) FROM pg_catalog.pg_class", &[]).await?.get(0);
     assert!(count > 0);
-    assert_eq!(server.db.scan_metrics.provider_scan_total.load(Ordering::Relaxed), before);
+    assert_eq!(timefusion::observability::counter_value(timefusion::database::scan_metric_names::PROVIDER_SCAN_TOTAL), before);
     Ok(())
 }
 

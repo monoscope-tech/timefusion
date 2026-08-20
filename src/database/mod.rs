@@ -180,100 +180,69 @@ impl DedupSkipVerdict {
     }
 }
 
-/// Counters surfaced via `timefusion_stats` for production debugging. Cheap to
-/// update on the hot path (Relaxed atomics); read via `snapshot()`. Latency
-/// histograms are recorded through `metrics::histogram!()` and read back via
-/// `observability::histogram_quantile()` — see that module for why (OTel export
-/// + local readback fanned out from one `metrics::Recorder`).
+/// Counter/gauge names for `ScanMetrics`, shared between the `metrics::counter!()`/
+/// `gauge!()` call sites (below) and their `timefusion_stats` readback
+/// (`server::pg_compat`) so the two can't drift apart into a silent typo. High-water-mark
+/// fields (`decode_polls_inflight`/`_peak`, `decode_peak_batch_bytes`) stay hand-rolled
+/// atomics below — `metrics::Gauge` has no `fetch_max`, so there's no clean equivalent.
+pub mod scan_metric_names {
+    pub const SCANS_TOTAL: &str = "timefusion.scan.scans_total";
+    pub const SCANS_SKIPPED_DELTA: &str = "timefusion.scan.scans_skipped_delta";
+    pub const SCANS_MEM_ONLY: &str = "timefusion.scan.scans_mem_only";
+    pub const SCANS_DELTA_ONLY: &str = "timefusion.scan.scans_delta_only";
+    pub const SCANS_MEM_PLUS_DELTA: &str = "timefusion.scan.scans_mem_plus_delta";
+    pub const DEDUP_ELIGIBLE_SCANS: &str = "timefusion.scan.dedup_eligible_scans";
+    pub const DEDUP_SKIPPED: &str = "timefusion.scan.dedup_skipped";
+    pub const DEDUP_DENIED_UNCERTIFIED: &str = "timefusion.scan.dedup_denied_uncertified";
+    pub const DEDUP_DENIED_BY_LEG: &str = "timefusion.scan.dedup_denied_by_leg";
+    pub const DEDUP_DENIED_NEVER_CERTIFIED: &str = "timefusion.scan.dedup_denied_never_certified";
+    pub const DEDUP_DENIED_FP_MOVED: &str = "timefusion.scan.dedup_denied_fp_moved";
+    pub const DEDUP_DENIED_NO_WINDOW: &str = "timefusion.scan.dedup_denied_no_window";
+    pub const DEDUP_DENIED_UNRESOLVED: &str = "timefusion.scan.dedup_denied_unresolved";
+    pub const DEDUP_DENIED_DISABLED: &str = "timefusion.scan.dedup_denied_disabled";
+    pub const CERT_GRANTED_TOTAL: &str = "timefusion.scan.cert_granted_total";
+    pub const CERT_DWELL_TOTAL: &str = "timefusion.scan.cert_dwell_total";
+    pub const CERT_DWELL_SECS_TOTAL: &str = "timefusion.scan.cert_dwell_secs_total";
+    pub const FAST_RESOLVE_HITS: &str = "timefusion.scan.fast_resolve_hits";
+    pub const FAST_RESOLVE_MISSES: &str = "timefusion.scan.fast_resolve_misses";
+    pub const PROVIDER_CACHE_HITS: &str = "timefusion.scan.provider_cache_hits";
+    pub const PROVIDER_CACHE_MISSES: &str = "timefusion.scan.provider_cache_misses";
+    pub const PROVIDER_CACHE_EVICTIONS: &str = "timefusion.scan.provider_cache_evictions";
+    pub const PROVIDER_BUILD_ABANDONED: &str = "timefusion.scan.provider_build_abandoned";
+    pub const PROVIDER_BUILD_US_TOTAL: &str = "timefusion.scan.provider_build_us_total";
+    pub const PROVIDER_BUILD_TOTAL: &str = "timefusion.scan.provider_build_total";
+    pub const PROVIDER_SCAN_US_TOTAL: &str = "timefusion.scan.provider_scan_us_total";
+    pub const PROVIDER_SCAN_TOTAL: &str = "timefusion.scan.provider_scan_total";
+    pub const BOUNDED_OTEL_SCAN_CANDIDATES: &str = "timefusion.scan.bounded_otel_scan_candidates";
+    pub const BOUNDED_OTEL_SCAN_REJECTIONS: &str = "timefusion.scan.bounded_otel_scan_rejections";
+    pub const WIDE_SCAN_OVERSIZE_TOTAL: &str = "timefusion.scan.wide_scan_oversize_total";
+    pub const MEM_PLAN_US_TOTAL: &str = "timefusion.scan.mem_plan_us_total";
+    pub const MEM_PLAN_TOTAL: &str = "timefusion.scan.mem_plan_total";
+    pub const HOT_PLAN_US_TOTAL: &str = "timefusion.scan.hot_plan_us_total";
+    pub const HOT_PLAN_TOTAL: &str = "timefusion.scan.hot_plan_total";
+    pub const PGWIRE_TOTAL: &str = "timefusion.scan.pgwire_total";
+    pub const DECODE_BYTES_TOTAL: &str = "timefusion.scan.decode_bytes_total";
+    pub const DECODE_PRESSURE_THROTTLED: &str = "timefusion.scan.decode_pressure_throttled";
+}
+
+/// High-water-mark decode gauges surfaced via `timefusion_stats`. Separate from the
+/// `metrics`-backed counters above because `metrics::Gauge` has no `fetch_max` —
+/// `decode_begin`/`decode_end` need the atomic read-modify-write these give directly.
 #[derive(Debug, Default)]
-pub struct ScanMetrics {
-    pub scans_total: std::sync::atomic::AtomicU64,
-    pub scans_skipped_delta: std::sync::atomic::AtomicU64,
-    pub scans_mem_only: std::sync::atomic::AtomicU64,
-    pub scans_delta_only: std::sync::atomic::AtomicU64,
-    pub scans_mem_plus_delta: std::sync::atomic::AtomicU64,
-    /// Swept-partition dedup skip, over scans that read Delta. See `record_scan`.
-    pub dedup_eligible_scans: std::sync::atomic::AtomicU64,
-    pub dedup_skipped: std::sync::atomic::AtomicU64,
-    /// Aggregate of every `pre_skip == false` denial; the sum of the five below.
-    /// Kept so the row keeps meaning what it did when the 0.5% figure was measured.
-    pub dedup_denied_uncertified: std::sync::atomic::AtomicU64,
-    pub dedup_denied_by_leg: std::sync::atomic::AtomicU64,
-    /// The `dedup_denied_uncertified` split — see `DedupSkipVerdict`. The pair
-    /// that decides the certification-survival question is
-    /// `never_certified` (persistence would recover it) vs `fp_moved` (nothing would).
-    pub dedup_denied_never_certified: std::sync::atomic::AtomicU64,
-    pub dedup_denied_fp_moved: std::sync::atomic::AtomicU64,
-    pub dedup_denied_no_window: std::sync::atomic::AtomicU64,
-    pub dedup_denied_unresolved: std::sync::atomic::AtomicU64,
-    pub dedup_denied_disabled: std::sync::atomic::AtomicU64,
-    /// How long a certification survived, from the sweep that granted it to the
-    /// read that first observed its fingerprint had moved. The other half of the
-    /// Phase 0 answer: persistence only pays if certifications live long enough
-    /// to be worth reloading. Same power-of-two bucketing as the latency
-    /// histograms, in SECONDS.
-    pub cert_granted_total: std::sync::atomic::AtomicU64,
-    pub cert_dwell_total: std::sync::atomic::AtomicU64,
-    pub cert_dwell_secs_total: std::sync::atomic::AtomicU64,
-    pub fast_resolve_hits: std::sync::atomic::AtomicU64,
-    pub fast_resolve_misses: std::sync::atomic::AtomicU64,
-    /// Delta TableProvider cache: hit = cached cell at the current snapshot
-    /// version; miss = either no entry, or an entry at a stale version that
-    /// had to be replaced. Operators tracking the cold-start vs steady-state
-    /// cliff watch the hit ratio: after the first ~tens of seconds per
-    /// (project, table), this should stay high; a low ratio in prod means
-    /// version is churning faster than expected (e.g. very aggressive
-    /// compaction) and the cache isn't paying for itself.
-    pub provider_cache_hits: std::sync::atomic::AtomicU64,
-    pub provider_cache_misses: std::sync::atomic::AtomicU64,
-    pub provider_cache_evictions: std::sync::atomic::AtomicU64,
-    /// Provider builds that started against a version that was already
-    /// stale by the time the build finished — the DashMap entry got
-    /// replaced under us (a flush bumped the version) and the rebuilt
-    /// provider had to be dropped. Cheap-to-skip in the steady state
-    /// (flush cadence is seconds apart); a non-zero rate here under
-    /// sustained traffic flags either very frequent compaction or a
-    /// pathological version-churn pattern worth investigating.
-    pub provider_build_abandoned: std::sync::atomic::AtomicU64,
-    /// Planning-stage wall time. Totals pair with counts so
-    /// `timefusion_stats` can expose an average without a lock or histogram.
-    /// These deliberately stop before execution: they explain the gap between
-    /// `EXPLAIN` wall time and the physical operators' elapsed metrics.
-    pub provider_build_us_total: std::sync::atomic::AtomicU64,
-    pub provider_build_total: std::sync::atomic::AtomicU64,
-    pub provider_scan_us_total: std::sync::atomic::AtomicU64,
-    pub provider_scan_total: std::sync::atomic::AtomicU64,
-    pub bounded_otel_scan_candidates: std::sync::atomic::AtomicU64,
-    pub bounded_otel_scan_rejections: std::sync::atomic::AtomicU64,
-    /// Wide scans whose selected file bytes exceeded [`WIDE_SCAN_OVERSIZE_BYTES`]. Observation only.
-    ///
-    /// Existing guards bound query shape and concurrency, not one scan's heap. This metric
-    /// measures how much traffic a future size limit would catch before refusing queries.
-    pub wide_scan_oversize_total: std::sync::atomic::AtomicU64,
-    pub mem_plan_us_total: std::sync::atomic::AtomicU64,
-    pub mem_plan_total: std::sync::atomic::AtomicU64,
-    pub hot_plan_us_total: std::sync::atomic::AtomicU64,
-    pub hot_plan_total: std::sync::atomic::AtomicU64,
-    /// End-to-end pgwire query latency. Recorded by `LoggingSimpleHandler` and
-    /// `LoggingExtendedQueryHandler` around the `DfSessionService::do_query`
-    /// call — the FULL server-side path from "harness received our query"
-    /// through "result encoded back to client". Compare to scan p95/p99 to
-    /// see how much of the user-visible tail is outside the scan call.
-    pub pgwire_total: std::sync::atomic::AtomicU64,
-    /// Parquet decode heap, measured at the `GatedScanExec` choke point.
-    ///
-    /// Decode is the one large consumer outside every budget. Worst-case concurrent decode heap
-    /// is roughly `decode_peak_batch_bytes × decode_polls_inflight_peak`, which is the figure to
-    /// size a transient budget from.
-    pub decode_bytes_total: std::sync::atomic::AtomicU64,
+pub struct DecodeGauges {
     pub decode_peak_batch_bytes: std::sync::atomic::AtomicU64,
     pub decode_polls_inflight: std::sync::atomic::AtomicU64,
     pub decode_polls_inflight_peak: std::sync::atomic::AtomicU64,
-    /// Decode polls that ran with pressure-reduced concurrency (see
-    /// `scan_pressure_permits`). Non-zero means the process was close enough
-    /// to its OOM line that wide-scan decodes were serialized instead of
-    /// letting an allocation burst outrun reclaim.
-    pub decode_pressure_throttled: std::sync::atomic::AtomicU64,
+}
+
+/// Counters/gauges surfaced via `timefusion_stats` for production debugging.
+/// Recorded through `metrics::counter!()`/`histogram!()` (see `scan_metric_names`)
+/// and read back via `observability::{counter_value, histogram_quantile}` — fanned
+/// out to OTel export and local readback from one `metrics::Recorder`; see that
+/// module for why. `decode` high-water marks are the one exception (`DecodeGauges`).
+#[derive(Debug, Default)]
+pub struct ScanMetrics {
+    pub decode: DecodeGauges,
 }
 
 impl ScanMetrics {
@@ -281,16 +250,16 @@ impl ScanMetrics {
     /// mark. Returns nothing — the caller pairs it with `decode_end`.
     fn decode_begin(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let n = self.decode_polls_inflight.fetch_add(1, Relaxed) + 1;
-        self.decode_polls_inflight_peak.fetch_max(n, Relaxed);
+        let n = self.decode.decode_polls_inflight.fetch_add(1, Relaxed) + 1;
+        self.decode.decode_polls_inflight_peak.fetch_max(n, Relaxed);
     }
 
     /// One gated decode finished, having produced `bytes` of Arrow.
     fn decode_end(&self, bytes: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.decode_polls_inflight.fetch_sub(1, Relaxed);
-        self.decode_bytes_total.fetch_add(bytes, Relaxed);
-        self.decode_peak_batch_bytes.fetch_max(bytes, Relaxed);
+        self.decode.decode_polls_inflight.fetch_sub(1, Relaxed);
+        metrics::counter!(scan_metric_names::DECODE_BYTES_TOTAL).increment(bytes);
+        self.decode.decode_peak_batch_bytes.fetch_max(bytes, Relaxed);
     }
 
     /// Outcome of the swept-partition dedup skip.
@@ -304,39 +273,39 @@ impl ScanMetrics {
         &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool,
         verdict: DedupSkipVerdict,
     ) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.scans_total.fetch_add(1, Relaxed);
+        use scan_metric_names::*;
+        metrics::counter!(SCANS_TOTAL).increment(1);
         // Counted only where a Delta leg was actually read: the skip's prize is the key columns
         // it stops decoding out of Parquet, and a mem-only scan has none to decode.
         if has_delta {
-            self.dedup_eligible_scans.fetch_add(1, Relaxed);
+            metrics::counter!(DEDUP_ELIGIBLE_SCANS).increment(1);
             if dedup_skip {
-                self.dedup_skipped.fetch_add(1, Relaxed);
+                metrics::counter!(DEDUP_SKIPPED).increment(1);
             } else if verdict.granted() {
-                self.dedup_denied_by_leg.fetch_add(1, Relaxed);
+                metrics::counter!(DEDUP_DENIED_BY_LEG).increment(1);
             } else {
-                self.dedup_denied_uncertified.fetch_add(1, Relaxed);
-                match verdict {
-                    DedupSkipVerdict::NeverCertified => &self.dedup_denied_never_certified,
-                    DedupSkipVerdict::FpMoved => &self.dedup_denied_fp_moved,
-                    DedupSkipVerdict::NoWindow => &self.dedup_denied_no_window,
-                    DedupSkipVerdict::Unresolved => &self.dedup_denied_unresolved,
+                metrics::counter!(DEDUP_DENIED_UNCERTIFIED).increment(1);
+                let name = match verdict {
+                    DedupSkipVerdict::NeverCertified => DEDUP_DENIED_NEVER_CERTIFIED,
+                    DedupSkipVerdict::FpMoved => DEDUP_DENIED_FP_MOVED,
+                    DedupSkipVerdict::NoWindow => DEDUP_DENIED_NO_WINDOW,
+                    DedupSkipVerdict::Unresolved => DEDUP_DENIED_UNRESOLVED,
                     // `Granted` is excluded by the branch above; it shares an arm
                     // rather than introducing a panic path on the scan hot path.
-                    DedupSkipVerdict::Disabled | DedupSkipVerdict::Granted => &self.dedup_denied_disabled,
-                }
-                .fetch_add(1, Relaxed);
+                    DedupSkipVerdict::Disabled | DedupSkipVerdict::Granted => DEDUP_DENIED_DISABLED,
+                };
+                metrics::counter!(name).increment(1);
             }
         }
         let by_source = match (has_mem, has_delta) {
-            (true, false) => Some(&self.scans_mem_only),
-            (false, true) => Some(&self.scans_delta_only),
-            (true, true) => Some(&self.scans_mem_plus_delta),
+            (true, false) => Some(SCANS_MEM_ONLY),
+            (false, true) => Some(SCANS_DELTA_ONLY),
+            (true, true) => Some(SCANS_MEM_PLUS_DELTA),
             (false, false) => None,
         };
-        let by_resolve = fast_resolve_hit.map(|hit| if hit { &self.fast_resolve_hits } else { &self.fast_resolve_misses });
-        for c in skipped_delta.then_some(&self.scans_skipped_delta).into_iter().chain(by_source).chain(by_resolve) {
-            c.fetch_add(1, Relaxed);
+        let by_resolve = fast_resolve_hit.map(|hit| if hit { FAST_RESOLVE_HITS } else { FAST_RESOLVE_MISSES });
+        for name in skipped_delta.then_some(SCANS_SKIPPED_DELTA).into_iter().chain(by_source).chain(by_resolve) {
+            metrics::counter!(name).increment(1);
         }
         metrics::histogram!("timefusion.scan.latency_seconds").record(duration_us as f64 / 1_000_000.0);
     }
@@ -349,10 +318,9 @@ impl ScanMetrics {
     /// the recorded dwell an upper bound on the true lifetime, which is the right
     /// direction: it cannot make persistence look better than it is.
     pub fn record_cert_dwell(&self, since: std::time::Instant) {
-        use std::sync::atomic::Ordering::Relaxed;
         let secs = since.elapsed().as_secs();
-        self.cert_dwell_total.fetch_add(1, Relaxed);
-        self.cert_dwell_secs_total.fetch_add(secs, Relaxed);
+        metrics::counter!(scan_metric_names::CERT_DWELL_TOTAL).increment(1);
+        metrics::counter!(scan_metric_names::CERT_DWELL_SECS_TOTAL).increment(secs);
         metrics::histogram!("timefusion.cert.dwell_seconds").record(secs as f64);
     }
 
@@ -365,8 +333,7 @@ impl ScanMetrics {
     /// Record a pgwire end-to-end query duration. Cheap on hot path — a
     /// counter bump and one histogram record.
     pub fn record_pgwire_query(&self, duration_us: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.pgwire_total.fetch_add(1, Relaxed);
+        metrics::counter!(scan_metric_names::PGWIRE_TOTAL).increment(1);
         metrics::histogram!("timefusion.pgwire.query_latency_seconds").record(duration_us as f64 / 1_000_000.0);
     }
 
@@ -4862,7 +4829,7 @@ impl Database {
                 .collect();
             evicted += doomed.iter().filter_map(|key| self.delta_provider_cache.remove(key)).map(|(_, entry)| entry.len()).sum::<usize>();
         }
-        self.scan_metrics.provider_cache_evictions.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
+        metrics::counter!(scan_metric_names::PROVIDER_CACHE_EVICTIONS).increment(evicted as u64);
     }
 
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
@@ -8059,9 +8026,9 @@ impl ProjectRoutingTable {
             }
         };
         if was_fresh_cell || !cell.initialized() {
-            self.database.scan_metrics.provider_cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::counter!(scan_metric_names::PROVIDER_CACHE_MISSES).increment(1);
         } else {
-            self.database.scan_metrics.provider_cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::counter!(scan_metric_names::PROVIDER_CACHE_HITS).increment(1);
         }
         // Soft-limit warning on the brand-new-entry path — mirrors the
         // fast_resolve_cache logic. Threshold-multiple cadence keeps log
@@ -8105,8 +8072,8 @@ impl ProjectRoutingTable {
                 } else {
                     table.table_provider().with_pushdown_with_deletion_vectors(true).await
                 };
-                self.database.scan_metrics.provider_build_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.database.scan_metrics.provider_build_us_total.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                metrics::counter!(scan_metric_names::PROVIDER_BUILD_TOTAL).increment(1);
+                metrics::counter!(scan_metric_names::PROVIDER_BUILD_US_TOTAL).increment(started.elapsed().as_micros() as u64);
                 result.map_err(|e| DataFusionError::External(Box::new(e)))
             })
             .await?
@@ -8119,7 +8086,7 @@ impl ProjectRoutingTable {
         if let Some(current_entry) = self.database.delta_provider_cache.get(&cache_key)
             && !current_entry.holds(&cell)
         {
-            self.database.scan_metrics.provider_build_abandoned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::counter!(scan_metric_names::PROVIDER_BUILD_ABANDONED).increment(1);
         }
 
         self.scan_via_provider(provider, state, projection, filters, limit).await
@@ -8247,8 +8214,8 @@ impl ProjectRoutingTable {
 
         let started = std::time::Instant::now();
         let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await;
-        self.database.scan_metrics.provider_scan_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.database.scan_metrics.provider_scan_us_total.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        metrics::counter!(scan_metric_names::PROVIDER_SCAN_TOTAL).increment(1);
+        metrics::counter!(scan_metric_names::PROVIDER_SCAN_US_TOTAL).increment(started.elapsed().as_micros() as u64);
         let delta_plan = delta_plan?;
 
         // Determine target schema based on projection
@@ -8314,7 +8281,7 @@ impl ProjectRoutingTable {
         if let Some((files, bytes)) = selected
             && bytes > Self::WIDE_SCAN_OVERSIZE_BYTES
         {
-            self.database.scan_metrics.wide_scan_oversize_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::counter!(scan_metric_names::WIDE_SCAN_OVERSIZE_TOTAL).increment(1);
             warn!(
                 event = "wide_scan_oversize",
                 table.name = %self.table_name,
@@ -8865,7 +8832,7 @@ impl ExecutionPlan for GatedScanExec {
                 if let Some(m) = &metrics {
                     m.decode_begin();
                     if want > DECODE_UNITS_PER_READER {
-                        m.decode_pressure_throttled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::counter!(scan_metric_names::DECODE_PRESSURE_THROTTLED).increment(1);
                     }
                 }
                 // The object-store fetches for this batch happen inside the
@@ -9060,11 +9027,11 @@ impl TableProvider for ProjectRoutingTable {
             match self.database.config.core.timefusion_otel_scan_guard {
                 config::OtelScanGuard::Off => {}
                 config::OtelScanGuard::Observe => {
-                    scan_metrics.bounded_otel_scan_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::counter!(scan_metric_names::BOUNDED_OTEL_SCAN_CANDIDATES).increment(1);
                     warn!(event = "otel_scan_guard_candidate", table.name = %self.table_name, reason, "raw OTel scan would be rejected");
                 }
                 config::OtelScanGuard::Enforce => {
-                    scan_metrics.bounded_otel_scan_rejections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::counter!(scan_metric_names::BOUNDED_OTEL_SCAN_REJECTIONS).increment(1);
                     return Err(DataFusionError::Plan("raw OTel queries require project_id = <value> and a timestamp lower bound or LIMIT".to_string()));
                 }
             }
@@ -9588,8 +9555,8 @@ impl TableProvider for ProjectRoutingTable {
             warn!("Failed to query mem buffer: {}", e);
             Default::default()
         });
-        scan_metrics.mem_plan_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        scan_metrics.mem_plan_us_total.fetch_add(mem_plan_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        metrics::counter!(scan_metric_names::MEM_PLAN_TOTAL).increment(1);
+        metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
         let mem_partitions = mem_leg.partitions;
 
         // Hot-tier third leg (P1) — see `HotTier::scan` for the coverage
@@ -9615,8 +9582,8 @@ impl TableProvider for ProjectRoutingTable {
             true => Default::default(),
             false => layer.hot_tier().scan(&project_id, &self.table_name, query_time_range, &mem_ranges, &optimized_filters, &self.schema, projection),
         };
-        scan_metrics.hot_plan_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        scan_metrics.hot_plan_us_total.fetch_add(hot_plan_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        metrics::counter!(scan_metric_names::HOT_PLAN_TOTAL).increment(1);
+        metrics::counter!(scan_metric_names::HOT_PLAN_US_TOTAL).increment(hot_plan_started.elapsed().as_micros() as u64);
         let (hot_plan, hot_ranges, version_gate) = (hot.plan, hot.ranges, hot.version_gate);
 
         // Nothing above Delta to union with: query Delta alone.
@@ -11570,6 +11537,7 @@ mod tests {
         use arrow::array::Int32Array;
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
         use std::sync::atomic::Ordering::Relaxed;
+        crate::observability::init_local_metrics_for_test();
         let schema = Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from((0..512).collect::<Vec<i32>>()))]).unwrap();
         let want = batch.get_array_memory_size() as u64;
@@ -11585,10 +11553,10 @@ mod tests {
         }
 
         assert_eq!(rows, 1024, "gating must not drop batches");
-        assert_eq!(metrics.decode_bytes_total.load(Relaxed), want * 2, "both decoded batches must be accounted");
-        assert_eq!(metrics.decode_peak_batch_bytes.load(Relaxed), want);
-        assert_eq!(metrics.decode_polls_inflight.load(Relaxed), 0, "in-flight gauge must return to zero");
-        assert_eq!(metrics.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
+        assert_eq!(crate::observability::counter_value(scan_metric_names::DECODE_BYTES_TOTAL), want * 2, "both decoded batches must be accounted");
+        assert_eq!(metrics.decode.decode_peak_batch_bytes.load(Relaxed), want);
+        assert_eq!(metrics.decode.decode_polls_inflight.load(Relaxed), 0, "in-flight gauge must return to zero");
+        assert_eq!(metrics.decode.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
     }
 
     /// The 2026-08-16 coordinator handover skipped rollup-declared tables in the dedup cron with a

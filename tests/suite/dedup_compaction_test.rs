@@ -12,7 +12,8 @@ use datafusion::arrow::{
 };
 use serial_test::serial;
 use timefusion::{
-    database::Database,
+    database::{Database, scan_metric_names},
+    observability::{counter_value, init_local_metrics_for_test},
     support::test_helpers::{BufferMode, TestConfigBuilder, array_get_str, delta_physical_row_count, json_to_batch, test_span_ts},
 };
 
@@ -2497,6 +2498,7 @@ async fn backfill_covers_sealed_days_and_legacy_coverage_falls_back_after_restar
 #[serial]
 #[tokio::test]
 async fn a_certification_survives_a_restart_and_still_grants_the_skip() -> Result<()> {
+    init_local_metrics_for_test();
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     let cfg = {
         let mut cfg = (*TestConfigBuilder::new("cert_restart").with_buffer_mode(BufferMode::Enabled).build()).clone();
@@ -2518,17 +2520,17 @@ async fn a_certification_survives_a_restart_and_still_grants_the_skip() -> Resul
         db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
         let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
         db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
-        assert_eq!(db.scan_metrics.cert_granted_total.load(std::sync::atomic::Ordering::Relaxed), 1, "the sweep must certify before a restart can carry it");
+        assert_eq!(counter_value(scan_metric_names::CERT_GRANTED_TOTAL), 1, "the sweep must certify before a restart can carry it");
     }
 
     // A brand-new Database over the same data dir — a deploy, in miniature. Its
     // `dedup_clean_fp` starts empty and is filled only from what was persisted.
     let db = Arc::new(Database::with_config(cfg).await?);
     db.query_delta_only(&sql).await?; // warm `try_fast_resolve`; cold it declines as Unresolved
-    let before = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed);
+    let before = counter_value(scan_metric_names::DEDUP_SKIPPED);
     db.query_delta_only(&sql).await?;
     assert_eq!(
-        db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed) - before,
+        counter_value(scan_metric_names::DEDUP_SKIPPED) - before,
         1,
         "the reloaded certification must grant the skip; a fresh process swept nothing"
     );
@@ -2549,6 +2551,7 @@ async fn a_certification_survives_a_restart_and_still_grants_the_skip() -> Resul
 #[serial]
 #[tokio::test]
 async fn a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit() -> Result<()> {
+    init_local_metrics_for_test();
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     let mut cfg = (*TestConfigBuilder::new("dedup_confirming_pass").with_buffer_mode(BufferMode::Enabled).build()).clone();
     cfg.maintenance.timefusion_read_dedup_skip_swept = true;
@@ -2565,7 +2568,7 @@ async fn a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit() 
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-    let certs = || db.scan_metrics.cert_granted_total.load(std::sync::atomic::Ordering::Relaxed);
+    let certs = || counter_value(scan_metric_names::CERT_GRANTED_TOTAL);
 
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
     assert_eq!(certs(), 0, "a pass that rewrites must not certify what it just rewrote");
@@ -2589,6 +2592,7 @@ async fn a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit() 
 #[serial]
 #[tokio::test]
 async fn a_denied_skip_says_whether_it_was_never_certified_or_written_to_since() -> Result<()> {
+    init_local_metrics_for_test();
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     let mut cfg = (*TestConfigBuilder::new("dedup_denial_split").with_buffer_mode(BufferMode::Enabled).build()).clone();
     cfg.maintenance.timefusion_read_dedup_skip_swept = true;
@@ -2610,10 +2614,13 @@ async fn a_denied_skip_says_whether_it_was_never_certified_or_written_to_since()
         ts - 1,
         ts + 1_000
     );
-    let m = Arc::clone(&db.scan_metrics);
     let counts = || {
-        use std::sync::atomic::Ordering::Relaxed;
-        (m.dedup_denied_never_certified.load(Relaxed), m.dedup_denied_fp_moved.load(Relaxed), m.dedup_skipped.load(Relaxed), m.cert_dwell_total.load(Relaxed))
+        (
+            counter_value(scan_metric_names::DEDUP_DENIED_NEVER_CERTIFIED),
+            counter_value(scan_metric_names::DEDUP_DENIED_FP_MOVED),
+            counter_value(scan_metric_names::DEDUP_SKIPPED),
+            counter_value(scan_metric_names::CERT_DWELL_TOTAL),
+        )
     };
     // Warm `try_fast_resolve` first: cold, the skip declines as `Unresolved`
     // before it ever consults a certification, and every assertion below reads
@@ -2663,6 +2670,7 @@ async fn a_denied_skip_says_whether_it_was_never_certified_or_written_to_since()
 #[serial]
 #[tokio::test]
 async fn an_uncertified_window_is_never_granted_the_dedup_skip() -> Result<()> {
+    init_local_metrics_for_test();
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     let mut cfg = (*TestConfigBuilder::new("dedup_empty_window").with_buffer_mode(BufferMode::Enabled).build()).clone();
     cfg.maintenance.timefusion_read_dedup_skip_swept = true;
@@ -2683,9 +2691,9 @@ async fn an_uncertified_window_is_never_granted_the_dedup_skip() -> Result<()> {
     // Warm `try_fast_resolve`: cold, the skip declines as `Unresolved` before it
     // reaches the verdict this test is about.
     db.query_delta_only(&sql).await?;
-    let before = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed);
+    let before = counter_value(scan_metric_names::DEDUP_SKIPPED);
     db.query_delta_only(&sql).await?;
-    let skipped = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let skipped = counter_value(scan_metric_names::DEDUP_SKIPPED) - before;
 
     assert_eq!(skipped, 0, "a window that certified nothing must not be granted the skip — that is granting from an absence of evidence");
     Ok(())
@@ -2704,6 +2712,7 @@ async fn an_uncertified_window_is_never_granted_the_dedup_skip() -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
+    init_local_metrics_for_test();
     const DUPLICATED: usize = 250;
     const UNIQUE: usize = 120;
     let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
@@ -2752,10 +2761,10 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
         // skip. Three earlier attempts at a skip test were green against broken
         // code for exactly this reason.
         db.query_delta_only(&sql).await?;
-        let before = db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed);
+        let before = counter_value(scan_metric_names::DEDUP_SKIPPED);
         let batches = db.query_delta_only(&sql).await?;
         let n = batches.iter().map(|b| b.num_rows()).sum::<usize>() as i64;
-        anyhow::Ok((n, db.scan_metrics.dedup_skipped.load(std::sync::atomic::Ordering::Relaxed) - before))
+        anyhow::Ok((n, counter_value(scan_metric_names::DEDUP_SKIPPED) - before))
     };
 
     let (authoritative, control_skips) = run(false, "count_parity_dedup_on").await?;

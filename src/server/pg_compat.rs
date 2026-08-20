@@ -1140,20 +1140,24 @@ impl StatsTableProvider {
         });
 
         let scan = self.scan_metrics.as_ref().map_or_else(Vec::new, |m| {
-            let (total, skipped) = (m.scans_total.load(Relaxed), m.scans_skipped_delta.load(Relaxed));
-            let (fr_hits, fr_misses) = (m.fast_resolve_hits.load(Relaxed), m.fast_resolve_misses.load(Relaxed));
-            let (dedup_elig, dedup_skipped) = (m.dedup_eligible_scans.load(Relaxed), m.dedup_skipped.load(Relaxed));
-            let (cert_never, cert_moved) = (m.dedup_denied_never_certified.load(Relaxed), m.dedup_denied_fp_moved.load(Relaxed));
-            let cert_dwells = m.cert_dwell_total.load(Relaxed);
-            let (pc_hits, pc_misses) = (m.provider_cache_hits.load(Relaxed), m.provider_cache_misses.load(Relaxed));
-            let provider_builds = m.provider_build_total.load(Relaxed);
-            let provider_scans = m.provider_scan_total.load(Relaxed);
-            let mem_plans = m.mem_plan_total.load(Relaxed);
-            let hot_plans = m.hot_plan_total.load(Relaxed);
+            use crate::database::scan_metric_names::*;
+            let cv = crate::observability::counter_value;
+            let (total, skipped) = (cv(SCANS_TOTAL), cv(SCANS_SKIPPED_DELTA));
+            let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
+            let (dedup_elig, dedup_skipped) = (cv(DEDUP_ELIGIBLE_SCANS), cv(DEDUP_SKIPPED));
+            let (cert_never, cert_moved) = (cv(DEDUP_DENIED_NEVER_CERTIFIED), cv(DEDUP_DENIED_FP_MOVED));
+            let cert_dwells = cv(CERT_DWELL_TOTAL);
+            let (pc_hits, pc_misses) = (cv(PROVIDER_CACHE_HITS), cv(PROVIDER_CACHE_MISSES));
+            let provider_builds = cv(PROVIDER_BUILD_TOTAL);
+            let provider_scans = cv(PROVIDER_SCAN_TOTAL);
+            let mem_plans = cv(MEM_PLAN_TOTAL);
+            let hot_plans = cv(HOT_PLAN_TOTAL);
             // Parquet decode heap — the largest consumer outside every budget.
             // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
             // concurrent decode heap, which is what a Transient budget must cover.
-            let (dpeak, dinflight_peak) = (m.decode_peak_batch_bytes.load(Relaxed), m.decode_polls_inflight_peak.load(Relaxed));
+            // High-water marks stay hand-rolled atomics (`m.decode`) — `metrics::Gauge`
+            // has no `fetch_max` equivalent, see `DecodeGauges`.
+            let (dpeak, dinflight_peak) = (m.decode.decode_peak_batch_bytes.load(Relaxed), m.decode.decode_polls_inflight_peak.load(Relaxed));
             // The number the OOM killer acts on, live: without this the only
             // record of a memory climb is the kernel's post-mortem kill line.
             let (used, limit) =
@@ -1171,25 +1175,25 @@ impl StatsTableProvider {
                     "query_pool_pct" => if pool_size > 0 { pool_used * 100 / pool_size } else { 0 },
                 ],
                 rows!["scan_decode";
-                    "bytes_total" => m.decode_bytes_total.load(Relaxed),
+                    "bytes_total" => cv(DECODE_BYTES_TOTAL),
                     "peak_batch_bytes" => dpeak,
-                    "polls_inflight" => m.decode_polls_inflight.load(Relaxed),
+                    "polls_inflight" => m.decode.decode_polls_inflight.load(Relaxed),
                     "polls_inflight_peak" => dinflight_peak,
-                    "pressure_throttled_total" => m.decode_pressure_throttled.load(Relaxed),
+                    "pressure_throttled_total" => cv(DECODE_PRESSURE_THROTTLED),
                     "worst_case_heap_mb" => mb(dpeak.saturating_mul(dinflight_peak) as f64),
                 ],
                 rows!["scan";
                     "total" => total,
                     "skipped_delta" => skipped,
                     "skipped_delta_pct" => pct(skipped, total),
-                    "mem_only" => m.scans_mem_only.load(Relaxed),
-                    "delta_only" => m.scans_delta_only.load(Relaxed),
-                    "mem_plus_delta" => m.scans_mem_plus_delta.load(Relaxed),
+                    "mem_only" => cv(SCANS_MEM_ONLY),
+                    "delta_only" => cv(SCANS_DELTA_ONLY),
+                    "mem_plus_delta" => cv(SCANS_MEM_PLUS_DELTA),
                     "dedup_eligible" => dedup_elig,
                     "dedup_skipped" => dedup_skipped,
                     "dedup_skipped_pct" => pct(dedup_skipped, dedup_elig),
-                    "dedup_denied_uncertified" => m.dedup_denied_uncertified.load(Relaxed),
-                    "dedup_denied_by_leg" => m.dedup_denied_by_leg.load(Relaxed),
+                    "dedup_denied_uncertified" => cv(DEDUP_DENIED_UNCERTIFIED),
+                    "dedup_denied_by_leg" => cv(DEDUP_DENIED_BY_LEG),
                     // The certification-survival split. `never_certified` is what a
                     // persistent/warmed `dedup_clean_fp` could convert; `fp_moved` is
                     // the irreducible floor (the partition genuinely changed), and
@@ -1200,12 +1204,12 @@ impl StatsTableProvider {
                     "dedup_denied_never_certified" => cert_never,
                     "dedup_denied_fp_moved" => cert_moved,
                     "dedup_denied_never_certified_pct" => pct(cert_never, cert_never + cert_moved),
-                    "dedup_denied_no_window" => m.dedup_denied_no_window.load(Relaxed),
-                    "dedup_denied_unresolved" => m.dedup_denied_unresolved.load(Relaxed),
-                    "dedup_denied_disabled" => m.dedup_denied_disabled.load(Relaxed),
-                    "cert_granted_total" => m.cert_granted_total.load(Relaxed),
+                    "dedup_denied_no_window" => cv(DEDUP_DENIED_NO_WINDOW),
+                    "dedup_denied_unresolved" => cv(DEDUP_DENIED_UNRESOLVED),
+                    "dedup_denied_disabled" => cv(DEDUP_DENIED_DISABLED),
+                    "cert_granted_total" => cv(CERT_GRANTED_TOTAL),
                     "cert_dwell_total" => cert_dwells,
-                    "cert_dwell_secs_avg" => avg(m.cert_dwell_secs_total.load(Relaxed), cert_dwells),
+                    "cert_dwell_secs_avg" => avg(cv(CERT_DWELL_SECS_TOTAL), cert_dwells),
                     "cert_dwell_p50_secs" => m.cert_dwell_percentile_secs(0.50),
                     "cert_dwell_p90_secs" => m.cert_dwell_percentile_secs(0.90),
                     "fast_resolve_hits" => fr_hits,
@@ -1213,19 +1217,19 @@ impl StatsTableProvider {
                     "fast_resolve_hit_pct" => pct(fr_hits, fr_hits + fr_misses),
                     "provider_cache_hits" => pc_hits,
                     "provider_cache_misses" => pc_misses,
-                    "provider_cache_evictions" => m.provider_cache_evictions.load(Relaxed),
+                    "provider_cache_evictions" => cv(PROVIDER_CACHE_EVICTIONS),
                     "provider_cache_hit_pct" => pct(pc_hits, pc_hits + pc_misses),
-                    "provider_build_abandoned" => m.provider_build_abandoned.load(Relaxed),
-                    "provider_build_us_avg" => avg(m.provider_build_us_total.load(Relaxed), provider_builds),
+                    "provider_build_abandoned" => cv(PROVIDER_BUILD_ABANDONED),
+                    "provider_build_us_avg" => avg(cv(PROVIDER_BUILD_US_TOTAL), provider_builds),
                     "provider_build_total" => provider_builds,
-                    "provider_scan_us_avg" => avg(m.provider_scan_us_total.load(Relaxed), provider_scans),
+                    "provider_scan_us_avg" => avg(cv(PROVIDER_SCAN_US_TOTAL), provider_scans),
                     "provider_scan_total" => provider_scans,
-                    "bounded_otel_scan_candidates" => m.bounded_otel_scan_candidates.load(Relaxed),
-                    "bounded_otel_scan_rejections" => m.bounded_otel_scan_rejections.load(Relaxed),
-                    "wide_scan_oversize_total" => m.wide_scan_oversize_total.load(Relaxed),
-                    "mem_plan_us_avg" => avg(m.mem_plan_us_total.load(Relaxed), mem_plans),
+                    "bounded_otel_scan_candidates" => cv(BOUNDED_OTEL_SCAN_CANDIDATES),
+                    "bounded_otel_scan_rejections" => cv(BOUNDED_OTEL_SCAN_REJECTIONS),
+                    "wide_scan_oversize_total" => cv(WIDE_SCAN_OVERSIZE_TOTAL),
+                    "mem_plan_us_avg" => avg(cv(MEM_PLAN_US_TOTAL), mem_plans),
                     "mem_plan_total" => mem_plans,
-                    "hot_plan_us_avg" => avg(m.hot_plan_us_total.load(Relaxed), hot_plans),
+                    "hot_plan_us_avg" => avg(cv(HOT_PLAN_US_TOTAL), hot_plans),
                     "hot_plan_total" => hot_plans,
                     "lat_p50_us_approx" => m.latency_percentile_us(0.50),
                     "lat_p95_us_approx" => m.latency_percentile_us(0.95),
@@ -1233,7 +1237,7 @@ impl StatsTableProvider {
                     "lat_p999_us_approx" => m.latency_percentile_us(0.999),
                 ],
                 rows!["pgwire";
-                    "queries_total" => m.pgwire_total.load(Relaxed),
+                    "queries_total" => cv(PGWIRE_TOTAL),
                     "lat_p50_us_approx" => m.pgwire_percentile_us(0.50),
                     "lat_p95_us_approx" => m.pgwire_percentile_us(0.95),
                     "lat_p99_us_approx" => m.pgwire_percentile_us(0.99),

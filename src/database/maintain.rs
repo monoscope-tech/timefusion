@@ -2514,7 +2514,7 @@ impl Database {
                 self.scan_metrics.record_cert_dwell(prev.since);
             }
             if prior.is_none() {
-                self.scan_metrics.cert_granted_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics::counter!(scan_metric_names::CERT_GRANTED_TOTAL).increment(1);
             }
             return Ok(Some(fp_post));
         }
