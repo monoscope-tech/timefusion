@@ -2356,3 +2356,55 @@ only logs when there is something to queue.
 
 **Still to confirm:** the 1h tier's oldest date moving back from 2026-07-25. The
 units are queued, not yet finished.
+
+## Part X — 2026-08-20 02:30: coverage goal MET; the gap moves to the read path
+
+`52e99aa` converged fast. The 1h tier went 22 days → **32 days, oldest 2026-07-20**,
+exactly matching the 1m tier, and:
+
+| | 01:38 | 02:34 |
+|---|---|---|
+| `rollup_min_contiguous_days` | 3 | **30** |
+| `rollup_median_contiguous_days` | 8 | **30** |
+
+`min = 30` means the WORST project has a full 30 contiguous days. That is the
+`CONTIGUITY_HORIZON_DAYS` target, hit exactly — the coverage half of the goal is done.
+
+### Coverage was necessary, not sufficient
+
+30d dashboard queries still hit the 60 s timeout. The decisive comparison:
+
+| path | window | time |
+|---|---|---|
+| direct scan of `..._1h_v2` | 14 days | **0.68 s**, 1,145 rows, plan = DataSource → Filter → Aggregate |
+| routed via `otel_logs_and_spans` | 14 days | **60 s timeout** |
+
+The rollup DATA can serve 30d in well under a second — the whole tier is 28 MB in
+611 files. The cost is entirely in the routed read path. Latency scales ~7 s per
+day of window, which is per-partition overhead, not data volume.
+
+`EXPLAIN ANALYZE` of a routed 2-day window shows a fully RAW plan:
+`DedupExec input_rows=10.70 M` over `SortPreservingMergeExec output_bytes=1274.7 MB`
+over `DeltaScanExec count_files_scanned=278`, `time_elapsed_scanning_total=29.64 s`.
+**Caveat: `EXPLAIN` does not exercise routing (already recorded as a trap), and
+EXPLAIN ANALYZE appears to bypass `DmlQueryPlanner` too — treat as indicative.**
+
+Two things it does establish on their own:
+1. **Recent partitions are fragmented enough to poison any raw leg** — 278 files
+   for two days (08-18/08-19). Hot packing is not keeping up with ingest on the
+   busiest tenants.
+2. **`DedupExec` is still in the plan**, which certification exists to remove.
+
+### Measurement discipline note
+
+I attributed "+84 full hits" to a single query. Wrong: `record_rollup_hit` fires
+once per plan, and prod serves live dashboard traffic continuously, so counter
+deltas cannot attribute a single statement. Any before/after around one query on
+a busy process is unusable. Use `EXPLAIN`-style per-plan evidence or a quiet
+instance instead.
+
+### Next
+1. Why a routed query still reads raw when coverage is complete — instrument the
+   hit/miss decision per plan rather than by counter delta.
+2. Hot-tail fragmentation: 08-18/08-19 at 250-460 files each.
+3. Certification, to drop `DedupExec` from the plan.
