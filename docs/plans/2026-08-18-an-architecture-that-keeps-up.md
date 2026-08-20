@@ -2712,3 +2712,52 @@ than option 1 and immune to the failure that option 1 risks.
 **Do not skip step 2.** The last three defects in this document were all "a
 predicate refuses for a reason the gauges do not show", and this hypothesis is
 one measurement away from being either a large simplification or a repeat.
+
+### Part XIV result — hypothesis REFUTED, and replaced by a precise rule
+
+Step 1 of the falsification ran. **The strong form ("tags are redundant with the
+journal") is wrong**, and the reason is a two-line asymmetry I had not noticed.
+
+**What step 1 established, and it is worth keeping:** no reader consults Delta
+tags. `rollup_slice_coverage` has exactly three writers — the live publish path,
+`recover_rollup_coverage` at boot, and two invalidating `retain`s — and the
+routing decision reads only that map. So tags reach routing through boot recovery
+and nowhere else. That much of the hypothesis survives, and it kills two of the
+three explanations offered for the prod evidence.
+
+**Where it breaks.** Boot recovery runs two passes that do *not* have the same
+precondition:
+
+| pass | requires |
+| --- | --- |
+| `published_rollups` | `state == Complete` **and `publication.is_some()`** |
+| tag-derived | `state == Complete` and an exact slice match — **publication irrelevant** |
+
+So the tag pass is not a subset of the journal pass. It is the **sole** coverage
+source for any slice that is `Complete` but carries no `publication` — and
+`publication` is cleared at several sites in `maintenance_coordinator.rs`
+(1256, 1380, 1820), including on the children `split_time_task` mints.
+
+That is exactly how untagged tier files produced `rollup_miss_not_built_total
++45` while the journal still "knew" the work was done. The prod evidence in the
+exclusion comment is correct, and my simplification would have re-broken coverage
+for precisely the split-heavy slices that dominate after the 87 k-unit explosion.
+
+**Consequence for the design.** Option 1 (compact tiers, rely on journal records)
+is **dead** — it silently drops coverage for publication-less Complete slices, and
+that class is common here rather than exotic. The remaining design is the one
+that was already the safe choice:
+
+> merge tier files only within a `(source, project, generation, fingerprint)`
+> group, and carry a **set** of `(slice_start, slice_end)` pairs on the merged
+> file — expanded by `recover_rollup_coverage` into one coverage entry per
+> original slice.
+
+Exact-match semantics are preserved per slice, `rollup_slice_complete` needs no
+change, and no coverage depends on a publication surviving.
+
+**Method note, since this is the third time it has paid.** The hypothesis was
+plausible, code-grounded, and would have been a large simplification. It was also
+wrong, and one grep for "who writes this map, who reads it" settled it before any
+code existed. *The cheap step is enumerating writers and readers; the expensive
+step is discovering the asymmetry after shipping.*
