@@ -44,7 +44,7 @@ impl Database {
         // out of the OCC retry loop below: the live file set only changes on a
         // *successful* commit, which returns.
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
-        let pre_uris: Option<std::collections::HashSet<String>> = track_files.then(|| all_uris.into_iter().collect());
+        let pre_uris: Option<HashSet<String>> = track_files.then(|| all_uris.into_iter().collect());
 
         // Keep the active partition at the light-compaction target. A single
         // day-sized file would make 1h and 3h predicates select the same file
@@ -281,9 +281,9 @@ impl Database {
     /// given dates only. URIs not matching any of `dates` are ignored. Every
     /// requested date gets an entry (possibly empty) so the idempotence guard
     /// can tell "no files" from "not looked at".
-    pub(crate) fn filesets_for_dates(uris: &[String], dates: &[chrono::NaiveDate]) -> HashMap<chrono::NaiveDate, std::collections::HashSet<String>> {
+    pub(crate) fn filesets_for_dates(uris: &[String], dates: &[chrono::NaiveDate]) -> HashMap<chrono::NaiveDate, HashSet<String>> {
         let markers: Vec<(chrono::NaiveDate, String)> = dates.iter().map(|d| (*d, format!("date={d}"))).collect();
-        let mut out: HashMap<chrono::NaiveDate, std::collections::HashSet<String>> = dates.iter().map(|d| (*d, std::collections::HashSet::new())).collect();
+        let mut out: HashMap<chrono::NaiveDate, HashSet<String>> = dates.iter().map(|d| (*d, HashSet::new())).collect();
         for uri in uris {
             if let Some((d, _)) = markers.iter().find(|(_, marker)| uri.contains(marker)) {
                 out.entry(*d).or_default().insert(uri.clone());
@@ -302,7 +302,7 @@ impl Database {
             .filter(|uri| uri.contains(&date_marker))
             .filter_map(|uri| path_partition_value(uri, "project_id"))
             .filter(|project_id| !project_id.is_empty())
-            .fold(std::collections::HashMap::<&str, usize>::new(), |mut counts, project_id| {
+            .fold(HashMap::<&str, usize>::new(), |mut counts, project_id| {
                 *counts.entry(project_id).or_default() += 1;
                 counts
             });
@@ -489,7 +489,7 @@ impl Database {
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let scope: Vec<String> = std::iter::once(format!("date={date}/")).chain(project_id.map(|pid| format!("project_id={pid}/"))).collect();
         let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
-        let pre_uris: Option<std::collections::HashSet<String>> =
+        let pre_uris: Option<HashSet<String>> =
             if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
         let mut scope_files = scoped_file_uris(&*table_ref.read().await, &scope).len();
         let (mut attempt, mut total_attempts) = (0usize, 0usize);
@@ -751,7 +751,7 @@ impl Database {
             let table = table_ref.read().await;
             (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store(), table.clone())
         };
-        let pre_uris: std::collections::HashSet<String> = file_uris(&table_clone);
+        let pre_uris: HashSet<String> = file_uris(&table_clone);
 
         let provider = deltalake::delta_datafusion::TableProviderBuilder::default()
             .with_log_store(log_store)
@@ -1082,7 +1082,7 @@ impl Database {
     /// exactly. Only valid when `timestamp` is a dedup key.
     pub(crate) async fn probe_dup_bins(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str,
-    ) -> Result<std::collections::HashSet<i64>> {
+    ) -> Result<HashSet<i64>> {
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
         let schema = schema_or_default(table_name);
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;

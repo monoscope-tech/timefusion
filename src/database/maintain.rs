@@ -2577,7 +2577,7 @@ impl Database {
     /// narrow overlay; any removal/rewrite declines. Filesystem IO is forbidden
     /// on this query path.
     pub(crate) fn logical_count_memory_for_files(
-        &self, project_id: &str, table_name: &str, date: &str, files: &std::collections::HashSet<String>,
+        &self, project_id: &str, table_name: &str, date: &str, files: &HashSet<String>,
     ) -> Option<(Arc<crate::read::LogicalCountIndex>, Vec<String>)> {
         let key = crate::read::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
         self.logical_count_cache.get_memory_appendable(&key, files)
@@ -2706,7 +2706,7 @@ impl Database {
         // in the table, so refuse publication and let the next miss rebuild.
         let current_files = {
             let table = table_ref.read().await;
-            Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?.1.into_iter().collect::<std::collections::HashSet<_>>()
+            Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?.1.into_iter().collect::<HashSet<_>>()
         };
         anyhow::ensure!(files.iter().all(|file| current_files.contains(file)), "logical-count partition was rewritten during build");
 
@@ -3316,7 +3316,7 @@ impl Database {
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, deadline: std::time::Instant,
     ) -> Vec<(String, String, i64)> {
         use std::sync::atomic::Ordering::Relaxed;
-        let mut groups: std::collections::HashMap<(String, String), Vec<i64>> = Default::default();
+        let mut groups: HashMap<(String, String), Vec<i64>> = Default::default();
         for (project, date, bin) in &ready {
             groups.entry((project.clone(), date.clone())).or_default().push(*bin);
         }
@@ -3350,7 +3350,7 @@ impl Database {
             budget_secs = deadline.saturating_duration_since(std::time::Instant::now()).as_secs(),
             event = "dedup_batch_probe_start"
         );
-        let clean: std::collections::HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
+        let clean: HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
             // What is left of the PHASE at the moment this probe starts, so the
             // waves behind the permit limit share one budget instead of each
             // claiming it whole. Zero left means this group was never examined:
@@ -4104,7 +4104,7 @@ impl Database {
         let (snapshot, log_store) = (Arc::new(staging_table.snapshot()?.snapshot().clone()), staging_table.log_store());
         // Map paths to Add actions in the SAME snapshot the scan reads, so the
         // Remove tombstones carry the exact fields of the files we rewrote.
-        let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
         let targets = dedup_adds_by_path(
             snapshot.log_data().iter().filter(|f| wanted.contains(f.path().as_ref())).map(|f| {
                 #[allow(deprecated)]
@@ -4563,7 +4563,7 @@ impl Database {
                 debug!("{engine} wave pre-commit refresh failed (attempt {}): {}", attempt + 1, e.message);
             }
             let mut new_table = { table_ref.read().await.clone() };
-            let live: std::collections::HashSet<String> = match new_table.snapshot() {
+            let live: HashSet<String> = match new_table.snapshot() {
                 Ok(s) => s.log_data().iter().map(|f| f.path().into_owned()).collect(),
                 Err(e) => {
                     drop(commit_guard);
@@ -4612,7 +4612,7 @@ impl Database {
             // its rows. Land only a target-disjoint subset per wave; failed
             // units are requeued and will re-plan from the replacement file on
             // the next tick. This is also required for Delta action validity.
-            let mut claimed_targets = std::collections::HashSet::new();
+            let mut claimed_targets = HashSet::new();
             let (fresh, overlapping): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|bin| {
                 if bin.target_paths.iter().any(|path| claimed_targets.contains(path)) {
                     false
@@ -4631,7 +4631,7 @@ impl Database {
                 return WaveResult { landed: carried, failed };
             }
             let actions: Vec<Action> = fresh.iter().flat_map(|b| b.removes.iter().chain(b.adds.iter()).cloned()).collect();
-            let pre_uris: Option<std::collections::HashSet<String>> = track_files.then(|| scoped_file_uris(&new_table, &markers).into_iter().collect());
+            let pre_uris: Option<HashSet<String>> = track_files.then(|| scoped_file_uris(&new_table, &markers).into_iter().collect());
             let partitions = schema_or_default(table_name).partitions.clone();
             let op = wave_operation(data_change, self.config.maintenance.timefusion_light_optimize_target_size, (!partitions.is_empty()).then_some(partitions));
             let snapshot_ref = match new_table.snapshot() {
@@ -4923,7 +4923,7 @@ impl Database {
             let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             std::fs::read_to_string(self.staged_intent_path()).ok()?
         };
-        let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
         // Set equality, not order: the bin is a SET of inputs, and admission may
         // legitimately hand them over in a different order than last time.
         let candidates: Vec<StagedIntent> = parse_staged_intents(&contents)
@@ -4936,13 +4936,13 @@ impl Database {
         }
         // Only the paths in play — the snapshot holds ~26k files and this must
         // not parse every one of their stats blobs.
-        let interest: std::collections::HashSet<&str> =
+        let interest: HashSet<&str> =
             candidates.iter().flat_map(|e| e.target_paths.iter().chain(e.adds.iter().map(|a| &a.path))).map(String::as_str).collect();
         let (live, target_adds, store) = {
             let table = table_ref.read().await;
             let snapshot = table.snapshot().ok()?;
-            let mut live: std::collections::HashMap<String, Option<i64>> = std::collections::HashMap::new();
-            let mut target_adds: std::collections::HashMap<String, deltalake::kernel::Add> = std::collections::HashMap::new();
+            let mut live: HashMap<String, Option<i64>> = HashMap::new();
+            let mut target_adds: HashMap<String, deltalake::kernel::Add> = HashMap::new();
             for file in snapshot.log_data().iter() {
                 let file_path = file.path().into_owned();
                 if !interest.contains(file_path.as_str()) {
@@ -4959,7 +4959,7 @@ impl Database {
             }
             (live, target_adds, table.log_store().object_store(None))
         };
-        let live_view: std::collections::HashMap<&str, Option<i64>> = live.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let live_view: HashMap<&str, Option<i64>> = live.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let now_secs = crate::support::now_secs();
         let stats = crate::observability::maintenance_stats();
         for entry in &candidates {
@@ -5047,7 +5047,7 @@ impl Database {
                 warn!("staged-intent reconcile skipped for '{table_name}': no snapshot loaded");
                 return;
             };
-            (snapshot.log_data().iter().map(|f| f.path().into_owned()).collect::<std::collections::HashSet<String>>(), table.log_store().object_store(None))
+            (snapshot.log_data().iter().map(|f| f.path().into_owned()).collect::<HashSet<String>>(), table.log_store().object_store(None))
         };
         let now_secs = crate::support::now_secs();
         let orphans = staged_orphan_deletions(&entries, table_name, now_secs, &referenced);
@@ -5255,7 +5255,7 @@ impl Database {
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let (pid_marker, date_marker) = (format!("project_id={project_id}/"), format!("date={today}/"));
         let scope = [pid_marker.as_str(), date_marker.as_str()];
-        let pre_uris: Option<std::collections::HashSet<String>> =
+        let pre_uris: Option<HashSet<String>> =
             if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
         for attempt in 0..MAX_RETRIES {
             let table_clone = {
@@ -5590,7 +5590,7 @@ impl Database {
         let table_ref = self.get_or_create_table(project_id, table_name).await?;
         let bogus = deltalake::kernel::Action::Add(deltalake::kernel::Add {
             path: "project_id=nope/date=1970-01-01/part-never-committed.parquet".to_string(),
-            partition_values: std::collections::HashMap::new(),
+            partition_values: HashMap::new(),
             size: 1,
             modification_time: 0,
             data_change: true,

@@ -361,7 +361,7 @@ pub type CustomProjectTables = Arc<RwLock<HashMap<(String, String), Arc<RwLock<D
 
 // Per-table (keyed by storage URL), per-date set of live file URIs at the last
 // successful z-order optimize. Backs the ZOrder idempotence guard.
-type ZOrderFilesets = Arc<RwLock<HashMap<String, HashMap<chrono::NaiveDate, std::collections::HashSet<String>>>>>;
+type ZOrderFilesets = Arc<RwLock<HashMap<String, HashMap<chrono::NaiveDate, HashSet<String>>>>>;
 /// Per-(project_id, table_name) DML serialization mutexes — see `Database::dml_lock`.
 type DmlLocks = Arc<dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
 
@@ -561,12 +561,9 @@ pub(crate) async fn ensure_table_properties(table: DeltaTable, desired: HashMap<
 /// Whether `uri` belongs to a partition no older than `cutoff` (inclusive).
 /// Parses the `date=YYYY-MM-DD` Hive partition segment; if absent or
 /// unparseable, returns `true` (warm rather than silently skip a file we can't
-/// classify). A `None` cutoff means "no recency limit".
-fn within_recency(uri: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
-    // Single source of truth for `date=` partition recency parsing, shared with
-    // the object-store cache admission window.
-    crate::storage::date_partition_within(uri, cutoff)
-}
+/// classify). A `None` cutoff means "no recency limit". Single source of truth,
+/// shared with the object-store cache admission window.
+use crate::storage::date_partition_within as within_recency;
 
 /// Whether `uri`'s `date=YYYY-MM-DD` Hive partition overlaps the `[lo, hi]`
 /// microsecond window, at day granularity. Absent/unparseable date ⇒ `true`
@@ -911,7 +908,7 @@ const MAINTENANCE_MAX_PARTITIONS: usize = 2;
 /// poison is. Empty string sorts last, which is the right default for a path
 /// that carries no date.
 fn repair_bin_date(files: &[String]) -> &str {
-    files.first().and_then(|p| p.split('/').find_map(|seg| seg.strip_prefix("date="))).unwrap_or("")
+    files.first().and_then(|p| path_partition_value(p, "date")).unwrap_or("")
 }
 
 /// The value of one Hive-style `key=value` path segment, or `None` if the
@@ -1327,7 +1324,7 @@ fn wal_topic(project_id: &str, table_name: &str) -> String {
 /// are dropped silently — schema-evolution-friendly: future writers can add
 /// fields without breaking older readers.
 fn parse_watermark_from_json(
-    info: &std::collections::HashMap<String, serde_json::Value>, shards: usize, project_id: &str, table_name: &str,
+    info: &HashMap<String, serde_json::Value>, shards: usize, project_id: &str, table_name: &str,
 ) -> Vec<Option<walrus_rust::WalPosition>> {
     let mut out = vec![None; shards];
     let Some(wm) = info.get(WAL_WATERMARK_KEY).and_then(|v| v.as_object()) else {
@@ -1369,7 +1366,7 @@ fn parse_watermark_from_json(
 /// Used during startup to compute the cursor each shard should sit at to
 /// be consistent with all recent Delta commits.
 fn max_watermark_across_commits<'a>(
-    commit_infos: impl IntoIterator<Item = &'a std::collections::HashMap<String, serde_json::Value>>, shards: usize, project_id: &str, table_name: &str,
+    commit_infos: impl IntoIterator<Item = &'a HashMap<String, serde_json::Value>>, shards: usize, project_id: &str, table_name: &str,
 ) -> Vec<Option<walrus_rust::WalPosition>> {
     commit_infos.into_iter().fold(vec![None; shards], |acc, info| {
         acc.into_iter()
@@ -1444,7 +1441,7 @@ fn scoped_file_uris(table: &DeltaTable, scope: &[&str]) -> Vec<String> {
 
 /// `table.get_file_uris()`, collected into `C` — empty on an unloaded snapshot,
 /// matching every existing `unwrap_or_default()` call site.
-pub(crate) fn file_uris<C: Default + FromIterator<String>>(table: &DeltaTable) -> C {
+pub fn file_uris<C: Default + FromIterator<String>>(table: &DeltaTable) -> C {
     table.get_file_uris().map(Iterator::collect).unwrap_or_default()
 }
 
@@ -1887,7 +1884,7 @@ fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake:
 /// `targets.len()` against the distinct files they mean to rewrite, so a duplicate silently
 /// mismatches the plan and stalls compaction.
 fn dedup_adds_by_path(adds: impl Iterator<Item = deltalake::kernel::Add>, table_name: &str) -> Vec<deltalake::kernel::Add> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut total = 0usize;
     let out: Vec<deltalake::kernel::Add> = adds.inspect(|_| total += 1).filter(|add| seen.insert(add.path.clone())).collect();
     let dropped = total - out.len();
@@ -3289,7 +3286,7 @@ impl Database {
         let mut result: HashMap<String, Vec<String>> = HashMap::with_capacity(by_pid.len());
         for (pid, mut uris) in by_pid {
             let manifest = crate::tantivy::load_manifest(svc.object_store.as_ref(), table_name, &pid).await?;
-            let covered: std::collections::HashSet<&String> =
+            let covered: HashSet<&String> =
                 manifest.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
             uris.retain(|uri| !covered.contains(uri));
             if max_bytes > 0 {
@@ -3479,7 +3476,7 @@ impl Database {
         // day with 4 rows. A project with no rows in the window can be dropped
         // safely: its rollup rows for that range are equally empty, so it
         // contributes nothing to the leg either way.
-        let window_dates: std::collections::HashSet<String> = dates.iter().map(chrono::NaiveDate::to_string).collect();
+        let window_dates: HashSet<String> = dates.iter().map(chrono::NaiveDate::to_string).collect();
         let projects: Vec<String> = match &route.project_id {
             Some(project) => vec![project.clone()],
             None => {
@@ -4725,7 +4722,7 @@ impl Database {
     /// Snapshot of the custom-storage (project, table) keys — one lock
     /// acquisition for callers that need many membership checks (the
     /// coalescer's fold pass). Custom storage is rare, so the clone is tiny.
-    pub(crate) async fn custom_storage_keys(&self) -> std::collections::HashSet<(String, String)> {
+    pub(crate) async fn custom_storage_keys(&self) -> HashSet<(String, String)> {
         self.storage_configs.read().await.keys().cloned().collect()
     }
 
@@ -5520,13 +5517,13 @@ impl Database {
     /// diffed against an unscoped live set would warm every other partition. Both optimize paths
     /// — full Z-order and light — funnel through here so warm/evict cannot drift between them.
     async fn swap_and_refresh_cache(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, new_table: DeltaTable, pre_uris: Option<&std::collections::HashSet<String>>, scope: &[&str],
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, new_table: DeltaTable, pre_uris: Option<&HashSet<String>>, scope: &[&str],
     ) -> Vec<String> {
         // Capture live URIs off `new_table` *before* the swap moves it in.
         let live_uris: Vec<String> = scoped_file_uris(&new_table, scope);
         let (added, removed): (Vec<String>, Vec<String>) = match pre_uris {
             Some(pre) => {
-                let live_set: std::collections::HashSet<&str> = live_uris.iter().map(String::as_str).collect();
+                let live_set: HashSet<&str> = live_uris.iter().map(String::as_str).collect();
                 (live_uris.iter().filter(|u| !pre.contains(*u)).cloned().collect(), pre.iter().filter(|u| !live_set.contains(u.as_str())).cloned().collect())
             }
             None => (Vec::new(), Vec::new()),
@@ -6351,7 +6348,7 @@ fn parse_staged_intents(contents: &str) -> Vec<StagedIntent> {
 /// left for its own wave commit, the next boot, or VACUUM.
 const STAGED_INTENT_MIN_AGE_SECS: u64 = 30 * 60;
 
-fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs: u64, referenced: &std::collections::HashSet<String>) -> Vec<String> {
+fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs: u64, referenced: &HashSet<String>) -> Vec<String> {
     entries
         .iter()
         .filter(|e| e.table_name == table_name)
@@ -6388,7 +6385,7 @@ enum ResumeVerdict {
 /// `live` maps every path in the current snapshot to its `numRecords`
 /// (`None` = the Add carries no stats, which makes row preservation
 /// unverifiable and is therefore never committable).
-fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: &std::collections::HashMap<&str, Option<i64>>) -> ResumeVerdict {
+fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<i64>>) -> ResumeVerdict {
     // Same age gate, same reason, as `staged_orphan_deletions`: on an
     // overlapping rolling deploy a still-running instance may be mid-staging,
     // and committing its half-written output is exactly the hazard.
@@ -7252,7 +7249,7 @@ mod repair_batch_tests {
 /// blast radius identical to the per-bin path (the dropped bin's files are just
 /// re-selected next tick). Pure + generic so the wave-assembly test needs no
 /// object store.
-fn split_live_bins<T>(bins: Vec<T>, targets: impl Fn(&T) -> &[String], live: &std::collections::HashSet<String>) -> (Vec<T>, Vec<T>) {
+fn split_live_bins<T>(bins: Vec<T>, targets: impl Fn(&T) -> &[String], live: &HashSet<String>) -> (Vec<T>, Vec<T>) {
     bins.into_iter().partition(|bin| targets(bin).iter().all(|t| live.contains(t)))
 }
 
@@ -7261,7 +7258,7 @@ fn split_live_bins<T>(bins: Vec<T>, targets: impl Fn(&T) -> &[String], live: &st
 /// garbage) from "my own earlier attempt landed and then errored" (staged
 /// parquet is LIVE DATA). See the self-landed split in `commit_wave`.
 /// A bin with no Adds can't have landed anything.
-fn bin_adds_live(bin: &StagedBin, live: &std::collections::HashSet<String>) -> bool {
+fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
     let mut adds = bin.adds.iter().filter_map(|a| match a {
         deltalake::kernel::Action::Add(add) => Some(add.path.as_str()),
         _ => None,
@@ -7565,7 +7562,7 @@ fn build_writer_properties(
     const BLOOM_NDV: u64 = 1_000_000;
 
     let sorting_columns_pq = schema.sorting_columns();
-    let sort_key_names: std::collections::HashSet<&str> = schema.sorting_columns.iter().map(|c| c.name.as_str()).collect();
+    let sort_key_names: HashSet<&str> = schema.sorting_columns.iter().map(|c| c.name.as_str()).collect();
 
     // Note: do NOT call `set_bloom_filter_fpp` at the global level — parquet-rs
     // treats any global bloom setter (other than `set_bloom_filter_enabled`)
@@ -7840,17 +7837,11 @@ impl ProjectRoutingTable {
             .collect();
 
         // Check if project_id filter is present
-        if !self.has_project_id_in_filters(&optimized_filters) {
+        if !crate::read::optimizers::ProjectIdPushdown::has_project_id_filter(&optimized_filters) {
             debug!("Query missing project_id filter - may scan all partitions");
         }
 
         Ok(optimized_filters)
-    }
-
-    /// Check if filters contain a project_id filter
-    fn has_project_id_in_filters(&self, filters: &[Expr]) -> bool {
-        use crate::read::optimizers::ProjectIdPushdown;
-        ProjectIdPushdown::has_project_id_filter(filters)
     }
 
     /// Create a MemorySourceConfig-based execution plan with multiple partitions.
@@ -7895,8 +7886,8 @@ impl ProjectRoutingTable {
     #[allow(clippy::too_many_arguments)]
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
-        include_files: Option<&std::collections::HashSet<String>>, exclude_files: Option<&std::collections::HashSet<String>>,
-        row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
+        include_files: Option<&HashSet<String>>, exclude_files: Option<&HashSet<String>>,
+        row_selections: Option<&HashMap<String, Vec<u64>>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Extract project_id from filters for the provider cache key.
         // Falls back to table_name-only key if absent (multi-project queries).
@@ -7923,7 +7914,7 @@ impl ProjectRoutingTable {
         // Row-selection pushdown: per-file matching ordinals keyed by rel path.
         // Purely narrowing — files without an entry scan normally — so unlike
         // `file_selection` an unmappable URI just drops that file's selection.
-        let ordinal_selections: std::collections::HashMap<String, Vec<u64>> = row_selections
+        let ordinal_selections: HashMap<String, Vec<u64>> = row_selections
             .into_iter()
             .flatten()
             .filter_map(|(uri, ords)| Some((crate::tantivy::search::parquet_rel_of_uri(uri)?.to_string(), ords.clone())))
@@ -8095,8 +8086,8 @@ impl ProjectRoutingTable {
     #[allow(clippy::too_many_arguments)]
     async fn scan_delta_with_tantivy(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>, id_filter: Option<&Expr>,
-        covered_files: Option<&std::collections::HashSet<String>>, zero_hit_files: Option<&std::collections::HashSet<String>>,
-        row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>, query_time_range: Option<(i64, i64)>,
+        covered_files: Option<&HashSet<String>>, zero_hit_files: Option<&HashSet<String>>,
+        row_selections: Option<&HashMap<String, Vec<u64>>>, query_time_range: Option<(i64, i64)>,
     ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
         let narrow = |filters: &[Expr]| filters.iter().cloned().chain(id_filter.cloned()).collect::<Vec<_>>();
         let Some(covered) = covered_files else {
@@ -8109,7 +8100,7 @@ impl ProjectRoutingTable {
             .get_file_uris()
             .map_err(|e| DataFusionError::External(Box::new(e)))?
             .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi));
-        let (mut indexed, raw): (std::collections::HashSet<String>, std::collections::HashSet<String>) = live.partition(|uri| covered.contains(uri));
+        let (mut indexed, raw): (HashSet<String>, HashSet<String>) = live.partition(|uri| covered.contains(uri));
         // Complete coverage keeps the established single-provider fast path.
         // The split is only needed when the exact snapshot has raw debt.
         if raw.is_empty() && !indexed.is_empty() {
@@ -8151,8 +8142,8 @@ impl ProjectRoutingTable {
         &self, state: &dyn Session, projection: Option<&Vec<usize>>, optimized_filters: &[Expr], unstripped_filters: &[Expr], project_id: &str,
         query_time_range: Option<(i64, i64)>, dedup_keys: &[String], pre_skip_dedup: bool, tombstone: &Option<String>, orig_limit: Option<usize>,
         limit: Option<usize>, readmit_mutable_filters: bool, tantivy_id_filter: Option<&Expr>,
-        tantivy_covered_files: Option<&std::collections::HashSet<String>>, tantivy_exclude: Option<&std::collections::HashSet<String>>,
-        tantivy_row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
+        tantivy_covered_files: Option<&HashSet<String>>, tantivy_exclude: Option<&HashSet<String>>,
+        tantivy_row_selections: Option<&HashMap<String, Vec<u64>>>,
     ) -> DFResult<(bool, Vec<Arc<dyn ExecutionPlan>>)> {
         let mut delta_only_filters = optimized_filters.to_vec();
         let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
@@ -8332,9 +8323,9 @@ impl ProjectRoutingTable {
     /// version from the input, and `keep-greatest` then returns the stale row. The filter must
     /// be `Unsupported` at the source so every version reaches `DedupExec` and the predicate
     /// runs above it. `None` for tables that append no versions.
-    fn version_mutable_columns(table_name: &str) -> Option<std::collections::HashSet<String>> {
+    fn version_mutable_columns(table_name: &str) -> Option<HashSet<String>> {
         let schema = crate::schema::get_schema(table_name).filter(|s| s.version_append)?;
-        let immutable: std::collections::HashSet<&str> =
+        let immutable: HashSet<&str> =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.partitions.iter().map(String::as_str)).collect();
         Some(schema.schema_ref().fields().iter().map(|f| f.name().clone()).filter(|n| !immutable.contains(n.as_str())).collect())
     }
@@ -8958,7 +8949,7 @@ impl TableProvider for ProjectRoutingTable {
         // Mark any filter that references a Variant column `Unsupported` so DataFusion
         // applies it via a FilterExec above the scan rather than pushing it into the
         // kernel. (Variant predicates can't prune row groups anyway.)
-        let variant_cols: std::collections::HashSet<String> = crate::schema::registry()
+        let variant_cols: HashSet<String> = crate::schema::registry()
             .get(&self.table_name)
             .map(|s| s.schema_ref().fields().iter().filter(|f| crate::schema::is_variant_type(f.data_type())).map(|f| f.name().clone()).collect())
             .unwrap_or_default();
@@ -9095,13 +9086,13 @@ impl TableProvider for ProjectRoutingTable {
         // id-set; uncovered files retain the original predicate and therefore
         // cannot lose rows. This turns coverage lag into bounded raw debt
         // instead of making one missing sidecar poison the whole query window.
-        let mut tantivy_covered_files: Option<std::collections::HashSet<String>> = None;
+        let mut tantivy_covered_files: Option<HashSet<String>> = None;
         // Files the prefilter proved hold no matches (zero-hit covering
         // index) — excluded from the Delta scan when file pruning is on.
-        let mut tantivy_exclude: Option<std::collections::HashSet<String>> = None;
+        let mut tantivy_exclude: Option<HashSet<String>> = None;
         // Per-file matching row ordinals (row-selection pushdown), for files
         // whose covering index was built in parquet row order.
-        let mut tantivy_row_selections: Option<std::collections::HashMap<String, Vec<u64>>> = None;
+        let mut tantivy_row_selections: Option<HashMap<String, Vec<u64>>> = None;
         if let Some(tree) = text_match_tree.as_ref()
             && let Some(svc) = self.database.tantivy_search()
         {
@@ -9111,11 +9102,11 @@ impl TableProvider for ProjectRoutingTable {
             let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
             crate::observability::record_tantivy_prefilter_attempt();
 
-            let mut delta_ids: Option<std::collections::HashSet<String>> = None;
+            let mut delta_ids: Option<HashSet<String>> = None;
             let mut delta_indexed_rows: u64 = 0;
-            let mut delta_covered: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut delta_zero_hit: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut delta_row_sel: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+            let mut delta_covered: HashSet<String> = HashSet::new();
+            let mut delta_zero_hit: HashSet<String> = HashSet::new();
+            let mut delta_row_sel: HashMap<String, Vec<u64>> = HashMap::new();
             let mut delta_field_gap = false;
             let mut delta_any_usable = false;
             let mut abort_reason: Option<&'static str> = None;
@@ -11916,7 +11907,7 @@ mod tests {
         use walrus_rust::WalPosition;
         let wm = vec![Some(WalPosition { block_id: 7, offset: 1024 }), None, Some(WalPosition { block_id: 9, offset: 0 }), None];
         let json = serialize_watermark_to_json(&wm, "p", "t");
-        let mut info = std::collections::HashMap::new();
+        let mut info = HashMap::new();
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
         let parsed = parse_watermark_from_json(&info, wm.len(), "p", "t");
         assert_eq!(parsed, wm);
@@ -11969,14 +11960,14 @@ mod tests {
         // to everyone (unattributable is indistinguishable from another tenant's,
         // and duplicates read-side dedup removes are preferable to loss).
         let busy = serialize_watermark_to_json(&vec![Some(WalPosition { block_id: 9_000, offset: 0 })], "busy_proj", "otel_logs_and_spans");
-        let mut info = std::collections::HashMap::new();
+        let mut info = HashMap::new();
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(busy));
         assert_eq!(parse_watermark_from_json(&info, 1, "busy_proj", "otel_logs_and_spans"), vec![Some(WalPosition { block_id: 9_000, offset: 0 })]);
         assert_eq!(parse_watermark_from_json(&info, 1, "quiet_proj", "otel_logs_and_spans"), vec![None], "co-tenant on the same log gets nothing");
         assert_eq!(parse_watermark_from_json(&info, 1, "busy_proj", "otel_metrics"), vec![None], "different table is a different topic");
         let legacy: serde_json::Map<String, serde_json::Value> =
             [("0".to_string(), serde_json::json!({ "block_id": 9_000, "offset": 0 }))].into_iter().collect();
-        let mut old = std::collections::HashMap::new();
+        let mut old = HashMap::new();
         old.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(legacy));
         assert_eq!(parse_watermark_from_json(&old, 1, "any_proj", "otel_logs_and_spans"), vec![None], "topic-less legacy commit applies to no one");
 
@@ -11985,7 +11976,7 @@ mod tests {
         // key and silently skips the commit, same path as pre-feature commits.
         let wm: crate::write::DeltaWatermark = vec![None, None, None];
         assert!(serialize_watermark_to_json(&wm, "p", "t").is_empty());
-        let mut empty_info = std::collections::HashMap::new();
+        let mut empty_info = HashMap::new();
         empty_info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(serde_json::Map::new()));
         assert!(parse_watermark_from_json(&empty_info, 3, "p", "t").iter().all(|p| p.is_none()));
 
@@ -11997,13 +11988,13 @@ mod tests {
                 entries.iter().map(|(s, b, o)| (s.to_string(), serde_json::json!({ "block_id": b, "offset": o }))).collect();
             let mut map = map;
             map.insert(WATERMARK_TOPIC_KEY.to_string(), serde_json::Value::String(wal_topic("p", "t")));
-            let mut info = std::collections::HashMap::new();
+            let mut info = HashMap::new();
             info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(map));
             info
         };
         let a = mk_info(&[(0, 5, 100), (1, 5, 50)]);
         let b = mk_info(&[(0, 6, 0)]); // past A on shard 0; nothing for shard 1
-        let c: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new(); // replay-derived, no watermark key
+        let c: HashMap<String, serde_json::Value> = HashMap::new(); // replay-derived, no watermark key
         let d = mk_info(&[(1, 5, 30)]); // behind A on shard 1; must lose to A
         let max = max_watermark_across_commits([&a, &b, &c, &d], 3, "p", "t");
         assert_eq!(max[0], Some(WalPosition { block_id: 6, offset: 0 }));
@@ -12022,14 +12013,14 @@ mod tests {
             ("proj_b".to_string(), t.to_string(), cb.clone()),
             ("proj_c".to_string(), t.to_string(), cc.clone()),
         ]);
-        let mut coalesced = std::collections::HashMap::new();
+        let mut coalesced = HashMap::new();
         coalesced.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
         assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_a", t), ca, "proj_a resumes from its own position");
         assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_b", t), cb, "proj_b resumes from its own position");
         assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_c", t), cc, "proj_c resumes from its own position");
         assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_d", t), vec![None, None], "project absent from the commit gets nothing");
         assert_eq!(parse_watermark_from_json(&coalesced, 2, "proj_a", "otel_metrics"), vec![None, None]);
-        let mut solo = std::collections::HashMap::new();
+        let mut solo = HashMap::new();
         solo.insert(
             WAL_WATERMARK_KEY.to_string(),
             serde_json::Value::Object(serialize_watermark_to_json(&vec![Some(WalPosition { block_id: 901, offset: 0 }), None], "proj_a", t)),
@@ -12058,7 +12049,7 @@ mod tests {
             ("p".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 5, offset: 40 }), Some(WalPosition { block_id: 9, offset: 0 })]),
             ("q".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 2, offset: 0 })]),
         ]);
-        let mut dup_info = std::collections::HashMap::new();
+        let mut dup_info = HashMap::new();
         dup_info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(dup_json));
         assert_eq!(
             parse_watermark_from_json(&dup_info, 2, "p", "t"),
@@ -12095,7 +12086,7 @@ mod tests {
     /// on a config-skew restart.
     #[test]
     fn watermark_parse_ignores_out_of_range_shards() {
-        let mut info = std::collections::HashMap::new();
+        let mut info = HashMap::new();
         info.insert(
             WAL_WATERMARK_KEY.to_string(),
             serde_json::json!({
@@ -12115,7 +12106,7 @@ mod tests {
     /// "absent"). URIs outside the requested dates are dropped.
     #[test]
     fn filesets_for_dates_groups_by_partition() {
-        use std::collections::HashSet;
+        use HashSet;
         let d0 = chrono::NaiveDate::from_ymd_opt(2026, 6, 6).unwrap();
         let d1 = chrono::NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
         let uris = vec![
@@ -12461,7 +12452,7 @@ mod tests {
     /// Naive batching would fail the whole wave (11 bins for one conflict).
     #[test]
     fn wave_drops_only_the_stale_bin() {
-        let live: std::collections::HashSet<String> = ["f1", "f2", "f4"].iter().map(|s| s.to_string()).collect();
+        let live: HashSet<String> = ["f1", "f2", "f4"].iter().map(|s| s.to_string()).collect();
         let bins = vec![
             ("alpha", vec!["f1".to_string()]),
             ("beta", vec!["f3".to_string()]), // f3 rewritten concurrently
@@ -12571,7 +12562,7 @@ mod tests {
     /// target file was rewritten concurrently drops out alone.
     #[test]
     fn dedup_wave_drops_only_the_stale_unit() {
-        let live: std::collections::HashSet<String> = ["f1", "f4"].iter().map(|s| s.to_string()).collect();
+        let live: HashSet<String> = ["f1", "f4"].iter().map(|s| s.to_string()).collect();
         let units = vec![
             staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6))),
             staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 5, 4))), // f2 gone
@@ -12593,7 +12584,7 @@ mod tests {
         let beta = staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 5, 4)));
         // alpha's commit LANDED: its target is gone AND its staged file is now
         // active. beta's target was rewritten by someone else.
-        let live: std::collections::HashSet<String> = ["alpha-new.parquet"].iter().map(|s| s.to_string()).collect();
+        let live: HashSet<String> = ["alpha-new.parquet"].iter().map(|s| s.to_string()).collect();
         let (fresh, stale) = super::split_live_bins(vec![alpha, beta], |b| &b.target_paths, &live);
         assert!(fresh.is_empty(), "neither bin's targets survive");
         let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| super::bin_adds_live(b, &live));
@@ -12602,7 +12593,7 @@ mod tests {
         // Its rows really were dropped from the table, so they count.
         assert_eq!(super::wave_dropped_rows(&self_landed), 4);
         // And a bin whose targets ARE live is never mistaken for self-landed.
-        let live_targets: std::collections::HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
+        let live_targets: HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
         assert!(!super::bin_adds_live(&staged_unit("alpha", &["f1"], None), &live_targets));
     }
 
@@ -12661,7 +12652,7 @@ mod tests {
     /// bookkeeping, certify a bin that still holds duplicates).
     #[test]
     fn dropped_rows_count_only_landed_units() {
-        let live: std::collections::HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
+        let live: HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
         let units = vec![
             staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6))), // drops 4
             staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 100, 1))), // never lands
@@ -12718,10 +12709,10 @@ mod tests {
             // (rolling deploy) — left alone.
             e("w4", "logs", 10, &["young_staged"]),
         ];
-        let referenced: std::collections::HashSet<String> = ["committed".to_string(), "unrelated".to_string()].into_iter().collect();
+        let referenced: HashSet<String> = ["committed".to_string(), "unrelated".to_string()].into_iter().collect();
         assert_eq!(super::staged_orphan_deletions(&entries, "logs", 100_000, &referenced), vec!["orphan1", "orphan2"]);
         // Nothing to delete when every staged file landed.
-        let all_live: std::collections::HashSet<String> = ["committed", "orphan1", "orphan2"].iter().map(|s| s.to_string()).collect();
+        let all_live: HashSet<String> = ["committed", "orphan1", "orphan2"].iter().map(|s| s.to_string()).collect();
         assert!(super::staged_orphan_deletions(&entries, "logs", 100_000, &all_live).is_empty());
     }
 
@@ -12741,7 +12732,7 @@ mod tests {
         }
     }
 
-    fn resume_live<'a>(files: &[(&'a str, Option<i64>)]) -> std::collections::HashMap<&'a str, Option<i64>> {
+    fn resume_live<'a>(files: &[(&'a str, Option<i64>)]) -> HashMap<&'a str, Option<i64>> {
         files.iter().copied().collect()
     }
 
@@ -12796,7 +12787,7 @@ mod tests {
             assert!(!cols.contains(&partition.as_str()), "partition column {partition} is in the path, not the stats");
         }
         assert!(cols.len() < schema.fields.len(), "must be a strict subset of the schema, got {} of {}", cols.len(), schema.fields.len());
-        assert_eq!(cols.len(), cols.iter().collect::<std::collections::HashSet<_>>().len(), "no duplicates");
+        assert_eq!(cols.len(), cols.iter().collect::<HashSet<_>>().len(), "no duplicates");
     }
 
     /// A repair pass must be bounded by its budget, not by a wave count.
@@ -14029,7 +14020,7 @@ mod tests {
         let table = table.write(vec![batch(vec![10, 11], vec!["a", "a"])]).with_save_mode(SaveMode::Overwrite).with_replace_where("p = 'a'").await?;
         assert_eq!(table.version(), Some(3));
 
-        let uris = |t: &DeltaTable| t.get_file_uris().map(|it| it.collect::<std::collections::HashSet<String>>()).unwrap_or_default();
+        let uris = |t: &DeltaTable| t.get_file_uris().map(|it| it.collect::<HashSet<String>>()).unwrap_or_default();
         let truth = uris(&table); // authoritative v3 set (full re-materialize)
         assert_eq!(truth.len(), 2, "v3 active set = p=b file + replaced p=a file");
 
