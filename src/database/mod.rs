@@ -1609,18 +1609,6 @@ fn coverage_is_short() -> bool {
     crate::observability::maintenance_stats().rollup_median_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
 }
 
-/// Sort and coalesce half-open ranges, merging any that touch or overlap.
-fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
-    ranges.sort_unstable();
-    ranges.into_iter().fold(Vec::<(i64, i64)>::new(), |mut merged, range| {
-        match merged.last_mut() {
-            Some(last) if range.0 <= last.1 => last.1 = last.1.max(range.1),
-            _ => merged.push(range),
-        }
-        merged
-    })
-}
-
 /// The overlap of two coalesced range sets. Both inputs must already be sorted
 /// and disjoint — `merge_ranges` guarantees that — so one linear sweep suffices.
 fn intersect_ranges(left: &[(i64, i64)], right: &[(i64, i64)]) -> Vec<(i64, i64)> {
@@ -3608,7 +3596,7 @@ impl Database {
                 }
                 slice_ticket.push((entry.key().clone(), coverage.source_fp, coverage.generation.clone()));
             }
-            let covered = merge_ranges(covered);
+            let covered = crate::write::mem_buffer::merge_ranges(covered);
             // The honest NotBuilt: this project produced no covered range for the
             // window by EITHER route — date-level or slice. It no longer REFUSES
             // the query, though: the project is read raw across the whole window
@@ -11055,13 +11043,6 @@ mod tests {
     }
 
     #[test]
-    fn merging_ranges_coalesces_what_touches_or_overlaps() {
-        assert_eq!(merge_ranges(vec![(30, 40), (0, 10), (10, 20)]), vec![(0, 20), (30, 40)]);
-        assert_eq!(merge_ranges(vec![(0, 100), (20, 30)]), vec![(0, 100)]);
-        assert_eq!(merge_ranges(Vec::new()), Vec::new());
-    }
-
-    #[test]
     fn tantivy_backfill_prioritizes_recent_partitions() {
         let mut uris = vec![
             "project_id=p/date=2024-01-01/old.parquet".to_string(),
@@ -13387,20 +13368,6 @@ mod tests {
         assert!(matches!(consolidate_optimize_type(schema, false), (OptimizeType::Compact, false)));
     }
 
-    /// Helper function to extract string value from array column, handling different string array types
-    fn get_str(array: &dyn Array, idx: usize) -> String {
-        use datafusion::arrow::array::{LargeStringArray, StringArray, StringViewArray};
-        if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-            arr.value(idx).to_string()
-        } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
-            arr.value(idx).to_string()
-        } else if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
-            arr.value(idx).to_string()
-        } else {
-            panic!("Unsupported string array type: {:?}", array.data_type())
-        }
-    }
-
     /// A narrow slice of a day-spanning file must estimate a narrow share.
     ///
     /// The whole splitting mechanism assumes bisecting a unit halves its cost.
@@ -14868,8 +14835,8 @@ mod tests {
             assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 1);
             let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", solo)).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "test1");
-            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "span1");
+            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "test1");
+            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "span1");
 
             // Multiple projects: isolation per project, and a total across them.
             let projects: Vec<String> = (1..=3).map(|i| format!("proj{}_{}", i, prefix)).collect();
@@ -14881,7 +14848,7 @@ mod tests {
                 let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
                 assert_eq!(result[0].num_rows(), 1);
-                assert_eq!(get_str(result[0].column(0).as_ref(), 0), format!("id_{}", project));
+                assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), format!("id_{}", project));
             }
             let mut total_count = 0;
             for project in &projects {
@@ -14916,21 +14883,21 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
+            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "span2");
             let result = ctx
                 .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND duration > 150000000", filter_project))
                 .await?
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
+            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "span2");
             let result = ctx
                 .sql(&format!("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'", filter_project))
                 .await?
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "Error occurred");
+            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "Error occurred");
 
             // Literal SQL INSERT, single- and multi-row, alongside a prior API insert.
             let sql_proj1 = format!("default_{}", prefix);
@@ -14958,7 +14925,7 @@ mod tests {
             let result =
                 ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'sql_id'", sql_proj2)).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "sql_name");
+            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "sql_name");
             // Multi-row INSERT, in one statement, returns a count of rows inserted
             // and preserves per-row field values and (default) insertion order.
             let multirow_id = format!("multirow_{}", prefix);
@@ -14976,9 +14943,9 @@ mod tests {
             let result =
                 ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{multirow_id}' ORDER BY id")).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 3);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "id1");
-            assert_eq!(get_str(result[0].column(0).as_ref(), 1), "id2");
-            assert_eq!(get_str(result[0].column(0).as_ref(), 2), "id3");
+            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "id1");
+            assert_eq!(array_get_str(result[0].column(0).as_ref(), 1), "id2");
+            assert_eq!(array_get_str(result[0].column(0).as_ref(), 2), "id3");
 
             // Timestamp filtering and `to_char` formatting.
             let ts_project = format!("ts_test_{}", prefix);
@@ -15001,7 +14968,7 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "late");
+            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "late");
             let result = ctx
                 .sql(&format!(
                     "SELECT id, to_char(timestamp, 'YYYY-MM-DD HH24:MI') as ts FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY timestamp",
@@ -15011,8 +14978,8 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 2);
-            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "2023-01-01 10:00");
-            assert_eq!(get_str(result[0].column(1).as_ref(), 1), "2023-01-01 12:00");
+            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "2023-01-01 10:00");
+            assert_eq!(array_get_str(result[0].column(1).as_ref(), 1), "2023-01-01 12:00");
 
             db.shutdown().await?;
             Ok(())
