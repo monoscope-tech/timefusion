@@ -8858,6 +8858,141 @@ impl DataSink for ProjectRoutingTable {
     }
 }
 
+/// Outcome of [`decide_prefilter`]: either why the tantivy prefilter was
+/// skipped, or the narrowing it proved sound to apply.
+enum PrefilterDecision {
+    Skipped(&'static str),
+    Used { ids: HashSet<String>, covered_files: HashSet<String>, exclude_files: Option<HashSet<String>>, row_selections: Option<HashMap<String, Vec<u64>>> },
+}
+
+/// Pure decision over an already-completed tantivy search's stats — no IO, mirrors the branches
+/// in `ProjectRoutingTable::scan`'s prefilter block exactly (skip reasons in the same order).
+///
+/// `is_mutable`: whether the leg is on a `version_append` (merge-on-read) table. On such a
+/// table a "hitless" file may hold the NEWEST version of a key whose match lives only in an
+/// older version, and dropping it below `DedupExec` would serve the stale row — so file
+/// exclusion/row-selection narrowing NEVER applies there; only the id-set does (sound at
+/// whole-key granularity).
+#[allow(clippy::too_many_arguments)]
+fn decide_prefilter(
+    ids: HashSet<String>, indexed_rows: u64, min_selectivity_pct: u64, field_gap: bool, covered_files: HashSet<String>, zero_hit_files: HashSet<String>,
+    row_selections: HashMap<String, Vec<u64>>, is_mutable: bool, file_pruning_enabled: bool, row_selection_enabled: bool,
+) -> PrefilterDecision {
+    // No indexed rows = no useful prefilter. Without this guard we'd emit an
+    // empty IN(...) list that zeros the Delta scan even when matching rows
+    // exist there (e.g. data written directly without triggering an index build).
+    if indexed_rows == 0 {
+        return PrefilterDecision::Skipped("empty_index");
+    }
+    // Selectivity cutoff: if the hit set covers most of the indexed rows, the
+    // IN-list won't prune enough to be worth its planning cost. Bail; the
+    // original predicate re-runs as the correctness backstop.
+    if (ids.len() as u64) * 100 >= indexed_rows * min_selectivity_pct {
+        return PrefilterDecision::Skipped("low_selectivity");
+    }
+    // An in-window index lacked one of the queried fields (schema evolution
+    // added a tantivy column after it was built). It can't answer that
+    // predicate yet appears "covered", so the IN-list would drop its rows.
+    if field_gap {
+        return PrefilterDecision::Skipped("field_coverage_gap");
+    }
+    // A zero-hit covering index proves its own files hold no matches. Complete
+    // coverage excludes those files from the single Delta leg; partial
+    // coverage excludes them only from the indexed leg while uncovered files
+    // scan raw.
+    let (exclude_files, row_selections) = if is_mutable {
+        (None, None)
+    } else {
+        (
+            (file_pruning_enabled && !zero_hit_files.is_empty()).then_some(zero_hit_files),
+            (row_selection_enabled && !row_selections.is_empty()).then_some(row_selections),
+        )
+    };
+    PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections }
+}
+
+#[cfg(test)]
+mod decide_prefilter_tests {
+    use super::*;
+
+    fn decide(ids: &[&str], indexed_rows: u64, is_mutable: bool) -> PrefilterDecision {
+        decide_prefilter(
+            ids.iter().map(|s| s.to_string()).collect(),
+            indexed_rows,
+            50, // min_selectivity_pct
+            false,
+            HashSet::from(["covered.parquet".to_string()]),
+            HashSet::from(["zero_hit.parquet".to_string()]),
+            HashMap::from([("row_sel.parquet".to_string(), vec![1, 2])]),
+            is_mutable,
+            true,
+            true,
+        )
+    }
+
+    /// Each skip reason fires independently and in the documented priority order —
+    /// pins the exact branch order `scan()`'s prefilter block depends on.
+    #[test]
+    fn skip_reasons_fire_in_priority_order() {
+        assert!(matches!(decide(&["a"], 0, false), PrefilterDecision::Skipped("empty_index")));
+        assert!(matches!(decide(&["a", "b"], 2, false), PrefilterDecision::Skipped("low_selectivity")), "2 of 2 indexed rows hit == 100% >= 50%");
+        let field_gap = decide_prefilter(
+            HashSet::from(["a".to_string()]),
+            10,
+            50,
+            true, // field_gap
+            HashSet::new(),
+            HashSet::new(),
+            HashMap::new(),
+            false,
+            true,
+            true,
+        );
+        assert!(matches!(field_gap, PrefilterDecision::Skipped("field_coverage_gap")));
+    }
+
+    /// A non-mutable (non-merge-on-read) table gets file exclusion + row selection.
+    #[test]
+    fn non_mutable_table_gets_file_exclusion_and_row_selection() {
+        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 10, false) else { panic!("expected Used") };
+        assert_eq!(exclude_files, Some(HashSet::from(["zero_hit.parquet".to_string()])));
+        assert_eq!(row_selections, Some(HashMap::from([("row_sel.parquet".to_string(), vec![1, 2])])));
+    }
+
+    /// A merge-on-read (`version_append`) table's Used decision NEVER carries file
+    /// exclusion or row selection — a "hitless" file may hold the newest version of a
+    /// key whose match lives only in an older version, and either narrowing would
+    /// serve the stale row instead of the current one. Only the id-set narrows, and
+    /// only at whole-key granularity.
+    #[test]
+    fn mutable_table_never_gets_file_exclusion_or_row_selection() {
+        let PrefilterDecision::Used { exclude_files, row_selections, ids, .. } = decide(&["a"], 10, true) else { panic!("expected Used") };
+        assert!(exclude_files.is_none());
+        assert!(row_selections.is_none());
+        assert_eq!(ids, HashSet::from(["a".to_string()]));
+    }
+
+    /// Disabled config knobs suppress narrowing even when the data would otherwise justify it.
+    #[test]
+    fn narrowing_respects_its_own_config_toggle() {
+        let decision = decide_prefilter(
+            HashSet::from(["a".to_string()]),
+            10,
+            50,
+            false,
+            HashSet::new(),
+            HashSet::from(["zero_hit.parquet".to_string()]),
+            HashMap::from([("row_sel.parquet".to_string(), vec![1])]),
+            false,
+            false, // file_pruning_enabled = false
+            false, // row_selection_enabled = false
+        );
+        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decision else { panic!("expected Used") };
+        assert!(exclude_files.is_none(), "file pruning disabled must suppress exclude_files even though zero_hit_files is non-empty");
+        assert!(row_selections.is_none(), "row selection disabled must suppress row_selections even though the map is non-empty");
+    }
+}
+
 #[async_trait]
 impl TableProvider for ProjectRoutingTable {
     fn table_type(&self) -> TableType {
@@ -9077,57 +9212,38 @@ impl TableProvider for ProjectRoutingTable {
 
             if delta_any_usable {
                 if let Some(ids) = delta_ids {
-                    // No indexed rows = no useful prefilter. Without this guard
-                    // we'd emit an empty IN(...) list that zeros the Delta
-                    // scan even when matching rows exist there (e.g. data
-                    // written directly without triggering an index build).
-                    if delta_indexed_rows == 0 {
-                        crate::observability::record_tantivy_prefilter_skipped();
-                        debug!("Tantivy prefilter skipped for {}/{}: empty_index", project_id, self.table_name);
-                    } else if (ids.len() as u64) * 100 >= delta_indexed_rows * min_sel_pct {
-                        // Selectivity cutoff: if the hit set covers most of the
-                        // indexed rows, the IN-list won't prune enough to be
-                        // worth its planning cost. Bail; original predicate
-                        // re-runs as the correctness backstop.
-                        crate::observability::record_tantivy_prefilter_skipped();
-                        debug!("Tantivy prefilter skipped for {}/{}: low_selectivity", project_id, self.table_name);
-                    } else if delta_field_gap {
-                        // An in-window index lacked one of the queried fields
-                        // (schema evolution added a tantivy column after it was
-                        // built). It can't answer that predicate yet appears
-                        // "covered", so the IN-list would drop its rows — skip.
-                        crate::observability::record_tantivy_prefilter_skipped();
-                        debug!("Tantivy prefilter skipped for {}/{}: field_coverage_gap", project_id, self.table_name);
-                    } else {
-                        crate::observability::record_tantivy_prefilter_used();
-                        tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
-                            expr: Box::new(datafusion::logical_expr::col("id")),
-                            list: ids.into_iter().map(lit).collect(),
-                            negated: false,
-                        }));
-                        // Partition the exact snapshot at scan construction,
-                        // not a separately resolved snapshot here. A flush or
-                        // compaction can commit between index search and table
-                        // resolution; carrying the coverage set forward makes
-                        // the later split race-free.
-                        tantivy_covered_files = Some(delta_covered);
-                        // A zero-hit covering index proves its own files hold
-                        // no matches. Complete coverage excludes those files
-                        // from the single Delta leg; partial coverage excludes
-                        // them only from the indexed leg while uncovered files
-                        // scan raw. NEVER on a
-                        // version_append table — a "hitless" file may hold
-                        // the NEWEST version of a key whose match lives only
-                        // in an older version (mutable column), and dropping
-                        // it below DedupExec serves the stale row. The id-set
-                        // above stays sound there (whole-key granularity).
-                        if mutable.is_none() {
-                            if tcfg.timefusion_tantivy_file_pruning && !delta_zero_hit.is_empty() {
-                                tantivy_exclude = Some(delta_zero_hit);
-                            }
-                            if tcfg.timefusion_tantivy_row_selection && !delta_row_sel.is_empty() {
-                                tantivy_row_selections = Some(delta_row_sel);
-                            }
+                    let decision = decide_prefilter(
+                        ids,
+                        delta_indexed_rows,
+                        min_sel_pct,
+                        delta_field_gap,
+                        delta_covered,
+                        delta_zero_hit,
+                        delta_row_sel,
+                        mutable.is_some(),
+                        tcfg.timefusion_tantivy_file_pruning,
+                        tcfg.timefusion_tantivy_row_selection,
+                    );
+                    match decision {
+                        PrefilterDecision::Skipped(reason) => {
+                            crate::observability::record_tantivy_prefilter_skipped();
+                            debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
+                        }
+                        PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
+                            crate::observability::record_tantivy_prefilter_used();
+                            tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
+                                expr: Box::new(datafusion::logical_expr::col("id")),
+                                list: ids.into_iter().map(lit).collect(),
+                                negated: false,
+                            }));
+                            // Partition the exact snapshot at scan construction,
+                            // not a separately resolved snapshot here. A flush or
+                            // compaction can commit between index search and table
+                            // resolution; carrying the coverage set forward makes
+                            // the later split race-free.
+                            tantivy_covered_files = Some(covered_files);
+                            tantivy_exclude = exclude_files;
+                            tantivy_row_selections = row_selections;
                         }
                     }
                 }
