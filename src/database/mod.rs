@@ -2313,6 +2313,9 @@ pub struct Database {
     /// Any commit touching the partition changes its file set → mismatch →
     /// dedup stays on until the next clean sweep pass.
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>>,
+    /// Serializes snapshots of `dedup_clean_fp` with their shared atomic temp
+    /// path. Coordinator workers can grant different partitions concurrently.
+    dedup_certification_persist_lock: Arc<std::sync::Mutex<()>>,
     /// Monotonic invalidation epoch for each source `(project, table, date)`.
     rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
     /// Certified rollup generations keyed by `(project, source, target, date)`.
@@ -3021,6 +3024,7 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp,
+            dedup_certification_persist_lock: Arc::new(std::sync::Mutex::new(())),
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
@@ -7457,11 +7461,16 @@ fn choose_optimize_type(schema: &crate::schema::TableSchema, allow_zorder: bool,
     if allow_sort && !sort_cols.is_empty() { (OptimizeType::SortBy(sort_cols), true) } else { (OptimizeType::Compact, false) }
 }
 
-/// Consolidation upgrades SortBy to SortByDedup: duplicates share every sort
-/// key (`id` is a content hash), so they're consecutive in the sorted stream
-/// and the fork drops them for free while writing. Tiebreak mirrors flush
-/// dedup's last-write-wins — greatest `dedup_tiebreak` (observed_timestamp)
-/// sorts first and survives, so the enriched re-emit beats the base row.
+/// Consolidation opportunistically upgrades SortBy to SortByDedup. Removing
+/// physically redundant versions preserves TimeFusion's logical DedupExec view,
+/// so the fork intentionally retains Optimize's `data_change=false` contract:
+/// concurrent appends remain outside the selected-file rewrite and visible,
+/// while concurrent removal of a source file still conflicts.
+///
+/// This is only a space/read-amplification optimization, not a convergence
+/// proof. Bin packing may strand versions of one key in different terminal
+/// output runs; authoritative physical collapse remains owned by the dedup
+/// engine, whose input scope contains every version of each rewritten key.
 fn consolidate_optimize_type(schema: &crate::schema::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     use deltalake::operations::optimize::{DedupConfig, OptimizeType, SortColumn};
     match choose_optimize_type(schema, false, allow_sort) {
@@ -10701,11 +10710,15 @@ mod tests {
     /// that granted it. The dedup cron skips rollup-declared tables, so for tables like
     /// `otel_logs_and_spans` the sweep stopped running and this path did not take over. This test
     /// pins that coordinator dedup must certify.
-    #[tokio::test]
+    #[test_case(true ; "persistence enabled")]
+    #[test_case(false ; "persistence disabled")]
     #[serial]
-    async fn a_clean_day_wide_coordinator_dedup_certifies_the_partition() -> Result<()> {
+    #[tokio::test]
+    async fn a_clean_day_wide_coordinator_dedup_certifies_the_partition(persist: bool) -> Result<()> {
         use crate::maintenance_coordinator::{DAY_MICROS, Operation, TaskKey, TimeSlice};
-        let db = Database::with_config(create_test_config("coord-dedup-certify")).await?;
+        let mut config = create_test_config("coord-dedup-certify");
+        Arc::make_mut(&mut config).maintenance.timefusion_dedup_certification_persist = persist;
+        let db = Database::with_config(config).await?;
         let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
         // A sealed day with NO duplicates: the pass must drop nothing and leave
         // the file set where it found it, which is exactly what certification
@@ -10735,6 +10748,12 @@ mod tests {
 
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
         assert!(db.dedup_clean_fp.contains_key(&key), "a clean day-wide unit must certify the partition; without it DedupExec survives in every 30d plan");
+        let stored = crate::storage::load_sidecar::<crate::storage::StoredCertification>(&db.config.core.timefusion_data_dir, crate::storage::CERTIFICATIONS);
+        let persisted = stored.iter().any(|entry| entry.project_id == project && entry.table_name == "otel_logs_and_spans" && entry.date == date.to_string());
+        assert_eq!(
+            persisted, persist,
+            "a coordinator-owned table never reaches the legacy sweep's persistence site, so its grant must honor the persistence flag here"
+        );
         Ok(())
     }
 
@@ -13559,7 +13578,7 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_dedups_on_sorted_rewrite() {
+    fn consolidate_opportunistically_dedups_on_sorted_rewrite() {
         use deltalake::operations::optimize::OptimizeType;
         let schema = get_schema("otel_logs_and_spans").unwrap();
         let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, true);
@@ -13567,13 +13586,26 @@ mod tests {
         assert_eq!(cols[0].column, "timestamp");
         assert_eq!(dedup.columns, vec!["timestamp", "id"]);
         let tb = dedup.tiebreak.expect("tiebreak from schema");
-        // `updated_at` since the 2026-08-02 merge-on-read flip: the tiebreak had
-        // to move off the client-supplied `observed_timestamp`, which
-        // `stamp_version` would otherwise overwrite on every write.
         assert!(tb.column == "updated_at" && tb.descending);
         assert!(declare_sorted);
-        // sort disabled → plain Compact, no dedup claim
+        // Sort disabled → plain Compact, no opportunistic dedup.
         assert!(matches!(consolidate_optimize_type(schema, false), (OptimizeType::Compact, false)));
+    }
+
+    /// Opportunistic per-bin keep-greatest cannot certify convergence. Two
+    /// versions can already live in separate target-sized sorted runs; neither
+    /// run is ever selected again, so no number of normal consolidation passes
+    /// brings those versions into the same dedup stream.
+    #[test]
+    fn converged_sorted_runs_are_a_counterexample_to_compaction_dedup_convergence() {
+        const TARGET: i64 = 1000;
+        let run = |path: &str, min: i64| super::TailAdd { path: path.into(), size: 900, is_sorted_run: true, event_range: Some((min, min + 1)) };
+        let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
+
+        assert!(
+            super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack).is_empty(),
+            "target-sized runs are terminal, even when their key/time domains overlap"
+        );
     }
 
     /// A narrow slice of a day-spanning file must estimate a narrow share.
