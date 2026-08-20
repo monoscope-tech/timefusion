@@ -181,9 +181,10 @@ impl DedupSkipVerdict {
 }
 
 /// Counters surfaced via `timefusion_stats` for production debugging. Cheap to
-/// update on the hot path (Relaxed atomics); read via `snapshot()`. Histogram
-/// is fixed-bucket microsecond bins so percentile estimates are O(buckets) to
-/// compute without sorting.
+/// update on the hot path (Relaxed atomics); read via `snapshot()`. Latency
+/// histograms are recorded through `metrics::histogram!()` and read back via
+/// `observability::histogram_quantile()` — see that module for why (OTel export
+/// + local readback fanned out from one `metrics::Recorder`).
 #[derive(Debug, Default)]
 pub struct ScanMetrics {
     pub scans_total: std::sync::atomic::AtomicU64,
@@ -214,7 +215,6 @@ pub struct ScanMetrics {
     pub cert_granted_total: std::sync::atomic::AtomicU64,
     pub cert_dwell_total: std::sync::atomic::AtomicU64,
     pub cert_dwell_secs_total: std::sync::atomic::AtomicU64,
-    pub cert_dwell_buckets: [std::sync::atomic::AtomicU64; 32],
     pub fast_resolve_hits: std::sync::atomic::AtomicU64,
     pub fast_resolve_misses: std::sync::atomic::AtomicU64,
     /// Delta TableProvider cache: hit = cached cell at the current snapshot
@@ -254,20 +254,12 @@ pub struct ScanMetrics {
     pub mem_plan_total: std::sync::atomic::AtomicU64,
     pub hot_plan_us_total: std::sync::atomic::AtomicU64,
     pub hot_plan_total: std::sync::atomic::AtomicU64,
-    /// Latency histogram of the full `ProjectRoutingTable::scan` call in
-    /// microseconds. Buckets are powers of two so reads at any duration land
-    /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
-    /// scans whose duration_us fits in `[1<<i, 1<<(i+1))`. 32 buckets covers
-    /// 1us through ~1.2 hours.
-    pub scan_latency_buckets: [std::sync::atomic::AtomicU64; 32],
-    /// End-to-end pgwire query latency histogram (same bucket scheme as
-    /// `scan_latency_buckets`). Recorded by `LoggingSimpleHandler` and
+    /// End-to-end pgwire query latency. Recorded by `LoggingSimpleHandler` and
     /// `LoggingExtendedQueryHandler` around the `DfSessionService::do_query`
     /// call — the FULL server-side path from "harness received our query"
     /// through "result encoded back to client". Compare to scan p95/p99 to
     /// see how much of the user-visible tail is outside the scan call.
     pub pgwire_total: std::sync::atomic::AtomicU64,
-    pub pgwire_latency_buckets: [std::sync::atomic::AtomicU64; 32],
     /// Parquet decode heap, measured at the `GatedScanExec` choke point.
     ///
     /// Decode is the one large consumer outside every budget. Worst-case concurrent decode heap
@@ -346,7 +338,7 @@ impl ScanMetrics {
         for c in skipped_delta.then_some(&self.scans_skipped_delta).into_iter().chain(by_source).chain(by_resolve) {
             c.fetch_add(1, Relaxed);
         }
-        self.scan_latency_buckets[latency_bucket(duration_us)].fetch_add(1, Relaxed);
+        metrics::histogram!("timefusion.scan.latency_seconds").record(duration_us as f64 / 1_000_000.0);
     }
 
     /// A certification ended: fold how long it survived into the dwell histogram.
@@ -361,50 +353,29 @@ impl ScanMetrics {
         let secs = since.elapsed().as_secs();
         self.cert_dwell_total.fetch_add(1, Relaxed);
         self.cert_dwell_secs_total.fetch_add(secs, Relaxed);
-        self.cert_dwell_buckets[latency_bucket(secs)].fetch_add(1, Relaxed);
+        metrics::histogram!("timefusion.cert.dwell_seconds").record(secs as f64);
     }
 
-    /// Coarse dwell percentile, in seconds. Same factor-of-two accuracy as the
-    /// latency histograms it shares bucketing with.
+    /// Dwell percentile, in seconds. `None` (surfaced as 0) if metrics weren't
+    /// initialized or nothing has been recorded yet.
     pub fn cert_dwell_percentile_secs(&self, p: f64) -> u64 {
-        Self::percentile_from_buckets(&self.cert_dwell_buckets, p)
+        crate::observability::histogram_quantile("timefusion.cert.dwell_seconds", p).unwrap_or(0.0) as u64
     }
 
-    /// Record a pgwire end-to-end query duration. Cheap on hot path —
-    /// just a counter bump and one histogram bin increment.
+    /// Record a pgwire end-to-end query duration. Cheap on hot path — a
+    /// counter bump and one histogram record.
     pub fn record_pgwire_query(&self, duration_us: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         self.pgwire_total.fetch_add(1, Relaxed);
-        self.pgwire_latency_buckets[latency_bucket(duration_us)].fetch_add(1, Relaxed);
+        metrics::histogram!("timefusion.pgwire.query_latency_seconds").record(duration_us as f64 / 1_000_000.0);
     }
 
-    /// Estimate percentile from the power-of-two histogram. Returns the upper
-    /// bound of the bucket containing the p-th percentile, in microseconds.
-    /// Coarse — accurate to a factor of 2 — but adequate for prod alerting.
+    /// Percentile of the full `ProjectRoutingTable::scan` call, in microseconds.
     pub fn latency_percentile_us(&self, p: f64) -> u64 {
-        Self::percentile_from_buckets(&self.scan_latency_buckets, p)
+        (crate::observability::histogram_quantile("timefusion.scan.latency_seconds", p).unwrap_or(0.0) * 1_000_000.0) as u64
     }
     pub fn pgwire_percentile_us(&self, p: f64) -> u64 {
-        Self::percentile_from_buckets(&self.pgwire_latency_buckets, p)
-    }
-    fn percentile_from_buckets(buckets: &[std::sync::atomic::AtomicU64; 32], p: f64) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        // Snapshot once: loading a second time for the cumulative walk could see
-        // a distribution that no longer sums to `total` under concurrent updates.
-        let counts = buckets.each_ref().map(|b| b.load(Relaxed));
-        let total: u64 = counts.iter().sum();
-        if total == 0 {
-            return 0;
-        }
-        let target = (total as f64 * p) as u64;
-        counts
-            .iter()
-            .scan(0u64, |cum, c| {
-                *cum += c;
-                Some(*cum)
-            })
-            .position(|cum| cum >= target)
-            .map_or(1u64 << 32, |i| 1u64 << (i + 1))
+        (crate::observability::histogram_quantile("timefusion.pgwire.query_latency_seconds", p).unwrap_or(0.0) * 1_000_000.0) as u64
     }
 }
 
@@ -415,11 +386,6 @@ impl ScanMetrics {
 struct Certification {
     fp: u64,
     since: std::time::Instant,
-}
-
-/// Power-of-two microsecond bucket index for the 32-bin latency histograms.
-fn latency_bucket(duration_us: u64) -> usize {
-    if duration_us <= 1 { 0 } else { (64 - duration_us.leading_zeros() - 1).min(31) as usize }
 }
 
 // Custom project tables: projects with their own S3 bucket get isolated tables
@@ -5708,7 +5674,6 @@ impl Database {
         let store = builder.build()?;
         Ok(Arc::new(store))
     }
-
 }
 
 /// Build the shared query `RuntimeEnv`: the global memory pool plus the

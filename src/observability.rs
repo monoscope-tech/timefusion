@@ -18,7 +18,7 @@
 
 use std::{
     sync::{
-        Mutex, OnceLock, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
@@ -152,6 +152,69 @@ pub fn registry() -> Option<&'static MetricsRegistry> {
     METRICS.get()
 }
 
+/// Local, in-process side of `metrics::histogram!()` calls, for readback (e.g.
+/// `timefusion_stats` percentiles). The OTel bridge (`metrics_exporter_opentelemetry`)
+/// is push-only — no snapshot API — so the two are fanned out from one global
+/// `metrics::Recorder` via `metrics_util::layers::Fanout`; see `init_metrics()`.
+///
+/// One `Summary` (DDSketch, relative-error quantiles) per metric name, keyed
+/// lazily on first `record()` — replaces hand-rolled power-of-two bucket arrays.
+struct LocalHistograms(dashmap::DashMap<String, Mutex<metrics_util::storage::Summary>>);
+
+impl LocalHistograms {
+    fn quantile(&self, name: &str, p: f64) -> Option<f64> {
+        self.0.get(name)?.lock().unwrap_or_else(std::sync::PoisonError::into_inner).quantile(p)
+    }
+}
+
+struct LocalHistogramHandle {
+    histograms: Arc<LocalHistograms>,
+    name: String,
+}
+
+impl metrics::HistogramFn for LocalHistogramHandle {
+    fn record(&self, value: f64) {
+        self.histograms
+            .0
+            .entry(self.name.clone())
+            .or_insert_with(|| Mutex::new(metrics_util::storage::Summary::with_defaults()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(value);
+    }
+}
+
+/// Newtype over `Arc<LocalHistograms>` so `metrics::Recorder` (a foreign trait) can
+/// be implemented on it — the orphan rule doesn't allow implementing directly on
+/// `Arc<LocalHistograms>` since `Arc` isn't a fundamental type.
+#[derive(Clone)]
+struct LocalRecorder(Arc<LocalHistograms>);
+
+/// Only `register_histogram` does anything; counters/gauges are left to the OTel
+/// bridge recorder in the `Fanout` — this recorder exists purely for histogram readback.
+impl metrics::Recorder for LocalRecorder {
+    fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+        metrics::Histogram::from_arc(Arc::new(LocalHistogramHandle { histograms: self.0.clone(), name: key.name().to_owned() }))
+    }
+}
+
+static LOCAL_HISTOGRAMS: OnceLock<Arc<LocalHistograms>> = OnceLock::new();
+
+/// Read back a quantile (0.0-1.0) for a name recorded via `metrics::histogram!()`.
+/// `None` if metrics weren't initialized or the name has never recorded a value.
+pub fn histogram_quantile(name: &str, p: f64) -> Option<f64> {
+    LOCAL_HISTOGRAMS.get()?.quantile(name, p)
+}
+
 /// Initialize OTel metrics. Idempotent (subsequent calls are no-ops).
 ///
 /// `buffered_layer` is a Weak so the metrics callback doesn't extend its
@@ -183,6 +246,24 @@ pub fn init_metrics(
     opentelemetry::global::set_meter_provider(SdkMeterProvider::builder().with_reader(reader).with_resource(resource).build());
 
     let meter = opentelemetry::global::meter("timefusion");
+
+    // Bridges the `metrics` facade (counter!/histogram!/gauge! macros) onto this
+    // same Meter/provider, so ad-hoc call-site metrics (e.g. latency histograms)
+    // don't need a hand-rolled Counter/instrument wired through a struct field —
+    // see database::ScanMetrics's record_scan/record_pgwire_query/record_cert_dwell.
+    // Fanned out to two recorders because the OTel bridge is push-only (no
+    // snapshot API): `local_histograms` also gets every call so `timefusion_stats`
+    // can read quantiles back in-process via `histogram_quantile()`.
+    // Idempotent-guarded by the METRICS OnceLock above; ignore "already installed"
+    // from a second init_metrics() call (tests, embedded use).
+    let local_histograms = Arc::new(LocalHistograms(dashmap::DashMap::new()));
+    let fanout = metrics_util::layers::FanoutBuilder::default()
+        .add_recorder(LocalRecorder(local_histograms.clone()))
+        .add_recorder(metrics_exporter_opentelemetry::Recorder::with_meter(meter.clone()))
+        .build();
+    if metrics::set_global_recorder(fanout).is_ok() {
+        let _ = LOCAL_HISTOGRAMS.set(local_histograms);
+    }
 
     // Observable gauges polled from snapshot_stats() each export cycle. We
     // build one shared snapshot per export by stashing the Weak; if the

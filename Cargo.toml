@@ -71,6 +71,9 @@ opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics", "logs"] }
 opentelemetry-appender-tracing = "0.31"
+metrics = "0.24"
+metrics-exporter-opentelemetry = "0.2"
+metrics-util = "0.20"
 datafusion-tracing = "54.0.0"
 instrumented-object-store = "54.0.0"
 dotenv = "0.15.0"
