@@ -10777,6 +10777,100 @@ mod tests {
         Ok(())
     }
 
+    /// An untagged tier file must not be immortal.
+    ///
+    /// The replace-set matched on slice tags alone, so a file that had lost them — a delta-rs
+    /// OPTIMIZE keeps only its own `sort_by` tag — could never be removed by anything. Every
+    /// rebuild then stacked another version of every `id` beside it and the tier's measures grew
+    /// without bound; prod 2026-08-20 held 352 such files at 7.17 versions per id, and a repair
+    /// rebuild published a correct 8,892-row file while the 22,505-row untagged file survived
+    /// untouched. A day-wide publish reproduces the whole partition, so it must retire them.
+    #[tokio::test]
+    async fn a_day_wide_publish_retires_an_untagged_tier_file() -> Result<()> {
+        use crate::maintenance_coordinator::{DAY_MICROS, MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        use object_store::ObjectStoreExt as _;
+        let mut cfg = (*create_test_config("untagged-immortal")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let project = format!("untag_{}", uuid::Uuid::new_v4().simple());
+        let day_start = (Utc::now() - chrono::Duration::days(3)).date_naive().and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+        let noon = day_start + DAY_MICROS / 2;
+        for i in 0..3 {
+            let span = test_span_ts(&format!("s{i}"), "op", &project, noon + i);
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![span])?], true, None).await?;
+        }
+
+        // Publish the day at DAY width — the width this fix is scoped to, and
+        // what `coarsen_sealed_slices` produces for a sealed day in prod.
+        let day_unit = |db: &Database| -> Result<TaskKey> {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in &keys {
+                journal.complete(key);
+            }
+            let base = keys.into_iter().find(|key| key.operation == Operation::BaseRollup).expect("the write path queues a base rollup for the day");
+            let key = TaskKey { slice: TimeSlice::new(day_start, day_start + DAY_MICROS)?, ..base };
+            journal.enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
+            Ok(key)
+        };
+        let key = day_unit(&db)?;
+        assert!(db.run_maintenance_units(1024).await? > 0, "the day-wide base unit must run");
+        let tier_total = async |db: &Database| -> Result<i64> {
+            let sql = format!("SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM {} WHERE project_id = '{project}'", key.physical_table);
+            Ok(db
+                .query_delta_only(&sql)
+                .await?
+                .iter()
+                .filter(|batch| batch.num_rows() > 0)
+                .filter_map(|batch| batch.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().map(|column| column.value(0)))
+                .next()
+                .unwrap_or(0))
+        };
+        assert_eq!(tier_total(&db).await?, 3, "the first publish must count each span once");
+
+        // Seed the damage exactly as OPTIMIZE produced it: the same bytes, live
+        // in the same partition, carrying no identity tags.
+        let tier_ref = db.get_or_create_table(&project, &key.physical_table).await?;
+        {
+            let mut table = tier_ref.read().await.clone();
+            let live: Vec<_> = table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .map(|file| {
+                    #[allow(deprecated)]
+                    file.add_action()
+                })
+                .collect();
+            assert!(!live.is_empty(), "the publish must have written a file to strip");
+            let store = table.log_store().object_store(None);
+            let mut actions = Vec::new();
+            for add in live {
+                let path = format!("{}-untagged.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            *tier_ref.write().await = table;
+        }
+        assert_eq!(tier_total(&db).await?, 6, "precondition: the untagged copy is live and every measure now double counts");
+
+        // A late row makes the day genuinely re-eligible, which is how a rebuild
+        // reaches a damaged partition in production.
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("s3", "op", &project, noon + 3)])?], true, None).await?;
+        day_unit(&db)?;
+        assert!(db.run_maintenance_units(1024).await? > 0, "the rebuild must run");
+        assert_eq!(tier_total(&db).await?, 4, "a day-wide rebuild must retire the untagged file, not stack a version beside it");
+        Ok(())
+    }
+
     /// A hygiene task for a partition the scan proved compliant must be retired, and a partition
     /// the scan never saw must not be.
     ///

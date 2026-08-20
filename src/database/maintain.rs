@@ -1613,26 +1613,32 @@ impl Database {
                 file.add_action()
             })
             .collect::<Vec<_>>();
+        // Containment, not exact equality. Slice WIDTH is not stable for a
+        // given range: `split_time_task` cuts a day into children and
+        // `coarsen_sealed_slices` (#134) fuses them back, so the same hours get
+        // published at different widths over time. Matching only the identical
+        // slice let a day-wide file and an hour-wide file inside it both stay
+        // live, and a dashboard SUMmed both — the test caught 10 where 9 was
+        // right.
+        //
+        // Removing a file WIDER than this slice is safe because a unit is only
+        // superseded by children that tile its whole range, so the rest is
+        // republished; until it is, the coverage check sees an incomplete tier
+        // and the query falls back to raw rather than reading a hole.
+        //
+        // `slice_retires` also retires UNTAGGED files on a day-wide publish —
+        // see there for why that is sound, and for the damage it undoes.
+        let date_string = date.to_string();
         let replaced = live_adds
             .iter()
             .filter(|add| {
-                // OVERLAP, not exact equality. Slice WIDTH is not stable for a
-                // given range: `split_time_task` cuts a day into children and
-                // `coarsen_sealed_slices` (#134) fuses them back, so the same
-                // hours get published at different widths over time. Matching
-                // only the identical slice let a day-wide file and an hour-wide
-                // file inside it both stay live, and a dashboard SUMmed both —
-                // the test caught 10 where 9 was right.
-                //
-                // Removing a file WIDER than this slice is safe because a unit
-                // is only superseded by children that tile its whole range, so
-                // the rest is republished; until it is, the coverage check sees
-                // an incomplete tier and the query falls back to raw rather
-                // than reading a hole.
-                let Some((start, end)) = slice_tag_range(add) else {
-                    return false;
+                let partition = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values));
+                let file = crate::rollup::LiveFile {
+                    slice: slice_tag_range(add),
+                    project: tag_project(add),
+                    partition: partition.as_ref().map(|(project, date)| (project.as_str(), date.as_str())),
                 };
-                tag_project(add) == Some(key.project_id.as_str()) && start >= key.slice.start_micros && end <= key.slice.end_micros
+                crate::rollup::slice_retires(&file, &key.project_id, &date_string, (key.slice.start_micros, key.slice.end_micros), rows)
             })
             .cloned()
             .collect::<Vec<_>>();

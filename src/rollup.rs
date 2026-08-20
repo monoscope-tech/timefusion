@@ -654,6 +654,52 @@ pub(crate) fn rollup_tier_dedup(schema: &crate::schema::TableSchema) -> Option<(
         .then(|| (vec!["timestamp".to_owned(), "id".to_owned()], "updated_at", schema.tombstone_column.as_deref()))
 }
 
+/// A live tier file, as the publish path's replace-set sees it.
+///
+/// `slice` is `None` for a file carrying no `timefusion.slice_*` tags — either
+/// written before tagging existed, or rewritten by something that dropped them
+/// (a delta-rs OPTIMIZE keeps only its own `sort_by` tag).
+pub(crate) struct LiveFile<'a> {
+    pub slice: Option<(i64, i64)>,
+    pub project: Option<&'a str>,
+    pub partition: Option<(&'a str, &'a str)>,
+}
+
+/// Whether publishing `slice` for `(project_id, date)`, having produced `rows`
+/// rows, retires `file`.
+///
+/// A TAGGED file is retired when this slice CONTAINS it — see the replace-set's
+/// own comment for why containment and not equality.
+///
+/// An UNTAGGED file was previously immortal: no tags meant not contained, meant
+/// never removed, so every rebuild stacked another version of every `id` beside
+/// it and nothing could ever collapse them (prod 2026-08-20: 352 such files,
+/// 7.17 versions per id). It is retirable under three conditions that together
+/// make it provably redundant:
+///
+/// - the slice spans a WHOLE partition day, so it reproduces everything a file
+///   in `date=D` can hold — files are partitioned by `(project_id, date)`, so
+///   such a file cannot carry rows outside `D`. A sub-day slice must not remove
+///   a file it only partly reproduces;
+/// - the file sits in exactly this `(project_id, date)` partition;
+/// - the rebuild produced `rows > 0`. If raw has aged out, the rebuild is empty
+///   and the untagged file may be the only copy left — removing it then deletes
+///   data rather than a duplicate.
+///
+/// Removing it cannot weaken coverage: `recover_rollup_coverage` skips any file
+/// missing any identity tag, so an untagged file proves nothing today.
+pub(crate) fn slice_retires(file: &LiveFile<'_>, project_id: &str, date: &str, (start, end): (i64, i64), rows: u64) -> bool {
+    match file.slice {
+        Some((file_start, file_end)) => file.project == Some(project_id) && file_start >= start && file_end <= end,
+        None => rows > 0 && spans_whole_day(start, end) && file.partition == Some((project_id, date)),
+    }
+}
+
+/// A slice covering exactly one UTC calendar day — the partition granularity.
+const fn spans_whole_day(start: i64, end: i64) -> bool {
+    start.rem_euclid(crate::maintenance_coordinator::DAY_MICROS) == 0 && end.saturating_sub(start) == crate::maintenance_coordinator::DAY_MICROS
+}
+
 /// The SELECT a rollup slice reads its input through, collapsing duplicates
 /// when `dedup` says how.
 ///
@@ -1663,6 +1709,31 @@ mod tests {
     use std::sync::Arc;
 
     const SOURCE: &str = "otel_logs_and_spans";
+    use crate::maintenance_coordinator::DAY_MICROS;
+    /// Any day-aligned instant; `slice_retires` takes the partition date as a
+    /// label rather than deriving it, so which day this is does not matter.
+    const DAY: i64 = 20_683 * DAY_MICROS;
+    const HOUR: i64 = HOUR_MICROS;
+
+    /// An untagged tier file used to be IMMORTAL — `slice_tag_range` returned
+    /// `None`, the replace-set skipped it, and every rebuild stacked another
+    /// version of every `id` beside it forever. A day-wide publish retires it;
+    /// nothing narrower, and nothing that produced no rows, may.
+    #[test_case::test_case(Some((DAY, DAY + HOUR)), Some("p"), None, DAY, DAY + DAY_MICROS, 9, true; "tagged file contained by the slice")]
+    #[test_case::test_case(Some((DAY - HOUR, DAY + DAY_MICROS)), Some("p"), None, DAY, DAY + DAY_MICROS, 9, false; "tagged file wider than the slice")]
+    #[test_case::test_case(Some((DAY, DAY + HOUR)), Some("other"), None, DAY, DAY + DAY_MICROS, 9, false; "tagged file of another project")]
+    #[test_case::test_case(None, None, Some(("p", "2026-08-18")), DAY, DAY + DAY_MICROS, 9, true; "untagged file in the rebuilt partition")]
+    #[test_case::test_case(None, None, Some(("p", "2026-08-18")), DAY, DAY + HOUR, 9, false; "sub-day slice reproduces only part of the day")]
+    #[test_case::test_case(None, None, Some(("p", "2026-08-18")), DAY, DAY + DAY_MICROS, 0, false; "empty rebuild may be the only copy left")]
+    #[test_case::test_case(None, None, Some(("p", "2026-08-17")), DAY, DAY + DAY_MICROS, 9, false; "untagged file in another day")]
+    #[test_case::test_case(None, None, Some(("other", "2026-08-18")), DAY, DAY + DAY_MICROS, 9, false; "untagged file of another project")]
+    #[test_case::test_case(None, None, None, DAY, DAY + DAY_MICROS, 9, false; "untagged file with no readable partition")]
+    fn slice_retires_tagged_by_containment_and_untagged_only_on_a_whole_day(
+        slice: Option<(i64, i64)>, project: Option<&str>, partition: Option<(&str, &str)>, start: i64, end: i64, rows: u64, expected: bool,
+    ) {
+        let file = LiveFile { slice, project, partition };
+        assert_eq!(slice_retires(&file, "p", "2026-08-18", (start, end), rows), expected);
+    }
 
     #[test]
     fn hours_from_stats_json_bounds_the_hours_a_file_can_touch() {

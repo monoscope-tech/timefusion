@@ -1,6 +1,4 @@
-//! OPTIMIZE / compaction: Z-order rewrite, hot-tail bin selection, per-date
-//! compaction, sealed-partition consolidation, and the dedup rewrite/stage
-//! machinery (probe + stage a dedup partition range/chunk).
+//! OPTIMIZE / compaction: Z-order, hot-tail, sealed-partition, and dedup rewrites.
 use super::*;
 
 impl Database {
@@ -26,11 +24,8 @@ impl Database {
         // S3 I/O). With after_days=1 this leaves warm processing only today —
         // the partition still taking writes.
         let after_days = self.config.parquet.cold_optimize_after_days();
-        // When the light (hot-tail) tier is on, it owns `today`: its event-time
-        // binned selection produces time-DISJOINT sorted runs, while this
-        // whole-partition rewrite re-bins them in snapshot (arrival) order —
-        // undoing the disjointness — and its full-day SortBy is the rewrite
-        // that kept dying of external-sort starvation (prod 2026-07-21).
+        // Cold consolidation owns sealed dates; light optimization owns today
+        // to preserve its event-time-disjoint runs.
         let skip_today = self.config.maintenance.timefusion_light_optimize_enabled;
         let window_dates: Vec<chrono::NaiveDate> = (0..=num_days)
             .map(|days_ago| (now - chrono::Duration::days(days_ago as i64)).date_naive())
@@ -104,11 +99,7 @@ impl Database {
         // prune whole files and row groups. It remains an incident kill switch.
         let (optimize_type, declare_sorted) = full_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
-        // SortBy bins materialize their decompressed Arrow set in the shared
-        // maintenance pool (a 256MB-zstd bin ≈ 2–6GB Arrow), so concurrent bin
-        // sorts starve each other's external-sort reservations and the whole
-        // optimize fails ("Not enough memory to continue external sort", prod
-        // 2026-07-21). Serialize sort bins — same rule as compact_date.
+        // SortBy materializes large Arrow buffers, so in-server bins are serial.
         let optimize_concurrency = if declare_sorted { 1 } else { self.config.derived.optimize_merge_tasks() };
 
         // Best-effort: retry bounded OCC conflicts against a fresh snapshot,
@@ -485,19 +476,8 @@ impl Database {
         if let Some(pid) = project_id {
             partition_filters.push(PartitionFilter::try_from(("project_id", "=", pid))?);
         }
-        // Old-event-time backlog data still lands in recent-old partitions, so a
-        // concurrent flush/dedup can delete files mid-merge → Serializable OCC
-        // conflict at commit (the merge read now-removed files). Refresh the
-        // snapshot and retry rather than fail; an intermittently-written
-        // partition lands on a later attempt. Mirrors the dedup retry loop.
-        //
-        // PROGRESS-AWARE BUDGET: `MAX_ATTEMPTS` counts consecutive attempts
-        // that shrank nothing. An attempt that reduced the partition's file
-        // count banked incremental commits (bins land every
-        // min_commit_interval), so it resets the counter — under a busy
-        // commit stream (2026-07-30: prod flush/dedup churning the same
-        // partition) a fixed budget quit mid-convergence. TOTAL_ATTEMPTS is
-        // the runaway backstop.
+        // Retry OCC/transient S3 errors; reset the no-progress budget only when
+        // committed bins reduce the scoped file count.
         const MAX_ATTEMPTS: usize = 4;
         const TOTAL_ATTEMPTS: usize = 32;
         // Pre-state file set for the warm/evict diff, hoisted out of the retry
@@ -530,12 +510,8 @@ impl Database {
             // SortBy is cheap SPM, so serializing partitions costs little.
             let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
-            // SortBy forces serial bins ONLY at in-server concurrency (≤ the
-            // pinned merge-task count): transition sorts stacking on the shared
-            // maintenance pool was the 2026-07-14 OOM multiplier. An explicitly
-            // higher `max_concurrent` (off-box CLI --concurrency, dedicated
-            // container pool) opts out — serial bins on a 25-40 GB pool waste
-            // nearly all of it (2026-07-31: 100-bin whale-days at 5-8 h serial).
+            // Serialise SortBy at in-server concurrency; explicit off-box
+            // concurrency opts into parallel transition sorts.
             let sort_concurrency = if declare_sorted && max_concurrent <= self.config.derived.optimize_merge_tasks() { 1 } else { max_concurrent };
             let result = table_clone
                 .optimize()
@@ -643,21 +619,15 @@ impl Database {
         use object_store::{ObjectStoreExt, path::Path as OsPath};
 
         let date_str = date.to_string();
-        let date_marker = format!("date={}", date_str);
-        // Both the SQL and the `replace_where` predicate interpolate this, so
-        // reject anything that isn't a bare partition token. `date_str` is
-        // already safe (a parsed `NaiveDate`).
-        if let Some(p) = project
-            && !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            anyhow::bail!("recompress: refusing project id with unsafe characters: {p:?}");
+        if project.is_some() {
+            // Scoped `replace_where` can deadlock; reject it before reading the table.
+            anyhow::bail!("recompress --project is disabled: scoped replace_where deadlocks; re-run without --project");
         }
-        let project_marker = project.map(|p| format!("project_id={p}/"));
+        let date_marker = format!("date={date_str}");
 
         let (uris, log_store, table_uri) = {
             let table = table_ref.read().await;
-            let uris: Vec<String> =
-                table.get_file_uris()?.filter(|u| u.contains(&date_marker) && project_marker.as_ref().is_none_or(|m| u.contains(m.as_str()))).collect();
+            let uris: Vec<String> = table.get_file_uris()?.filter(|u| u.contains(&date_marker)).collect();
             (uris, table.log_store(), table.table_url().to_string())
         };
         if uris.is_empty() {
@@ -715,6 +685,7 @@ impl Database {
         // last 30 days. Probe the footers (a ranged read each, and the same
         // metadata cache the scan would warm) and let sortedness veto the skip.
         let declares_order = get_schema(table_name).is_some_and(|s| !s.sorting_columns.is_empty());
+        // A tier-qualified file without a sorted footer is not converged.
         let any_unsorted = match declares_order {
             false => false,
             true => {
@@ -754,14 +725,7 @@ impl Database {
         info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // Sort the rewrite by the schema keys via an `ORDER BY` on the input
-        // plan and declare the footer, so a recompressed partition keeps an
-        // honest DESC footer — a bare `SELECT *` concatenation would strip the
-        // ordering that optimize/compact established. `declare_sorted` tracks
-        // whether we actually sort (empty clause when no sort order declared).
-        // Gated by timefusion_optimize_sort_by: a global ORDER BY sort of a cold
-        // partition can exhaust the bounded maintenance pool (same limit that
-        // disables SortBy for optimize). Off → bare SELECT * (no sort, declare false).
+        // Sort and declare footer order when enabled; otherwise stream `SELECT *`.
         let order_by = if self.config.maintenance.timefusion_optimize_sort_by { schema_order_by_clause(schema) } else { String::new() };
         let declare_sorted = !order_by.is_empty();
         let writer_properties = self.create_writer_properties(schema, target_level, declare_sorted);
@@ -802,34 +766,10 @@ impl Database {
         let session = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env());
         let ctx = datafusion::prelude::SessionContext::new_with_state(session);
         ctx.register_table("recompress_src", Arc::new(provider))?;
-        // Literal date is safe: `date_str` is a parsed `chrono::NaiveDate`. The
-        // `order_by` clause (quoted identifiers) makes the rewrite globally
-        // sorted so `declare_sorted` above is honest.
-        // `project_id` is a partition column, so scoping BOTH the scan and the
-        // overwrite predicate leaves every other tenant's files on that date
-        // untouched by the commit — correct, and pinned by
-        // `recompress_scoped_to_a_project_leaves_other_projects_untouched`.
-        //
-        // DISABLED: it also DEADLOCKS the write. Prod 2026-08-08, same date and
-        // data, only the scope varying:
-        //   unscoped, 80 files, 40 GiB  → 270-520% CPU, writes, progresses
-        //   scoped,    2 files,  6 GiB  → 0% CPU forever, right after `write_operation`
-        //   scoped,    2 files, 24 GiB  → grew to 3.5 GB, then the SAME 0% stall
-        // So it is neither memory nor the budget. Prime suspect is the
-        // `replace_where` conjunction over TWO partition columns in delta-rs.
-        // Until that is understood, refuse the flag rather than hang: an
-        // unscoped rewrite of the same date is slower but WORKS, and a hang is
-        // the worst possible failure for a repair tool (it looks like progress).
-        if project.is_some() {
-            anyhow::bail!(
-                "recompress --project is disabled: the scoped replace_where deadlocks the write (2026-08-08). \
-                 Re-run without --project to rewrite the whole date; it needs more memory but completes."
-            );
-        }
-        let scope = String::new();
-        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{scope}{order_by}")).await?.into_optimized_plan()?;
+        // `date_str` is a parsed `NaiveDate`; `order_by` uses quoted identifiers.
+        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{order_by}")).await?.into_optimized_plan()?;
 
-        let replace_pred = format!("date = '{date_str}'{scope}");
+        let replace_pred = format!("date = '{date_str}'");
         let write_result = table_clone
             .write(Vec::<RecordBatch>::new())
             .with_input_plan(input_plan)
@@ -1117,26 +1057,18 @@ impl Database {
              (SELECT \"timestamp\", count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {filter} GROUP BY {keys_csv}) AS g \
              WHERE c > 1 GROUP BY 1 ORDER BY 1"
         );
-        let mut starts = Vec::new();
-        for batch in ctx.sql(&probe).await?.collect().await? {
+        ctx.sql(&probe).await?.collect().await?.into_iter().try_fold(Vec::new(), |mut starts, batch| {
             let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
             let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
-            for i in 0..col.len() {
-                if col.is_null(i) {
-                    continue;
-                }
-                // CAST .. AS VARCHAR may append fractional seconds or a
-                // timezone suffix; the leading 19 chars are the datetime.
-                if let Some(start) = col.value(i).get(..19).and_then(|h19| {
-                    chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%dT%H:%M:%S")
-                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%d %H:%M:%S"))
+            starts.extend(col.iter().flatten().filter_map(|value| {
+                value.get(..19).and_then(|datetime| {
+                    chrono::NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S")
+                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S"))
                         .ok()
-                }) {
-                    starts.push(start);
-                }
-            }
-        }
-        Ok(starts)
+                })
+            }));
+            Ok::<_, anyhow::Error>(starts)
+        })
     }
 
     /// Runs `sql` and pulls its first output row's `column(0)` as an `i64` —
@@ -1210,15 +1142,8 @@ impl Database {
         } else {
             partition_filter.clone()
         };
-        // Probe for duplicates BEFORE materializing anything: the common case
-        // is zero dupes, and `SELECT *` + collect() of a whole day partition
-        // (1.4M wide OTel rows observed) transiently allocated tens of GB
-        // outside any memory pool, every 5-minute sweep, for every project —
-        // the direct cause of prod's 2026-06-11 OOM crash loop (each kill
-        // replayed the WAL, minting the dupes that fattened the next sweep).
-        // The probe aggregates group keys only: bounded by key cardinality,
-        // not row width. It also stops the every-5-min whole-partition
-        // replace_where rewrite, the main Remove-tombstone factory.
+        // Probe keys before materializing rows: it bounds the common no-duplicate
+        // case by key cardinality rather than row width.
         let keys_csv = schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ");
 
         // Identify the hour buckets that actually contain duplicates. A dup
@@ -1228,17 +1153,8 @@ impl Database {
         // whole day (the crash-loop backlog made EVERY project probe-positive,
         // so the probe alone still ballooned tens of GB per sweep).
         let (chunks, skipped_any): (Vec<(String, String)>, bool) = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
-            // 10-minute bins (not hours): one HOUR of the largest project is
-            // >2.1GB of string data — past Arrow's i32 offset limit ("Offset
-            // overflow error: 2222394106" in prod) and tens of GB materialized.
-            // 10 minutes matches the flush-bucket granularity.
-            //
-            // Rewriting an hour that late data may still flush into races
-            // replace_where against the append (the stale materialized chunk
-            // would win and drop the fresh rows — same race the old
-            // whole-partition rewrite had for the entire day). The buffer
-            // holds up to ~70 min of data, so only hours sealed for 2h+ are
-            // rewritten; newer dupes clear on a later sweep.
+            // Ten-minute sealed bins bound materialization and avoid racing late
+            // flushes; newer duplicates are retried later.
             let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
             let mut skipped_unsealed = 0usize;
             // A one-minute whale cannot be split further in time. Bound the
@@ -1297,10 +1213,8 @@ impl Database {
             return Ok((Vec::new(), !skipped_any));
         }
 
-        // Chunks of one partition stage CONCURRENTLY, bounded by the same
-        // `maintenance_rewrite_sem` each staging task takes around its Arrow
-        // materialization — `buffer_unordered` only decides how many tasks are
-        // in flight, the semaphore decides how many are decoding at once.
+        // `buffer_unordered` bounds tasks in flight; the rewrite semaphore bounds
+        // concurrent Arrow materialization.
         use futures::stream::StreamExt;
         let permits = self.config.derived.rewrite_permits().max(1);
         let staged: Vec<Result<BinOutcome<StagedBin>>> = futures::stream::iter(chunks.into_iter().map(|(chunk_filter, label)| {
@@ -1367,11 +1281,8 @@ impl Database {
                 .flatten()
                 .collect())
         };
-        // Re-plan loop: a concurrent rewrite (optimize / z-order / another
-        // dedup) can remove a target file mid-flight, so the scan's file ids no
-        // longer map onto the snapshot's Adds. The snapshot→commit window is NOT
-        // handled here any more — `commit_wave`'s liveness check drops the stale
-        // unit and the dirty bin is requeued for the next tick.
+        // Re-plan against a fresh snapshot when concurrent rewrites invalidate
+        // file mappings; `commit_wave` guards the remaining commit window.
         const MAX_REPLANS: usize = 3;
         for replan in 0..MAX_REPLANS {
             // Scan and file-mapping MUST share one snapshot: the caller's ctx
@@ -1570,14 +1481,8 @@ impl Database {
             let rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
             let staging_table = { table_ref.read().await.clone() };
             let stage_store = staging_table.log_store().object_store(None);
-            // Shards are INDEPENDENT — disjoint bucket ranges, each staging its
-            // own parquet — so run them CONCURRENTLY. End to end, a bin needing
-            // N shards paid N scans + sorts + writes back to back while holding
-            // one rewrite permit: prod 2026-08-13 watched three otel_metrics
-            // bins burn the whole 3600s per-bin deadline and fail that way,
-            // on a box using 5 of its 48 cores. The permit still bounds
-            // concurrent BINS; `shard_k` bounds shards within one, so peak
-            // Arrow is `shard_k x decoded_budget` rather than one budget.
+            // Shards have disjoint bucket ranges. The permit bounds concurrent
+            // bins; `shard_k` bounds Arrow memory within each bin.
             let shard_k = limits.map_or_else(
                 || dedup_shard_concurrency(decoded_budget, self.config.derived.cores),
                 |limits| dedup_shard_concurrency(decoded_budget, self.config.derived.cores).min(limits.max_concurrent_shards.max(1)),
@@ -1813,12 +1718,9 @@ impl Database {
     /// tables don't embed it). Shared by the sweep's fingerprint capture and
     /// the read-side dedup-skip check so both hash identical groupings.
     pub(crate) fn partition_files_by_pid(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, Vec<String>>> {
-        let mut m: HashMap<String, Vec<String>> = HashMap::new();
-        for uri in table.get_file_uris()?.filter(|u| u.contains(date_marker) && u.ends_with(".parquet")) {
-            let pid = path_partition_value(&uri, "project_id").unwrap_or("default").to_string();
-            m.entry(pid).or_default().push(uri);
-        }
-        Ok(m)
+        Ok(table.get_file_uris()?.filter(|uri| uri.contains(date_marker) && uri.ends_with(".parquet")).fold(HashMap::new(), |mut files, uri| {
+            files.entry(path_partition_value(&uri, "project_id").unwrap_or("default").to_string()).or_default().push(uri);
+            files
+        }))
     }
-
 }

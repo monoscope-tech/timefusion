@@ -1406,5 +1406,4 @@ impl Database {
         }
         Ok(total_advanced)
     }
-
 }
