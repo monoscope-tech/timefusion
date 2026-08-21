@@ -144,3 +144,27 @@ Time-gated residuals (nothing further is code-actionable tonight):
   `timefusion optimize --recompress` maintenance window.
 - Observability gap worth one small PR: `journal.retry()` logs nothing — the
   night's two hardest diagnoses both stalled on invisible retry reasons.
+
+
+## Deploy-test-attribute cycle CLOSED (2026-08-22 ~01:00, bench_final_cycle/)
+
+Full 100-cell matrix + 24 EXPLAIN ANALYZEs on 525f6ec, per-operator
+attribution of every miss (raw: scratchpad bench_final_cycle/matrix.md):
+
+- Scorecard: completed 46 -> 75/100; 24h<1s 0 -> 13/25; 30d<10s 4 -> 8/25;
+  combined targets 4/50 -> 21/50 vs the 08-20 baseline.
+- Attribution splits cleanly: (a) file-count/IO owns most misses (P1 B 30d:
+  27.2s wall / 0.02s compute / 746 cold opens; A-shapes: zero FILE-level
+  pruning, blooms then cut row groups 352->2); (b) dedup amplification owns
+  every E miss (cert still 0, DedupExec 5.36M->3.55M at 24h, 31.98M->23.73M
+  at 7d); (d) one anomaly: P5 A 24h 5.9s WARM over 43 files/6.8MB.
+- Measurement trap: shape D (kind='SPAN') returns count=0 everywhere — its
+  fast cells are zero-match stat pruning, not count-pushdown evidence.
+- Iteration shipped from the attribution: warm depth 9d -> 35d (the largest
+  per-cell delta was beyond-warm-depth cold opens).
+- Ranked remaining: (1) cert unblock [accumulating via persistence; re-check
+  keying if still 0 after clean day-sets], (2) FILE-level trace_id pruning
+  (Tempo/Loki-style sidecar for the delta leg — the earlier design, now with
+  EA evidence), (3) sealed backlog drain [wall-clock], (4) shipped, (5) P5
+  A-shape warm anomaly (5.9s/43 files — roundtrip overhead, investigate
+  before optimizing).
