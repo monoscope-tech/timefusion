@@ -1184,6 +1184,50 @@ impl TaskJournal {
         // would delete the unit it exists to create.
         self.removed_tasks.remove(&key);
         if let Some(index) = self.task_indices.get(&key).copied() {
+            // A superseded parent's work lives on in its children; re-noticing
+            // the same debt is not new information and must not resurrect the
+            // parent beside them. Prod 2026-08-21, project 87576849: ~6 whole-day
+            // Repair units sat at attempts 140-204 for days because every timeout
+            // split them and the next 60s `plan_compaction_debt` tick flipped the
+            // Superseded parent back to Pending — where its day width outranked
+            // its own 12h children, so they never ran once. Only when no live
+            // descendant remains is the enqueue fresh debt, and then it is a NEW
+            // unit: attempts start over.
+            if self.snapshot.tasks[index].state == TaskState::Superseded {
+                let parent = &self.snapshot.tasks[index].key;
+                let live_descendant = self.snapshot.tasks.iter().any(|task| {
+                    task.key != *parent
+                        && task.key.operation == parent.operation
+                        && task.key.source == parent.source
+                        && task.key.project_id == parent.project_id
+                        && task.key.physical_table == parent.physical_table
+                        && task.key.slice.start_micros >= parent.slice.start_micros
+                        && task.key.slice.end_micros <= parent.slice.end_micros
+                        && matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)
+                });
+                if live_descendant {
+                    return;
+                }
+                let task = &mut self.snapshot.tasks[index];
+                task.state = TaskState::Pending;
+                task.deadline_micros = deadline_micros;
+                task.estimated_decoded_bytes = estimated_decoded_bytes;
+                task.attempts = 0;
+                task.retry_reason = None;
+                task.publication = None;
+                task.base_tier_present |= base_tier_present;
+                self.dirty_tasks.insert(key);
+                return;
+            }
+            // `abandon_running`'s verdict outlives a planner tick. Its deadline
+            // floor is the only bound on a doomed unit's duty cycle and its
+            // `worker_error` reason is what routes the unit through the small
+            // quarantine permit; the reset below erased both every 60s, which is
+            // how day-wide units re-claimed every 5-8 minutes against a >=900s
+            // floor. The debt it re-notices is already queued — nothing is lost.
+            if self.snapshot.tasks[index].state == TaskState::Retry && self.snapshot.tasks[index].retry_reason.as_deref() == Some(Self::WORKER_FAILURE_REASON) {
+                return;
+            }
             let task = &mut self.snapshot.tasks[index];
             if task.state != TaskState::Running {
                 let new_deadline = task.deadline_micros.min(deadline_micros);
@@ -2387,6 +2431,70 @@ mod tests {
         journal.abandon_running(&key, 0);
         let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
         assert_eq!(not_before, 2 * 1_000_000, "one failure retries on plain exponential backoff, not the deadline floor");
+    }
+
+    /// The planner re-derives file debt every 60s and enqueues the same day-wide
+    /// key while a partition stays out of policy. That re-mint must not resurrect
+    /// a parent `split_time_task` superseded: prod 2026-08-21, project 87576849,
+    /// held ~6 whole-day Repair units at attempts 140-204 for days — each timeout
+    /// split the parent, the next 60s tick flipped it back to Pending with its
+    /// attempts intact, and the day-wide width outranked its own 12h children in
+    /// `scheduling_class`, so across 24h of logs not one child ever started.
+    #[test]
+    fn a_replanned_day_does_not_resurrect_a_superseded_parent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut unit = task("p", 0, DAY_MICROS, Operation::Repair);
+        unit.attempts = 2;
+        unit.state = TaskState::Running;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        journal.abandon_running(&key, 0);
+        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "two failures split a day-wide unit");
+        let children: Vec<_> = journal.tasks().filter(|child| child.key != key).map(|child| child.key.clone()).collect();
+        assert_eq!(children.len(), 2, "bisection leaves two live children");
+
+        // The 60s planner tick re-mints the day key while children are live.
+        journal.enqueue(key.clone(), 60_000_000, 1_000, 0);
+        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "the children carry the work; the parent must stay down");
+        assert!(!journal.mark_running(&key), "a superseded parent is not claimable");
+
+        // Once every child is done, new debt on the day is new work: recreate fresh.
+        for child in &children {
+            journal.complete(child);
+        }
+        journal.enqueue(key.clone(), 120_000_000, 1_000, 0);
+        let revived = journal.tasks().find(|candidate| candidate.key == key).expect("revived");
+        assert_eq!(revived.state, TaskState::Pending, "a childless superseded key revives for fresh debt");
+        assert_eq!(revived.attempts, 0, "revival is a new unit, not attempt 205 of the old one");
+    }
+
+    /// The same 60s re-mint must not erase what `abandon_running` recorded: its
+    /// deadline floor is the only bound on a doomed unit's duty cycle, and its
+    /// `worker_error` reason is what routes the unit through the small quarantine
+    /// permit. Prod 2026-08-21: day-wide Repair units were re-claimed every 5-8
+    /// minutes against a >=900s floor, because every planner tick pulled the
+    /// deadline back to `now` and cleared the reason.
+    #[test]
+    fn a_replanned_debt_does_not_erase_worker_failure_backoff() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Single-slice: unsplittable, so abandonment falls to the backoff floor.
+        let mut unit = task("p", 0, MIN_SLICE_MICROS, Operation::Repair);
+        unit.attempts = 5;
+        unit.state = TaskState::Running;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        let now = 1_000_000_000;
+        journal.abandon_running(&key, now);
+        let floored = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
+
+        journal.enqueue(key.clone(), now + 60_000_000, 1_000, 0);
+        let after = journal.tasks().find(|candidate| candidate.key == key).expect("still queued");
+        assert_eq!(after.deadline_micros, floored, "a re-noticed debt must not cancel the abandonment backoff");
+        assert_eq!(after.retry_reason.as_deref(), Some(TaskJournal::WORKER_FAILURE_REASON), "the quarantine tag survives the planner tick");
     }
 
     /// The floor must not REPLACE exponential backoff, only raise it. A unit that
