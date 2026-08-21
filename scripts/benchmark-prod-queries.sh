@@ -16,7 +16,7 @@ psql "$url" -X -v ON_ERROR_STOP=1 -P pager=off <<SQL
 \\timing on
 SELECT component, key, value
 FROM timefusion_stats
-WHERE component IN ('foyer', 'foyer_metadata', 'hot_tier', 'parquet', 'scan')
+WHERE component IN ('foyer', 'foyer_metadata', 'parquet', 'scan')
 ORDER BY component, key;
 SQL
 
@@ -39,6 +39,6 @@ WHERE project_id = '${tenants[0]}'
   AND timestamp >= now() - interval '1 hour';
 SELECT component, key, value
 FROM timefusion_stats
-WHERE component IN ('foyer', 'foyer_metadata', 'hot_tier', 'parquet', 'scan')
+WHERE component IN ('foyer', 'foyer_metadata', 'parquet', 'scan')
 ORDER BY component, key;
 SQL

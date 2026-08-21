@@ -6,9 +6,21 @@
 > on kind-count). Checklist below carries per-item [x] marks with results.
 > STILL OPEN here: DV matrix cell, cert-grant watch (counter still 0),
 > resumable dirty-bin staging, 4b degraded path, §5 accounting, §6 overlap
-> bypass. THE NEXT CONSTRAINT moved to its own plan:
-> `2026-08-21-hot-leg-pruning.md` (hot tier has no per-file stats; shape-A
-> 24h TIMEOUTs on all projects). Incident note: 2026-08-21 morning fast-OOM
+> bypass.
+>
+> **SUPERSEDED 2026-08-21: THE HOT TIER WAS REMOVED.** The follow-on plan
+> (`2026-08-21-hot-leg-pruning.md`, "give the tier's IPC files per-file
+> stats") was written because the tier has no pruning metadata. Measurement
+> then showed the tier was a net LOSS at every shape — a recent-window point
+> lookup ran 1.21s against 0.59s for the same query on a Delta-only window a
+> day older, and a wide aggregate 1.31s against 0.21s — because Foyer already
+> keeps fresh Delta parquet on local disk (`put_cached` warms from the
+> just-written bytes) WITH stats, blooms and a page index, while the tier held
+> 644GB of unindexed IPC and starved Foyer's 120GB cap. Disabling it made
+> recent-window queries ~6x faster while the Delta-only control moved 1.2x.
+> So every hot-tier item below is history, not work: §1c shipped and was then
+> deleted with the module, and §1b's open item is void. Remaining work is the
+> Delta path only. Incident note: 2026-08-21 morning fast-OOM
 > loop was the pre-existing anon-125GB memcg kill at morning peak, NOT these
 > changes; fork pin reverted to e2e2c65e during triage (consolidated
 > 2568401c re-lands via staging).
@@ -331,13 +343,12 @@ whole-conjunction failure on one non-convertible conjunct.
       all-or-nothing genus as the conjunction bug; consider per-file scoping.
 - [x] DONE (05bdcd5 matrix): completed cells 13/40 -> 16/40; C/P1 1h TIMEOUT->8.1s, D/P1 1h 5.6s->0.95s, D/P1 30d completes (16.9s). Post-deploy verify: 24h `SELECT *` trace_id lookup completes; string
       point lookups show `predicate=` on the delta scan.
-- [ ] OPEN (superseded in urgency by hot-leg pruning — see 2026-08-21 plan): re-profile the 2x hot/delta overlap BY ADMISSION REASON before
-      attributing it to conjunction loss: rows admitted because outside the
-      hot range vs specifically by `updated_at > gate` vs exact duplicates of
-      hot rows vs genuine newer Delta versions. Distinguishes a bug from an
-      overly conservative gate derivation from expected MOR behavior.
+- [x] VOID 2026-08-21 — the hot tier was removed, so there is no hot/delta
+      overlap and no `updated_at > gate` admission left to profile.
 
-### 1c. Hot tier must absorb updates instead of forfeiting coverage — SHIPPED 2026-08-20
+### 1c. Hot tier must absorb updates instead of forfeiting coverage — SHIPPED 2026-08-20, then REMOVED 2026-08-21
+> Kept as a record of what the tier did and why; the module and both fixes
+> below were deleted with it. See the STATUS header.
 Diagnosed from the 2x hot/delta double-read + the enrichment pattern (every
 row updated ~twice). Two compounding leaks in `hot_tier.rs`:
 - `version_gate` = the demoted file's `max_stamp`; enrichment versions are

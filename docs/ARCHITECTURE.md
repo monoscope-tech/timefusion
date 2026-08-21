@@ -16,7 +16,7 @@ DataFusion planner and executor
        |
        +---- write ----> WAL ----> memory buffer ----> Delta Lake on S3
        |
-       `---- read -----> memory buffer + hot tier + Delta Lake
+       `---- read -----> memory buffer + Delta Lake
                                       |
                                       `---- Foyer object cache
 ```
