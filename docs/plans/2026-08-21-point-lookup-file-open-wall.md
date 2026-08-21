@@ -98,11 +98,43 @@ row_groups_pruned_bloom_filter = 653 → 1     ← blooms are excellent
 bloom_filter_eval_time         = 4.17ms      ← for ~4ms, not ~3s
 ```
 
+**Cite leg 2, not leg 1, for "blooms suffice on their own."** Leg 1's
+653→1 is *confounded*: that plan carried
+`required_guarantees=[id in (…17 UUIDs…)]`, and those ids came **from** the
+plan-time tantivy search we propose to remove — so leg 1 cannot prove blooms
+stand alone. Leg 2 can: it had `required_guarantees=[]` (no id-set) and still
+bloom-pruned **102 row groups → 0 on the `context___trace_id` bloom alone**.
+That is the un-confounded evidence, and it is what P0 rests on.
+
 File-level min/max prunes nothing and *structurally cannot*: `trace_id` is
 random hex, so every file's `[min,max]` spans the hex space. Min/max is the
 wrong index for a high-cardinality random key. Blooms fix that — but they
 live **inside the footer**, so consulting one requires already having opened
 the file. They save decode; they can never save the open.
+
+### 3b. Exactly what P0 changes — and what it does not
+
+Equality routing is **gated on the RAW tokenizer**
+(`src/read/optimizers.rs:1126-1145`: `if indexed_columns.get(&c.name)?.0 !=
+RAW_TOKENIZER { return None }`). Cross-referencing the 12 tantivy-indexed
+columns against the 7 bloomed ones in `schemas/otel_logs_and_spans.yaml`:
+
+| raw-tokenized (so affected by the flip) | bloom? | consequence of flipping |
+|---|---|---|
+| `id`, `parent_id`, `context___trace_id`, `context___span_id` | **yes** | falls back to blooms — the measured 102→0 path |
+| `kind`, `status_code`, `level` | no | **no loss**: low-cardinality (`log`/`span`, `ERROR`/`OK`, `error`/`info`), so neither a bloom nor a term index prunes — essentially every file holds every value |
+
+`name`, `status_message`, `body`, `attributes`, `summary` are ngram3, so
+equality never routed to them in the first place. **`attributes___user___email`
+is not tantivy-indexed at all**, so the flip does not touch it — the
+companion doc's "add the email bloom" item stands on its own merit,
+independent of P0.
+
+Critically, **LIKE / regex / `contains` routing is unaffected** — those match
+in the `Expr::Like` and regex arms, which are not gated by `allow_eq`. The
+DSL's substring search keeps its tantivy acceleration. P0 removes the
+plan-time index lookup *only* for exact `=`, which is precisely the case
+blooms already serve.
 
 ### 4. Healthy — ruled out, do not chase
 
@@ -116,6 +148,35 @@ timestamps defeating the plan cache. Identical vs varying literals time the
 same. (Consistent with the code: the shape cache lifts literals to `$N`, and
 a hit skips only parse/analyze/optimize — never physical planning, which is
 where the cost is.)
+
+### 4b. The residual planning cost does NOT scale with window
+
+Running the same ladder on variant B (rewrite defeated, so no tantivy),
+3 interleaved reps, min per window:
+
+| window | A (tantivy-routed) | B (no tantivy) |
+|---|---|---|
+| 1 min | 147ms | ~905ms |
+| 1 h | 305ms | ~1,352ms |
+| 24 h | 1,133ms | ~900ms |
+| 7 d | **4,789ms** | **~888ms** |
+
+**B is flat across windows; A scales.** So the window-scaling of planning is
+the tantivy prefilter (wider window → more sidecar indexes to fetch and
+search), *not* the delta-rs `provider.scan()` replay or `dedup_window_clean`.
+The non-tantivy residual is a roughly constant ~0.9–1.5s.
+
+Two honesty caveats: this ladder ran while prod was heavily loaded (`SELECT 1`
+in that same session cost **3,376ms**, versus 84ms earlier), so B's absolute
+floor is inflated and one rep hit a 28s outlier — the *flatness* is the robust
+claim, not the exact floor. And B's `||''` defeats pushdown, so B selects more
+files than a real `route_equality=false` would, which makes the flatness
+finding conservative rather than optimistic.
+
+This **re-sizes P3/P5**: after P0, planning stops being window-proportional,
+so compaction's value shifts away from planning and toward the cold-path
+opens it always addressed. It also means the ~0.9–1.5s residual — not file
+count — becomes the next ceiling for point lookups, and it is unattributed.
 
 ### 5. Dedup is never skipped
 
@@ -142,10 +203,21 @@ leave it half-alive. (P0 makes this non-urgent, which is why it is second.)
 `never_certified`. Diagnose why `record_clean_slice` never grants; removes
 `DedupExec` from every eligible scan.
 
+**P2b — attribute the ~0.9–1.5s non-tantivy planning residual.** After P0 this
+*is* the point-lookup cost, and it does not scale with window (§4b), so
+neither compaction nor a pruning index will move it. Nothing below should be
+sized until this is understood. Prime suspects from the code map:
+`provider.scan()`'s O(files) replay with plan-time deletion-vector loads
+(`scan/replay.rs:150-163`), and `dedup_window_clean`'s two full
+`get_file_uris()` string scans per query (`src/database/maintain.rs:2655`),
+which are O(*total* files, ~26k) rather than O(window). Measure on a quiet
+box — the counters are contaminated under prod load.
+
 **P3 — compaction to <20 files/project-day** (from ~62 measured here, ~200
-fleet-wide). File count multiplies planning *and* opens, so this is the lever
-that scales everything else. Sized against measured anchors rather than a
-synthesized per-file cost:
+fleet-wide). **Re-scoped by §4b**: since planning is flat once tantivy is out
+of the path, compaction's value is the cold-path opens and decode, not
+planning. Sized against measured anchors rather than a synthesized per-file
+cost:
 
 | | files/day | 30d files | equivalent to |
 |---|---|---|---|
