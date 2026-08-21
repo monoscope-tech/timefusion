@@ -2654,6 +2654,9 @@ fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGr
 /// Accumulates deferred `UPDATE ... FROM` Delta legs and drains them as
 /// batched merges. One instance per `Database`, created when
 /// `TIMEFUSION_DML_COALESCE_SECS > 0`.
+/// Manual format: `PendingGroup` holds an `Arc<dyn Session>`, which has no `Debug`.
+#[derive(derive_more::Debug)]
+#[debug("DmlCoalescer {{ interval_secs: {interval_secs}, queued_rows: {}, .. }}", queued_rows.load(Ordering::Relaxed))]
 pub struct DmlCoalescer {
     interval_secs: u64,
     /// See `fold_groups` — cross-project folding of same-shape groups.
@@ -2665,16 +2668,6 @@ pub struct DmlCoalescer {
     drain_lock: tokio::sync::Mutex<()>,
     /// Where terminally-failed groups are parked instead of dropped.
     quarantine_dir: std::path::PathBuf,
-}
-
-impl std::fmt::Debug for DmlCoalescer {
-    // Manual: PendingGroup holds an Arc<dyn Session>, which has no Debug.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DmlCoalescer")
-            .field("interval_secs", &self.interval_secs)
-            .field("queued_rows", &self.queued_rows.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
 }
 
 impl DmlCoalescer {

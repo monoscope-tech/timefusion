@@ -136,18 +136,17 @@ pub struct DerivedBudget {
 }
 
 /// Reservation shape selected internally for a server or one-shot maintenance CLI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, strum::EnumString)]
+#[strum(serialize_all = "kebab-case")]
 pub enum BudgetProfile {
     #[default]
     Server,
     MaintenanceCli,
 }
 
+/// Anything unrecognised (including unset) is the server profile.
 fn profile_from_env() -> BudgetProfile {
-    match std::env::var("TIMEFUSION_BUDGET_PROFILE").as_deref() {
-        Ok("maintenance-cli") => BudgetProfile::MaintenanceCli,
-        _ => BudgetProfile::Server,
-    }
+    std::env::var("TIMEFUSION_BUDGET_PROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or_default()
 }
 
 // 0.20, down from 0.25: sampled pool usage sat at 0 while the 70% memory
@@ -613,193 +612,6 @@ pub fn is_insecure_auth_allowed() -> bool {
     std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-// serde `default = "..."` needs a fn per default value. The owned-type arms
-// convert (`&str` → String/PathBuf); everything else returns the literal.
-macro_rules! const_default {
-    ($name:ident: String = $val:expr) => {
-        fn $name() -> String {
-            $val.into()
-        }
-    };
-    ($name:ident: PathBuf = $val:expr) => {
-        fn $name() -> PathBuf {
-            PathBuf::from($val)
-        }
-    };
-    ($name:ident: $t:ty = $val:expr) => {
-        fn $name() -> $t {
-            $val
-        }
-    };
-}
-
-const_default!(d_true: bool = true);
-const_default!(d_tantivy_build_concurrency: usize = 2);
-const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
-const_default!(d_data_dir: PathBuf = "./data");
-const_default!(d_pgwire_port: u16 = 5432);
-const_default!(d_table_prefix: String = "timefusion");
-const_default!(d_batch_queue_capacity: usize = 100_000_000);
-const_default!(d_pgwire_user: String = "postgres");
-const_default!(d_pgwire_max_statement_secs: u64 = 60);
-// 60s (was 300s): a shorter flush interval bounds how much un-flushed WAL a
-// restart must replay — startup/redeploy downtime is dominated by WAL replay,
-// which scales ~linearly with this interval. Trade-off: ~5x more Delta
-// commits / small files (handled by compaction/OPTIMIZE).
-const_default!(d_flush_interval: u64 = 60);
-// Flush dwell: a sealed-but-young bucket waits this long from CREATION before
-// the periodic flush commits it, unless it is already big. -1 = one
-// bucket_duration (the prod default), 0 = off (the test harnesses set this —
-// they assert "sealed => next tick flushes"). See flush_completed_buckets.
-const_default!(d_flush_dwell_secs: i64 = -1);
-const_default!(d_retention_mins: u64 = 70);
-// The local hot tier: demoted sealed buckets served as the scan's third leg.
-//
-// Holds WHATEVER FITS ON DISK — no time retention. Used to keep a fixed
-// number of hours, which made the tier's value depend on guessing the right
-// number and left disk unused. GC now unlinks oldest-first purely to stay
-// under `d_hot_tier_max_disk_gb`, so buying disk buys coverage directly, and
-// `skip_for_lookback` reads the tier's MEASURED span rather than a setting.
-const_default!(d_hot_tier_enabled: bool = true);
-// Files are UNCOMPRESSED (~4x the bytes of the LZ4 era), so this holds
-// roughly the coverage the old compressed cap did — bought with disk that was
-// sitting idle instead of decompression CPU and anon heap. Raise it to buy
-// more history; that is now the only knob that changes how far back the tier
-// reaches.
-const_default!(d_hot_tier_max_disk_gb: u64 = 600);
-const_default!(d_hot_tier_merge_demote: bool = true);
-const_default!(d_eviction_interval: u64 = 60);
-const_default!(d_buffer_max_memory: usize = 4096);
-const_default!(d_wal_shards_per_topic: usize = 4);
-// Total graceful-shutdown budget shared by ALL serial shutdown phases
-// (PGWire drain → buffered-layer flush + cursor snapshot).
-// Set to ~80% of the orchestrator's SIGTERM→SIGKILL grace (Docker/CapRover
-// `StopGracePeriod`; prod is 90s) so the clean cursor snapshot always lands
-// before SIGKILL — the previous per-phase 180s ceilings assumed grace nobody
-// configured, and PGWire drain alone could eat the real grace before the
-// flush or snapshot ever started. Anything unflushed at the deadline is
-// durable in the WAL and replays on next boot.
-const_default!(d_stop_grace: u64 = 70);
-const_default!(d_wal_corruption_threshold: usize = 10);
-// Concurrent staged flush commits. Parquet encode + S3 upload happen outside
-// the per-table commit lock (see insert_records_batch staged path), so this scales
-// upload throughput directly — the dominant steady-state drain lever under
-// backfill. 8 doubles concurrency over the old 4 while bounding in-flight
-// encode memory; raise further (env) if CPU/R2 headroom allows.
-const_default!(d_flush_parallelism: usize = 8);
-// Cross-project flush commit coalescing (C3). All default-storage projects share
-// ONE physical Delta table, and `table_lock_key` already serializes their commits
-// behind a single mutex — so N per-project commits per tick produce N log entries,
-// N snapshot refreshes and N log-JSON parses where 1 would do. When enabled, one
-// tick produces one commit per PHYSICAL table carrying every project's Add
-// actions; parquet writes still fan out `flush_parallelism`-wide, only the
-// commit is shared. Custom-storage projects have their own `_delta_log` and are
-// never coalesced with default storage.
-// Default OFF: the coalesced path changes the durability-critical commit +
-// watermark shape, so it ships as an operator-enabled lever (env
-// `TIMEFUSION_FLUSH_COALESCE_COMMITS=true`) that needs a soak before default-on.
-const_default!(d_flush_coalesce_commits: bool = false);
-// Cold-boot Delta cursor reconciliation. R2 happily takes 64+ concurrent
-// gets per bucket; the original 8 left ~8× headroom. Depth 8 is half the
-// original 16 (the snapshot replaces the bulk of the scan) but keeps a
-// safety margin: if a few snapshot writes failed silently before reboot,
-// depth-2 could miss the legitimate cursor advance. Tune via env if the
-// fallback Delta scan is the bottleneck.
-const_default!(d_delta_scan_concurrency: usize = 64);
-const_default!(d_delta_scan_depth: usize = 8);
-const_default!(d_wal_fsync_ms: u64 = 200);
-// MemBuffer bucket window (seconds). Smaller windows free RAM sooner because
-// the previous bucket becomes flushable sooner; larger windows amortize into
-// fewer/larger Delta commits. 300s, halved from 600s to cut peak MemBuffer
-// footprint (the current bucket is excluded from flushing, so this is the
-// floor on how long a row accumulates in RAM). Trade-off is ~2× Delta commits
-// / small files; high-throughput tenants can go lower (60–120s), memory-relaxed
-// deployments can raise it back.
-const_default!(d_bucket_duration_secs: u64 = 300);
-// Memory pressure threshold (0–100) at which the flush task is woken
-// independently of the periodic flush timer. Triggers an early
-// `flush_completed_buckets` so MemBuffer drains before reservation reaches
-// the hard limit. 0 disables pressure-triggered flushes.
-const_default!(d_pressure_flush_pct: u32 = 75);
-// Max seconds an insert applies backpressure (synchronously flushing
-// MemBuffer → Delta to free RAM) before failing, when the memory hard limit
-// is hit. The rows are already durable in the WAL, so this trades a slow
-// write for a rejected one — the right call for a TS DB whose producers DLQ
-// on rejection. 0 restores the old fail-fast behavior. 60s is long enough to
-// ride out a flush cycle / drain a replayed backlog, finite so a genuinely
-// down Delta can't pile blocked writers up without bound.
-const_default!(d_write_backpressure_secs: u64 = 60);
-// DML coalescing (0 = disabled). When > 0, the Delta leg of `UPDATE ... FROM`
-// statements is deferred and batched: sources accumulate per (project, table,
-// statement shape) and a background task merges them every N seconds, cutting
-// one-Delta-commit-per-statement churn (which starves OPTIMIZE via OCC and
-// piles up small files) down to a few commits per interval. The in-memory leg
-// still applies synchronously, so reads that overlay the buffer stay
-// read-your-writes. CONTRACT: statements must be idempotent under
-// re-application (e.g. guard appends with `NOT (col @> val)`), because a row
-// flushed between the mem leg and the drain sees the assignment applied
-// twice, and a failed drain retries whole groups. Timestamp-range conjuncts
-// are widened to the union across coalesced statements.
-// 3s ON by default: a drain hash-update storm (repeated same-shape UPDATEs,
-// each rewriting most of the hot partition) OOM-looped prod; coalescing
-// collapses a window's statements into one rewrite. 0 restores the
-// synchronous per-statement path.
-const_default!(d_dml_coalesce_secs: u64 = 3);
-// Watchdog for a single bucket's Delta commit inside `flush_bucket`. A hung S3
-// commit / commit-lock wait otherwise pins `flush_lock` forever with no log:
-// flushes freeing zero memory while inserts wedge at the hard limit. On
-// timeout the flush errors (counted in flush_failed + flush_stalled),
-// releasing the lock so relief retries; rows stay in MemBuffer + WAL, so it's
-// safe. Must exceed a normal backfill commit but stay well under retention.
-//
-// The CEILING, not the budget: `BufferedWriteLayer::adaptive_flush_timeout`
-// contracts it as the ingest buffer fills. Read that function before changing
-// this — prod has been wedged from both ends of the fixed-value trade (too low
-// aborted legitimate multi-GB drains into a retry loop; too high let a hung
-// commit hold the global flush_lock until every tenant's INSERT was rejected).
-// 600 stays right for the ceiling: with headroom, a slow-but-progressing
-// commit should be allowed to finish, since aborting it wastes the work and
-// the next attempt is no faster.
-const_default!(d_flush_bucket_timeout_secs: u64 = 600);
-// Durability mode for the WAL. One of:
-//   "sync_each" — fsync after every entry (default; zero data-loss window, ~1ms per write)
-//   "ms"        — async fsync every `wal_fsync_ms` (~200ms loss window; a torn
-//                 mmap tail after OOM/SIGKILL quarantines acked entries)
-//   "none"      — never fsync (test/throwaway data only)
-const_default!(d_wal_fsync_mode: String = "sync_each");
-const_default!(d_wal_ack_fsync: bool = true);
-// 0 = unset → derived (DerivedBudget::wal_flush_file_threshold); env-set wins.
-const_default!(d_wal_max_files: usize = 0);
-const_default!(d_wal_hard_limit_gb: u64 = 192);
-const_default!(d_foyer_memory_mb: usize = 1024);
-// Local disk is cheap and fast relative to S3 GETs, so default the cache large
-// — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse,
-// but this is the logical ceiling at which it starts evicting, so it MUST stay
-// <= the cache volume's free space or writes hit ENOSPC before eviction kicks
-// in. Lower it on smaller disks.
-const_default!(d_foyer_disk_gb: usize = 500);
-const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
-const_default!(d_provider_cache_ttl: u64 = 300); // 5 minutes
-const_default!(d_provider_cache_capacity: usize = 4_096);
-const_default!(d_foyer_shards: usize = 8);
-const_default!(d_foyer_file_size_mb: usize = 32);
-const_default!(d_foyer_stats: String = "true");
-const_default!(d_metadata_size_hint: usize = MIB);
-// DataFusion's in-process decoded-parquet-metadata cache (footer + page index).
-// Distinct from the Foyer footer-BYTES cache: this holds the decoded
-// ParquetMetaData so repeat scans skip re-parsing. Entries larger than the
-// limit are silently dropped, so it must comfortably exceed a single file's
-// metadata; the DataFusion default is only 50MB.
-const_default!(d_df_metadata_cache_mb: usize = 512);
-const_default!(d_metadata_memory_mb: usize = 512);
-const_default!(d_metadata_disk_gb: usize = 5);
-const_default!(d_metadata_shards: usize = 4);
-const_default!(d_warm_inline_max_mb: usize = 0);
-const_default!(d_write_capture_max_mb: usize = 32);
-const_default!(d_write_capture_budget_mb: usize = 256);
-const_default!(d_foyer_block_size_mb: usize = 256);
-const_default!(d_l1_max_entry_mb: usize = 16);
-const_default!(d_cache_recent_days: usize = 8);
 /// Bound on the post-commit cache confirm. It is an optimization, never a
 /// durability gate, so a slow warm must not stall the flush loop.
 pub const CACHE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -809,197 +621,6 @@ pub const CACHE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 /// tracks, ON the flush path — the untracked-consumer shape behind this box's
 /// prior OOMs. Peak ≈ this × largest added file.
 pub const CACHE_CONFIRM_CONCURRENCY: usize = 4;
-const_default!(d_cache_bypass_scan_hours: u64 = 24);
-const_default!(d_page_rows: usize = 20_000);
-const_default!(d_zstd_level: i32 = 3);
-// Tiered compression by partition age. Hot writes prioritize ingest latency;
-// older data is rewritten at progressively higher levels by `recompress_tier`.
-const_default!(d_zstd_level_intermediate: i32 = 1);
-const_default!(d_zstd_level_warm: i32 = 9);
-const_default!(d_zstd_level_cold: i32 = 19);
-const_default!(d_cold_cutoff_days: u64 = 14);
-const_default!(d_recompress_schedule: String = "0 0 3 * * *");
-const_default!(d_row_group_size: usize = 128 * MIB);
-const_default!(d_checkpoint_interval: u64 = 10);
-// 256MB compacted-file target: fewer, larger files cut Delta metadata, S3
-// object count, and the per-commit get_file_uris() walk on the flush append
-// path; sorted + page-indexed files still prune time-range queries within a
-// file, so the query downside is minimal for this (project_id,date)-partitioned
-// workload. Light/today optimize keeps its own 16MB target.
-const_default!(d_optimize_target: i64 = 256 * MIB as i64);
-// Cold tier: sealed partitions (older than `cold_optimize_after_days`) bin-pack
-// to 512MB. File size grows with partition age — recent days stay at 256MB (less
-// rewrite while the day still fills), sealed days consolidate to 512MB so the
-// Delta checkpoint (≈ live file count) shrinks, the dominant driver of commit
-// latency. Compression is per-row-group, so bigger files don't change bytes
-// stored — the win is fewer files. Re-runs are cheap: Compact skips files
-// already ≥ target. 512MB, not 1GB: a merge holds ~target-sized output buffers
-// per concurrent task and the decompressed working set is ~17x the compressed
-// target, so 1GB made the final consolidation's sort/merge memory-hostile.
-const_default!(d_cold_optimize_target: i64 = 512 * MIB as i64);
-// 1 day = everything past the current (day-partitioned) partition. Only today
-// still takes writes, so every sealed day consolidates to 512MB. The warm
-// optimize is clamped to dates newer than this boundary (see `optimize_table`)
-// so the 30-min Z-order never fragments these files back to 256MB.
-const_default!(d_cold_optimize_after_days: u64 = 1);
-const_default!(d_stats_cache_size: usize = 50);
-// Observability data is high-churn and rarely time-traveled; the only hard
-// floor is that retention must outlive any in-flight query (which holds a Delta
-// snapshot referencing files vacuum would delete). This value also drives
-// `delta.deletedFileRetentionDuration` (set at create + reconciled at load):
-// Remove tombstones stay in every checkpoint for this long, and a shorter
-// default's compaction churn accumulated tombstones replayed on every
-// snapshot refresh.
-//
-// 72h, not 24h: removed-but-unvacuumed files are the ONLY recovery source
-// after a bad rewrite, and the default is what a deploy-wiped env falls back
-// to. A vacuum once fired inside a 24h window right after an env wipe and
-// permanently destroyed millions of rows' recovery source. A 3-day floor
-// keeps one bad daytime incident recoverable across a weekend.
-const_default!(d_vacuum_retention: u64 = 72);
-// Delta _delta_log (transaction-log) retention. Keeps the log directory small
-// (~commit-rate × retention files) so every commit's version-discovery LIST
-// stays cheap. Delta's default is 30 DAYS, which let the log grow to tens of
-// thousands of objects and made each commit's version-discovery slow; even a
-// 1-day window regrew under the multi-tenant per-project commit rate, so hold
-// a tighter 6h window. enableExpiredLogCleanup (default true) prunes during
-// checkpoints; cross-project flush coalescing cuts the commit rate driving
-// growth.
-const_default!(d_log_retention: u64 = 6);
-const_default!(d_optimize_window_hours: u64 = 48);
-const_default!(d_compact_min_files: usize = 5);
-// 256MB (raised from 32MB): the small-merge-memory rationale for a tiny
-// hot/today target is moot on this box, and 32MB left the hot partition as
-// dozens of tiny files for a high-write project — recent queries were
-// file-open-latency bound. A larger target collapses today's sealed slices
-// into a few large event-time-disjoint runs.
-const_default!(d_light_optimize_target: i64 = 256 * MIB as i64);
-const_default!(d_writer_max_file_bytes: usize = 512 * MIB);
-const_default!(d_repair_max_file_bytes: usize = 512 * MIB);
-// 2 GiB escalation threshold for the flush sort. The flush sort is IN-PROCESS
-// and allocates OUTSIDE the DataFusion pool — raising this ceiling authorised
-// multi-GB untracked allocations on the ingest path and correlated with OOM
-// kills, so it was reverted. Past this threshold the flush instead sorts
-// inside a pooled, disk-spilling DataFusion plan (`sort_flush_group_spilling`)
-// — the footer stays honest and the peak is bounded by the pool. 2 GiB keeps
-// the fast in-process path for everything ordinary; DataFusion's sort also
-// overtakes Arrow lexsort above ~370 MB, so the pooled path is faster there too.
-const_default!(d_sort_skip_bytes: usize = 2 * GIB);
-const_default!(d_flush_sort_pool_mb: u64 = 1024);
-const_default!(d_light_schedule: String = "0 */5 * * * *");
-// Must match d_dedup_lookback_days — certification and rollup coverage need
-// the same horizon, or a day is certified but never rolled up (or vice versa).
-const_default!(d_rollup_backfill_days: u16 = 35);
-const_default!(d_rollup_backfill_schedule: String = "0 */10 * * * *");
-const_default!(d_footer_repair_schedule: String = "0 30 * * * *");
-const_default!(d_footer_repair_budget_secs: u64 = 8640);
-const_default!(d_repair_lookback_days: u64 = 31);
-const_default!(d_optimize_schedule: String = "0 */30 * * * *");
-// Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
-// cold target. Calendar-age driven; idempotent (skips ≥-target files).
-const_default!(d_consolidate_schedule: String = "0 30 2 * * *");
-const_default!(d_consolidate_catchup_passes: usize = 4);
-// Every 6h, not daily: tombstones leave the checkpoint once older than the
-// retention window, so vacuum must run often enough to delete files before
-// their tombstones age out (VacuumMode::Full backstops any that slip through).
-const_default!(d_vacuum_schedule: String = "0 15 */6 * * *");
-// Out-of-band checkpoint + expired-log cleanup, driven here instead of
-// delta-rs's commit-path hook: a hook failure surfaced as a commit error
-// AFTER the commit landed, and the flush path misread that as a failed
-// commit and deleted the committed parquet. Every 2 min, tolerant of R2
-// 500s — faster than the commit cadence so the log stays bounded.
-const_default!(d_checkpoint_schedule: String = "0 */2 * * * *");
-// Reconcile active Add entries against object-store truth: HEAD every live
-// file and commit Remove for any that are missing. Repairs dangling Adds left
-// by past commit-path parquet deletions; a nonzero removal count means
-// committed data was destroyed elsewhere.
-const_default!(d_reconcile_schedule: String = "0 0 * * * *");
-const_default!(d_tantivy_reconcile_schedule: String = "0 30 3 * * *");
-const_default!(d_warm_recency_days: u64 = 1);
-// 16: at concurrency 4 a large boot warm ran >55 min and was cut short by a
-// restart every time; 16 finishes in ~1-3 min. Footer GETs are small
-// suffix-range reads, well within R2/S3 burst limits.
-const_default!(d_warm_concurrency: usize = 16);
-const_default!(d_snapshot_reconcile: u64 = 500);
-// Byte ceiling on the file set one dedup chunk rewrite may materialize.
-// Over-budget chunks are SKIPPED loudly (metric: timefusion.dedup.chunk_skipped)
-// rather than rewritten — read-side dedup keeps queries correct meanwhile.
-// Guards against e.g. a z-ordered whole-day file dragging the whole day into
-// one rewrite. Kept in step with `d_dedup_max_decoded_bytes` — shard count
-// takes the MAX of both, so leaving this lower would silently cap sharding
-// below the decoded budget.
-const_default!(d_dedup_max_rewrite_bytes: u64 = GIB as u64 / 2);
-// 512 MiB estimated decoded footprint, sized so permits x budget stays bounded
-// in flight (see HEAVY_REWRITE_PERMITS). A chunk this large already dwarfs the
-// DataFusion pool; larger chunks skip rather than risk the cgroup.
-//
-// Sized to FUND SHARD CONCURRENCY, not to save memory: `dedup_shard_concurrency`
-// runs `DEDUP_BIN_ARROW_BUDGET / this` shards at once, so a smaller shard buys
-// parallelism at an unchanged peak. It also keeps each unit inside its per-bin
-// deadline — a unit bigger than its budget produces nothing, forever.
-const_default!(d_dedup_max_decoded_bytes: u64 = GIB as u64 / 2);
-// 12x compressed->decoded: zstd on wide Variant/JSON otel rows routinely
-// decodes 10-20x; 12 is a deliberately conservative floor.
-const_default!(d_dedup_decode_inflation: u64 = 12);
-// 4 KiB/row decoded estimate for otel spans (wide Variant/JSON bodies).
-const_default!(d_dedup_bytes_per_row: u64 = 4096);
-// Serial: each merge-update decodes + rewrites whole hot partitions with
-// pool-invisible memory; concurrent stacking under a heavy UPDATE-drain
-// storm drove an OOM crash-loop. Results are identical either way — permits
-// only bound peak memory, excess statements queue.
-const_default!(d_dml_merge_concurrency: usize = 1);
-// 128: a lower bound put a multi-day floor under the backlog, but a much
-// higher one OOM'd the box — RSS climbed independent of query load, tracking
-// pass-scoped state (per-bin provider/session/snapshot) that only frees at
-// pass end. 128 completes a pass in ~10-15min while draining well above the
-// original rate.
-//
-// Separately: how many days back (plus today) the dedup sweep covers. 1 day
-// catches cross-flush dupes from a late replay crossing midnight, but 35 is
-// needed because this sweep is the ONLY caller of `record_certification`,
-// which bounds how far back a partition can be certified duplicate-free —
-// rollup routing needs a contiguous certified prefix across the query window,
-// so a 1-day horizon meant no 7d/14d/30d query could ever route to a rollup.
-//
-// Affordable because the sweep is O(partitions-changed), not O(window): a
-// partition whose `dedup_clean_fp` still matches its live fingerprint is
-// skipped without a probe, and `deadline` + `dedup_sweep_cursor` rotation
-// bound and resume a truncated tick. Do NOT raise this without matching
-// coordinator job concurrency, or the work list backs a queue that commits
-// nothing. 35 covers a 30d query with margin and matches `d_repair_lookback_days`.
-const_default!(d_dedup_lookback_days: u64 = 35);
-const_default!(d_query_partitions: usize = 0);
-// Wide-scan admission guard. 16 concurrent Parquet decoders bounds untracked
-// decode heap well under the pool on this box (48-way caused an OOM). Wide
-// observability windows are already latency-bound below this, so gating is
-// near-free. 2h lookback keeps the hot dashboards ungated (they page-prune to
-// tiny per-file bytes) while 3d+/no-time scans queue. Both tunable via
-// TIMEFUSION_{MAX_CONCURRENT_SCAN_READERS,WIDE_SCAN_LOOKBACK_HOURS}.
-const_default!(d_max_concurrent_scan_readers: usize = 16);
-const_default!(d_wide_scan_lookback_hours: u64 = 2);
-// Sized against the incident that motivated the gate: a 7-day dashboard
-// opened hundreds of files at ~48-way parallelism.
-//
-// The file-count half assumed a recent-window scan selects a handful of
-// files after pruning — false once partitions fragmented to thousands of
-// small files, at which point the release could never fire and every
-// dashboard past the 2h lookback queued behind the semaphore.
-//
-// BYTES are the honest proxy for decode heap; file COUNT is a proxy for a
-// proxy, and fragmentation is exactly what invalidates it. Median prod file
-// is ~0.1 MB, so 256 files is only ~26 MB — the MB cap does the real
-// bounding, and the 7-day case that motivated the gate blows through it regardless.
-const_default!(d_wide_scan_max_files: usize = 256);
-// Compressed parquet bytes understate transient Arrow decode heap by an
-// order of magnitude on OTel data — a 222 MB file measured ~4 GiB of process
-// growth decoding 48 row groups in parallel, so it must participate in the
-// shared decode gate rather than the small-scan exemption. 64 MB keeps
-// genuinely small, well-pruned history reads ungated.
-const_default!(d_wide_scan_max_mb: u64 = 64);
-const_default!(d_plan_cache_capacity: usize = 2048);
-const_default!(d_otlp_endpoint: String = "http://localhost:4317");
-const_default!(d_service_name: String = "timefusion");
-const_default!(d_service_version: String = env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -1029,54 +650,46 @@ pub struct AppConfig {
     pub derived: DerivedBudget,
 }
 
-const_default!(d_tantivy_backfill_max_file_mb: u64 = 4096);
-const_default!(d_tantivy_max_index_mb: u64 = 64);
-// Sized against a working set, not a wish: the reaper only evicts what no
-// query has opened recently, and every eviction re-downloads a blob on the
-// next hit. 4 GB (the value this knob carried as dead code) would thrash the
-// hot window at prod scale. Measured working set: ~65 GB across ~6500 leaf
-// index dirs, so 64 sits right at it — the reaper trims rather than evicting
-// the hot window on its first pass.
-const_default!(d_tantivy_cache_disk_gb: u64 = 64);
-const_default!(d_tantivy_cache_reap_schedule: String = "0 */10 * * * *");
-// Level 3: index packing is on the flush hot path; level 19 cost ~88% of a
-// CPU window per flush for only 10-15% smaller output.
-const_default!(d_tantivy_zstd_level: i32 = 3);
-const_default!(d_tantivy_min_files: usize = 2);
-const_default!(d_tantivy_prefilter_max_hits: usize = 100_000);
-const_default!(d_tantivy_prefilter_min_selectivity_pct: u32 = 50);
-
 /// Tantivy sidecar-index config. Indexing is always-on for any table whose
 /// YAML schema declares `tantivy.indexed: true` on at least one field —
 /// schema is the single source of truth, no override knob.
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TantivyConfig {
-    #[serde(default = "d_tantivy_max_index_mb")]
+    #[serde_inline_default(64)]
     pub timefusion_tantivy_max_index_size_mb: u64,
     /// Byte budget for the local extracted-index cache
     /// (`<timefusion_data_dir>/tantivy_cache`), enforced LRU-first by the
     /// "Tantivy cache reap" cron — the only thing that deletes from that
     /// tree. Shares a volume with the WAL, so a full volume also fails WAL
     /// appends.
-    #[serde(default = "d_tantivy_cache_disk_gb")]
+    // Sized against a working set, not a wish: the reaper only evicts what no
+    // query has opened recently, and every eviction re-downloads a blob on the
+    // next hit. 4 GB (the value this knob carried as dead code) would thrash the
+    // hot window at prod scale. Measured working set: ~65 GB across ~6500 leaf
+    // index dirs, so 64 sits right at it — the reaper trims rather than evicting
+    // the hot window on its first pass.
+    #[serde_inline_default(64)]
     pub timefusion_tantivy_cache_disk_gb: u64,
     /// How often to enforce `timefusion_tantivy_cache_disk_gb`. Each sweep
     /// walks the whole cache tree; empty disables the reap (and the bound).
-    #[serde(default = "d_tantivy_cache_reap_schedule")]
+    #[serde_inline_default("0 */10 * * * *".to_string())]
     pub timefusion_tantivy_cache_reap_schedule: String,
-    #[serde(default = "d_tantivy_zstd_level")]
+    // Level 3: index packing is on the flush hot path; level 19 cost ~88% of a
+    // CPU window per flush for only 10-15% smaller output.
+    #[serde_inline_default(3)]
     pub timefusion_tantivy_compression_level: i32,
-    #[serde(default = "d_tantivy_min_files")]
+    #[serde_inline_default(2)]
     pub timefusion_tantivy_min_files_for_pushdown: usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
     /// the `id IN (...)` pushdown entirely — the IN-list itself becomes the
     /// bottleneck above this point. Default 100k.
-    #[serde(default = "d_tantivy_prefilter_max_hits")]
+    #[serde_inline_default(100_000)]
     pub timefusion_tantivy_prefilter_max_hits: usize,
     /// If a tantivy prefilter selects more than this percentage of the
     /// indexed rows, the pushdown isn't worth the round-trip; skip it and
     /// let Delta scan with the original predicate. Default 50 (%).
-    #[serde(default = "d_tantivy_prefilter_min_selectivity_pct")]
+    #[serde_inline_default(50)]
     pub timefusion_tantivy_prefilter_min_selectivity_pct: u32,
     /// Route exact `col = 'lit'` on raw-tokenized high-cardinality columns
     /// (trace_id/span_id/id/parent_id) through the tantivy id-prefilter, not
@@ -1086,7 +699,7 @@ pub struct TantivyConfig {
     /// stays as the post-filter backstop. Targets the trace/span lookup gap
     /// vs the indexed PG path. Default ON; set false to revert to
     /// bloom/stats-only equality pruning.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_tantivy_route_equality: bool,
     /// Startup backfill: build partition-mirrored indexes for live parquet
     /// files no manifest entry covers (pre-tantivy history, failed builds,
@@ -1097,7 +710,7 @@ pub struct TantivyConfig {
     /// Concurrent index builds during backfill/reconcile/post-optimize
     /// reindex. 2 is safe alongside prod query load; the off-box repair CLI
     /// raises it (each 1 GB parquet takes ~2-3 min to index).
-    #[serde(default = "d_tantivy_build_concurrency")]
+    #[serde_inline_default(2)]
     pub timefusion_tantivy_build_concurrency: usize,
     /// Backfill/reconcile skips parquet files larger than this (MB); 0 = no
     /// limit. Memory-tight runners OOM decoding+indexing very large files;
@@ -1111,12 +724,12 @@ pub struct TantivyConfig {
     /// outright: `pack_dir` still builds the compressed-index tar in memory,
     /// so 4096 keeps a bound on that one term while clearing the largest
     /// files on record with margin.
-    #[serde(default = "d_tantivy_backfill_max_file_mb")]
+    #[serde_inline_default(4096)]
     pub timefusion_tantivy_backfill_max_file_mb: u64,
     /// File-level scan pruning: when the prefilter engages, files whose
     /// covering index returned zero hits are excluded from the Delta scan
     /// entirely. Off switch for instant rollback to id-IN-list-only pruning.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_tantivy_file_pruning: bool,
     /// Warm the local index cache with blobs whose data is at most this many
     /// days old, at startup (0 = off). Turns the cold-window download cliff
@@ -1127,7 +740,7 @@ pub struct TantivyConfig {
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
     /// reader decodes only matching rows. Off switch for instant rollback to
     /// id-IN-list-only filtering inside surviving files.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_tantivy_row_selection: bool,
 }
 
@@ -1170,6 +783,7 @@ impl TantivyConfig {
     }
 }
 
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AwsConfig {
     #[serde(default)]
@@ -1178,7 +792,7 @@ pub struct AwsConfig {
     pub aws_secret_access_key: Option<String>,
     #[serde(default)]
     pub aws_default_region: Option<String>,
-    #[serde(default = "d_s3_endpoint")]
+    #[serde_inline_default("https://s3.amazonaws.com".to_string())]
     pub aws_s3_endpoint: String,
     #[serde(default)]
     pub aws_s3_bucket: Option<String>,
@@ -1277,25 +891,26 @@ pub enum OtelScanGuard {
     Enforce,
 }
 
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
-    #[serde(default = "d_data_dir")]
+    #[serde_inline_default(PathBuf::from("./data"))]
     pub timefusion_data_dir: PathBuf,
-    #[serde(default = "d_pgwire_port")]
+    #[serde_inline_default(5432)]
     pub pgwire_port: u16,
-    #[serde(default = "d_table_prefix")]
+    #[serde_inline_default("timefusion".to_string())]
     pub timefusion_table_prefix: String,
     #[serde(default)]
     pub timefusion_config_database_url: Option<String>,
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub enable_batch_queue: bool,
-    #[serde(default = "d_batch_queue_capacity")]
+    #[serde_inline_default(100_000_000)]
     pub timefusion_batch_queue_capacity: usize,
-    #[serde(default = "d_pgwire_user")]
+    #[serde_inline_default("postgres".to_string())]
     pub pgwire_user: String,
     #[serde(default)]
     pub pgwire_password: Option<String>,
-    #[serde(default = "d_pgwire_max_statement_secs")]
+    #[serde_inline_default(60)]
     pub timefusion_pgwire_max_statement_secs: u64,
     #[serde(default)]
     pub timefusion_otel_scan_guard: OtelScanGuard,
@@ -1315,42 +930,87 @@ impl CoreConfig {
     }
 }
 
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
-    #[serde(default = "d_flush_interval")]
+    // 60s (was 300s): a shorter flush interval bounds how much un-flushed WAL a
+    // restart must replay — startup/redeploy downtime is dominated by WAL replay,
+    // which scales ~linearly with this interval. Trade-off: ~5x more Delta
+    // commits / small files (handled by compaction/OPTIMIZE).
+    #[serde_inline_default(60)]
     pub timefusion_flush_interval_secs: u64,
-    #[serde(default = "d_flush_dwell_secs")]
+    // Flush dwell: a sealed-but-young bucket waits this long from CREATION before
+    // the periodic flush commits it, unless it is already big. -1 = one
+    // bucket_duration (the prod default), 0 = off (the test harnesses set this —
+    // they assert "sealed => next tick flushes"). See flush_completed_buckets.
+    #[serde_inline_default(-1)]
     pub timefusion_flush_dwell_secs: i64,
-    #[serde(default = "d_retention_mins")]
+    #[serde_inline_default(70)]
     pub timefusion_buffer_retention_mins: u64,
-    #[serde(default = "d_eviction_interval")]
+    #[serde_inline_default(60)]
     pub timefusion_eviction_interval_secs: u64,
     /// Local hot tier: instead of dropping a drained bucket, demote it to an
     /// uncompressed Arrow IPC file on local disk and serve recent-window
     /// reads via zero-copy mmap. This is the tier's main switch; **0 turns
     /// demotion off** (GC still sweeps). Past this age a demoted file is
     /// unlinked and its window falls back to Delta.
-    #[serde(default = "d_hot_tier_enabled")]
+    // The local hot tier: demoted sealed buckets served as the scan's third leg.
+    //
+    // Holds WHATEVER FITS ON DISK — no time retention. Used to keep a fixed
+    // number of hours, which made the tier's value depend on guessing the right
+    // number and left disk unused. GC now unlinks oldest-first purely to stay
+    // under `timefusion_hot_tier_max_disk_gb`, so buying disk buys coverage directly, and
+    // `skip_for_lookback` reads the tier's MEASURED span rather than a setting.
+    #[serde_inline_default(true)]
     pub timefusion_hot_tier_enabled: bool,
     /// Hard cap on the tier's directory; over it, GC unlinks oldest-first.
     /// The tier shares the WAL/data volume, which has twice been eaten by an
     /// unbounded consumer, so this one is a real dial.
-    #[serde(default = "d_hot_tier_max_disk_gb")]
+    // Files are UNCOMPRESSED (~4x the bytes of the LZ4 era), so this holds
+    // roughly the coverage the old compressed cap did — bought with disk that was
+    // sitting idle instead of decompression CPU and anon heap. Raise it to buy
+    // more history; that is now the only knob that changes how far back the tier
+    // reaches.
+    #[serde_inline_default(600)]
     pub timefusion_hot_tier_max_disk_gb: u64,
     /// Kill switch for hot-tier merge-on-demote (falls back to stacked files).
-    #[serde(default = "d_hot_tier_merge_demote")]
+    #[serde_inline_default(true)]
     pub timefusion_hot_tier_merge_demote: bool,
-    #[serde(default = "d_buffer_max_memory")]
+    #[serde_inline_default(4096)]
     pub timefusion_buffer_max_memory_mb: usize,
-    #[serde(default = "d_stop_grace")]
+    // Total graceful-shutdown budget shared by ALL serial shutdown phases
+    // (PGWire drain → buffered-layer flush + cursor snapshot).
+    // Set to ~80% of the orchestrator's SIGTERM→SIGKILL grace (Docker/CapRover
+    // `StopGracePeriod`; prod is 90s) so the clean cursor snapshot always lands
+    // before SIGKILL — the previous per-phase 180s ceilings assumed grace nobody
+    // configured, and PGWire drain alone could eat the real grace before the
+    // flush or snapshot ever started. Anything unflushed at the deadline is
+    // durable in the WAL and replays on next boot.
+    #[serde_inline_default(70)]
     pub timefusion_stop_grace_secs: u64,
-    #[serde(default = "d_wal_corruption_threshold")]
+    #[serde_inline_default(10)]
     pub timefusion_wal_corruption_threshold: usize,
-    #[serde(default = "d_flush_parallelism")]
+    // Concurrent staged flush commits. Parquet encode + S3 upload happen outside
+    // the per-table commit lock (see insert_records_batch staged path), so this scales
+    // upload throughput directly — the dominant steady-state drain lever under
+    // backfill. 8 doubles concurrency over the old 4 while bounding in-flight
+    // encode memory; raise further (env) if CPU/R2 headroom allows.
+    #[serde_inline_default(8)]
     pub timefusion_flush_parallelism: usize,
     /// Coalesce one tick's per-project flush commits into one commit per
     /// PHYSICAL Delta table (see `d_flush_coalesce_commits`).
-    #[serde(default = "d_flush_coalesce_commits")]
+    // Cross-project flush commit coalescing (C3). All default-storage projects share
+    // ONE physical Delta table, and `table_lock_key` already serializes their commits
+    // behind a single mutex — so N per-project commits per tick produce N log entries,
+    // N snapshot refreshes and N log-JSON parses where 1 would do. When enabled, one
+    // tick produces one commit per PHYSICAL table carrying every project's Add
+    // actions; parquet writes still fan out `flush_parallelism`-wide, only the
+    // commit is shared. Custom-storage projects have their own `_delta_log` and are
+    // never coalesced with default storage.
+    // Default OFF: the coalesced path changes the durability-critical commit +
+    // watermark shape, so it ships as an operator-enabled lever (env
+    // `TIMEFUSION_FLUSH_COALESCE_COMMITS=true`) that needs a soak before default-on.
+    #[serde_inline_default(false)]
     pub timefusion_flush_coalesce_commits: bool,
     #[serde(default)]
     pub timefusion_flush_immediately: bool,
@@ -1362,18 +1022,24 @@ pub struct BufferConfig {
     /// reject for unbounded growth if flush can't keep up.
     #[serde(default)]
     pub timefusion_wal_admit_decouple: bool,
-    #[serde(default = "d_wal_fsync_ms")]
+    #[serde_inline_default(200)]
     pub timefusion_wal_fsync_ms: u64,
-    #[serde(default = "d_wal_fsync_mode")]
+    // Durability mode for the WAL. One of:
+    //   "sync_each" — fsync after every entry (default; zero data-loss window, ~1ms per write)
+    //   "ms"        — async fsync every `wal_fsync_ms` (~200ms loss window; a torn
+    //                 mmap tail after OOM/SIGKILL quarantines acked entries)
+    //   "none"      — never fsync (test/throwaway data only)
+    #[serde_inline_default("sync_each".to_string())]
     pub timefusion_wal_fsync_mode: String,
     /// Fsync the WAL shard before acking DML appends (machine-crash
     /// durability). Batched INSERT appends are always flushed before ack;
     /// only single-entry DML appends defer to the background fsync thread —
     /// this closes that window. Default on: a torn mmap tail after
     /// OOM/SIGKILL can quarantine acked-but-unsynced entries.
-    #[serde(default = "d_wal_ack_fsync")]
+    #[serde_inline_default(true)]
     pub timefusion_wal_ack_fsync: bool,
-    #[serde(default = "d_wal_max_files")]
+    // 0 = unset → derived (DerivedBudget::wal_flush_file_threshold); env-set wins.
+    #[serde_inline_default(0)]
     pub timefusion_wal_max_file_count: usize,
     /// Force-flush backstop on total on-disk (unflushed) WAL bytes. Guards
     /// the case the memory-pressure valve misses: a stuck/retrying commit
@@ -1392,39 +1058,93 @@ pub struct BufferConfig {
     /// deliberately not the flush loop, which stalls in exactly the overload
     /// this guards against). DML mem legs are exempt: failing an UPDATE
     /// mid-statement would desync mem vs Delta. 0 disables.
-    #[serde(default = "d_wal_hard_limit_gb")]
+    #[serde_inline_default(192)]
     pub timefusion_wal_hard_limit_gb: u64,
-    #[serde(default = "d_bucket_duration_secs")]
+    // MemBuffer bucket window (seconds). Smaller windows free RAM sooner because
+    // the previous bucket becomes flushable sooner; larger windows amortize into
+    // fewer/larger Delta commits. 300s, halved from 600s to cut peak MemBuffer
+    // footprint (the current bucket is excluded from flushing, so this is the
+    // floor on how long a row accumulates in RAM). Trade-off is ~2× Delta commits
+    // / small files; high-throughput tenants can go lower (60–120s), memory-relaxed
+    // deployments can raise it back.
+    #[serde_inline_default(300)]
     pub timefusion_bucket_duration_secs: u64,
-    #[serde(default = "d_pressure_flush_pct")]
+    // Memory pressure threshold (0–100) at which the flush task is woken
+    // independently of the periodic flush timer. Triggers an early
+    // `flush_completed_buckets` so MemBuffer drains before reservation reaches
+    // the hard limit. 0 disables pressure-triggered flushes.
+    #[serde_inline_default(75)]
     pub timefusion_pressure_flush_pct: u32,
-    #[serde(default = "d_write_backpressure_secs")]
+    // Max seconds an insert applies backpressure (synchronously flushing
+    // MemBuffer → Delta to free RAM) before failing, when the memory hard limit
+    // is hit. The rows are already durable in the WAL, so this trades a slow
+    // write for a rejected one — the right call for a TS DB whose producers DLQ
+    // on rejection. 0 restores the old fail-fast behavior. 60s is long enough to
+    // ride out a flush cycle / drain a replayed backlog, finite so a genuinely
+    // down Delta can't pile blocked writers up without bound.
+    #[serde_inline_default(60)]
     pub timefusion_write_backpressure_secs: u64,
     /// See `d_dml_coalesce_secs` — drain interval for deferred UPDATE ... FROM
     /// Delta merges; 0 keeps the synchronous per-statement path.
-    #[serde(default = "d_dml_coalesce_secs")]
+    // DML coalescing (0 = disabled). When > 0, the Delta leg of `UPDATE ... FROM`
+    // statements is deferred and batched: sources accumulate per (project, table,
+    // statement shape) and a background task merges them every N seconds, cutting
+    // one-Delta-commit-per-statement churn (which starves OPTIMIZE via OCC and
+    // piles up small files) down to a few commits per interval. The in-memory leg
+    // still applies synchronously, so reads that overlay the buffer stay
+    // read-your-writes. CONTRACT: statements must be idempotent under
+    // re-application (e.g. guard appends with `NOT (col @> val)`), because a row
+    // flushed between the mem leg and the drain sees the assignment applied
+    // twice, and a failed drain retries whole groups. Timestamp-range conjuncts
+    // are widened to the union across coalesced statements.
+    // 3s ON by default: a drain hash-update storm (repeated same-shape UPDATEs,
+    // each rewriting most of the hot partition) OOM-looped prod; coalescing
+    // collapses a window's statements into one rewrite. 0 restores the
+    // synchronous per-statement path.
+    #[serde_inline_default(3)]
     pub timefusion_dml_coalesce_secs: u64,
     /// Fold same-shape coalesced groups across projects into one MERGE per
     /// unified table per drain (`project_id` becomes a join key + IN-list
     /// partition filter). Eliminates the per-project metadata-scan +
     /// OCC-commit multiplication that starved flush under a heavy merge
     /// storm. Kill switch: `TIMEFUSION_DML_COALESCE_FOLD=false`.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_dml_coalesce_fold: bool,
-    #[serde(default = "d_flush_bucket_timeout_secs")]
+    // Watchdog for a single bucket's Delta commit inside `flush_bucket`. A hung S3
+    // commit / commit-lock wait otherwise pins `flush_lock` forever with no log:
+    // flushes freeing zero memory while inserts wedge at the hard limit. On
+    // timeout the flush errors (counted in flush_failed + flush_stalled),
+    // releasing the lock so relief retries; rows stay in MemBuffer + WAL, so it's
+    // safe. Must exceed a normal backfill commit but stay well under retention.
+    //
+    // The CEILING, not the budget: `BufferedWriteLayer::adaptive_flush_timeout`
+    // contracts it as the ingest buffer fills. Read that function before changing
+    // this — prod has been wedged from both ends of the fixed-value trade (too low
+    // aborted legitimate multi-GB drains into a retry loop; too high let a hung
+    // commit hold the global flush_lock until every tenant's INSERT was rejected).
+    // 600 stays right for the ceiling: with headroom, a slow-but-progressing
+    // commit should be allowed to finish, since aborting it wastes the work and
+    // the next attempt is no faster.
+    #[serde_inline_default(600)]
     pub timefusion_flush_bucket_timeout_secs: u64,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
     /// at the cost of O(shards) recovery memory and more file handles.
-    #[serde(default = "d_wal_shards_per_topic")]
+    #[serde_inline_default(4)]
     pub timefusion_wal_shards_per_topic: usize,
     /// Max concurrent S3/R2 reads when reconciling per-table Delta watermarks
     /// at boot. Only used when the cursor snapshot is missing or stale.
-    #[serde(default = "d_delta_scan_concurrency")]
+    // Cold-boot Delta cursor reconciliation. R2 happily takes 64+ concurrent
+    // gets per bucket; the original 8 left ~8× headroom. Depth 8 is half the
+    // original 16 (the snapshot replaces the bulk of the scan) but keeps a
+    // safety margin: if a few snapshot writes failed silently before reboot,
+    // depth-2 could miss the legitimate cursor advance. Tune via env if the
+    // fallback Delta scan is the bottleneck.
+    #[serde_inline_default(64)]
     pub timefusion_delta_scan_concurrency: usize,
     /// Per-table Delta commit history depth scanned at boot. The cursor
     /// snapshot covers the bulk of the watermark; this only needs to catch
     /// a writer that committed after the last snapshot was written.
-    #[serde(default = "d_delta_scan_depth")]
+    #[serde_inline_default(8)]
     pub timefusion_delta_scan_depth: usize,
 }
 
@@ -1561,41 +1281,54 @@ impl BufferConfig {
     }
 }
 
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    #[serde(default = "d_foyer_memory_mb")]
+    #[serde_inline_default(1024)]
     pub timefusion_foyer_memory_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_disk_mb: Option<usize>,
-    #[serde(default = "d_foyer_disk_gb")]
+    // Local disk is cheap and fast relative to S3 GETs, so default the cache large
+    // — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse,
+    // but this is the logical ceiling at which it starts evicting, so it MUST stay
+    // <= the cache volume's free space or writes hit ENOSPC before eviction kicks
+    // in. Lower it on smaller disks.
+    #[serde_inline_default(500)]
     pub timefusion_foyer_disk_gb: usize,
-    #[serde(default = "d_foyer_ttl")]
+    // 7 days
+    #[serde_inline_default(604_800)]
     pub timefusion_foyer_ttl_seconds: u64,
     /// Bounded lifetime of resolved Delta providers. A provider is also
     /// invalidated immediately when its Delta snapshot version changes.
-    #[serde(default = "d_provider_cache_ttl")]
+    // 5 minutes
+    #[serde_inline_default(300)]
     pub timefusion_provider_cache_ttl_seconds: u64,
-    #[serde(default = "d_provider_cache_capacity")]
+    #[serde_inline_default(4_096)]
     pub timefusion_provider_cache_capacity: usize,
-    #[serde(default = "d_foyer_shards")]
+    #[serde_inline_default(8)]
     pub timefusion_foyer_shards: usize,
-    #[serde(default = "d_foyer_file_size_mb")]
+    #[serde_inline_default(32)]
     pub timefusion_foyer_file_size_mb: usize,
-    #[serde(default = "d_foyer_stats")]
+    #[serde_inline_default("true".to_string())]
     pub timefusion_foyer_stats: String,
-    #[serde(default = "d_metadata_size_hint")]
+    #[serde_inline_default(MIB)]
     pub timefusion_parquet_metadata_size_hint: usize,
     /// Memory limit (MB) for DataFusion's decoded parquet-metadata cache
     /// (`datafusion.runtime.metadata_cache_limit`). See `d_df_metadata_cache_mb`.
-    #[serde(default = "d_df_metadata_cache_mb")]
+    // DataFusion's in-process decoded-parquet-metadata cache (footer + page index).
+    // Distinct from the Foyer footer-BYTES cache: this holds the decoded
+    // ParquetMetaData so repeat scans skip re-parsing. Entries larger than the
+    // limit are silently dropped, so it must comfortably exceed a single file's
+    // metadata; the DataFusion default is only 50MB.
+    #[serde_inline_default(512)]
     pub timefusion_df_metadata_cache_mb: usize,
-    #[serde(default = "d_metadata_memory_mb")]
+    #[serde_inline_default(512)]
     pub timefusion_foyer_metadata_memory_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_metadata_disk_mb: Option<usize>,
-    #[serde(default = "d_metadata_disk_gb")]
+    #[serde_inline_default(5)]
     pub timefusion_foyer_metadata_disk_gb: usize,
-    #[serde(default = "d_metadata_shards")]
+    #[serde_inline_default(4)]
     pub timefusion_foyer_metadata_shards: usize,
     /// Disk block size (MB) for the main data cache. The block is foyer's
     /// minimal eviction unit AND caps the largest entry that can land on disk
@@ -1608,23 +1341,23 @@ pub struct CacheConfig {
     /// `timefusion_warm_concurrency` compactions can run at once, so worst
     /// case is `block_size_mb * warm_concurrency` transient heap. On
     /// smaller-memory instances, cap `timefusion_warm_inline_max_mb` independently.
-    #[serde(default = "d_foyer_block_size_mb")]
+    #[serde_inline_default(256)]
     pub timefusion_foyer_block_size_mb: usize,
     /// Entries larger than this (MB) are inserted disk-only so warming a big
     /// compaction output doesn't evict the hot small-entry working set from
     /// L1 memory. 0 = always use L1.
-    #[serde(default = "d_l1_max_entry_mb")]
+    #[serde_inline_default(16)]
     pub timefusion_foyer_l1_max_entry_mb: usize,
     /// Don't admit writes whose `date=` partition is older than this many
     /// days (e.g. cold-tier recompress rewrites) — recent data stays local,
     /// old data serves from S3. 0 = no age limit. Pairs with the cache TTL.
-    #[serde(default = "d_cache_recent_days")]
+    #[serde_inline_default(8)]
     pub timefusion_cache_recent_days: usize,
     /// Optional extra cap (MB) on the in-flight buffer used to warm the cache
     /// directly from a multipart write (skip re-downloading what we just
     /// streamed to S3). Always bounded by the disk block size; 0 = bound
     /// only by the block size.
-    #[serde(default = "d_warm_inline_max_mb")]
+    #[serde_inline_default(0)]
     pub timefusion_warm_inline_max_mb: usize,
     /// Per-upload cap (MB) on the heap buffer a multipart write tees into to
     /// warm the cache. Uploads that grow past this abandon capture and
@@ -1639,7 +1372,7 @@ pub struct CacheConfig {
     /// prod heap profiles attributed a large share of heap to. 0 = bounded
     /// only by the block size, further clamped to the process-wide budget so
     /// a cap larger than the budget can't deny every reservation.
-    #[serde(default = "d_write_capture_max_mb")]
+    #[serde_inline_default(32)]
     pub timefusion_write_capture_max_mb: usize,
     /// Process-wide budget (MB) for in-flight write-capture buffers. Each
     /// capturing upload reserves its full per-upload cap up front,
@@ -1648,7 +1381,7 @@ pub struct CacheConfig {
     /// unaffected). Also CLAMPS the per-upload cap, so a cap above the
     /// budget degrades capture rather than disabling it. Default 8x the
     /// per-upload cap so a flush wave never starves itself. 0 = unbudgeted.
-    #[serde(default = "d_write_capture_budget_mb")]
+    #[serde_inline_default(256)]
     pub timefusion_write_capture_budget_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_disabled: bool,
@@ -1656,7 +1389,7 @@ pub struct CacheConfig {
     /// hours runs with cache population BYPASSED, so a wide sweep can't
     /// flush the hot tail out of L1/disk. Reads still HIT what's already
     /// cached. 0 disables the bypass.
-    #[serde(default = "d_cache_bypass_scan_hours")]
+    #[serde_inline_default(24)]
     pub timefusion_cache_bypass_scan_hours: u64,
 }
 
@@ -1713,13 +1446,15 @@ impl CacheConfig {
     }
 }
 
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParquetConfig {
-    #[serde(default = "d_page_rows")]
+    #[serde_inline_default(20_000)]
     pub timefusion_page_row_count_limit: usize,
     /// ZSTD level for hot writes (flush + today's light optimize). Default 3.
     /// Aliased by the legacy env name; lower = faster ingest.
-    #[serde(default = "d_zstd_level", alias = "timefusion_zstd_level_hot")]
+    #[serde_inline_default(3)]
+    #[serde(alias = "timefusion_zstd_level_hot")]
     pub timefusion_zstd_compression_level: i32,
     /// ZSTD level for same-day INTERMEDIATE rewrites (hot-tail light optimize,
     /// dedup), later rewritten again by nightly consolidate/recompress. Default
@@ -1727,25 +1462,45 @@ pub struct ParquetConfig {
     /// decompress on recent queries. Steady-state size is unaffected — the
     /// tier-1 footer stays below both warm and cold tiers, so recompress still
     /// re-tiers it.
-    #[serde(default = "d_zstd_level_intermediate")]
+    // Tiered compression by partition age. Hot writes prioritize ingest latency;
+    // older data is rewritten at progressively higher levels by `recompress_tier`.
+    #[serde_inline_default(1)]
     pub timefusion_zstd_level_intermediate: i32,
-    #[serde(default = "d_zstd_level_warm")]
+    #[serde_inline_default(9)]
     pub timefusion_zstd_level_warm: i32,
-    #[serde(default = "d_zstd_level_cold")]
+    #[serde_inline_default(19)]
     pub timefusion_zstd_level_cold: i32,
-    #[serde(default = "d_cold_cutoff_days")]
+    #[serde_inline_default(14)]
     pub timefusion_cold_cutoff_days: u64,
-    #[serde(default = "d_row_group_size")]
+    #[serde_inline_default(128 * MIB)]
     pub timefusion_max_row_group_size: usize,
-    #[serde(default = "d_checkpoint_interval")]
+    #[serde_inline_default(10)]
     pub timefusion_checkpoint_interval: u64,
-    #[serde(default = "d_optimize_target")]
+    // 256MB compacted-file target: fewer, larger files cut Delta metadata, S3
+    // object count, and the per-commit get_file_uris() walk on the flush append
+    // path; sorted + page-indexed files still prune time-range queries within a
+    // file, so the query downside is minimal for this (project_id,date)-partitioned
+    // workload. Light/today optimize keeps its own 16MB target.
+    #[serde_inline_default(256 * MIB as i64)]
     pub timefusion_optimize_target_size: i64,
-    #[serde(default = "d_cold_optimize_target")]
+    // Cold tier: sealed partitions (older than `cold_optimize_after_days`) bin-pack
+    // to 512MB. File size grows with partition age — recent days stay at 256MB (less
+    // rewrite while the day still fills), sealed days consolidate to 512MB so the
+    // Delta checkpoint (≈ live file count) shrinks, the dominant driver of commit
+    // latency. Compression is per-row-group, so bigger files don't change bytes
+    // stored — the win is fewer files. Re-runs are cheap: Compact skips files
+    // already ≥ target. 512MB, not 1GB: a merge holds ~target-sized output buffers
+    // per concurrent task and the decompressed working set is ~17x the compressed
+    // target, so 1GB made the final consolidation's sort/merge memory-hostile.
+    #[serde_inline_default(512 * MIB as i64)]
     pub timefusion_cold_optimize_target_size: i64,
-    #[serde(default = "d_cold_optimize_after_days")]
+    // 1 day = everything past the current (day-partitioned) partition. Only today
+    // still takes writes, so every sealed day consolidates to 512MB. The warm
+    // optimize is clamped to dates newer than this boundary (see `optimize_table`)
+    // so the 30-min Z-order never fragments these files back to 256MB.
+    #[serde_inline_default(1)]
     pub timefusion_cold_optimize_after_days: u64,
-    #[serde(default = "d_stats_cache_size")]
+    #[serde_inline_default(50)]
     pub timefusion_stats_cache_size: usize,
     #[serde(default)]
     pub timefusion_bloom_filter_disabled: bool,
@@ -1760,13 +1515,35 @@ impl ParquetConfig {
     }
 }
 
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaintenanceConfig {
-    #[serde(default = "d_vacuum_retention")]
+    // Observability data is high-churn and rarely time-traveled; the only hard
+    // floor is that retention must outlive any in-flight query (which holds a Delta
+    // snapshot referencing files vacuum would delete). This value also drives
+    // `delta.deletedFileRetentionDuration` (set at create + reconciled at load):
+    // Remove tombstones stay in every checkpoint for this long, and a shorter
+    // default's compaction churn accumulated tombstones replayed on every
+    // snapshot refresh.
+    //
+    // 72h, not 24h: removed-but-unvacuumed files are the ONLY recovery source
+    // after a bad rewrite, and the default is what a deploy-wiped env falls back
+    // to. A vacuum once fired inside a 24h window right after an env wipe and
+    // permanently destroyed millions of rows' recovery source. A 3-day floor
+    // keeps one bad daytime incident recoverable across a weekend.
+    #[serde_inline_default(72)]
     pub timefusion_vacuum_retention_hours: u64,
-    #[serde(default = "d_log_retention")]
+    // Delta _delta_log (transaction-log) retention. Keeps the log directory small
+    // (~commit-rate × retention files) so every commit's version-discovery LIST
+    // stays cheap. Delta's default is 30 DAYS, which let the log grow to tens of
+    // thousands of objects and made each commit's version-discovery slow; even a
+    // 1-day window regrew under the multi-tenant per-project commit rate, so hold
+    // a tighter 6h window. enableExpiredLogCleanup (default true) prunes during
+    // checkpoints; cross-project flush coalescing cuts the commit rate driving
+    // growth.
+    #[serde_inline_default(6)]
     pub timefusion_log_retention_hours: u64,
-    #[serde(default = "d_optimize_window_hours")]
+    #[serde_inline_default(48)]
     pub timefusion_optimize_window_hours: u64,
     /// Use Z-order clustering for the periodic full OPTIMIZE. Default OFF:
     /// Z-order runs a memory-heavy global sort that can exhaust the pool on
@@ -1793,7 +1570,7 @@ pub struct MaintenanceConfig {
     /// by the maintenance pool + spill); after that every later compaction is
     /// the streaming merge. Set `false` (plain Compact) only if a deployment
     /// can't afford even that one-time transition sort.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_optimize_sort_by: bool,
     /// Budget for an IN-PROCESS Arrow sort on the flush path, in in-memory
     /// bytes. Past it `sort_batches_by_schema` writes unsorted (still correct —
@@ -1804,21 +1581,34 @@ pub struct MaintenanceConfig {
     /// 256 MB file-byte hot-tail bin is ~4.3 GB here. Paths that rewrite whole
     /// bins sort inside a pooled, spillable DataFusion plan instead — see
     /// `stage_hot_bin`.
-    #[serde(default = "d_sort_skip_bytes")]
+    // 2 GiB escalation threshold for the flush sort. The flush sort is IN-PROCESS
+    // and allocates OUTSIDE the DataFusion pool — raising this ceiling authorised
+    // multi-GB untracked allocations on the ingest path and correlated with OOM
+    // kills, so it was reverted. Past this threshold the flush instead sorts
+    // inside a pooled, disk-spilling DataFusion plan (`sort_flush_group_spilling`)
+    // — the footer stays honest and the peak is bounded by the pool. 2 GiB keeps
+    // the fast in-process path for everything ordinary; DataFusion's sort also
+    // overtakes Arrow lexsort above ~370 MB, so the pooled path is faster there too.
+    #[serde_inline_default(2 * GIB)]
     pub timefusion_sort_skip_bytes: usize,
     /// Pool for the flush-path escalation sort, in MB — its own slice so an
     /// ingest-path sort never queues behind a Z-order holding the maintenance
     /// pool. Deliberately smaller than the escalation threshold: exceeding it
     /// spills to disk, the intended degradation.
-    #[serde(default = "d_flush_sort_pool_mb")]
+    #[serde_inline_default(1024)]
     pub timefusion_flush_sort_pool_mb: u64,
-    #[serde(default = "d_compact_min_files")]
+    #[serde_inline_default(5)]
     pub timefusion_compact_min_files: usize,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_light_optimize_enabled: bool,
-    #[serde(default = "d_light_optimize_target")]
+    // 256MB (raised from 32MB): the small-merge-memory rationale for a tiny
+    // hot/today target is moot on this box, and 32MB left the hot partition as
+    // dozens of tiny files for a high-write project — recent queries were
+    // file-open-latency bound. A larger target collapses today's sealed slices
+    // into a few large event-time-disjoint runs.
+    #[serde_inline_default(256 * MIB as i64)]
     pub timefusion_light_optimize_target_size: i64,
     /// Byte ceiling for ONE output file from a rewrite that writes through
     /// `RecordBatchWriter`, which has no target-size support — `flush()` emits
@@ -1834,7 +1624,7 @@ pub struct MaintenanceConfig {
     /// Cutting is free for correctness: each cut lands on a contiguous slice of
     /// an already-sorted stream, so every piece keeps a sorted footer and stays
     /// event-time disjoint (better pruning).
-    #[serde(default = "d_writer_max_file_bytes")]
+    #[serde_inline_default(512 * MIB)]
     pub timefusion_writer_max_file_bytes: usize,
     /// Largest file a 5-minute hot tick will rewrite purely to repair its
     /// missing `sorting_columns` footer.
@@ -1845,7 +1635,7 @@ pub struct MaintenanceConfig {
     /// start emitting bigger files. Anything above this is left to `timefusion
     /// optimize --recompress`, the only thing that can touch a single-file
     /// partition.
-    #[serde(default = "d_repair_max_file_bytes")]
+    #[serde_inline_default(512 * MIB)]
     pub timefusion_repair_max_file_bytes: usize,
     /// Sealed dates (yesterday backwards) the hot tail also scans for FOOTER
     /// REPAIR — rewriting files with no `sorting_columns` so the reader's
@@ -1862,11 +1652,11 @@ pub struct MaintenanceConfig {
     /// every un-verified sealed file, so the lookback IS the suspect-set size,
     /// and too wide a value can spend the whole pass clearing correctly-sorted
     /// files without ever reaching a rewrite. 0 restores today-only repair.
-    #[serde(default = "d_repair_lookback_days")]
+    #[serde_inline_default(31)]
     pub timefusion_light_optimize_repair_days: u64,
     // Concurrent merge tasks per optimize run — formerly
     // `TIMEFUSION_OPTIMIZE_MAX_CONCURRENT_TASKS`. Now `derived.optimize_merge_tasks()`.
-    #[serde(default = "d_light_schedule")]
+    #[serde_inline_default("0 */5 * * * *".to_string())]
     pub timefusion_light_optimize_schedule: String,
     /// Sealed-date FOOTER REPAIR, on its own cron, split out of the hot-tail
     /// tick: a repair unit is one whole-file rewrite of up to ~1 GiB, too big
@@ -1888,7 +1678,7 @@ pub struct MaintenanceConfig {
     /// project (concurrency bounds parallelism, not count), so slot-minutes per
     /// day are identical at any period, and only longer ticks let large units
     /// actually finish.
-    #[serde(default = "d_footer_repair_schedule")]
+    #[serde_inline_default("0 30 * * * *".to_string())]
     pub timefusion_footer_repair_schedule: String,
     /// How long ONE repair pass may run, in seconds — deliberately INDEPENDENT
     /// of the schedule above, unlike every other maintenance tick.
@@ -1903,50 +1693,64 @@ pub struct MaintenanceConfig {
     /// `spawn_cron_job` SKIPS overlapping ticks rather than queueing them, so a
     /// short period with a long budget is well-defined: a pass starts soon after
     /// boot, runs as long as it needs, and the ticks it overruns are dropped.
-    #[serde(default = "d_footer_repair_budget_secs")]
+    #[serde_inline_default(8640)]
     pub timefusion_footer_repair_budget_secs: u64,
     /// Dirty-bin dedup of sealed (< today) partitions, on its OWN cron —
     /// decoupled from hot-tail compaction so an old-date dedup backlog can't
     /// starve today's compaction (they touch disjoint partitions). Default 5 min.
-    #[serde(default = "d_light_schedule")]
+    #[serde_inline_default("0 */5 * * * *".to_string())]
     pub timefusion_dedup_schedule: String,
     /// Incident kill switch for physical dirty-bin dedup; read-side dedup
     /// remains the correctness path. Re-enabled by default after prod-shaped
     /// validation: canaried on live traffic, then physically audited committed
     /// bins — distinct dedup keys intact in-bin and across the partition, only
     /// duplicate versions removed.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_dirty_bin_dedup_enabled: bool,
-    #[serde(default = "d_optimize_schedule")]
+    #[serde_inline_default("0 */30 * * * *".to_string())]
     pub timefusion_optimize_schedule: String,
-    #[serde(default = "d_consolidate_schedule")]
+    // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
+    // cold target. Calendar-age driven; idempotent (skips ≥-target files).
+    #[serde_inline_default("0 30 2 * * *".to_string())]
     pub timefusion_consolidate_schedule: String,
     /// Passes of cold consolidation to run on each hot-compaction tick, for
     /// sealed partitions the daily sweep never reached. Small on purpose: each
     /// pass is one ≤target sorted rewrite and its own commit, so a restart
     /// costs at most one pass and the next tick resumes. 0 disables.
-    #[serde(default = "d_consolidate_catchup_passes")]
+    #[serde_inline_default(4)]
     pub timefusion_consolidate_catchup_passes: usize,
-    #[serde(default = "d_vacuum_schedule")]
+    // Every 6h, not daily: tombstones leave the checkpoint once older than the
+    // retention window, so vacuum must run often enough to delete files before
+    // their tombstones age out (VacuumMode::Full backstops any that slip through).
+    #[serde_inline_default("0 15 */6 * * *".to_string())]
     pub timefusion_vacuum_schedule: String,
-    #[serde(default = "d_recompress_schedule")]
+    #[serde_inline_default("0 0 3 * * *".to_string())]
     pub timefusion_recompress_schedule: String,
     /// Out-of-band checkpoint + expired-log-cleanup schedule. See d_checkpoint_schedule.
-    #[serde(default = "d_checkpoint_schedule")]
+    // Out-of-band checkpoint + expired-log cleanup, driven here instead of
+    // delta-rs's commit-path hook: a hook failure surfaced as a commit error
+    // AFTER the commit landed, and the flush path misread that as a failed
+    // commit and deleted the committed parquet. Every 2 min, tolerant of R2
+    // 500s — faster than the commit cadence so the log stays bounded.
+    #[serde_inline_default("0 */2 * * * *".to_string())]
     pub timefusion_checkpoint_schedule: String,
     /// Dangling-Add reconcile schedule. See d_reconcile_schedule.
-    #[serde(default = "d_reconcile_schedule")]
+    // Reconcile active Add entries against object-store truth: HEAD every live
+    // file and commit Remove for any that are missing. Repairs dangling Adds left
+    // by past commit-path parquet deletions; a nonzero removal count means
+    // committed data was destroyed elsewhere.
+    #[serde_inline_default("0 0 * * * *".to_string())]
     pub timefusion_reconcile_schedule: String,
     /// Nightly tantivy index reconcile: backfill uncovered live parquet +
     /// GC manifest entries for rewritten-away files, per-uuid manifests
     /// included. The single-process self-management of index consistency —
     /// compaction/wave commits and CLI runs all converge here.
-    #[serde(default = "d_tantivy_reconcile_schedule")]
+    #[serde_inline_default("0 30 3 * * *".to_string())]
     pub timefusion_tantivy_reconcile_schedule: String,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_warm_after_compaction: bool,
     /// In addition to footers, warm the full file contents into the main
     /// (full-file) cache. OFF by default. Tried ON to keep the recent-window hot
@@ -1960,35 +1764,38 @@ pub struct MaintenanceConfig {
     /// Only warm files whose `date=` partition is within this many days of
     /// today. Bounds warming to the partitions dashboards actually query.
     /// 0 = no recency limit.
-    #[serde(default = "d_warm_recency_days")]
+    #[serde_inline_default(1)]
     pub timefusion_warm_recency_days: u64,
     /// Warm parquet footers for EVERY live file (not just recency-window
     /// ones). Footers are tens of KB each, but on tables with thousands of
     /// files the boot-time GET burst may matter on small instances — disable
     /// to fall back to recency-bounded footer warming.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_warm_all_footers: bool,
     /// Max concurrent warm fetches per commit. Bounds the S3 GET burst a
     /// warm job adds right after a compaction.
-    #[serde(default = "d_warm_concurrency")]
+    // 16: at concurrency 4 a large boot warm ran >55 min and was cut short by a
+    // restart every time; 16 finishes in ~1-3 min. Footer GETs are small
+    // suffix-range reads, well within R2/S3 burst limits.
+    #[serde_inline_default(16)]
     pub timefusion_warm_concurrency: usize,
     /// After a compaction commit, proactively evict the cached full-file bytes
     /// of the files it tombstoned (no longer in the live set), instead of
     /// waiting for VACUUM / TTL / LRU to reclaim them. Cheap (in-cache only, no
     /// S3) and keeps the cache from filling with dead compaction outputs.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_evict_after_compaction: bool,
     /// Advance the post-commit snapshot by appending only the files the commit
     /// added, instead of re-materializing the whole active file set (2-8s over
     /// 26k files every flush in prod). Produces an identical file set — a
     /// faster, equivalent replay, safe regardless of writer count. Off reverts
     /// to the full re-materialize per commit.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_incremental_snapshot: bool,
     /// Belt-and-suspenders for the above: every Nth commit per table, drop the
     /// materialized files and re-materialize from S3 truth, bounding any drift
     /// from an incremental-replay bug. 0 disables reconciliation.
-    #[serde(default = "d_snapshot_reconcile")]
+    #[serde_inline_default(500)]
     pub timefusion_snapshot_reconcile_commits: u64,
     /// Commit staged-but-uncommitted footer-repair parquet found at boot,
     /// instead of deleting it and re-doing the 40+ minute rewrite. False
@@ -2001,10 +1808,29 @@ pub struct MaintenanceConfig {
     /// healthcheck replacements), so every pass discarded a complete staged
     /// output and the same file stayed poisoned for days. Resume is what makes
     /// the rewrite survive a restart at all.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
-    /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
-    #[serde(default = "d_dedup_lookback_days")]
+    /// Days back (plus today) the dedup sweep scans.
+    // 128: a lower bound put a multi-day floor under the backlog, but a much
+    // higher one OOM'd the box — RSS climbed independent of query load, tracking
+    // pass-scoped state (per-bin provider/session/snapshot) that only frees at
+    // pass end. 128 completes a pass in ~10-15min while draining well above the
+    // original rate.
+    //
+    // Separately: how many days back (plus today) the dedup sweep covers. 1 day
+    // catches cross-flush dupes from a late replay crossing midnight, but 35 is
+    // needed because this sweep is the ONLY caller of `record_certification`,
+    // which bounds how far back a partition can be certified duplicate-free —
+    // rollup routing needs a contiguous certified prefix across the query window,
+    // so a 1-day horizon meant no 7d/14d/30d query could ever route to a rollup.
+    //
+    // Affordable because the sweep is O(partitions-changed), not O(window): a
+    // partition whose `dedup_clean_fp` still matches its live fingerprint is
+    // skipped without a probe, and `deadline` + `dedup_sweep_cursor` rotation
+    // bound and resume a truncated tick. Do NOT raise this without matching
+    // coordinator job concurrency, or the work list backs a queue that commits
+    // nothing. 35 covers a 30d query with margin and matches `timefusion_light_optimize_repair_days`.
+    #[serde_inline_default(35)]
     pub timefusion_dedup_lookback_days: u64,
     /// Run the legacy partition-wide dedup probe as an audit/fallback. Dirty
     /// sealed bins are the normal maintenance path.
@@ -2038,9 +1864,11 @@ pub struct MaintenanceConfig {
     /// drift apart. `plan_rollup_backfill` is bounded per pass, so a wide
     /// horizon converges over hours instead of burying the journal in one go.
     /// Set 0 to disable.
-    #[serde(default = "d_rollup_backfill_days")]
+    // Must match `timefusion_dedup_lookback_days` — certification and rollup coverage need
+    // the same horizon, or a day is certified but never rolled up (or vice versa).
+    #[serde_inline_default(35)]
     pub timefusion_rollup_backfill_days: u16,
-    #[serde(default = "d_rollup_backfill_schedule")]
+    #[serde_inline_default("0 */10 * * * *".to_string())]
     pub timefusion_rollup_backfill_schedule: String,
     /// Skip the read-side DedupExec (and its key projection) for Delta-only
     /// queries whose every in-window (project, date) partition was verified
@@ -2058,7 +1886,7 @@ pub struct MaintenanceConfig {
     /// sweep hasn't certified with a matching file fingerprint, so an unswept
     /// or newly-written partition keeps full dedup. Turn off here if a count is
     /// ever doubted.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_read_dedup_skip_swept: bool,
     /// Dedup-as-you-compact experiment (docs/plans/2026-08-20-dedup-and-sort
     /// strategy §3): the on-demand compaction path (`compact_date`, i.e. pgwire
@@ -2084,7 +1912,7 @@ pub struct MaintenanceConfig {
     /// Kill switches, in order of bluntness: set this false for a cold cache
     /// per process; set `timefusion_read_dedup_skip_swept` false to remove the
     /// skip entirely. Doubt a `count(*)` and reach for the second one.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_dedup_certification_persist: bool,
     /// Allow `DedupExec` to run in streaming `bounded[timestamp]` mode, which
     /// trusts the scan's declared `output_ordering` (the parquet footer's
@@ -2097,20 +1925,27 @@ pub struct MaintenanceConfig {
     /// This is only an emergency kill switch, and not a cheap one — bounded
     /// mode carries LIMIT early termination, so turning it off makes "top N"
     /// queries scan the whole window.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_read_dedup_bounded: bool,
     /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only
     /// fires when the window is fully flushed, dedup-provably-clean, and
     /// every overlapping file lies entirely inside the window — otherwise
     /// the normal scan runs. See src/count_pushdown.rs.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_count_pushdown: bool,
     /// Per-shard COMPRESSED-bytes target for a dedup chunk rewrite (`sum(add.size)`).
     /// The rewrite is split into `ceil(compressed_bytes / this)` hash-bucketed passes
     /// so each pass reads ~this much. 0 disables this ceiling's contribution to the
     /// shard count. See `d_dedup_max_rewrite_bytes`.
-    #[serde(default = "d_dedup_max_rewrite_bytes")]
+    // Byte ceiling on the file set one dedup chunk rewrite may materialize.
+    // Over-budget chunks are SKIPPED loudly (metric: timefusion.dedup.chunk_skipped)
+    // rather than rewritten — read-side dedup keeps queries correct meanwhile.
+    // Guards against e.g. a z-ordered whole-day file dragging the whole day into
+    // one rewrite. Kept in step with `d_dedup_max_decoded_bytes` — shard count
+    // takes the MAX of both, so leaving this lower would silently cap sharding
+    // below the decoded budget.
+    #[serde_inline_default(GIB as u64 / 2)]
     pub timefusion_dedup_max_rewrite_bytes: u64,
     /// Per-shard target on the ESTIMATED DECODED (in-memory Arrow) footprint of
     /// a dedup chunk rewrite. Compressed bytes under-count by 5-20x for wide
@@ -2122,18 +1957,29 @@ pub struct MaintenanceConfig {
     /// alone exceeds this is unshardable and skipped (read-side dedup keeps
     /// queries correct). 0 → one shard for this ceiling. See
     /// `d_dedup_max_decoded_bytes`.
-    #[serde(default = "d_dedup_max_decoded_bytes")]
+    // 512 MiB estimated decoded footprint, sized so permits x budget stays bounded
+    // in flight (see HEAVY_REWRITE_PERMITS). A chunk this large already dwarfs the
+    // DataFusion pool; larger chunks skip rather than risk the cgroup.
+    //
+    // Sized to FUND SHARD CONCURRENCY, not to save memory: `dedup_shard_concurrency`
+    // runs `DEDUP_BIN_ARROW_BUDGET / this` shards at once, so a smaller shard buys
+    // parallelism at an unchanged peak. It also keeps each unit inside its per-bin
+    // deadline — a unit bigger than its budget produces nothing, forever.
+    #[serde_inline_default(GIB as u64 / 2)]
     pub timefusion_dedup_max_decoded_bytes: u64,
     /// Compressed→decoded inflation factor used to estimate a dedup chunk's
     /// in-memory footprint when per-file `num_records` stats are unavailable.
     /// See `d_dedup_decode_inflation`.
-    #[serde(default = "d_dedup_decode_inflation")]
+    // 12x compressed->decoded: zstd on wide Variant/JSON otel rows routinely
+    // decodes 10-20x; 12 is a deliberately conservative floor.
+    #[serde_inline_default(12)]
     pub timefusion_dedup_decode_inflation: u64,
     /// Estimated decoded Arrow bytes per row, used with per-file `num_records`
     /// to size a dedup chunk's in-memory footprint. otel spans carry wide
     /// Variant/JSON bodies; 4 KiB is a conservative average. See
     /// `d_dedup_bytes_per_row`.
-    #[serde(default = "d_dedup_bytes_per_row")]
+    // 4 KiB/row decoded estimate for otel spans (wide Variant/JSON bodies).
+    #[serde_inline_default(4096)]
     pub timefusion_dedup_bytes_per_row: u64,
     // Max concurrent heavy maintenance rewrites (dedup / optimize / recompress)
     // — formerly `TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY`. Now
@@ -2151,7 +1997,11 @@ pub struct MaintenanceConfig {
     /// matches — heavy on a CPU-throttled box. Ungated, bursts of per-project
     /// drains stampede all cores and starve read queries. This caps that so
     /// reads keep CPU; drains queue behind it.
-    #[serde(default = "d_dml_merge_concurrency")]
+    // Serial: each merge-update decodes + rewrites whole hot partitions with
+    // pool-invisible memory; concurrent stacking under a heavy UPDATE-drain
+    // storm drove an OOM crash-loop. Results are identical either way — permits
+    // only bound peak memory, excess statements queue.
+    #[serde_inline_default(1)]
     pub timefusion_dml_merge_concurrency: usize,
     /// Perform UPDATE/DELETE as merge-on-read deletion-vector operations
     /// instead of copy-on-write full-file rewrites. A DV UPDATE appends only
@@ -2165,7 +2015,7 @@ pub struct MaintenanceConfig {
     /// Delta tables must understand DVs (TF's own scan does; external log
     /// readers may not) — set `TIMEFUSION_USE_DELETION_VECTORS=false` to keep
     /// copy-on-write rewrites.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_use_deletion_vectors: bool,
     /// Commit DV merges append-tolerantly: a concurrent flush commit (AddFile
     /// only) no longer aborts the merge with ConcurrentAppend — the commit
@@ -2178,14 +2028,14 @@ pub struct MaintenanceConfig {
     /// whose flushes bypass this process's mem leg, set this to false or its
     /// rows can miss enrichment merges. On by default;
     /// `TIMEFUSION_DML_MERGE_APPEND_REBASE=false` restores strict OCC.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_dml_merge_append_rebase: bool,
     /// Push a `target.key IN (source key values)` filter into the DV merge's
     /// per-file scan so parquet bloom filters prune files/row-groups holding none
     /// of the source keys — turning a whole-window enrichment scan into a few-file
     /// scan. Sound (bloom never false-negatives); on by default. Kill-switch:
     /// `TIMEFUSION_DML_MERGE_KEY_PRUNE=false` reverts to scanning all window files.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_dml_merge_key_prune: bool,
 }
 
@@ -2229,17 +2079,15 @@ impl MaintenanceConfig {
 /// - `FairSpill`: slot-per-consumer fairness. Better for ad-hoc query
 ///   workloads with many concurrent users where one large query
 ///   shouldn't starve the others. Not the right default for ingest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPoolKind {
+    #[default]
     Greedy,
     FairSpill,
 }
 
-fn d_memory_pool() -> MemoryPoolKind {
-    MemoryPoolKind::Greedy
-}
-
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     // Formerly `timefusion_memory_limit_gb` — now `derived.memory_limit_bytes()`.
@@ -2249,16 +2097,16 @@ pub struct MemoryConfig {
     // (25 GB-box clamp vs a 188 GB box) is what the derivation replaces.
     #[serde(default)]
     pub timefusion_sort_spill_reservation_bytes: Option<usize>,
-    #[serde(default = "d_memory_pool")]
+    #[serde(default)]
     pub timefusion_memory_pool: MemoryPoolKind,
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_tracing_record_metrics: bool,
     /// DataFusion `target_partitions` for query + maintenance sessions. 0 =
     /// auto: `config::apply()` derives it from the container's CPU quota
     /// (num_cpus ignores the CFS quota, oversubscribing throttled containers).
     /// A non-zero env (`TIMEFUSION_QUERY_PARTITIONS`) wins. 0 also when unset in
     /// tests → sessions keep DataFusion's default.
-    #[serde(default = "d_query_partitions")]
+    #[serde_inline_default(0)]
     pub timefusion_query_partitions: usize,
     /// Admission guard for wide-window read scans. A query reaching further
     /// back than `timefusion_wide_scan_lookback_hours` (or with no lower time
@@ -2269,9 +2117,15 @@ pub struct MemoryConfig {
     /// `timefusion_max_concurrent_scan_readers` concurrent batch-decodes across
     /// all queries so they degrade to slower rather than take the process
     /// down; narrow recent-window scans keep full parallelism.
-    #[serde(default = "d_max_concurrent_scan_readers")]
+    // Wide-scan admission guard. 16 concurrent Parquet decoders bounds untracked
+    // decode heap well under the pool on this box (48-way caused an OOM). Wide
+    // observability windows are already latency-bound below this, so gating is
+    // near-free. 2h lookback keeps the hot dashboards ungated (they page-prune to
+    // tiny per-file bytes) while 3d+/no-time scans queue. Both tunable via
+    // TIMEFUSION_{MAX_CONCURRENT_SCAN_READERS,WIDE_SCAN_LOOKBACK_HOURS}.
+    #[serde_inline_default(16)]
     pub timefusion_max_concurrent_scan_readers: usize,
-    #[serde(default = "d_wide_scan_lookback_hours")]
+    #[serde_inline_default(2)]
     pub timefusion_wide_scan_lookback_hours: u64,
     /// Depth alone badly over-fires the gate above. Lookback is only a PROXY
     /// for decode heap, and once file pruning works the proxy breaks — a query
@@ -2281,14 +2135,31 @@ pub struct MemoryConfig {
     /// them, counted from the plan's file groups after pruning. The wide scan
     /// that caused the original OOM still selects hundreds of files and stays
     /// gated; a deep-but-pruned dashboard query no longer waits behind it.
-    #[serde(default = "d_wide_scan_max_files")]
+    // Sized against the incident that motivated the gate: a 7-day dashboard
+    // opened hundreds of files at ~48-way parallelism.
+    //
+    // The file-count half assumed a recent-window scan selects a handful of
+    // files after pruning — false once partitions fragmented to thousands of
+    // small files, at which point the release could never fire and every
+    // dashboard past the 2h lookback queued behind the semaphore.
+    //
+    // BYTES are the honest proxy for decode heap; file COUNT is a proxy for a
+    // proxy, and fragmentation is exactly what invalidates it. Median prod file
+    // is ~0.1 MB, so 256 files is only ~26 MB — the MB cap does the real
+    // bounding, and the 7-day case that motivated the gate blows through it regardless.
+    #[serde_inline_default(256)]
     pub timefusion_wide_scan_max_files: usize,
-    #[serde(default = "d_wide_scan_max_mb")]
+    // Compressed parquet bytes understate transient Arrow decode heap by an
+    // order of magnitude on OTel data — a 222 MB file measured ~4 GiB of process
+    // growth decoding 48 row groups in parallel, so it must participate in the
+    // shared decode gate rather than the small-scan exemption. 64 MB keeps
+    // genuinely small, well-pruned history reads ungated.
+    #[serde_inline_default(64)]
     pub timefusion_wide_scan_max_mb: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
     /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
     /// set with room to spare. Each entry is one LogicalPlan (~KBs).
-    #[serde(default = "d_plan_cache_capacity")]
+    #[serde_inline_default(2048)]
     pub timefusion_plan_cache_capacity: usize,
     /// Route `now()`/`current_timestamp` SELECTs through the shape cache (time
     /// fn parameterized to a fresh per-query instant) instead of bypassing it.
@@ -2296,17 +2167,18 @@ pub struct MemoryConfig {
     /// SessionState::optimize from now()-bearing dashboard cache misses. The
     /// cached artifact is a placeholder plan template; the instant is re-bound
     /// per query, so windows never freeze. Set =false to disable in an emergency.
-    #[serde(default = "d_true")]
+    #[serde_inline_default(true)]
     pub timefusion_plan_cache_time_fns: bool,
 }
 
+#[serde_inline_default::serde_inline_default]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
-    #[serde(default = "d_otlp_endpoint")]
+    #[serde_inline_default("http://localhost:4317".to_string())]
     pub otel_exporter_otlp_endpoint: String,
-    #[serde(default = "d_service_name")]
+    #[serde_inline_default("timefusion".to_string())]
     pub otel_service_name: String,
-    #[serde(default = "d_service_version")]
+    #[serde_inline_default(env!("CARGO_PKG_VERSION").to_string())]
     pub otel_service_version: String,
     #[serde(default)]
     pub log_format: Option<String>,
@@ -2549,13 +2421,16 @@ mod tests {
     /// Certification must reach back far enough to serve a 30d query.
     ///
     /// `dedup_sweep` is the only caller of `record_certification`, scoped to
-    /// `today - d_dedup_lookback_days ..= today`, which is therefore a hard
+    /// `today - timefusion_dedup_lookback_days ..= today`, which is therefore a hard
     /// ceiling on the longest window that can ever route to a rollup. At a
     /// former default of 1, nothing past yesterday could certify (30d queries
     /// timed out). Dropping below 30 silently reintroduces that.
     #[test]
     fn certification_window_covers_a_thirty_day_query() {
-        assert!(super::d_dedup_lookback_days() >= 30, "the dedup sweep is what certifies partitions; below 30d no 30d query can ever route to a rollup");
+        assert!(
+            AppConfig::default().maintenance.timefusion_dedup_lookback_days >= 30,
+            "the dedup sweep is what certifies partitions; below 30d no 30d query can ever route to a rollup"
+        );
     }
 
     /// Maintenance must not be serialized on a box with room to spare.
@@ -2713,7 +2588,7 @@ mod tests {
     /// instead of rewriting.
     #[test]
     fn repair_lookback_covers_the_query_window_without_flooding() {
-        let d = super::d_repair_lookback_days();
+        let d = AppConfig::default().maintenance.timefusion_light_optimize_repair_days;
         assert!(d >= 30, "must cover the 30-day window users actually query, got {d}");
         assert!(d <= 45, "must not balloon the suspect set beyond the query window, got {d}");
     }

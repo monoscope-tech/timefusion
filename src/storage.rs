@@ -138,67 +138,60 @@ mod object_meta_serde {
 }
 
 /// Configuration for the foyer-based object store cache
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, educe::Educe)]
+#[educe(Default)]
 pub struct FoyerCacheConfig {
+    #[educe(Default = 134_217_728)] // 128MB
     pub memory_size_bytes: usize,
+    #[educe(Default = 107_374_182_400)] // 100GB
     pub disk_size_bytes: usize,
+    #[educe(Default(expression = Duration::from_secs(86_400)))] // 24h
     pub ttl: Duration,
+    #[educe(Default(expression = PathBuf::from("/tmp/timefusion_cache")))]
     pub cache_dir: PathBuf,
+    #[educe(Default = 8)]
     pub shards: usize,
+    #[educe(Default = 16_777_216)] // 16MB - good for Parquet files
     pub file_size_bytes: usize,
+    #[educe(Default = true)]
     pub enable_stats: bool,
     /// Size hint for reading parquet metadata from the end of files
+    #[educe(Default = 1_048_576)] // 1MB - typical size for parquet metadata
     pub parquet_metadata_size_hint: usize,
     /// Memory size for metadata cache in bytes
+    #[educe(Default = 67_108_864)] // 64MB
     pub metadata_memory_size_bytes: usize,
     /// Disk size for metadata cache in bytes
+    #[educe(Default = 536_870_912)] // 512MB
     pub metadata_disk_size_bytes: usize,
-    /// Number of shards for metadata cache
+    /// Number of shards for metadata cache — fewer than the data cache needs.
+    #[educe(Default = 4)]
     pub metadata_shards: usize,
     /// Optional extra cap on bytes buffered to warm the cache inline from a
     /// multipart write (see `CachingMultipartUpload`). Always bounded by
-    /// `block_size_bytes`; 0 = bound only by the block size.
+    /// `block_size_bytes`; 0 = bound only by the block size (the default).
     pub warm_inline_max_bytes: usize,
     /// Per-upload cap on bytes teed into heap by `CachingMultipartUpload`.
     /// Sized for flush outputs; big compaction outputs skip the tee and are
     /// warmed post-commit via the read path. 0 = bounded only by the block size.
+    #[educe(Default = 33_554_432)] // 32MB — flush-sized files only
     pub write_capture_max_bytes: usize,
     /// Process-wide budget for in-flight write-capture buffers. 0 = unbudgeted.
+    #[educe(Default = 268_435_456)] // 256MB process-wide (8 x the per-upload cap)
     pub write_capture_budget_bytes: usize,
     /// Disk block size for the main data cache — foyer's eviction unit and the
     /// hard cap on the largest entry that can persist to disk. Must be >= the
     /// largest file we want cached (compaction target size).
+    #[educe(Default = 268_435_456)] // 256MB — fits 128MB compaction outputs
     pub block_size_bytes: usize,
     /// Entries larger than this are inserted disk-only (`Location::OnDisk`) so
     /// they don't evict the hot L1 working set. 0 = always use L1.
+    #[educe(Default = 16_777_216)] // 16MB
     pub l1_max_entry_bytes: usize,
     /// Don't admit writes whose `date=` partition is older than this many days.
     /// 0 = no age limit.
+    #[educe(Default = 8)]
     pub cache_recent_days: usize,
-}
-
-impl Default for FoyerCacheConfig {
-    fn default() -> Self {
-        Self {
-            memory_size_bytes: 134_217_728,   // 128MB
-            disk_size_bytes: 107_374_182_400, // 100GB
-            ttl: Duration::from_secs(86_400), // 24h
-            cache_dir: PathBuf::from("/tmp/timefusion_cache"),
-            shards: 8,
-            file_size_bytes: 16_777_216, // 16MB - good for Parquet files
-            enable_stats: true,
-            parquet_metadata_size_hint: 1_048_576,   // 1MB - typical size for parquet metadata
-            metadata_memory_size_bytes: 67_108_864,  // 64MB
-            metadata_disk_size_bytes: 536_870_912,   // 512MB
-            metadata_shards: 4,                      // Fewer shards for metadata cache
-            warm_inline_max_bytes: 0,                // bound by block size
-            write_capture_max_bytes: 33_554_432,     // 32MB — flush-sized files only
-            write_capture_budget_bytes: 268_435_456, // 256MB process-wide (8 x the per-upload cap)
-            block_size_bytes: 268_435_456,           // 256MB — fits 128MB compaction outputs
-            l1_max_entry_bytes: 16_777_216,          // 16MB
-            cache_recent_days: 8,
-        }
-    }
 }
 
 impl FoyerCacheConfig {
@@ -2950,18 +2943,13 @@ mod tests {
     /// can assert that warming + reads issue the expected number of HEADs/GETs.
     /// `head()` is an extension method that routes through `get_opts(head:true)`,
     /// so we count it there.
-    #[derive(Debug)]
+    #[derive(Debug, derive_more::Display)]
+    #[display("CountingStore")]
     struct CountingStore {
         inner: Arc<InMemory>,
         heads: Arc<std::sync::atomic::AtomicUsize>,
         gets: Arc<std::sync::atomic::AtomicUsize>,
         delay: Duration,
-    }
-
-    impl std::fmt::Display for CountingStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "CountingStore")
-        }
     }
 
     #[async_trait]

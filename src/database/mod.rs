@@ -34,8 +34,8 @@ use deltalake::{
     logstore::LogStore, operations::create::CreateBuilder,
 };
 use futures::{StreamExt, TryStreamExt};
-use itertools::Itertools;
 use instrumented_object_store::instrument_object_store;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
@@ -69,16 +69,12 @@ const CACHE_SOFT_LIMIT_WARN: usize = 10_000;
 /// concurrent first-time misses share the same Arc and await the same build.
 type DeltaProviderCell = tokio::sync::OnceCell<Arc<dyn datafusion::datasource::TableProvider>>;
 
+#[derive(derive_more::Debug)]
+#[debug("CachedDeltaProvider {{ version: {version}, age: {:?}, .. }}", created_at.elapsed())]
 struct CachedDeltaProvider {
     version: u64,
     created_at: std::time::Instant,
     cell: Arc<DeltaProviderCell>,
-}
-
-impl fmt::Debug for CachedDeltaProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CachedDeltaProvider").field("version", &self.version).field("age", &self.created_at.elapsed()).finish_non_exhaustive()
-    }
 }
 
 /// Snapshot versions kept cached per `(project, table)`. A single slot thrashes
@@ -3065,11 +3061,8 @@ impl Database {
             };
             (t.get_file_uris()?.collect::<Vec<String>>(), sizes, t.log_store().object_store(None))
         };
-        let by_pid: HashMap<String, Vec<String>> = uris
-            .into_iter()
-            .filter(|uri| uri.ends_with(".parquet"))
-            .filter_map(|uri| Some((project_id_of_uri(&uri)?.to_string(), uri)))
-            .into_group_map();
+        let by_pid: HashMap<String, Vec<String>> =
+            uris.into_iter().filter(|uri| uri.ends_with(".parquet")).filter_map(|uri| Some((project_id_of_uri(&uri)?.to_string(), uri))).into_group_map();
         let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
         let mut result: HashMap<String, Vec<String>> = HashMap::with_capacity(by_pid.len());
         for (pid, mut uris) in by_pid {

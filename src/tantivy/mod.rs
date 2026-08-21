@@ -584,8 +584,10 @@ use crate::write::mem_buffer::TableKey;
 pub const MANIFEST_PREFIX: &str = "index_manifests";
 pub const SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, educe::Educe)]
+#[educe(Default)]
 pub struct Manifest {
+    #[educe(Default = SCHEMA_VERSION)]
     pub version: u32,
     pub entries: BTreeMap<String, ManifestEntry>,
 }
@@ -616,12 +618,6 @@ pub struct ManifestEntry {
     /// selection. Old entries deserialize to false.
     #[serde(default)]
     pub ordinals_valid: bool,
-}
-
-impl Default for Manifest {
-    fn default() -> Self {
-        Self { version: SCHEMA_VERSION, entries: BTreeMap::new() }
-    }
 }
 
 /// Object-store path of the manifest for a given table/project.

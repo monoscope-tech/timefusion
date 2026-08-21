@@ -19,17 +19,22 @@ const MINT_INTERVAL_MICROS: i64 = crate::maintenance_coordinator::NORMAL_SLICE_M
 /// Lets idle workers notice newly mature deadlines.
 const IDLE_POLL_MICROS: i64 = 5 * MICROS;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, educe::Educe)]
+#[educe(Default)]
 pub struct SimConfig {
+    #[educe(Default = 16)]
     pub workers: usize,
     /// Virtual time to simulate.
+    #[educe(Default(expression = 24 * 60 * 60 * MICROS))]
     pub horizon_micros: i64,
     /// Model ongoing ingest invalidations for the streams found in the journal.
+    #[educe(Default = true)]
     pub mint_frontier: bool,
     /// Override the minted stream count (10x experiments: 260 streams at 130
     /// projects). Extra streams clone the first real stream's tables under
     /// synthetic project ids.
     pub streams: Option<usize>,
+    #[educe(Default = 1.0)]
     pub duration_scale: f64,
     /// Model deploy/OOM restarts: re-invalidate the whole current day for
     /// every stream — exactly what `reconcile_maintenance_task_cursors` does
@@ -41,22 +46,8 @@ pub struct SimConfig {
     /// fixed offset (backtesting a known boot time).
     pub restart_every_micros: i64,
     pub restart_at_micros: Option<i64>,
+    #[educe(Default = 0x5EED)]
     pub seed: u64,
-}
-
-impl Default for SimConfig {
-    fn default() -> Self {
-        Self {
-            workers: 16,
-            horizon_micros: 24 * 60 * 60 * MICROS,
-            mint_frontier: true,
-            streams: None,
-            duration_scale: 1.0,
-            restart_every_micros: 0,
-            restart_at_micros: None,
-            seed: 0x5EED,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

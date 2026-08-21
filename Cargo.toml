@@ -120,6 +120,14 @@ sysinfo = { version = "0.32", default-features = false, features = ["system", "d
 num_cpus = "1.16"
 scopeguard = "1.2.0"
 memmap2 = "0.9.10"
+# `#[derive(Default)]` cannot express a non-`Default::default()` field value, so
+# every such struct needed a hand-written `impl Default`. educe's `Default`
+# derive takes the value on the field, which is where the doc comment already is.
+educe = { version = "0.7.6", default-features = false, features = ["Default"] }
+# serde's `default = "..."` takes a FUNCTION path, so 138 config fields needed a
+# `const_default!`-generated fn each. This attribute inlines the literal.
+serde-inline-default = "1.0.2"
+bon = "3.9.3"
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }

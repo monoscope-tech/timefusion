@@ -7,8 +7,11 @@
 
 use crate::schema::RollupSpec;
 
-/// Why a query cannot use a rollup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a query cannot use a rollup. Variant names ARE the `rollup_misses`
+/// telemetry labels (snake_case); the two `serialize` overrides are historical
+/// names prod dashboards already query on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum MissReason {
     UnsupportedShape,
     MissingProject,
@@ -21,7 +24,12 @@ pub enum MissReason {
     /// and didn't" — see the decline site for the prod evidence.
     FilterNotEligible,
     MissingMeasure,
+    #[strum(serialize = "non_decomposable")]
     NonDecomposableAggregate,
+    /// Names the ONLY thing this reason still means: a `time_bucket` width that
+    /// is not a multiple of the grain. The window's own alignment stopped
+    /// mattering once raw fringes were added.
+    #[strum(serialize = "unaligned_bucket_width")]
     PartialBucket,
     /// No rollup was ever built for a date in the window.
     NotBuilt,
@@ -39,27 +47,8 @@ pub enum MissReason {
 }
 
 impl MissReason {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::UnsupportedShape => "unsupported_shape",
-            Self::MissingProject => "missing_project",
-            Self::UnboundedTime => "unbounded_time",
-            Self::UnknownGroupBy => "unknown_group_by",
-            Self::UnknownFilter => "unknown_filter",
-            Self::FilterNotEligible => "filter_not_eligible",
-            Self::MissingMeasure => "missing_measure",
-            Self::NonDecomposableAggregate => "non_decomposable",
-            // Names the ONLY thing this reason still means: a `time_bucket`
-            // width that is not a multiple of the grain. The window's own
-            // alignment stopped mattering once raw fringes were added.
-            Self::PartialBucket => "unaligned_bucket_width",
-            Self::NotBuilt => "not_built",
-            Self::StaleCoverage => "stale_coverage",
-            Self::IncompleteCoverage => "incomplete_coverage",
-            Self::TinyInterior => "tiny_interior",
-            Self::TooManyBranches => "too_many_branches",
-            Self::RewriteSchemaMismatch => "rewrite_schema_mismatch",
-        }
+    pub fn label(self) -> &'static str {
+        self.into()
     }
 }
 
@@ -1762,6 +1751,36 @@ mod tests {
     use std::sync::Arc;
 
     const SOURCE: &str = "otel_logs_and_spans";
+
+    /// `MissReason::label` feeds the `rollup_misses` counter, so these strings
+    /// are a prod dashboard contract, not an implementation detail. Pinned
+    /// exhaustively (via `EnumIter`) so a rename or a new variant has to state
+    /// its label here rather than silently changing what a panel counts.
+    #[test]
+    fn miss_reason_labels_are_the_prod_telemetry_contract() {
+        use strum::IntoEnumIterator as _;
+        assert_eq!(
+            MissReason::iter().map(MissReason::label).collect::<Vec<_>>(),
+            [
+                "unsupported_shape",
+                "missing_project",
+                "unbounded_time",
+                "unknown_group_by",
+                "unknown_filter",
+                "filter_not_eligible",
+                "missing_measure",
+                "non_decomposable",
+                "unaligned_bucket_width",
+                "not_built",
+                "stale_coverage",
+                "incomplete_coverage",
+                "tiny_interior",
+                "too_many_branches",
+                "rewrite_schema_mismatch",
+            ]
+        );
+    }
+
     use crate::maintenance_coordinator::DAY_MICROS;
     /// Any day-aligned instant; `slice_retires` takes the partition date as a
     /// label rather than deriving it, so which day this is does not matter.

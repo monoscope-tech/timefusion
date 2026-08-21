@@ -114,7 +114,8 @@ impl Bound {
 /// writes a row's ORIGINAL timestamp into a NEW file, so its files overlap and
 /// the blocking sort that "fixes" that exhausted the query pool, prod
 /// 2026-08-02).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum LegKind {
     Mem,
     Hot,
@@ -127,11 +128,7 @@ impl LegKind {
     }
 
     pub fn label(self) -> &'static str {
-        match self {
-            LegKind::Mem => "mem",
-            LegKind::Hot => "hot",
-            LegKind::Delta => "delta",
-        }
+        self.into()
     }
 
     fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
@@ -148,12 +145,7 @@ pub(crate) static ORDERING_VIOLATIONS_HOT: std::sync::atomic::AtomicU64 = std::s
 pub(crate) static ORDERING_VIOLATIONS_DELTA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn ordering_violations_by_leg() -> [(&'static str, u64); 3] {
-    use std::sync::atomic::Ordering::Relaxed;
-    [
-        (LegKind::Mem.label(), ORDERING_VIOLATIONS_MEM.load(Relaxed)),
-        (LegKind::Hot.label(), ORDERING_VIOLATIONS_HOT.load(Relaxed)),
-        (LegKind::Delta.label(), ORDERING_VIOLATIONS_DELTA.load(Relaxed)),
-    ]
+    [LegKind::Mem, LegKind::Hot, LegKind::Delta].map(|leg| (leg.label(), leg.counter().load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// Diagnostic wrapper that answers "which leg's declared ordering is false?".
@@ -168,6 +160,8 @@ pub fn ordering_violations_by_leg() -> [(&'static str, u64); 3] {
 /// OFF by default (`TIMEFUSION_ORDERING_PROBE`): it costs one i64 compare per
 /// row per leg, which is the same order as the bound check it duplicates. Turn
 /// it on when `ordering_violations_total` is nonzero and you need attribution.
+#[derive(derive_more::Debug)]
+#[debug("OrderingProbeExec: leg={}", leg.label())]
 pub struct OrderingProbeExec {
     inner: Arc<dyn ExecutionPlan>,
     leg: LegKind,
@@ -176,12 +170,6 @@ pub struct OrderingProbeExec {
 impl OrderingProbeExec {
     pub fn new(inner: Arc<dyn ExecutionPlan>, leg: LegKind) -> Self {
         Self { inner, leg }
-    }
-}
-
-impl std::fmt::Debug for OrderingProbeExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "OrderingProbeExec: leg={}", self.leg.label())
     }
 }
 
@@ -3377,16 +3365,12 @@ pub fn hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// A distinct-count sketch. `Default` is the empty sketch, estimating 0.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, educe::Educe)]
+#[educe(Default)]
 pub enum Hll {
+    #[educe(Default)]
     Sparse(HashSet<u64>),
     Dense(Box<[u8; M]>),
-}
-
-impl Default for Hll {
-    fn default() -> Self {
-        Self::Sparse(HashSet::new())
-    }
 }
 
 /// Split a hash into its register index and the 1-based position of the first

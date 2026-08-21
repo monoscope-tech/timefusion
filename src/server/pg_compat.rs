@@ -774,6 +774,8 @@ fn or_null<T: ToString>(v: Option<T>) -> String {
     v.map_or_else(|| "null".to_string(), |v| v.to_string())
 }
 
+#[derive(derive_more::Debug)]
+#[debug("StatsTableProvider {{ layer: {layer:?}, scan_metrics: {scan_metrics:?}, .. }}")]
 pub struct StatsTableProvider {
     layer: Option<Arc<BufferedWriteLayer>>,
     scan_metrics: Option<Arc<ScanMetrics>>,
@@ -782,12 +784,6 @@ pub struct StatsTableProvider {
     query_pool: Option<PoolSnapshot>,
     logical_count: Option<LogicalCountSnapshot>,
     schema: SchemaRef,
-}
-
-impl std::fmt::Debug for StatsTableProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StatsTableProvider").field("layer", &self.layer).field("scan_metrics", &self.scan_metrics).finish_non_exhaustive()
-    }
 }
 
 impl StatsTableProvider {

@@ -463,6 +463,8 @@ pub type TantivyIndexCallback =
 /// with flush for CPU, it only has to keep up with the flush RATE.
 const DEMOTE_CONCURRENCY: usize = 4;
 
+#[derive(derive_more::Debug)]
+#[debug("BufferedWriteLayer {{ has_callback: {} }}", delta_write_callback.is_some())]
 pub struct BufferedWriteLayer {
     config: Arc<AppConfig>,
     wal: Arc<WalManager>,
@@ -648,12 +650,6 @@ pub struct BufferedWriteLayer {
 
 /// Per-shard WAL cursor holds (`None` = no hold on that shard).
 type ShardHolds = Vec<Option<walrus_rust::WalPosition>>;
-
-impl std::fmt::Debug for BufferedWriteLayer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferedWriteLayer").field("has_callback", &self.delta_write_callback.is_some()).finish()
-    }
-}
 
 struct WriteAdmission<'a> {
     layer: &'a BufferedWriteLayer,

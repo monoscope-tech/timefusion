@@ -191,16 +191,12 @@ use crate::{
 };
 
 /// Auth configuration for PgWire server
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, educe::Educe)]
+#[educe(Default)]
 pub struct AuthConfig {
+    #[educe(Default = "postgres")]
     pub username: String,
     pub password: Option<String>,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self { username: "postgres".into(), password: None }
-    }
 }
 
 impl AuthConfig {
@@ -256,29 +252,19 @@ pub struct LoggingHandlerFactory {
     max_statement_secs: u64,
 }
 
+#[bon::bon]
 impl LoggingHandlerFactory {
-    pub fn new(session_context: Arc<SessionContext>, auth_config: AuthConfig) -> Self {
+    /// `db` enables the on-demand `OPTIMIZE <table> WHERE date = '...'` admin
+    /// command (intercepted in the simple-query path). Unset in test servers,
+    /// which don't need it.
+    #[builder]
+    pub fn new(
+        session_context: Arc<SessionContext>, auth_config: AuthConfig, scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>,
+        #[builder(default = DEFAULT_MAX_STATEMENT_SECS)] max_statement_secs: u64,
+    ) -> Self {
         let plan_cache = Arc::new(PlanCacheHook::default());
         crate::read::plan_cache::set_global(plan_cache.clone());
-        Self { session_context, auth_config, plan_cache, scan_metrics: None, db: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS }
-    }
-
-    pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
-        self.scan_metrics = Some(m);
-        self
-    }
-
-    pub fn with_max_statement_secs(mut self, max_statement_secs: u64) -> Self {
-        self.max_statement_secs = max_statement_secs;
-        self
-    }
-
-    /// Enables the on-demand `OPTIMIZE <table> WHERE date = '...'` admin command
-    /// (intercepted in the simple-query path). Unset in test servers, which
-    /// don't need it.
-    pub fn with_database(mut self, db: Arc<Database>) -> Self {
-        self.db = Some(db);
-        self
+        Self { session_context, auth_config, plan_cache, scan_metrics, db, max_statement_secs }
     }
 
     /// Hook list passed to every `DfSessionService` instance the factory
@@ -301,14 +287,26 @@ impl LoggingHandlerFactory {
 
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        let h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()).with_max_statement_secs(self.max_statement_secs);
-        let h = self.scan_metrics.iter().fold(h, |h, m| h.with_scan_metrics(m.clone()));
-        Arc::new(self.db.iter().fold(h, |h, db| h.with_database(db.clone())))
+        Arc::new(
+            LoggingSimpleQueryHandler::builder()
+                .session_context(self.session_context.clone())
+                .hooks(self.hooks())
+                .max_statement_secs(self.max_statement_secs)
+                .maybe_scan_metrics(self.scan_metrics.clone())
+                .maybe_db(self.db.clone())
+                .build(),
+        )
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        let h = LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()).with_max_statement_secs(self.max_statement_secs);
-        Arc::new(self.scan_metrics.iter().fold(h, |h, m| h.with_scan_metrics(m.clone())))
+        Arc::new(
+            LoggingExtendedQueryHandler::builder()
+                .session_context(self.session_context.clone())
+                .hooks(self.hooks())
+                .max_statement_secs(self.max_statement_secs)
+                .maybe_scan_metrics(self.scan_metrics.clone())
+                .build(),
+        )
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
@@ -422,24 +420,14 @@ pub struct LoggingSimpleQueryHandler {
     max_statement_secs: u64,
 }
 
+#[bon::bon]
 impl LoggingSimpleQueryHandler {
-    pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
-        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None, db: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS }
-    }
-
-    pub fn with_max_statement_secs(mut self, max_statement_secs: u64) -> Self {
-        self.max_statement_secs = max_statement_secs;
-        self
-    }
-
-    pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
-        self.scan_metrics = Some(m);
-        self
-    }
-
-    pub fn with_database(mut self, db: Arc<Database>) -> Self {
-        self.db = Some(db);
-        self
+    #[builder]
+    pub fn new(
+        session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>, scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+        db: Option<Arc<Database>>, #[builder(default = DEFAULT_MAX_STATEMENT_SECS)] max_statement_secs: u64,
+    ) -> Self {
+        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics, db, max_statement_secs }
     }
 
     /// Execute an intercepted `OPTIMIZE <table> WHERE date = '...'`.
@@ -1078,21 +1066,16 @@ pub struct LoggingExtendedQueryHandler {
     query_parser: Arc<RewritingQueryParser>,
 }
 
+#[bon::bon]
 impl LoggingExtendedQueryHandler {
-    pub fn with_max_statement_secs(mut self, max_statement_secs: u64) -> Self {
-        self.max_statement_secs = max_statement_secs;
-        self
-    }
-
-    pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
-        self.scan_metrics = Some(m);
-        self
-    }
-
-    pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
+    #[builder]
+    pub fn new(
+        session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>, scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+        #[builder(default = DEFAULT_MAX_STATEMENT_SECS)] max_statement_secs: u64,
+    ) -> Self {
         let inner = DfSessionService::new_with_hooks(session_context, hooks);
         let query_parser = Arc::new(RewritingQueryParser { inner: ExtendedQueryHandler::query_parser(&inner) });
-        Self { inner, scan_metrics: None, max_statement_secs: DEFAULT_MAX_STATEMENT_SECS, query_parser }
+        Self { inner, scan_metrics, max_statement_secs, query_parser }
     }
 }
 
@@ -1193,9 +1176,15 @@ fn handler_factory(
     session_context: Arc<SessionContext>, auth_config: AuthConfig, scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>,
 ) -> Arc<LoggingHandlerFactory> {
     let max_statement_secs = db.as_ref().map_or(DEFAULT_MAX_STATEMENT_SECS, |db| db.config().core.timefusion_pgwire_max_statement_secs);
-    let factory = LoggingHandlerFactory::new(session_context, auth_config).with_max_statement_secs(max_statement_secs);
-    let factory = scan_metrics.into_iter().fold(factory, LoggingHandlerFactory::with_scan_metrics);
-    Arc::new(db.into_iter().fold(factory, LoggingHandlerFactory::with_database))
+    Arc::new(
+        LoggingHandlerFactory::builder()
+            .session_context(session_context)
+            .auth_config(auth_config)
+            .max_statement_secs(max_statement_secs)
+            .maybe_scan_metrics(scan_metrics)
+            .maybe_db(db)
+            .build(),
+    )
 }
 
 /// Start the server with custom handlers. `db` enables the admin commands

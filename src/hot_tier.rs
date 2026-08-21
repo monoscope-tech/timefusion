@@ -38,22 +38,19 @@ const MIN_FILE_LEN: usize = 6 + 10;
 /// (`TIMEFUSION_HOT_TIER_MAX_DISK_GB`) because it bounds the WAL/data volume
 /// this box has already been killed by. Query heap needs no knob of its own
 /// since `HotTier::scan` streams inside the query's memory pool.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, educe::Educe)]
+#[educe(Default)]
 pub struct HotTierLimits {
     /// Directory cap; over it GC unlinks oldest-first.
+    #[educe(Default = 68_719_476_736)] // 64 GiB
     pub max_disk_bytes: u64,
     /// Merge-on-demote: a versioned bucket that already has demoted files is
     /// rewritten (old stack + new drain, keep-greatest) into ONE covering file
     /// whose gate is the newest stamp. Kill switch falls back to STACKED files
     /// (coverage still stands, gate still advances via `plan_leg`) — never to
     /// the old coverage-voiding behaviour.
+    #[educe(Default = true)]
     pub merge_demote: bool,
-}
-
-impl Default for HotTierLimits {
-    fn default() -> Self {
-        Self { max_disk_bytes: 64 << 30, merge_demote: true }
-    }
 }
 
 /// Demotions a table must accumulate before its first conviction — one unlucky
