@@ -1,15 +1,4 @@
-//! DedupExec read-side dedup benchmark (parity plan Point 3).
-//!
-//! Drives `DedupExec` end-to-end over an in-memory input (no S3): a
-//! `MemorySourceConfig` feeds synthetic `(id, timestamp, payload)` batches
-//! through the operator and we drain the resulting stream. Sweeps the axes the
-//! optimization plan calls out — input size, duplicate ratio, sorted vs
-//! shuffled — so every change to `read_dedup.rs` can be gated on real numbers.
-//!
-//! Throughput (rows/s) comes from criterion. Peak seen-set bytes and allocation
-//! count come from a counting global allocator (below); run with
-//! `DEDUP_MEM_REPORT=1` to print that table. The 49M-row axis is heavy (multi-GB
-//! input) so it is gated behind `DEDUP_BIG=1`; the default max is 10M.
+//! `DedupExec` read-side dedup benchmark.
 //!
 //!   cargo bench --bench dedup_benchmarks
 //!   DEDUP_MEM_REPORT=1 DEDUP_BIG=1 cargo bench --bench dedup_benchmarks
@@ -37,7 +26,6 @@ use futures::StreamExt;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use timefusion::read::DedupExec;
 
-// ── Counting allocator: peak live bytes + total alloc count ──────────────────
 struct CountingAlloc;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -62,9 +50,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static A: CountingAlloc = CountingAlloc;
 
-/// Reset counters, run `f`, return (peak_live_bytes, alloc_count) attributable
-/// to it. `LIVE` isn't reset (other live allocs exist) — we track the delta in
-/// PEAK by zeroing it and letting `fetch_max` climb.
+/// `LIVE` includes unrelated allocations, so measure peak growth from its baseline.
 fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
     let live0 = LIVE.load(Relaxed);
     PEAK.store(live0, Relaxed);
@@ -73,29 +59,25 @@ fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
     (r, PEAK.load(Relaxed).saturating_sub(live0), ALLOCS.load(Relaxed) - a0)
 }
 
-// ── Synthetic input ──────────────────────────────────────────────────────────
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         Field::new("version", DataType::Int64, false),
-        Field::new("payload", DataType::Utf8, false), // fat body DedupExec must never touch
+        // Keep payloads large to expose accidental reads by `DedupExec`.
+        Field::new("payload", DataType::Utf8, false),
     ]))
 }
 
 const BATCH: usize = 8192;
-const PAYLOAD: &str = "payloadpayloadpayloadpayloadpayloadpayloadpayload__"; // ~50B
+const PAYLOAD: &str = "payloadpayloadpayloadpayloadpayloadpayloadpayload__";
 
-/// `total` rows drawn from `distinct` unique `(id, timestamp)` keys (dup ratio =
-/// 1 - distinct/total). A duplicate shares BOTH id and ts, so when `sorted` the
-/// copies cluster in one timestamp run — the case the bounded-window mode
-/// exploits. Chunked into `BATCH`-row batches to model streaming.
 fn make_batches(total: usize, distinct: usize, sorted: bool) -> Vec<RecordBatch> {
     let mut rng = StdRng::seed_from_u64(0xDED0_9000);
-    // key i → (id_i, ts_i); ts strictly increasing in i so sort-by-ts == sort-by-key-index.
     let mut idx: Vec<usize> = (0..total).map(|r| r % distinct).collect();
     if sorted {
-        idx.sort_unstable(); // group identical keys; ts increasing in key index
+        // Sorted duplicates exercise the bounded-window path.
+        idx.sort_unstable();
     } else {
         idx.shuffle(&mut rng);
     }
@@ -117,21 +99,25 @@ fn make_batches(total: usize, distinct: usize, sorted: bool) -> Vec<RecordBatch>
 }
 
 fn dedup_plan(batches: Vec<RecordBatch>, sorted: bool, keep_greatest: bool) -> Arc<dyn ExecutionPlan> {
-    let s = schema();
-    let src = MemorySourceConfig::try_new(&[batches], s.clone(), None).unwrap();
-    // Declare the timestamp ordering so DedupExec's Tier-2 bounded-window gate
-    // can fire; shuffled input declares nothing (full-set fallback).
+    let src = MemorySourceConfig::try_new(&[batches], schema(), None).unwrap();
     let src = if sorted {
+        // Ordered input enables DedupExec's bounded-window path.
         let ord = LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("timestamp", 1)), Default::default())]).unwrap();
         src.try_with_sort_information(vec![ord]).unwrap()
     } else {
         src
     };
-    let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(src)));
-    Arc::new(DedupExec::with_tiebreak(input, vec!["id".into(), "timestamp".into()], keep_greatest.then(|| "version".into()), None).unwrap())
+    Arc::new(
+        DedupExec::with_tiebreak(
+            Arc::new(DataSourceExec::new(Arc::new(src))),
+            vec!["id".into(), "timestamp".into()],
+            keep_greatest.then_some("version".into()),
+            None,
+        )
+        .unwrap(),
+    )
 }
 
-/// Drain the dedup stream, return surviving row count.
 async fn drain(plan: Arc<dyn ExecutionPlan>) -> usize {
     let mut stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
     let mut rows = 0;
@@ -141,8 +127,8 @@ async fn drain(plan: Arc<dyn ExecutionPlan>) -> usize {
     rows
 }
 
-fn sizes() -> Vec<usize> {
-    if std::env::var("DEDUP_BIG").is_ok() { vec![1_000_000, 10_000_000, 49_000_000] } else { vec![1_000_000, 10_000_000] }
+fn sizes() -> &'static [usize] {
+    if std::env::var("DEDUP_BIG").is_ok() { &[1_000_000, 10_000_000, 49_000_000] } else { &[1_000_000, 10_000_000] }
 }
 const DUP_RATIOS: [u32; 4] = [0, 50, 90, 99];
 
@@ -151,7 +137,7 @@ fn bench_dedup(c: &mut Criterion) {
     let mut group = c.benchmark_group("dedup");
     group.sample_size(10);
 
-    for &total in &sizes() {
+    for &total in sizes() {
         for &ratio in &DUP_RATIOS {
             let distinct = (total * (100 - ratio) as usize / 100).max(1);
             for &keep_greatest in &[false, true] {
@@ -178,12 +164,10 @@ fn bench_dedup(c: &mut Criterion) {
     group.finish();
 }
 
-/// One-shot memory/alloc report (peak seen-set bytes, alloc count) — the metric
-/// criterion can't give. Gated so `cargo bench` stays throughput-only.
 fn mem_report(rt: &tokio::runtime::Runtime) {
     println!("\n=== dedup memory report (peak live bytes / alloc count) ===");
     println!("{:<28} {:>14} {:>14} {:>10}", "config", "peak_bytes", "allocs", "kept");
-    for &total in &sizes() {
+    for &total in sizes() {
         for &ratio in &DUP_RATIOS {
             let distinct = (total * (100 - ratio) as usize / 100).max(1);
             for &keep_greatest in &[false, true] {
@@ -204,17 +188,11 @@ fn mem_report(rt: &tokio::runtime::Runtime) {
     }
 }
 
-/// The FLUSH-path dedup (`mem_buffer::dedup_batches`), which is a different
-/// function from the read-side `DedupExec` above and runs once per row of every
-/// flush AND every dedup rewrite. It keys a hash map by the encoded sort-key
-/// row, so it is dominated by hashing and by whatever that key costs to
-/// materialize — which is what makes it worth measuring on its own.
 fn bench_flush_dedup(c: &mut Criterion) {
     let keys = vec!["id".to_string(), "timestamp".to_string()];
     let mut group = c.benchmark_group("flush_dedup");
     for &(total, distinct) in &[(200_000usize, 200_000usize), (200_000, 100_000), (200_000, 20_000)] {
-        // Unsorted: the realistic flush shape, and it denies the map any
-        // locality that would mask per-row key costs.
+        // Flushes receive batches in insertion order.
         let batches = make_batches(total, distinct, false);
         group.throughput(Throughput::Elements(total as u64));
         group.bench_function(format!("{}k_rows_{}pct_dup", total / 1000, 100 - distinct * 100 / total), |b| {

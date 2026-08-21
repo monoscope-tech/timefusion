@@ -14,23 +14,13 @@ impl Database {
         self.config.maintenance.timefusion_incremental_snapshot
     }
 
-    /// The process-wide `RuntimeEnv`: one memory pool + parquet-metadata cache shared by every
-    /// session.
-    ///
-    /// Pool defaults to Greedy for ingest-heavy workloads; opt into FairSpill via
-    /// `TIMEFUSION_MEMORY_POOL=fair_spill`. Maintenance jobs must run under this env so the
-    /// configured memory cap is a real budget; an unpooled session can OOM-kill the process instead
-    /// of erroring.
+    /// Returns the process-wide query memory pool and Parquet metadata cache.
     pub(crate) fn shared_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.runtime_env
             .get_or_init(|| {
                 let pool_size = self.config.derived.query_pool_bytes();
                 use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, TrackConsumersPool};
-                // TrackConsumersPool: "Resources exhausted" errors name the top
-                // pool holders. The 30G pool pinned to 100% twice on 2026-08-03
-                // (07:06Z 45min, ~09:30Z), starving KB-scale DedupExec
-                // reservations and failing enrichment UPDATEs — with a bare
-                // Greedy pool the holder was unattributable.
+                // Name the largest consumers when the pool is exhausted.
                 let top = std::num::NonZeroUsize::new(5).unwrap();
                 let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
                     crate::config::MemoryPoolKind::Greedy => Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(pool_size), top)),
@@ -58,22 +48,7 @@ impl Database {
         let _ = std::fs::create_dir_all(&spill_dir);
         reap_orphaned_spill_dirs(&spill_dir);
         let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
-        // TrackConsumersPool so an exhausted MAINTENANCE pool names its holders,
-        // exactly as `shared_runtime_env` already does for the query pool.
-        //
-        // Without it the error names only the victim, which is never the culprit:
-        // prod 2026-08-09 00:13 reported `Failed to allocate additional 2.5 MB for
-        // SortPreservingMergeExec[0] with 4.9 MB already allocated - 1188.5 KB
-        // remain available for the total memory pool: fair(pool_size: 22.5 GB)`.
-        // A consumer asking for 2.5 MB is the thing that got starved, and the
-        // 22.5 GB was held by something the message would not name. One shared
-        // light pool serves every hot-tail pass across ALL tables and projects,
-        // so the holder can be another table entirely — that same night an
-        // `otel_metrics` packing bin was misread as the `otel_logs_and_spans`
-        // footer repair failing, and the wrong subsystem was blamed for hours.
-        //
-        // The query pool learned this on 2026-08-03 ("with a bare Greedy pool the
-        // holder was unattributable"); the maintenance pool never did.
+        // Name holders, not merely the allocation victim, on exhaustion.
         let top = std::num::NonZeroUsize::new(5).expect("5 is non-zero");
         let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), top));
         Arc::new(RuntimeEnvBuilder::new().with_memory_pool(pool).with_disk_manager_builder(disk).build().expect("build maintenance runtime env"))
@@ -621,8 +596,8 @@ impl Database {
 
         // Stamp the schema's TF-owned version column. This is the single funnel
         // every *inbound* write passes through — pgwire INSERT (`write_all`),
-        // the `__bulk` direct-to-Delta alias, gRPC ingest, the legacy batch
-        // queue — regardless of whether the buffered layer is configured, and it
+        // the `__bulk` direct-to-Delta alias, and the legacy batch queue —
+        // regardless of whether the buffered layer is configured, and it
         // runs before the WAL append so the durable record carries the value.
         //
         // A `watermark` marks the one caller that is NOT inbound: the flush of

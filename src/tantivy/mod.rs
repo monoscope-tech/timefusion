@@ -11,7 +11,6 @@ pub mod udf;
 
 pub use search::{Hit, query_index};
 
-// ===== builder =====
 // Build a tantivy index from a stream of `RecordBatch`es.
 //
 // Strategy: in-memory `tantivy::Index` (RAMDirectory) — caller is responsible
@@ -42,40 +41,20 @@ use tracing::{debug, warn};
 
 use crate::schema::TableSchema;
 
-/// Heap reserved per tantivy `IndexWriter`. Surfaced so the
-/// `BufferedWriteLayer` can subtract peak in-flight tantivy memory from the
-/// MemBuffer budget (`max_memory_bytes`).
+/// Heap reserved per writer and charged against the MemBuffer budget.
 pub const WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
-/// Segment-count safety valve for `MergeMode::Deferred`: past this many
-/// segments a build merges inline anyway, because per-query cost is linear in
-/// segment count (one term-dictionary seek per segment) and an index whose
-/// parquet never gets compacted would otherwise stay pathological forever.
-/// Generous on purpose — a normal flush bucket lands well under it, so the
-/// valve only fires for outlier-sized buckets.
+/// Deferred builds merge past this cap to bound per-query segment cost.
 pub const MAX_DEFERRED_SEGMENTS: usize = 32;
 
 /// When a build is allowed to spend CPU on segment merges.
 ///
-/// Merging is *semantically invisible*: it changes neither the hit set nor any
-/// stored/fast-field value, only the number of segment readers a query opens
-/// and the packed blob's size. That is what makes deferring it safe.
-///
-/// It is not cheap though — tantivy schedules merges from
-/// `SegmentUpdater::consider_merge_options()`, which runs on **every in-flight
-/// segment flush**, not just on commit. Under the default `LogMergePolicy` that
-/// puts `TermMerger` work concurrently with `add_document`, inside the ingest
-/// window, ×`tantivy_spawn_sem` concurrent builds.
+/// Merging is logically invisible but expensive during ingestion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeMode {
-    /// Ingest path (post-flush sidecar build, MemBuffer bucket index): install
-    /// `NoMergePolicy` and ship whatever segments the per-thread arena flushes
-    /// produced. Bounded by `MAX_DEFERRED_SEGMENTS`; collapsed to one segment
-    /// later by the post-optimize / backfill rebuilds, which run `Now`.
+    /// Defers ingest-path merges up to [`MAX_DEFERRED_SEGMENTS`].
     Deferred,
-    /// Maintenance path (post-optimize reindex, startup backfill, WAL-recovery
-    /// reindex): merge everything into a single segment after the commit. These
-    /// callers are already off the ingest path, so this is the merge cadence.
+    /// Merges maintenance-path indexes after commit.
     Now,
 }
 
@@ -96,8 +75,6 @@ pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(
     let built = build_for_table(table);
     let index = Index::create_in_ram(built.schema.clone());
     crate::tantivy::register_tokenizers(&index);
-    // Bucket indexes are a query-time cache rebuilt on every row-count change —
-    // merging them is pure waste.
     let stats = index_to_writer(&built, &index, batches, MergeMode::Deferred)?;
     Ok((index, built, stats))
 }
@@ -106,9 +83,7 @@ pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(
 /// Used by `store::build_to_dir` to write directly to a `MmapDirectory`.
 pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatch], merge: MergeMode) -> Result<IndexBuildStats> {
     let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
-    // Merges are driven explicitly below, never by the writer's own policy: the
-    // default `LogMergePolicy` fires from `consider_merge_options()` on every
-    // in-flight segment flush, i.e. *while* documents are still being added.
+    // Explicit merges keep `TermMerger` off the ingest path.
     writer.set_merge_policy(Box::new(NoMergePolicy));
     let mut stats = IndexBuildStats::default();
     batches.iter().try_for_each(|batch| index_batch(built, &mut writer, batch, &mut stats))?;
@@ -158,12 +133,7 @@ fn finish_writer(index: &Index, mut writer: IndexWriter, mut stats: IndexBuildSt
         debug!("tantivy build deferring merge of {} segments", stats.segments);
         crate::observability::record_tantivy_merge_deferred();
     }
-    // Join background merge threads before returning: an explicit `merge()` runs
-    // on tantivy's threadpool, and dropping the writer does NOT wait for it.
-    // If the caller then tars the index dir (`store::pack_dir`) while a merge is still
-    // GC-ing source segments, the archive captures vanished/half-rewritten files —
-    // surfacing as non-fatal `tar append` (build) / `tar unpack` (read) failures that
-    // silently disable the index. Waiting leaves the dir quiescent.
+    // Packing requires all background merge file mutations to finish.
     writer.wait_merging_threads().context("wait merging threads")?;
     Ok(stats)
 }

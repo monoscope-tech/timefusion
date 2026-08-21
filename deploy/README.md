@@ -14,9 +14,10 @@ Production proxy state:
 - published port: TCP 5432, host mode
 - backend: `srv-captain--timefusion:5432`
 
-The CapRover app publishes only TCP 50051. Apply
-`caprover-service-override.yml` as its Service Update Override. Forward
-deployments are start-first; rollbacks are stop-first.
+The CapRover app does not publish a host-mode port. It exposes PGWire to the
+overlay network on TCP 5432. Apply `caprover-service-override.yml` as its
+Service Update Override. Forward deployments are start-first. Rollbacks are
+stop-first.
 
 The deployment workflow executes `FLUSH` and then leased `HANDOFF` before it
 submits an update. A replacement binds an unhealthy 57P03 responder, waits for

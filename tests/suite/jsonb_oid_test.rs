@@ -61,7 +61,6 @@ mod jsonb_oid {
                 }
             });
 
-            // Wait for readiness
             let conn_str = format!("host=localhost port={port} user=postgres password=postgres");
             for _ in 0..100 {
                 if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {

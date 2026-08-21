@@ -4,27 +4,13 @@ use serde::Deserialize;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
-/// Bytes per MiB / GiB — used by the `*_bytes()` size accessors below so the
-/// `* 1024 * 1024` chains don't repeat (and read as the unit they mean).
 const MIB: usize = 1024 * 1024;
 const GIB: usize = 1024 * 1024 * 1024;
 
-// ---------------------------------------------------------------------------
-// Self-sizing budget tree (docs/compaction-redesign-2026-07-29.md §4).
-// Replaces hand-set memory/concurrency env vars (drift caused the 07-21
-// budget-vs-limit crash loop) with derivation from the container's actual
-// cgroup limits. Detection is pure-parseable (`parse_*` fns take `&str`,
-// doctested) so a misread cgroup file reproduces without a container.
-// ---------------------------------------------------------------------------
-
-/// Read+parse a `/proc`/`/sys` file; `None` on failure — every detector below
-/// chains these.
 fn read_parsed<T>(path: &str, parse: impl FnOnce(&str) -> Option<T>) -> Option<T> {
     std::fs::read_to_string(path).ok().and_then(|s| parse(&s))
 }
 
-/// Parse cgroup v2 `memory.max` content. Returns `None` for `"max"`
-/// (unlimited, which simply fails to parse) or garbage — caller falls back.
 fn parse_cgroup_v2_memory_max(content: &str) -> Option<usize> {
     content.trim().parse().ok()
 }
@@ -37,7 +23,6 @@ fn parse_cgroup_v1_memory_limit(content: &str) -> Option<usize> {
     (v < (1_usize << 62)).then_some(v)
 }
 
-/// Parse `/proc/meminfo`'s `MemTotal:` line (kB) into bytes.
 fn parse_meminfo_total_bytes(content: &str) -> Option<usize> {
     content.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|kb| kb.parse::<usize>().ok()).map(|kb| kb * 1024)
 }
@@ -117,8 +102,6 @@ fn detect_memory_limit_clamped() -> usize {
     read_parsed("/proc/meminfo", parse_meminfo_total_bytes).map_or(detected, |host| detected.min(host))
 }
 
-/// Detect available cores: cgroup v2 `cpu.max` quota/period → OS-reported
-/// parallelism → a 4-core floor. Never panics.
 pub(crate) fn detect_cores() -> usize {
     let host = std::thread::available_parallelism().map(NonZeroUsize::get).unwrap_or(4);
     let read_i64 = |p: &str| read_parsed(p, |s| s.trim().parse::<i64>().ok());
@@ -152,13 +135,7 @@ pub struct DerivedBudget {
     profile: BudgetProfile,
 }
 
-/// Which reservation shape the budget tree derives. A one-shot maintenance CLI
-/// (`optimize` / `redrive-dml` / `migrate-columns`) serves no pgwire queries
-/// and starts no ingest, yet under the server shape it still pays those
-/// reservations — on a small pod the maintenance pool lands on its floor and
-/// sorts die admitting their first batch. The CLI shape hands maintenance
-/// nearly the whole cgroup. Selected via `TIMEFUSION_BUDGET_PROFILE=maintenance-cli`,
-/// set by `main` for CLI subcommands before config init — never by operators.
+/// Reservation shape selected internally for a server or one-shot maintenance CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BudgetProfile {
     #[default]
@@ -630,7 +607,7 @@ pub fn set_config_for_test(cfg: AppConfig) {
 }
 
 /// Whether the operator has opted into open auth for local dev via
-/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
+/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`.
 /// paths gate their fail-secure defaults on this flag.
 pub fn is_insecure_auth_allowed() -> bool {
     std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
@@ -661,7 +638,6 @@ const_default!(d_tantivy_build_concurrency: usize = 2);
 const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
 const_default!(d_data_dir: PathBuf = "./data");
 const_default!(d_pgwire_port: u16 = 5432);
-const_default!(d_grpc_port: u16 = 50051);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
 const_default!(d_pgwire_user: String = "postgres");
@@ -696,7 +672,7 @@ const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
 // Total graceful-shutdown budget shared by ALL serial shutdown phases
-// (PGWire drain → gRPC drain → buffered-layer flush + cursor snapshot).
+// (PGWire drain → buffered-layer flush + cursor snapshot).
 // Set to ~80% of the orchestrator's SIGTERM→SIGKILL grace (Docker/CapRover
 // `StopGracePeriod`; prod is 90s) so the clean cursor snapshot always lands
 // before SIGKILL — the previous per-phase 180s ceilings assumed grace nobody
@@ -1323,10 +1299,6 @@ pub struct CoreConfig {
     pub timefusion_pgwire_max_statement_secs: u64,
     #[serde(default)]
     pub timefusion_otel_scan_guard: OtelScanGuard,
-    #[serde(default = "d_grpc_port")]
-    pub grpc_port: u16,
-    #[serde(default)]
-    pub grpc_token: Option<String>,
 }
 
 impl CoreConfig {

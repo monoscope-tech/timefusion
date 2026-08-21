@@ -5,12 +5,11 @@
 ##############################
 FROM rust:1.91-slim-bookworm AS chef
 WORKDIR /app
-# protoc is required by tonic-prost-build (build.rs). make is required by
-# tikv-jemalloc-sys (jemalloc compiles from C source under --features
+# make is required by tikv-jemalloc-sys (jemalloc compiles from C source under --features
 # profiling); the slim image ships cc but not make. libunwind-dev backs the
 # heap profiler's unwinder (see JEMALLOC_SYS_PROF_BACKTRACE below).
 RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev protobuf-compiler make libunwind-dev && \
+    apt-get install -y pkg-config libssl-dev make libunwind-dev && \
     rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --version 0.1.77 --locked
 
@@ -22,11 +21,11 @@ RUN cargo install cargo-chef --version 0.1.77 --locked
 # stays cached across most edits.
 FROM chef AS planner
 # Only inputs cargo chef prepare actually reads: Cargo manifests + path-dep
-# manifests (in vendor/). NOT src/, schemas/, or proto/ — including them
+# manifests (in vendor/). NOT src/ or schemas/ — including them
 # here would bust the planner layer on edits unrelated to the dep graph,
 # defeating cargo-chef's purpose. vendor/ is copied in full (manifests +
 # source) since separating them isn't worth the Dockerfile complexity.
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 # Stub auto-discovered targets so `cargo metadata` (run by cargo chef prepare)
 # can parse the manifest without the real sources. recipe.json content depends
@@ -49,7 +48,7 @@ FROM chef AS builder
 # Cook compiles only dependencies. Docker layer-caches this step; cache-to:
 # type=gha,mode=max in deploy.yml persists the layer across CI runs. Layer
 # invalidates only when recipe.json changes (i.e. the dep graph changes),
-# not on every src/ or proto/ edit. vendor/ is required here for the same
+# not on every src/ edit. vendor/ is required here for the same
 # reason as in the planner stage (path-deps) — the duplication is necessary.
 COPY --from=planner /app/recipe.json recipe.json
 COPY vendor/ vendor/
@@ -93,10 +92,8 @@ ENV JEMALLOC_SYS_PROF_BACKTRACE=libunwind
 RUN cargo chef cook --release --locked --features profiling --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
-# the crate itself when src/, build.rs, or proto/ change. proto/ must be
-# copied *after* cook so .proto edits don't bust the dep-compile layer.
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto/ proto/
+# the crate itself when src/ changes.
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY schemas/ schemas/
 RUN cargo build --release --locked --features profiling

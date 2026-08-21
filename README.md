@@ -65,8 +65,6 @@ If you already have a Postgres client, you already have a TimeFusion client.
   Completed time buckets flush to Delta in the background.
 - **Read:** queries union the in-memory buffer with Delta on S3, so recently
   written rows are visible immediately.
-- **Ingest:** besides pgwire `INSERT`, TimeFusion accepts gRPC streaming
-  ingestion of Arrow IPC payloads (`GRPC_PORT`, default `50051`).
 
 > **Single-writer WAL.** Exactly one TimeFusion process may run against a given
 > WAL directory. Startup takes an exclusive `flock` on the WAL dir to enforce
@@ -243,11 +241,9 @@ TimeFusion is configured entirely through environment variables.
 
 **Server**
 
-| Variable      | Description                          | Default |
-| ------------- | ------------------------------------ | ------- |
-| `PGWIRE_PORT` | PostgreSQL wire protocol port        | `5432`  |
-| `GRPC_PORT`   | gRPC ingestion port                  | `50051` |
-| `GRPC_TOKEN`  | Bearer token for gRPC (open if unset)| —       |
+| Variable      | Description                   | Default |
+| ------------- | ----------------------------- | ------- |
+| `PGWIRE_PORT` | PostgreSQL wire protocol port | `5432`  |
 
 **Write buffer & flushing**
 

@@ -55,7 +55,6 @@ async fn deep_but_well_pruned_scan_is_not_gated_while_a_many_file_scan_still_is(
     let client = env.pg_client().await?;
 
     // One file per flush, each an hour apart, all far enough back that every
-    // query below is "deep" (> the 2h lookback threshold). 12 files > the
     // 8-file budget, so the unpruned query must still be gated.
     let hour = 3_600_000_000i64;
     let base = FROZEN_START_MICROS - 40 * hour;

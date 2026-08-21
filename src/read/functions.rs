@@ -28,21 +28,17 @@ use tdigests::TDigest;
 
 use crate::{observability::arrow_err, read::optimizers::extract_utf8_string, schema::is_variant_type};
 
-/// Pull a single UTF-8 string out of a scalar-or-length-1-array argument.
-/// Used by UDFs whose Nth argument is a constant string (format, timezone,
-/// etc.). `label` names the argument in error messages.
+/// Extracts a UTF-8 constant argument.
 fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error::Result<String> {
     let not_utf8 = || DataFusionError::Execution(format!("{label} must be a UTF8 string"));
     match arg {
         ColumnarValue::Scalar(scalar) => extract_utf8_string(scalar).ok_or_else(not_utf8),
-        // `||` short-circuits so is_null(0) is never called on an empty array.
         ColumnarValue::Array(arr) if arr.len() != 1 || arr.is_null(0) => Err(DataFusionError::Execution(format!("{label} must be a scalar value"))),
         ColumnarValue::Array(arr) => extract_utf8_string(&ScalarValue::try_from_array(arr, 0)?).ok_or_else(not_utf8),
     }
 }
 
-/// The `Array(a) => a.clone(), Scalar(s) => s.to_array()?` dance every UDF here
-/// repeats. Scalars materialize length-1, matching the pre-existing behavior.
+/// Materializes scalars as one-element arrays.
 fn as_array(v: &ColumnarValue) -> datafusion::error::Result<ArrayRef> {
     match v {
         ColumnarValue::Array(a) => Ok(a.clone()),
@@ -50,9 +46,6 @@ fn as_array(v: &ColumnarValue) -> datafusion::error::Result<ArrayRef> {
     }
 }
 
-/// Emits the boilerplate `ScalarUDFImpl` `name`/`signature` methods shared by
-/// every UDF in this module that stores its `Signature` in a `signature` field.
-/// `return_type` / `invoke_with_args` stay per-impl.
 macro_rules! scalar_udf_boilerplate {
     ($name:literal) => {
         fn name(&self) -> &str {
@@ -63,10 +56,6 @@ macro_rules! scalar_udf_boilerplate {
         }
     };
 }
-
-// ============================================================================
-// Variant-Aware Expression Planner
-// ============================================================================
 
 /// Resolves PostgreSQL types that DataFusion does not model natively as text.
 /// The planner runs for simple and extended protocol casts alike.
@@ -84,12 +73,10 @@ impl TypePlanner for PostgresTypePlanner {
     }
 }
 
-/// ExprPlanner that intercepts -> and ->> operators on Variant columns
-/// and rewrites them to efficient variant_get calls with flattened dot-paths.
+/// Rewrites Variant `->` and `->>` operators to `variant_get` calls.
 #[derive(Debug, Default)]
 pub struct VariantAwareExprPlanner;
 
-/// Path component for building variant_get paths
 #[derive(Debug, Clone)]
 enum PathComponent {
     Field(String),
@@ -115,7 +102,6 @@ impl ExprPlanner for VariantAwareExprPlanner {
             _ => return Ok(PlannerResult::Original(expr)),
         };
 
-        // Recursively collect path components from chained operators
         let (base_expr, mut path_parts) = collect_arrow_chain(&expr.left);
         let Some(component) = extract_path_component(&expr.right) else {
             return Ok(PlannerResult::Original(expr));
@@ -126,17 +112,9 @@ impl ExprPlanner for VariantAwareExprPlanner {
             return Ok(PlannerResult::Original(expr)); // Let JSON planner handle
         }
 
-        // Build the variant_get(base, '<path>') call. For `->` we return the
-        // Variant leaf so chained `->` keeps working. For `->>` we'd previously
-        // ask variant_get to project as Utf8, but that returns NULL for
-        // numeric/boolean leaves (parquet_variant_compute doesn't stringify).
-        // Postgres `->>` text semantics need numeric/bool → text, JSON null →
-        // SQL NULL, and string → unquoted. Compose:
-        //   variant_get(col, path) → Variant
-        //   variant_to_json(...)   → JSON-encoded text (Utf8)
-        //   json_to_pg_text(...)   → Postgres ->> text
+        // `variant_get` cannot stringify numeric/boolean leaves. Compose through
+        // JSON text to preserve PostgreSQL `->>` semantics.
         let path_literal = Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path_parts))), None);
-        // Render the alias base before `base_expr` is moved into the call args.
         let base_repr = expr_repr(&base_expr);
         let variant_leaf = Expr::ScalarFunction(ScalarFunction { func: variant_get_udf(), args: vec![base_expr, path_literal] });
         let result = if is_long_arrow {
@@ -146,14 +124,12 @@ impl ExprPlanner for VariantAwareExprPlanner {
             variant_leaf
         };
 
-        // Create alias to preserve original SQL representation
         let op_str = if is_long_arrow { "->>" } else { "->" };
         let alias_name = format!("{base_repr} {op_str} {}", path_repr(&path_parts));
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(result, None::<&str>, alias_name))))
     }
 }
 
-/// Recursively collect chained arrow expressions into base + path components
 fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
     match expr {
         Expr::BinaryExpr(binary) if matches!(binary.op, datafusion::logical_expr::Operator::Arrow) => {
@@ -166,7 +142,6 @@ fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
     }
 }
 
-/// Extract path component from expression (string literal or integer)
 fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
     let Expr::Literal(v, _) = expr else { return None };
     extract_utf8_string(v).map(PathComponent::Field).or_else(|| {

@@ -6,16 +6,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_to_char_function() -> Result<()> {
-        // Create a new SessionContext
         let mut ctx = SessionContext::new();
 
         // Register our custom functions
         register_custom_functions(&mut ctx)?;
 
-        // Create a test timestamp
         let timestamp = "2024-01-15 14:30:45";
 
-        // Test various format patterns
         let test_cases = vec![
             ("YYYY-MM-DD", "2024-01-15"),
             ("YYYY-MM-DD HH24:MI:SS", "2024-01-15 14:30:45"),
@@ -43,13 +40,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_at_time_zone_function() -> Result<()> {
-        // Create a new SessionContext
         let mut ctx = SessionContext::new();
 
         // Register our custom functions
         register_custom_functions(&mut ctx)?;
 
-        // Test timezone conversion with a simpler query
         let sql = "SELECT at_time_zone(TIMESTAMP '2024-01-15 14:30:45 UTC', 'America/New_York') as ny_time";
 
         let df = ctx.sql(sql).await?;

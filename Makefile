@@ -137,7 +137,7 @@ tf-start: minio-start
 	@set -a; . ./.env.minio; set +a; \
 		port="$${PGWIRE_PORT:-12345}"; \
 		( nohup cargo run --release > /tmp/timefusion.log 2>&1 & echo $$! > /tmp/timefusion.pid ); \
-		echo "timefusion starting (PGWire: $$port, gRPC: $${GRPC_PORT:-50051}). Logs: /tmp/timefusion.log"; \
+		echo "timefusion starting (PGWire: $$port). Logs: /tmp/timefusion.log"; \
 		for i in $$(seq 1 900); do \
 			nc -z 127.0.0.1 $$port 2>/dev/null && { echo "ready on $$port"; exit 0; }; \
 			kill -0 $$(cat /tmp/timefusion.pid) 2>/dev/null || { echo "timefusion died; see /tmp/timefusion.log"; tail -50 /tmp/timefusion.log; exit 1; }; \

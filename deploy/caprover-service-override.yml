@@ -39,8 +39,8 @@
 # - stop-first rollback: older binaries might not implement that liveness and
 #   takeover contract, so rollback stays conservative.
 #
-# No EndpointSpec here on purpose: TCP 50051 is published by the app's own port
-# mapping, and 5432 belongs to the stable srv-timefusion-pgwire-proxy service.
+# No EndpointSpec here on purpose: 5432 belongs to the stable
+# srv-timefusion-pgwire-proxy service.
 {
   "TaskTemplate": {
     "ContainerSpec": {

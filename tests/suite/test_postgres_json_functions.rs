@@ -11,7 +11,6 @@ mod test_json_functions {
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
-        // Test json_build_array with literals
         let df = ctx.sql("SELECT json_build_array('a', 'b', 'c') as result").await?;
         let results = df.collect().await?;
         assert_eq!(results.len(), 1);
@@ -30,7 +29,6 @@ mod test_json_functions {
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
-        // Test to_json with string
         let df = ctx.sql(r#"SELECT to_json('{"hello": "world"}') as result"#).await?;
         let results = df.collect().await?;
         assert_eq!(results.len(), 1);
@@ -38,7 +36,6 @@ mod test_json_functions {
         let column = batch.column(0);
         assert_eq!(get_str(column.as_ref(), 0), r#"{"hello":"world"}"#);
 
-        // Test to_json with number
         let df = ctx.sql("SELECT to_json(123) as result").await?;
         let results = df.collect().await?;
         assert_eq!(results.len(), 1);
@@ -76,7 +73,6 @@ mod test_json_functions {
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
-        // Test extract_epoch
         let df = ctx.sql("SELECT extract_epoch(TIMESTAMP '2025-08-07T10:00:00Z') as result").await?;
         let results = df.collect().await?;
         assert_eq!(results.len(), 1);
@@ -97,7 +93,6 @@ mod test_json_functions {
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
-        // Test to_char
         let df = ctx.sql("SELECT to_char(TIMESTAMP '2025-08-07T10:00:00Z', 'YYYY-MM-DD HH24:MI:SS') as result").await?;
         let results = df.collect().await?;
         assert_eq!(results.len(), 1);
@@ -168,11 +163,9 @@ mod test_json_functions {
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
-        // Create test table and insert data
         ctx.sql("CREATE TABLE test_table (id VARCHAR, name VARCHAR, duration BIGINT, summary VARCHAR)").await?.collect().await?;
         ctx.sql(r#"INSERT INTO test_table VALUES ('001', 'test_span', 1500, '{"status": "ok"}')"#).await?.collect().await?;
 
-        // Test complex json_build_array query
         let df = ctx.sql("SELECT json_build_array(id, name, duration, to_json(summary)) as result FROM test_table").await?;
         let results = df.collect().await?;
         assert_eq!(results.len(), 1);

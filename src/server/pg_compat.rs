@@ -80,12 +80,7 @@ pub fn setup_catalog(ctx: &SessionContext, role: &str, max_statement_secs: u64) 
     overlay_runtime_stat_views(ctx)
 }
 
-/// The runtime-statistics views pgAdmin's dashboard polls. TF keeps no session,
-/// lock or replication registry, so these are honestly empty — but they must
-/// *exist*, or every dashboard refresh raises a planning error.
-///
-/// Column shapes follow PostgreSQL 16. `oid`/`xid` map to UInt32, `name`/`inet`/
-/// `pg_lsn`/`interval` to Utf8, matching how the pg_catalog crate types its own.
+/// Empty PostgreSQL 16 runtime views needed by pgAdmin clients.
 const RUNTIME_STAT_VIEWS: [(&str, &str); 6] = [
     (
         "pg_stat_activity",

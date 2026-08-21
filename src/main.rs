@@ -177,8 +177,7 @@ fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let write_ms = stage(&mut mark);
     wrote.inspect_err(|e| println!("probe stage=write connect_ms={connect_ms} ms={write_ms} result=error err={e}"))?;
 
-    // The stage that actually costs: the server has to schedule the handshake
-    // task and answer. Starvation shows up here, not in connect.
+    // Auth latency exposes server task starvation that connect latency misses.
     let mut tag = [0u8; 1];
     let read = stream.read_exact(&mut tag);
     let auth_ms = stage(&mut mark);
@@ -634,43 +633,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // relief files be indexed.
     db.spawn_deferred_tantivy_reindex(Arc::clone(&buffered_layer));
 
-    // Start gRPC ingestion server alongside PGWire
-    let grpc_port = cfg.core.grpc_port;
-    // GRPC_TOKEN: required shared bearer token. Clients send
-    // `Authorization: Bearer <token>` and the server (grpc_handlers.rs)
-    // compares against this env var. Same fail-secure posture as
-    // PGWIRE_PASSWORD — opt out for local dev only via
-    // TIMEFUSION_ALLOW_INSECURE_AUTH=true.
-    let grpc_token = match (&cfg.core.grpc_token, config::is_insecure_auth_allowed()) {
-        (Some(t), _) if !t.is_empty() => Some(t.clone()),
-        (_, true) => {
-            warn!("GRPC_TOKEN unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — gRPC ingest accepts any client. Local dev ONLY.");
-            None
-        }
-        _ => return Err(anyhow::anyhow!("GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)")),
-    };
-    // gRPC shutdown signal: tonic's `serve_with_shutdown` polls this future
-    // and stops accepting new requests once it resolves. In-flight requests
-    // are then awaited up to the server's drain timeout.
-    let grpc_shutdown = tokio_util::sync::CancellationToken::new();
-    let grpc_task = tokio::spawn({
-        let shutdown = grpc_shutdown.clone();
-        let db_for_grpc = Arc::clone(&db);
-        async move {
-            let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
-            info!("Starting gRPC ingestion server on port: {}", grpc_port);
-            let svc = timefusion::server::IngestService::new(db_for_grpc, grpc_token).into_server();
-            let serve = tonic::transport::Server::builder().add_service(svc).serve_with_shutdown(addr, async move {
-                shutdown.cancelled().await;
-                info!("gRPC server: shutdown signal received, draining in-flight requests");
-            });
-            match serve.await {
-                Err(e) => error!("gRPC server error: {}", e),
-                Ok(()) => info!("gRPC server: shutdown complete"),
-            }
-        }
-    });
-
     // Catch SIGTERM (k8s rolling restart) in addition to SIGINT (Ctrl-C).
     // Without SIGTERM handling, k8s sends SIGKILL after the grace period
     // and in-flight writes are dropped.
@@ -760,11 +722,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     //    BufferedWriteLayer flush below races fresh inserts that pile back
     //    into MemBuffer + WAL, defeating the whole point of a graceful
     //    shutdown.
-    // 1. Tell gRPC to stop accepting new connections. tonic's
-    //    serve_with_shutdown then waits for existing streams to complete.
-    // 2. Once gRPC is done, the buffered layer no longer receives new
-    //    writes — safe to flush + checkpoint.
-    // 3. Shut down database (cache, foyer, log store).
+    // 1. Flush and checkpoint the fenced buffered layer.
+    // 2. Shut down database (cache, foyer, log store).
     // One shutdown budget shared by all serial phases (TIMEFUSION_STOP_GRACE_SECS,
     // sized to fit the orchestrator's SIGTERM→SIGKILL grace). The drain phases
     // get small caps so a hung connection can't starve the buffer flush +
@@ -786,14 +745,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         Ok(Ok(())) => info!("PGWire drained cleanly"),
         Ok(Err(e)) => error!("PGWire task panicked during drain: {}", e),
         Err(_) => warn!("PGWire drain exceeded its slice of the stop grace — proceeding; in-flight queries may be reset"),
-    }
-
-    grpc_shutdown.cancel();
-    let grpc_drain_budget = if preflushed_handoff { Duration::from_millis(50) } else { grace.mul_f32(0.1) };
-    match tokio::time::timeout(grpc_drain_budget, grpc_task).await {
-        Ok(Ok(())) => info!("gRPC drained cleanly"),
-        Ok(Err(e)) => error!("gRPC task panicked during drain: {}", e),
-        Err(_) => error!("gRPC drain exceeded its slice of the stop grace — proceeding; in-flight requests may be reset"),
     }
 
     if let Err(e) = buffered_layer.shutdown_by(deadline).await {

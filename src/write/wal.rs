@@ -1165,10 +1165,8 @@ fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) ->
 }
 
 /// Cast top-level dictionary columns to their value types (`None` when the
-/// batch has no dictionary columns). Dictionary batches reach the WAL only
-/// via gRPC ingest (client-supplied Arrow IPC is forwarded with no schema
-/// coercion), and their shared dictionary defeats row-boundary splitting —
-/// see `split_to_wal_payloads`.
+/// batch has no dictionary columns). Shared dictionaries defeat row-boundary
+/// splitting; see `split_to_wal_payloads`.
 fn flatten_dictionary_columns(batch: &RecordBatch) -> Result<Option<RecordBatch>, WalError> {
     use arrow::datatypes::{DataType, Field};
     if !batch.schema().fields().iter().any(|f| matches!(f.data_type(), DataType::Dictionary(_, _))) {
@@ -1877,8 +1875,7 @@ mod tests {
         );
     }
 
-    /// Dictionary-encoded columns (reachable via gRPC ingest, which forwards
-    /// client Arrow IPC verbatim) defeat row-boundary splitting: every IPC
+    /// Dictionary-encoded columns defeat row-boundary splitting: every IPC
     /// stream carries the full dictionary, so halving rows doesn't halve
     /// bytes and the pre-fix splitter degenerated to one near-full-size
     /// entry per row (a 39k-row batch with a 150MB dictionary → multi-TB

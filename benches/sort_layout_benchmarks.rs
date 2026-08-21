@@ -42,7 +42,8 @@ use deltalake::datafusion::parquet::{
 
 const N_ROWS: usize = 200_000;
 const N_SERVICES: usize = 20;
-const TS_SPAN_SECS: i64 = 3600; // 1 hour
+const BASE_TIMESTAMP: i64 = 1_700_000_000_000_000;
+const TS_SPAN_SECS: i64 = 3600;
 const ROW_GROUP_SIZE: usize = 8_000;
 
 fn schema() -> Arc<Schema> {
@@ -58,7 +59,6 @@ fn schema() -> Arc<Schema> {
 }
 
 fn generate_batch(seed_offset: usize) -> RecordBatch {
-    let base_ts: i64 = 1_700_000_000_000_000; // 2023-11-14
     let mut ts = Vec::with_capacity(N_ROWS);
     let mut id = Vec::with_capacity(N_ROWS);
     let mut svc = Vec::with_capacity(N_ROWS);
@@ -67,8 +67,7 @@ fn generate_batch(seed_offset: usize) -> RecordBatch {
     let mut name = Vec::with_capacity(N_ROWS);
     let mut sev = Vec::with_capacity(N_ROWS);
     for i in 0..N_ROWS {
-        // Spread timestamps evenly across the span, with µs precision.
-        let t = base_ts + ((i as i64) * (TS_SPAN_SECS * 1_000_000) / N_ROWS as i64);
+        let t = BASE_TIMESTAMP + ((i as i64) * (TS_SPAN_SECS * 1_000_000) / N_ROWS as i64);
         ts.push(t);
         id.push(format!("id_{:08x}", i + seed_offset));
         svc.push(format!("svc_{:02}", (i + seed_offset) % N_SERVICES));
@@ -92,7 +91,6 @@ fn generate_batch(seed_offset: usize) -> RecordBatch {
     .unwrap()
 }
 
-/// Sort a batch by the supplied (column-name, descending) pairs, returning a new batch.
 fn sort_batch(batch: &RecordBatch, by: &[&str]) -> RecordBatch {
     let cols: Vec<SortColumn> = by
         .iter()
@@ -125,7 +123,7 @@ fn write_parquet(path: &Path, batch: &RecordBatch) {
 }
 
 fn file_size(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 fn row_group_count(path: &Path) -> usize {
@@ -134,7 +132,6 @@ fn row_group_count(path: &Path) -> usize {
 }
 
 async fn time_query(ctx: &SessionContext, sql: &str, iters: u32) -> (f64, usize) {
-    // Warm-up
     let df = ctx.sql(sql).await.unwrap();
     let rows: usize = df.collect().await.unwrap().iter().map(|b| b.num_rows()).sum();
     let start = Instant::now();
@@ -149,25 +146,24 @@ async fn time_query(ctx: &SessionContext, sql: &str, iters: u32) -> (f64, usize)
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let tmp = tempfile::tempdir().unwrap();
-    let base = tmp.path().to_path_buf();
     println!("Generating {} rows...", N_ROWS);
     let raw = generate_batch(0);
 
-    let layouts: &[(&str, &[&str])] = &[
+    let layouts: [(&str, &[&str]); 3] = [
         ("A_ts_id", &["timestamp", "id"]),
         ("B_ts_svc_id", &["timestamp", "resource___service___name", "id"]),
         ("C_level_status_svc_ts", &["level", "status_code", "resource___service___name", "timestamp"]),
     ];
 
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    for (name, sort_by) in layouts {
-        let sorted = sort_batch(&raw, sort_by);
-        let path = base.join(format!("{name}.parquet"));
-        write_parquet(&path, &sorted);
-        let rg = row_group_count(&path);
-        println!("Layout {:<22} {:>8} bytes  {:>3} row groups", name, file_size(&path), rg);
-        files.push((name.to_string(), path));
-    }
+    let files: Vec<(&str, PathBuf)> = layouts
+        .iter()
+        .map(|(name, sort_by)| {
+            let path = tmp.path().join(format!("{name}.parquet"));
+            write_parquet(&path, &sort_batch(&raw, sort_by));
+            println!("Layout {:<22} {:>8} bytes  {:>3} row groups", name, file_size(&path), row_group_count(&path));
+            (*name, path)
+        })
+        .collect();
 
     // Pick a target row from the middle of the dataset.
     let target_idx = N_ROWS / 2;
@@ -182,7 +178,7 @@ async fn main() {
     let win_end = target_ts + 3 * 60 * 1_000_000;
     let ts_lit = |t: i64| format!("TIMESTAMP '1970-01-01 00:00:00 UTC' + INTERVAL '{} microseconds'", t);
 
-    let queries: Vec<(&str, String)> = vec![
+    let queries = [
         ("Q1_point_lookup", format!("SELECT id FROM t WHERE timestamp = {} AND id = '{}'", ts_lit(target_ts), target_id)),
         (
             "Q2_service_in_time",
@@ -202,7 +198,7 @@ async fn main() {
 
     for (qname, sql) in &queries {
         let mut row = format!("{:<24}", qname);
-        for (lname, path) in &files {
+        for (_, path) in &files {
             let ctx = SessionContext::new();
             ctx.register_parquet("t", path.to_str().unwrap(), ParquetReadOptions::default()).await.unwrap();
             // Toggle pushdown + bloom-filter pruning so layouts compete fairly.
@@ -211,7 +207,6 @@ async fn main() {
             ctx.state_ref().write().config_mut().options_mut().execution.parquet.bloom_filter_on_read = true;
             let (ms, rows) = time_query(&ctx, sql, 30).await;
             row.push_str(&format!(" {:>10.3}ms({})", ms, rows));
-            let _ = lname;
         }
         println!("{}", row);
     }

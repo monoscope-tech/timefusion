@@ -1,9 +1,9 @@
 # Configuration reference
 
-Every setting is an environment variable, parsed at startup. Defaults below are
-the authoritative values from [`src/config.rs`](src/config.rs); the [README](README.md#configuration)
-covers the common subset. Sizes are MB/GB unless noted; schedules are 6-field
-cron (`sec min hour dom mon dow`).
+Every setting is an environment variable that TimeFusion reads at startup. The
+[README](README.md#configuration) covers the common subset. `src/config.rs` is
+the source of truth for defaults. Sizes are MB or GB unless noted. Schedules use
+six cron fields: `sec min hour dom mon dow`.
 
 ## Object storage (S3 / MinIO / R2)
 
@@ -25,9 +25,7 @@ cron (`sec min hour dom mon dow`).
 | `PGWIRE_PORT`                     | `5432`       | PostgreSQL wire protocol port. |
 | `PGWIRE_USER`                     | `postgres`   | pgwire username. |
 | `PGWIRE_PASSWORD`                 | —            | pgwire password (required unless insecure auth is allowed). |
-| `GRPC_PORT`                       | `50051`      | gRPC ingestion port (Arrow IPC). |
-| `GRPC_TOKEN`                      | —            | Bearer token for gRPC; ingest is open if unset. |
-| `TIMEFUSION_ALLOW_INSECURE_AUTH`  | `false`      | Opt into open auth for local dev (both pgwire and gRPC). |
+| `TIMEFUSION_ALLOW_INSECURE_AUTH`  | `false`      | Allow PGWire startup without a password for local development. |
 | `TIMEFUSION_DATA_DIR`             | `./data`     | Base dir for the WAL (`/wal`) and cache (`/cache`). |
 | `TIMEFUSION_TABLE_PREFIX`         | `timefusion` | Path prefix for tables within the bucket. |
 | `TIMEFUSION_STOP_GRACE_SECS`      | `70`         | Total graceful-shutdown budget; keep below the 90s CapRover SIGTERM→SIGKILL grace. |

@@ -16,10 +16,8 @@ mod tests {
         minio_test_config(test_id, &format!("/tmp/timefusion-dml-{test_id}"))
     }
 
-    // ==========================================================================
     // Delta-Only DML Tests (no buffered layer - operations go directly to Delta)
     // These tests verify that UPDATE/DELETE work correctly on Delta Lake tables.
-    // ==========================================================================
 
     fn create_test_records(now: chrono::DateTime<chrono::Utc>) -> Vec<serde_json::Value> {
         vec![
@@ -62,8 +60,6 @@ mod tests {
         ]
     }
 
-    // UPDATE Tests
-
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_query() -> Result<()> {
@@ -80,7 +76,6 @@ mod tests {
 
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
-        // Test UPDATE with WHERE clause
         info!("Executing UPDATE query");
         let df = ctx.sql("UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let result = df.collect().await?;
@@ -92,7 +87,6 @@ mod tests {
         let rows_updated = batch.column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
 
-        // Verify the update
         let df = ctx.sql("SELECT id, name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id").await?;
         let results = df.collect().await?;
 
@@ -118,8 +112,6 @@ mod tests {
         Ok(())
     }
 
-    // DELETE Tests
-
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_with_predicate() -> Result<()> {
@@ -136,7 +128,6 @@ mod tests {
 
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
-        // Test DELETE with WHERE clause
         info!("Executing DELETE query");
         let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
         let result = df.collect().await?;
@@ -148,7 +139,6 @@ mod tests {
         let rows_deleted = batch.column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_deleted, 1, "Expected 1 row to be deleted");
 
-        // Verify the delete
         let df = ctx.sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id").await?;
         let results = df.collect().await?;
 
@@ -241,13 +231,11 @@ mod tests {
         let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_deleted, 3, "Expected 3 rows to be deleted");
 
-        // Verify only the INFO record remains
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(count, 1, "Expected 1 row to remain");
 
-        // Verify it's the right record
         let df = ctx.sql("SELECT id, level FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let batch = &results[0];
@@ -260,10 +248,6 @@ mod tests {
 
         Ok(())
     }
-
-    // ==========================================================================
-    // Delta UPDATE with multiple columns test
-    // ==========================================================================
 
     #[serial]
     #[tokio::test]
@@ -279,7 +263,6 @@ mod tests {
         let records = create_test_records(now);
         let batch = timefusion::support::test_helpers::json_to_batch(records)?;
 
-        // Insert directly to Delta (skip_queue=true)
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Update multiple columns at once
@@ -290,7 +273,6 @@ mod tests {
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
 
-        // Verify both columns were updated
         let df = ctx.sql("SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration, COALESCE(array_element(hashes, 2), level) AS level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Alice'").await?;
         let results = df.collect().await?;
 
@@ -310,10 +292,6 @@ mod tests {
         Ok(())
     }
 
-    // ==========================================================================
-    // Delta DELETE then verify row counts test
-    // ==========================================================================
-
     #[serial]
     #[tokio::test]
     async fn test_delete_verify_counts() -> Result<()> {
@@ -326,7 +304,6 @@ mod tests {
 
         let now = chrono::Utc::now();
 
-        // Create 5 records
         let records = vec![
             serde_json::json!({
                 "id": "1", "name": "R1", "project_id": "test_project",
@@ -358,7 +335,6 @@ mod tests {
         let batch = timefusion::support::test_helpers::json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
-        // Verify initial count
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let initial_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
@@ -370,7 +346,6 @@ mod tests {
         let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_deleted, 2, "Should delete 2 ERROR records");
 
-        // Verify final count
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
@@ -424,10 +399,6 @@ mod tests {
 
         Ok(())
     }
-
-    // ==========================================================================
-    // UPDATE ... FROM Tests
-    // ==========================================================================
 
     /// Helper: select `duration` for `name` in `test_project`, ordered by name.
     /// `mor_dormant` is the in-place-DML fixture: `otel_logs_and_spans` flipped
@@ -899,10 +870,6 @@ mod tests {
         assert_eq!(get_str(b.column(1).as_ref(), 0), "WARN");
         Ok(())
     }
-
-    // ==========================================================================
-    // DML coalescer + flush-watermark tests
-    // ==========================================================================
 
     /// With `TIMEFUSION_DML_COALESCE_SECS > 0`, the Delta leg of
     /// `UPDATE ... FROM` defers: statements return without touching Delta,

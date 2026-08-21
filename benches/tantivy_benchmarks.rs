@@ -91,9 +91,7 @@ fn bench_build(c: &mut Criterion) {
         let b = synthetic_batch(n);
         g.throughput(Throughput::Elements(n as u64));
         g.bench_function(format!("build_in_memory/{n}"), |bench| {
-            bench.iter(|| {
-                let _ = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
-            });
+            bench.iter(|| drop(build_in_memory(&table, std::slice::from_ref(&b)).unwrap()));
         });
     }
     g.finish();
@@ -107,7 +105,7 @@ fn bench_query(c: &mut Criterion) {
     c.bench_function("tantivy_query_term_100k", |bench| {
         bench.iter(|| {
             let q = TermQuery::new(Term::from_field_text(level, "ERROR"), IndexRecordOption::Basic);
-            let _ = query_index(&idx, &q, None).unwrap();
+            query_index(&idx, &q, None).unwrap();
         });
     });
 }
@@ -121,7 +119,7 @@ fn bench_size_ratio(c: &mut Criterion) {
     println!("tantivy index size: {} bytes for {} rows ({:.2} bytes/row)", blob.len(), stats.rows, bytes_per_row);
     c.bench_function("tantivy_pack_100k_zstd_19", |bench| {
         bench.iter(|| {
-            let _ = timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now).unwrap();
+            timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now).unwrap();
         });
     });
 }
@@ -142,7 +140,7 @@ use timefusion::{
     write::DeltaWriteCallback,
 };
 
-fn make_app_cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
+fn make_app_cfg(test_id: &str) -> Arc<AppConfig> {
     let mut c = AppConfig::default();
     c.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
     c.aws.aws_access_key_id = Some("minioadmin".into());
@@ -158,7 +156,7 @@ fn make_app_cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
 }
 
 async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Option<(Database, datafusion::execution::context::SessionContext, String)> {
-    let cfg_arc = make_app_cfg(test_id, tantivy_enabled);
+    let cfg_arc = make_app_cfg(test_id);
     let mut db = Database::with_config(cfg_arc.clone()).await.ok()?;
     let db_for_cb = db.clone();
     let delta_cb: DeltaWriteCallback = Arc::new(move |project_id, table_name, batches, _watermark| {
@@ -235,12 +233,12 @@ fn bench_e2e_scan(c: &mut Criterion) {
     g.measurement_time(Duration::from_secs(15));
     g.bench_function("scan_10k_with_prefilter", |b| {
         b.to_async(&rt).iter(|| async {
-            let _ = ctx_on.sql(&q_on).await.unwrap().collect().await.unwrap();
+            ctx_on.sql(&q_on).await.unwrap().collect().await.unwrap();
         });
     });
     g.bench_function("scan_10k_without_prefilter", |b| {
         b.to_async(&rt).iter(|| async {
-            let _ = ctx_off.sql(&q_off).await.unwrap().collect().await.unwrap();
+            ctx_off.sql(&q_off).await.unwrap().collect().await.unwrap();
         });
     });
     g.finish();

@@ -49,9 +49,7 @@ fn create_records(project_id: &str, count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// =============================================================================
 // Parameterized tests - run in both buffer modes
-// =============================================================================
 
 #[test_case(BufferMode::Enabled ; "buffered")]
 #[test_case(BufferMode::FlushImmediately ; "immediate")]
@@ -171,9 +169,7 @@ async fn test_aggregations(mode: BufferMode) -> Result<()> {
     Ok(())
 }
 
-// =============================================================================
 // Union tests - data split between buffer and Delta
-// =============================================================================
 //
 // The two #[ignore]'d tests below write the same (project_id, time-window) to
 // Delta directly AND to MemBuffer, then expect the union to reflect both legs.
@@ -192,11 +188,9 @@ async fn test_partial_flush_union() -> Result<()> {
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
 
-    // Insert first batch directly to Delta (skip_queue=true)
     let batch1 = json_to_batch(create_records(&project_id, 50))?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true, None).await?;
 
-    // Insert second batch to buffer only (skip_queue=false, no callback so no flush to Delta)
     let now = chrono::Utc::now();
     let records2: Vec<_> = (50..100)
         .map(|i| {
@@ -216,7 +210,6 @@ async fn test_partial_flush_union() -> Result<()> {
     let batch2 = json_to_batch(records2)?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false, None).await?;
 
-    // Query should return all 100 rows (50 from Delta + 50 from buffer)
     let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
 
     let count = result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
@@ -230,11 +223,9 @@ async fn test_partial_flush_union() -> Result<()> {
 async fn test_delta_only_query() -> Result<()> {
     let (db, _layer, project_id) = setup_db_with_buffer(BufferMode::Enabled).await?;
 
-    // Insert directly to Delta (skip_queue=true)
     let batch1 = json_to_batch(create_records(&project_id, 30))?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true, None).await?;
 
-    // Insert to buffer only (skip_queue=false, no callback so stays in buffer)
     let now = chrono::Utc::now();
     let records2: Vec<_> = (30..50)
         .map(|i| {
@@ -270,16 +261,13 @@ async fn test_delta_only_query() -> Result<()> {
     Ok(())
 }
 
-// =============================================================================
 // Immediate flush verification
-// =============================================================================
 
 #[serial]
 #[tokio::test]
 async fn test_immediate_flush_drains_buffer() -> Result<()> {
     let (db, layer, project_id) = setup_db_with_buffer(BufferMode::FlushImmediately).await?;
 
-    // Insert with immediate mode through buffer (skip_queue=false)
     let batch = json_to_batch(create_records(&project_id, 10))?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
 

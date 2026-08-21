@@ -72,7 +72,7 @@ top priorities**. Before opening a PR:
   numbers, and bounded deserialization.
 - Run `cargo fmt` and `cargo clippy` before pushing; fix new warnings.
 
-See [CLAUDE.md](CLAUDE.md) for the full code philosophy.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current design rules.
 
 ## Commits & pull requests
 

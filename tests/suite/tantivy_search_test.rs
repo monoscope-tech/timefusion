@@ -79,7 +79,6 @@ fn batch(rows: &[(i64, &str, &str)]) -> RecordBatch {
 async fn callback_builds_index_and_search_returns_hits() {
     // Manually register the schema is tricky here because the schema_loader
     // pulls from compiled YAML. Use the otel_logs_and_spans table instead and
-    // build batches that match its required columns. We index "level" which
     // is configured for tantivy in the production YAML.
     let table_name = "otel_logs_and_spans";
     let project_id = "p1";
@@ -89,13 +88,11 @@ async fn callback_builds_index_and_search_returns_hits() {
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
     let cb = svc.clone().callback();
 
-    // Build a batch matching the prod schema. Only the columns we care about
     // here are timestamp/id/level — the rest of the columns can be missing
     // because schema validation is on the Delta side, not tantivy.
     let b = batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "INFO")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["test-uri".into()]).await.expect("callback");
 
-    // Manifest has one entry now
     let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
     assert_eq!(m.entries.len(), 1);
     let entry = m.entries.values().next().unwrap();
@@ -112,7 +109,6 @@ async fn callback_builds_index_and_search_returns_hits() {
     assert_eq!(hits[0].id, "b");
     assert_eq!(hits[0].timestamp_micros, 2_000_000);
 
-    // Cache hit: re-run; must return same answers
     let hits2 = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
     assert_eq!(hits, hits2);
 }
@@ -228,7 +224,6 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
     .unwrap();
     let cache = TempDir::new().unwrap();
     let search = TantivySearchService::new(store, cache.path().to_path_buf());
-    // Manifest has only failed entries → no usable index → returns None so
     // the caller falls back to full scan + UDF post-filter.
     let hits = search.search("logs", "p1", "level", "ERROR").await.unwrap();
     assert!(hits.is_none());
@@ -242,7 +237,6 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
     let cb = svc.clone().callback();
-    // First flush wrote file_a; second flush wrote file_b.
     cb(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "INFO")])], vec!["file_a".into()]).await.unwrap();
     cb(project_id.into(), table_name.into(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["file_b".into()]).await.unwrap();
     let m_before = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();

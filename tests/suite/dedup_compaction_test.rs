@@ -44,14 +44,12 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-dedup: cross-flush duplicate should exist as 2 physical rows in Delta");
 
-    // Verify there are at least two parquet files in the partition (proves the
     // two commits did not coalesce by accident).
     let date_str = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
     let part_marker = format!("project_id={}/date={}", project_id, date_str);
     let file_count_before = table_ref.read().await.get_file_uris()?.filter(|u| u.contains(&part_marker)).count();
     assert!(file_count_before >= 2, "expected >=2 files in partition before dedup, got {}", file_count_before);
 
-    // Run the new dedup compaction on the partition.
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
     let (dropped, complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
     assert_eq!((dropped, complete), (1, true), "expected exactly one duplicate row dropped in a complete pass");
@@ -892,7 +890,6 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Merge-on-read read path (docs/plans/2026-08-01-merge-on-read-dml.md §3).
 //
 // Keep-greatest only engages while `DedupExec`'s input still DECLARES an
@@ -907,7 +904,6 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
 // The shape under test is the production one: the base row is already flushed to
 // Delta (one file → the fork's footer pushdown declares `timestamp DESC`) and
 // the new version is still in MemBuffer.
-// ---------------------------------------------------------------------------
 
 /// A `Database` with a real buffered layer, so writes can land in MemBuffer.
 async fn buffered_db(name: &str) -> Result<(Arc<Database>, String)> {
@@ -1328,7 +1324,6 @@ async fn adding_a_column_to_an_existing_table_is_caught() -> Result<()> {
         "the added column must carry values — silently dropping it is the quieter form of this bug"
     );
 
-    // Now the FLUSH leg — the one that produced the 268 prod failures.
     // `flush_all_now` swallows per-bucket errors into `buckets_failed`; that
     // counter IS the 268, so it is the assertion that matters.
     let stats = layer.flush_all_now().await.map_err(|e| {
@@ -1413,7 +1408,6 @@ async fn aggregate_groups_on_a_nullability_widened_column() -> Result<()> {
     let rows: Vec<_> = (0..2).map(|i| test_span_ts(&format!("n{i}"), "v", &project_id, ts + i * 1000)).collect();
     db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(rows)?], true, None).await?;
 
-    // Now widen `timestamp` + `id` to nullable and merge-write them in, exactly
     // as the 7d68f01 binary did. Values untouched — only the field flags move.
     let rows: Vec<_> = (2..4).map(|i| test_span_ts(&format!("n{i}"), "v", &project_id, ts + i * 1000)).collect();
     let batch = json_to_batch(rows)?;
@@ -1525,7 +1519,6 @@ async fn a_legacy_null_stamped_row_loses_to_a_stamped_version() -> Result<()> {
     // A normal write, to create the table.
     db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("other", "v", &project_id, ts)])?], true, None).await?;
 
-    // Now the legacy row: written straight to Delta so nothing stamps it, which
     // leaves `updated_at` NULL just like every pre-migration row in prod.
     let batch = json_to_batch(vec![test_span_ts("legacy", "before", &project_id, ts)])?;
     assert!(
@@ -1966,7 +1959,6 @@ async fn a_pushed_mutable_predicate_on_a_swept_partition_cannot_match_the_supers
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
     // `name` is version-mutable, so this predicate is exactly the one that may
-    // now reach the Parquet scan on a certified window.
     let count_where = |val: &str| {
         let sql = format!(
             "SELECT array_element(hashes, 1) FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
@@ -2191,7 +2183,6 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
     // mid-bucket so the left fringe is non-empty too. The hybrid cost guard
     // intentionally declines a rollup covering less than 20% of the requested
     // window; keeping these rows in one hour made this test depend on the old
-    // first-write bug manufacturing full-day empty coverage.
     for (i, offset) in
         [17i64, 61_000_000, 130_000_000, 610_000_000, 3_661_000_000, 7_330_000_000, 10_810_000_000, 14_410_000_000, 18_010_000_000].iter().enumerate()
     {
@@ -2667,7 +2658,6 @@ async fn a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit() 
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     // The same keys twice, in separate flushes: cross-file duplicates, so the
-    // first sweep pass must rewrite.
     let batch = || json_to_batch((0..40).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i as i64)).collect());
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch()?], true, None).await?;
@@ -2849,7 +2839,6 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
 
         // TIME-BOUNDED. Without a window `dedup_skip_allowed` returns `NoWindow`
         // and refuses before it ever looks at a certification, so the unbounded
-        // count this test used to run proved nothing about the skip it exists to
         // gate. The `skips` assertion below is what stops that recurring silently.
         let (lo, hi) = (ts - 1, ts + (DUPLICATED + UNIQUE) as i64 + 1);
         // Rows, counted here — NOT `count(*)`. A bare count is answered by
@@ -2892,7 +2881,6 @@ async fn count_is_identical_with_and_without_the_dedup_skip() -> Result<()> {
 /// against `count(distinct id)` as the authority):
 ///
 /// | span   | `count(*)` | truth  |
-/// | ------ | ---------- | ------ |
 /// | 1 hour |        360 |    360 |
 /// | 1 day  |      8,919 |  8,919 |
 /// | 3 days |    112,595 | 27,909 |

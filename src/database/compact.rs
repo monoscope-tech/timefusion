@@ -2,8 +2,7 @@
 use super::*;
 
 impl Database {
-    /// Optimize the Delta table using Z-ordering on timestamp and id columns
-    /// This improves query performance for time-based queries
+    /// Optimizes recent Delta partitions for time-range reads.
     pub async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, _target_size: Option<i64>) -> Result<()> {
         let start_time = std::time::Instant::now();
         let window_hours = self.config.maintenance.timefusion_optimize_window_hours.max(1);
@@ -13,7 +12,6 @@ impl Database {
             table.clone()
         };
 
-        // Candidate date partitions in the window (today .. today-num_days).
         let now = Utc::now();
         let today = now.date_naive();
         let num_days = (window_hours / 24).max(1);
@@ -24,8 +22,7 @@ impl Database {
         // S3 I/O). With after_days=1 this leaves warm processing only today —
         // the partition still taking writes.
         let after_days = self.config.parquet.cold_optimize_after_days();
-        // Cold consolidation owns sealed dates; light optimization owns today
-        // to preserve its event-time-disjoint runs.
+        // Light optimization owns today's event-time-disjoint runs.
         let skip_today = self.config.maintenance.timefusion_light_optimize_enabled;
         let window_dates: Vec<chrono::NaiveDate> = (0..=num_days)
             .map(|days_ago| (now - chrono::Duration::days(days_ago as i64)).date_naive())
@@ -38,11 +35,7 @@ impl Database {
         let table_url = table_clone.table_url().to_string();
         let current = Self::filesets_for_dates(&all_uris, &window_dates);
 
-        // Pre-state file set, used to derive the files this optimize *adds*
-        // (to warm) and *removes* (to evict) — see warm/evict_cache_for_uris.
-        // Reuses (moves) the walk above instead of a second copy, and is hoisted
-        // out of the OCC retry loop below: the live file set only changes on a
-        // *successful* commit, which returns.
+        // Keep pre-state outside OCC retries; only a successful commit changes it.
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let pre_uris: Option<HashSet<String>> = track_files.then(|| all_uris.into_iter().collect());
 
@@ -102,17 +95,8 @@ impl Database {
         // SortBy materializes large Arrow buffers, so in-server bins are serial.
         let optimize_concurrency = if declare_sorted { 1 } else { self.config.derived.optimize_merge_tasks() };
 
-        // Best-effort: retry bounded OCC conflicts against a fresh snapshot,
-        // but never pause flushes (see optimize_table_light). This preserves
-        // ingestion latency and prevents maintenance from running unbounded.
-        //
-        // Hold a maintenance-rewrite permit across the .optimize() — this is
-        // the HEAVIEST rewrite (full-window ZOrder/Compact materializing a
-        // large pool-invisible Arrow set), so leaving it outside the
-        // concurrency cap would let it stack with a dedup/recompress and
-        // reproduce the cgroup OOM the cap exists to prevent (prod 2026-07-04).
-        // Scoped to the optimize call so the post-commit warm/evict bookkeeping
-        // below runs without the permit.
+        // Bound OCC retries and hold the rewrite permit only across optimize;
+        // stacking this materializing rewrite with dedup caused a cgroup OOM.
         const MAX_RETRIES: usize = 4;
         let optimize_result: Result<_> = {
             let mut attempt = 0;

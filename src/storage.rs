@@ -1148,7 +1148,6 @@ impl FoyerObjectStoreCache {
         let mut response_slice = None;
         let mut range_meta = None;
 
-        // First check if we have the full file cached
         let full_cache_key = Self::make_cache_key(location);
         if let Ok(Some(entry)) = self.cache.get(&full_cache_key).await {
             let value = entry.value();

@@ -140,17 +140,14 @@ async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result
     let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
     let client = env.pg_client().await?;
 
-    // --- Stage 1: row in the MemBuffer (not yet flushed) ---
     insert_span(&client, "h-1", "span-1", "trace-1", FROZEN_START_MICROS).await?;
     let updated = enrich(&client, "span-1", "trace-1", "H1").await?;
     assert_eq!(updated, 1, "enrichment UPDATE matched no rows in MemBuffer");
     assert_eq!(count_by_hash(&client, "H1").await?, 1, "MemBuffer: hashes && ARRAY['H1'] did not match the enriched row");
 
-    // --- Stage 2: flush to Delta, same query must still match ---
     env.force_flush().await?;
     assert_eq!(count_by_hash(&client, "H1").await?, 1, "after flush: enriched hash lost");
 
-    // --- Stage 3: enrich a *flushed* row (Delta merge-on-read DV path) ---
     insert_span(&client, "h-2", "span-2", "trace-2", FROZEN_START_MICROS + 1_000_000).await?;
     env.force_flush().await?;
     let updated = enrich(&client, "span-2", "trace-2", "H2").await?;
@@ -159,7 +156,6 @@ async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result
     // The first row's hash must be unaffected.
     assert_eq!(count_by_hash(&client, "H1").await?, 1, "H1 lost after enriching a different row");
 
-    // --- Stage 4: the monoscope query shape — filter by hashes WITH ORDER BY/LIMIT
     // (projection pushdown may drop `hashes` from the scan while the predicate
     // still references it). Reproduces prod "Predicate references unknown column: hashes". ---
     let rows = client
@@ -182,7 +178,6 @@ async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result
         .await?;
     assert_eq!(rows.len(), 2, "ORDER BY + LIMIT array_length filter returned wrong rows");
 
-    // --- Stage 5: `hashes IS NOT NULL` predicate on the List column. In prod this
     // pushed to delta_kernel data-skipping and errored "Predicate references unknown
     // column: hashes", breaking every hash query that includes the null-check. ---
     let rows = client

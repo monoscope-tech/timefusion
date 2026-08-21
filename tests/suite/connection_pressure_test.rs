@@ -35,7 +35,6 @@ mod connection_pressure {
             let test_id = Uuid::new_v4().to_string();
             // Kernel-assigned free port, not a random pick from a 100-wide
             // window: these servers now start concurrently with every other
-            // test process, and a collision wedges the whole run.
             let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
 
             unsafe {
@@ -65,7 +64,6 @@ mod connection_pressure {
                 }
             });
 
-            // Wait for server to be ready
             tokio::time::sleep(Duration::from_millis(1000)).await;
 
             Ok(Self { port, test_id, shutdown })
@@ -102,7 +100,6 @@ mod connection_pressure {
 
             handles.push(tokio::spawn(async move {
                 for op in 0..OPS_PER_CLIENT {
-                    // Create a new connection for each operation (no connection pooling)
                     let conn_str = format!("host=localhost port={} user=postgres password=postgres", server_port);
 
                     match timeout(Duration::from_millis(CONNECTION_TIMEOUT_MS), tokio_postgres::connect(&conn_str, NoTls)).await {
@@ -158,7 +155,6 @@ mod connection_pressure {
                             error_count.fetch_add(1, Ordering::Relaxed);
                             let error_msg = e.to_string();
 
-                            // Check if this is a connection refused error
                             if error_msg.contains("Connection refused")
                                 || error_msg.contains("connection refused")
                                 || error_msg.contains("could not receive data from server")
@@ -179,7 +175,6 @@ mod connection_pressure {
             }));
         }
 
-        // Wait for all clients to complete
         for handle in handles {
             let _ = handle.await;
         }
@@ -196,7 +191,6 @@ mod connection_pressure {
         println!("Success rate: {:.2}%", (successes as f64 / (CONCURRENT_CLIENTS * OPS_PER_CLIENT) as f64) * 100.0);
         println!("Connection refused rate: {:.2}%", (refused as f64 / (CONCURRENT_CLIENTS * OPS_PER_CLIENT) as f64) * 100.0);
 
-        // Verify that we actually reproduced issues under pressure
         assert!(errors > 0, "Expected to see some errors under pressure");
 
         // The test should demonstrate connection issues (either timeouts or refusals)
@@ -218,7 +212,6 @@ mod connection_pressure {
         let read_errors = Arc::new(AtomicUsize::new(0));
         let write_errors = Arc::new(AtomicUsize::new(0));
 
-        // Test with simultaneous reads and writes
         const READERS: usize = 24;
         const WRITERS: usize = 24;
         const OPS_PER_WORKER: usize = 10;
@@ -325,7 +318,6 @@ mod connection_pressure {
             }));
         }
 
-        // Wait for completion
         for handle in handles {
             let _ = handle.await;
         }

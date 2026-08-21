@@ -21,7 +21,6 @@ async fn old_data_evicted_recent_retained() -> anyhow::Result<()> {
 
     insert_at(&client, "recent", support::now_micros()).await?;
 
-    // Run flush + eviction.
     env.force_flush().await?;
     env.force_evict().await?;
 

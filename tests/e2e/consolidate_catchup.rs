@@ -44,7 +44,6 @@ async fn a_sealed_partition_converges_through_durable_bounded_tasks() -> anyhow:
     env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
-    // Build a fragmented partition on a day that is already sealed once the
     // clock moves on: one flush per file, well inside the same UTC day.
     let sec = 1_000_000i64;
     let day_start = FROZEN_START_MICROS - (FROZEN_START_MICROS % (86_400 * sec));

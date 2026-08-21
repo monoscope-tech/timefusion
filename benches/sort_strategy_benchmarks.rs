@@ -1,21 +1,7 @@
-//! Which sort should the WRITE paths use, and at what size?
+//! Compare in-process Arrow and spillable DataFusion sorts at flush-bucket sizes.
 //!
-//! The flush path sorts each bucket in-process with an Arrow
-//! `lexsort_to_indices` + `take`, and REFUSES above
-//! `timefusion_sort_skip_bytes` (256 MB of in-memory Arrow) — writing the file
-//! unsorted instead. That refusal is what poisons the partition: one file
-//! without a `sorting_columns` footer disables the reader's all-or-nothing
-//! ordering for every scan touching it, which costs the streaming top-N
-//! pushdown and forces `DedupExec` into its unbounded seen-set.
-//!
-//! Compaction already escalates to a DataFusion sort (pooled, spillable,
-//! streaming). The open question for flush is the LATENCY cost: flush is on the
-//! ingest path, so an escalation that is slower at small sizes would trade a
-//! read win for a write regression.
-//!
-//! This measures both strategies over the real 90-column-ish shape at bucket
-//! sizes spanning the threshold, and reports the crossover. Run:
-//!   cargo bench --bench sort_strategy_benchmarks
+//! An unsorted flush file disables ordering for every scan of its partition;
+//! this benchmark identifies when a DataFusion-sort escalation is worthwhile.
 
 use std::{sync::Arc, time::Instant};
 
@@ -32,18 +18,17 @@ use datafusion::{
 /// Wide-ish rows: the cost that matters is per-ROW comparison plus the `take`
 /// of every payload column, and otel rows carry fat string payloads.
 fn schema() -> SchemaRef {
-    let mut fields = vec![
-        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-        Field::new("id", DataType::Utf8, false),
-        Field::new("service_name", DataType::Utf8, true),
-        Field::new("level", DataType::Int32, true),
-    ];
-    // Payload columns: not sort keys, but every one of them is materialised by
-    // the `take`, which is where the in-process sort actually spends itself.
-    for i in 0..20 {
-        fields.push(Field::new(format!("body_{i}"), DataType::Utf8, true));
-    }
-    Arc::new(Schema::new(fields))
+    Arc::new(Schema::new(
+        [
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("level", DataType::Int32, true),
+        ]
+        .into_iter()
+        .chain((0..20).map(|i| Field::new(format!("body_{i}"), DataType::Utf8, true)))
+        .collect::<Vec<_>>(),
+    ))
 }
 
 fn batch(rows: usize, seed: u64) -> RecordBatch {
@@ -54,7 +39,6 @@ fn batch(rows: usize, seed: u64) -> RecordBatch {
     let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     for i in 0..rows {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        // Scrambled event time: a flush bucket's rows arrive out of order.
         ts.push(1_700_000_000_000_000i64 + ((x >> 17) % 600_000_000) as i64);
         ids.push(format!("{:032x}", x ^ (i as u64)));
         svc.push(format!("svc-{}", x % 24));
@@ -66,9 +50,9 @@ fn batch(rows: usize, seed: u64) -> RecordBatch {
         Arc::new(StringArray::from(svc)),
         Arc::new(Int32Array::from(lvl)),
     ];
-    for i in 0..20 {
-        cols.push(Arc::new(StringArray::from((0..rows).map(|r| format!("payload-{i}-{r:06}-xxxxxxxxxxxxxxxxxxxx")).collect::<Vec<_>>())) as ArrayRef);
-    }
+    cols.extend(
+        (0..20).map(|i| Arc::new(StringArray::from((0..rows).map(|r| format!("payload-{i}-{r:06}-xxxxxxxxxxxxxxxxxxxx")).collect::<Vec<_>>())) as ArrayRef),
+    );
     RecordBatch::try_new(schema(), cols).unwrap()
 }
 
@@ -91,14 +75,13 @@ async fn datafusion_sort(batches: Vec<RecordBatch>, ctx: &SessionContext) -> usi
     let name = format!("s{}", uuid::Uuid::new_v4().simple());
     ctx.register_table(&name, Arc::new(mem)).unwrap();
     let df = ctx.sql(&format!("SELECT * FROM {name} ORDER BY \"timestamp\" DESC NULLS FIRST, \"id\" ASC NULLS LAST")).await.unwrap();
-    let out: usize = df.collect().await.unwrap().iter().map(|b| b.num_rows()).sum();
+    let rows = df.collect().await.unwrap().iter().map(RecordBatch::num_rows).sum();
     let _ = ctx.deregister_table(&name);
-    out
+    rows
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    // Match the flush path's shape: many small batches per bucket.
     const BATCH_ROWS: usize = 8192;
     let sizes = [8_192usize, 65_536, 262_144, 1_048_576];
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
@@ -108,18 +91,17 @@ async fn main() {
         let batches: Vec<RecordBatch> = (0..rows.div_ceil(BATCH_ROWS)).map(|i| batch(BATCH_ROWS.min(rows), i as u64)).collect();
         let mb = batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() as f64 / 1e6;
 
-        // Warm both paths once, then time.
         let _ = arrow_sort(&batches);
         let t = Instant::now();
-        let a_rows = arrow_sort(&batches);
+        let arrow_rows = arrow_sort(&batches);
         let arrow_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let _ = datafusion_sort(batches.clone(), &ctx).await;
         let t = Instant::now();
-        let d_rows = datafusion_sort(batches.clone(), &ctx).await;
+        let datafusion_rows = datafusion_sort(batches.clone(), &ctx).await;
         let df_ms = t.elapsed().as_secs_f64() * 1e3;
 
-        assert_eq!(a_rows, d_rows, "both strategies must emit the same row count");
+        assert_eq!(arrow_rows, datafusion_rows, "both strategies must emit the same row count");
         println!("{rows:>10} {mb:>10.1} {arrow_ms:>12.1} {df_ms:>13.1} {:>10.2}", df_ms / arrow_ms);
     }
     println!("\nratio < 1 => DataFusion is faster at that size.");
