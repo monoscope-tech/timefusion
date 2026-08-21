@@ -27,25 +27,51 @@ finishes:
 ### The structural problem: one index per parquet file
 
 `m.entries.insert(parquet_key, entry)` (`src/tantivy/mod.rs:690`) keys the
-manifest **by parquet file**. So the number of tantivy indexes opened and
-searched by one query is the number of parquet files in the window:
+manifest **by parquet file**. Confirmed against the real manifest (read-only
+GET of `index_manifests/otel_logs_and_spans/6297304f…/manifest.json`, 745 KB):
+**950 entries, of which 932 cover exactly one parquet file** (15 cover two, 3
+cover three). Average 114k rows per index, 108.6M rows indexed.
 
-| window | files ≈ indexes searched | rounds at concurrency 8 |
+Index count actually searched per window, computed from that manifest's
+`[min,max]_timestamp_micros` — **measured, not extrapolated**:
+
+| window | indexes searched | measured planning |
 |---|---|---|
-| 1 day | ~62 | 8 |
-| 7 days | ~434 | 54 |
-| 30 days | ~1,860 | 233 |
+| 1 h | 38 | ~0.4–0.7 s |
+| 3 h | 131 | ~0.4–0.7 s |
+| 6 h | 254 | ~0.3–1.2 s |
+| 12 h | 457 | ~1.3–2.5 s |
+| 24 h | 503 | ~1.7–2.5 s |
+| 7 d | 913 | ~3.2 s |
+| 30 d | 918 | ~2.5–3.5 s |
 
-This is the *same* fragmentation that produces the file-open wall, mirrored
-into the index tier — and it is why planning scales with window width. Tantivy
-is designed for a few large indexes with merged segments; we are running
-thousands of tiny ones and paying per-index fixed cost on every query.
+Two things fall out. Cost tracks index count roughly linearly (~3ms per index
+at concurrency 8 across the range). And **the manifest saturates at 950
+entries**, which is the real reason planning is flat from 7d to 30d — 913 vs
+918 indexes — not any property of the query. An earlier draft of this doc
+extrapolated ~1,860 indexes at 30d from parquet file counts and predicted 233
+rounds; that was wrong, and the flat slope my own timings showed is what
+disproved it.
+
+Time-pruning itself is healthy: median entry spans 0.007 days, max 1.9 days,
+**zero** entries with degenerate or missing bounds. So no entry is
+unprunable — the fan-out is genuine work, not a pruning bug.
+
+This is still the *same* fragmentation that produces the file-open wall,
+mirrored into the index tier. Tantivy is designed for a few large indexes with
+merged segments; we run ~one per parquet file and pay per-index fixed cost on
+every query.
 
 ### Four compounding defects around it
 
 1. **Reader cache is smaller than one query's working set.**
-   `READER_CACHE_ENTRIES = 256` (`search.rs:38`) against 434 indexes at 7d and
-   ~1,860 at 30d. Wide-window queries evict exactly what the next one needs.
+   `READER_CACHE_ENTRIES = 256` (`search.rs:38`) against **457 indexes at 12h,
+   503 at 24h, 913 at 7d**. The budget is exceeded somewhere between a 6h
+   (254) and a 12h (457) window — i.e. by nearly every real dashboard query.
+   *Tested and inconclusive:* repeat-query warming did not track the 256
+   boundary cleanly (12h warmed 1.9x while 3h did not), which is expected
+   given prod's own traffic shares and churns the same LRU. Treat the
+   undersizing as a design smell to fix, not as a measured cause.
 2. **The startup cache warmer is off by default.**
    `timefusion_tantivy_prefetch_days` is `#[serde(default)]` → **0**
    (`config.rs:738`). Every index blob is re-downloaded on demand after each
@@ -55,9 +81,13 @@ thousands of tiny ones and paying per-index fixed cost on every query.
    shape at 7d — the `=` plan carries **2** parquet scans / `file_groups`, the
    unrouted plan **1**. With `tantivy_uncovered_files = 5506` and diverging,
    the split is the normal case, so we plan the window twice.
-4. **Negative manifest lookups are never cached.** `load_manifest_cached`
-   inserts only on success (`search.rs:249-259`), so a project with no index
-   re-issues the miss on every query.
+4. **The manifest is 745 KB behind a 5-second TTL.** `load_manifest_cached`
+   (`search.rs:249-259`) re-GETs and re-parses all 950 entries whenever the
+   TTL lapses — and a single routed query takes 1.7–3.2s, so back-to-back
+   dashboard queries routinely straddle it. Negative lookups are worse: the
+   cache inserts only on success, so a project with no index re-issues the
+   miss every single time. This is the leading candidate for the fixed
+   component below, and D0 would confirm it in one measurement.
 
 ### The honest gap: part of the tax is still unattributed
 
@@ -89,21 +119,34 @@ Timers for manifest / fetch / open / search + hit counts, in
 `timefusion_stats`. Revive or delete `index_opens`. Everything below is
 guesswork until this exists.
 
-### D1 — Config-only, no code (hours)
-- `timefusion_tantivy_prefetch_days` > 0 so restarts don't re-download.
-- `READER_CACHE_ENTRIES` 256 → a few thousand (an entry is an mmap handle plus
-  small structs; this is cheap memory, and the OOM budget should be checked
-  but the tier is not a large consumer).
-- `SEARCH_CONCURRENCY` 8 → 32+. These tasks are IO-bound; 8 makes a 7d query
-  serialize into 54 rounds for no reason.
-- Cache negative manifest lookups under the same TTL.
+### D1 — Small knobs (one env flip; the rest are one-line code + a deploy)
+**Only the first is config.** The other three are compile-time `const`s or new
+code, so they need a build and a deploy — and on this repo any non-docs push
+restarts prod, which is not free (in-flight maintenance units die, the rollup
+coverage map resets). Ship them together, not as four separate deploys.
 
-Each is independently revertible and none changes results.
+- `timefusion_tantivy_prefetch_days` > 0 — **env only, no deploy.** Stops
+  re-downloading every blob after each restart.
+- `READER_CACHE_ENTRIES` 256 → a few thousand (`search.rs:38`). An entry is an
+  mmap handle plus small structs, but each open index mmaps ~10 segment files —
+  **check the container's fd limit before picking the number**, or this trades
+  a cache miss for `EMFILE`.
+- `SEARCH_CONCURRENCY` 8 → 32+ (`search.rs:42`). These tasks are IO-bound;
+  8 makes a 7d query serialize into ~114 rounds.
+- Cache negative manifest lookups, and raise `MANIFEST_CACHE_TTL` above the
+  duration of a single query (currently 5s vs 1.7–3.2s queries).
+
+None changes query results; all are revertible, but reverting costs a deploy.
 
 ### D2 — Consolidate index granularity (the structural fix)
 Build **one index per (project, day)** — or per hour for whales — instead of
-one per parquet file. A 7d query then opens 7 indexes, not 434; a 30d query 30,
-not 1,860. Window width stops multiplying index count.
+one per parquet file. Against the measured counts, a 7d query would open ~7
+indexes instead of **913**, and 30d ~30 instead of **918**: a ~30–130x
+reduction in per-query index fan-out, and at ~3ms per index that is the
+dominant term.
+
+Note the win is bounded by the same saturation that flattened 7d→30d: the
+whole manifest is 950 entries, so consolidation buys ~30x, not ~1000x.
 
 Row-selection pushdown survives: store the source `file_uri` alongside
 `row_ordinal` as fast fields in the doc, so a per-day index still emits
@@ -154,6 +197,13 @@ that converges, every routed query plans the window twice.
 - **Apache Hudi** keeps `column_stats`, `bloom_filters` and `record_index` in a
   secondary metadata table written on commit, so pruning never opens data
   files. **Iceberg Puffin** is the same idea as a sidecar format.
+
+Two mechanical borrowings worth noting, both variants of D2/D3 rather than new
+directions: the manifest could be **fully resident instead of TTL'd** — the
+indexer runs in this same process, so it can push-update the cache on publish
+and remove the plan-time GET entirely; and Quickwit's hot-cache idea is
+adoptable as a custom tantivy `Directory` served out of foyer, which would
+also delete the download-and-untar step in `ensure_cached`.
 
 The common thread, and the answer to "can we keep tantivy": **yes — but the
 index must be coarse-grained, its hot bytes resident, and it must not be
