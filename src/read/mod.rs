@@ -1690,12 +1690,11 @@ mod ordering_probe_tests {
         drain(Arc::new(OrderingProbeExec::new(lying_desc_leg(vec![1, 2, 3, 4]), LegKind::Delta))).await;
         let after = ordering_violations_by_leg();
         let delta = |k: &str| {
-            let g = |v: &[(&'static str, u64); 3]| v.iter().find(|(n, _)| *n == k).unwrap().1;
+            let g = |v: &[(&'static str, u64); 2]| v.iter().find(|(n, _)| *n == k).unwrap().1;
             g(&after) - g(&before)
         };
         assert!(delta("delta") >= 3, "the lying delta leg must be attributed, got {}", delta("delta"));
         assert_eq!(delta("mem"), 0, "an innocent leg must not be blamed");
-        assert_eq!(delta("hot"), 0, "an innocent leg must not be blamed");
     }
 
     /// A leg that honours its claim must be silent, or the counter is noise.
@@ -1704,7 +1703,7 @@ mod ordering_probe_tests {
         let before = ordering_violations_by_leg();
         drain(Arc::new(OrderingProbeExec::new(lying_desc_leg(vec![9, 8, 7, 6]), LegKind::Mem))).await;
         let after = ordering_violations_by_leg();
-        let g = |v: &[(&'static str, u64); 3]| v.iter().find(|(n, _)| *n == "mem").unwrap().1;
+        let g = |v: &[(&'static str, u64); 2]| v.iter().find(|(n, _)| *n == "mem").unwrap().1;
         assert_eq!(g(&after) - g(&before), 0, "descending rows honour a DESC claim — nothing to report");
     }
 
@@ -1714,7 +1713,7 @@ mod ordering_probe_tests {
     /// that "fixes" that exhausted the query pool (prod 2026-08-02).
     #[test]
     fn only_the_in_memory_legs_are_sortable() {
-        assert!(LegKind::Mem.sortable() && LegKind::Hot.sortable());
+        assert!(LegKind::Mem.sortable());
         assert!(!LegKind::Delta.sortable(), "sorting the Delta leg at read time is the 2026-08-02 pool exhaustion");
     }
 }
@@ -2098,11 +2097,8 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
     indexes.into_iter().try_fold(0u64, |total, (date, index)| {
         let day_lo = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
         let day_hi = date.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
-        let input = crate::read::LogicalCountOverlay {
-            authoritative_batches: &authoritative_batches,
-            delta_batches: &delta_batches,
-            covered_ranges: &covered_ranges,
-        };
+        let input =
+            crate::read::LogicalCountOverlay { authoritative_batches: &authoritative_batches, delta_batches: &delta_batches, covered_ranges: &covered_ranges };
         let count = index.count_with_covered_overlay(input, q.lo.max(day_lo), hi.min(day_hi), columns).ok()?;
         total.checked_add(count)
     })
@@ -2574,12 +2570,7 @@ impl LogicalCountIndex {
     /// the temporary map, so the cost follows the hot tail rather than the
     /// full 24-hour cardinality.
     pub fn count_with_overlay(&self, batches: &[RecordBatch], lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
-        self.count_with_covered_overlay(
-            LogicalCountOverlay { authoritative_batches: batches, delta_batches: &[], covered_ranges: &[] },
-            lo,
-            hi,
-            columns,
-        )
+        self.count_with_covered_overlay(LogicalCountOverlay { authoritative_batches: batches, delta_batches: &[], covered_ranges: &[] }, lo, hi, columns)
     }
 
     /// Count after applying the same coverage contract as the ordinary
@@ -2648,11 +2639,7 @@ impl LogicalCountIndex {
 
     fn count_covered_live(&self, lo: i64, hi: i64, covered_ranges: &[(i64, i64)]) -> u64 {
         let visible = |timestamp: i64, winner: Winner| {
-            !winner.deleted
-                && (lo..hi).contains(&timestamp)
-                && covered_ranges
-                    .iter()
-                    .any(|&(start, end)| (start..end).contains(&timestamp))
+            !winner.deleted && (lo..hi).contains(&timestamp) && covered_ranges.iter().any(|&(start, end)| (start..end).contains(&timestamp))
         };
         let count = if let Some(packed) = &self.packed {
             packed

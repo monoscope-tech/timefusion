@@ -5949,7 +5949,6 @@ mod tests {
         layer.wal_hard_backpressure.store(false, Ordering::Relaxed);
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.expect("insert must succeed once backpressure clears");
     }
-
 }
 
 #[cfg(test)]
