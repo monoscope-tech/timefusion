@@ -76,3 +76,24 @@ Cross-cutting: every fast-on-object-store system (a) separates INDEX from
 DATA FILE and caches the index locally, and (b) treats "no dedup needed" as
 a maintained file-layout invariant checked at plan time. Items 1-2 are (a);
 item 4 is (b).
+
+
+## Verification (2026-08-21 evening, deployed 2f5d221)
+
+The paced body warm ran at full scope (per-table warms of 2,434 / 2,235 /
+4,596 / 696 files; foyer L2 130->152GB; hits 97.6-98.7%). The formerly-cold
+band (24h trace lookups aged 48-72h, previously 23-31s / TIMEOUT):
+
+| project | pre-warm | first touch | steady |
+|---|---|---|---|
+| dcad860a (P1) | 23.4s | 4.5s | **1.2s** |
+| 6297304f (P2) | 28.9s | 3.7s | 3.7s |
+| 28f62f01 (P3) | 31s TIMEOUT | 6.8s | **1.1s** |
+
+~20-28x improvement to steady state on two of three; P2's 3.7s floor is
+per-query file count (its partitions), i.e. item 3 (compaction), not cache.
+Slice-coverage persistence deployed same day (grants accumulate across
+restarts now; expect cert_granted_total to move within hours-days as sealed
+days complete their slice sets — dedup-skip is the next step change for
+count shapes). Remaining ordered work: compaction to <20 files/project-day,
+dedup-deadline/unspillable-sort ticket, rollup routing coverage.
