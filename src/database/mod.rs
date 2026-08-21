@@ -3412,7 +3412,19 @@ impl Database {
                 queues.push((pid, queue));
             }
             let table_owned = table_name.to_string();
-            let mut jobs = futures::stream::iter(fair_tantivy_backfill_work(queues).into_iter().map(|(pid, rel, uri)| {
+            let work = fair_tantivy_backfill_work(queues);
+            // A pass is UNBOUNDED — `fair_tantivy_backfill_work` queues every
+            // uncovered file — so it runs for hours on a real backlog while the
+            // completion event (`tantivy_backfill_pass`) prints only at the end.
+            // Prod 2026-08-21: a pass started 03:30 was still running at 06:20
+            // having emitted nothing since its GC lines, and an in-flight pass
+            // was indistinguishable from one that never fired. Announce the
+            // start and tick progress so "running" is observable.
+            let planned = work.len();
+            info!(table_name, root = %root, planned, event = "tantivy_backfill_started");
+            const PROGRESS_EVERY: usize = 200;
+            let mut done = 0usize;
+            let mut jobs = futures::stream::iter(work.into_iter().map(|(pid, rel, uri)| {
                 let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
                 async move { (pid.clone(), svc.build_index_for_file(&table, &pid, &rel, &uri, store).await) }
             }))
@@ -3421,6 +3433,10 @@ impl Database {
                 match result {
                     Ok(()) => built += 1,
                     Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
+                }
+                done += 1;
+                if done.is_multiple_of(PROGRESS_EVERY) {
+                    info!(table_name, root = %root, done, planned, built, event = "tantivy_backfill_progress");
                 }
             }
         }
