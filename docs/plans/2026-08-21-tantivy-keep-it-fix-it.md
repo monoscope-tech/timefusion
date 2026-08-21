@@ -1,5 +1,27 @@
 # Keep tantivy, fix how it is consulted
 
+> **Status 2026-08-21 night — increment 1 implemented and deployed.**
+> Shipped: **D0** (per-phase timers + fan-out counters as the `tantivy`
+> component of `timefusion_stats`), **D1** (seed-on-publish, hot-window re-warm
+> cron, `prefetch_days` 0→3, `search_concurrency` 8→32, `manifest_ttl` 5s→300s
+> with publish-time invalidation, `reader_cache_entries` 256→2048,
+> `cache_disk_gb` 64→200), and the local-first property the whole increment
+> exists for: **an index this process built is never fetched back from S3.**
+>
+> **Deliberately deferred**, pending what D0's timers now report: **D5**
+> (coverage/reconcile drain — this is the "keep S3 up to date" half and is the
+> next increment), **D2** (per-day index granularity), **D3** (off the planning
+> path), **D4** (benefit-based routing). Increment 1 shrinks the fan-out term
+> and finally measures the rest; it does not remove the `route_equality` tax,
+> which is still ON.
+>
+> Two known gaps recorded rather than silently carried: `gc_after_compaction`
+> prunes manifest entries without invalidating this process's cache, so for up
+> to `manifest_ttl` a query can consult an entry whose blob is gone (soft — the
+> prefilter treats it as "no usable index" and falls back); and the ~1.8s
+> ghost-project component of the eq tax is still unattributed, which is exactly
+> what D0 was built to answer.
+
 2026-08-21 evening. Follow-up to
 `2026-08-21-point-lookup-file-open-wall.md` (P0: flip
 `TIMEFUSION_TANTIVY_ROUTE_EQUALITY=false`) and
