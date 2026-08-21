@@ -178,7 +178,7 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
         let s = Arc::new(TantivyIndexService::new(obj_store.clone(), Arc::new(cfg_arc.tantivy.clone())));
         layer = layer.with_tantivy_indexer(s.clone().callback());
         let cache_root = cfg_arc.core.timefusion_data_dir.clone();
-        let search = Arc::new(TantivySearchService::new(obj_store, cache_root));
+        let search = Arc::new(TantivySearchService::new(obj_store, cache_root, Arc::new(TantivyConfig::default())));
         db = db.with_tantivy_search(search).with_tantivy_indexer(s);
     }
     db = db.with_buffered_layer(Arc::new(layer));

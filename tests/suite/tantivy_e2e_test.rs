@@ -80,7 +80,7 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
         let s = Arc::new(TantivyIndexService::new(obj_store.clone(), Arc::new(cfg_arc.tantivy.clone())));
         layer = layer.with_tantivy_indexer(s.clone().callback());
         let cache_root = cfg_arc.core.timefusion_data_dir.clone();
-        let search = Arc::new(TantivySearchService::new(obj_store, cache_root));
+        let search = Arc::new(TantivySearchService::new(obj_store, cache_root, Arc::new(cfg_arc.tantivy.clone())));
         db = db.with_tantivy_search(search).with_tantivy_indexer(s.clone());
         svc = Some(s);
     }
@@ -515,7 +515,7 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
     // prefilter genuinely fires for exact dashed-UUID equality; if it's empty,
     // the SQL test above only passed because the scan fell back (P0 = no-op).
     let cache_root = std::path::PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{id}-uuideq-on"));
-    let search = TantivySearchService::new(svc.object_store.clone(), cache_root);
+    let search = TantivySearchService::new(svc.object_store.clone(), cache_root, Arc::new(TantivyConfig::default()));
     let hits: Vec<String> = search
         .search_with_stats(
             TABLE,

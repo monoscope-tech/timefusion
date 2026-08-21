@@ -667,9 +667,19 @@ pub struct TantivyConfig {
     // query has opened recently, and every eviction re-downloads a blob on the
     // next hit. 4 GB (the value this knob carried as dead code) would thrash the
     // hot window at prod scale. Measured working set: ~65 GB across ~6500 leaf
-    // index dirs, so 64 sits right at it — the reaper trims rather than evicting
-    // the hot window on its first pass.
-    #[serde_inline_default(64)]
+    // index dirs.
+    //
+    // 200, up from 64. 64 sat *at* the measured working set, which was survivable
+    // only while nothing actively repopulated the cache. It no longer is: indexes
+    // are now seeded on publish and a cron re-warms `prefetch_days` for every
+    // project, so a budget equal to the working set makes the 10-minute reaper
+    // evict precisely what the 15-minute warmer re-downloads — a permanent S3
+    // churn loop, and one that would show up as a `blob_fetches` counter that
+    // never falls, i.e. the metric this work is judged by.
+    //
+    // Headroom, not a wish: the prod volume has ~1.1 TB free, and the only other
+    // large tenant on it is foyer at an env-pinned 600 GB.
+    #[serde_inline_default(200)]
     pub timefusion_tantivy_cache_disk_gb: u64,
     /// How often to enforce `timefusion_tantivy_cache_disk_gb`. Each sweep
     /// walks the whole cache tree; empty disables the reap (and the bound).
@@ -732,10 +742,70 @@ pub struct TantivyConfig {
     #[serde_inline_default(true)]
     pub timefusion_tantivy_file_pruning: bool,
     /// Warm the local index cache with blobs whose data is at most this many
-    /// days old, at startup (0 = off). Turns the cold-window download cliff
-    /// into a background cost after restarts.
-    #[serde(default)]
+    /// days old, at startup AND on `timefusion_tantivy_prefetch_schedule`
+    /// (0 = off). Turns the cold-window download cliff into a background cost
+    /// after restarts, and keeps the hot window resident thereafter.
+    ///
+    /// Default 3, up from 0 (the warmer had never run in prod). Sized from the
+    /// whale's real blob distribution: recent days carry nearly all the blobs
+    /// AND nearly all the bytes (2026-08-21 alone: 483 blobs / 1.4 GB
+    /// compressed; days older than a week are single-digit MB). At the
+    /// measured 5.66x extraction ratio, 3 days is ~20 GB extracted for the
+    /// largest project — affordable against `cache_disk_gb`, where a week
+    /// would not be.
+    #[serde_inline_default(3)]
     pub timefusion_tantivy_prefetch_days: u32,
+    /// Re-warm cadence for `timefusion_tantivy_prefetch_days`. Startup warming
+    /// alone decays: the reaper evicts, new indexes land, and a wide historical
+    /// query can pull enough cold blobs to push the hot window out. Re-warming
+    /// also re-stamps `last_used` on hot dirs, which is what keeps them at the
+    /// young end of the reaper's LRU order. Empty disables the periodic pass
+    /// (startup warming still runs).
+    #[serde_inline_default("0 */15 * * * *".to_string())]
+    pub timefusion_tantivy_prefetch_schedule: String,
+    /// Seed the local extracted-index cache at publish time, so a freshly
+    /// built index is never re-downloaded from S3 to answer the first query
+    /// that needs it. The upload still happens either way — S3 remains the
+    /// source of truth and this only avoids the round trip back.
+    /// Off switch for instant rollback to download-on-first-read.
+    #[serde_inline_default(true)]
+    pub timefusion_tantivy_seed_cache_on_publish: bool,
+    /// Open-index (mmap + reader) LRU capacity. Was a hardcoded 256, which is
+    /// smaller than a single query's working set at any window wider than ~6h
+    /// (measured: 254 indexes at 6h, 457 at 12h, 913 at 7d), so wide queries
+    /// evicted exactly what the next one needed.
+    ///
+    /// 2048 covers an entire project's manifest (950 entries for the largest)
+    /// with headroom for several more. Two things make that affordable, and
+    /// both were measured rather than assumed:
+    /// - fds: `server::raise_file_limit()` lifts RLIMIT_NOFILE soft to hard at
+    ///   startup, and the prod process really is running at **524288**. Read it
+    ///   from the CONTAINER's pid: a host-side `pgrep -f timefusion` matches the
+    ///   ssh shell instead and reports its 1024, which is how an earlier pass of
+    ///   this work talked itself into leaving the cache at 256. Even 2048
+    ///   indexes x 28 files is ~57k fds, roughly a ninth of the limit.
+    /// - memory: an open index is mmap'd, so its pages are FILE-backed, and
+    ///   every recorded OOM on this box is anon-driven (~100 GB anon vs ~170 MB
+    ///   file-rss). This does not push the term that actually kills us.
+    #[serde_inline_default(2048)]
+    pub timefusion_tantivy_reader_cache_entries: usize,
+    /// Concurrent per-index download+open+search tasks within one query. Was a
+    /// hardcoded 8, which serialized a 7d query's 913 indexes into ~114 rounds.
+    /// These tasks are IO-bound (object-store GET or page-cache read), so the
+    /// useful ceiling is far above 8.
+    #[serde_inline_default(32)]
+    pub timefusion_tantivy_search_concurrency: usize,
+    /// TTL for the parsed-manifest cache. Was a hardcoded 5s while a routed
+    /// query takes 1.7-3.2s, so back-to-back queries routinely straddled it and
+    /// re-GET + re-parsed a 745 KB, 950-entry manifest on the planning path.
+    /// Safe to lengthen: publishing an index invalidates this process's cached
+    /// entry, so our own indexer is never unseen. It does still bound staleness
+    /// against writers we don't observe — other processes (the repair CLI), and
+    /// `gc_after_compaction`, which prunes entries without invalidating here. A
+    /// stale entry only ever costs a wasted lookup against a deleted blob, which
+    /// the prefilter treats as "no usable index" and falls back from.
+    #[serde_inline_default(300)]
+    pub timefusion_tantivy_manifest_ttl_secs: u64,
     /// Row-selection pushdown: when the prefilter engages, files whose index
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
     /// reader decodes only matching rows. Off switch for instant rollback to
@@ -780,6 +850,20 @@ impl TantivyConfig {
     /// nothing every 10 minutes, turning every query into a re-download.
     pub fn cache_disk_bytes(&self) -> u64 {
         self.timefusion_tantivy_cache_disk_gb.max(1) * 1024 * 1024 * 1024
+    }
+    /// Floored at 1: a zero-capacity LRU would make every open a cold open.
+    pub fn reader_cache_entries(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.timefusion_tantivy_reader_cache_entries.max(1)).expect("max(1) is non-zero")
+    }
+    /// Floored at 1: zero concurrency would deadlock the per-index fan-out.
+    pub fn search_concurrency(&self) -> usize {
+        self.timefusion_tantivy_search_concurrency.max(1)
+    }
+    pub fn manifest_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timefusion_tantivy_manifest_ttl_secs)
+    }
+    pub fn seed_cache_on_publish(&self) -> bool {
+        self.timefusion_tantivy_seed_cache_on_publish
     }
 }
 
@@ -2196,6 +2280,32 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tantivy read path's tunables are load-bearing and easy to change by
+    /// accident, so pin the *deserialized* values — which is what prod runs.
+    ///
+    /// This also guards a trap that has already cost a debugging cycle:
+    /// `TantivyConfig::default()` is the DERIVED `Default`, so it returns zeros
+    /// and `false` and bypasses every `#[serde_inline_default]` here. A test
+    /// built on `Default::default()` therefore exercises a configuration
+    /// production can never have (seeding off, 1-entry reader cache, no
+    /// manifest TTL). Deserialize instead — as this test does.
+    #[test]
+    fn tantivy_defaults_are_the_deserialized_ones_not_the_derived_ones() {
+        let cfg: TantivyConfig = serde_json::from_str("{}").expect("every field has a default");
+        assert!(cfg.seed_cache_on_publish(), "a published index must be kept locally by default");
+        assert_eq!(cfg.timefusion_tantivy_prefetch_days, 3, "the hot window must be warmed by default");
+        assert_eq!(cfg.search_concurrency(), 32);
+        assert_eq!(cfg.reader_cache_entries().get(), 2048);
+        assert_eq!(cfg.manifest_ttl(), Duration::from_secs(300));
+
+        let derived = TantivyConfig::default();
+        assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");
+        // The floors are what keep a derived-Default config merely wrong and
+        // not deadlocked: zero concurrency would stall the per-index fan-out.
+        assert_eq!(derived.search_concurrency(), 1);
+        assert_eq!(derived.reader_cache_entries().get(), 1);
+    }
 
     /// Builds follow the global switch and NOTHING else. The read side keeps
     /// its canary list; the build side deliberately has none, so a project

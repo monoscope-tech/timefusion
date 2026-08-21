@@ -3904,6 +3904,27 @@ impl Database {
             }
         });
 
+        // Tantivy hot-window re-warm. Startup warming alone decays: the reaper
+        // evicts, new indexes land from other writers, and one wide historical
+        // query can pull enough cold blobs to push the hot window out. Re-warming
+        // also re-stamps `last_used` on every hot dir, which is what keeps them
+        // at the young end of the reaper's eviction order — so this is the
+        // mechanism that makes "hot indexes stay local" true over time, not just
+        // at boot. Blobs already on disk cost one `has_any_segment` stat each.
+        spawn_db_cron(&db, "Tantivy hot warm", &self.config.tantivy.timefusion_tantivy_prefetch_schedule, cancel.clone(), |db| async move {
+            let days = db.config.tantivy.timefusion_tantivy_prefetch_days;
+            let Some(svc) = db.tantivy_search().cloned() else { return };
+            if days == 0 {
+                return;
+            }
+            for t in db.config.tantivy.indexed_tables() {
+                match svc.warm_recent(&t, days).await {
+                    Ok(n) => debug!("tantivy hot warm: table={t} days={days} blobs_resident={n}"),
+                    Err(e) => warn!("tantivy hot warm failed for {t}: {e}"),
+                }
+            }
+        });
+
         // Checkpoint + expired-log cleanup — runs the post-commit hooks out-of-band
         // (see the 2026-07-09 incident) so R2 500s on the checkpoint PUT / bulk log
         // delete never fail a landed commit; faster cadence keeps the log bounded.
@@ -4216,7 +4237,8 @@ impl Database {
                         let env = self.shared_runtime_env();
                         let size = self.config.derived.query_pool_bytes();
                         Arc::new(move || (env.memory_pool.reserved(), size))
-                    }),
+                    })
+                    .with_tantivy_search_opt(self.tantivy_search().cloned()),
             ),
         )?;
 

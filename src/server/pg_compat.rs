@@ -783,6 +783,7 @@ pub struct StatsTableProvider {
     foyer_stats: Option<FoyerStatsSnapshot>,
     query_pool: Option<PoolSnapshot>,
     logical_count: Option<LogicalCountSnapshot>,
+    tantivy_search: Option<Arc<crate::tantivy::search::TantivySearchService>>,
     schema: SchemaRef,
 }
 
@@ -793,7 +794,7 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, query_pool: None, logical_count: None, schema }
+        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, query_pool: None, logical_count: None, tantivy_search: None, schema }
     }
 
     pub fn with_scan_metrics(self, m: Arc<ScanMetrics>) -> Self {
@@ -814,6 +815,14 @@ impl StatsTableProvider {
 
     pub fn with_logical_count(self, f: LogicalCountSnapshot) -> Self {
         Self { logical_count: Some(f), ..self }
+    }
+
+    /// `Option` because the sidecar is absent whenever no schema declares an
+    /// indexed field or object storage is unconfigured — the stats table then
+    /// simply omits the `tantivy` component rather than reporting zeros that
+    /// look like an idle index.
+    pub fn with_tantivy_search_opt(self, s: Option<Arc<crate::tantivy::search::TantivySearchService>>) -> Self {
+        Self { tantivy_search: s, ..self }
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
@@ -1258,8 +1267,46 @@ impl StatsTableProvider {
             ]
         });
 
-        let rows: Vec<Row> =
-            [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, parquet, cache_sizes].into_iter().flatten().collect();
+        // Tantivy read path. `*_us_avg` are the per-phase means the prefilter
+        // had no way to report before: `indexes_per_query` is the fan-out that
+        // dominates it, `blob_fetches` vs `cache_seeded` says whether the local
+        // cache is actually absorbing reads, and `manifest_hit_pct` says whether
+        // the 745 KB manifest is being re-fetched on the planning path.
+        let tantivy = self.tantivy_search.as_ref().map_or_else(Vec::new, |svc| {
+            let s = &svc.stats;
+            let mean = |us: &std::sync::atomic::AtomicU64, n: &std::sync::atomic::AtomicU64| avg(us.load(Relaxed), n.load(Relaxed));
+            let (mh, ml) = (s.manifest_hits.load(Relaxed), s.manifest_loads.load(Relaxed));
+            let (rh, io) = (s.reader_hits.load(Relaxed), s.index_opens.load(Relaxed));
+            let (idx, q) = (s.indexes_searched.load(Relaxed), s.queries.load(Relaxed));
+            rows!["tantivy";
+                "queries" => q,
+                "indexes_searched_total" => idx,
+                "indexes_per_query" => avg(idx, q),
+                "search_us_avg" => mean(&s.search_us, &s.searches),
+                "manifest_loads" => ml,
+                "manifest_hits" => mh,
+                "manifest_hit_pct" => pct(mh, mh + ml),
+                "manifest_load_us_avg" => mean(&s.manifest_load_us, &s.manifest_loads),
+                // Every blob fetch is an S3 round trip on the planning path that
+                // a resident local cache would have served. Should trend to ~0
+                // for the hot window once seeding + re-warm are working.
+                "blob_fetches" => s.blob_fetches.load(Relaxed),
+                "blob_fetch_us_avg" => mean(&s.blob_fetch_us, &s.blob_fetches),
+                "index_opens" => io,
+                "index_open_us_avg" => mean(&s.index_open_us, &s.index_opens),
+                "reader_hits" => rh,
+                "reader_hit_pct" => pct(rh, rh + io),
+                "reader_cache_capacity" => svc.config.reader_cache_entries().get(),
+                "search_concurrency" => svc.config.search_concurrency(),
+                "cache_seeded" => s.cache_seeded.load(Relaxed),
+                "cache_seed_failures" => s.cache_seed_failures.load(Relaxed),
+            ]
+        });
+
+        let rows: Vec<Row> = [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, tantivy, parquet, cache_sizes]
+            .into_iter()
+            .flatten()
+            .collect();
         let cols: Vec<ArrayRef> = vec![
             Arc::new(rows.iter().map(|r| Some(r.0)).collect::<StringArray>()),
             Arc::new(rows.iter().map(|r| Some(r.1.as_str())).collect::<StringArray>()),

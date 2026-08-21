@@ -11,13 +11,12 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -34,12 +33,47 @@ use crate::tantivy::{
     upsert_manifest,
 };
 
-/// Open (Index, IndexReader) pairs kept hot across queries.
-const READER_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
-/// Stale manifests degrade to full scans, never incorrect rows.
-const MANIFEST_CACHE_TTL: Duration = Duration::from_secs(5);
-/// Concurrent per-index download+search tasks within one query.
-const SEARCH_CONCURRENCY: usize = 8;
+/// Per-phase timings and counts for one process's tantivy read path, so the
+/// prefilter's cost can be attributed from `timefusion_stats` instead of by
+/// differencing query wall-clock on a loaded box. Sums and counts only —
+/// they divide into means and that is all this needs to answer.
+///
+/// Every counter here was added because the path had NONE: the pre-existing
+/// `index_opens` was incremented and never read by anything, and the OTel
+/// counters don't reach pgwire, so the biggest cost centre on the read path
+/// could not be attributed in-process at all.
+#[derive(Debug, Default)]
+pub struct SearchStats {
+    pub manifest_loads: AtomicU64,
+    pub manifest_load_us: AtomicU64,
+    pub manifest_hits: AtomicU64,
+    pub blob_fetches: AtomicU64,
+    pub blob_fetch_us: AtomicU64,
+    pub index_opens: AtomicU64,
+    pub index_open_us: AtomicU64,
+    pub reader_hits: AtomicU64,
+    pub searches: AtomicU64,
+    pub search_us: AtomicU64,
+    /// Indexes consulted across all queries — the fan-out this path is
+    /// dominated by. Divided by `queries`, this is indexes-per-query.
+    pub indexes_searched: AtomicU64,
+    pub queries: AtomicU64,
+    /// Extracted-index dirs seeded by the indexer at publish time, i.e. S3
+    /// round trips this process avoided by keeping what it just built.
+    pub cache_seeded: AtomicU64,
+    pub cache_seed_failures: AtomicU64,
+}
+
+impl SearchStats {
+    fn add(c: &AtomicU64, n: u64) {
+        c.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Record an elapsed duration against a (count, micros) pair.
+    fn timed(count: &AtomicU64, micros: &AtomicU64, started: Instant) {
+        Self::add(count, 1);
+        Self::add(micros, started.elapsed().as_micros() as u64);
+    }
+}
 
 #[derive(Debug)]
 pub struct SearchResult {
@@ -60,12 +94,13 @@ pub struct SearchResult {
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
     pub cache_root: PathBuf,
+    pub config: Arc<TantivyConfig>,
+    /// Per-phase attribution for the read path; surfaced via `timefusion_stats`.
+    pub stats: SearchStats,
     readers: Mutex<LruCache<PathBuf, (Index, IndexReader)>>,
     /// TTL cache of parsed manifests, keyed (table, project). Per-service
     /// (not global) so distinct object stores never cross-contaminate.
     manifests: DashMap<(String, String), (Instant, Arc<Manifest>)>,
-    /// Cold `open_index` calls — observability for the reader cache.
-    pub index_opens: AtomicU64,
     /// Last time each cache dir was served to a query — the reaper's recency
     /// signal. mmap reads don't reliably move a directory's atime, so the
     /// filesystem cannot be asked what is hot. Dirs absent here (never touched
@@ -85,13 +120,14 @@ pub struct ReapReport {
 }
 
 impl TantivySearchService {
-    pub fn new(object_store: Arc<dyn ObjectStore>, cache_root: PathBuf) -> Self {
+    pub fn new(object_store: Arc<dyn ObjectStore>, cache_root: PathBuf, config: Arc<TantivyConfig>) -> Self {
         Self {
             object_store,
             cache_root,
-            readers: Mutex::new(LruCache::new(READER_CACHE_ENTRIES)),
+            readers: Mutex::new(LruCache::new(config.reader_cache_entries())),
+            config,
+            stats: SearchStats::default(),
             manifests: DashMap::new(),
-            index_opens: AtomicU64::new(0),
             last_used: DashMap::new(),
         }
     }
@@ -143,15 +179,20 @@ impl TantivySearchService {
 
         // One download+open+search task per index, SEARCH_CONCURRENCY-wide.
         // `None` hits = the index lacks a queried field (coverage gap).
+        SearchStats::add(&self.stats.queries, 1);
+        SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
         let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid)| async move {
             let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
             let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
-            match build_node_query(&index, node)? {
-                PredsQuery::MissingField => Ok::<_, anyhow::Error>((None, rows, entry_covered, ordinals_valid)),
-                PredsQuery::Query(q) => Ok((Some(query_with_searcher(&reader.searcher(), &*q, None)?), rows, entry_covered, ordinals_valid)),
-            }
+            let started = Instant::now();
+            let out = match build_node_query(&index, node)? {
+                PredsQuery::MissingField => (None, rows, entry_covered, ordinals_valid),
+                PredsQuery::Query(q) => (Some(query_with_searcher(&reader.searcher(), &*q, None)?), rows, entry_covered, ordinals_valid),
+            };
+            SearchStats::timed(&self.stats.searches, &self.stats.search_us, started);
+            Ok::<_, anyhow::Error>(out)
         }))
-        .buffer_unordered(SEARCH_CONCURRENCY);
+        .buffer_unordered(self.config.search_concurrency());
 
         // Imperative: seven interdependent accumulators plus an early abort once
         // `max_hits` is exceeded — a fold would only hide the control flow.
@@ -248,12 +289,23 @@ impl TantivySearchService {
     /// argument). Removes the per-query S3 GET + JSON parse.
     async fn load_manifest_cached(&self, table: &str, project_id: &str) -> Result<Arc<Manifest>> {
         let key = (table.to_string(), project_id.to_string());
-        if let Some(m) = self.manifests.get(&key).filter(|e| e.0.elapsed() < MANIFEST_CACHE_TTL).map(|e| e.1.clone()) {
+        if let Some(m) = self.manifests.get(&key).filter(|e| e.0.elapsed() < self.config.manifest_ttl()).map(|e| e.1.clone()) {
+            SearchStats::add(&self.stats.manifest_hits, 1);
             return Ok(m);
         }
+        let started = Instant::now();
         let m = Arc::new(load_manifest(self.object_store.as_ref(), table, project_id).await?);
+        SearchStats::timed(&self.stats.manifest_loads, &self.stats.manifest_load_us, started);
         self.manifests.insert(key, (Instant::now(), m.clone()));
         Ok(m)
+    }
+
+    /// Drop the cached manifest for one (table, project) so the next read
+    /// reloads it. Called after this process publishes an entry, which is what
+    /// lets `manifest_ttl` be long: our own writes never go unseen, so the TTL
+    /// only bounds staleness against writers in other processes.
+    pub fn invalidate_manifest(&self, table: &str, project_id: &str) {
+        self.manifests.remove(&(table.to_string(), project_id.to_string()));
     }
 
     /// LRU-cached open, keyed by cache dir — 1:1 with the (immutable) blob
@@ -261,11 +313,13 @@ impl TantivySearchService {
     /// for a dir it deletes under that same key.
     fn open_cached(&self, dir: &Path) -> Result<(Index, IndexReader)> {
         if let Some(v) = self.readers.lock().get(dir) {
+            SearchStats::add(&self.stats.reader_hits, 1);
             return Ok(v.clone());
         }
+        let started = Instant::now();
         let index = super::open_index(dir)?;
         let reader = index.reader().map_err(|e| anyhow!("open reader: {e}"))?;
-        self.index_opens.fetch_add(1, Ordering::Relaxed);
+        SearchStats::timed(&self.stats.index_opens, &self.stats.index_open_us, started);
         self.readers.lock().put(dir.to_path_buf(), (index.clone(), reader.clone()));
         Ok((index, reader))
     }
@@ -279,20 +333,10 @@ impl TantivySearchService {
         if has_any_segment(&dir) {
             return Ok(dir);
         }
-        // Fetch blob and unpack into a temp dir adjacent to the cache, then rename.
+        let started = Instant::now();
         let blob = super::download(self.object_store.as_ref(), &ObjPath::from(blob_path)).await?;
-        let parent = dir.parent().ok_or_else(|| anyhow!("cache path has no parent"))?;
-        std::fs::create_dir_all(parent).context("mkdir cache parent")?;
-        let tmp = tempfile::TempDir::new_in(parent).context("tempdir for unpack")?;
-        super::unpack_to_dir(&blob, tmp.path())?;
-        // Best-effort rename. If another worker beat us, drop ours and use theirs.
-        // Bound in a `let` so the `tmp.path()` borrow ends before the arms move `tmp`.
-        let renamed = std::fs::rename(tmp.path(), &dir);
-        match renamed {
-            Ok(()) => drop(tmp.keep()),  // disarm cleanup: the dir now lives at `dir`
-            Err(_) if dir.exists() => {} // someone else won the race
-            Err(e) => return Err(e).context("rename into cache"),
-        }
+        install_blob_into_cache(&dir, &blob)?;
+        SearchStats::timed(&self.stats.blob_fetches, &self.stats.blob_fetch_us, started);
         Ok(dir)
     }
 
@@ -415,6 +459,35 @@ fn file_uuid(key: &str) -> &str {
     key.strip_prefix("bucket-").unwrap_or(key)
 }
 
+/// Unpack `blob` into a temp dir adjacent to `dir`, then atomically rename it
+/// into place. Shared by the reader (after a download) and the indexer (right
+/// after publishing a blob it just built) so a freshly built index is never
+/// fetched back from S3 to answer the first query that needs it.
+///
+/// Concurrency-safe by construction: unpack happens in a private temp dir and
+/// only the rename is observable, so a query downloading the same blob and an
+/// indexer seeding it can race freely — whoever renames second finds the dir
+/// present and keeps the winner's copy. Blob paths are immutable, so the two
+/// copies are byte-identical anyway.
+///
+/// Deliberately does NOT stamp `last_used`: a seeded dir's mtime is its unpack
+/// time, which the reaper already treats as the recency fallback, so it sorts
+/// as newest and is evicted last. That is what the seeding is for.
+fn install_blob_into_cache(dir: &Path, blob: &bytes::Bytes) -> Result<()> {
+    let parent = dir.parent().ok_or_else(|| anyhow!("cache path has no parent"))?;
+    std::fs::create_dir_all(parent).context("mkdir cache parent")?;
+    let tmp = tempfile::TempDir::new_in(parent).context("tempdir for unpack")?;
+    super::unpack_to_dir(blob, tmp.path())?;
+    // Bound in a `let` so the `tmp.path()` borrow ends before the arms move `tmp`.
+    let renamed = std::fs::rename(tmp.path(), dir);
+    match renamed {
+        Ok(()) => drop(tmp.keep()),  // disarm cleanup: the dir now lives at `dir`
+        Err(_) if dir.exists() => {} // someone else won the race
+        Err(e) => return Err(e).context("rename into cache"),
+    }
+    Ok(())
+}
+
 /// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
 fn has_any_segment(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|rd| {
@@ -442,7 +515,7 @@ mod tests {
     }
 
     fn service(root: &std::path::Path) -> TantivySearchService {
-        TantivySearchService::new(Arc::new(object_store::memory::InMemory::new()), root.to_path_buf())
+        TantivySearchService::new(Arc::new(object_store::memory::InMemory::new()), root.to_path_buf(), Arc::new(crate::config::TantivyConfig::default()))
     }
 
     #[test]
@@ -886,11 +959,32 @@ pub struct TantivyIndexService {
     /// successfully published; `i64::MIN` until the first one. Feeds the
     /// `index_lag_seconds` gauge.
     newest_indexed_micros: AtomicI64,
+    /// The reader this process serves queries from, if it has one. Held so a
+    /// publish can seed the reader's extracted-index cache and invalidate its
+    /// manifest — the indexer and reader are separate services, but in the
+    /// server they are two halves of one process and there is no reason for
+    /// the reader to re-fetch from S3 what the indexer just wrote.
+    ///
+    /// `Weak` because the reader also holds no ownership claim on the indexer
+    /// and both are `Arc`-held by `Database`; a strong ref here would make the
+    /// pair mutually immortal.
+    reader: Mutex<Option<std::sync::Weak<TantivySearchService>>>,
 }
 
 impl TantivyIndexService {
     pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>) -> Self {
-        Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN) }
+        Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN), reader: Mutex::new(None) }
+    }
+
+    /// Attach the reader whose cache publishes should seed. Without this the
+    /// indexer still works — it just uploads and lets the first query download
+    /// the blob back, which is the pre-existing behaviour.
+    pub fn with_reader(&self, reader: &Arc<TantivySearchService>) {
+        *self.reader.lock() = Some(Arc::downgrade(reader));
+    }
+
+    fn reader(&self) -> Option<Arc<TantivySearchService>> {
+        self.reader.lock().as_ref().and_then(std::sync::Weak::upgrade)
     }
 
     /// Newest indexed timestamp seen so far (microseconds). `None` until this
@@ -988,7 +1082,11 @@ impl TantivyIndexService {
             }
         };
         debug!("tantivy index for {project_id}/{table_name} built: rows={} bytes={} segments={}", stats.rows, blob.len(), stats.segments);
-        super::upload(self.object_store.as_ref(), &blob_path, blob).await?;
+        // S3 first, always: it is the source of truth and the local copy is
+        // only ever a cache. Seeding after a failed upload would leave a
+        // locally-readable index no manifest entry points at.
+        super::upload(self.object_store.as_ref(), &blob_path, blob.clone()).await?;
+        self.seed_reader_cache(table_name, project_id, manifest_key, blob).await;
         let entry = ManifestEntry {
             index: Some(blob_path.to_string()),
             rows: stats.rows,
@@ -1001,10 +1099,41 @@ impl TantivyIndexService {
             ordinals_valid,
         };
         upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await?;
+        // Our own write must never wait out the manifest TTL, which is what
+        // lets that TTL be minutes rather than seconds.
+        if let Some(reader) = self.reader() {
+            reader.invalidate_manifest(table_name, project_id);
+        }
         if let Some(ts) = stats.max_timestamp_micros {
             self.newest_indexed_micros.fetch_max(ts, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Install a just-published blob into the reader's extracted-index cache,
+    /// so the first query needing it reads local disk instead of S3.
+    ///
+    /// Strictly best-effort: every failure path leaves the pre-existing
+    /// behaviour (download on first read) intact, so this can never fail a
+    /// flush. Unpack is CPU + disk, hence `spawn_blocking`.
+    async fn seed_reader_cache(&self, table: &str, project_id: &str, manifest_key: &str, blob: bytes::Bytes) {
+        if !self.config.seed_cache_on_publish() {
+            return;
+        }
+        let Some(reader) = self.reader() else { return };
+        let dir = super::local_cache_path(&reader.cache_root, table, project_id, file_uuid(manifest_key));
+        let installed = tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob)).await;
+        match installed {
+            Ok(Ok(())) => SearchStats::add(&reader.stats.cache_seeded, 1),
+            Ok(Err(e)) => {
+                SearchStats::add(&reader.stats.cache_seed_failures, 1);
+                debug!("tantivy cache seed failed for {project_id}/{table}: {e:#}");
+            }
+            Err(e) => {
+                SearchStats::add(&reader.stats.cache_seed_failures, 1);
+                debug!("tantivy cache seed join failed for {project_id}/{table}: {e}");
+            }
+        }
     }
 
     /// Targeted compaction GC: drop manifest entries whose `covered_files`
