@@ -97,3 +97,27 @@ restarts now; expect cert_granted_total to move within hours-days as sealed
 days complete their slice sets — dedup-skip is the next step change for
 count shapes). Remaining ordered work: compaction to <20 files/project-day,
 dedup-deadline/unspillable-sort ticket, rollup routing coverage.
+
+
+## Addendum: the immortal-unit family (2026-08-21 night, deployed 1824627 + 525f6ec)
+
+The compaction/capacity blocker was diagnosed to a FAMILY of loops keeping
+whole-day 0.65-1.1TB Repair units alive at attempts=140-211 for days on
+project 87576849:
+1. Every timeout split the parent, but the 60s planner re-mint resurrected
+   the Superseded parent (attempts intact, backoff floor cancelled,
+   quarantine tag erased) and its day width outranked its own children —
+   across 24h of logs no child EVER started. Fixed: a Superseded parent with
+   live descendants is never resurrected; worker_error retries keep their
+   floor (1824627).
+2. Post-fix the loop persisted at ~2min cadence WITHOUT timeouts: the 1.1TB
+   estimate can never pass resource admission, and the admission retry was
+   the one retry path with no split and no backoff escalation. Fixed:
+   resource_admission is a capacity failure; retry_task routes through
+   retry_or_split; split-refused repeats escalate exponentially (525f6ec).
+Expected effect: poisoned days bisect to admittable sizes, quarantine slots
+free, sealed consolidation reaches the backlog — the direct path to P2's
+3.7s floor and the remaining wide-window TIMEOUTs. Residual: deterministic-
+failing files (footer_repair_quarantined) still need off-box
+`optimize --recompress`; convergence itself is now unblocked but is
+wall-clock work over days.
