@@ -1248,8 +1248,13 @@ pub struct CacheConfig {
     // in. Lower it on smaller disks.
     #[serde_inline_default(500)]
     pub timefusion_foyer_disk_gb: usize,
-    // 7 days
-    #[serde_inline_default(604_800)]
+    // 35 days: measured 2026-08-21 — a 7d ttl put the 2-9d query window
+    // exactly outside the cache, turning warm 1.3s lookups into 26s-to-timeout
+    // cold ones (docs/plans/2026-08-21-post-hot-tier-speed.md). With the hot
+    // tier removed, foyer IS the local tier; its horizon must cover the query
+    // mix (30d dashboards), not the flush cadence. Disk stays the real bound
+    // (env-pinned GB cap + oldest-first eviction).
+    #[serde_inline_default(3_024_000)]
     pub timefusion_foyer_ttl_seconds: u64,
     /// Bounded lifetime of resolved Delta providers. A provider is also
     /// invalidated immediately when its Delta snapshot version changes.
@@ -1304,7 +1309,9 @@ pub struct CacheConfig {
     /// Don't admit writes whose `date=` partition is older than this many
     /// days (e.g. cold-tier recompress rewrites) — recent data stays local,
     /// old data serves from S3. 0 = no age limit. Pairs with the cache TTL.
-    #[serde_inline_default(8)]
+    /// 35 to match: dashboards read 30d, so the whole window must be
+    /// admittable or its tail is permanently cold (measured 2026-08-21).
+    #[serde_inline_default(35)]
     pub timefusion_cache_recent_days: usize,
     /// Optional extra cap (MB) on the in-flight buffer used to warm the cache
     /// directly from a multipart write (skip re-downloading what we just
@@ -1717,7 +1724,13 @@ pub struct MaintenanceConfig {
     /// Only warm files whose `date=` partition is within this many days of
     /// today. Bounds warming to the partitions dashboards actually query.
     /// 0 = no recency limit.
-    #[serde_inline_default(1)]
+    /// 9 (was 1): measured 2026-08-21 — delta-only lookups in the 2-9d band
+    /// were the cold cliff (26s-to-timeout vs 1.3s warm on the identical
+    /// scan), and a full day is ~100MB/project, so nine days fleet-wide is
+    /// ~10GB against the 600GB cache. Full-file warmth must reach as deep as
+    /// the ttl/query mix, or the band between "flushed yesterday" and
+    /// "dashboard horizon" is permanently cold.
+    #[serde_inline_default(9)]
     pub timefusion_warm_recency_days: u64,
     /// Warm parquet footers for EVERY live file (not just recency-window
     /// ones). Footers are tens of KB each, but on tables with thousands of
@@ -2298,7 +2311,7 @@ mod tests {
         assert_eq!(config.cache.timefusion_foyer_block_size_mb, 256);
         assert_eq!(config.cache.block_size_bytes(), 256 * MIB);
         assert_eq!(config.cache.timefusion_foyer_l1_max_entry_mb, 16);
-        assert_eq!(config.cache.timefusion_cache_recent_days, 8);
+        assert_eq!(config.cache.timefusion_cache_recent_days, 35);
         assert_eq!(config.memory.timefusion_wide_scan_max_mb, 64);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(config.maintenance.timefusion_evict_after_compaction);
@@ -2306,7 +2319,7 @@ mod tests {
         // harnesses that build from AppConfig::default() exercise).
         assert!(config.maintenance.timefusion_use_deletion_vectors);
         assert!(!config.maintenance.timefusion_warm_full_files);
-        assert_eq!(config.maintenance.timefusion_warm_recency_days, 1);
+        assert_eq!(config.maintenance.timefusion_warm_recency_days, 9);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
         // Durable-by-default WAL: an async fsync default let OOM-kills tear the
         // mmap tail and silently quarantine acked rows. Pin the durable defaults.

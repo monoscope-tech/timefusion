@@ -3548,4 +3548,18 @@ pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&s
 
 /// Sidecar file names, paired with the label their warnings use.
 pub const CERTIFICATIONS: (&str, &str) = ("dedup_certifications.json", "certification store");
+pub const SLICE_COVERAGE: (&str, &str) = ("dedup_slice_coverage.json", "slice coverage store");
+
+/// One partition's accumulated clean-slice intervals, persisted write-through so
+/// certification evidence survives the restarts that the journal's Complete
+/// marks do (a day straddling a restart was otherwise permanently
+/// uncertifiable — cert_granted_total=0, diagnosed 2026-08-21).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StoredSliceCoverage {
+    pub project_id: String,
+    pub table_name: String,
+    pub date: String,
+    pub fp: u64,
+    pub intervals: Vec<(i64, i64)>,
+}
 pub const DIRTY_BINS: (&str, &str) = ("dedup_dirty_bins.json", "dirty-bin queue");

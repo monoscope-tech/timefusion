@@ -2585,7 +2585,9 @@ impl Database {
         };
         let fp = partition_file_fp(post.clone());
         if dropped != 0 || post.is_empty() || partition_file_fp(pre.to_vec()) != fp {
-            self.dedup_slice_coverage.remove(&key);
+            if self.dedup_slice_coverage.remove(&key).is_some() {
+                self.persist_slice_coverage();
+            }
             return self.record_certification(table_ref, table_name, project_id, date, pre, (dropped, true)).await;
         }
         // Bind `covered` in its own block: the RefMut must drop before the
@@ -2600,10 +2602,15 @@ impl Database {
             }
             entry.intervals.iter().any(|&(s, e)| s <= day_start && e >= day_end)
         };
+        // Write-through on every mutation: the journal durably marks this slice
+        // Complete (it will never re-run), so its evidence must be equally
+        // durable or a restart strands the day at partial coverage forever.
+        self.persist_slice_coverage();
         if !covered {
             return Ok(None);
         }
         self.dedup_slice_coverage.remove(&key);
+        self.persist_slice_coverage();
         self.record_certification(table_ref, table_name, project_id, date, &post, (0, true)).await
     }
 
@@ -3072,6 +3079,27 @@ impl Database {
     ///
     /// Best-effort by design — this is a cache, and a lost write costs a cold
     /// start, never a wrong answer.
+    /// Mirror of `persist_certifications` for the accumulating half of the
+    /// evidence. Same flag, same lock (one writer at a time across both
+    /// sidecars), same newest-irrelevant cap semantics — coverage entries are
+    /// few (only days mid-accumulation) so the cap is a formality.
+    fn persist_slice_coverage(&self) {
+        if !self.config.maintenance.timefusion_dedup_certification_persist {
+            return;
+        }
+        let _persist = self.dedup_certification_persist_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries: Vec<_> = self
+            .dedup_slice_coverage
+            .iter()
+            .map(|entry| {
+                let ((project_id, table_name, date), cov) = (entry.key().clone(), entry.value().clone());
+                crate::storage::StoredSliceCoverage { project_id, table_name, date, fp: cov.fp, intervals: cov.intervals }
+            })
+            .collect();
+        entries.truncate(crate::storage::PERSIST_CAP);
+        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::SLICE_COVERAGE, &entries);
+    }
+
     fn persist_certifications(&self) {
         if !self.config.maintenance.timefusion_dedup_certification_persist {
             return;
