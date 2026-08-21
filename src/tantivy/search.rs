@@ -257,7 +257,7 @@ impl TantivySearchService {
     /// `days` old, across all projects of `table`. Turns the cold-window
     /// download cliff after a restart into a background cost. Best-effort:
     /// individual blob failures are skipped.
-    pub async fn warm_recent(&self, table: &str, days: u32) -> Result<usize> {
+    pub async fn warm_recent(self: &Arc<Self>, table: &str, days: u32) -> Result<usize> {
         let cutoff = crate::support::now_micros() - i64::from(days) * 86_400_000_000;
         let prefix = ObjPath::from(format!("{}/{table}", MANIFEST_PREFIX));
         let objs: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
@@ -271,16 +271,29 @@ impl TantivySearchService {
             let Ok(m) = load_manifest(self.object_store.as_ref(), table, project).await else {
                 continue;
             };
-            let recent = m
+            // Owned, not borrowed from `m`: the warm tasks below must be
+            // 'static to be driven concurrently from the cron.
+            let recent: Vec<(String, String)> = m
                 .entries
                 .iter()
                 .filter(|(_, e)| e.schema_version == SCHEMA_VERSION && e.max_timestamp_micros.is_some_and(|mx| mx >= cutoff))
-                .filter_map(|(key, e)| Some((file_uuid(key), e.index.as_ref()?)));
-            for (uuid, blob) in recent {
-                if self.ensure_cached(table, project, uuid, blob).await.is_ok() {
-                    warmed += 1;
-                }
-            }
+                .filter_map(|(key, e)| Some((file_uuid(key).to_string(), e.index.as_ref()?.clone())))
+                .collect();
+            // Concurrent, at the same width as a query's fan-out. Sequentially
+            // this was one round trip at a time: a cold start after a restart
+            // has ~550 blobs to pull for the largest project alone, so serial
+            // warming took minutes per project and the "hot window is local"
+            // guarantee did not hold until long after the box was serving.
+            // Already-resident blobs cost one `has_any_segment` stat each, so a
+            // steady-state pass stays cheap at this width.
+            warmed += futures::stream::iter(recent.into_iter().map(|(uuid, blob)| {
+                let (me, table, project) = (Arc::clone(self), table.to_string(), project.to_string());
+                async move { me.ensure_cached(&table, &project, &uuid, &blob).await }
+            }))
+            .buffer_unordered(self.config.search_concurrency())
+            .filter(|r| futures::future::ready(r.is_ok()))
+            .count()
+            .await;
         }
         Ok(warmed)
     }
@@ -300,12 +313,36 @@ impl TantivySearchService {
         Ok(m)
     }
 
-    /// Drop the cached manifest for one (table, project) so the next read
-    /// reloads it. Called after this process publishes an entry, which is what
-    /// lets `manifest_ttl` be long: our own writes never go unseen, so the TTL
-    /// only bounds staleness against writers in other processes.
-    pub fn invalidate_manifest(&self, table: &str, project_id: &str) {
-        self.manifests.remove(&(table.to_string(), project_id.to_string()));
+    /// Fold a just-published entry into the cached manifest instead of dropping
+    /// it, so this process sees its own write without paying to reload all of
+    /// it. Where there is nothing cached, do nothing — the next read loads it.
+    ///
+    /// This replaced a `remove()`, and the difference is not cosmetic: with a
+    /// remove, prod measured **manifest_hit_pct = 0.0 across 56 loads for 54
+    /// queries** — busy projects publish far more often than they are queried,
+    /// so every publish threw away the entry the next query needed and the
+    /// 300s TTL bought exactly nothing. Updating in place keeps the cache warm
+    /// while still never letting our own write go unseen.
+    pub fn apply_published_entry(&self, table: &str, project_id: &str, key: &str, entry: crate::tantivy::ManifestEntry) {
+        // `entry()` holds the shard lock across the read-modify-write. A plain
+        // get-clone-insert would let two concurrent publishes for the same
+        // project (a flush overlapping a backfill/compaction build) each start
+        // from the same snapshot, so the second write would silently drop the
+        // first one's entry — leaving a covered file looking uncovered here
+        // until the TTL expired. The S3 manifest is unaffected either way,
+        // since `upsert_manifest` serializes per (table, project).
+        let dashmap::mapref::entry::Entry::Occupied(mut occupied) = self.manifests.entry((table.to_string(), project_id.to_string())) else {
+            // Nothing cached: the next read loads it, including this entry.
+            return;
+        };
+        let (loaded_at, current) = occupied.get();
+        // Keep the ORIGINAL load time. Refreshing it here would mean a project
+        // that publishes every few minutes never re-reads its manifest at all,
+        // so writers we don't observe (the repair CLI, `gc_after_compaction`)
+        // would be invisible forever rather than for at most one TTL.
+        let (loaded_at, mut updated) = (*loaded_at, (**current).clone());
+        updated.entries.insert(key.to_string(), entry);
+        occupied.insert((loaded_at, Arc::new(updated)));
     }
 
     /// LRU-cached open, keyed by cache dir — 1:1 with the (immutable) blob
@@ -1098,11 +1135,11 @@ impl TantivyIndexService {
             covered_files,
             ordinals_valid,
         };
-        upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await?;
+        upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry.clone()).await?;
         // Our own write must never wait out the manifest TTL, which is what
         // lets that TTL be minutes rather than seconds.
         if let Some(reader) = self.reader() {
-            reader.invalidate_manifest(table_name, project_id);
+            reader.apply_published_entry(table_name, project_id, manifest_key, entry);
         }
         if let Some(ts) = stats.max_timestamp_micros {
             self.newest_indexed_micros.fetch_max(ts, Ordering::Relaxed);

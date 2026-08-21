@@ -806,6 +806,16 @@ pub struct TantivyConfig {
     /// the prefilter treats as "no usable index" and falls back from.
     #[serde_inline_default(300)]
     pub timefusion_tantivy_manifest_ttl_secs: u64,
+    /// Max index builds one reconcile pass will start. Bounds a pass so it can
+    /// run hourly and drain incrementally instead of attempting the entire
+    /// backlog once a night; work not taken this pass is taken by the next, and
+    /// the fair round-robin across projects means no project can monopolise a
+    /// pass. 0 = unbounded (the previous behaviour).
+    ///
+    /// A truncated pass logs how much it left behind — a silent cap reads as
+    /// "coverage is converging" when it is not.
+    #[serde_inline_default(400)]
+    pub timefusion_tantivy_backfill_max_files_per_pass: usize,
     /// Row-selection pushdown: when the prefilter engages, files whose index
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
     /// reader decodes only matching rows. Off switch for instant rollback to
@@ -1785,11 +1795,21 @@ pub struct MaintenanceConfig {
     // committed data was destroyed elsewhere.
     #[serde_inline_default("0 0 * * * *".to_string())]
     pub timefusion_reconcile_schedule: String,
-    /// Nightly tantivy index reconcile: backfill uncovered live parquet +
-    /// GC manifest entries for rewritten-away files, per-uuid manifests
-    /// included. The single-process self-management of index consistency —
-    /// compaction/wave commits and CLI runs all converge here.
-    #[serde_inline_default("0 30 3 * * *".to_string())]
+    /// Tantivy index reconcile: backfill uncovered live parquet + GC manifest
+    /// entries for rewritten-away files, per-uuid manifests included. The
+    /// single-process self-management of index consistency — compaction/wave
+    /// commits and CLI runs all converge here.
+    ///
+    /// Hourly, was `0 30 3 * * *` (once a day). Daily could not hold the line:
+    /// uncovered files accrue continuously (~85/hr observed) while this box
+    /// restarts every few hours for deploys and OOM kills, so a process that
+    /// never lived through 03:30 never reconciled AT ALL — which is how prod
+    /// reached 5,506 uncovered files with a drain that looked implemented.
+    /// Safe to run hourly only because each pass is now bounded by
+    /// `timefusion_tantivy_backfill_max_files_per_pass`; before that bound a
+    /// pass attempted every uncovered file at once, which is what forced the
+    /// nightly cadence in the first place.
+    #[serde_inline_default("0 20 * * * *".to_string())]
     pub timefusion_tantivy_reconcile_schedule: String,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after

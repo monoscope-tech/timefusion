@@ -2958,6 +2958,27 @@ impl Database {
         });
     }
 
+    /// Make the hot window resident: pull every index blob covering the last
+    /// `prefetch_days` into the local extraction cache. Idempotent — blobs
+    /// already on disk cost one stat each — so this is safe to run on a cron.
+    ///
+    /// A named method rather than an inline cron body on purpose: the closure
+    /// form borrows the loop's table name across an await inside an HRTB-bound
+    /// closure, which rustc cannot prove general enough.
+    pub async fn tantivy_warm_hot_window(&self) {
+        let days = self.config.tantivy.timefusion_tantivy_prefetch_days;
+        let Some(svc) = self.tantivy_search().cloned() else { return };
+        if days == 0 {
+            return;
+        }
+        for table in self.config.tantivy.indexed_tables() {
+            match svc.warm_recent(&table, days).await {
+                Ok(n) => debug!("tantivy hot warm: table={table} days={days} blobs_resident={n}"),
+                Err(e) => warn!("tantivy hot warm failed for {table}: {e}"),
+            }
+        }
+    }
+
     /// Synchronous backfill + GC for one table — the optimize CLI's
     /// post-compaction reconcile. Builds indexes for every live parquet not
     /// covered by a manifest (repairing earlier CLI runs that compacted with
@@ -3078,6 +3099,10 @@ impl Database {
         let mut built = 0usize;
         // Coverage gauges for this pass — see `tantivy_uncovered_files`.
         let (mut uncovered_total, mut oversized_total) = (0u64, 0u64);
+        // Work this pass deliberately left for the next one. Reported, never
+        // silent: a capped pass that logged only `built` would look identical
+        // to a converged one.
+        let mut deferred_total = 0u64;
         for root in roots {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
@@ -3094,7 +3119,16 @@ impl Database {
                 queues.push((pid, queue));
             }
             let table_owned = table_name.to_string();
-            let mut jobs = futures::stream::iter(fair_tantivy_backfill_work(queues).into_iter().map(|(pid, rel, uri)| {
+            // Bound the pass so the cron can run hourly. Fair round-robin
+            // ordering means truncation drops the OLDEST round across every
+            // project, never one project's whole queue.
+            let mut work = fair_tantivy_backfill_work(queues);
+            let cap = self.config.tantivy.timefusion_tantivy_backfill_max_files_per_pass;
+            if cap > 0 && work.len() > cap {
+                deferred_total = deferred_total.saturating_add((work.len() - cap) as u64);
+                work.truncate(cap);
+            }
+            let mut jobs = futures::stream::iter(work.into_iter().map(|(pid, rel, uri)| {
                 let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
                 async move { (pid.clone(), svc.build_index_for_file(&table, &pid, &rel, &uri, store).await) }
             }))
@@ -3113,7 +3147,14 @@ impl Database {
         let stats = crate::observability::maintenance_stats();
         stats.tantivy_uncovered_files.store(uncovered_total.saturating_sub(built as u64), std::sync::atomic::Ordering::Relaxed);
         stats.tantivy_oversized_skipped.store(oversized_total, std::sync::atomic::Ordering::Relaxed);
-        info!(table_name, built, uncovered_before = uncovered_total, oversized_skipped = oversized_total, event = "tantivy_backfill_pass");
+        info!(
+            table_name,
+            built,
+            uncovered_before = uncovered_total,
+            oversized_skipped = oversized_total,
+            deferred_to_next_pass = deferred_total,
+            event = "tantivy_backfill_pass"
+        );
         Ok(built)
     }
 
@@ -3871,11 +3912,13 @@ impl Database {
             let Some(svc) = db.tantivy_indexer().cloned() else { return };
             for table_name in svc.config.indexed_tables() {
                 match db.tantivy_reconcile_table(&table_name).await {
-                    Ok((0, 0, 0)) => {}
+                    // Logged even when it did nothing: a silent no-op arm made
+                    // "ran and found nothing" indistinguishable from "never
+                    // ran", and the cron not firing at all was the actual bug.
                     Ok((built, removed, blobs)) => {
-                        info!("tantivy nightly reconcile: table={} built={} entries_removed={} blobs_deleted={}", table_name, built, removed, blobs);
+                        info!("tantivy reconcile: table={} built={} entries_removed={} blobs_deleted={}", table_name, built, removed, blobs);
                     }
-                    Err(e) => warn!("tantivy nightly reconcile failed for {}: {}", table_name, e),
+                    Err(e) => warn!("tantivy reconcile failed for {}: {}", table_name, e),
                 }
             }
         });
@@ -3912,17 +3955,7 @@ impl Database {
         // mechanism that makes "hot indexes stay local" true over time, not just
         // at boot. Blobs already on disk cost one `has_any_segment` stat each.
         spawn_db_cron(&db, "Tantivy hot warm", &self.config.tantivy.timefusion_tantivy_prefetch_schedule, cancel.clone(), |db| async move {
-            let days = db.config.tantivy.timefusion_tantivy_prefetch_days;
-            let Some(svc) = db.tantivy_search().cloned() else { return };
-            if days == 0 {
-                return;
-            }
-            for t in db.config.tantivy.indexed_tables() {
-                match svc.warm_recent(&t, days).await {
-                    Ok(n) => debug!("tantivy hot warm: table={t} days={days} blobs_resident={n}"),
-                    Err(e) => warn!("tantivy hot warm failed for {t}: {e}"),
-                }
-            }
+            db.tantivy_warm_hot_window().await;
         });
 
         // Checkpoint + expired-log cleanup — runs the post-commit hooks out-of-band
@@ -10671,6 +10704,26 @@ mod tests {
         let scheduled: Vec<_> = work.iter().map(|(project, _, uri)| (project.as_str(), uri.as_str())).collect();
 
         assert_eq!(scheduled, vec![("small", "uri/small-new"), ("whale", "uri/whale-new"), ("whale", "uri/whale-mid"), ("whale", "uri/whale-old"),]);
+    }
+
+    /// Truncating a bounded pass must cut the OLDEST round, never one project's
+    /// whole queue — that is the property that lets the reconcile run hourly
+    /// without a big tenant's history starving everyone else's recent files.
+    #[test]
+    fn a_bounded_backfill_pass_truncates_the_oldest_round_not_one_project() {
+        let queue = |items: &[&str]| items.iter().map(|item| (format!("rel/{item}"), format!("uri/{item}"))).collect::<VecDeque<_>>();
+        let mut work = super::fair_tantivy_backfill_work(vec![
+            ("whale".to_string(), queue(&["whale-new", "whale-mid", "whale-old"])),
+            ("small".to_string(), queue(&["small-new", "small-old"])),
+        ]);
+        let deferred = work.len().saturating_sub(3);
+        work.truncate(3);
+        let scheduled: Vec<_> = work.iter().map(|(project, _, uri)| (project.as_str(), uri.as_str())).collect();
+
+        assert_eq!(deferred, 2, "the cap must report what it left behind, not swallow it");
+        // Round 0 is both projects' newest; round 1 begins before anything older.
+        assert_eq!(scheduled, vec![("small", "uri/small-new"), ("whale", "uri/whale-new"), ("small", "uri/small-old")]);
+        assert!(scheduled.iter().any(|(p, _)| *p == "small"), "the smaller project keeps its slot under a cap");
     }
 
     /// The merge-on-read gate: `keep_greatest_ordering` yields the lead sort key

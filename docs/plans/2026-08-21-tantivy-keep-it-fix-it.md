@@ -12,8 +12,35 @@
 > (coverage/reconcile drain — this is the "keep S3 up to date" half and is the
 > next increment), **D2** (per-day index granularity), **D3** (off the planning
 > path), **D4** (benefit-based routing). Increment 1 shrinks the fan-out term
-> and finally measures the rest; it does not remove the `route_equality` tax,
-> which is still ON.
+> and finally measures the rest; `route_equality` is still ON (and, per the
+> numbers below, no longer obviously worth turning off).
+>
+> **Measured on prod** — 5 interleaved reps per sample, minimums, in-round
+> `SELECT 1` control. Only the tantivy-routed shapes moved; every control is
+> flat, which is what makes the attribution credible. Two independent samples
+> (+15 min, +50 min), so this is confirmed rather than one quiet window:
+>
+> | shape | pre | post +15m | post +50m |
+> |---|---|---|---|
+> | `trace_id =` @7d (routed) | 2481 ms | 579 ms | **484 ms** |
+> | `trace_id =` @30d (routed) | 2652 ms | 720 ms | **674 ms** |
+> | range @7d (control) | 198 ms | 202 ms | 185 ms |
+> | range @30d (control) | 312 ms | 347 ms | 336 ms |
+> | `SELECT 1` (control) | 34 ms | 36 ms | 35 ms |
+>
+> **5.1x at 7d, 3.9x at 30d**, with every control flat across all three
+> samples — and still improving as the cache warms. The equality tax fell from
+> ~2.2s to **~300ms** above the unrouted baseline, with tantivy still doing its
+> job. That materially weakens the earlier P0 case for flipping
+> `route_equality` off: the tax it was meant to remove is now ~300ms, not 2.2s.
+> `cache_seeded` confirms indexes are kept locally rather than re-fetched.
+>
+> D0's counters immediately paid for themselves by exposing a defect in this
+> same increment: `manifest_hit_pct = 0.0` across 56 loads for 54 queries,
+> because invalidating the cached manifest on every publish threw away the
+> entry the next query needed (busy projects publish far more often than they
+> are queried). Fixed in increment 2 by folding the published entry into the
+> cached manifest instead of dropping it.
 >
 > Two known gaps recorded rather than silently carried: `gc_after_compaction`
 > prunes manifest entries without invalidating this process's cache, so for up

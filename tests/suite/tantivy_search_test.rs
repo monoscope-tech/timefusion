@@ -251,6 +251,44 @@ async fn concurrent_install_of_same_index_is_idempotent() {
     assert_eq!(hits.len(), 1, "index stays readable after a repeat install");
 }
 
+/// A publish must leave the manifest cache WARM, not empty.
+///
+/// Regression guard for a measured prod defect: the first version of this path
+/// called `remove()` on publish, and prod reported `manifest_hit_pct = 0.0`
+/// across 56 loads for 54 queries — busy projects publish far more often than
+/// they are queried, so every publish threw away the entry the next query
+/// needed and the 300s TTL bought nothing.
+#[tokio::test]
+async fn publishing_keeps_the_manifest_cache_warm_and_current() {
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p-manifest-warm";
+    let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = Arc::new(FailAfterArm::new(inner));
+    let cfg = Arc::new(prod_defaults());
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
+    let cache = TempDir::new().unwrap();
+    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
+    svc.with_reader(&search);
+    let cb = svc.clone().callback();
+
+    // First publish + query: populates the manifest cache.
+    cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
+    search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
+    let loads_after_first = search.stats.manifest_loads.load(Relaxed);
+
+    // Second publish, then cut the object store off entirely. If publishing had
+    // evicted the manifest, this search would have to reload it and would fail.
+    cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["f2".into()]).await.unwrap();
+    store.arm();
+
+    let hits = search.search(table_name, project_id, "level", "ERROR").await.expect("must not reload the manifest").expect("usable index");
+    assert_eq!(search.stats.manifest_loads.load(Relaxed), loads_after_first, "a publish must not force a manifest reload");
+    // ...and the cache must be CURRENT, not merely warm: the second publish's
+    // rows have to be visible, which is the thing a stale cache would lose.
+    let ids: Vec<_> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(ids.contains(&"b"), "the just-published entry must be visible without a reload, got {ids:?}");
+}
+
 /// An object store that serves normally until `arm()`, then fails every GET.
 /// Lets a test assert "this read did not go to S3" positively, rather than by
 /// inferring it from a counter that a future refactor could stop incrementing.
