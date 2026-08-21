@@ -1,6 +1,7 @@
 //! Maintenance: rollup planning/coordinator ticks, dedup sweeps + wave commits,
 //! hot-tail packing/repair passes, vacuum, checkpoint/reconcile, shutdown.
 use super::*;
+use tap::Tap;
 
 /// Estimated decoded (in-memory) bytes for a Parquet file of `compressed_size` on
 /// disk — a fixed 12x compression-ratio guess used for budgeting, not measurement.
@@ -4123,7 +4124,7 @@ impl Database {
                     // Publish the sort while it runs, so `timefusion_stats` can
                     // distinguish a grinding repair from a wedged one. The guard
                     // decrements on every exit path including the timeout.
-                    let _in_flight = (pass == TailPass::Repair).then(|| InFlightGuard::enter(&crate::observability::maintenance_stats().repair_bins_in_flight));
+                    let _in_flight = (pass == TailPass::Repair).then(|| in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(
                         left,
                         self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None }),
@@ -4772,7 +4773,7 @@ impl Database {
                     let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
                     self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                     Self::record_wave_landed(&fresh, data_change);
-                    return WaveResult { landed: concat_landed(carried, fresh), failed };
+                    return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
                 }
                 Err(CommitFailure { message: e, timed_out }) => {
                     // Released BEFORE the probe: on a timeout the store is
@@ -4802,7 +4803,7 @@ impl Database {
                             self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                             self.clear_bin_intents(&fresh);
                             Self::record_wave_landed(&fresh, data_change);
-                            return WaveResult { landed: concat_landed(carried, fresh), failed };
+                            return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
                         }
                         CommitProbe::NotLanded => {
                             crate::observability::record_optimize_failed();

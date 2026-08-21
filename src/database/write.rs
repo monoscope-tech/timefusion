@@ -239,7 +239,7 @@ impl Database {
         // doubled a half-pool reservation). Shrinking the batch trades scan
         // throughput for the allocation; the alternative — writing the group
         // UNSORTED — poisons the partition's footer ordering for every later scan.
-        let state = build_delta_write_session_state_with_batch(1, self.flush_sort_runtime_env(), "256");
+        let state = build_delta_write_session_state(1, self.flush_sort_runtime_env(), "256");
         let ctx = SessionContext::new_with_state(state);
         let name = format!("flush_sort_{}", uuid::Uuid::new_v4().simple());
         ctx.register_table(&name, Arc::new(MemTable::try_new(arrow_schema, vec![unified]).ok()?)).ok()?;
@@ -328,7 +328,7 @@ impl Database {
 
     /// Waiter count for the SAME key as [`Self::commit_lock`] (see
     /// `flush_waiter_counts`). Flush/ingest commit paths register a
-    /// [`FlushWaiter`] on it across their `lock().await`; `commit_wave` reads it
+    /// [`flush_waiter`] on it across their `lock().await`; `commit_wave` reads it
     /// and stands down while it is nonzero.
     pub(crate) async fn flush_waiters(&self, project_id: &str, table_name: &str) -> Arc<std::sync::atomic::AtomicUsize> {
         self.flush_waiter_counts.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
@@ -704,7 +704,7 @@ impl Database {
                 // count must fall the moment we hold the lock — or the moment a
                 // watchdog cancels this future.
                 let commit_guard = {
-                    let _waiting = FlushWaiter::register(&flush_waiters);
+                    let _waiting = flush_waiter(&flush_waiters);
                     commit_lock.lock().await
                 };
                 // DIAG (commit-throughput profiling): time the serial commit phases
@@ -839,7 +839,7 @@ impl Database {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
             let commit_guard = {
-                let _waiting = FlushWaiter::register(&flush_waiters);
+                let _waiting = flush_waiter(&flush_waiters);
                 commit_lock.lock().await
             };
             let (table, pre_uris) = {
@@ -1063,7 +1063,7 @@ impl Database {
         let mut retry_count = 0u32;
         loop {
             let commit_guard = {
-                let _waiting = FlushWaiter::register(&flush_waiters);
+                let _waiting = flush_waiter(&flush_waiters);
                 commit_lock.lock().await
             };
             if let Err(e) = bounded_commit_await(

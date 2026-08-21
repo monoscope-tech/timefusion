@@ -8508,6 +8508,7 @@ dependencies = [
  "strum",
  "sysinfo",
  "tantivy",
+ "tap",
  "tar",
  "tdigests",
  "tempfile",

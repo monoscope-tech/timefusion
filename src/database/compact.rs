@@ -776,7 +776,7 @@ impl Database {
         // wraps its input in a MetricObserver node only that planner can
         // physically plan. It now also reserves sort-spill memory so the added
         // ORDER BY spills rather than erroring on a large partition.
-        let session = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env());
+        let session = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env(), "8192");
         let ctx = datafusion::prelude::SessionContext::new_with_state(session);
         ctx.register_table("recompress_src", Arc::new(provider))?;
         // `date_str` is a parsed `NaiveDate`; `order_by` uses quoted identifiers.

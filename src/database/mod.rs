@@ -414,21 +414,13 @@ pub(crate) struct RollupRewrite {
 type FlushWaiterCounts = Arc<dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicUsize>>>;
 
 /// RAII count of one flush/ingest committer waiting on a per-table commit lock.
-/// Must decrement on lock acquisition AND on future cancellation — `Drop`
+/// Must decrement on lock acquisition AND on future cancellation — drop
 /// covers both; a manual decrement leaks on cancellation and wedges maintenance.
-struct FlushWaiter(Arc<std::sync::atomic::AtomicUsize>);
-
-impl FlushWaiter {
-    fn register(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(count.clone())
-    }
-}
-
-impl Drop for FlushWaiter {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
+fn flush_waiter(count: &Arc<std::sync::atomic::AtomicUsize>) -> impl Drop + use<> {
+    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    scopeguard::guard(Arc::clone(count), |count| {
+        count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    })
 }
 
 /// Get a Delta table from custom project tables by project_id and table_name
@@ -598,8 +590,7 @@ fn bucket_cache_key(table_path: &str, rel: &object_store::path::Path) -> String 
 fn select_warm_paths(
     uris: Vec<String>, prefix: &str, warm_all_footers: bool, cutoff: Option<chrono::NaiveDate>,
 ) -> (Vec<(object_store::path::Path, bool)>, usize) {
-    let mut dropped = 0usize;
-    let mut paths: Vec<(object_store::path::Path, bool)> = uris
+    let (mut paths, dropped): (Vec<(object_store::path::Path, bool)>, Vec<()>) = uris
         .into_iter()
         .filter(|u| u.ends_with(".parquet"))
         .map(|u| {
@@ -607,17 +598,13 @@ fn select_warm_paths(
             (u, recent)
         })
         .filter(|(_, recent)| warm_all_footers || *recent)
-        .filter_map(|(u, recent)| match relativize_to_prefix(prefix, &u) {
-            Some(path) => Some((path, recent)),
-            None => {
-                // Prefix mismatch (e.g. trailing-slash or query-string drift
-                // between table_url() and get_file_uris()). Warming this file
-                // would address the wrong key, so skip it.
-                dropped += 1;
-                None
-            }
-        })
-        .collect();
+        .partition_map(|(u, recent)| match relativize_to_prefix(prefix, &u) {
+            Some(path) => itertools::Either::Left((path, recent)),
+            // Prefix mismatch (e.g. trailing-slash or query-string drift
+            // between table_url() and get_file_uris()). Warming this file
+            // would address the wrong key, so skip it.
+            None => itertools::Either::Right(()),
+        });
     // Assumes 10-char ISO dates (date=YYYY-MM-DD, lexically sortable). A
     // missing or differently-shaped date= segment keys as "" — sorts last
     // under Reverse (treated as oldest), never a crash.
@@ -627,7 +614,7 @@ fn select_warm_paths(
     };
     // cached_key: one allocation per path, not one per comparison.
     paths.sort_by_cached_key(|(p, _)| std::cmp::Reverse(date_key(p)));
-    (paths, dropped)
+    (paths, dropped.len())
 }
 
 // Helper function to extract project_id from a batch
@@ -712,17 +699,7 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
 fn build_optimize_session_state(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> datafusion::execution::session_state::SessionState {
-    build_optimize_session_state_with_batch(target_partitions, runtime_env, None)
-}
-
-/// `batch_override` shrinks the sort's indivisible admission unit. Merge memory
-/// scales with fan-in x batch, so a whole-file repair — the one rewrite whose
-/// input is a single ~1 GiB file and whose sort therefore spills into a wide
-/// merge — needs a smaller batch than the packing bins it shares a pool with.
-fn build_optimize_session_state_with_batch(
-    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>,
-) -> datafusion::execution::session_state::SessionState {
-    build_optimize_session_state_tuned(target_partitions, runtime_env, batch_override, None)
+    build_optimize_session_state_tuned(target_partitions, runtime_env, None, None)
 }
 
 /// A sort whose caller runs FEW enough concurrent bins that
@@ -739,6 +716,10 @@ struct UncappedSort {
     reservation_bytes: Option<usize>,
 }
 
+/// `batch_override` shrinks the sort's indivisible admission unit. Merge memory
+/// scales with fan-in x batch, so a whole-file repair — the one rewrite whose
+/// input is a single ~1 GiB file and whose sort therefore spills into a wide
+/// merge — needs a smaller batch than the packing bins it shares a pool with.
 /// `uncapped` lifts `MAINTENANCE_MAX_PARTITIONS` and pins the sort's
 /// parallelism to the given value — see [`UncappedSort`].
 fn build_optimize_session_state_tuned(
@@ -965,19 +946,14 @@ fn maintenance_session_config(base: datafusion::prelude::SessionConfig, batch_si
 /// convert to a physical plan. `schema_force_view_types=false` keeps Variant
 /// columns as `Binary` (not `BinaryView`) so delta_kernel's unshredded-variant
 /// schema check passes (same reason as `dml.rs::delta_session_from`).
-fn build_delta_write_session_state(
-    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-) -> datafusion::execution::session_state::SessionState {
-    build_delta_write_session_state_with_batch(target_partitions, runtime_env, "8192")
-}
-
+///
 /// `batch_size` is the sort's indivisible admission unit, and merge memory
 /// scales with fan-in x batch — the same relationship
-/// [`build_optimize_session_state_with_batch`] exists for. The flush escalation
-/// sort needs it MORE than repair does, because it has the worst combination in
-/// the system: the largest batch (8192) against the smallest pool (the 1 GB
+/// `build_optimize_session_state_tuned`'s `batch_override` exists for. The
+/// flush escalation sort passes 256 because it has the worst combination in
+/// the system: the largest batches against the smallest pool (the 1 GB
 /// `flush_sort_pool`, vs maintenance's 22.5 GB).
-fn build_delta_write_session_state_with_batch(
+fn build_delta_write_session_state(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_size: &str,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
@@ -2358,27 +2334,25 @@ fn slice_share_of_file(file_min: Option<i64>, file_max: Option<i64>, slice: crat
 
 fn fair_tantivy_backfill_work(mut queues: Vec<(String, VecDeque<(String, String)>)>) -> Vec<TantivyBackfillWork> {
     // HashMap iteration is deliberately unstable. Pin project order so repair
-    // is reproducible, then take one newest file from every project per round.
+    // is reproducible, then take one newest file from every project per round —
+    // a stable sort by per-queue position keeps project order within a round.
     queues.sort_by(|a, b| a.0.cmp(&b.0));
-    let capacity = queues.iter().map(|(_, q)| q.len()).sum();
-    let mut work = Vec::with_capacity(capacity);
-    loop {
-        let mut added = false;
-        for (project, queue) in &mut queues {
-            if let Some((rel, uri)) = queue.pop_front() {
-                work.push((project.clone(), rel, uri));
-                added = true;
-            }
-        }
-        if !added {
-            return work;
-        }
-    }
+    queues
+        .into_iter()
+        .flat_map(|(project, queue)| queue.into_iter().enumerate().map(move |(round, (rel, uri))| (round, (project.clone(), rel, uri))))
+        .sorted_by_key(|(round, _)| *round)
+        .map(|(_, work)| work)
+        .collect()
 }
 
 /// What a single `run-unit` execution produced. The phase counters are deltas
 /// of the global `maintenance_stats` atomics over the unit's run; the CLI owns
 /// the process, so nothing else is moving them.
+#[derive(derive_more::Display)]
+#[display(
+    "run-unit: {operation:?} {project_id} {date} | wall {wall_ms}ms | scan {scan_ms}ms staging {staging_ms}ms commit {commit_ms}ms e2e {end_to_end_ms}ms | cohorts {cohorts} | state {state:?}{}",
+    retry_reason.as_deref().map_or_else(String::new, |reason| format!(" | retry_reason {reason}"))
+)]
 pub struct UnitRunReport {
     pub operation: crate::maintenance_coordinator::Operation,
     pub project_id: String,
@@ -2391,26 +2365,6 @@ pub struct UnitRunReport {
     pub cohorts: u64,
     pub state: Option<crate::maintenance_coordinator::TaskState>,
     pub retry_reason: Option<String>,
-}
-
-impl std::fmt::Display for UnitRunReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "run-unit: {:?} {} {} | wall {}ms | scan {}ms staging {}ms commit {}ms e2e {}ms | cohorts {} | state {:?}{}",
-            self.operation,
-            self.project_id,
-            self.date,
-            self.wall_ms,
-            self.scan_ms,
-            self.staging_ms,
-            self.commit_ms,
-            self.end_to_end_ms,
-            self.cohorts,
-            self.state,
-            self.retry_reason.as_deref().map_or(String::new(), |reason| format!(" | retry_reason {reason}")),
-        )
-    }
 }
 
 impl Database {
@@ -2572,28 +2526,21 @@ impl Database {
         let key_set = crate::config::key_configured();
         let mut map = HashMap::new();
         let mut plaintext_rows = 0usize;
-        for mut config in configs {
-            let enc_access = config.s3_access_key_id.starts_with(crate::config::ENC_PREFIX);
-            let enc_secret = config.s3_secret_access_key.starts_with(crate::config::ENC_PREFIX);
-            match crate::config::decrypt_or_passthrough(&config.s3_access_key_id) {
-                Ok(v) => config.s3_access_key_id = v,
-                Err(e) => {
-                    error!("Skipping {}/{}: cannot decrypt s3_access_key_id: {}", config.project_id, config.table_name, e);
-                    continue;
+        'rows: for mut config in configs {
+            let all_encrypted = [&config.s3_access_key_id, &config.s3_secret_access_key].into_iter().all(|v| v.starts_with(crate::config::ENC_PREFIX));
+            let (project_id, table_name) = (config.project_id.clone(), config.table_name.clone());
+            for (name, field) in [("s3_access_key_id", &mut config.s3_access_key_id), ("s3_secret_access_key", &mut config.s3_secret_access_key)] {
+                match crate::config::decrypt_or_passthrough(field) {
+                    Ok(v) => *field = v,
+                    Err(e) => {
+                        error!("Skipping {project_id}/{table_name}: cannot decrypt {name}: {e}");
+                        continue 'rows;
+                    }
                 }
             }
-            match crate::config::decrypt_or_passthrough(&config.s3_secret_access_key) {
-                Ok(v) => config.s3_secret_access_key = v,
-                Err(e) => {
-                    error!("Skipping {}/{}: cannot decrypt s3_secret_access_key: {}", config.project_id, config.table_name, e);
-                    continue;
-                }
-            }
-            if !(enc_access && enc_secret) {
-                plaintext_rows += 1;
-            }
-            debug!("Loaded config: {}/{}", config.project_id, config.table_name);
-            map.insert((config.project_id.clone(), config.table_name.clone()), config);
+            plaintext_rows += usize::from(!all_encrypted);
+            debug!("Loaded config: {project_id}/{table_name}");
+            map.insert((project_id, table_name), config);
         }
         if plaintext_rows > 0 {
             warn!(
@@ -2862,11 +2809,8 @@ impl Database {
     /// Create a new Database using global config (for production).
     /// For tests, prefer `with_config()` to pass config explicitly.
     pub async fn new() -> Result<Self> {
-        let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
-        // Convert &'static to Arc - it's fine since static lives forever
-        // We clone the config to create an owned Arc
-        let cfg_arc = Arc::new(cfg.clone());
-        Self::with_config(cfg_arc).await
+        let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+        Self::with_config(Arc::new(cfg.clone())).await
     }
 
     /// Set the batch queue to use for insert operations
@@ -4007,35 +3951,77 @@ impl Database {
         use crate::dml::DmlQueryPlanner;
 
         let mut options = ConfigOptions::new();
-        let _ = options.set("datafusion.catalog.information_schema", "true");
-
-        // INCIDENT 2026-07-31 (7d68f01): a briefly-live commit wrote permanent
-        // parquet whose physical schema has `timestamp`/`id` NULLABLE while the
-        // YAML declares NOT NULL, and DataFusion rejects aggregates grouped on
-        // such columns (physical-vs-logical nullability mismatch) — which took
-        // out every time_bucket dashboard. Widened nullability is always safe to
-        // read; keep this set until those files age out or are rewritten.
-        let _ = options.set("datafusion.execution.skip_physical_aggregate_schema_check", "true");
-
-        // Must be false: delta_kernel's unshredded_variant() schema uses Binary (not BinaryView).
-        // Forcing view types causes UPDATE/DELETE rewrites to fail schema validation against variant columns.
-        let _ = options.set("datafusion.execution.parquet.schema_force_view_types", "false");
-        let _ = options.set("datafusion.sql_parser.map_string_types_to_utf8view", "true");
-        // PostgreSQL dialect for ctx.sql() parsing. The default GenericDialect gives
-        // the JSON `->`/`->>` operators precedence *below* `=` (PgOther 16 < Eq 20), so
-        // `body->>'k'='v'` mis-parses as `body->>('k'='v')`. PostgreSQL binds them
-        // *above* comparison (matching real Postgres + the pgwire fork's own parser),
-        // so unparenthesized `col->>'k'='v'` works without the caller adding parens.
-        let _ = options.set("datafusion.sql_parser.dialect", "postgresql");
-
-        // Enable Parquet statistics for better query optimization with Delta Lake
-        // These settings ensure DataFusion uses file and column statistics for pruning
-        let _ = options.set("datafusion.execution.parquet.statistics_enabled", "page");
-        let _ = options.set("datafusion.execution.parquet.pushdown_filters", "true");
-        let _ = options.set("datafusion.execution.parquet.reorder_filters", "true");
-        let _ = options.set("datafusion.execution.parquet.enable_page_index", "true");
-        let _ = options.set("datafusion.execution.parquet.pruning", "true");
-        let _ = options.set("datafusion.execution.parquet.skip_metadata", "false");
+        // Defaults set explicitly (even where they match DataFusion's) so a
+        // future upstream default flip can't silently regress query plans.
+        // NOTE: the decoded-metadata cache limit is NOT set here — a
+        // `datafusion.runtime.*` SessionConfig string does not reconfigure an
+        // already-built RuntimeEnv. It is applied on the RuntimeEnvBuilder
+        // below via `build_query_runtime_env` instead.
+        for (key, value) in [
+            ("datafusion.catalog.information_schema", "true"),
+            // INCIDENT 2026-07-31 (7d68f01): a briefly-live commit wrote permanent
+            // parquet whose physical schema has `timestamp`/`id` NULLABLE while the
+            // YAML declares NOT NULL, and DataFusion rejects aggregates grouped on
+            // such columns (physical-vs-logical nullability mismatch) — which took
+            // out every time_bucket dashboard. Widened nullability is always safe to
+            // read; keep this set until those files age out or are rewritten.
+            ("datafusion.execution.skip_physical_aggregate_schema_check", "true"),
+            // Must be false: delta_kernel's unshredded_variant() schema uses Binary (not BinaryView).
+            // Forcing view types causes UPDATE/DELETE rewrites to fail schema validation against variant columns.
+            ("datafusion.execution.parquet.schema_force_view_types", "false"),
+            ("datafusion.sql_parser.map_string_types_to_utf8view", "true"),
+            // PostgreSQL dialect for ctx.sql() parsing. The default GenericDialect gives
+            // the JSON `->`/`->>` operators precedence *below* `=` (PgOther 16 < Eq 20), so
+            // `body->>'k'='v'` mis-parses as `body->>('k'='v')`. PostgreSQL binds them
+            // *above* comparison (matching real Postgres + the pgwire fork's own parser),
+            // so unparenthesized `col->>'k'='v'` works without the caller adding parens.
+            ("datafusion.sql_parser.dialect", "postgresql"),
+            // Parquet file/column statistics + bloom filters for pruning with Delta Lake.
+            ("datafusion.execution.parquet.statistics_enabled", "page"),
+            ("datafusion.execution.parquet.pushdown_filters", "true"),
+            ("datafusion.execution.parquet.reorder_filters", "true"),
+            ("datafusion.execution.parquet.enable_page_index", "true"),
+            ("datafusion.execution.parquet.pruning", "true"),
+            ("datafusion.execution.parquet.skip_metadata", "false"),
+            ("datafusion.execution.parquet.bloom_filter_on_read", "true"),
+            ("datafusion.execution.collect_statistics", "true"),
+            ("datafusion.explain.show_schema", "true"),
+            // Batch size 2048 (down from 65536): the wide otel schema makes every
+            // decode buffer cost `batch_size × row width`, none of it pool-accounted
+            // — heap profiling caught byte-view coalesce and parquet decoder buffers
+            // at 10-29GB. Same value the maintenance sessions have run since 07-12.
+            ("datafusion.execution.batch_size", WIDE_ROW_DECODE_BATCH_SIZE),
+            // Optimize for sorted data (timestamps are typically sorted); disable
+            // round-robin repartitioning to maintain sort order.
+            ("datafusion.optimizer.prefer_existing_sort", "true"),
+            ("datafusion.optimizer.repartition_aggregations", "true"),
+            ("datafusion.optimizer.enable_round_robin_repartition", "false"),
+            ("datafusion.optimizer.filter_null_join_keys", "true"),
+            ("datafusion.optimizer.skip_failed_rules", "false"),
+            // Disable leaf-expression pushdown (DF54 extract_leaf_expressions /
+            // push_down_leaf_projections). Those rules call
+            // `Unnest::with_new_exprs(unnest.expressions(), …)` while routing
+            // get_field (struct/map access) toward leaves, but `Unnest::expressions()`
+            // returns its exec_columns whereas `with_new_exprs` asserts none — so any
+            // multi-column UNNEST whose plan carries a get_field panics with
+            // "Assertion failed: expr.is_empty()" (upstream DF bug). This hit prod via
+            // monoscope's `UPDATE otel_logs_and_spans … FROM (SELECT unnest($1),
+            // unnest($2), unnest($3)) u` dual-write. The rules only fire on get_field;
+            // TF's Variant access uses the `variant_get` UDF (no MoveTowardsLeafNodes
+            // placement), so disabling them does not affect Variant query plans.
+            ("datafusion.optimizer.enable_leaf_expression_pushdown", "false"),
+            // Proper limit handling across partitions.
+            ("datafusion.optimizer.enable_distinct_aggregation_soft_limit", "true"),
+            ("datafusion.optimizer.enable_topk_aggregation", "true"),
+            ("datafusion.execution.coalesce_batches", "true"),
+            ("datafusion.optimizer.max_passes", "5"),
+            // The per-query share of the (already tree-sized) pool — a fixed 0.9
+            // replaces the deleted TIMEFUSION_MEMORY_FRACTION knob, whose prod
+            // value was calibrated against the old hand-set limit.
+            ("datafusion.execution.memory_fraction", "0.9"),
+        ] {
+            let _ = options.set(key, value);
+        }
         // One-shot footer read sized to match `warm_footer`'s suffix range: the
         // Foyer metadata cache keys on (path, exact range), so the reader's
         // first fetch (size-hint..size) hits the entry the warm task populated.
@@ -4043,12 +4029,10 @@ impl Database {
         // two sequential S3 RTTs on different keys that can never be pre-warmed
         // (measured 1.6 s of metadata_load_time on a cold OVH partition).
         let _ = options.set("datafusion.execution.parquet.metadata_size_hint", &self.config.cache.timefusion_parquet_metadata_size_hint.to_string());
-        let _ = options.set("datafusion.explain.show_schema", "true");
-        // NOTE: the decoded-metadata cache limit is NOT set here — a
-        // `datafusion.runtime.*` SessionConfig string does not reconfigure an
-        // already-built RuntimeEnv. It is applied on the RuntimeEnvBuilder
-        // below via `build_query_runtime_env` instead.
-
+        let _ = options.set(
+            "datafusion.execution.sort_spill_reservation_bytes",
+            &self.config.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864).to_string(),
+        );
         // Cap query parallelism at the container's CPU quota (derived in
         // config::apply; 0 = leave DataFusion's default). See MemoryConfig.
         if self.maintenance_scan {
@@ -4056,67 +4040,6 @@ impl Database {
         } else if self.config.memory.timefusion_query_partitions > 0 {
             let _ = options.set("datafusion.execution.target_partitions", &self.config.memory.timefusion_query_partitions.to_string());
         }
-
-        // Enable general statistics collection for query optimization.
-        // (DataFusion default is `true` — set explicitly so a future default flip
-        // doesn't silently regress query plans.)
-        let _ = options.set("datafusion.execution.collect_statistics", "true");
-
-        // Enable bloom filter pruning if available in Parquet files
-        let _ = options.set("datafusion.execution.parquet.bloom_filter_on_read", "true");
-
-        // Batch size 2048 (down from 65536): the wide otel schema makes every
-        // decode buffer cost `batch_size × row width`, none of it pool-accounted
-        // — heap profiling caught byte-view coalesce and parquet decoder buffers
-        // at 10-29GB. Same value the maintenance sessions have run since 07-12.
-        let _ = options.set("datafusion.execution.batch_size", WIDE_ROW_DECODE_BATCH_SIZE);
-
-        // Optimize for sorted data (timestamps are typically sorted)
-        let _ = options.set("datafusion.optimizer.prefer_existing_sort", "true");
-
-        // Enable repartition for better parallel aggregations
-        let _ = options.set("datafusion.optimizer.repartition_aggregations", "true");
-
-        // Disable round-robin repartitioning to maintain sort order
-        let _ = options.set("datafusion.optimizer.enable_round_robin_repartition", "false");
-
-        // Enable filter and limit pushdown optimizations
-        let _ = options.set("datafusion.optimizer.filter_null_join_keys", "true");
-        let _ = options.set("datafusion.optimizer.skip_failed_rules", "false");
-
-        // Disable leaf-expression pushdown (DF54 extract_leaf_expressions /
-        // push_down_leaf_projections). Those rules call
-        // `Unnest::with_new_exprs(unnest.expressions(), …)` while routing
-        // get_field (struct/map access) toward leaves, but `Unnest::expressions()`
-        // returns its exec_columns whereas `with_new_exprs` asserts none — so any
-        // multi-column UNNEST whose plan carries a get_field panics with
-        // "Assertion failed: expr.is_empty()" (upstream DF bug). This hit prod via
-        // monoscope's `UPDATE otel_logs_and_spans … FROM (SELECT unnest($1),
-        // unnest($2), unnest($3)) u` dual-write. The rules only fire on get_field;
-        // TF's Variant access uses the `variant_get` UDF (no MoveTowardsLeafNodes
-        // placement), so disabling them does not affect Variant query plans.
-        let _ = options.set("datafusion.optimizer.enable_leaf_expression_pushdown", "false");
-
-        // Enable proper limit handling across partitions
-        let _ = options.set("datafusion.optimizer.enable_distinct_aggregation_soft_limit", "true");
-        let _ = options.set("datafusion.optimizer.enable_topk_aggregation", "true");
-
-        // Memory management for large time-series queries
-        let _ = options.set("datafusion.execution.coalesce_batches", "true");
-
-        // Enable all optimizer rules for maximum optimization
-        let _ = options.set("datafusion.optimizer.max_passes", "5");
-
-        // Configure memory limit for DataFusion operations
-        // datafusion.execution.memory_fraction is the per-query share of the (already
-        // tree-sized) pool — a fixed 0.9 replaces the deleted TIMEFUSION_MEMORY_FRACTION
-        // knob, whose prod value was calibrated against the old hand-set limit.
-        let memory_fraction = 0.9;
-        let sort_spill_reservation_bytes = self.config.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864);
-
-        // Set memory-related configuration options
-        let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
-        let _ = options.set("datafusion.execution.sort_spill_reservation_bytes", &sort_spill_reservation_bytes.to_string());
 
         // A maintenance scan borrows the MAINTENANCE pool, not the query pool.
         // Two reasons, both about staying inside the configured budget rather
@@ -5712,13 +5635,8 @@ fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
         .chain(schema.dedup_keys.iter().map(String::as_str))
         .chain(schema.dedup_tiebreak.as_deref())
         .filter(|c| !schema.partitions.iter().any(|p| p == c))
-        // Dedup preserving first-seen order; the list is a handful of columns.
-        .fold(Vec::<&str>::new(), |mut cols, c| {
-            if !cols.contains(&c) {
-                cols.push(c);
-            }
-            cols
-        })
+        // `unique` dedups preserving first-seen order; the list is a handful of columns.
+        .unique()
         .join(",")
 }
 
@@ -5796,8 +5714,7 @@ async fn repair_slice_cuts(ctx: &datafusion::prelude::SessionContext, bin_table:
     if slices <= 1 {
         return Vec::new();
     }
-    let exprs =
-        (1..slices).map(|i| format!("approx_percentile_cont(arrow_cast(\"{col}\", 'Int64'), {})", i as f64 / slices as f64)).collect::<Vec<_>>().join(", ");
+    let exprs = (1..slices).map(|i| format!("approx_percentile_cont(arrow_cast(\"{col}\", 'Int64'), {})", i as f64 / slices as f64)).join(", ");
     let Ok(df) = ctx.sql(&format!("SELECT {exprs} FROM {bin_table}")).await else {
         return Vec::new();
     };
@@ -5852,7 +5769,6 @@ fn schema_order_by_clause(schema: &crate::schema::TableSchema) -> String {
                 if c.nulls_first { " NULLS FIRST" } else { " NULLS LAST" }
             )
         })
-        .collect::<Vec<_>>()
         .join(", ");
     format!(" ORDER BY {cols}")
 }
@@ -6766,13 +6682,6 @@ fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
     adds.next().is_some_and(|first| live.contains(first) && adds.all(|p| live.contains(p)))
 }
 
-/// `landed ++ more` — the wave's two landing sources (bins confirmed by an
-/// earlier attempt, and the ones this attempt just committed) as one list.
-fn concat_landed(mut landed: Vec<StagedBin>, more: Vec<StagedBin>) -> Vec<StagedBin> {
-    landed.extend(more);
-    landed
-}
-
 /// Per-project outcome of one round's staging. `Result<Option<T>>` overloaded `None`: "converged"
 /// (drop for the tick) vs "bin vanished under a concurrent rewrite" (project still has work —
 /// dropping it would silence its compaction for the rest of the tick).
@@ -6831,19 +6740,11 @@ fn rotate_sealed_tail<T>(work: &mut Vec<T>, sealed_from: usize, cursor: usize) {
 
 /// Decrement-on-drop gauge, so a bin that times out or panics still clears its
 /// slot rather than reading as permanently busy.
-struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicU64);
-
-impl<'a> InFlightGuard<'a> {
-    fn enter(counter: &'a std::sync::atomic::AtomicU64) -> Self {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self(counter)
-    }
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
+fn in_flight_guard(counter: &std::sync::atomic::AtomicU64) -> impl Drop + use<'_> {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    scopeguard::guard(counter, |counter| {
+        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    })
 }
 
 /// A wave-boundary safety brake. Two levels: `Degrade` keeps a SERVICE FLOOR
@@ -12637,12 +12538,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let counter = AtomicU64::new(0);
         {
-            let _guard = super::InFlightGuard::enter(&counter);
+            let _guard = super::in_flight_guard(&counter);
             assert_eq!(counter.load(Relaxed), 1, "the gauge must SHOW the sort while it runs");
         }
         assert_eq!(counter.load(Relaxed), 0);
         let _ = std::panic::catch_unwind(|| {
-            let _guard = super::InFlightGuard::enter(&counter);
+            let _guard = super::in_flight_guard(&counter);
             panic!("bin exploded");
         });
         assert_eq!(counter.load(Relaxed), 0, "a panicking bin left the slot held");
@@ -13487,7 +13388,7 @@ mod tests {
 
         // The brake must be blind to repair: an in-flight repair bin is exactly
         // the state that used to zero packing's throughput.
-        let _repair_bin = InFlightGuard::enter(&crate::observability::maintenance_stats().repair_bins_in_flight);
+        let _repair_bin = in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight);
         assert!(db.light_optimize_brake().is_none(), "a repair bin in flight must no longer stop packing");
         Ok(())
     }
@@ -13546,7 +13447,7 @@ mod tests {
         let bin = || vec![staged_unit("alpha", &[target.as_str()], None)];
 
         // A flush queued on the lock ⇒ the wave stands down without committing.
-        let waiter = FlushWaiter::register(&db.flush_waiters("", "otel_logs_and_spans").await);
+        let waiter = flush_waiter(&db.flush_waiters("", "otel_logs_and_spans").await);
         let yields = crate::observability::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed);
         let deferred = db.commit_wave(&table_ref, "otel_logs_and_spans", &[], false, bin(), 0).await;
         assert_eq!(crate::observability::maintenance_stats().wave_commits_yielded_to_flush.load(Relaxed), yields + 1, "the yield is counted, not silent");
