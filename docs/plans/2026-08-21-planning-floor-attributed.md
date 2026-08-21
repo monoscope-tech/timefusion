@@ -136,3 +136,57 @@ That ordering is the actionable part. P0 is a config flip worth ~5–10x at ≤7
 The resident pre-open index is still the only mechanism that reaches 30d — but
 had it been built first, it would have sat behind a 2.2s planning tax that no
 index can remove.
+
+---
+
+## Review addendum (parallel session, later the same evening)
+
+Re-measured on the same prod image `823746a`, **6 interleaved reps per cell**
+at 30d rather than 3, minimums reported, sorted ascending:
+
+| cell | reps (ms, sorted) | min |
+|---|---|---|
+| whale `=` (routed) | 2656 2781 2937 2997 3276 5302 | **2656** |
+| whale range (not routed) | 569 572 637 648 813 813 | **569** |
+| ghost `=` (routed) | 700 795 797 799 1564 2766 | **700** |
+| ghost range (not routed) | 616 663 704 724 759 783 | **616** |
+
+**§1 is confirmed and strengthened.** The routing tax on the whale at 30d is
+2656 − 569 ≈ **2.1s**, matching §1's independent estimate by a different
+route. The range-form proxy is the right instrument; the companion doc's
+`||''` arm was inflated, and its "~0.9–1.5s flat residual" should be read as
+**~570–620ms** — the cleaner number here.
+
+**§2 is half right, and the half that fails is the load-bearing half.** The
+*residual* is indeed window-driven and not file-driven: ghost range (616ms)
+≈ whale range (569ms), despite one having no data at all. That kills the
+"mirror the Delta log" idea exactly as §2 argues, and it is a good control.
+
+But §2 generalises it to the whole cost — "planning tracks the time range
+asked for, not the files found". The dominant term does **not** behave that
+way: ghost `=` pays only ~85ms of routing tax (700 vs 616), while whale `=`
+pays ~2.1s (2656 vs 569), a **~25x difference driven purely by how much
+indexed data sits in the window**. §2's single ghost figure (2153ms) does not
+replicate at n=6, where the minimum is 700ms; the routed form is heavy-tailed
+(outliers at 2766ms and 5302ms here), so n=3 minimums are under-powered
+precisely on the arm that varies most.
+
+The corrected mechanism is the companion doc's original one, which §2 believed
+it had ruled out: **the prefilter's cost scales with the number of sidecar
+indexes actually present in the window.** Ghost has none, so it pays nothing.
+
+This *strengthens* P0 rather than weakening it — the tax is largest exactly
+where the goal lives, on popular projects with the most indexed data in the
+widest windows.
+
+**§3, §4, §5 stand.** The heavy tail here independently reproduces "the routed
+form never warms". §5's conclusion that P0 does not rescue 30d also survives
+this data: 30d planning is ~2.7s routed against a 35–60s full query, so at 30d
+planning is a minor term and execution dominates — the reverse of 7d.
+
+**One citation to retire.** §5 leans on `time_elapsed_opening=4.39s` versus
+26ms of scanning to argue a file-open wall. That figure is **summed across the
+24 partition groups, not wall clock** (the companion doc retracts a
+"19ms/open" number derived the same way). The compaction and resident-index
+conclusions may well hold, but this number cannot carry them — the file-open
+wall needs a wall-clock measurement it does not yet have.
