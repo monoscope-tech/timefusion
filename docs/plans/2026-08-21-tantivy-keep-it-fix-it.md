@@ -1,53 +1,60 @@
 # Keep tantivy, fix how it is consulted
 
-> **Status 2026-08-21 night — increment 1 implemented and deployed.**
-> Shipped: **D0** (per-phase timers + fan-out counters as the `tantivy`
-> component of `timefusion_stats`), **D1** (seed-on-publish, hot-window re-warm
-> cron, `prefetch_days` 0→3, `search_concurrency` 8→32, `manifest_ttl` 5s→300s
-> with publish-time invalidation, `reader_cache_entries` 256→2048,
-> `cache_disk_gb` 64→200), and the local-first property the whole increment
-> exists for: **an index this process built is never fetched back from S3.**
+> **Status 2026-08-21 night — increments 1 and 2 shipped and verified in prod.**
 >
-> **Deliberately deferred**, pending what D0's timers now report: **D5**
-> (coverage/reconcile drain — this is the "keep S3 up to date" half and is the
-> next increment), **D2** (per-day index granularity), **D3** (off the planning
-> path), **D4** (benefit-based routing). Increment 1 shrinks the fan-out term
-> and finally measures the rest; `route_equality` is still ON (and, per the
-> numbers below, no longer obviously worth turning off).
+> **Increment 1** (`8229acf`): **D0** — per-phase timers + fan-out counters as
+> the `tantivy` component of `timefusion_stats`; **D1** — seed-on-publish,
+> hot-window re-warm cron, `prefetch_days` 0→3, `search_concurrency` 8→32,
+> `manifest_ttl` 5s→300s, `reader_cache_entries` 256→2048, `cache_disk_gb`
+> 64→200. The property the increment exists for: **an index this process built
+> is never fetched back from S3.**
+>
+> **Increment 2** (`7602c0a`): **D5** — the coverage drain, i.e. the
+> keep-S3-current half. Reconcile went daily→**hourly**, made possible by
+> bounding a pass (`backfill_max_files_per_pass`, default 400); it was
+> unbounded, which is what forced the nightly cadence. Plus two fixes D0's own
+> counters exposed in increment 1: the manifest cache (see below) and a
+> sequential `warm_recent` that prod logged as "still in progress after 600s".
 >
 > **Measured on prod** — 5 interleaved reps per sample, minimums, in-round
-> `SELECT 1` control. Only the tantivy-routed shapes moved; every control is
-> flat, which is what makes the attribution credible. Two independent samples
-> (+15 min, +50 min), so this is confirmed rather than one quiet window:
+> `SELECT 1` control. Four samples across both deploys; only the tantivy-routed
+> shapes ever move, which is what makes the attribution credible:
 >
-> | shape | pre | post +15m | post +50m |
-> |---|---|---|---|
-> | `trace_id =` @7d (routed) | 2481 ms | 579 ms | **484 ms** |
-> | `trace_id =` @30d (routed) | 2652 ms | 720 ms | **674 ms** |
-> | range @7d (control) | 198 ms | 202 ms | 185 ms |
-> | range @30d (control) | 312 ms | 347 ms | 336 ms |
-> | `SELECT 1` (control) | 34 ms | 36 ms | 35 ms |
+> | shape | pre | inc1 +15m | inc1 +50m | inc2 |
+> |---|---|---|---|---|
+> | `trace_id =` @7d (routed) | 2481 ms | 579 | 484 | **436 ms** |
+> | `trace_id =` @30d (routed) | 2652 ms | 720 | 674 | **649 ms** |
+> | range @7d (control) | 198 ms | 202 | 185 | 192 |
+> | range @30d (control) | 312 ms | 347 | 336 | 323 |
+> | `SELECT 1` (control) | 34 ms | 36 | 35 | 39 |
 >
-> **5.1x at 7d, 3.9x at 30d**, with every control flat across all three
-> samples — and still improving as the cache warms. The equality tax fell from
-> ~2.2s to **~300ms** above the unrouted baseline, with tantivy still doing its
-> job. That materially weakens the earlier P0 case for flipping
-> `route_equality` off: the tax it was meant to remove is now ~300ms, not 2.2s.
-> `cache_seeded` confirms indexes are kept locally rather than re-fetched.
+> **5.7x at 7d, 4.1x at 30d.** The equality tax fell from ~2.2s to ~250-330ms
+> above the unrouted baseline, with tantivy still serving LIKE/regex/substring.
+> That **materially weakens the earlier P0 case for flipping `route_equality`
+> off** — the tax it was meant to remove is now ~300ms, not 2.2s. Do not flip
+> it without re-measuring.
 >
-> D0's counters immediately paid for themselves by exposing a defect in this
-> same increment: `manifest_hit_pct = 0.0` across 56 loads for 54 queries,
-> because invalidating the cached manifest on every publish threw away the
-> entry the next query needed (busy projects publish far more often than they
-> are queried). Fixed in increment 2 by folding the published entry into the
-> cached manifest instead of dropping it.
+> Supporting counters: `search_us_avg` 13.7ms → **0.34ms** (indexes local, not
+> fetched), `reader_hit_pct` 83% → **96.9%**, and after the increment-2 restart
+> `blob_fetches = 0` — the extracted cache survived the restart and served
+> every query, which is the local-first guarantee holding across a deploy.
 >
-> Two known gaps recorded rather than silently carried: `gc_after_compaction`
-> prunes manifest entries without invalidating this process's cache, so for up
-> to `manifest_ttl` a query can consult an entry whose blob is gone (soft — the
-> prefilter treats it as "no usable index" and falls back); and the ~1.8s
-> ghost-project component of the eq tax is still unattributed, which is exactly
-> what D0 was built to answer.
+> **D0 paid for itself immediately** by exposing a defect in the same increment
+> that shipped it: `manifest_hit_pct = 0.0` across 56 loads for 54 queries,
+> because invalidating the cached manifest on every publish threw away the entry
+> the next query needed (busy projects publish far more often than they are
+> queried). Increment 2 folds the entry in instead. Verified by controlled test
+> rather than by the aggregate percentage — 3 identical queries now cause **zero**
+> additional manifest loads. The fleet-wide percentage stays low only because
+> real traffic sweeps many distinct projects, each a forced first miss.
+>
+> **Still deferred:** D2 (per-day index granularity), D3 (prefilter off the
+> planning path), D4 (benefit-based routing). Stated so the narrowing is visible.
+>
+> **Known gap carried:** `gc_after_compaction` prunes manifest entries without
+> invalidating this process's cache, so for up to `manifest_ttl` a query can
+> consult an entry whose blob is gone. Soft — the prefilter treats it as "no
+> usable index" and falls back.
 
 2026-08-21 evening. Follow-up to
 `2026-08-21-point-lookup-file-open-wall.md` (P0: flip
