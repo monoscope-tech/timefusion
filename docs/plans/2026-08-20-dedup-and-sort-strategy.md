@@ -66,6 +66,36 @@ hot-tier leg (fragmentation, the fixed cost). cert_granted_total=0 /
 dedup_denied 100% (the §2 certification gap). The night's four fixes map 1:1
 onto these four causes.
 
+## Three-point results (baseline 493bb1b -> post-P0 05bdcd5 -> post-hot-tier 975f89f)
+
+Completed cells: **13/40 -> 16/40 -> 22/40**. First target hits at 975f89f
+(raw: scratchpad bench_post_hottier/): D/P1 fully green (519ms / 5.2s / 3.4s /
+**3.2s @30d** — beats <10s), B/P1 30d **3.2s**, C/P1 7d+30d complete for the
+first time (28.4s / 21.0s), D/P2 7d+30d complete (26.3s / 23.6s).
+Still failing: all A(trace) >=24h, C 24h, E >=7d, most P2 24h — 13 TIMEOUT +
+5 skips. 24h<1s met nowhere (best non-1h: D/P1 24h 5.2s).
+
+Plan shape at 975f89f: no full-set, no Coalesce, no EmptyExec anywhere;
+delta leg collapsed from 48 file groups to 4-5 (shape D: excluded outright —
+the stack-gate fix working as designed). **The shared fixed cost of every
+remaining TIMEOUT is the hot-tier leg: 567 file groups**, plus DedupExec still
+runs on every plan (cert_granted_total=0, dedup_skipped=0 — slice-coverage
+certification is deployed but needs dedup units to complete post-boot).
+
+Caveats: run started 22min after the deploy restart, so merge-on-demote had
+NOT phased in (writes_total only +45 during the run); A/P2 1h and E/P2 1h
+regressions are one-attempt cold-cache cells. WATCH: unproven_windows_total
+tripled (+1017/40min) — stack-gate advances minting unproven windows faster
+than merges prove them at low uptime; re-check after hours of uptime.
+
+Next levers, in order: (1) hot-tier file consolidation — 567 groups is the
+new 427; merge-on-demote reduces it only for update-churned buckets, a
+background stack-compactor (option B applied tier-wide) or larger demote
+units are the direct fix; (2) certification dwell — verify slice-coverage
+grants start appearing once coordinator dedup units complete, then
+dedup_skipped should finally move off 0; (3) re-run the A/C/E 24h cells after
+phase-in before concluding anything more.
+
 ## The measurement ladder (one project, otel_logs_and_spans)
 
 | query | result |
