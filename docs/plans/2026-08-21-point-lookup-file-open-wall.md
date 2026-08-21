@@ -73,11 +73,14 @@ Read that top to bottom and the shape is unambiguous:
    save the open.
 3. **So the query pays ~468 file opens to return 17 rows**, and
    `time_elapsed_opening` (4.39s) dwarfs actual scanning (26ms) by ~170x.
-   Warm cost is ≈19ms/open (8.9s / 468); the earlier cold measurement in the
-   companion doc (26s / ~200 opens ≈ 130ms) is the same curve, cold.
+   Note `time_elapsed_opening` is **summed across the 24 partition groups**,
+   not wall clock — do not divide wall by opens to get a per-open cost. (An
+   earlier draft of this doc did exactly that and derived a bogus "19ms per
+   warm open"; it is retracted.)
 
-**Cost is a function of `files_opened`, essentially nothing else.** Bytes,
-decode and row groups are already solved problems here.
+**Cost is driven by file count — via planning and opens — and essentially not
+at all by bytes.** Confirmed on the real 12-column shape (next section):
+24.67MB scanned, 196ms scanning, 644ms processing, for 460 files and 17 rows.
 
 ## Why compaction alone cannot reach the 30-day goal
 
@@ -85,16 +88,22 @@ Current fragmentation is ~62 files/project-day (434 over 7d), consistent with
 the companion doc's 197–217 files/project-day fleet-wide figure. Plan item 3
 targets <20 files/project-day. Apply that to the goal:
 
-| | files/day | 30d files | @19ms warm open |
+| | files/day | 30d files | vs. measured anchors |
 |---|---|---|---|
-| today | ~62 | ~1,860 | ~35s (measured: 60s timeout) |
-| after compaction to 20 | 20 | 600 | **~11s** |
-| after compaction to 10 | 10 | 300 | ~6s |
+| today | ~62 | ~1,860 | 30d query **times out at 60s** |
+| after compaction to 20 | 20 | ~600 | ≈ today's 7d file count (434), which measures 4.9–8.9s |
+| after compaction to 10 | 10 | ~300 | ≈ today's 3–4d file count, which measures ~1.6–2.5s |
 
-Compaction is a 3–6x win and is worth doing — but a linear win against a
-linear cost cannot turn 1,860 opens into an interactive query. **At 30 days,
-any design that opens one object per file-per-day is already lost.** The
-window is the multiplier, and compaction does not change the exponent.
+The right-hand column is deliberately stated as *equivalence to a measured
+window* rather than a per-open extrapolation — prod is noisy enough (load ~44)
+that a synthesized ms-per-file number would be false precision.
+
+Even read charitably, compaction to 20 files/day only buys 30d the latency 7d
+has today — **4.9–8.9s, still far outside interactive**, and it does nothing
+about the ~2.25s planning floor. Compaction is a real 3–6x and worth doing,
+but a linear win against a linear cost cannot make 1,860 files interactive.
+**At 30 days, any design that opens one object per file-per-day is already
+lost.** The window is the multiplier, and compaction does not change that.
 
 ## The mechanism that does fix it — and it is the user's idea
 
@@ -144,28 +153,45 @@ index at day+shard granularity rather than per file.
 
 ## Second cost centre: planning is ~3s before a single byte is read
 
-Timing `EXPLAIN` (planning only, no execution) against `EXPLAIN ANALYZE` at 7d:
+Timing `EXPLAIN` (planning only, no execution) at 7d:
 
 | statement | wall |
 |---|---|
 | `EXPLAIN` (plan only, 0 rows read) | **2.6–3.1s** |
-| `EXPLAIN ANALYZE`, 2 projected columns | 3.2s |
-| full query, 12 projected columns incl. `to_jsonb(summary)` | 8.9s |
+| `EXPLAIN` at 1d | **2.25s** |
+| full query, 12 columns, `EXPLAIN ANALYZE` | 4.9s |
 
-So the 7d budget decomposes roughly as **~3s planning + ~0.2s to reach the
-17 rows + ~5.7s decoding the wide projection**. Planning is a third of the
-cost and produces no data at all: it is delta snapshot handling and pruning
-across the file-action list, and it scales with the same file count as
-everything else. Note also that widening the projection from 2 to 12 columns
-costs ~5.7s for the *same 17 rows* — worth its own attribution pass, since
-`bytes_scanned` was only 23.6MB.
+Planning costs 2.6–3.1s before a single byte is read, and — the more
+interesting number — **~2.25s of that is already present at a 1-day window**.
+Planning has a large fixed floor, not merely a per-file slope. It is delta
+snapshot handling plus pruning across the file-action list, and it produces
+no data at all.
+
+Execution of the real 12-column shape then adds surprisingly little:
+`bytes_scanned=24.67MB`, `time_elapsed_scanning_total=196ms`,
+`time_elapsed_processing=644ms` for 460 files and 17 rows.
+
+**Retraction:** an earlier draft of this doc attributed ~5.7s to decoding the
+wide projection, from a 8.9s-vs-3.2s comparison across separate runs. Running
+`EXPLAIN ANALYZE` on the actual 12-column projection disproves it — the whole
+wide query lands at 4.9s and decode is under 1s. The 8.9s/3.2s gap was
+run-to-run variance on a loaded prod box (load average ~44), not projection
+width. **Projection width is not a cost centre here; `to_jsonb(summary)` is
+not the problem.**
+
+Also tested and **not** supported: the hypothesis that monoscope's literal
+(non-parameterized) timestamps defeat the plan cache and force a re-plan per
+page load. Four runs with identical literals (3.7s, 1.9s, 1.9s, 2.5s) versus
+four with varying literals (3.7s, 2.1s, 1.5s, 1.5s) show no difference.
 
 This **raises the value of compaction** relative to the companion doc's
-ordering: file count is the multiplier on planning *and* opens *and* decode,
-so it is the only lever that attacks all three. It also means a pre-open
-pruning index must be consulted early enough to shorten the planning file
-list, not just the execution one — otherwise it removes the opens and leaves
-the 3s.
+ordering: file count multiplies planning and opens alike. It also means a
+pre-open pruning index must be consulted early enough to shorten the
+plan-time file-action list, not just the execution one — otherwise it removes
+the opens and leaves the planning cost untouched. And the ~2.25s floor at 1
+day says some of planning is fixed overhead that *neither* lever addresses:
+that floor deserves its own attribution pass, because it alone exceeds an
+interactive budget.
 
 ## Not in scope, deliberately
 
