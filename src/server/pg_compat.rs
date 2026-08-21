@@ -1162,6 +1162,20 @@ impl StatsTableProvider {
                     "dedup_denied_unresolved" => cv(DEDUP_DENIED_UNRESOLVED),
                     "dedup_denied_disabled" => cv(DEDUP_DENIED_DISABLED),
                     "cert_granted_total" => cv(CERT_GRANTED_TOTAL),
+                    // Why certification never happens. `cert_slice_*` are the exits
+                    // of `record_clean_slice` (they should sum to its call count);
+                    // `cert_refused_*` split `record_certification`'s refusal by the
+                    // conjunct that failed. cert_granted_total has been 0 since
+                    // 2026-08-20 through three fixes that each guessed the exit —
+                    // read these before attempting a fourth.
+                    "cert_slice_outside_day" => cv(CERT_SLICE_OUTSIDE_DAY),
+                    "cert_slice_dirty" => cv(CERT_SLICE_DIRTY),
+                    "cert_slice_partial" => cv(CERT_SLICE_PARTIAL),
+                    "cert_slice_day_covered" => cv(CERT_SLICE_DAY_COVERED),
+                    "cert_refused_dropped" => cv(CERT_REFUSED_DROPPED),
+                    "cert_refused_incomplete" => cv(CERT_REFUSED_INCOMPLETE),
+                    "cert_refused_empty" => cv(CERT_REFUSED_EMPTY),
+                    "cert_refused_fp_moved" => cv(CERT_REFUSED_FP_MOVED),
                     "cert_dwell_total" => cert_dwells,
                     "cert_dwell_secs_avg" => avg(cv(CERT_DWELL_SECS_TOTAL), cert_dwells),
                     "cert_dwell_p50_secs" => m.cert_dwell_percentile_secs(0.50),

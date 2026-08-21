@@ -814,7 +814,16 @@ pub struct TantivyConfig {
     ///
     /// A truncated pass logs how much it left behind — a silent cap reads as
     /// "coverage is converging" when it is not.
-    #[serde_inline_default(400)]
+    ///
+    /// 150 (was 400): at measured prod throughput a 400-file pass runs ~2h, so
+    /// the "hourly" reconcile was effectively continuous — prod logged
+    /// `still in progress after 600s (skips=1)`, i.e. ticks correctly dropped
+    /// rather than piling up. The drain was healthy, but `deferred_to_next_pass`
+    /// and the `uncovered` gauge only update at pass end, so a 2h pass reports
+    /// a quarter as often as the bounded-pass design intended. ~150 gives a
+    /// ~30-minute pass that fits inside the tick and reports every time.
+    /// This is an observability fix, not a throughput one.
+    #[serde_inline_default(150)]
     pub timefusion_tantivy_backfill_max_files_per_pass: usize,
     /// Row-selection pushdown: when the prefilter engages, files whose index
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
