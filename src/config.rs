@@ -974,7 +974,7 @@ pub struct BufferConfig {
     #[serde_inline_default(600)]
     pub timefusion_hot_tier_max_disk_gb: u64,
     /// Kill switch for hot-tier merge-on-demote (falls back to stacked files).
-    #[serde_inline_default(true)]
+    #[serde_inline_default(false)]
     pub timefusion_hot_tier_merge_demote: bool,
     #[serde_inline_default(4096)]
     pub timefusion_buffer_max_memory_mb: usize,
