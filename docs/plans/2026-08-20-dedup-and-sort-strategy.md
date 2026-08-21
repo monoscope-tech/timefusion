@@ -294,7 +294,7 @@ whole-conjunction failure on one non-convertible conjunct.
       hot rows vs genuine newer Delta versions. Distinguishes a bug from an
       overly conservative gate derivation from expected MOR behavior.
 
-### 1c. Hot tier must absorb updates instead of forfeiting coverage (NEW)
+### 1c. Hot tier must absorb updates instead of forfeiting coverage — SHIPPED 2026-08-20
 Diagnosed from the 2x hot/delta double-read + the enrichment pattern (every
 row updated ~twice). Two compounding leaks in `hot_tier.rs`:
 - `version_gate` = the demoted file's `max_stamp`; enrichment versions are
@@ -304,20 +304,22 @@ row updated ~twice). Two compounding leaks in `hot_tier.rs`:
   covers_window rule ("exactly one file per bucket") then retracts the whole
   window — it falls through to Delta wholesale (`unproven_windows_total=863`).
   Updates arriving VOIDS coverage instead of EXTENDING it.
-Fix shapes (compose; A first):
-- [ ] **A. Stacked base+delta files**: base file (complete at stamp <= s1) +
+Implemented in `60cc790` (both shapes, with a default-on kill switch for B):
+- [x] **A. Stacked base+delta files**: base file (complete at stamp <= s1) +
       late-drain file (all rows with stamp in (s1, s2]) = coverage stands,
       gate advances to s2. Read leg serves the stack, DedupExec collapses.
       Metadata/read-leg change only.
-- [ ] **B. Merge-on-demote**: late version for a demoted bucket rewrites the
+- [x] **B. Merge-on-demote**: late version for a demoted bucket rewrites the
       bucket's .arrow (old + new, keep-greatest, one file, advanced
       max_stamp, covers_window=true; write-new+rename keeps mmap safety).
       Local-disk cost only; the hot-tier analog of dedup-as-you-compact.
-Success criterion: recent windows (tier depth ~20h at the 600GB cap) read
-ZERO Delta rows for fully-enriched buckets — the only path to 24h<1s/300ms,
-since even perfectly-pruned R2 reads pay per-file round trips.
-Precondition check before building: post-deploy matrix + §1b admission-reason
-profile to confirm how much of the residual amplification this owns.
+Regression coverage now checks the mechanism at both levels: unit tests prove
+that a complete stack advances to its newest stamp and merge-on-demote keeps
+the newest complete row per key; the merge-on-read e2e additionally requires a
+bounded query over the fully enriched Arrow window to hit the hot leg while
+every `DeltaScanExec` emits zero rows. Production still needs the post-deploy
+matrix and §1b admission-reason profile to measure the resulting latency and
+confirm that no different admission path dominates.
 
 ### 2. Why is deployed certification coverage zero? — DIAGNOSED 2026-08-20
 **Cause: certification requires a day-wide dedup unit, and prod never produces

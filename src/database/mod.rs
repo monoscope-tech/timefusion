@@ -80,14 +80,9 @@ impl fmt::Debug for CachedDeltaProvider {
     }
 }
 
-/// Snapshot versions to keep cached per `(project, table)`.
-///
-/// One entry per key degenerated under flush cadence: every commit bumps `table.version()`,
-/// evicting the sole entry and forcing the next query to rebuild the provider from scratch.
-/// Version observation is also not monotone across concurrent readers, so a single slot thrashes
-/// between v=N and v=N+1. A short ring keeps up to three versions per hot key without serving
-/// stale data: lookup is by exact version, so a query only gets the provider for its own
-/// resolved handle's version.
+/// Snapshot versions kept cached per `(project, table)`. A single slot thrashes
+/// under flush cadence (every commit bumps the version; concurrent readers
+/// observe non-monotonically); a short ring serves each query its exact version.
 const PROVIDER_VERSION_RETENTION: usize = 3;
 
 /// The recent-version ring for one `(project, table)`, newest first.
@@ -147,15 +142,10 @@ struct ScanShape {
     skip_dedup: bool,
 }
 
-/// Why the swept-partition dedup skip was granted or refused. Decided once per
-/// scan, above the projection.
-///
-/// A single "denied" counter cannot answer the only question worth asking about
-/// this feature (it fires on 0.2–0.5% of Delta-reading scans): would a warm,
-/// persistent `dedup_clean_fp` have converted the denial? `NeverCertified` says
-/// yes — this process simply never swept that partition. `FpMoved` says no — the
-/// partition WAS certified and has been written to since, and no amount of
-/// persistence recovers that. See `docs/plans/2026-08-11-certification-survival.md`.
+/// Why the swept-partition dedup skip was granted or refused, decided once per
+/// scan. The split answers "would persisting certifications convert the
+/// denial?": `NeverCertified` = yes, `FpMoved` = no (written since certified).
+/// See `docs/plans/2026-08-11-certification-survival.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DedupSkipVerdict {
     Granted,
@@ -261,12 +251,9 @@ impl ScanMetrics {
         self.decode.decode_peak_batch_bytes.fetch_max(bytes, Relaxed);
     }
 
-    /// Outcome of the swept-partition dedup skip.
-    ///
-    /// Split by why it was refused: a non-`Granted` verdict means the window was never eligible,
-    /// while `Granted` with no skip means a leg refused one that was. The two have different fixes
-    /// and the aggregate hides which one you have. Every denial is a verdict, so the verdict — not a
-    /// bool — is what arrives here.
+    /// Outcome of the swept-partition dedup skip. A non-`Granted` verdict means
+    /// the window was never eligible; `Granted` with no skip means a leg
+    /// refused one that was — different fixes, so the verdict arrives whole.
     #[allow(clippy::too_many_arguments)] // one flag per counter; a struct would just rename them
     pub fn record_scan(
         &self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>, dedup_skip: bool,
@@ -309,13 +296,9 @@ impl ScanMetrics {
         metrics::histogram!("timefusion.scan.latency_seconds").record(duration_us as f64 / 1_000_000.0);
     }
 
-    /// A certification ended: fold how long it survived into the dwell histogram.
-    ///
-    /// The end is almost always OBSERVED rather than caused — a flush moves the
-    /// partition's fingerprint without touching `dedup_clean_fp`, so the entry
-    /// dies silently and the first read to notice is what reports it. That makes
-    /// the recorded dwell an upper bound on the true lifetime, which is the right
-    /// direction: it cannot make persistence look better than it is.
+    /// A certification ended: record its survival in the dwell histogram. The
+    /// end is observed (first read to notice), not caused, so the dwell is an
+    /// upper bound — it can't make persistence look better than it is.
     pub fn record_cert_dwell(&self, since: std::time::Instant) {
         let secs = since.elapsed().as_secs();
         metrics::counter!(scan_metric_names::CERT_DWELL_TOTAL).increment(1);
@@ -439,12 +422,9 @@ pub(crate) struct RollupRewrite {
 /// — see `Database::flush_waiters` and the priority check in `commit_wave`.
 type FlushWaiterCounts = Arc<dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicUsize>>>;
 
-/// RAII registration of one flush/ingest committer waiting for a per-table
-/// commit lock. Waves read this count to decide whether to queue at all, so it
-/// must drop the instant the flush acquires the lock — OR the instant its
-/// future is cancelled by a watchdog/timeout. `Drop` covers both; a manual
-/// decrement after `lock().await` silently leaks the count on cancellation and
-/// would wedge maintenance forever.
+/// RAII count of one flush/ingest committer waiting on a per-table commit lock.
+/// Must decrement on lock acquisition AND on future cancellation — `Drop`
+/// covers both; a manual decrement leaks on cancellation and wedges maintenance.
 struct FlushWaiter(Arc<std::sync::atomic::AtomicUsize>);
 
 impl FlushWaiter {
@@ -471,19 +451,14 @@ pub async fn get_unified_delta_table(unified_tables: &UnifiedTables, table_name:
 }
 
 /// Should `resolve_*_table` call `update_state()` on the cached snapshot?
-/// Refresh when this process knows the snapshot is behind (last_written ahead
-/// of current) *or* when this process hasn't written but something else (e.g.
-/// the buffered_write_layer's background flusher) may have committed. The
-/// `(Some(_), None) => false` shortcut once tempted us — it broke buffer→Delta
-/// visibility — so the bias is toward refreshing more often, not less.
+/// Biased toward refreshing: skip only when this process's own writes prove the
+/// snapshot current — a `(Some(_), None) => false` shortcut broke buffer→Delta
+/// visibility (a background flusher may have committed).
 fn should_refresh_table(current_version: Option<u64>, last_written_version: Option<u64>) -> bool {
     match (current_version, last_written_version) {
         (Some(current), Some(last)) => current < last,
-        // Either: process hasn't directly written but a background flusher may have.
-        // Or: snapshot has no version yet but we know someone wrote one.
-        // Both warrant a refresh.
-        (Some(_), None) | (None, Some(_)) => true,
         (None, None) => false,
+        _ => true,
     }
 }
 
@@ -499,13 +474,10 @@ const REFRESH_APPEND_CATCHUP_MAX_GAP: u64 = 64;
 /// old snapshot while a clone refreshes, and the write lock is held only for the swap. The swap is
 /// version-guarded against concurrent committers, so the shared handle never regresses.
 pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incremental: bool) -> std::result::Result<Option<u64>, deltalake::DeltaTableError> {
-    // Staleness probe before the expensive path: commit files are immutable
-    // and versions are contiguous, so the snapshot is current iff
-    // `{version+1}.json` doesn't exist — one GET/404 instead of the
-    // `_delta_log` LIST that `update_state()` always pays (LISTs bypass the
-    // Foyer cache; this was the residual per-query S3 metadata traffic).
-    // A probe hit also warms the cache for the commit read below. On probe
-    // *error* fall through to the full refresh — never skip on uncertainty.
+    // Staleness probe: versions are contiguous, so the snapshot is current iff
+    // `{version+1}.json` doesn't exist — one GET/404 instead of update_state's
+    // `_delta_log` LIST (LISTs bypass the Foyer cache). On probe *error* fall
+    // through to the full refresh — never skip on uncertainty.
     {
         let guard = table.read().await;
         if let Some(v) = guard.version() {
@@ -517,18 +489,11 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incr
         }
     }
     let mut fresh = table.read().await.clone();
-    // Fast path (gated by the caller's `incremental` flag, i.e. self.config):
-    // carry the materialized file list forward over the catch-up range —
-    // appending the new files and dropping the tombstoned ones (compaction /
-    // replace_where) — instead of re-collecting the whole active set, the
-    // O(active files) re-materialize `update_state` pays (2-8s on the 26k-file
-    // unified table). Falls back to the full update when not applicable (gap
-    // too large, not materialized, unreadable commit). The fallback path is
-    // slightly *more* expensive than a bare update_state — it pays
-    // advance_catchup's probe (one get_latest_version + cached commit GETs)
-    // before the full update_state's uncached `_delta_log` LIST + re-materialize
-    // — but the common case (in-gap, materialized) is always the win now that
-    // removes no longer force the fallback.
+    // Fast path (caller's `incremental` flag): carry the materialized file list
+    // forward over the catch-up range instead of the O(active files)
+    // re-materialize `update_state` pays (2-8s on the 26k-file unified table).
+    // Falls back to the full update when not applicable (gap too large, not
+    // materialized, unreadable commit).
     let advanced = if incremental {
         let log_store = fresh.log_store();
         match fresh.state.as_mut() {
@@ -617,11 +582,9 @@ fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::P
 }
 
 /// The table's path within its bucket (`"s3://bucket/tf/tbl"` → `"tf/tbl"`).
-///
-/// Cache inserts happen below delta-rs's `PrefixStore`, so keys are bucket-relative, while
-/// `relativize_to_prefix` output is table-relative. Joining the two yields the key inserts actually
-/// used. Evict-after-compaction and the flush-confirm probe used to address table-relative keys,
-/// so evictions were silent no-ops and every confirm re-downloaded bytes it had just uploaded.
+/// Cache inserts happen below delta-rs's `PrefixStore`, so keys are
+/// bucket-relative; joining this with `relativize_to_prefix` output yields the
+/// key inserts actually used — table-relative keys made evictions silent no-ops.
 fn table_path_in_bucket(prefix: &str) -> &str {
     prefix.splitn(4, '/').nth(3).unwrap_or("").trim_matches('/')
 }
@@ -791,13 +754,10 @@ fn build_optimize_session_state_tuned(
     target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>, batch_override: Option<&str>, uncapped: Option<UncappedSort>,
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
-    // batch_size 2048 (was 8192): merge memory ≈ fan-in × batch, and otel rows are
-    // wide — 8192-row decode batches measured up to 145MB (2026-07-27). Quartering
-    // the batch bounds a 32-file bin merge near ~1GB. Bare `SessionConfig::new()`
-    // otherwise keeps DataFusion's larger default. Under the maintenance-CLI
-    // budget profile the batch drops to 256 rows — a batch is the sort's
-    // indivisible admission unit, and small-cgroup pools must be able to admit
-    // one before spilling can engage.
+    // batch_size 2048: merge memory ≈ fan-in × batch and otel rows are wide
+    // (8192-row batches measured 145MB), so this bounds a 32-file bin merge
+    // near ~1GB. The maintenance-CLI budget profile drops it to 256 — a batch
+    // is the sort's indivisible admission unit and small pools must admit one.
     let batch_size = batch_override.unwrap_or_else(|| crate::config::try_config().map_or("2048", |c| c.derived.maintenance_batch_size()));
     let mut cfg = match uncapped {
         None => maintenance_session_config(SessionConfig::new(), batch_size, target_partitions),
@@ -810,14 +770,10 @@ fn build_optimize_session_state_tuned(
     // `maintenance_runtime_env`): allocations still fail as errors rather than
     // OOM-killing the process, but are isolated from query pressure and can spill.
     let mut state = SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build();
-    // `hash_bucket` is ours, not a DataFusion builtin, and the sharded dedup
-    // rewrite and the maintenance slice builder both put it in generated SQL.
-    // These states are built bare — no `register_custom_functions` — so without
-    // this every sharded rewrite fails to PLAN. That is exactly what happened
-    // when the bucketing moved off `md5` (a builtin, so it had worked in every
-    // context): `dedup_shards_over_budget_and_preserves_rows` failed with
-    // "Invalid function 'hash_bucket'". Registered on the one builder every
-    // maintenance context goes through rather than at each call site.
+    // `hash_bucket` is ours, not a builtin, and sharded dedup / slice-builder
+    // SQL uses it. These states skip `register_custom_functions`, so without
+    // this every sharded rewrite fails to PLAN ("Invalid function
+    // 'hash_bucket'"). Registered on the one builder all maintenance contexts share.
     datafusion::execution::FunctionRegistry::register_udf(&mut state, Arc::new(crate::read::functions::hash_bucket_udf())).ok();
     state
 }
@@ -836,30 +792,15 @@ const CONTIGUITY_HORIZON_DAYS: u64 = 30;
 fn min_contiguous_days<'a>(
     covered: &HashSet<(String, chrono::NaiveDate)>, source: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&'a str>,
 ) -> (u64, Option<&'a str>, u64) {
-    // A day the SOURCE never held counts as covered. A rollup cannot exist for
-    // rows that do not exist, and a query over that day correctly returns
-    // nothing whether or not a tier partition is there — so an absent day is
-    // answered, not missing.
-    //
-    // Without this the gauge is unreachable by construction, and it was:
-    // measured 2026-08-18, project 4f020cf8 held source rows on 08-14 (85),
-    // 08-16 (4) and 08-18 (8) and NOTHING on 08-15 or 08-17. Its tier matches
-    // that exactly, so the tier is correct and complete — yet counting back from
-    // yesterday it scored 0, and because this is a MINIMUM over active projects
-    // it pinned the whole fleet's gauge to 0 no matter how much coverage every
-    // other project had. `6297304f` scored 4 and `5ce1c976` 1 in the same sweep.
-    //
-    // The goal is "30 contiguous days a 30d panel can answer from the tier", not
-    // "30 days on which every tenant happened to send traffic". One quiet
-    // low-traffic tenant must not make the target unattainable for the fleet.
+    // A day the SOURCE never held counts as answered: a rollup can't exist for
+    // rows that don't exist, and the query correctly returns nothing. Without
+    // this the minimum is unreachable — one sparse tenant pins the fleet at 0.
     let answered = |project: &str, date: chrono::NaiveDate| {
         let key = (project.to_owned(), date);
         covered.contains(&key) || !source.contains(&key)
     };
-    // Bounded, because "answered" is true for every day before a project's first
-    // row: without a cap a quiet tenant scores the age of the epoch. 30 is the
-    // goal itself, so the gauge reads as progress toward it and saturates exactly
-    // when a 30d panel is fully answerable.
+    // Capped at the horizon (30 is the goal itself); otherwise a quiet tenant —
+    // for whom every pre-first-row day is "answered" — scores the age of the epoch.
     let mut per_project = active_projects
         .iter()
         .map(|project| {
@@ -869,24 +810,12 @@ fn min_contiguous_days<'a>(
             (days, Some(*project))
         })
         .collect::<Vec<_>>();
-    // Tie-break on the name so the reported laggard is stable across sweeps
-    // rather than flipping between equally-bad projects.
+    // Name tie-break keeps the reported laggard stable across sweeps.
     let (worst_days, worst) = per_project.iter().copied().min_by_key(|(days, project)| (*days, *project)).unwrap_or((0, None));
-    // The MEDIAN alongside it, because the minimum is the honest goal metric and
-    // a terrible control signal.
-    //
-    // `coverage_is_short` selects `CYCLE_COVERAGE_SHORT`, which gives Dedup 1 of
-    // 10 slots instead of 3 — and Dedup is what certifies partitions, without
-    // which every query is a hybrid that scans raw. Prod 2026-08-19 measured the
-    // whole chain: `5ce1c976` holds ONE file per day at 0.00 GB and has zero
-    // rows in the 1h tier, so it scored 2 and pinned the fleet, while shipbubble
-    // sat at 12/14 and otel_metrics' 1m tier had reached the full 30. One
-    // negligible tenant therefore held the entire fleet in coverage-short mode
-    // indefinitely, starving the very operation that would end it.
-    //
-    // The minimum still gets published as the goal — "can EVERY tenant answer a
-    // 30d panel" is the right thing to aim at. It is just not the right thing to
-    // steer by, because a single outlier can pin it forever.
+    // The minimum is the honest goal ("can EVERY tenant answer a 30d panel")
+    // but a terrible control signal — one outlier pins it forever, holding the
+    // fleet in coverage-short mode and starving the dedup that would end it.
+    // The median is what `coverage_is_short` steers by.
     per_project.sort_unstable_by_key(|(days, _)| *days);
     let median = per_project.get(per_project.len() / 2).map_or(0, |(days, _)| *days);
     (worst_days, worst, median)
@@ -937,7 +866,7 @@ fn repair_bin_date(files: &[String]) -> &str {
 /// The value of one Hive-style `key=value` path segment, or `None` if the
 /// path carries no such segment.
 fn path_partition_value<'a>(path: &'a str, key: &str) -> Option<&'a str> {
-    path.split('/').find_map(|segment| segment.strip_prefix(&format!("{key}=")))
+    path.split('/').find_map(|segment| segment.strip_prefix(key)?.strip_prefix('='))
 }
 
 /// Parallelism for the repair sort specifically.
@@ -1000,23 +929,10 @@ fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Oper
     use crate::maintenance_coordinator::Operation;
     match operation {
         Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => COORDINATOR_FILE_REWRITE_TIMEOUT,
-        // Rollup builds get the longer deadline too, because their cost is set
-        // by the INPUT FILE COUNT and narrowing the slice does not reduce it.
-        //
-        // A large tenant's sealed day is not yet compacted, so its files are
-        // unsorted and each spans the whole day: prod 2026-08-17, a ONE-MINUTE
-        // window over the whale read `active_add_files=828`,
-        // `active_add_files_bytes=1803177094`. A day-sized rollup therefore
-        // reads all 828 files whatever its width, cannot finish in 300s, and —
-        // because time-bisection cannot shrink a file set whose every member
-        // spans the day — never converges either. That tenant published no
-        // historical coverage at all while smaller ones reached eleven days.
-        //
-        // Safe to lengthen where dedup is not: a rollup unit takes no rewrite
-        // permit, and its memory is bounded by GROUP CARDINALITY rather than
-        // input size, so a long unit holds a worker but not the heap. The
-        // abandonment bisection still bounds it — a unit that misses even this
-        // deadline twice is split.
+        // Rollup cost is set by INPUT FILE COUNT — every uncompacted file spans
+        // the whole day, so narrowing the slice shrinks nothing and bisection
+        // never converges. Safe to lengthen: rollup takes no rewrite permit and
+        // its memory is bounded by group cardinality, not input size.
         Operation::BaseRollup | Operation::DerivedRollup => COORDINATOR_FILE_REWRITE_TIMEOUT,
         Operation::Dedup => COORDINATOR_STANDARD_UNIT_TIMEOUT,
     }
@@ -1215,11 +1131,10 @@ fn serialize_watermark_to_json(watermark: &crate::write::DeltaWatermark, project
         .filter_map(|(shard, pos)| pos.map(|p| (shard.to_string(), serde_json::json!({ "block_id": p.block_id, "offset": p.offset }))))
         .collect();
     if !map.is_empty() {
-        // Topic scope. Unified-table tenants all commit to ONE Delta log, and
-        // walrus positions are per-topic, so an unscoped watermark read back by
-        // a different tenant advances its cursor past unreplayed entries.
-        // Non-numeric keys are already skipped by older readers, so adding this
-        // is backward-compatible on the read side.
+        // Topic scope: unified-table tenants share ONE Delta log and walrus
+        // positions are per-topic, so an unscoped watermark read by another
+        // tenant advances its cursor past unreplayed entries. Backward-compatible:
+        // older readers skip non-numeric keys.
         map.insert(WATERMARK_TOPIC_KEY.to_string(), serde_json::Value::String(wal_topic(project_id, table_name)));
     }
     map
@@ -1228,13 +1143,10 @@ fn serialize_watermark_to_json(watermark: &crate::write::DeltaWatermark, project
 /// Key inside the watermark object naming the topic that produced it.
 const WATERMARK_TOPIC_KEY: &str = "topic";
 
-/// Key inside the watermark object holding the MULTI-topic map written by a
-/// cross-project coalesced commit: `{ "<project>:<table>": <single-topic map> }`.
-/// Only present when one commit carries more than one topic's watermark — a
-/// single-topic commit keeps the flat legacy shape byte-for-byte, so nothing
-/// changes on the non-coalesced path and an old binary reading those commits
-/// behaves exactly as before. An old binary reading a MULTI commit finds no
-/// top-level `topic` key, so it contributes nothing (under-advance = replay +
+/// Key holding the MULTI-topic map of a cross-project coalesced commit:
+/// `{ "<project>:<table>": <single-topic map> }`. Single-topic commits keep the
+/// flat legacy shape byte-for-byte; an old binary reading a MULTI commit finds
+/// no top-level `topic` key and contributes nothing (under-advance = replay +
 /// dedup, never loss) — the safe rollback direction.
 const WATERMARK_TOPICS_KEY: &str = "topics";
 
@@ -1295,13 +1207,10 @@ fn merge_max_watermark_maps(into: &mut serde_json::Map<String, serde_json::Value
 /// TimeFusion. Deletion runs on a detached thread because reaping a dead process's garbage is
 /// never urgent.
 fn reap_orphaned_spill_dirs(spill_dir: &std::path::Path) {
-    // Snapshot the orphan list synchronously, BEFORE the caller builds this
-    // env's DiskManager. `read_dir` streams lazily, so enumerating on the
-    // detached thread raced dirs the *new* DiskManager creates: with a large
-    // orphan backlog the slow size-walk was still iterating when the first
-    // sort's live spill dir appeared, and `remove_dir_all` yanked it mid-sort
-    // (prod 2026-07-29: light optimize failed with ENOENT on its own spill
-    // file). Only the pre-existing snapshot is deleted off-thread.
+    // Snapshot the orphan list synchronously, BEFORE this env's DiskManager
+    // exists: enumerating lazily on the detached thread raced dirs the new
+    // DiskManager creates and yanked a live spill dir mid-sort. Only the
+    // pre-existing snapshot is deleted off-thread.
     let orphans: Vec<std::path::PathBuf> = std::fs::read_dir(spill_dir)
         .map(|entries| {
             entries
@@ -1366,32 +1275,20 @@ fn parse_watermark_from_json(
         return out;
     };
     let topic = wal_topic(project_id, table_name);
-    // A cross-project coalesced commit nests one map per topic. Selecting by
-    // key IS the topic scoping — a project only ever reads its own entry, so
-    // the crash-recovery resume position stays per-project exactly as it is on
-    // the one-commit-per-project path. An absent topic contributes nothing.
+    // Only apply a watermark to the topic that wrote it: an unattributable
+    // position may be another tenant's, and over-advancing a cursor loses acked
+    // writes, whereas under-advancing only replays duplicates (dedup drops them).
     let wm = match wm.get(WATERMARK_TOPICS_KEY).and_then(|v| v.as_object()) {
-        Some(topics) => {
-            let Some(mine) = topics.get(&topic).and_then(|v| v.as_object()) else { return out };
-            mine
-        }
-        // Only apply a watermark to the topic that wrote it. A commit from another
-        // tenant of the same unified table, or a legacy commit with no topic at
-        // all, contributes nothing — an unattributable position is indistinguishable
-        // from another tenant's, and over-advancing a cursor loses acked writes,
-        // whereas under-advancing only replays duplicates (read-side dedup drops
-        // those).
+        Some(topics) => match topics.get(&topic).and_then(|v| v.as_object()) {
+            Some(mine) => mine,
+            None => return out,
+        },
         None if wm.get(WATERMARK_TOPIC_KEY).and_then(|v| v.as_str()) == Some(topic.as_str()) => wm,
         None => return out,
     };
-    for (shard_str, pos_val) in wm {
-        let Ok(shard) = shard_str.parse::<usize>() else { continue };
-        if shard >= shards {
-            continue;
-        }
-        let block_id = pos_val.get("block_id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let offset = pos_val.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        out[shard] = Some(walrus_rust::WalPosition { block_id, offset });
+    for (shard, pos_val) in wm.iter().filter_map(|(s, v)| s.parse::<usize>().ok().filter(|&s| s < shards).map(|s| (s, v))) {
+        let field = |k| pos_val.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        out[shard] = Some(walrus_rust::WalPosition { block_id: field("block_id"), offset: field("offset") });
     }
     out
 }
@@ -1585,9 +1482,6 @@ fn partition_file_fp(mut files: Vec<String>) -> u64 {
     h.finish()
 }
 
-/// UTC dates covered by a `[lo, hi]` microsecond window, or `None` when the
-/// window is unbounded/invalid/wider than a year (bounds the per-date
-/// fingerprint checks; such queries just keep DedupExec).
 /// A partition's identity hash plus the row timestamps its files span.
 #[derive(Clone, Copy)]
 pub(crate) struct PartitionStats {
@@ -1619,25 +1513,11 @@ impl PartitionStats {
 pub const COVERAGE_SHORT_DAYS: u64 = 14;
 
 /// Is contiguous rollup coverage short enough to be worth reweighting for?
-///
-/// Reads the gauge `rollup_coverage_contiguity` publishes — the minimum over
-/// every (project, declared tier) of contiguous sealed days counting back from
-/// yesterday. That is exactly the number a 14d/30d query needs, and it is
-/// already computed once per backfill sweep, so this costs an atomic load.
+/// Reads the gauge the backfill sweep already publishes — one atomic load.
 fn coverage_is_short() -> bool {
-    // The MEDIAN, not the minimum. The minimum is the goal metric — "can every
-    // tenant answer a 30d panel" is the right thing to aim at — and a terrible
-    // control signal, because one negligible tenant pins it forever.
-    //
-    // Prod 2026-08-19 measured the full chain: `5ce1c976` holds ONE file per day
-    // at 0.00 GB and has zero rows in the 1h tier, so it scored 2 and pinned the
-    // fleet gauge, while shipbubble was at 12/14 and otel_metrics' 1m tier had
-    // reached the full 30. That kept `CYCLE_COVERAGE_SHORT` selected
-    // indefinitely, which gives Dedup 1 of 10 slots instead of 3 — and Dedup is
-    // what certifies partitions. Without certification `rollup_hits_full_total`
-    // stays 0, every query is a hybrid that unions a raw scan, and a 7d
-    // aggregate over fully compacted, fully rolled-up days still timed out at
-    // 60s. One trivial tenant was holding the whole fleet's query latency.
+    // The MEDIAN, not the minimum: the minimum is the goal metric but one
+    // negligible tenant pins it forever, holding the fleet in coverage-short
+    // mode and starving the dedup certification that would end it.
     crate::observability::maintenance_stats().rollup_median_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
 }
 
@@ -1656,6 +1536,8 @@ fn intersect_ranges(left: &[(i64, i64)], right: &[(i64, i64)]) -> Vec<(i64, i64)
     out
 }
 
+/// UTC dates covered by a `[lo, hi]` microsecond window, or `None` when the
+/// window is unbounded/invalid/wider than a year (such queries keep DedupExec).
 fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
     let lo_d = chrono::DateTime::from_timestamp_micros(lo)?.date_naive();
     let hi_d = chrono::DateTime::from_timestamp_micros(hi)?.date_naive();
@@ -1853,12 +1735,9 @@ fn probe_after_timeout(probe: CommitProbe, timed_out: bool) -> CommitProbe {
     }
 }
 
-/// Split a coalesced commit's newly-added file URIs per project. Files are
-/// written under the `project_id=<id>/` partition path, so the path IS the
-/// attribution — downstream consumers (tantivy sidecar, cache warming) keep
-/// receiving only their own project's files even though one commit produced
-/// them all. A single-project group returns the full list unfiltered, byte-for-
-/// byte what the per-project path returns.
+/// Split a coalesced commit's newly-added file URIs per project — the
+/// `project_id=<id>/` path segment IS the attribution, so downstream consumers
+/// receive only their own files. Single-project groups pass through unfiltered.
 fn attribute_added_files(added: Vec<String>, projects: &[&str]) -> Vec<Vec<String>> {
     if projects.len() == 1 {
         return vec![added];
@@ -2205,117 +2084,81 @@ fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::O
 #[derive(Debug, Clone)]
 pub struct Database {
     config: Arc<AppConfig>,
-    /// One RuntimeEnv (and thus one memory pool) shared by every session
-    /// context, across `Database` clones. Per-context pools each granted the
-    /// full `memory_limit × fraction` budget, so N contexts oversubscribed
-    /// the cgroup N×; the pool only enforces a global cap if it's global.
+    /// One RuntimeEnv/memory pool shared by every session context and clone —
+    /// the pool only enforces a global cap if it's global.
     runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
-    /// Dedicated maintenance (optimize / dedup / recompress) `RuntimeEnv`: a
-    /// bounded FairSpill pool + on-disk spill dir, kept separate from the query
-    /// pool so a Z-order global sort can always reserve its merge floor and spill
-    /// instead of losing the race for the saturated shared Greedy pool.
+    // The next five runtime envs are disjoint pool slices (constant total
+    // budget) so one workload's long sorts can never starve another's.
+    /// Heavy maintenance (optimize/dedup/recompress): bounded FairSpill pool +
+    /// spill dir so a Z-order global sort can always reserve its merge floor
+    /// instead of losing the race for the saturated query pool.
     maintenance_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
-    /// Hot-tail light-optimize slice carved out of the maintenance budget:
-    /// heavy rewrites (dedup, recompress, Z-order) can hold the shared pool
-    /// for minutes, and the small (≤target_size) hot-tail sorts starved
-    /// Runtime env for hot-tail packing. Separate from maintenance's pool so today's compaction
-    /// always has its reserve; total budget stays constant.
+    /// Hot-tail packing: keeps today's compaction reserve while heavy rewrites
+    /// hold the maintenance pool for minutes.
     light_optimize_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
-    /// Footer repair's slice, disjoint from packing's above. Same argument one
-    /// level down: repair sorts whole multi-hundred-MB files for minutes, and
-    /// sharing packing's pool meant packing had to be stopped outright for the
-    /// duration (see `pack_pool_bytes`).
+    /// Footer repair: sorts whole multi-hundred-MB files; sharing packing's
+    /// pool meant stopping packing outright for the duration.
     repair_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
-    /// One process-wide 512 MiB spill pool for every coordinator execution
-    /// unit. Reusing it prevents a newly created runtime from treating another
-    /// worker's live spill directory as an orphan, while the pool itself is the
-    /// hard aggregate ceiling across concurrent slice workers.
+    /// Coordinator execution units: one process-wide 512 MiB spill pool. Reuse
+    /// stops a fresh runtime treating another worker's live spill dir as an
+    /// orphan; the pool is the hard aggregate ceiling across slice workers.
     coordinator_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
-    /// Flush-path sort pool, for buckets too large for the in-process sort.
-    /// Its own slice, not maintenance's: flush is on the INGEST path and must
-    /// not queue behind a Z-order holding the maintenance pool for minutes.
-    /// Bounded + spillable: the in-process sort allocates outside every pool, so an unbounded
-    /// sort can consume gigabytes on a small box.
+    /// Flush-path sorts for oversized buckets: flush is on the INGEST path and
+    /// must not queue behind maintenance. Bounded + spillable because the
+    /// in-process sort allocates outside every pool.
     flush_sort_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
-    /// Caps how many spilling flush sorts share `flush_sort_runtime_env` at
-    /// once. The pool is a `FairSpillPool`, so N concurrent sorts each get ~pool/N; below a viable
-    /// slice `ExternalSorterMerge` cannot merge its spill files and the sort fails. The caller then
-    /// writes the group unsorted, and a single file with no `sorting_columns` footer disables the
-    /// reader's all-or-nothing ordering for every scan touching that partition — so pool starvation
-    /// shows up as slow queries, not an error. Serialising a few oversized sorts is much cheaper.
+    /// Caps concurrent spilling flush sorts. FairSpill gives each ~pool/N;
+    /// below a viable slice the sort fails, the group is written unsorted, and
+    /// a footer with no `sorting_columns` disables ordering for every scan of
+    /// that partition — starvation shows up as slow queries, not errors.
     flush_sort_gate: Arc<tokio::sync::Semaphore>,
-    /// Memoized `build_optimize_session_state` results, one per runtime env.
-    ///
-    /// Building a `SessionState` re-registers every analyzer/optimizer rule and the whole
-    /// UDF/UDAF set. The maintenance loop did that on every optimize attempt, so cache the build
-    /// and clone per use. Inputs are constant for the process lifetime. Only for delta-rs
-    /// builders that share the state via `.with_session_state(...)`. A `SessionState` clone shares
-    /// its `catalog_list`, so sites that register temporary tables must still build a fresh state.
+    /// Memoized `build_optimize_session_state` per runtime env (building one
+    /// re-registers every rule and UDF). A clone shares its `catalog_list`, so
+    /// sites that register temporary tables must still build a fresh state.
     maintenance_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
     light_optimize_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
     /// Repair-only sessions: same pool, smaller batches, keyed by the sort
-    /// parallelism they pin. See `repair_session_state`.
+    /// parallelism they pin.
     repair_session_states: Arc<dashmap::DashMap<usize, datafusion::execution::session_state::SessionState>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
     unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
     custom_project_tables: CustomProjectTables,
-    /// Lock-free per-(project, table) cache of resolved Delta table refs.
-    ///
-    /// The inner `Arc<RwLock<DeltaTable>>` is the same object held in `unified_tables`/`custom_project_tables`,
-    /// so `update_state` on the slow path mutates the table seen by hot-path callers. The read path
-    /// is `DashMap.get` → `Arc` clone, skipping tokio RwLock awaits. No eviction: size scales with
-    /// unique pairs seen since process start, so entries for dropped tables persist until restart.
+    /// Lock-free (project, table) → resolved Delta table cache. The inner
+    /// `Arc<RwLock<DeltaTable>>` is the same object held in the table maps
+    /// above, so slow-path `update_state` is seen by hot-path callers.
+    /// No eviction: grows with unique pairs seen since process start.
     fast_resolve_cache: FastResolveCache,
-    /// Per-(project, table) sticky bit: "Delta may hold matching files."
-    ///
-    /// The bit is at least as conservative as truth, never falsely `false`. Cold start sets it true
-    /// when `version > 0`; flush callbacks set it true after commits that add files. While false,
-    /// scans skip Delta entirely and MemBuffer is authoritative, avoiding building a delta-rs
-    /// `TableProvider` for projects that have never committed. `Arc<AtomicBool>` is used because
-    /// `Database` derives `Clone` and `AtomicBool` is not `Clone`.
+    /// Per-(project, table) sticky "Delta may hold matching files" bit — never
+    /// falsely `false`. While false, scans skip Delta and MemBuffer is
+    /// authoritative. `Arc<AtomicBool>` because `Database` derives `Clone`.
     delta_has_files: dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
-    /// Per-(project, table) cached Delta-side `TableProvider` and the snapshot version it was built
-    /// against.
-    ///
-    /// The provider is parameter-independent: every query for the same `(project, table)` and snapshot
-    /// version uses the same provider, varying only filters/projection/limit on scan. Invalidation is
-    /// exact-version via a recent-version ring. Concurrent misses are de-duplicated with a per-key
-    /// `OnceCell`. Known limitation: no drop eviction, so entries for dropped tables stay in the
-    /// cache and memory tracks the historical max of distinct pairs.
+    /// Cached Delta-side `TableProvider` per (project, table) + snapshot
+    /// version. Exact-version invalidation; concurrent misses single-flight
+    /// via a per-key `OnceCell`. No drop eviction.
     delta_provider_cache: DeltaProviderCache,
-    /// Per-process scan-path counters. Read by `timefusion_stats` so operators
-    /// can see — in prod — whether the in-memory shortcut is being taken,
-    /// what the resolve cache hit rate looks like, and how the latency
-    /// distribution shifts under real load. Counters are cumulative since
-    /// process start; deltas are useful for rate analysis.
+    /// Cumulative scan-path counters, exported via `timefusion_stats`.
     pub scan_metrics: Arc<ScanMetrics>,
     batch_queue: Option<Arc<crate::write::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
-    /// Cancels `maintenance_shutdown` when the last guard-holding `Database` clone drops.
-    ///
-    /// `Database` is `Clone`, so a per-value `Drop` cancelling the shared token killed every cron job,
-    /// DML coalescer, and dedup sweep as soon as any transient clone dropped. `None` in clones handed
-    /// to long-lived background tasks; otherwise a task waiting on the token would hold its own
-    /// kill-switch alive and the guard could never fire.
+    /// Cancels `maintenance_shutdown` when the last guard-holding clone drops.
+    /// `None` in clones handed to long-lived background tasks — a task waiting
+    /// on the token must not hold its own kill-switch alive.
     _maintenance_cancel_guard: Option<Arc<tokio_util::sync::DropGuard>>,
-    /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
-    /// disjoint entry points today, but a second call must not double the
+    /// One-shot guard so a second `preload_tables` call can't double the
     /// boot-time S3 warm burst.
     preload_started: Arc<std::sync::atomic::AtomicBool>,
-    /// Set only after startup table discovery and footer warming finish.
-    /// Maintenance waits for this barrier so it can never become the first
-    /// caller to cold-load a source table needed by foreground reads/ingest.
+    /// Barrier set after startup discovery + footer warming. Maintenance waits
+    /// on it so it's never the first cold-loader of a table foreground needs.
     preload_complete: Arc<std::sync::atomic::AtomicBool>,
     preload_complete_notify: Arc<tokio::sync::Notify>,
-    /// Handle for CPU/I/O-heavy startup and coordinator work. Foreground
-    /// PGWire tasks never execute on this runtime.
+    /// Runtime for CPU/IO-heavy startup and coordinator work; foreground
+    /// PGWire tasks never execute here.
     maintenance_executor: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
     config_pool: Option<PgPool>,
     storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
-    /// Monotonic deadline (nanos since process start) for when the next
-    /// storage-configs refresh from the config DB is allowed. Capped at 30s
-    /// so a hot SQL path doesn't hit PG on every statement.
+    /// Monotonic deadline (ns since process start) throttling storage-config
+    /// refreshes to ≤ every 30s, so a hot SQL path doesn't hit PG per statement.
     storage_configs_next_refresh_ns: Arc<std::sync::atomic::AtomicU64>,
     default_s3_bucket: Option<String>,
     default_s3_prefix: Option<String>,
@@ -2323,54 +2166,40 @@ pub struct Database {
     object_store_cache: Option<Arc<SharedFoyerCache>>,
     statistics_extractor: Arc<DeltaStatisticsExtractor>,
     last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
-    /// Delta snapshot version at last dedup sweep, per scheduler key. Skips
-    /// the sweep when the version hasn't moved (no commits → no new dupes).
-    /// Same unbounded-growth caveat as `last_written_versions`.
+    /// Delta version at last dedup sweep per scheduler key; unmoved version →
+    /// skip (no commits, no new dupes). Unbounded like `last_written_versions`.
     last_dedup_versions: Arc<RwLock<HashMap<String, u64>>>,
-    /// (project, table, date) → fingerprint (hash of the partition's sorted
-    /// live file set) captured when a dedup sweep pass found ZERO duplicates
-    /// and the file set was unchanged across the pass. A query whose window
-    /// partitions all fingerprint-match the current snapshot provably reads
-    /// no duplicates from Delta, so `DedupExec` (and its LIMIT-pushdown
-    /// suppression) can be skipped (`timefusion_read_dedup_skip_swept`).
-    /// Any commit touching the partition changes its file set → mismatch →
-    /// dedup stays on until the next clean sweep pass.
+    /// (project, table, date) → live-file-set fingerprint captured when a sweep
+    /// found zero duplicates. A query whose window partitions all match the
+    /// current snapshot provably reads no Delta duplicates, so `DedupExec` can
+    /// be skipped. Any commit changes the file set → mismatch → dedup stays on.
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>>,
-    /// Serializes snapshots of `dedup_clean_fp` with their shared atomic temp
-    /// path. Coordinator workers can grant different partitions concurrently.
+    /// Serializes `dedup_clean_fp` snapshots with their shared atomic temp path.
     dedup_certification_persist_lock: Arc<std::sync::Mutex<()>>,
-    /// (project, table, date) → clean-slice coverage accumulating toward a
-    /// `dedup_clean_fp` entry. See `SliceCoverage` and `record_clean_slice`.
+    /// Clean-slice coverage accumulating toward a `dedup_clean_fp` entry.
+    /// See `SliceCoverage` and `record_clean_slice`.
     dedup_slice_coverage: Arc<dashmap::DashMap<(String, String, String), SliceCoverage>>,
     /// Monotonic invalidation epoch for each source `(project, table, date)`.
     rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
     /// Certified rollup generations keyed by `(project, source, target, date)`.
     rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
-    /// Untagged live files per tier table, as of that tier's last publish.
-    ///
-    /// Per TABLE, because the exported gauge is one slot and the tiers publish
-    /// independently: a single shared slot is overwritten by whichever tier
-    /// published last, so a publish to an already-clean tier reported ZERO while
-    /// another tier still held 67 untagged files. A gauge that reads clean while
-    /// the damage is present is worse than none — it is the exact failure this
-    /// metric was added to catch. The exported value is the SUM over tiers.
+    /// Untagged live files per tier TABLE (tiers publish independently, so one
+    /// shared slot would read clean while another tier still held damage).
+    /// The exported gauge is the SUM over tiers.
     rollup_tier_untagged: Arc<dashmap::DashMap<String, u64>>,
-    /// Hours changed since this `(project, source, date)` was last rolled up, as
-    /// a 24-bit mask. PRESENCE is the claim that every change since that build
-    /// was observed; absence means "unknown", which forces a full rebuild. Only
-    /// a successful build inserts one.
+    /// 24-bit changed-hours mask per `(project, source, date)`. PRESENCE claims
+    /// every change since the last build was observed; absence means "unknown"
+    /// and forces a full rebuild. Only a successful build inserts one.
     rollup_dirty: Arc<dashmap::DashMap<(String, String, String), u32>>,
-    /// First durable invalidation time for each dirty source partition. Kept
-    /// separately from the mask so a clean zero-mask entry has no age.
+    /// First durable invalidation time per dirty source partition; kept apart
+    /// from the mask so a clean zero-mask entry has no age.
     rollup_invalidated_at: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
-    /// Serializes dirty-map mutation with durable journal snapshots. Without
-    /// this, two inbound writers can persist snapshots out of order and lose
-    /// the newer invalidation on restart.
+    /// Serializes dirty-map mutation with journal snapshots, else two writers
+    /// can persist out of order and lose the newer invalidation on restart.
     rollup_journal_lock: Arc<std::sync::Mutex<()>>,
-    /// Durable slice work produced by the same pre-ack invalidation path as
-    /// `rollup_dirty`. The legacy hour journal remains during migration, but
-    /// new coordinator workers consume this finer-grained source of truth.
+    /// Durable slice work from the same pre-ack invalidation path as
+    /// `rollup_dirty`; the finer-grained source of truth coordinator workers consume.
     maintenance_tasks: Arc<std::sync::Mutex<crate::maintenance_coordinator::TaskJournal>>,
     maintenance_admission: crate::maintenance_coordinator::AdmissionController,
     maintenance_debt_planned_at: Arc<std::sync::atomic::AtomicI64>,
@@ -2381,190 +2210,129 @@ pub struct Database {
     /// Bounded exponential retry state for failed source-partition rollup builds.
     rollup_backoff: Arc<dashmap::DashMap<RollupCoverageKey, (u32, std::time::Instant)>>,
     /// Exact merge-on-read count partitions. Query threads use only the
-    /// process-local front; disk loads and Delta builds are single-flight and
-    /// bounded in the background so a cold cache cannot amplify query load.
+    /// process-local front; disk/Delta loads are single-flight and bounded in
+    /// the background so a cold cache cannot amplify query load.
     logical_count_cache: Arc<crate::read::LogicalCountCache>,
     logical_count_building: Arc<dashmap::DashSet<crate::read::CountPartition>>,
     logical_count_build_sem: Arc<tokio::sync::Semaphore>,
-    /// Dirty `(project, table, date, 10-minute bin)` keys recorded only after
-    /// a Delta append commits. In-memory by design: after restart the
-    /// read-side DedupExec remains the correctness backstop.
+    /// Dirty `(project, table, date, 10-minute bin)` keys recorded only after a
+    /// Delta append commits. In-memory by design: after restart the read-side
+    /// DedupExec remains the correctness backstop.
     dedup_dirty_bins: Arc<dashmap::DashMap<(String, String, String, i64), ()>>,
-    /// Exponential failure backoff per `(table, project, date)` dedup target.
-    ///
-    /// Without it a failing partition re-runs on every sweep tick forever. Cleared on success;
-    /// in-memory only, so a restart retries once.
+    /// Exponential failure backoff per dedup target, else a failing partition
+    /// re-runs every sweep tick. In-memory only; a restart retries once.
     dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
-    /// Repair candidates whose footer turned out to be sorted after all, so the pass stops
-    /// re-selecting them.
-    ///
-    /// The `delta-rs.optimize.sort_by` tag is not equivalent to having a `sorting_columns` footer:
-    /// the flush path sorts and stamps a correct footer without the tag, so untagged means suspect,
-    /// not unsorted. Admission by tag alone would rewrite healthy files. Verified files are excluded
-    /// after one footer read per process.
+    /// Repair candidates whose footer proved sorted, excluded after one footer
+    /// read per process. The `delta-rs.optimize.sort_by` tag ≠ a
+    /// `sorting_columns` footer (flush sorts without the tag), so untagged
+    /// means suspect, not unsorted — admission by tag would rewrite healthy files.
     repair_verified_sorted: Arc<dashmap::DashSet<String>>,
     /// Serializes appends to the persisted verified-sorted list.
     repair_verified_lock: Arc<std::sync::Mutex<()>>,
-    /// Consecutive staging failures per repair candidate. A file whose rewrite
-    /// cannot fit the resources available fails, is re-selected identically next
-    /// pass, and starves every candidate behind it — see
-    /// `REPAIR_QUARANTINE_AFTER`.
+    /// Consecutive staging failures per repair candidate — an always-failing
+    /// file starves every candidate behind it; see `REPAIR_QUARANTINE_AFTER`.
     repair_failures: Arc<dashmap::DashMap<String, u32>>,
-    /// Index into [`REPAIR_SORT_PARTITION_LADDER`] for a repair candidate that
-    /// has exhausted the pool at a higher parallelism. Cleared on success, so a
-    /// file only carries a degraded setting while it needs one.
+    /// Index into [`REPAIR_SORT_PARTITION_LADDER`] for candidates that
+    /// exhausted the pool at higher parallelism; cleared on success.
     repair_degradation: Arc<dashmap::DashMap<String, usize>>,
-    /// Caps concurrent heavy maintenance rewrites.
-    ///
-    /// Applies to dedup dirty-bin staging, full optimize, light-consolidate, and recompress.
-    /// Their Arrow footprint is invisible to the DataFusion memory pool, so aggregate concurrency,
-    /// not the pool, is the real bound against cgroup OOM. The hot-tail wave engine deliberately
-    /// does not share this semaphore; see [`Self::light_rewrite_sem`].
+    /// Caps concurrent heavy rewrites (dedup staging, optimize, consolidate,
+    /// recompress). Their Arrow footprint is invisible to the DataFusion memory
+    /// pool, so aggregate concurrency, not the pool, is the real OOM bound.
+    /// Hot-tail waves deliberately use [`Self::light_rewrite_sem`] instead.
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
-    /// Caps concurrent hot-tail wave staging.
-    ///
-    /// Separate from `maintenance_rewrite_sem` because a long dedup drain once held the shared
-    /// rewrite permits and starved hot compaction for tens of minutes. The two engines target
-    /// disjoint partitions, so serializing them is pure loss. Sized to the light pool's own K
-    /// rather than the heavy permit count, so staging is not capped at the heavy limit. Also acts
-    /// as an instrumented choke point and a hard ceiling for callers outside `round_robin_bins`.
+    /// Caps hot-tail wave staging. Separate from `maintenance_rewrite_sem` so a
+    /// long dedup drain can't starve hot compaction (disjoint partitions, so
+    /// serializing them is pure loss). Sized to the light pool's own K.
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
-    /// Cap how many coordinator workers may sit in debt work at once (dedup, hot packing,
-    /// sealed consolidation, repair), leaving the rest for the rollup chain while coverage is
-    /// short.
-    ///
-    /// The other rewrite semaphores bound memory; this one bounds occupancy, which turned out
-    /// to be the binding scarcity. Rollup units are cheap; debt units hold a worker for many
-    /// minutes, so filling all workers with debt starves rollup regardless of attempt share.
+    /// Caps coordinator workers in debt work (dedup, packing, consolidation,
+    /// repair), reserving the rest for rollup. Bounds occupancy, not memory:
+    /// debt units hold a worker for minutes and would otherwise starve cheap
+    /// rollup units regardless of attempt share.
     maintenance_debt_slots: Arc<tokio::sync::Semaphore>,
-    /// Cap workers inside units that have already timed out under
-    /// `TaskJournal::QUARANTINE_ATTEMPTS`.
-    ///
-    /// Occupancy, not attempt share or scheduling cycle, is the binding scarcity. This bounds
-    /// the wall-clock cost of a doomed unit rather than its frequency. Bisection is
-    /// counterproductive because per-file rewrite cost is roughly fixed, so halving the slice
-    /// only doubles the number of units paying it.
+    /// Caps workers inside units already timed out under
+    /// `TaskJournal::QUARANTINE_ATTEMPTS`: bounds the wall-clock cost of a
+    /// doomed unit, not its frequency.
     maintenance_quarantine_slots: Arc<tokio::sync::Semaphore>,
-    /// Reserve workers for `DerivedRollup` while coverage is short, so base work cannot starve
-    /// derived work.
-    ///
-    /// Freed workers for "the rollup chain" were not uniform: a sealed `BaseRollup` day is much
-    /// slower than derived work, so it would occupy the freed slot and `DerivedRollup` still
-    /// starved. Derived is cheap and builds the 1h tier that 14d/30d dashboards read, which is the
-    /// actual coverage gap. The scarcity is slot-time, not attempt count.
+    /// Reserves workers for `DerivedRollup` while coverage is short — slow
+    /// sealed `BaseRollup` days would otherwise occupy every freed slot while
+    /// cheap derived work (the actual coverage gap) starves.
     maintenance_derived_reserve: Arc<tokio::sync::Semaphore>,
-    /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the time-windowed target
-    /// to hash-join keys; ungated bursts starve reads on a CPU-throttled box. Permits =
+    /// Caps concurrent user DML MERGE-UPDATEs; each scans the time-windowed
+    /// target and ungated bursts starve reads. Permits =
     /// `timefusion_dml_merge_concurrency`.
     dml_merge_sem: Arc<tokio::sync::Semaphore>,
-    /// Caps concurrent Parquet batch-decodes for WIDE read scans (see
-    /// `timefusion_max_concurrent_scan_readers`). Shared across all queries so a
-    /// burst of wide-window dashboards can't stack decode buffers into an OOM.
+    /// Caps concurrent Parquet decodes for WIDE scans across all queries
+    /// (`timefusion_max_concurrent_scan_readers`), so a burst of wide-window
+    /// dashboards can't stack decode buffers into an OOM.
     heavy_scan_sem: Arc<tokio::sync::Semaphore>,
-    /// Serializes the outer full and light maintenance jobs. Their rewrite
-    /// permits alone are insufficient: a waiting light job can exhaust its
-    /// table timeout before it ever starts work.
+    /// Serializes the outer full and light maintenance jobs; rewrite permits
+    /// alone let a waiting light job exhaust its table timeout before starting.
     maintenance_job_sem: Arc<tokio::sync::Semaphore>,
-    /// Serializes in-process Delta commits per physical table, keyed via `table_lock_key`.
-    ///
-    /// delta-kernel's OCC checker cannot evaluate the bare-string timestamp predicate that
-    /// `replace_where` commits carry, so a dedup commit racing any concurrent append to the same
-    /// log aborts every attempt. Serializing per-log commits lets the rebase see no newer versions
-    /// and skip the checker. A process-wide mutex formerly serialized commits to different Delta
-    /// logs needlessly, capping flush throughput.
+    /// Serializes in-process Delta commits per physical table (`table_lock_key`).
+    /// delta-kernel's OCC checker can't evaluate `replace_where`'s timestamp
+    /// predicate, so a dedup commit racing a concurrent append to the same log
+    /// aborts; per-log serialization lets the rebase skip the checker.
     commit_locks: DmlLocks,
-    /// Flush/ingest committers currently queued on each table's `commit_locks` entry.
-    ///
-    /// A backlogged maintenance tick can park long wave commits ahead of a flush, starving it in the
-    /// queue even though no holder hangs. Durability outranks maintenance, so `commit_wave` declines
-    /// to enqueue while this is nonzero and flush latency is bounded by at most one in-flight wave
-    /// commit.
+    /// Flush/ingest committers queued on each table's `commit_locks` entry.
+    /// Durability outranks maintenance: `commit_wave` declines to enqueue while
+    /// nonzero, bounding flush latency to one in-flight wave commit.
     flush_waiter_counts: FlushWaiterCounts,
     /// Per-table serialization for in-process DML (see `dml_lock`): concurrent
-    /// merges on the same table would OCC-conflict and redo full parquet
-    /// rewrites, so they queue here — without touching the table's RwLock,
-    /// which stays free for readers and insert commits.
+    /// merges would OCC-conflict and redo full rewrites. Queuing here leaves
+    /// the table's RwLock free for readers and insert commits.
     dml_locks: DmlLocks,
-    /// Last time each table's snapshot was persisted to disk (keyed by table
-    /// url). `persist_snapshot` throttles on this: the on-disk snapshot is only a boot-recovery seed
-    /// (restore V, replay commits > V), so rewriting the whole state on every commit is wasted CPU.
-    /// A slightly stale snapshot just makes boot replay a few more (sub-second) commits.
+    /// Last snapshot-persist time per table URL; throttles `persist_snapshot`.
+    /// The on-disk snapshot is only a boot-recovery seed, so staleness just
+    /// means boot replays a few more sub-second commits.
     snapshot_persist_gate: Arc<dashmap::DashMap<String, std::time::Instant>>,
-    /// Late-binding shared cell: boot must create the pgwire SessionContext
-    /// (whose FunctionRegistry the WAL replay needs) BEFORE the layer exists,
-    /// so the layer is published through a OnceLock shared across all clones —
-    /// including ones captured earlier (DmlQueryPlanner). A plain
-    /// `Option<Arc<_>>` here silently left pre-layer clones without the mem
-    /// leg: pgwire UPDATEs skipped the buffer and lost updates to unflushed
-    /// rows.
+    /// Late-binding shared cell: boot creates the pgwire SessionContext before
+    /// the layer exists, so the layer is published through a OnceLock visible
+    /// to clones captured earlier (e.g. DmlQueryPlanner). A plain Option left
+    /// those clones without the mem leg, losing updates to unflushed rows.
     buffered_layer: Arc<std::sync::OnceLock<Arc<crate::write::BufferedWriteLayer>>>,
     /// Per-clone override for `query_delta_only`: hides the shared layer so
     /// scans bypass the in-memory buffer.
     bypass_buffer: bool,
     /// Internal aggregate builds must never read the rollup they are rebuilding.
     bypass_rollup: bool,
-    /// Plan the scan with maintenance parallelism instead of query parallelism.
-    ///
-    /// A rollup build is a background rewrite and was being planned with `target_partitions` equal to
-    /// the CPU quota, which multiplied concurrent decode. Parquet decode buffers are not tracked by
-    /// the memory pool, so the fan-out caused OOMs.
+    /// Plan the scan with maintenance parallelism instead of query parallelism:
+    /// Parquet decode buffers are untracked by the memory pool, so planning a
+    /// background rewrite at the full CPU quota fanned out decode into OOMs.
     maintenance_scan: bool,
-    /// Late-binding shared cells like `buffered_layer`: attached by `with_*`
-    /// builders after boot has already cloned Database into sessions/planners,
-    /// so a plain Option would leave those clones silently service-less.
+    /// Same late-binding pattern as `buffered_layer`: attached by `with_*`
+    /// builders after boot has already cloned Database into sessions/planners.
     tantivy_search: Arc<std::sync::OnceLock<Arc<crate::tantivy::search::TantivySearchService>>>,
     tantivy_indexer: Arc<std::sync::OnceLock<Arc<crate::tantivy::search::TantivyIndexService>>>,
-    /// Deferred-DML coalescer (see `dml_coalescer`) — populated by
-    /// `start_dml_coalescer` when `TIMEFUSION_DML_COALESCE_SECS > 0`. Same
-    /// late-binding shared-cell pattern as `buffered_layer`: the DML planner
-    /// clones Database before boot wiring finishes.
+    /// Same late-binding pattern; populated by `start_dml_coalescer` when
+    /// `TIMEFUSION_DML_COALESCE_SECS > 0`.
     dml_coalescer: Arc<std::sync::OnceLock<Arc<crate::dml::DmlCoalescer>>>,
-    /// Per-table, per-date set of live file URIs as of the last successful full
-    /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
-    /// it rewrites every file in the window on every run, even sealed days that
-    /// didn't change, minting cold multipart objects that cold-start the
-    /// object-store cache (which PR #39 then has to re-warm). This lets
-    /// `optimize_table` skip a sealed partition whose file set is unchanged.
-    /// Keyed by table storage URL (unique per physical table). In-memory only:
-    /// a restart re-z-orders each partition once, which is harmless.
+    /// Live file URIs per (table URL, date) at the last full z-order optimize.
+    /// delta-rs's ZOrder planner has no idempotence guard, so this lets
+    /// `optimize_table` skip sealed partitions whose file set is unchanged.
+    /// In-memory only; a restart re-z-orders each partition once, harmlessly.
     zorder_filesets: ZOrderFilesets,
-    /// Last version the out-of-band checkpoint task checkpointed, keyed by table
-    /// storage URL. Lets that task skip idle tables and tables whose version
-    /// hasn't advanced by `checkpoint_interval` since the last checkpoint. Since
-    /// checkpoint/log-cleanup no longer run in the commit hook (base_commit_properties),
-    /// this task and `checkpoint_after_waves` (post-tick) are the only
-    /// checkpoint drivers. In-memory only: after a restart
-    /// the first tick checkpoints every table once, which is harmless.
+    /// Last checkpointed version per table URL, letting the out-of-band
+    /// checkpoint task (with `checkpoint_after_waves`, the only checkpoint
+    /// drivers) skip idle tables. In-memory only; the first tick after restart
+    /// checkpoints every table once, harmlessly.
     checkpoint_versions: Arc<dashmap::DashMap<String, u64>>,
-    /// Serializes local staged-intent manifest append/rewrite operations.
-    /// Orphan reconciliation runs after readiness and may finish while a
-    /// maintenance wave records a new intent; without this lock its compacting
-    /// rewrite could overwrite that append and remove the only targeted-cleanup
-    /// record for a subsequently orphaned parquet file.
+    /// Serializes staged-intent manifest append/rewrite: orphan reconciliation's
+    /// compacting rewrite racing a wave's append could drop the only
+    /// targeted-cleanup record for a later-orphaned parquet file.
     staged_intent_manifest_lock: Arc<std::sync::Mutex<()>>,
-    /// Where the last truncated light-optimize tick stopped, as an index into
-    /// that tick's debt-ordered project list. The next tick rotates its plan by
-    /// this so an overloaded box degrades to "every project within k ticks"
-    /// instead of forever re-serving the same debt-ordered prefix.
+    // Rotation cursors: each pass's budget is smaller than its work list, so
+    // without rotating the start point the tail would never be reached.
+    /// Index into the light-optimize tick's debt-ordered project list.
     light_optimize_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// Where the last deadline-truncated dedup sweep stopped, as a count of
-    /// (date, project) items served. Same role as `light_optimize_cursor`: the
-    /// sweep is bigger than one tick, so without rotation the tail of the work
-    /// list is never reached.
+    /// Count of (date, project) items served by the last truncated dedup sweep.
     dedup_sweep_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// Which table a dedup tick starts with. The pass's budget is shared across
-    /// every table, so without rotation the tail of the table list is never
-    /// reached — see the cron's comment.
+    /// Which table a dedup tick starts with.
     dedup_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// Which table a hot-compaction tick starts with. Same reason as
-    /// `dedup_table_cursor`: the tick budget is shared across every table, so
-    /// without rotation the tail of the table list is never compacted.
+    /// Which table a hot-compaction tick starts with.
     hot_compact_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// One repair pass at a time, process-wide.
-    ///
-    /// `round_robin_bins` serialises repair within a table, but the light pool is shared by every
-    /// table. Two tables repairing concurrently can exhaust the pool and kill a bin that still has
-    /// headroom, so this permit caps repair staging to one bin across the whole process.
+    /// One repair pass process-wide: the light pool is shared by every table,
+    /// and two tables repairing concurrently can exhaust it and kill a bin
+    /// that still had headroom.
     repair_pass_permit: Arc<tokio::sync::Semaphore>,
 }
 
@@ -3461,12 +3229,9 @@ impl Database {
         if !enabled {
             return Ok(None);
         }
-        // Try every viable tier, best first, and take the first one that is
-        // actually BUILT across the window. The coarsest tier is cheapest to
-        // read but is also the newest and therefore the likeliest to have a hole
-        // at the oldest date; without this fallback a window starting one day
-        // before the coarse tier's coverage missed entirely while the fine tier
-        // sat fully built (measured in production, 08-04 vs 08-05).
+        // Try every viable tier, best first, taking the first actually BUILT
+        // across the window: the coarsest tier is cheapest but newest, so it's
+        // the likeliest to have a hole the fine tier can still serve.
         let mut best_miss = None;
         for route in routes {
             match self.rollup_rewrite_for(route, session).await {
@@ -3516,19 +3281,11 @@ impl Database {
             .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         // Pinned: the one project. Grouped: every project the SOURCE holds rows
-        // for IN THIS WINDOW — taken from the source, never from the tier, so a
-        // project whose rollup was never built still counts against the coverage
-        // rather than quietly vanishing from the answer.
-        //
-        // The window test is what makes this usable. Asking only "has a partition
-        // on this DATE" pulls in every dormant tenant that wrote a handful of rows
-        // at some other hour, and since coverage is intersected across the set,
-        // one of them with no rollup voids the range for everyone. Prod 2026-08-18:
-        // `missing_project` went to 0 and `not_built` became the whole miss
-        // profile — 13 projects hold tier partitions, and one of them has a single
-        // day with 4 rows. A project with no rows in the window can be dropped
-        // safely: its rollup rows for that range are equally empty, so it
-        // contributes nothing to the leg either way.
+        // for IN THIS WINDOW — from the source, never the tier, so a project
+        // with no rollup still counts against coverage. The window test (not
+        // just the date) matters: a dormant tenant with rows at another hour
+        // would otherwise void the intersected range for everyone, and dropping
+        // it is safe — its rollup rows for the range are equally empty.
         let window_dates: HashSet<String> = dates.iter().map(chrono::NaiveDate::to_string).collect();
         let projects: Vec<String> = match &route.project_id {
             Some(project) => vec![project.clone()],
@@ -3546,12 +3303,8 @@ impl Database {
         if projects.is_empty() {
             return Err(crate::rollup::MissReason::NotBuilt);
         }
-        // A rollup partition is built from Delta files only (`query_delta_only`),
-        // so any row still in the MemBuffer is absent from it. That is a bound on
-        // how far the rollup may be trusted, not a reason to refuse: everything
-        // at or above it is read raw. Across projects the EARLIEST such bound
-        // governs, since one project's buffered rows are missing from the answer
-        // just as surely as another's.
+        // Buffered rows are absent from every rollup partition; the EARLIEST
+        // project's bound governs, and everything at or above it is read raw.
         let buffered = projects
             .iter()
             .filter_map(|project| self.buffered_layer().and_then(|layer| layer.min_buffered_micros(project, &route.source, route.lo, end)))
@@ -3559,11 +3312,7 @@ impl Database {
         let mut generations = Vec::with_capacity(dates.len());
         let mut ticket = Vec::with_capacity(dates.len());
         let mut slice_ticket = Vec::new();
-        // The certified prefix, not the certified SET: a gap in the middle cannot
-        // be served, but everything before it can. Today's partition is normally
-        // the first uncertified date, because every flush changes its file
-        // fingerprint — which is precisely why the tail must be read raw.
-        // The certified SET, not a prefix. A gap in the middle used to discard
+        // The certified SET, not a prefix: a mid-window gap used to discard
         // every later date too, so one stale day made a 7-day query scan 8.4M
         // raw rows while six days sat fully built.
         let mut miss = None;
@@ -3590,24 +3339,11 @@ impl Database {
                 // miss histogram cannot tell a missing cron from a churning
                 // partition, which is the only question a rollout has to answer.
                 let Some(coverage) = self.rollup_coverage.get(&key) else {
-                    // Deliberately does NOT set `miss`. `recover_rollup_coverage`
-                    // repopulates SLICE coverage after a restart and never this
-                    // date-level map, so on a process that has not itself rebuilt
-                    // the partition this lookup misses for EVERY date while the
-                    // slice loop below still covers the window completely.
-                    //
-                    // Setting `miss` here made `not_built` the reported reason for
-                    // every later refusal, whatever actually caused it, because the
-                    // returns below are `miss.unwrap_or(<real reason>)`. Prod
-                    // 2026-08-18: 5,454 of 5,516 misses were `not_built`, and the
-                    // real reason was invisible. It also meant the strict
-                    // (non-realtime) path refused every window on a freshly
-                    // restarted process even when slice coverage served it whole —
-                    // rollup reads worked at all only because
-                    // `TIMEFUSION_ROLLUP_REALTIME_TAIL` happened to be on.
-                    //
-                    // Genuine absence is caught after the slice loop, from whether
-                    // the project contributed any covered range at all.
+                    // Deliberately does NOT set `miss`: after a restart only SLICE
+                    // coverage is recovered, so this lookup misses for every date
+                    // while the slice loop below may still cover the window whole.
+                    // Setting `miss` here hid every real refusal reason behind
+                    // `not_built`. Genuine absence is caught after the slice loop.
                     continue;
                 };
                 let source_fp = fingerprints
@@ -3698,12 +3434,9 @@ impl Database {
         }
         let interiors = crate::rollup::interiors(route.lo, route.hi, route.grain, horizon, &covered);
         if interiors.is_empty() {
-            // The single most common refusal in production, and the counter alone
-            // cannot explain it: an empty interior can mean no coverage overlaps
-            // the window, or that coverage overlaps but the BUFFERED horizon cuts
-            // it away, or that what survives is narrower than one grain. Those
-            // want opposite fixes — build more coverage vs flush sooner vs widen
-            // the window — and nothing outside the process can tell them apart.
+            // The most common refusal, and ambiguous from the counter alone: no
+            // overlapping coverage vs the buffered horizon cutting it away vs a
+            // survivor narrower than one grain — opposite fixes, so log the shape.
             if crate::observability::sample_rollup_miss() {
                 warn!(
                     lo = route.lo,
@@ -3985,13 +3718,10 @@ impl Database {
                 .map_err(|error| anyhow::anyhow!("failed to start maintenance runtime: {error}"))?;
         }
 
-        // Always-on pressure sampling. `scan_pressure_permits` samples lazily
-        // (on gated decode polls), so a climb driven by anything OTHER than a
-        // wide scan — flush sorts, replay, maintenance — reached the OOM kill
-        // with zero tier transitions logged and a stale tier for the first
-        // gated poll that DID arrive (2026-08-03 04:36 kill: no valve line in
-        // the whole 24-min life). A 250ms heartbeat keeps the tier fresh and
-        // the transition log complete no matter who is allocating.
+        // Always-on pressure sampling: `scan_pressure_permits` samples lazily on
+        // gated decode polls, so pressure driven by anything else (flush sorts,
+        // replay, maintenance) reached the OOM kill unlogged. A 250ms heartbeat
+        // keeps the tier fresh whoever is allocating.
         {
             let total = self.config.memory.timefusion_max_concurrent_scan_readers as u32;
             let cancel = cancel.clone();
@@ -4144,34 +3874,19 @@ impl Database {
                         return;
                     };
                     info!("Running scheduled dedup on sealed partitions");
-                    // ONE budget for the whole pass, shared across tables. The
-                    // pass holds `maintenance_job_sem`, so overrunning the
-                    // period does not just delay itself — it skips every later
-                    // tick, and with it the dirty-bin drain (prod 2026-08-12:
-                    // 55+ minutes on a 5-minute schedule, 10 consecutive skips,
-                    // zero bins committed).
-                    //
-                    // SPLIT between the pass's two halves, because they run in
-                    // sequence and the first one will otherwise take all of it:
-                    // with a single shared deadline prod 2026-08-13 logged
-                    // `dedup_sweep_truncated swept=0 remaining=19` — the drain's
-                    // probes spent the whole 239s and the sweep, which is what
-                    // certifies partitions and builds rollups, did not run at all.
-                    // Trading a starved sweep for a starved drain is not a fix.
+                    // ONE budget for the whole pass (overrunning skips every later
+                    // tick via maintenance_job_sem), SPLIT between its two
+                    // sequential halves so the drain can't spend it all before the
+                    // sweep — which is what certifies partitions — ever runs.
                     let budget = db.config.derived.tick_budget(cron_period(&db.config.maintenance.timefusion_dedup_schedule));
                     let now = std::time::Instant::now();
-                    // The drain gets the larger share: it is the half that
-                    // physically removes duplicates, and the sweep's work is
-                    // resumable at a cursor while a half-drained bin is not.
+                    // The drain gets the larger share: it physically removes
+                    // duplicates, and the sweep resumes at a cursor while a
+                    // half-drained bin does not.
                     let drain_deadline = now + budget.mul_f64(0.6);
                     let sweep_deadline = now + budget;
-                    // ROTATE the table order. The budget is shared across every
-                    // table, so a fixed order means the first table spends it and
-                    // the rest are served in name order forever — prod 2026-08-13
-                    // reached `otel_metrics` with `budget_secs=0` and swept 0 of
-                    // its 19 items on every tick, while `otel_logs_and_spans` ran
-                    // first every time. Same starvation the sweep and packing
-                    // cursors already fix, one level up.
+                    // ROTATE the table order — a fixed order lets the first table
+                    // spend the shared budget and starve the rest forever.
                     let mut tables = db.all_tables().await;
                     let start = sweep_resume_offset(tables.len(), db.dedup_table_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
                     tables.rotate_left(start);
@@ -4179,20 +3894,13 @@ impl Database {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
-                        // Rollup-declared sources are now owned by durable
-                        // ten-minute coordinator tasks. Keep this legacy cron
-                        // only for tables that have no slice lifecycle yet.
-                        //
-                        // Re-enabling the drain here (954d516) WEDGED the tier and
-                        // was reverted in d5688fd: drain_deadline bounds admission
-                        // only, so a bin already admitted runs to
-                        // DEDUP_BIN_STAGE_DEADLINE = 3600s while holding
-                        // maintenance_job_sem — two permits can hold the pass an
-                        // hour past its ~144s budget and every other maintenance
-                        // job is skipped. A timed-out bin discards its staged
-                        // work, so the hour buys nothing. Staging must become
-                        // resumable, and the drain needs its own budget rather
-                        // than the shared job semaphore, before this comes back.
+                        // Rollup-declared sources are owned by durable coordinator
+                        // tasks; this legacy cron serves only tables with no slice
+                        // lifecycle. Do NOT re-enable the drain here (954d516,
+                        // reverted d5688fd): drain_deadline bounds admission only,
+                        // so one admitted bin can hold maintenance_job_sem for its
+                        // 3600s stage deadline and wedge every other job. Staging
+                        // must become resumable and the drain needs its own budget first.
                         if get_schema(&table_name).is_some_and(|schema| !schema.rollups.is_empty()) {
                             continue;
                         }
@@ -4368,26 +4076,12 @@ impl Database {
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
 
-        // INCIDENT 2026-07-31 (7d68f01): during the ~30 min that commit was live,
-        // TF wrote parquet files into the LIVE `otel_logs_and_spans` table whose
-        // physical schema had `timestamp` (and `id`) NULLABLE, while the YAML —
-        // and therefore every logical plan — declares them NOT NULL. Those files
-        // are permanent table content: the rollback restored the binary, but it
-        // cannot un-write them, and no `metaData` action was ever committed so
-        // the Delta schema itself is unchanged and there is nothing to "fix".
-        //
-        // DataFusion then rejects any aggregate grouping on such a column:
-        //   Internal error: Physical input schema should be the same as the one
-        //   converted from logical input schema. Differences: field nullability
-        //   at index 0 [timestamp]: (physical) true vs (logical) false.
-        // which took out every `GROUP BY time_bucket(timestamp)` dashboard on
-        // every project (`GROUP BY status_code` was fine; `otel_metrics` was
-        // unaffected). This flag exists for exactly that physical-vs-logical
-        // nullability mismatch. Widening nullability is always SAFE to read: a
-        // column declared NOT NULL simply has no nulls to observe.
-        //
-        // Keep it set until those files have aged out of retention or been
-        // rewritten by compaction; removing it re-breaks the dashboards.
+        // INCIDENT 2026-07-31 (7d68f01): a briefly-live commit wrote permanent
+        // parquet whose physical schema has `timestamp`/`id` NULLABLE while the
+        // YAML declares NOT NULL, and DataFusion rejects aggregates grouped on
+        // such columns (physical-vs-logical nullability mismatch) — which took
+        // out every time_bucket dashboard. Widened nullability is always safe to
+        // read; keep this set until those files age out or are rewritten.
         let _ = options.set("datafusion.execution.skip_physical_aggregate_schema_check", "true");
 
         // Must be false: delta_kernel's unshredded_variant() schema uses Binary (not BinaryView).

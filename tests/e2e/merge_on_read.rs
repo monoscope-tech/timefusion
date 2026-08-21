@@ -39,6 +39,21 @@ async fn name_of(client: &tokio_postgres::Client, id: &str) -> anyhow::Result<Op
     Ok(rows.first().map(|r| r.get(0)))
 }
 
+fn scan_metric(line: &str, name: &str) -> Option<i64> {
+    let i = line.rfind(name)?;
+    line[i + name.len()..].split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok()
+}
+
+async fn explain_analyze(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<String> {
+    Ok(client
+        .query(&format!("EXPLAIN ANALYZE {sql}"), &[])
+        .await?
+        .iter()
+        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// THE regression this whole design turns on. An UPDATE appends a new version
 /// carrying the row's ORIGINAL timestamp, so it lands in a bucket whose window
 /// Delta already holds every other row for. If that bucket is left to claim the
@@ -89,6 +104,24 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
     env.force_evict().await?;
     assert_eq!(name_of(&client, "row3").await?.as_deref(), Some("enriched"), "the newer version must survive its own flush + demotion");
     assert_eq!(count(&client).await?, 8, "flushing the appended version must not double-count it");
+
+    // The user-visible purpose of absorbing the late drain: after the update
+    // itself has been demoted, a bounded query wholly inside the Arrow-covered
+    // window must get both base and enriched rows from Arrow and emit ZERO
+    // Delta rows. Correct final results alone do not prove this — DedupExec can
+    // hide a full duplicate Delta read, which was the production regression.
+    let lo = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS - 1).unwrap().format("%Y-%m-%d %H:%M:%S%.f");
+    let hi = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS + 9).unwrap().format("%Y-%m-%d %H:%M:%S%.f");
+    let sql = format!(
+        "SELECT name FROM mor_versioned WHERE project_id = '{PROJECT}' \
+         AND timestamp >= '{lo}' AND timestamp < '{hi}'"
+    );
+    let hot_before = env.snapshot_stats().hot_tier.read_hits;
+    let plan = explain_analyze(&client, &sql).await?;
+    assert!(env.snapshot_stats().hot_tier.read_hits > hot_before, "the bounded query did not use Arrow.\nplan:\n{plan}");
+    for delta in plan.lines().filter(|line| line.contains("DeltaScanExec")) {
+        assert_eq!(scan_metric(delta, "output_rows="), Some(0), "Delta emitted rows already absorbed by the Arrow bucket.\nplan:\n{plan}");
+    }
 
     Ok(())
 }
