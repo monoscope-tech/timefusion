@@ -129,22 +129,43 @@ index at day+shard granularity rather than per file.
 1. **Foyer coverage** (companion item 1) — unchanged, still the cheapest win,
    and note l2 is 131GB of a 600GB budget with 1.1TB host free. Fixes *cold*
    (130ms/open → 19ms/open). Does **not** fix warm 30d.
-2. **Compaction to <20 files/project-day** (companion item 3) — promoted, it
-   is the multiplier on everything below, 3–6x. Still insufficient alone.
+2. **Compaction to <20 files/project-day** (companion item 3) — promoted to
+   the top of the code-work list: file count multiplies planning, opens and
+   decode alike, so it is the only lever that attacks all three. 3–6x. Still
+   insufficient alone for 30d.
 3. **Pre-open file pruning index (NEW, and the load-bearing one for 30d)** —
-   resident per-file trace-key sketches consulted at plan time. Without this,
-   the 30-day goal is unreachable by tuning; with it, window width stops
-   being a cost multiplier for point lookups.
+   resident per-file trace-key sketches, consulted **at plan time so the
+   file-action list itself shrinks** (otherwise it removes the opens and
+   leaves the ~3s planning). Without this, the 30-day goal is unreachable by
+   tuning; with it, window width stops being a cost multiplier for point
+   lookups.
 4. Wide *aggregates* over 30d are already solved by rollups (845ms measured) —
    this document is about point lookups, which rollups cannot serve.
 
-## Open question, flagged not answered
+## Second cost centre: planning is ~3s before a single byte is read
 
-`time_elapsed_opening=4.39s` is far larger than `metadata_load_time=58ms`, so
-"opening" is dominated by something other than footer parse — per-file task
-setup, the bloom fetch round trip, or page-index load. Worth attributing
-before sizing item 3's exact target, since it sets the real per-open floor.
-It does not change the conclusion: the fix is to stop opening files.
+Timing `EXPLAIN` (planning only, no execution) against `EXPLAIN ANALYZE` at 7d:
+
+| statement | wall |
+|---|---|
+| `EXPLAIN` (plan only, 0 rows read) | **2.6–3.1s** |
+| `EXPLAIN ANALYZE`, 2 projected columns | 3.2s |
+| full query, 12 projected columns incl. `to_jsonb(summary)` | 8.9s |
+
+So the 7d budget decomposes roughly as **~3s planning + ~0.2s to reach the
+17 rows + ~5.7s decoding the wide projection**. Planning is a third of the
+cost and produces no data at all: it is delta snapshot handling and pruning
+across the file-action list, and it scales with the same file count as
+everything else. Note also that widening the projection from 2 to 12 columns
+costs ~5.7s for the *same 17 rows* — worth its own attribution pass, since
+`bytes_scanned` was only 23.6MB.
+
+This **raises the value of compaction** relative to the companion doc's
+ordering: file count is the multiplier on planning *and* opens *and* decode,
+so it is the only lever that attacks all three. It also means a pre-open
+pruning index must be consulted early enough to shorten the planning file
+list, not just the execution one — otherwise it removes the opens and leaves
+the 3s.
 
 ## Not in scope, deliberately
 
