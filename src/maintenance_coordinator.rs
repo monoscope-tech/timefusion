@@ -101,7 +101,13 @@ pub const fn operation_deadline_secs(operation: Operation) -> u64 {
 }
 
 pub fn is_capacity_failure(message: &str) -> bool {
-    message.contains("Resources exhausted") || message.contains("Not enough memory to continue external sort")
+    // "resource_admission" belongs here by definition: the unit's ESTIMATE
+    // exceeds what admission can ever grant, so it fails identically every
+    // pass. Before it was included, a 1.1TB-estimate day-wide Repair looped
+    // at its 1s admission-retry delay for DAYS (prod 2026-08-21, attempts
+    // 140-211): never claimed a worker, never timed out, so neither
+    // abandon_running's split nor its backoff floor ever fired.
+    message.contains("Resources exhausted") || message.contains("Not enough memory to continue external sort") || message.contains("resource_admission")
 }
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
@@ -1688,6 +1694,10 @@ impl TaskJournal {
         })
     }
 
+    pub fn attempts(&self, key: &TaskKey) -> u32 {
+        self.task_indices.get(key).and_then(|index| self.snapshot.tasks.get(*index)).map_or(0, |task| task.attempts)
+    }
+
     pub fn retry(&mut self, key: &TaskKey, reason: String, not_before_micros: i64) -> bool {
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let task = &mut self.snapshot.tasks[index];
@@ -1789,6 +1799,17 @@ impl TaskJournal {
         if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1)) {
             return;
         }
+        // Split refused (already at minimum width, or would hash-shard) on a
+        // REPEATED capacity failure: the caller's delay is tuned for transient
+        // contention (1s for admission), which turns an unfittable unit into a
+        // hot loop that increments attempts every second. Escalate the delay
+        // with the evidence instead — same exponential abandon_running uses.
+        let when_micros = if attempts >= 2 && is_capacity_failure(&reason) {
+            let backoff = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+            when_micros.max(crate::support::now_micros().saturating_add(backoff))
+        } else {
+            when_micros
+        };
         self.retry(key, reason, when_micros);
     }
 
@@ -2431,6 +2452,59 @@ mod tests {
         journal.abandon_running(&key, 0);
         let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
         assert_eq!(not_before, 2 * 1_000_000, "one failure retries on plain exponential backoff, not the deadline floor");
+    }
+
+    /// A fast-fail retry (resource admission) repeats identically at the same
+    /// size: the estimate exceeds what admission can ever grant. This was the
+    /// ONE retry path with no split — prod 2026-08-21, a 1.1TB-estimate
+    /// day-wide Repair looped at its 1s admission delay for days (attempts
+    /// 140-211), never claiming a worker, so neither abandon_running's split
+    /// nor its floor ever fired. Routed through retry_or_split, a repeated
+    /// admission failure bisects like any other capacity failure.
+    #[test]
+    fn a_repeated_admission_failure_splits_instead_of_hot_looping() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let day = 86_400_000_000;
+        let mut unit = task("p", 0, day, Operation::Repair);
+        unit.attempts = 3;
+        unit.estimated_decoded_bytes = 1_100_000_000_000; // the observed 1.1TB
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        journal.retry_or_split(&key, "resource_admission".into(), 1_000_000, 3);
+
+        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "an unadmittable unit must split, not requeue whole");
+        let children: Vec<_> = journal.tasks().filter(|t| t.key != key && t.state == TaskState::Pending).collect();
+        assert_eq!(children.len(), 2, "one bisection: two half-day children");
+        assert!(children.iter().all(|t| t.attempts == 0));
+    }
+
+    /// When the split is REFUSED (already at minimum width), a repeated
+    /// capacity failure must not keep the caller's transient-tuned delay: a 1s
+    /// admission retry on an unfittable unit is a hot loop that increments
+    /// attempts every second forever. The delay escalates with the evidence.
+    #[test]
+    fn a_split_refused_capacity_retry_escalates_its_delay() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Single MIN_SLICE unit: byte_bounded_units would hash-shard, so the
+        // split declines.
+        let mut unit = task("p", 0, MIN_SLICE_MICROS, Operation::Repair);
+        unit.attempts = 6;
+        unit.estimated_decoded_bytes = 1_100_000_000_000;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        let now = crate::support::now_micros();
+        journal.retry_or_split(&key, "resource_admission".into(), now + 1_000_000, 6);
+
+        let not_before = journal.tasks().find(|t| t.key == key).map(|t| t.deadline_micros).expect("requeued");
+        assert!(
+            not_before >= now + (1 << 6) * 1_000_000,
+            "sixth identical capacity failure must wait 2^6s, not the 1s admission delay (waited {}s)",
+            (not_before - now) / 1_000_000
+        );
     }
 
     /// The planner re-derives file debt every 60s and enqueues the same day-wide

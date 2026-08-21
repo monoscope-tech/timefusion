@@ -14,7 +14,13 @@ impl Database {
     fn retry_task(&self, key: &crate::maintenance_coordinator::TaskKey, reason: String, delay: std::time::Duration) -> Result<()> {
         let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
         let mut journal = self.journal();
-        journal.retry(key, reason, crate::support::now_micros().saturating_add(delay_micros));
+        // Route through retry_or_split, not retry: a fast-fail retry (resource
+        // admission, memory) repeats identically at the same size, and this was
+        // the one retry path with NO split — a day-wide Repair whose estimate
+        // can never be admitted looped here at 1s for days (attempts 140-211,
+        // prod 2026-08-21) without ever reaching abandon_running's bisection.
+        let attempts = journal.attempts(key);
+        journal.retry_or_split(key, reason, crate::support::now_micros().saturating_add(delay_micros), attempts);
         journal.checkpoint()
     }
 
