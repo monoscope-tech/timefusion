@@ -2639,6 +2639,18 @@ impl Database {
             }
             info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
         }
+        // Reload accumulated slice coverage for the same reason — the journal
+        // durably skips completed slices, so losing their evidence on restart
+        // makes any day that straddles one permanently uncertifiable. Stale
+        // entries are harmless: `record_clean_slice` recomputes the live fp on
+        // every merge and the grant path re-checks it one final time.
+        let dedup_slice_coverage: Arc<dashmap::DashMap<(String, String, String), SliceCoverage>> = Arc::new(dashmap::DashMap::new());
+        if cfg.maintenance.timefusion_dedup_certification_persist {
+            for e in crate::storage::load_sidecar::<crate::storage::StoredSliceCoverage>(&cfg.core.timefusion_data_dir, crate::storage::SLICE_COVERAGE) {
+                dedup_slice_coverage.insert((e.project_id, e.table_name, e.date), SliceCoverage { fp: e.fp, intervals: e.intervals });
+            }
+            info!(loaded = dedup_slice_coverage.len(), event = "dedup_slice_coverage_loaded");
+        }
         let aws_endpoint = &cfg.aws.aws_s3_endpoint;
         let aws_url = Url::parse(aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
@@ -2740,7 +2752,7 @@ impl Database {
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp,
             dedup_certification_persist_lock: Arc::new(std::sync::Mutex::new(())),
-            dedup_slice_coverage: Arc::new(dashmap::DashMap::new()),
+            dedup_slice_coverage,
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
@@ -10008,6 +10020,40 @@ mod tests {
         assert!(!db.dedup_clean_fp.contains_key(&key), "half a day proves nothing on its own");
         assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run");
         assert!(db.dedup_clean_fp.contains_key(&key), "two clean halves cover the day and must certify the partition");
+        Ok(())
+    }
+
+    /// Accumulated slice coverage must survive a restart.
+    ///
+    /// Prod restarts every 1-2h and a day needs ~8 clean 3h slices; the journal
+    /// durably marks completed slices Complete (never re-run) while the coverage
+    /// evidence lived only in memory — so a day straddling any restart could
+    /// NEVER certify, and cert_granted_total stayed 0 (diagnosed 2026-08-21).
+    #[tokio::test]
+    #[serial]
+    async fn slice_coverage_survives_a_restart() -> Result<()> {
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let cfg = create_test_config("slice-cov-restart");
+        let db = Database::with_config(cfg.clone()).await?;
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
+        let date = day.date_naive();
+        let day_start = midnight_micros(date);
+        let half = day_start + DAY_MICROS / 2;
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+
+        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
+        assert!(!db.dedup_clean_fp.contains_key(&key));
+        drop(db); // the restart: coverage evidence must not die with the process
+
+        let db = Database::with_config(cfg).await?;
+        assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run post-restart");
+        assert!(
+            db.dedup_clean_fp.contains_key(&key),
+            "coverage accumulated before the restart plus the post-restart half must certify; \
+             losing it on restart is why prod (restarting every 1-2h) never granted"
+        );
         Ok(())
     }
 
