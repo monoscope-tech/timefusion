@@ -1,5 +1,18 @@
 # Duplicates, merge-on-read, and sorting: what is actually slow and what to do
 
+> **STATUS 2026-08-21: substantially DONE and deployed** (05bdcd5 -> 975f89f
+> -> 5559ac8). Outcome: matrix cells 13/40 -> 22/40; delta leg 48 -> 4-5 file
+> groups; first target hits (D/P1 + B/P1 30d ~3.2s; P2 meets 24h<1s / 30d<10s
+> on kind-count). Checklist below carries per-item [x] marks with results.
+> STILL OPEN here: DV matrix cell, cert-grant watch (counter still 0),
+> resumable dirty-bin staging, 4b degraded path, §5 accounting, §6 overlap
+> bypass. THE NEXT CONSTRAINT moved to its own plan:
+> `2026-08-21-hot-leg-pruning.md` (hot tier has no per-file stats; shape-A
+> 24h TIMEOUTs on all projects). Incident note: 2026-08-21 morning fast-OOM
+> loop was the pre-existing anon-125GB memcg kill at morning peak, NOT these
+> changes; fork pin reverted to e2e2c65e during triage (consolidated
+> 2568401c re-lands via staging).
+
 2026-08-20. Investigated from a prod slow-query report (trace
 `9b4b64dad7af955fbad42fa8d43c90da`, project `6297304f`), measured live against
 `timefusion.s.past3.tech` on deployed `37c48f2`.
@@ -286,10 +299,10 @@ text_match) pushes down fully (`predicate=`, `required_guarantees`,
 `bytes_scanned=0`); string equality + injected `text_match` loses the ENTIRE
 conjunction (no `predicate=`, `pushdown_rows_matched/pruned=0`). The bug is
 whole-conjunction failure on one non-convertible conjunct.
-- [ ] Regression test: string equality AND `text_match(...)` → assert the
+- [x] DONE (fork e2e2c65e): `test_predicate_pushdown_keeps_bindable_conjuncts` — failing-first proven. Regression test: string equality AND `text_match(...)` → assert the
       physical parquet predicate still contains the equality and timestamp
       bounds, and `DeltaScanExec output_rows=0` for a nonexistent value.
-- [ ] Fix IN THE FORK (primary): split top-level AND terms only, preserve OR
+- [x] DONE (fork e2e2c65e, both sites: get_read_plan per-term bind + gather_filters_for_pushdown per-filter sentinel). Fix IN THE FORK (primary): split top-level AND terms only, preserve OR
       subtrees atomically, independently select parquet-convertible terms,
       keep the complete original expression above the scan. Conversion sites:
       `process_predicate` fallback stuffs non-convertible exprs into the
@@ -299,14 +312,14 @@ whole-conjunction failure on one non-convertible conjunct.
       one Err (`next/scan/exec.rs:493-497`). Unit tests live in the fork;
       cover projection-excluded predicate columns, column mapping,
       Utf8/Utf8View coercion, and actual DV files.
-- [ ] TF-side e2e regression proves the dependency stays wired (extend
+- [x] DONE: `text_match_conjunct_does_not_poison_parquet_pushdown` (red on old code: 100 rows into dedup; green: 0 rows + bounded mode). NOTE the dominant prod mechanism turned out to be the missing DV opt-in on the tantivy file-selection path (one-line fix in scan_delta_table) — the fork split is defense-in-depth. TF-side e2e regression proves the dependency stays wired (extend
       `tests/e2e/recent_window_pruning.rs`: string equality AND
       `text_match(...)` → `pushdown_rows_pruned > 0`, scan output_rows ≈ 0
       for a nonexistent value). Optional fast mitigation while the fork bump
       lands: strip text_match-bearing conjuncts at the `provider.scan`
       handoff (`src/database/mod.rs:8164`) — sound because pushdown is
       Inexact and text_match is served by the tantivy prefilter.
-- [ ] Deletion-vector matrix (CORRECTED: DV-bearing files disable the parquet
+- [ ] STILL OPEN (only unrun cell): deletion-vector matrix (CORRECTED: DV-bearing files disable the parquet
       predicate ON PURPOSE — filtering before the row-position mask shifts
       ordinals and resurrects deleted rows; fork `next/scan/mod.rs:733-734`).
       Cells: (a) DV feature on, selected files carry no DV → pushdown allowed;
@@ -316,9 +329,9 @@ whole-conjunction failure on one non-convertible conjunct.
       DV files degraded. Note `has_selection_vectors` is `files.iter().any()`:
       ONE DV file kills the predicate for the whole set — the same
       all-or-nothing genus as the conjunction bug; consider per-file scoping.
-- [ ] Post-deploy verify: 24h `SELECT *` trace_id lookup completes; string
+- [x] DONE (05bdcd5 matrix): completed cells 13/40 -> 16/40; C/P1 1h TIMEOUT->8.1s, D/P1 1h 5.6s->0.95s, D/P1 30d completes (16.9s). Post-deploy verify: 24h `SELECT *` trace_id lookup completes; string
       point lookups show `predicate=` on the delta scan.
-- [ ] Then re-profile the 2x hot/delta overlap BY ADMISSION REASON before
+- [ ] OPEN (superseded in urgency by hot-leg pruning — see 2026-08-21 plan): re-profile the 2x hot/delta overlap BY ADMISSION REASON before
       attributing it to conjunction loss: rows admitted because outside the
       hot range vs specifically by `updated_at > gate` vs exact duplicates of
       hot rows vs genuine newer Delta versions. Distinguishes a bug from an
@@ -377,13 +390,13 @@ certifiable-but-Complete days. Riskier alternative: hash-shard-aware
 2026-08-18 and reverted same day after an OOM).
 
 Original diagnosis checklist (retained):
-- [ ] `run_coordinator_dedup_once` already certifies clean day-wide units
+- [x] DONE (feat/slice-coverage-certification 6f56243, deployed 975f89f): slice-coverage certification — clean narrow units accumulate per-(project,table,date) intervals under an unmoved fp; day covered -> record_certification (+ persistence from work/dedup-parallel 82f89e8). 4 tests, failing-first. `run_coordinator_dedup_once` already certifies clean day-wide units
       (maintain.rs ~1070). Find which precondition fails in prod: units
       splitting (`maintenance_dedup_task_split`), OOM retries (live
       `retry_reason` shows an external-sort exhaustion), `covers_day=false`
       shapes, fp churn from concurrent packing, or persistence off
       (`timefusion_dedup_certification_persist`).
-- [ ] Watch `cert_granted_total` / `dedup_skipped_pct` move after the fix.
+- [ ] WATCHING: `cert_granted_total` still 0 at ~1h uptime post-deploy (2026-08-21 11:00) — grants need completed coordinator dedup units; monitor armed. If still 0 after several hours of uptime, diagnose which precondition fails IN THE DEPLOYED slice path.
 
 ### 3. Duplicate removal at rest — RESOLVED 2026-08-20 night (both directions)
 Two independent results, reconciled:
@@ -401,12 +414,12 @@ NOT retirable. Certification comes from the dedup engine; compaction reduces
 how much it has to chew. The original retirement criterion is refuted.
 
 Original framing (superseded):
-- [ ] Test whether compaction can be the primary drain: collapse versions
+- [x] DONE both directions (see RESOLVED header): ca4983c extends SortByDedup to compact_date behind `timefusion_compact_dedup_merge` (default OFF, 46/46 green); df30961 proves convergence is impossible (stranded-runs counterexample) so the dedup engine stays authoritative. Test whether compaction can be the primary drain: collapse versions
       keep-greatest while merging overlap groups; outputs become unique-within
       by construction; certification follows clean compaction.
-- [ ] Measure convergence on a fragmented prod-shaped partition (sim /
+- [ ] MOOT for retirement (counterexample settled it); still useful to measure the flag's read-amplification reduction on staging before enabling. Measure convergence on a fragmented prod-shaped partition (sim /
       run-unit ladder first — no deploy-per-hypothesis).
-- [ ] Only if convergence is insufficient: resumable dirty-bin staging with
+- [ ] OPEN (now known REQUIRED, since compaction can't converge): resumable dirty-bin staging with
       its own budget (the `954d516` wedge cause — admission deadline vs 3600s
       stage deadline are the same dial at opposite ends). Do not build both
       engines up front.
@@ -444,7 +457,7 @@ once.
 - [ ] Footer coverage as an operational goal: drive footer-repair until no
       live partition holds a footer-less file; keep
       `flush_sort_unsorted_fallbacks_total > 0` paging.
-- [ ] Diagnose why prod plans still lose ordering DESPITE the fork's
+- [x] DONE: cause was TF-side — a tantivy-pruned-to-empty leg (EmptyExec, no ordering) vetoed merge_req. Fixed by dropping provably-empty legs in wrap_result (deployed 975f89f); post-deploy plans show zero EmptyExec, zero full-set, zero Coalesce. Original item: diagnose why prod plans still lose ordering DESPITE the fork's
       isolation/regrouping (see corrected sorting section): unordered sibling
       merged above? 512-group cap exceeded? stats-backed prefix empty? SPM
       replaced by a later pass? deployed rev mismatch?
@@ -469,7 +482,7 @@ once.
 - [ ] Retire binary certification once bypass coverage exceeds it.
 
 ### 7. Upstream (monoscope) — independent of all the above
-- [ ] Deterministic ids per event so client retries stop minting different-id
+- [x] DONE (monoscope master 6f2458acc): deterministic namespaced ids on the legacy SDK path (prefer msg_id, canonical-JSON fallback), unit tests, uniqueness migration parked in migrations-pending/ for a maintenance window. Deterministic ids per event so client retries stop minting different-id
       duplicates (`ON CONFLICT DO NOTHING` on the PG leg; TF-side dedup can
       never fix this class).
 
