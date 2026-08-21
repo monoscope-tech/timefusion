@@ -190,3 +190,22 @@ planning is a minor term and execution dominates — the reverse of 7d.
 "19ms/open" number derived the same way). The compaction and resident-index
 conclusions may well hold, but this number cannot carry them — the file-open
 wall needs a wall-clock measurement it does not yet have.
+
+### Addendum note on the paired foyer change (c8e03ac)
+
+`ttl 7d→35d` and `cache_recent_days 8→35` are live in prod now
+(`timefusion_stats` reports `ttl_seconds=3024000`, `cache_recent_days=35`),
+but **`disk_gb` is still 600** — and it is env-pinned on CapRover, so the code
+default is not the lever.
+
+Sizing concern: l2 sat at ~131GB steady-state under an 8-day admission window
+and is at ~136GB and climbing. Scaling the admission window 8d→35d scales the
+resident set roughly 4.4x, i.e. toward **~575GB against a 600GB cap** — ~95%
+full, where foyer is evicting oldest-first continuously and the 30-day tail
+(the exact band this change exists to warm) is the first thing evicted.
+
+The companion doc's item 1 called for `disk_gb` 600→~900 of the 1.1TB free,
+and this change shipped the horizon half without the capacity half. They are
+one change: without the disk raise, the expansion partly self-defeats. Watch
+`foyer.evictions` (9,812 at the time of writing) and `l2_used_bytes` over the
+next day — a rising eviction rate with l2 pinned near 600GB is the signature.
