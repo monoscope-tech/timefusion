@@ -121,3 +121,26 @@ free, sealed consolidation reaches the backlog — the direct path to P2's
 failing files (footer_repair_quarantined) still need off-box
 `optimize --recompress`; convergence itself is now unblocked but is
 wall-clock work over days.
+
+
+## Final night status (2026-08-22 ~01:00)
+
+Post-fix verification revised the picture once more: the surviving day-wide
+Repair starts at ~2.8min cadence are NOT a loop — Repair takes ONE candidate
+file per claim (take(1)) and requeues with `compaction_debt_remaining` while
+debt remains; attempts is a loop counter on this path. The unit is
+progressing (~21 files/h on 87576849). With resurrection (1824627) and the
+admission hot-loop (525f6ec) both closed, the maintenance tier is draining.
+
+Time-gated residuals (nothing further is code-actionable tonight):
+- cert_granted_total: still 0 — needs full clean-slice day-sets to complete;
+  evidence now durable across restarts. RE-CHECK after ~24h; if still 0 with
+  completed sealed dedup days, diagnose the grant keying.
+- Repair/consolidation backlog: 529 pending days at ~1 file/2.8min/worker —
+  days of wall clock; timeout rate should fall as day units bisect.
+- P2 3.7s floor + remaining wide-window TIMEOUTs: re-run
+  bench_per_project/run_bench.sh after ~24-48h of drain.
+- Deterministic-failing files (footer_repair_quarantined): off-box
+  `timefusion optimize --recompress` maintenance window.
+- Observability gap worth one small PR: `journal.retry()` logs nothing — the
+  night's two hardest diagnoses both stalled on invisible retry reasons.
