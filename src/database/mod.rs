@@ -204,8 +204,6 @@ pub mod scan_metric_names {
     pub const WIDE_SCAN_OVERSIZE_TOTAL: &str = "timefusion.scan.wide_scan_oversize_total";
     pub const MEM_PLAN_US_TOTAL: &str = "timefusion.scan.mem_plan_us_total";
     pub const MEM_PLAN_TOTAL: &str = "timefusion.scan.mem_plan_total";
-    pub const HOT_PLAN_US_TOTAL: &str = "timefusion.scan.hot_plan_us_total";
-    pub const HOT_PLAN_TOTAL: &str = "timefusion.scan.hot_plan_total";
     pub const PGWIRE_TOTAL: &str = "timefusion.scan.pgwire_total";
     pub const DECODE_BYTES_TOTAL: &str = "timefusion.scan.decode_bytes_total";
     pub const DECODE_PRESSURE_THROTTLED: &str = "timefusion.scan.decode_pressure_throttled";
@@ -8942,27 +8940,11 @@ impl TableProvider for ProjectRoutingTable {
         metrics::counter!(scan_metric_names::MEM_PLAN_US_TOTAL).increment(mem_plan_started.elapsed().as_micros() as u64);
         let mem_partitions = mem_leg.partitions;
 
-        // Hot-tier third leg (P1) — see `HotTier::scan` for the coverage
-        // contract. Consulted only when Delta is actually scanned (the tier
-        // holds only flushed data) and only for shallow scans — past its
-        // retention window the tier is a fraction of the answer, so a 7d scan
-        // would open every file in it for nothing. DEDUP: a non-empty hot leg
-        // forces the union path, which never sets `skip_dedup` (the hot leg
-        // serves pre-dedup rows and relies on `DedupExec`).
-        let too_deep = crate::hot_tier::skip_for_lookback(self.scan_lookback_micros(&optimized_filters));
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
-        let hot_plan_started = std::time::Instant::now();
-        let hot: crate::hot_tier::HotLeg = match skip_delta || too_deep {
-            true => Default::default(),
-            false => layer.hot_tier().scan(&project_id, &self.table_name, query_time_range, &mem_ranges, &optimized_filters, &self.schema, projection),
-        };
-        metrics::counter!(scan_metric_names::HOT_PLAN_TOTAL).increment(1);
-        metrics::counter!(scan_metric_names::HOT_PLAN_US_TOTAL).increment(hot_plan_started.elapsed().as_micros() as u64);
-        let (hot_plan, hot_ranges, version_gate) = (hot.plan, hot.ranges, hot.version_gate);
 
         // Nothing above Delta to union with: query Delta alone.
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
-        if mem_partitions.is_empty() && hot_plan.is_none() && hot_ranges.is_empty() {
+        if mem_partitions.is_empty() {
             debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
             scan_state.lock().has_delta = true;
             // Same guard for the dedup gate and the scan (see branch above, and
@@ -9024,20 +9006,11 @@ impl TableProvider for ProjectRoutingTable {
         let mut delta_filters = optimized_filters.clone();
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
-        let version_col = table_schema.as_ref().filter(|s| s.version_append).and_then(|s| s.dedup_tiebreak.clone());
-        for (start, end) in crate::write::mem_buffer::merge_ranges([mem_ranges, hot_ranges].concat()) {
+        for (start, end) in crate::write::mem_buffer::merge_ranges(mem_ranges) {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(start) });
             let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(end) });
-            let outside = Expr::BinaryExpr(BinaryExpr { left: Box::new(below), op: Operator::Or, right: Box::new(at_or_above) });
-            delta_filters.push(match (&version_col, version_gate) {
-                (Some(c), Some(g)) => Expr::BinaryExpr(BinaryExpr {
-                    left: Box::new(outside),
-                    op: Operator::Or,
-                    right: Box::new(Expr::BinaryExpr(BinaryExpr { left: Box::new(col(c)), op: Operator::Gt, right: ts_lit(g) })),
-                }),
-                _ => outside,
-            });
+            delta_filters.push(Expr::BinaryExpr(BinaryExpr { left: Box::new(below), op: Operator::Or, right: Box::new(at_or_above) }));
         }
         // Execute Delta query — fast path skips the 3 tokio RwLock `.await`s
         // when we've already resolved this (project, table) pair before.
@@ -9069,16 +9042,13 @@ impl TableProvider for ProjectRoutingTable {
             .await?;
         scan_state.lock().has_delta = true;
 
-        // Union the legs in recency order — mem, then hot tier, then Delta — so
-        // DedupExec's keep-first favours the freshest copy of a row. The hot leg
-        // arrives already built (projected, filtered and ordering-declared by
-        // `HotTier::scan`), so there is nothing left to assemble here.
+        // Union the legs in recency order — mem, then Delta — so DedupExec's
+        // keep-first favours the freshest copy of a row.
         //
         // Identity travels WITH the plan, so the flatten cannot desynchronise it
         // from the sortability it implies (see `wrap_result`).
         use crate::read::LegKind;
-        let mut legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> =
-            [mem_plan.map(|p| (p, LegKind::Mem)), hot_plan.map(|p| (p, LegKind::Hot))].into_iter().flatten().collect();
+        let mut legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> = mem_plan.map(|p| (p, LegKind::Mem)).into_iter().collect();
         legs.extend(delta_plans.into_iter().map(|p| (p, LegKind::Delta)));
         wrap_result(legs)
     }

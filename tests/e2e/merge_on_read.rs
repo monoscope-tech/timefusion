@@ -4,7 +4,7 @@
 //!
 //! These run against `mor_versioned` — the only shipped schema with
 //! `version_append: true` — through the full prod path (pgwire → WAL →
-//! MemBuffer → flush → Delta → hot tier), because every bug this file guards
+//! MemBuffer → flush → Delta), because every bug this file guards
 //! against is an interaction between those layers rather than anything visible
 //! to a unit test.
 
@@ -39,33 +39,16 @@ async fn name_of(client: &tokio_postgres::Client, id: &str) -> anyhow::Result<Op
     Ok(rows.first().map(|r| r.get(0)))
 }
 
-fn scan_metric(line: &str, name: &str) -> Option<i64> {
-    let i = line.rfind(name)?;
-    line[i + name.len()..].split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok()
-}
-
-async fn explain_analyze(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<String> {
-    Ok(client
-        .query(&format!("EXPLAIN ANALYZE {sql}"), &[])
-        .await?
-        .iter()
-        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
 /// THE regression this whole design turns on. An UPDATE appends a new version
 /// carrying the row's ORIGINAL timestamp, so it lands in a bucket whose window
 /// Delta already holds every other row for. If that bucket is left to claim the
 /// window (MemBuffer authoritative ⇒ Delta excluded), the update makes every
 /// UNTOUCHED row in the window vanish — a 1-row statement silently deleting
 /// thousands. Guarded by `BufferedWriteLayer::insert_versions`.
-///
-/// Also asserts what the feature exists for: the hot tier is NOT invalidated.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
     let client = env.pg_client().await?;
 
     // All eight rows share one bucket, so the updated row's window is exactly
@@ -75,15 +58,12 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
     }
     assert_eq!(count(&client).await?, 8, "baseline");
 
-    // Commit to Delta and demote the drained bucket, so the update below is
-    // resolved against rows that live in Delta + the hot tier, not MemBuffer.
-    // The clock must leave the rows' bucket first — only a SEALED bucket is
-    // flushable, and only a drained one is demoted.
+    // Commit to Delta so the update below is resolved against rows that live
+    // in Delta, not MemBuffer. The clock must leave the rows' bucket first —
+    // only a SEALED bucket is flushable.
     support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
     env.force_flush().await?;
     env.force_evict().await?;
-    let before = env.snapshot_stats().hot_tier;
-    assert!(before.files > 0, "the bucket must have been demoted for this test to mean anything ({before:?})");
 
     client.execute("UPDATE mor_versioned SET name = 'enriched' WHERE project_id = $1 AND id = 'row3'", &[&PROJECT]).await?;
 
@@ -91,37 +71,13 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
     assert_eq!(name_of(&client, "row3").await?.as_deref(), Some("enriched"), "the appended version must win");
     assert_eq!(name_of(&client, "row4").await?.as_deref(), Some("base"), "a sibling row must be untouched");
 
-    // The point of merge-on-read: demoted files are still valid, because
-    // nothing they hold was rewritten.
-    let after = env.snapshot_stats().hot_tier;
-    assert_eq!(after.invalidated, before.invalidated, "merge-on-read must not invalidate hot-tier files ({after:?})");
-    assert_eq!(after.files, before.files, "no demoted file may be unlinked by a DML ({after:?})");
-
     // ...and the version still resolves after the appended row itself is
-    // flushed and demoted, which is when the hot leg's version gate (rather
-    // than MemBuffer) is what keeps the newer copy visible.
+    // flushed, which is when merge-on-read (rather than MemBuffer) is what
+    // keeps the newer copy visible.
     env.force_flush().await?;
     env.force_evict().await?;
-    assert_eq!(name_of(&client, "row3").await?.as_deref(), Some("enriched"), "the newer version must survive its own flush + demotion");
+    assert_eq!(name_of(&client, "row3").await?.as_deref(), Some("enriched"), "the newer version must survive its own flush");
     assert_eq!(count(&client).await?, 8, "flushing the appended version must not double-count it");
-
-    // The user-visible purpose of absorbing the late drain: after the update
-    // itself has been demoted, a bounded query wholly inside the Arrow-covered
-    // window must get both base and enriched rows from Arrow and emit ZERO
-    // Delta rows. Correct final results alone do not prove this — DedupExec can
-    // hide a full duplicate Delta read, which was the production regression.
-    let lo = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS - 1).unwrap().format("%Y-%m-%d %H:%M:%S%.f");
-    let hi = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS + 9).unwrap().format("%Y-%m-%d %H:%M:%S%.f");
-    let sql = format!(
-        "SELECT name FROM mor_versioned WHERE project_id = '{PROJECT}' \
-         AND timestamp >= '{lo}' AND timestamp < '{hi}'"
-    );
-    let hot_before = env.snapshot_stats().hot_tier.read_hits;
-    let plan = explain_analyze(&client, &sql).await?;
-    assert!(env.snapshot_stats().hot_tier.read_hits > hot_before, "the bounded query did not use Arrow.\nplan:\n{plan}");
-    for delta in plan.lines().filter(|line| line.contains("DeltaScanExec")) {
-        assert_eq!(scan_metric(delta, "output_rows="), Some(0), "Delta emitted rows already absorbed by the Arrow bucket.\nplan:\n{plan}");
-    }
 
     Ok(())
 }
@@ -131,7 +87,7 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_appends_a_tombstone_that_hides_only_its_own_key() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
     let client = env.pg_client().await?;
 
     for i in 0..4 {
@@ -146,9 +102,9 @@ async fn delete_appends_a_tombstone_that_hides_only_its_own_key() -> anyhow::Res
     assert_eq!(count(&client).await?, 3, "COUNT(*) must not count a tombstoned key");
     assert_eq!(name_of(&client, "row2").await?.as_deref(), Some("base"), "a sibling must survive the tombstone");
 
-    // The tombstone must still suppress the row once it is itself committed and
-    // demoted — i.e. the suppression is a property of the data, not of the
-    // tombstone happening to sit in MemBuffer.
+    // The tombstone must still suppress the row once it is itself committed —
+    // i.e. the suppression is a property of the data, not of the tombstone
+    // happening to sit in MemBuffer.
     env.force_flush().await?;
     env.force_evict().await?;
     assert_eq!(name_of(&client, "row1").await?, None, "the tombstone must survive its own flush");
@@ -163,7 +119,7 @@ async fn delete_appends_a_tombstone_that_hides_only_its_own_key() -> anyhow::Res
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_updates_of_one_key_still_resolve_to_one_row() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_hot_tier(6).with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
     let client = env.pg_client().await?;
 
     insert_row(&client, "hot", "v0", FROZEN_START_MICROS).await?;

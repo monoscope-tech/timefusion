@@ -211,13 +211,6 @@ pub struct StatsSnapshot {
     /// `timefusion.flush.completed`/`failed` counters for OTel-free tests.
     pub flush_completed_total: u64,
     pub flush_failed_total: u64,
-    /// Drained bucket-sets DROPPED instead of demoted, and the bytes currently
-    /// queued. A skip is a PERMANENT hot-tier coverage hole — those windows are
-    /// served from Delta/R2 forever. Compare `demote_skipped_total` against
-    /// `flush_completed_total`: prod 2026-08-14 ran 84 flushed vs 9 demoted with
-    /// no way to see it, because this counter was OTel-only.
-    pub demote_skipped_total: u64,
-    pub demote_queued_bytes: u64,
     /// Inserts that hit the hard limit and applied backpressure (sync flush)
     /// instead of rejecting. Sustained growth = ingest outpacing flush.
     pub backpressure_engaged_total: u64,
@@ -255,8 +248,6 @@ pub struct StatsSnapshot {
     pub tantivy_recovery_pending_files: usize,
     /// Process start time, used to distinguish a replacement from its predecessor.
     pub boot_micros: i64,
-    /// Local hot tier occupancy + counters (all zero when it is disabled).
-    pub hot_tier: crate::hot_tier::HotTierStats,
 }
 
 #[derive(Debug, Default)]
@@ -456,48 +447,12 @@ impl CoalescedGroup {
 pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
-/// Concurrent demotions. One slot serialized every table behind the slowest
-/// bucket, and the slowest is always the busiest project — the one whose hot
-/// coverage matters most. Demotion is `spawn_blocking` (sort + encode + fsync),
-/// so this is bounded well below the maintenance pool: it must never contend
-/// with flush for CPU, it only has to keep up with the flush RATE.
-const DEMOTE_CONCURRENCY: usize = 4;
-
 #[derive(derive_more::Debug)]
 #[debug("BufferedWriteLayer {{ has_callback: {} }}", delta_write_callback.is_some())]
 pub struct BufferedWriteLayer {
     config: Arc<AppConfig>,
     wal: Arc<WalManager>,
     mem_buffer: Arc<MemBuffer>,
-    /// Local hot tier: drained buckets are demoted here post-commit and served
-    /// as the scan's third leg. Always constructed — with
-    /// `TIMEFUSION_HOT_TIER_RETENTION_HOURS=0` it demotes nothing and serves
-    /// nothing, but still sweeps its own directory.
-    hot_tier: Arc<crate::hot_tier::HotTier>,
-    /// Demotion slots — see [`DEMOTE_CONCURRENCY`].
-    ///
-    /// Each holder sorts, encodes and fsyncs one bucket, so a
-    /// single slot serialized every table behind the slowest one — and the
-    /// slowest is always the busiest project, which is also the one whose
-    /// coverage matters most. Also the point GC and tests quiesce against
-    /// (`acquire_many(DEMOTE_CONCURRENCY)`).
-    demote_permit: Arc<tokio::sync::Semaphore>,
-    /// Bytes of drained batches queued for demotion, and the sets dropped for
-    /// exceeding `demote_queue_limit`.
-    ///
-    /// PROD 2026-08-14: the bound was a COUNT (`MAX_PENDING_DEMOTIONS = 2`) and
-    /// over it the WHOLE drained set was discarded — 84 buckets flushed, 9
-    /// demoted, so **89% of the tier's writes were thrown away** and every later
-    /// recent-window query paid R2 for them. The busiest project lost the most,
-    /// because it produces the most buckets and so always lost the race.
-    /// A count bounds nothing when one set can be a thousand times another; the
-    /// stated concern was always heap, so the bound is now bytes. Same lesson as
-    /// the plan cache (12ff764): weigh the entries.
-    demote_queued_bytes: Arc<AtomicU64>,
-    demote_skipped: Arc<AtomicU64>,
-    /// Byte ceiling on queued demotions — heap held after MemBuffer stopped
-    /// accounting for it, so it is sized against the buffer's own budget.
-    demote_queue_limit: u64,
     shutdown: CancellationToken,
     /// Write-admission barrier for graceful handoff. Closing it before server
     /// connection drain prevents already-accepted PGWire sockets from appending
@@ -735,14 +690,9 @@ impl BufferedWriteLayer {
             wal,
             mem_buffer,
             // `open` rescans the dir, so a restart comes back warm.
-            hot_tier: crate::hot_tier::HotTier::open_lazy(cfg.core.hot_tier_dir(), cfg.buffer.hot_tier_enabled(), cfg.buffer.hot_tier_limits()),
-            demote_permit: Arc::new(tokio::sync::Semaphore::new(DEMOTE_CONCURRENCY)),
-            demote_queued_bytes: Arc::new(AtomicU64::new(0)),
-            demote_skipped: Arc::new(AtomicU64::new(0)),
             // An eighth of the write buffer's own budget: enough that a burst of
             // drained buckets queues instead of being thrown away, small enough
             // that it cannot itself become the thing that OOMs the box.
-            demote_queue_limit: ((cfg.buffer.max_memory_mb() * 1024 * 1024 / 8) as u64).max(1),
             shutdown: CancellationToken::new(),
             accepting_writes: std::sync::atomic::AtomicBool::new(true),
             active_writes: AtomicU64::new(0),
@@ -1991,18 +1941,10 @@ impl BufferedWriteLayer {
             // MemBuffer; this flushes it down under budget in the background so the
             // listener serves immediately instead of blocking on the drain.
             spawn_task!(drain_to_budget),
-            spawn_task!(finish_hot_tier_open),
             spawn_task!(run_quarantine_redrive_task),
         ]);
 
         info!("BufferedWriteLayer background tasks started");
-    }
-
-    async fn finish_hot_tier_open(&self) {
-        let tier = Arc::clone(&self.hot_tier);
-        if let Err(e) = tokio::task::spawn_blocking(move || tier.finish_open()).await {
-            warn!("hot tier background rescan panicked: {e}");
-        }
     }
 
     async fn run_quarantine_redrive_task(self: Arc<Self>) {
@@ -2274,7 +2216,6 @@ impl BufferedWriteLayer {
                     // entries net to zero rows on replay; see
                     // reap_expired_empty_buckets.
                     self.mem_buffer.reap_expired_empty_buckets(self.retention_cutoff_micros());
-                    self.hot_tier_gc().await;
                     self.eviction_tick_notify.notify_waiters();
                 }
                 _ = self.shutdown.cancelled() => {
@@ -2602,9 +2543,6 @@ impl BufferedWriteLayer {
                 // bucket's rows are neither freed nor authoritative in
                 // Delta, and will be counted when its re-flush drains.
                 let drained: Vec<_> = source_buckets.iter().filter(|b| self.mem_buffer.finish_flushed_snapshot(b)).collect();
-                // Post-commit is the ONLY sound point to demote: anywhere
-                // earlier makes the hot tier a durability boundary.
-                self.demote_drained(&drained);
                 self.release_and_advance(&combined.project_id, &combined.table_name, token);
                 crate::observability::record_flush(true);
                 let drained_rows: u64 = drained.iter().map(|b| b.row_count as u64).sum();
@@ -2655,98 +2593,6 @@ impl BufferedWriteLayer {
                 );
                 (false, FlushStats { buckets_failed: source_buckets.len() as u64, ..Default::default() })
             }
-        }
-    }
-
-    pub fn hot_tier(&self) -> &Arc<crate::hot_tier::HotTier> {
-        &self.hot_tier
-    }
-
-    /// Write post-commit drained buckets to the hot tier, off the flush's
-    /// critical path (a blocking task; batches are Arc clones) and entirely
-    /// best-effort — a demotion failure only costs the next query a Delta hit.
-    fn demote_drained(&self, drained: &[&FlushableBucket]) {
-        if drained.is_empty() {
-            return;
-        }
-        // Admit on BYTES, not on how many sets are already waiting. Queued
-        // batches are rows MemBuffer has already stopped accounting for, so the
-        // bound exists to cap invisible heap — which a count cannot do. See
-        // `demote_queued_bytes`.
-        use std::sync::atomic::Ordering::Relaxed;
-        let bytes: u64 = drained.iter().map(|b| flushable_bytes(b)).sum();
-        if self.demote_queued_bytes.fetch_update(Relaxed, Relaxed, |q| (q + bytes <= self.demote_queue_limit).then_some(q + bytes)).is_err() {
-            self.demote_skipped.fetch_add(1, Relaxed);
-            crate::observability::record_hot_tier_demote_skipped();
-            // Tell the tier, or the hole is not merely a hole — it is a WRONG
-            // claim. A bucket re-forms when late rows arrive after a full
-            // drain, and `plan_leg` only catches multiple incarnations by
-            // counting a bucket's files. A skip leaves no file to count, so a
-            // later incarnation's file looks like a single fully-covered drain
-            // and excludes from Delta a window whose earlier rows it never got.
-            for bucket in drained {
-                self.hot_tier.note_demote_skipped(&bucket.project_id, &bucket.table_name, &[bucket.bucket_id]);
-            }
-            warn!(
-                "hot tier demotion SKIPPED for {} buckets ({bytes} bytes; {} queued, limit {}) — those windows are a permanent coverage hole served from Delta",
-                drained.len(),
-                self.demote_queued_bytes.load(Relaxed),
-                self.demote_queue_limit
-            );
-            return;
-        }
-        let work: Vec<_> =
-            drained.iter().map(|b| (b.project_id.clone(), b.table_name.clone(), b.bucket_id, b.batches.clone(), b.min_timestamp, b.max_timestamp)).collect();
-        let (tier, sem, queued) = (self.hot_tier.clone(), self.demote_permit.clone(), self.demote_queued_bytes.clone());
-        tokio::spawn(async move {
-            let permit = sem.acquire_owned().await;
-            let _ = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                for (p, t, id, batches, min, max) in work {
-                    // `drained` = the bucket was fully removed from the buffer
-                    // after its rows committed, so this file holds every row the
-                    // bucket carried. That is the coverage claim; `read_leg`
-                    // still refuses it if the bucket has more than one file.
-                    tier.demote(&p, &t, crate::hot_tier::Bucket { bucket_id: id, batches: &batches, min_ts: min, max_ts: max, covers_window: true });
-                }
-            })
-            .await;
-            queued.fetch_sub(bytes, Relaxed);
-        });
-    }
-
-    /// Age/disk-cap sweep of the hot tier, driven by the eviction task. Waits
-    /// out any in-flight demotion first, which also makes it the deterministic
-    /// settle point for `force_evict_now`.
-    async fn hot_tier_gc(&self) {
-        let _quiesce = self.demote_permit.acquire_many(DEMOTE_CONCURRENCY as u32).await;
-        let (tier, now) = (self.hot_tier.clone(), crate::support::now_micros());
-        let _ = tokio::task::spawn_blocking(move || tier.gc(now)).await;
-    }
-
-    /// A DML mutates rows the hot tier may hold a pre-DML copy of, and the hot
-    /// leg is ordered ahead of Delta in the union (keep-first dedup), so a
-    /// stale file would shadow the corrected Delta row.
-    ///
-    /// Every row the statement can touch satisfies its predicate, so a demoted
-    /// file whose row range is disjoint from the predicate's time window holds
-    /// none of them and survives. When no window can be derived the whole
-    /// table goes — over-invalidating costs a Delta read, under-invalidating
-    /// resurrects a stale row.
-    ///
-    /// `source` is the `UPDATE ... FROM` source: the touched rows are the
-    /// JOIN's matches, so a bound is only the target's when the source cannot
-    /// also supply that column name (bound matching is by column name, which
-    /// ignores the qualifier — `u.timestamp >= X` would read as a target
-    /// bound). A source carrying the time column falls back.
-    fn invalidate_hot_tier(
-        &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, source: Option<&crate::dml::UpdateSource>,
-    ) {
-        let time_col = crate::dml::table_time_column(table_name);
-        let shadowed = source.is_some_and(|s| s.schema.fields().iter().any(|f| f.name() == time_col));
-        match (!shadowed).then(|| crate::dml::dml_time_window(predicate, time_col)).flatten() {
-            Some((lo, hi)) => self.hot_tier.invalidate_range(project_id, table_name, lo, hi),
-            None => self.hot_tier.invalidate(project_id, table_name),
         }
     }
 
@@ -3419,7 +3265,6 @@ impl BufferedWriteLayer {
     pub async fn force_evict_now(&self) -> anyhow::Result<()> {
         self.flush_completed_buckets().await?;
         self.evict_drained_metadata();
-        self.hot_tier_gc().await;
         self.eviction_tick_notify.notify_waiters();
         Ok(())
     }
@@ -3492,8 +3337,6 @@ impl BufferedWriteLayer {
             bucket_duration_micros: crate::write::mem_buffer::bucket_duration_micros(),
             oldest_bucket_age_secs,
             flush_completed_total: self.flush_completed_total.load(Ordering::Relaxed),
-            demote_skipped_total: self.demote_skipped.load(Ordering::Relaxed),
-            demote_queued_bytes: self.demote_queued_bytes.load(Ordering::Relaxed),
             flush_failed_total: self.flush_failed_total.load(Ordering::Relaxed),
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
             backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
@@ -3509,7 +3352,6 @@ impl BufferedWriteLayer {
             wal_recovery_complete: self.wal_recovery_complete.load(Ordering::Relaxed),
             tantivy_recovery_pending_files: self.deferred_tantivy_files.lock().unwrap().len(),
             boot_micros: self.boot_micros,
-            hot_tier: self.hot_tier.stats(),
         }
     }
 
@@ -3659,7 +3501,6 @@ impl BufferedWriteLayer {
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
         let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
-        self.invalidate_hot_tier(project_id, table_name, predicate, None);
         // Log to WAL first for durability. Failure here means the delete is
         // not recoverable after a crash — propagate so the client knows the
         // operation didn't commit, rather than apply in-memory and lose it
@@ -3683,7 +3524,6 @@ impl BufferedWriteLayer {
         let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &std::collections::HashSet::new());
-        self.invalidate_hot_tier(project_id, table_name, predicate, None);
         // See `delete()` — WAL failure must propagate so the client doesn't
         // see a "successful" update that disappears on the next restart.
         self.with_wal_pin(
@@ -3708,8 +3548,6 @@ impl BufferedWriteLayer {
         let source_cols: std::collections::HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
         let predicate_sql = predicate.map(|p| Self::normalized_wal_sql(p, &source_cols));
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &source_cols);
-
-        self.invalidate_hot_tier(project_id, table_name, predicate, Some(source));
         let batch_ipc = crate::write::wal::serialize_record_batch(&source.batch).map_err(wal_err("source serialize"))?;
         let serialized_source = crate::write::wal::SerializedSource { join_keys: source.join_keys.clone(), batch_ipc };
 
@@ -4010,50 +3848,6 @@ mod tests {
         let results = layer.query(&project, &table, &[]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].num_rows(), 3);
-    }
-
-    /// The DML seams must scope hot-tier invalidation to the statement's own
-    /// time window — monoscope's enrichment UPDATEs all carry one — and fall
-    /// back to the whole table (today's behaviour) only when no bound exists.
-    /// A file the window can't reach holds no row the statement rewrote.
-    #[serial]
-    #[tokio::test]
-    async fn dml_invalidates_only_the_hot_files_its_time_window_reaches() {
-        let dir = tempdir().unwrap();
-        // Explicit: the shipped default is 0 (tier off for its first release),
-        // so this test must opt the tier in rather than inherit it.
-        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_hot_tier_enabled = true);
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let (project, table) = (format!("hp{test_id}"), format!("ht{test_id}"));
-
-        let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        let batch = create_test_batch(&project);
-        let tier = layer.hot_tier().clone();
-        tier.demote(
-            &project,
-            &table,
-            crate::hot_tier::Bucket { bucket_id: 1, batches: std::slice::from_ref(&batch), min_ts: 1_000, max_ts: 1_999, covers_window: true },
-        );
-        tier.demote(&project, &table, crate::hot_tier::Bucket { bucket_id: 2, batches: &[batch], min_ts: 10_000, max_ts: 10_999, covers_window: true });
-
-        use datafusion::prelude::lit;
-        let ts = |micros: i64| lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())));
-        let bounded = datafusion::prelude::col("project_id")
-            .eq(lit(project.clone()))
-            .and(datafusion::prelude::col("timestamp").gt_eq(ts(1_500)))
-            .and(datafusion::prelude::col("timestamp").lt(ts(5_000)));
-        layer.delete(&project, &table, Some(&bounded)).unwrap();
-
-        let s = layer.hot_tier().stats();
-        assert_eq!((s.files, s.invalidations_ranged, s.invalidations_full), (1, 1, 0), "only the overlapped file goes");
-        assert_eq!(tier.buckets_in_range(&project, &table, None)[0].bucket_id, 2);
-
-        // No time predicate → no derivable window → today's whole-table drop,
-        // and the fallback must be VISIBLE (it is what a broken derivation
-        // looks like in prod).
-        layer.delete(&project, &table, Some(&datafusion::prelude::col("project_id").eq(lit(project.clone())))).unwrap();
-        let s = layer.hot_tier().stats();
-        assert_eq!((s.files, s.invalidations_ranged, s.invalidations_full), (0, 1, 1));
     }
 
     /// C3 — cross-project flush commit coalescing, from the flush layer's side.
@@ -6154,47 +5948,6 @@ mod tests {
 
         layer.wal_hard_backpressure.store(false, Ordering::Relaxed);
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.expect("insert must succeed once backpressure clears");
-    }
-
-    /// PROD 2026-08-14 — the tier was being starved at the WRITE side.
-    /// `demote_drained` bounded its queue by COUNT (`MAX_PENDING_DEMOTIONS = 2`)
-    /// and over the bound discarded the WHOLE drained set: prod ran
-    /// `flush_completed_total` 84 against `hot_tier.writes_total` 9, so **89% of
-    /// the tier's writes were thrown away**, each one a permanent coverage hole
-    /// the recent-window queries then paid R2 for. The busiest project lost the
-    /// most, because it produces the most buckets and always lost the race.
-    ///
-    /// A count bounds nothing when one set can be a thousand times another. The
-    /// bound is bytes now, and the skip is COUNTED and queryable — it was
-    /// OTel-only before, which is why this hid for weeks.
-    #[serial]
-    #[tokio::test]
-    async fn demotion_admits_on_bytes_and_counts_what_it_drops() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config_with(dir.path().to_path_buf(), |c| {
-            c.buffer.timefusion_hot_tier_enabled = true;
-            c.buffer.timefusion_buffer_max_memory_mb = 64;
-        });
-        let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        assert_eq!(layer.demote_queue_limit, 64 * 1024 * 1024 / 8, "the ceiling tracks the buffer budget, not a magic count");
-
-        // Far more sets than the old count bound of 2 would ever have admitted.
-        let project = format!("dq{}", &uuid::Uuid::new_v4().to_string()[..4]);
-        for i in 0..8i64 {
-            let batch = create_test_batch(&project);
-            layer.hot_tier().demote(
-                &project,
-                "t",
-                crate::hot_tier::Bucket { bucket_id: i, batches: &[batch], min_ts: i * 1_000, max_ts: i * 1_000 + 999, covers_window: true },
-            );
-        }
-        assert_eq!(layer.hot_tier().stats().files, 8, "every bucket must reach the tier; the old bound would have kept 2 sets' worth");
-
-        // And the counter is visible: a set larger than the whole ceiling is
-        // refused rather than silently dropped.
-        let s = layer.snapshot_stats();
-        assert_eq!(s.demote_skipped_total, 0, "nothing this small may be skipped");
-        assert_eq!(s.demote_queued_bytes, 0, "the queue drains back to zero");
     }
 }
 

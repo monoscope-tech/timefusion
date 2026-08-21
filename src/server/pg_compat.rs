@@ -840,11 +840,6 @@ impl StatsTableProvider {
             || rows!["buffered_layer"; "status" => "disabled"],
             |layer| {
                 let s = layer.snapshot_stats();
-                // Local hot tier (demoted sealed buckets served by mmap'd Arrow
-                // IPC). `read_misses` growing = torn/absent files falling through
-                // to Delta; `write_failures` growing = demotion is broken (reads
-                // stay correct, just slower).
-                let h = &s.hot_tier;
                 [
                     rows!["mem_buffer";
                         "project_count" => s.mem_project_count,
@@ -876,11 +871,6 @@ impl StatsTableProvider {
                         "backpressure_force_flush_total" => s.backpressure_force_flush_total,
                         "flush_completed_total" => s.flush_completed_total,
                         "flush_failed_total" => s.flush_failed_total,
-                        // A skip is a PERMANENT hot-tier coverage hole. Compare
-                        // against flush_completed_total: sustained skips mean the
-                        // tier is not holding the recent window it exists for.
-                        "demote_skipped_total" => s.demote_skipped_total,
-                        "demote_queued_bytes" => s.demote_queued_bytes,
                         // Ingest-vs-drain: both climb in steady state. If ingested pulls
                         // ahead of flushed while pressure_pct=100 and flush_failed_total is
                         // flat, ingest is outpacing a working drain (throughput wedge) —
@@ -917,40 +907,6 @@ impl StatsTableProvider {
                         "quarantine_files" => s.quarantine_files,
                         "quarantine_mb" => mb(s.quarantine_bytes as f64),
                     ],
-                    rows!["hot_tier";
-                        "tables" => h.tables,
-                        "files" => h.files,
-                        "bytes" => h.bytes,
-                        "writes_total" => h.writes,
-                        "write_failures_total" => h.write_failures,
-                        "read_hits_total" => h.read_hits,
-                        "read_misses_total" => h.read_misses,
-                        "mem_skipped_total" => h.mem_skipped,
-                        // Windows served without a Delta exclusion because coverage
-                        // was not proven — the reads that used to lose rows.
-                        "unproven_windows_total" => h.unproven_windows,
-                        "schema_drift_total" => h.schema_drift,
-                        "gc_deleted_total" => h.gc_deleted,
-                        "gc_bytes_freed_total" => h.gc_bytes_freed,
-                        "invalidated_total" => h.invalidated,
-                        // DML statements scoped to their own time window vs. those
-                        // that had to drop the whole table. `invalidations_full_total`
-                        // dominating means the range derivation isn't matching the
-                        // workload's predicate shapes — the tier is back to paying for
-                        // files every enrichment statement throws away.
-                        "invalidations_ranged_total" => h.invalidations_ranged,
-                        "invalidations_full_total" => h.invalidations_full,
-                        // Tables that stopped demoting because a DML kept dropping
-                        // their files before any query read them (continuous
-                        // whole-table enrichment). Non-zero is the tier working as
-                        // intended; it used to be an invisible silent waste.
-                        "suppressed_tables" => h.suppressed_tables,
-                        "suppressions_total" => h.suppressions,
-                    ],
-                    h.suppressed
-                        .iter()
-                        .map(|((project, table), secs)| ("hot_tier", format!("suppressed.{project}.{table}"), format!("cooldown_secs_remaining={secs}")))
-                        .collect(),
                     rows!["wal"; "shards_per_topic" => s.wal_shards_per_topic, "known_topics" => s.wal_known_topics],
                 ]
                 .into_iter()
@@ -975,7 +931,6 @@ impl StatsTableProvider {
             // TIMEFUSION_ORDERING_PROBE=true. All zero with a nonzero total
             // just means the probe is off — not that no leg is at fault.
             "ordering_violations_mem" => crate::read::ORDERING_VIOLATIONS_MEM,
-            "ordering_violations_hot" => crate::read::ORDERING_VIOLATIONS_HOT,
             "ordering_violations_delta" => crate::read::ORDERING_VIOLATIONS_DELTA,
         ];
 
@@ -1142,7 +1097,6 @@ impl StatsTableProvider {
             let provider_builds = cv(PROVIDER_BUILD_TOTAL);
             let provider_scans = cv(PROVIDER_SCAN_TOTAL);
             let mem_plans = cv(MEM_PLAN_TOTAL);
-            let hot_plans = cv(HOT_PLAN_TOTAL);
             // Parquet decode heap — the largest consumer outside every budget.
             // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
             // concurrent decode heap, which is what a Transient budget must cover.
@@ -1220,8 +1174,6 @@ impl StatsTableProvider {
                     "wide_scan_oversize_total" => cv(WIDE_SCAN_OVERSIZE_TOTAL),
                     "mem_plan_us_avg" => avg(cv(MEM_PLAN_US_TOTAL), mem_plans),
                     "mem_plan_total" => mem_plans,
-                    "hot_plan_us_avg" => avg(cv(HOT_PLAN_US_TOTAL), hot_plans),
-                    "hot_plan_total" => hot_plans,
                     "lat_p50_us_approx" => m.latency_percentile_us(0.50),
                     "lat_p95_us_approx" => m.latency_percentile_us(0.95),
                     "lat_p99_us_approx" => m.latency_percentile_us(0.99),
@@ -1423,7 +1375,6 @@ mod stats_table_tests {
             ("scan", "provider_build_us_avg"),
             ("scan", "provider_scan_us_avg"),
             ("scan", "mem_plan_us_avg"),
-            ("scan", "hot_plan_us_avg"),
         ] {
             assert_has(&rows, component, key);
         }

@@ -138,7 +138,6 @@ counter_registry! {
     rollup_full_hours_rebuilt  => "timefusion.rollup.maintenance.full_hours_rebuilt": "Rollup project-hours rebuilt by full scans",
     rollup_incremental_hours_rebuilt => "timefusion.rollup.maintenance.incremental_hours_rebuilt": "Rollup project-hours rebuilt from durable dirty masks",
     cache_insert_bypassed      => "timefusion.cache.insert_bypassed": "Cache populations suppressed because the read ran inside a large-scan bypass scope (scan-resistant admission — a wide historical scan must not evict the hot tail)",
-    hot_tier_demote_skipped    => "timefusion.hot_tier.demote_skipped": "Flush groups NOT demoted to the local hot tier because a demotion was already running (the bound that keeps drained batches from piling up off-ledger). Purely a latency miss — those windows are served from Delta. WARN if sustained: the local IPC write is falling behind the flush rate",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
     maintenance_checkpoint_failed => "timefusion.maintenance.checkpoint_failed": "Out-of-band checkpoint attempts that errored (e.g. R2 500 on the checkpoint PUT). Retried next tick; ingest is unaffected. WARN if sustained — checkpoints falling behind slows boot replay and blocks log cleanup",
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
@@ -348,34 +347,6 @@ pub fn init_metrics(
     layer_metric!(counter "timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s
         .rows_ingested_total);
     layer_metric!(counter "timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
-    // Local hot tier. The two "the tier is broken" signals are write_failures
-    // (demotion failing — reads stay correct, just slower) and read_misses
-    // (torn/absent files falling back to Delta); schema_drift is the silent
-    // one, where a file looks like a healthy hit but contributes zero rows.
-    layer_metric!(gauge "timefusion.hot_tier.bytes", "Bytes of demoted Arrow IPC held by the local hot tier", |s| s.hot_tier.bytes);
-    layer_metric!(gauge "timefusion.hot_tier.files", "Demoted bucket files in the local hot tier", |s| s.hot_tier.files as u64);
-    layer_metric!(counter "timefusion.hot_tier.writes_total", "Buckets demoted to the local hot tier", |s| s.hot_tier.writes);
-    layer_metric!(counter "timefusion.hot_tier.write_failures_total", "Demotions that errored. ALERT if sustained", |s| s.hot_tier.write_failures);
-    layer_metric!(counter "timefusion.hot_tier.read_hits_total", "Hot-tier files served to a scan", |s| s.hot_tier.read_hits);
-    layer_metric!(counter "timefusion.hot_tier.read_misses_total", "Hot-tier files that read as torn/absent and fell through to Delta. ALERT if sustained", |s| s
-        .hot_tier
-        .read_misses);
-    layer_metric!(counter "timefusion.hot_tier.schema_drift_total", "Hot-tier files skipped because their schema no longer matches the table's", |s| s
-        .hot_tier
-        .schema_drift);
-    layer_metric!(counter "timefusion.hot_tier.mem_skipped_total", "Hot-tier files skipped because MemBuffer still owned their window (expected)", |s| s
-        .hot_tier
-        .mem_skipped);
-    layer_metric!(gauge
-        "timefusion.hot_tier.suppressed_tables",
-        "Tables currently not demoting because a DML kept invalidating their files before any query read them",
-        |s| s.hot_tier.suppressed_tables as u64
-    );
-    layer_metric!(counter
-        "timefusion.hot_tier.suppressions_total",
-        "Times a table's demotions were judged not to pay off and were suspended for a cooldown. Sustained growth on a table you expect to be read means the hot tier is losing a race with continuous enrichment — expected for whole-table UPDATE workloads, otherwise investigate",
-        |s| s.hot_tier.suppressions
-    );
     layer_metric!(gauge "timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
     layer_metric!(gauge "timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
     layer_metric!(gauge "timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
@@ -591,7 +562,6 @@ recorders! {
     record_write_capture_skipped => write_capture_skipped,
     record_cache_confirm_timeout => cache_confirm_timeouts,
     record_cache_insert_bypassed => cache_insert_bypassed,
-    record_hot_tier_demote_skipped => hot_tier_demote_skipped,
     /// One optimize/compaction OCC conflict (retryable). A sustained rate means the
     /// optimizer is repeatedly losing commit races to concurrent dedup/flush.
     record_optimize_conflict => optimize_conflict,
