@@ -2995,7 +2995,7 @@ dependencies = [
 [[package]]
 name = "deltalake"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2568401c#2568401cd612c5790d6a2cde85e1fd64503b69fa"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e2e2c65e#e2e2c65e637a7460b4ae921738f0a417b1839f78"
 dependencies = [
  "buoyant_kernel 0.24.0",
  "ctor",
@@ -3006,7 +3006,7 @@ dependencies = [
 [[package]]
 name = "deltalake-aws"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2568401c#2568401cd612c5790d6a2cde85e1fd64503b69fa"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e2e2c65e#e2e2c65e637a7460b4ae921738f0a417b1839f78"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3029,7 +3029,7 @@ dependencies = [
 [[package]]
 name = "deltalake-core"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2568401c#2568401cd612c5790d6a2cde85e1fd64503b69fa"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e2e2c65e#e2e2c65e637a7460b4ae921738f0a417b1839f78"
 dependencies = [
  "alloc-stdlib",
  "arrow",
@@ -3087,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "deltalake-derive"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2568401c#2568401cd612c5790d6a2cde85e1fd64503b69fa"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=e2e2c65e#e2e2c65e637a7460b4ae921738f0a417b1839f78"
 dependencies = [
  "convert_case 0.9.0",
  "itertools 0.14.0",
@@ -6200,7 +6200,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -9456,7 +9456,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
