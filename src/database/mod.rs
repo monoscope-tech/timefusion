@@ -4806,6 +4806,10 @@ impl Database {
         // Labelled scope rather than `full=true/false` so warm logs are easy to
         // filter (e.g. in Loki) by what was actually primed.
         let scope = if warm_full_files { "full" } else { "footer-only" };
+        // Pace only the boot/background pass (confirm=None); per-flush confirm
+        // warms are small and latency-relevant.
+        let body_pace = (confirm.is_none() && self.config.maintenance.timefusion_warm_body_boot_files_per_sec > 0)
+            .then(|| std::time::Duration::from_secs_f64(1.0 / f64::from(self.config.maintenance.timefusion_warm_body_boot_files_per_sec)));
         // Surface the burst size up front so operators can see what a restart
         // is about to issue against S3 (the completion log alone can't —
         // a large warm set takes minutes to get there). The confirm pass is
@@ -4834,6 +4838,13 @@ impl Database {
                         None => crate::storage::warm_full(store.as_ref(), &path).await,
                     };
                     fetched.fetch_add(hit as usize, std::sync::atomic::Ordering::Relaxed);
+                    // Boot-path body warms are PACED (see the config comment: the
+                    // unpaced variant saturated object-store bandwidth and was
+                    // reverted). Only fetches sleep — cached files fly by — and
+                    // post-commit confirm warms (small, bounded) stay unthrottled.
+                    if hit && let Some(interval) = body_pace {
+                        tokio::time::sleep(interval).await;
+                    }
                 }
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if n.is_multiple_of(WARM_PROGRESS_INTERVAL) {
@@ -4973,13 +4984,16 @@ impl Database {
                                 (uris, table.log_store().object_store(None), table.table_url().to_string())
                             };
                             info!("bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}", uris.len(), t.elapsed().as_millis());
-                            // Restart reconstructs table and parquet metadata
-                            // only. Re-downloading every uncached recent body at
-                            // boot saturated object-store bandwidth (13GB during
-                            // three 1h queries) and made a recovered deployment
-                            // slower than a cold range read. New files still get
-                            // full-body warming on their post-commit paths.
-                            db.warm_cache_for_uris(store, table_uri, uris, None, false).await;
+                            // Bodies warm too, but PACED and skip-if-cached
+                            // (timefusion_warm_body_boot_files_per_sec; 0 restores
+                            // footer-only). The unpaced variant saturated
+                            // object-store bandwidth (13GB during three 1h
+                            // queries) and was reverted; pacing is what makes
+                            // body warmth at boot safe. Without it, windows
+                            // older than the last flush burst stay cold until
+                            // first query — the measured 23-31s band.
+                            let bodies = db.config.maintenance.timefusion_warm_body_boot_files_per_sec > 0;
+                            db.warm_cache_for_uris(store, table_uri, uris, None, bodies).await;
                         }
                         Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }

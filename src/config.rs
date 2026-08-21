@@ -1732,6 +1732,18 @@ pub struct MaintenanceConfig {
     /// "dashboard horizon" is permanently cold.
     #[serde_inline_default(9)]
     pub timefusion_warm_recency_days: u64,
+    /// Paced full-body warm at BOOT for recency-window files, in fetched
+    /// files/sec. The unpaced variant was tried and reverted: re-downloading
+    /// every recent body at boot saturated object-store bandwidth (13GB
+    /// during three 1h queries) and made a recovered deployment slower than
+    /// a cold read. Pacing + skip-if-cached removes that failure mode while
+    /// closing the measured cold band (2026-08-21: 2-9d-old windows ran
+    /// 23-31s cold vs 1.0-1.3s warm on identical scans). At ~0.5MB/file
+    /// (fragmented days) 16 files/s ≈ 8MB/s — invisible next to query load;
+    /// ~60k fleet files complete in ~1h. 0 = footer-only boot warm (the old
+    /// behavior).
+    #[serde_inline_default(16)]
+    pub timefusion_warm_body_boot_files_per_sec: u32,
     /// Warm parquet footers for EVERY live file (not just recency-window
     /// ones). Footers are tens of KB each, but on tables with thousands of
     /// files the boot-time GET burst may matter on small instances — disable
