@@ -95,3 +95,35 @@ redeploys a different image against the same WAL and the same cache budget, so i
 does not address any candidate cause. Two push notifications were sent; the
 second was partially wrong (it called the lag monotone) and that is corrected
 above.
+
+### Part XVIII resolved — the episode ran 09:34 to ~10:01, ~27 minutes
+
+Recovery confirmed at 10:20: `5559ac8` running 10 minutes, the preceding task
+entry a clean `Shutdown` (deploy) rather than `Failed`, last failure 19 minutes
+earlier, RSS 14.4 GB, `rows_in_buffer_lag` back to a normal 339 k, coverage 30,
+kernel kill count static at 10.
+
+**What ended it.** The last `41ca4c6` instance survived seven minutes — the
+longest of the episode — and drove `rows_in_buffer_lag` to **0** for the first
+time. Once the replay backlog was gone, the next start had almost nothing to do
+and the loop stopped. A new image (`5559ac8`) landed at about the same moment, so
+the two are confounded: I cannot say whether the build helped or simply arrived
+after the backlog cleared.
+
+**What this episode is worth remembering for.**
+
+1. **Replay pressure is real but self-limiting.** The lag oscillated
+   (1.25M / 867k / 1.60M / 1.19M / 429k / 0) rather than ratcheting, and it
+   eventually drained under exactly the conditions I had claimed would prevent it
+   from draining. The "death spiral" framing was wrong and is retracted above.
+2. **A health check that kills during startup work extends an outage.** Two of
+   the five failures were `dockerexec: unhealthy container`, not OOM. Each one
+   destroyed partially-completed replay. A startup grace period long enough to
+   cover replay would likely have ended this in one cycle instead of five.
+3. **The tantivy cache budget remains the open question** — 64 GiB reserved on a
+   120 GB container, observed sitting at budget, against a kill band of
+   124.5-125.4 GB. Still unresolved whether that memory is anon (in which case it
+   is the dominant term) or disk-backed (in which case it is a red herring).
+
+Item 2 is the cheapest available mitigation and does not require knowing the
+answer to item 3.
