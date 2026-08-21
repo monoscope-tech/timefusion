@@ -1828,13 +1828,14 @@ pub struct MaintenanceConfig {
     /// Only warm files whose `date=` partition is within this many days of
     /// today. Bounds warming to the partitions dashboards actually query.
     /// 0 = no recency limit.
-    /// 9 (was 1): measured 2026-08-21 — delta-only lookups in the 2-9d band
-    /// were the cold cliff (26s-to-timeout vs 1.3s warm on the identical
-    /// scan), and a full day is ~100MB/project, so nine days fleet-wide is
-    /// ~10GB against the 600GB cache. Full-file warmth must reach as deep as
-    /// the ttl/query mix, or the band between "flushed yesterday" and
-    /// "dashboard horizon" is permanently cold.
-    #[serde_inline_default(9)]
+    /// 35 (was 9, was 1): the final-cycle EA (2026-08-22, bench_final_cycle)
+    /// attributed the largest per-cell delta to windows beyond the body-warm
+    /// depth — P1 B 30d ran 27.2s wall on 0.02s compute over 746 cold file
+    /// opens. Full-file warmth must reach the dashboard horizon (30d + ttl
+    /// slack); ~35 days fleet-wide is ~40GB against the 600GB cache, and the
+    /// paced fetcher (timefusion_warm_body_boot_files_per_sec) bounds the
+    /// burst regardless of depth.
+    #[serde_inline_default(35)]
     pub timefusion_warm_recency_days: u64,
     /// Paced full-body warm at BOOT for recency-window files, in fetched
     /// files/sec. The unpaced variant was tried and reverted: re-downloading
@@ -2461,7 +2462,7 @@ mod tests {
         // harnesses that build from AppConfig::default() exercise).
         assert!(config.maintenance.timefusion_use_deletion_vectors);
         assert!(!config.maintenance.timefusion_warm_full_files);
-        assert_eq!(config.maintenance.timefusion_warm_recency_days, 9);
+        assert_eq!(config.maintenance.timefusion_warm_recency_days, 35);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
         // Durable-by-default WAL: an async fsync default let OOM-kills tear the
         // mmap tail and silently quarantine acked rows. Pin the durable defaults.
