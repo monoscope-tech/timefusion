@@ -51,6 +51,20 @@
 > **Still deferred:** D2 (per-day index granularity), D3 (prefilter off the
 > planning path), D4 (benefit-based routing). Stated so the narrowing is visible.
 >
+> **Observed after shipping — the cap is tuned too high.** At the measured
+> throughput a 400-file pass runs ~2 hours, so the reconcile is effectively
+> CONTINUOUS rather than hourly: prod logged `Tantivy reconcile job run still in
+> progress after 600s … (skips=1)`, i.e. the next tick was correctly dropped
+> rather than piling up. The drain itself is healthy and converging
+> (`cache_seeded` 100 → 421 in ~50 min, with query latency flat throughout), so
+> this is not a functional defect — but `deferred_to_next_pass` and the
+> `uncovered` gauge only update at pass end, so observability is far coarser
+> than the bounded-pass design intended. **Next deploy should lower
+> `timefusion_tantivy_backfill_max_files_per_pass` to ~150**, which at measured
+> rates gives a ~30-minute pass that fits inside the tick and reports each time.
+> Deliberately not deployed tonight: prod has already taken three restarts, and
+> this changes reporting cadence, not correctness.
+>
 > **Known gap carried:** `gc_after_compaction` prunes manifest entries without
 > invalidating this process's cache, so for up to `manifest_ttl` a query can
 > consult an entry whose blob is gone. Soft — the prefilter treats it as "no
