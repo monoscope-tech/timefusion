@@ -931,7 +931,6 @@ impl StatsTableProvider {
             // TIMEFUSION_ORDERING_PROBE=true. All zero with a nonzero total
             // just means the probe is off — not that no leg is at fault.
             "ordering_violations_mem" => crate::read::ORDERING_VIOLATIONS_MEM,
-            "ordering_violations_hot" => crate::read::ORDERING_VIOLATIONS_HOT,
             "ordering_violations_delta" => crate::read::ORDERING_VIOLATIONS_DELTA,
         ];
 

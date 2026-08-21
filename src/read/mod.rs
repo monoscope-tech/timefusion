@@ -2595,11 +2595,7 @@ impl LogicalCountIndex {
             timestamp: i64,
         }
 
-        let base_visible = |timestamp: i64, winner: Winner| {
-            !covered_ranges
-                .iter()
-                .any(|&(start, end)| (start..end).contains(&timestamp))
-        };
+        let base_visible = |timestamp: i64| !covered_ranges.iter().any(|&(start, end)| (start..end).contains(&timestamp));
         let mut overlay: HashMap<Box<[u8]>, Overlay, ahash::RandomState> = HashMap::default();
         for (batches, authoritative) in [(authoritative_batches, true), (delta_batches, false)] {
             for batch in batches {
@@ -2621,7 +2617,7 @@ impl LogicalCountIndex {
                     let encoded = key(timestamp, id);
                     let candidate =
                         Winner { tiebreak: (!tiebreaks.is_null(row)).then(|| tiebreaks.value(row)), deleted: !deleted.is_null(row) && deleted.value(row) };
-                    if !authoritative && !base_visible(timestamp, candidate) {
+                    if !authoritative && !base_visible(timestamp) {
                         continue;
                     }
                     match overlay.entry(encoded) {
@@ -2631,7 +2627,7 @@ impl LogicalCountIndex {
                             }
                         }
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            let base = self.winner(timestamp, id).filter(|winner| base_visible(timestamp, *winner));
+                            let base = self.winner(timestamp, id).filter(|_| base_visible(timestamp));
                             let current = base.filter(|winner| winner.tiebreak >= candidate.tiebreak).unwrap_or(candidate);
                             entry.insert(Overlay { base, current, timestamp });
                         }
