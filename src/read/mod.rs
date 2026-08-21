@@ -118,7 +118,6 @@ impl Bound {
 #[strum(serialize_all = "lowercase")]
 pub enum LegKind {
     Mem,
-    Hot,
     Delta,
 }
 
@@ -134,18 +133,16 @@ impl LegKind {
     fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
         match self {
             LegKind::Mem => &ORDERING_VIOLATIONS_MEM,
-            LegKind::Hot => &ORDERING_VIOLATIONS_HOT,
             LegKind::Delta => &ORDERING_VIOLATIONS_DELTA,
         }
     }
 }
 
 pub(crate) static ORDERING_VIOLATIONS_MEM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static ORDERING_VIOLATIONS_HOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static ORDERING_VIOLATIONS_DELTA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub fn ordering_violations_by_leg() -> [(&'static str, u64); 3] {
-    [LegKind::Mem, LegKind::Hot, LegKind::Delta].map(|leg| (leg.label(), leg.counter().load(std::sync::atomic::Ordering::Relaxed)))
+pub fn ordering_violations_by_leg() -> [(&'static str, u64); 2] {
+    [LegKind::Mem, LegKind::Delta].map(|leg| (leg.label(), leg.counter().load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// Diagnostic wrapper that answers "which leg's declared ordering is false?".
@@ -2044,22 +2041,13 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         datafusion::logical_expr::col("timestamp").gt_eq(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(q.lo), Some("UTC".into())))),
         datafusion::logical_expr::col("timestamp").lt(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(hi), Some("UTC".into())))),
     ];
-    let (mem_batches, mem_ranges, hot) = match database.buffered_layer() {
+    let (mem_batches, mem_ranges) = match database.buffered_layer() {
         Some(layer) => {
             let mem = layer.query(&q.project_id, &q.table_name, &filters).ok()?;
-            // The ordinary MOR scan resolves mem ∪ hot ∪ Delta. Omitting
-            // the raw hot-tier versions can leave a newer tombstone/update out
-            // of the cached winner overlay even though the physical Delta base
-            // is complete. Read only the four narrow index columns; files that
-            // the hot tier declines remain represented by the Delta base.
-            let arrow_schema = schema.schema_ref();
-            let projection: Vec<usize> =
-                ["timestamp", "id", tiebreak, deleted].into_iter().map(|column| arrow_schema.index_of(column).ok()).collect::<Option<_>>()?;
             let mem_ranges = layer.get_bucket_ranges(&q.project_id, &q.table_name);
-            let hot = layer.hot_tier().scan(&q.project_id, &q.table_name, Some((q.lo, q.hi)), &mem_ranges, &filters, &arrow_schema, Some(&projection));
-            (mem, mem_ranges, hot)
+            (mem, mem_ranges)
         }
-        None => (Vec::new(), Vec::new(), Default::default()),
+        None => (Vec::new(), Vec::new()),
     };
     let table_ref = database.resolve_table(&q.project_id, &q.table_name).await.ok()?;
     let (indexes, missing, added_files, stale_dates, delta_snapshot, log_store) = {
@@ -2104,9 +2092,8 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         }
         return None;
     }
-    let mut authoritative_batches = mem_batches;
-    authoritative_batches.extend(hot.collect().await);
-    let covered_ranges = crate::write::mem_buffer::merge_ranges([mem_ranges, hot.ranges].concat());
+    let authoritative_batches = mem_batches;
+    let covered_ranges = crate::write::mem_buffer::merge_ranges(mem_ranges);
     let delta_batches = database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?;
     indexes.into_iter().try_fold(0u64, |total, (date, index)| {
         let day_lo = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
@@ -2115,7 +2102,6 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
             authoritative_batches: &authoritative_batches,
             delta_batches: &delta_batches,
             covered_ranges: &covered_ranges,
-            version_gate: hot.version_gate,
         };
         let count = index.count_with_covered_overlay(input, q.lo.max(day_lo), hi.min(day_hi), columns).ok()?;
         total.checked_add(count)
@@ -2273,7 +2259,6 @@ pub struct LogicalCountOverlay<'a> {
     pub authoritative_batches: &'a [RecordBatch],
     pub delta_batches: &'a [RecordBatch],
     pub covered_ranges: &'a [(i64, i64)],
-    pub version_gate: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2590,7 +2575,7 @@ impl LogicalCountIndex {
     /// full 24-hour cardinality.
     pub fn count_with_overlay(&self, batches: &[RecordBatch], lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
         self.count_with_covered_overlay(
-            LogicalCountOverlay { authoritative_batches: batches, delta_batches: &[], covered_ranges: &[], version_gate: None },
+            LogicalCountOverlay { authoritative_batches: batches, delta_batches: &[], covered_ranges: &[] },
             lo,
             hi,
             columns,
@@ -2598,11 +2583,11 @@ impl LogicalCountIndex {
     }
 
     /// Count after applying the same coverage contract as the ordinary
-    /// `mem ∪ hot ∪ Delta` scan. Rows in `authoritative_batches` replace
-    /// covered Delta rows; `delta_batches` are newly appended Delta files and
-    /// remain subject to the same range/version gate as the indexed base.
+    /// `mem ∪ Delta` scan. Rows in `authoritative_batches` replace covered
+    /// Delta rows; `delta_batches` are newly appended Delta files and remain
+    /// subject to the same range gate as the indexed base.
     pub fn count_with_covered_overlay(&self, input: LogicalCountOverlay<'_>, lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
-        let LogicalCountOverlay { authoritative_batches, delta_batches, covered_ranges, version_gate } = input;
+        let LogicalCountOverlay { authoritative_batches, delta_batches, covered_ranges } = input;
         #[derive(Clone, Copy)]
         struct Overlay {
             base: Option<Winner>,
@@ -2613,7 +2598,7 @@ impl LogicalCountIndex {
         let base_visible = |timestamp: i64, winner: Winner| {
             !covered_ranges
                 .iter()
-                .any(|&(start, end)| (start..end).contains(&timestamp) && version_gate.is_none_or(|gate| winner.tiebreak.is_none_or(|stamp| stamp <= gate)))
+                .any(|&(start, end)| (start..end).contains(&timestamp))
         };
         let mut overlay: HashMap<Box<[u8]>, Overlay, ahash::RandomState> = HashMap::default();
         for (batches, authoritative) in [(authoritative_batches, true), (delta_batches, false)] {
@@ -2657,7 +2642,7 @@ impl LogicalCountIndex {
 
         let mut count = i128::from(self.count(lo, hi));
         if !covered_ranges.is_empty() {
-            count -= i128::from(self.count_covered_live(lo, hi, covered_ranges, version_gate));
+            count -= i128::from(self.count_covered_live(lo, hi, covered_ranges));
         }
         for state in overlay.values().filter(|state| (lo..hi).contains(&state.timestamp)) {
             count += i128::from(!state.current.deleted) - i128::from(state.base.is_some_and(|winner| !winner.deleted));
@@ -2665,13 +2650,13 @@ impl LogicalCountIndex {
         u64::try_from(count).context("logical-count overlay produced an invalid negative/overflow count")
     }
 
-    fn count_covered_live(&self, lo: i64, hi: i64, covered_ranges: &[(i64, i64)], version_gate: Option<i64>) -> u64 {
+    fn count_covered_live(&self, lo: i64, hi: i64, covered_ranges: &[(i64, i64)]) -> u64 {
         let visible = |timestamp: i64, winner: Winner| {
             !winner.deleted
                 && (lo..hi).contains(&timestamp)
                 && covered_ranges
                     .iter()
-                    .any(|&(start, end)| (start..end).contains(&timestamp) && version_gate.is_none_or(|gate| winner.tiebreak.is_none_or(|stamp| stamp <= gate)))
+                    .any(|&(start, end)| (start..end).contains(&timestamp))
         };
         let count = if let Some(packed) = &self.packed {
             packed
@@ -3061,28 +3046,11 @@ mod logical_count_index_tests {
         index.apply(10, "old", Some(1), false);
         index.apply(20, "newer-delta", Some(5), false);
         index.finalize().unwrap();
-        let hot = versions(&[(10, "old", Some(2), Some(true)), (20, "newer-delta", Some(3), Some(true))]);
+        let mem = [versions(&[(10, "old", Some(2), Some(true)), (20, "newer-delta", Some(3), Some(true))])];
 
-        let hot_copy = [hot.clone()];
         let ranges = [(0, 50)];
-        let input = LogicalCountOverlay { authoritative_batches: &hot_copy, delta_batches: &[], covered_ranges: &ranges, version_gate: None };
+        let input = LogicalCountOverlay { authoritative_batches: &mem, delta_batches: &[], covered_ranges: &ranges };
         assert_eq!(index.count_with_covered_overlay(input, 0, 100, columns).unwrap(), 0);
-        let hot_copy = [hot];
-        let input = LogicalCountOverlay { authoritative_batches: &hot_copy, delta_batches: &[], covered_ranges: &ranges, version_gate: Some(3) };
-        assert_eq!(index.count_with_covered_overlay(input, 0, 100, columns).unwrap(), 1, "a Delta winner newer than the hot version gate remains visible");
-    }
-
-    #[test]
-    fn covered_delta_append_obeys_the_hot_version_gate() {
-        let columns = LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak: "updated_at", deleted: "deleted" };
-        let mut index = LogicalCountIndex::new();
-        index.finalize().unwrap();
-        let appended = versions(&[(10, "covered", Some(2), Some(false)), (20, "newer", Some(4), Some(false))]);
-
-        let appended = [appended];
-        let ranges = [(0, 50)];
-        let input = LogicalCountOverlay { authoritative_batches: &[], delta_batches: &appended, covered_ranges: &ranges, version_gate: Some(3) };
-        assert_eq!(index.count_with_covered_overlay(input, 0, 100, columns).unwrap(), 1);
     }
 
     #[test]

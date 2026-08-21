@@ -923,11 +923,6 @@ impl CoreConfig {
     pub fn cache_dir(&self) -> PathBuf {
         self.timefusion_data_dir.join("cache")
     }
-    /// Own root for the local hot tier — never share a dir with a generic
-    /// recursive deleter (WAL GC once ate the quarantine dir this way).
-    pub fn hot_tier_dir(&self) -> PathBuf {
-        self.timefusion_data_dir.join("hot_tier")
-    }
 }
 
 #[serde_inline_default::serde_inline_default]
@@ -949,33 +944,6 @@ pub struct BufferConfig {
     pub timefusion_buffer_retention_mins: u64,
     #[serde_inline_default(60)]
     pub timefusion_eviction_interval_secs: u64,
-    /// Local hot tier: instead of dropping a drained bucket, demote it to an
-    /// uncompressed Arrow IPC file on local disk and serve recent-window
-    /// reads via zero-copy mmap. This is the tier's main switch; **0 turns
-    /// demotion off** (GC still sweeps). Past this age a demoted file is
-    /// unlinked and its window falls back to Delta.
-    // The local hot tier: demoted sealed buckets served as the scan's third leg.
-    //
-    // Holds WHATEVER FITS ON DISK — no time retention. Used to keep a fixed
-    // number of hours, which made the tier's value depend on guessing the right
-    // number and left disk unused. GC now unlinks oldest-first purely to stay
-    // under `timefusion_hot_tier_max_disk_gb`, so buying disk buys coverage directly, and
-    // `skip_for_lookback` reads the tier's MEASURED span rather than a setting.
-    #[serde_inline_default(true)]
-    pub timefusion_hot_tier_enabled: bool,
-    /// Hard cap on the tier's directory; over it, GC unlinks oldest-first.
-    /// The tier shares the WAL/data volume, which has twice been eaten by an
-    /// unbounded consumer, so this one is a real dial.
-    // Files are UNCOMPRESSED (~4x the bytes of the LZ4 era), so this holds
-    // roughly the coverage the old compressed cap did — bought with disk that was
-    // sitting idle instead of decompression CPU and anon heap. Raise it to buy
-    // more history; that is now the only knob that changes how far back the tier
-    // reaches.
-    #[serde_inline_default(600)]
-    pub timefusion_hot_tier_max_disk_gb: u64,
-    /// Kill switch for hot-tier merge-on-demote (falls back to stacked files).
-    #[serde_inline_default(false)]
-    pub timefusion_hot_tier_merge_demote: bool,
     #[serde_inline_default(4096)]
     pub timefusion_buffer_max_memory_mb: usize,
     // Total graceful-shutdown budget shared by ALL serial shutdown phases
@@ -1163,21 +1131,6 @@ impl BufferConfig {
     pub fn retention_mins(&self) -> u64 {
         self.timefusion_buffer_retention_mins.max(1)
     }
-    /// `TIMEFUSION_HOT_TIER_ENABLED=false` is the tier's off switch: no
-    /// demotion, no third scan leg, no disk use. No time retention — the
-    /// tier holds whatever `hot_tier_limits().max_disk_bytes` affords.
-    pub fn hot_tier_enabled(&self) -> bool {
-        self.timefusion_hot_tier_enabled
-    }
-    /// The tier's only ceiling. Per-scan heap needs no knob: `HotTier::scan`
-    /// streams its files inside the query's own memory pool.
-    pub fn hot_tier_limits(&self) -> crate::hot_tier::HotTierLimits {
-        crate::hot_tier::HotTierLimits {
-            max_disk_bytes: self.timefusion_hot_tier_max_disk_gb.saturating_mul(GIB as u64),
-            merge_demote: self.timefusion_hot_tier_merge_demote,
-        }
-    }
-
     /// mtime age past which a WAL file is PRESUMED dead weight. Heuristic,
     /// not a soundness bound: replay is cursor-bounded (no age cutoff), so
     /// GC soundness comes from the un-flushed floor and the drained-gated

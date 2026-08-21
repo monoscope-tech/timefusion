@@ -17,7 +17,6 @@ mod flush_sort_escalation;
 mod flush_warm;
 mod hash_enrichment;
 mod hot_tail_sorted_footer;
-mod hot_tier;
 mod insert_unnest_variant;
 mod merge_on_read;
 mod multi_tenant_isolation;
