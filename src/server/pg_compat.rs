@@ -795,7 +795,17 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, query_pool: None, logical_count: None, tantivy_search: None, bloom_prune: None, schema }
+        Self {
+            layer,
+            scan_metrics: None,
+            cache_sizes: None,
+            foyer_stats: None,
+            query_pool: None,
+            logical_count: None,
+            tantivy_search: None,
+            bloom_prune: None,
+            schema,
+        }
     }
 
     pub fn with_scan_metrics(self, m: Arc<ScanMetrics>) -> Self {

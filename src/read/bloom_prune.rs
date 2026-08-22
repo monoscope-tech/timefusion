@@ -26,7 +26,10 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use bincode::{Decode, Encode};
 use dashmap::DashMap;
-use datafusion::{logical_expr::{Expr, Operator, utils::split_conjunction}, scalar::ScalarValue};
+use datafusion::{
+    logical_expr::{Expr, Operator, utils::split_conjunction},
+    scalar::ScalarValue,
+};
 use deltalake::datafusion::parquet::{
     arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     bloom_filter::Sbbf,
@@ -93,9 +96,7 @@ pub fn project_date_of_rel(rel: &str) -> Option<(&str, &str)> {
 /// columns, from the query's top-level conjuncts. Two conjuncts on the same
 /// column merge value lists — weaker (OR for rejection) but always safe.
 pub fn extract_needles(filters: &[Expr], schema: &crate::schema::TableSchema, mutable: Option<&HashSet<String>>) -> Vec<(String, Vec<String>)> {
-    let eligible = |name: &str| {
-        schema.fields.iter().any(|f| f.name == name && f.bloom_filter) && !mutable.is_some_and(|m| m.contains(name))
-    };
+    let eligible = |name: &str| schema.fields.iter().any(|f| f.name == name && f.bloom_filter) && !mutable.is_some_and(|m| m.contains(name));
     let lit_str = |e: &Expr| match e {
         Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)), _) => Some(s.clone()),
         _ => None,
@@ -171,9 +172,9 @@ impl DateBlooms {
         if probe.no_bloom {
             return Some(false);
         }
-        Some(needles.iter().any(|(col, values)| {
-            probe.columns.get(col).is_some_and(|blooms| values.iter().all(|v| blooms.iter().all(|b| !b.check(v.as_str()))))
-        }))
+        Some(
+            needles.iter().any(|(col, values)| probe.columns.get(col).is_some_and(|blooms| values.iter().all(|v| blooms.iter().all(|b| !b.check(v.as_str()))))),
+        )
     }
 }
 
@@ -315,8 +316,7 @@ pub async fn build_file_blooms(store: Arc<dyn ObjectStore>, rel: &str, file_size
     let reader = ParquetObjectReader::new(store, Path::from(rel)).with_file_size(file_size);
     let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet footer")?;
     let n_rg = builder.metadata().num_row_groups();
-    let leaves: Vec<Option<usize>> =
-        cols.iter().map(|col| builder.parquet_schema().columns().iter().position(|c| c.path().string() == *col)).collect();
+    let leaves: Vec<Option<usize>> = cols.iter().map(|col| builder.parquet_schema().columns().iter().position(|c| c.path().string() == *col)).collect();
     let mut columns = Vec::new();
     let mut total = 0u64;
     'col: for (col, leaf) in cols.iter().zip(leaves) {
@@ -353,7 +353,11 @@ mod tests {
         bloom.write(&mut bytes).unwrap();
         let sidecar = DateSidecar {
             files: vec![
-                FileBlooms { rel: "project_id=p/date=2026-08-22/f1.parquet".into(), no_bloom: false, columns: vec![("context___trace_id".into(), vec![bytes])] },
+                FileBlooms {
+                    rel: "project_id=p/date=2026-08-22/f1.parquet".into(),
+                    no_bloom: false,
+                    columns: vec![("context___trace_id".into(), vec![bytes])],
+                },
                 FileBlooms { rel: "project_id=p/date=2026-08-22/f2.parquet".into(), no_bloom: true, columns: vec![] },
             ],
         };
