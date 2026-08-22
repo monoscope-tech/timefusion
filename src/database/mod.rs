@@ -9020,7 +9020,11 @@ impl ExecutionPlan for GatedScanExec {
                 next.map(|item| (item, (inner, produced)))
             }
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, gated)))
+        // Same cancellation contract as `DedupExec` — see its `execute`. The
+        // permit await below yields, but the inner decode inside one poll need
+        // not, so the wrapper guarantees a budget is consumed per batch and the
+        // statement deadline stays observable.
+        Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(RecordBatchStreamAdapter::new(schema, gated))))
     }
 }
 

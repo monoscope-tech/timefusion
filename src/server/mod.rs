@@ -1274,6 +1274,45 @@ mod pgwire_handlers_tests {
         assert_eq!(parse_optimize("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  ").unwrap().unwrap().table, "t");
     }
 
+    /// Mode D, pinned as a test: the statement deadline is COOPERATIVE. It is
+    /// enforced by dropping the in-flight future, and `tokio::time::timeout_at`
+    /// only gets to run when a poll returns `Pending`. A future that computes
+    /// without yielding therefore overruns the deadline by however long it likes
+    /// — the timer is never polled.
+    ///
+    /// Prod 2026-08-22: a 7-day aggregate ran >20 min against a 60s effective
+    /// cap that never fired, on a container with 2h uptime still answering
+    /// `SELECT 1` on new connections. This is why the operators that can run
+    /// long inside one poll (`DedupExec`, `GatedScanExec`) wrap their output in
+    /// DataFusion's `coop::make_cooperative`: it spends a task budget per batch,
+    /// which is what makes the deadline observable at all.
+    ///
+    /// The test asserts the LIMITATION, not the fix, so it keeps passing and
+    /// keeps the reason discoverable. If someone later makes the deadline
+    /// preemptive, this is the test that should be rewritten deliberately.
+    #[tokio::test(start_paused = true)]
+    async fn the_statement_deadline_cannot_interrupt_a_future_that_never_yields() {
+        use super::run_with_statement_timeout;
+        // Awaits a timer ⇒ returns Pending, the deadline is observed, it fires.
+        // (Under a paused clock tokio auto-advances once every task is idle, so
+        // this is deterministic rather than a real 10s wait.)
+        let yielding = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(())
+        };
+        let timed_out = run_with_statement_timeout(Some(std::time::Duration::from_secs(1)), yielding).await;
+        assert!(timed_out.is_err(), "a future that yields must be interruptible by the deadline");
+
+        // Never yields ⇒ runs to completion regardless of the deadline. Under a
+        // paused clock this is exact rather than timing-dependent: no timer can
+        // advance while the future holds the thread.
+        let non_yielding = async { Ok(41 + 1) };
+        let (value, _) = run_with_statement_timeout(Some(std::time::Duration::from_nanos(1)), non_yielding)
+            .await
+            .expect("a non-yielding future outruns the deadline instead of being cancelled");
+        assert_eq!(value, 42, "it completed, which is precisely the failure mode");
+    }
+
     #[test]
     fn optimize_rejects_unbounded_and_malformed() {
         // Bare OPTIMIZE (no date) is rejected — would compact all history in-process.

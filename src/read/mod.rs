@@ -650,7 +650,19 @@ impl ExecutionPlan for DedupExec {
         })
         .flat_map(|r| futures::stream::iter(r.map_or_else(|e| vec![Err(e)], |bs| bs.into_iter().map(Ok).collect::<Vec<_>>())));
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream)))
+        // A statement timeout is enforced by DROPPING the in-flight future
+        // (`run_with_statement_timeout`), and `tokio::time::timeout_at` can only
+        // fire when a poll returns `Pending`. Unbounded keep-greatest buffers to
+        // end-of-stream, so one `poll_next` here can run for minutes of pure CPU
+        // — and while it does, the deadline is unobservable.
+        //
+        // Prod 2026-08-22: a 7-day aggregate ran >20 min against a 60s effective
+        // cap that never fired, on a container with 2h uptime that was answering
+        // `SELECT 1` on new connections the whole time. DataFusion's own coop
+        // docs name this exact failure: "this prevents the query execution from
+        // being cancelled". Built-in sources carry yield points; custom
+        // operators like this one have to opt in.
+        Ok(datafusion::physical_plan::coop::make_cooperative(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream))))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
