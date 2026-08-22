@@ -2021,11 +2021,15 @@ pub struct MaintenanceConfig {
     /// version and tombstone of a row shares one date partition. No dedup key
     /// spans dates, so dedup over the union equals dedup applied per date.
     ///
-    /// **Default OFF.** The failure mode is a silent over-count on every
-    /// dashboard tile, and this table is `version_append` (merge-on-read), so
-    /// the uncertified legs must keep their keep-greatest ordering. Flip only
-    /// after a staging run comparing `count(*)` with it on and off.
-    #[serde_inline_default(false)]
+    /// **Default ON since 2026-08-22.** The failure mode is a silent over-count
+    /// on every dashboard tile, so it ships on the strength of
+    /// `dedup_compaction_test::per_date_dedup_skip_matches_the_all_or_nothing_result`,
+    /// which forces PARTIAL certification (sweep, then write to the older date
+    /// so its fingerprint moves) and demands the split result equal the
+    /// all-or-nothing result — each date yielding its own winning version.
+    /// Kill switch: `TIMEFUSION_READ_DEDUP_SKIP_PER_DATE=false` (or
+    /// `..._SKIP_SWEPT=false` to remove the skip entirely).
+    #[serde_inline_default(true)]
     pub timefusion_read_dedup_skip_per_date: bool,
     /// Dedup-as-you-compact experiment (docs/plans/2026-08-20-dedup-and-sort
     /// strategy §3): the on-demand compaction path (`compact_date`, i.e. pgwire
