@@ -256,3 +256,43 @@ fingerprint and voids the proof, which is the livelock in the small.
 **Do not add `cert_slice_fp_reset`** (queued in the previous section) — the
 question it was to answer is now answered by the sidecars, and it would cost a
 deploy to learn nothing new.
+
+## Per-date dedup skip SHIPPED (default off) — and the second half, honestly
+
+`timefusion_read_dedup_skip_per_date` splits the Delta-only scan by date:
+certified partitions union ABOVE `DedupExec`, uncertified ones flow through it
+unchanged. Sound because `date` derives from `timestamp` and DML re-appends
+preserve it, so no dedup key spans a date boundary.
+
+Default **off**: the failure mode is a silent over-count on every dashboard
+tile, and this table is `version_append`. Flip after a staging run comparing
+`count(*)` on and off. Expected effect at today's certification levels: the
+5-day runs that currently buy nothing start skipping dedup over 5 of a 7-day
+window's dates.
+
+### "Stop maintenance voiding certifications it didn't need to disturb"
+
+Investigated and **not implemented, deliberately** — the premise does not hold
+as stated. Certifications are keyed on the partition file fingerprint, and
+compaction/repair genuinely change that file set, so the invalidation is
+*correct*, not spurious. There is no "didn't need to disturb" case to
+suppress: the day really did change.
+
+Two things I considered and rejected:
+
+1. **Carry the certification forward across a compaction** (re-certify at the
+   new fingerprint, since merging files cannot introduce duplicates). Unsound
+   as written: a concurrent append landing between the pre-image snapshot and
+   the commit would be certified sight-unseen. Making it sound needs the
+   commit's exact added-file set, which `optimize()` returns only as counts.
+2. **Force-grant after dedup-as-you-compact** (`timefusion_compact_dedup_merge`
+   produces a provably deduped output). Unsound at partition granularity:
+   compaction bin-packs and may rewrite only *some* bins, so the untouched
+   remainder can still hold duplicates.
+
+The real shape of the problem is throughput, not spurious voiding: a changed
+partition is already re-swept (the incremental skip at `maintain.rs:3031` only
+skips *unchanged* ones), so certification does come back — just slower than
+compaction knocks it down. Per-date skip is what makes that tolerable, because
+partial runs now pay. Chasing the voiding directly would be optimising the
+wrong half.
