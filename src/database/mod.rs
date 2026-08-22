@@ -290,6 +290,8 @@ pub mod scan_metric_names {
     pub const BOUNDED_OTEL_SCAN_REJECTIONS: &str = "timefusion.scan.bounded_otel_scan_rejections";
     pub const WIDE_SCAN_OVERSIZE_TOTAL: &str = "timefusion.scan.wide_scan_oversize_total";
     pub const WIDE_SCAN_REFUSED_TOTAL: &str = "timefusion.scan.wide_scan_refused_total";
+    pub const DEDUP_BOUNDED_TOTAL: &str = "timefusion.scan.dedup_bounded_total";
+    pub const DEDUP_FULL_SET_TOTAL: &str = "timefusion.scan.dedup_full_set_total";
     pub const WIDE_SCAN_SELECTED_MB: &str = "timefusion.scan.wide_scan_selected_mb";
     pub const MEM_PLAN_US_TOTAL: &str = "timefusion.scan.mem_plan_us_total";
     pub const MEM_PLAN_TOTAL: &str = "timefusion.scan.mem_plan_total";

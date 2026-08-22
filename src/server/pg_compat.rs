@@ -1276,6 +1276,12 @@ impl StatsTableProvider {
                     "bounded_otel_scan_rejections" => cv(BOUNDED_OTEL_SCAN_REJECTIONS),
                     "wide_scan_oversize_total" => cv(WIDE_SCAN_OVERSIZE_TOTAL),
                     "wide_scan_refused_total" => cv(WIDE_SCAN_REFUSED_TOTAL),
+                    // full-set is the mode that has no LIMIT early termination and
+                    // charges the 2 GiB per-query budget. A non-zero pct is the
+                    // footer-repair backlog measured from the read side.
+                    "dedup_bounded_total" => cv(DEDUP_BOUNDED_TOTAL),
+                    "dedup_full_set_total" => cv(DEDUP_FULL_SET_TOTAL),
+                    "dedup_full_set_pct" => pct(cv(DEDUP_FULL_SET_TOTAL), cv(DEDUP_BOUNDED_TOTAL) + cv(DEDUP_FULL_SET_TOTAL)),
                     // Read these BEFORE setting TIMEFUSION_WIDE_SCAN_REFUSE_MB — the
                     // threshold has to sit above p99 or it rejects working dashboards.
                     "wide_scan_selected_mb_p50" => q(WIDE_SCAN_SELECTED_MB, 0.50),

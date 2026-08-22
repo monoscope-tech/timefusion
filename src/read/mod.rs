@@ -572,6 +572,19 @@ impl ExecutionPlan for DedupExec {
         }
         let in_schema = self.input.schema();
         let bound = detect_bound(&self.input, &self.keys, &in_schema, bounded_dedup_enabled());
+        // Which mode a scan got is the difference between a `LIMIT 251` that
+        // terminates after a few batches and one that buffers the whole window
+        // into the 2 GiB budget and fails. It was visible only in EXPLAIN, so the
+        // footer-repair backlog showed up as a user-facing error rather than as a
+        // number: 2026-08-22 the whale answered log_list@30d bounded while p1
+        // failed on the identical shape, because 38 of p1's 86 file groups carry
+        // no footer `sorting_columns` and ONE unordered branch erases the ordering
+        // the whole leg declares.
+        metrics::counter!(match bound {
+            Some(_) => crate::database::scan_metric_names::DEDUP_BOUNDED_TOTAL,
+            None => crate::database::scan_metric_names::DEDUP_FULL_SET_TOTAL,
+        })
+        .increment(1);
         let key_idxs = dedup_key_idxs(bound.as_ref(), &self.key_idxs);
         // A bound lets keep-greatest emit per run without buffering the stream,
         // so it is the preferred shape — but it is no longer REQUIRED. Refusing
