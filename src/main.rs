@@ -477,6 +477,15 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         info!("Tantivy sidecar indexes active for tables: {:?}", indexed_tables);
         Some(svc)
     };
+    if cfg.maintenance.timefusion_file_bloom_pruning && !bucket.is_empty() {
+        let storage_uri = format!("s3://{bucket}/{}/bloom_sidecars", cfg.core.timefusion_table_prefix);
+        let store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+        db = db.with_bloom_prune(Arc::new(timefusion::read::bloom_prune::BloomPruneRegistry::new(
+            store,
+            cfg.maintenance.timefusion_bloom_registry_cap_mb * 1024 * 1024,
+            std::time::Duration::from_secs(cfg.maintenance.timefusion_bloom_registry_refresh_secs),
+        )));
+    }
     let buffered_layer = Arc::new(layer);
 
     // Initialize OpenTelemetry metrics — observable gauges read snapshot_stats()

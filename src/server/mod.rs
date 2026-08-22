@@ -82,6 +82,15 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         svc.with_reader(&search);
         db = db.with_tantivy_search(search).with_tantivy_indexer(svc);
     }
+    if cfg.maintenance.timefusion_file_bloom_pruning && !bucket.is_empty() {
+        let storage_uri = format!("s3://{}/{}/bloom_sidecars", bucket, cfg.core.timefusion_table_prefix);
+        let store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+        db = db.with_bloom_prune(Arc::new(crate::read::bloom_prune::BloomPruneRegistry::new(
+            store,
+            cfg.maintenance.timefusion_bloom_registry_cap_mb * 1024 * 1024,
+            std::time::Duration::from_secs(cfg.maintenance.timefusion_bloom_registry_refresh_secs),
+        )));
+    }
 
     let buffered_layer = Arc::new(layer);
 

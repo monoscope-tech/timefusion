@@ -1814,6 +1814,29 @@ pub struct MaintenanceConfig {
     /// nightly cadence in the first place.
     #[serde_inline_default("0 20 * * * *".to_string())]
     pub timefusion_tantivy_reconcile_schedule: String,
+    /// File-level needle pruning: consult per-file bloom sidecars at
+    /// file-selection time so point lookups (trace_id/id/span_id…) scan only
+    /// files that can contain the needle. Kill switch for the read path; the
+    /// sidecar builder cron is keyed off the same flag.
+    /// docs/plans/2026-08-22-file-level-needle-pruning.md
+    #[serde_inline_default(true)]
+    pub timefusion_file_bloom_pruning: bool,
+    /// Bloom sidecar reconcile: lift parquet blooms of uncovered live files
+    /// into per-(project,date) sidecars, GC retired entries. Each pass is
+    /// bounded by `timefusion_bloom_sidecar_files_per_pass`, newest dates
+    /// first so hot partitions converge first.
+    #[serde_inline_default("0 */5 * * * *".to_string())]
+    pub timefusion_bloom_sidecar_schedule: String,
+    #[serde_inline_default(512)]
+    pub timefusion_bloom_sidecar_files_per_pass: usize,
+    /// Resident registry cap; sidecars beyond it are re-fetched on demand
+    /// (off the plan path — a miss only skips pruning for that query).
+    #[serde_inline_default(256)]
+    pub timefusion_bloom_registry_cap_mb: usize,
+    /// Re-fetch a resident sidecar this often so entries built since the
+    /// last load start pruning without a restart.
+    #[serde_inline_default(300)]
+    pub timefusion_bloom_registry_refresh_secs: u64,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.
