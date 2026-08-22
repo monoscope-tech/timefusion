@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 use tantivy::{Index, IndexReader};
 
 use crate::tantivy::{
-    MANIFEST_PREFIX, Manifest, SCHEMA_VERSION, load_manifest, save_manifest,
+    MANIFEST_PREFIX, Manifest, SCHEMA_VERSION, load_manifest,
     udf::{PredNode, TextMatchPred},
     upsert_manifest,
 };
