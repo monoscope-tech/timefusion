@@ -375,12 +375,21 @@ backfill pass in flight.** The 02:20 reconcile finished its GC phase in 9
 seconds and then ran for 40+ minutes without emitting `tantivy_backfill_pass`,
 without a failure warning, and without bending the curve.
 
-**Root cause, from the config's own comment:** `build_concurrency = 2`, and
-"each 1 GB parquet takes ~2-3 min to index". So a 150-file pass costs
-`150 x 2.5min / 2` = **~3 HOURS**, and the backfill's real build rate is
-**~48 files/hour** against **~133/hour gross accrual**. Coverage cannot
-converge at ANY cap, because the cap is never reached inside a tick — the
-binding constraint is build throughput, not pass bounding.
+**What is measured vs what is inferred.** MEASURED: net +85/hr with a pass in
+flight, and no `tantivy_backfill_pass` line 49+ minutes in. Those alone
+establish that coverage does not converge and that a 150-file pass does not fit
+an hourly tick — the cap is not the binding constraint, because it is never
+reached inside a tick.
+
+INFERRED, and flagged as such: the config says `build_concurrency = 2` and
+"each 1 GB parquet takes ~2-3 min to index", which would put backfill at ~48
+files/hr against ~133/hr gross accrual and a 150-file pass at ~3h. Do not act
+on that split yet. Most uncovered files are nowhere near 1 GB — ~1MB
+fragmentation is this repo's standing problem — so the true rate may be several
+times higher, and the split is partly circular (gross accrual was derived by
+assuming the build rate). Taking a number from a CODE COMMENT rather than a
+counter is the same mistake as the one below, one step removed. The direct
+measurement is `built=` on the pass line over its elapsed time.
 
 **This corrects the premise of the cap change (400 -> 150).** The 150 was sized
 against a measured "~456 builds/hr", taken from the `cache_seeded` counter —
