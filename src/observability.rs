@@ -1272,12 +1272,43 @@ mod imp {
         //
         // Heap profiling is unaffected: it is jemalloc's own, configured by the
         // baked `malloc_conf`, so the dumps that attribute an OOM still land.
+        // Heap-dump pruning must NOT ride on the CPU sampler. jemalloc dumps a
+        // .heap every ~8GiB allocated and never prunes them — left alone they
+        // reached 95GB / 42k files in prod — and the pruning used to live inside
+        // the sampler loop, which the next line can skip entirely. Prod runs
+        // exactly that way (`TIMEFUSION_CPU_PROFILE=false` since the 2026-08-11
+        // crashloop), so the guard was absent in the one configuration where it
+        // matters: `prof_active` is flipped on to attribute an OOM, and the
+        // dumps then grow unpruned on a volume that is already the WAL's.
+        spawn_heap_pruner(dir.clone());
         if std::env::var("TIMEFUSION_CPU_PROFILE").is_ok_and(|v| v.eq_ignore_ascii_case("false") || v == "0") {
             info!("profiling: jemalloc heap auto-dump only — CPU sampler disabled by TIMEFUSION_CPU_PROFILE → {dir:?}");
             return;
         }
         info!("profiling: enabled (jemalloc heap auto-dump + rolling CPU flamegraph) → {dir:?}");
         spawn_cpu_sampler(dir);
+    }
+
+    /// Cap the jemalloc heap dumps, independently of whether the CPU sampler
+    /// runs.
+    ///
+    /// jemalloc writes a `.heap` every ~8GiB allocated (`lg_prof_interval`) once
+    /// `prof_active` is on, and never removes one. This is deliberately its own
+    /// thread rather than a step in the CPU sampler: the sampler is disabled in
+    /// prod, so pruning attached to it does nothing in the exact configuration
+    /// where heap dumps are being produced on purpose.
+    fn spawn_heap_pruner(dir: PathBuf) {
+        const KEEP_HEAP: usize = 50;
+        const EVERY: Duration = Duration::from_secs(60);
+        std::thread::Builder::new()
+            .name("heap-pruner".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(EVERY);
+                    prune_old(&dir, "jeprof", KEEP_HEAP);
+                }
+            })
+            .expect("spawn heap-pruner thread");
     }
 
     /// One CPU profile window at a time on a dedicated OS thread: build a
@@ -1288,7 +1319,6 @@ mod imp {
         const HZ: i32 = 99; // 99Hz: cheap, avoids lock-step with periodic timers
         const WINDOW: Duration = Duration::from_secs(60);
         const KEEP_CPU: usize = 10;
-        const KEEP_HEAP: usize = 50;
         std::thread::Builder::new()
             .name("cpu-profiler".into())
             .spawn(move || {
@@ -1316,7 +1346,6 @@ mod imp {
                     // allocated (lg_prof_interval:33) and never prunes them —
                     // left alone they grow unbounded (95GB / 42k files in prod).
                     prune_old(&dir, "cpu-", KEEP_CPU);
-                    prune_old(&dir, "jeprof", KEEP_HEAP);
                     seq += 1;
                 }
             })
