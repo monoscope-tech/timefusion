@@ -1218,6 +1218,15 @@ impl StatsTableProvider {
                     "prefilter_skipped_no_index_or_cap" => skip_reason("delta_no_index_or_cap_exceeded"),
                     "prefilter_skipped_no_hits_returned" => skip_reason("delta_no_hits_returned"),
                     "prefilter_skipped_delta_error" => skip_reason("delta_error"),
+                    // Splits `rollup_miss_stale_coverage`, which was the SOLE
+                    // blocker on every bare dashboard shape measured 2026-08-22.
+                    // `no_witness` clears itself once the coordinator republishes
+                    // those slices — it is a throughput problem. `moved` does not,
+                    // because the partition really is churning. Same miss, opposite
+                    // fix, and indistinguishable before this.
+                    "rollup_stale_no_witness" => cv(ROLLUP_STALE_NO_WITNESS),
+                    "rollup_stale_moved" => cv(ROLLUP_STALE_MOVED),
+                    "rollup_stale_no_source_rows" => cv(ROLLUP_STALE_NO_SOURCE_ROWS),
                     "pruned_calls" => cv(PRUNED_CALLS),
                     "pruned_files_total" => cv(PRUNED_FILES),
                     "pruned_select_us_total" => cv(PRUNED_SELECT_US),

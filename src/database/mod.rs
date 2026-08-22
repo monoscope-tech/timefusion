@@ -234,6 +234,13 @@ pub mod scan_metric_names {
         ("delta_error", "timefusion.scan.prefilter_skipped.delta_error"),
     ];
 
+    /// Why a slice's coverage was refused, splitting `rollup_miss_stale_coverage`.
+    /// Unverifiable (predates `TAG_SOURCE_ROWS`) and genuinely-moved are the same
+    /// miss with opposite fixes: the first clears on republish, the second cannot.
+    pub const ROLLUP_STALE_NO_WITNESS: &str = "timefusion.scan.rollup_stale_no_witness";
+    pub const ROLLUP_STALE_MOVED: &str = "timefusion.scan.rollup_stale_moved";
+    pub const ROLLUP_STALE_NO_SOURCE_ROWS: &str = "timefusion.scan.rollup_stale_no_source_rows";
+
     pub fn prefilter_skip_metric(reason: &str) -> Option<&'static str> {
         PREFILTER_SKIP_REASONS.iter().find(|(r, _)| *r == reason).map(|(_, m)| *m)
     }
@@ -3706,6 +3713,20 @@ impl Database {
                     slices.into_iter().partition(|(_, coverage)| crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current));
                 if !stale.is_empty() {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
+                    // WHY it is stale, because the two answers demand opposite
+                    // work. `no_witness` is a slice written before
+                    // `TAG_SOURCE_ROWS` — it is not disagreeing, it is
+                    // unverifiable, and only a republish clears it, so the fix is
+                    // build throughput. `moved` is the partition genuinely
+                    // changing under a verifiable slice, which no amount of
+                    // rebuilding fixes on a churning day. `no_source_rows` is
+                    // neither: the LIVE fingerprint is missing, so nothing can be
+                    // compared. Prod 2026-08-22 had `stale_coverage` as the sole
+                    // blocker on every bare dashboard shape, with no way to tell
+                    // these apart.
+                    for (_, coverage) in &stale {
+                        metrics::counter!(stale_coverage_metric(coverage.source_rows, current)).increment(1);
+                    }
                 }
                 for (key, coverage) in fresh {
                     covered.push((key.3, key.4));
@@ -9022,6 +9043,44 @@ fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate
     match (mutable, tree) {
         (Some(m), Some(t)) => t.columns().iter().any(|c| m.contains(*c)),
         _ => false,
+    }
+}
+
+/// Why one slice's coverage was refused. Mirrors `slice_coverage_agrees`'s
+/// FALSE branches, which is the only thing that reaches here.
+///
+/// The split exists because the three demand opposite work: an absent witness
+/// clears itself on republish (build throughput), a moved partition never will,
+/// and an absent live row count means nothing could be compared at all.
+fn stale_coverage_metric(witness: Option<u64>, current: Option<u64>) -> &'static str {
+    match (witness, current) {
+        (None, _) => scan_metric_names::ROLLUP_STALE_NO_WITNESS,
+        (_, None) => scan_metric_names::ROLLUP_STALE_NO_SOURCE_ROWS,
+        _ => scan_metric_names::ROLLUP_STALE_MOVED,
+    }
+}
+
+#[cfg(test)]
+mod stale_coverage_metric_tests {
+    use super::*;
+
+    /// Every case that reaches the classifier is one `slice_coverage_agrees`
+    /// rejected, so the two must not drift: anything this names must be a slice
+    /// the read path actually refused.
+    #[test]
+    fn each_refusal_gets_its_own_name_and_only_refusals_reach_it() {
+        for (witness, current, expected) in [
+            (None, Some(10), scan_metric_names::ROLLUP_STALE_NO_WITNESS),
+            (None, None, scan_metric_names::ROLLUP_STALE_NO_WITNESS),
+            (Some(10), None, scan_metric_names::ROLLUP_STALE_NO_SOURCE_ROWS),
+            (Some(9), Some(10), scan_metric_names::ROLLUP_STALE_MOVED),
+            (Some(11), Some(10), scan_metric_names::ROLLUP_STALE_MOVED),
+        ] {
+            assert!(!crate::rollup::slice_coverage_agrees(&[witness], current), "{witness:?}/{current:?} must be a refusal to be classified");
+            assert_eq!(stale_coverage_metric(witness, current), expected, "for witness={witness:?} current={current:?}");
+        }
+        // The one agreeing case never reaches the classifier.
+        assert!(crate::rollup::slice_coverage_agrees(&[Some(10)], Some(10)));
     }
 }
 
