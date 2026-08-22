@@ -383,3 +383,39 @@ progress so a restart does not discard it? A pass that completes at ANY size
 beats a larger one that never does — and nothing in the cap's history
 (400 -> 150, sized for observability) considered that a pass must fit inside the
 mean time between restarts.
+
+### 15:17 — the pass does not START, and the reason is a once-an-hour cron
+
+Chased the "a pass never finishes" claim to its mechanism, and it is worse and
+simpler than that. Over **six hours** of prod logs:
+
+- `tantivy_backfill_started`: **0**
+- `tantivy_backfill_progress`: **0**
+- `tantivy_backfill_pass`: **0**
+
+`tantivy_backfill_started` is announced BEFORE the first build (added in
+`c4843b5`, live), so zero of them means the pass is not starting at all — not
+starting and dying.
+
+The cause is `timefusion_tantivy_reconcile_schedule = "0 20 * * * *"`: the
+tantivy reconcile fires **only at minute 20 of each hour**. Prod has restarted
+every 15-30 minutes all afternoon, so most containers never live through a `:20`
+boundary — the one booted at 14:33 has to survive until 15:20 before it even
+begins — and a container that does catch a `:20` then needs to survive an hour
+of pass to finish it.
+
+**This is the whole drain, gated on one instant per hour.** Every other
+finding today sits downstream of it: the tail reservation cannot pay out, the
+cap is irrelevant, and `week`/`older` frozen at 1723/3456 is not a starvation
+symptom at all — it is simply nothing having run.
+
+**Corrects the section above.** "A pass takes longer than an hour" was inferred
+from last night's single 60-minute uncompleted pass; today's evidence says the
+usual case is that no pass begins. Both can be true, but the START gate is the
+one that explains six hours of an entirely frozen tail.
+
+The fix is not another ordering or throughput knob. It is either a schedule that
+retries (e.g. `0 */15 * * * *`, so a container that misses one boundary catches
+the next) or a run-on-boot-if-overdue, so the drain is not hostage to a single
+minute of the hour. Deliberately NOT shipped here: it wants one quiet deploy and
+a measurement, and prod has taken seven today.
