@@ -151,6 +151,20 @@ covered at birth.
 
 `search_us_avg` has regressed 0.34ms → 2.1ms and `reader_hit_pct` 96.9% →
 85.2% since the 08-21 increment-2 measurement, with 334 blob fetches averaging
-**3.5 seconds** each. That is the local-first guarantee leaking, and it is a
-separate defect from coverage — a day index makes it cheaper to hold, but does
-not explain the regression. Worth its own investigation.
+**3.5 seconds** each. Two hypotheses, both untested, and they are not
+alternatives — they can both be true:
+
+- **Working set > cache.** `reader_cache_entries = 2048` open readers against
+  `indexes_searched_total = 15302` over 2895 queries. With one index per
+  parquet file the live working set is far larger than the cache, so the LRU
+  churns. This one *is* granularity: at one index per project-day, a month for
+  every project fits in 2048 entries with room left, and `warm_recent` could
+  warm the entire retention window instead of `prefetch_days = 3`.
+- **IO contention.** The backfill pass never completes, so it is continuously
+  reading parquet back and uploading blobs over the same OVH link a query's
+  blob fetch uses. 3.5s for a download+unpack that used to be free is what a
+  saturated link looks like. Disk is not the constraint — the host has 714G
+  free against a 200G budget.
+
+The first is fixed by this design. The second is fixed by not having a
+permanently-running backfill, which is also what this design delivers.
