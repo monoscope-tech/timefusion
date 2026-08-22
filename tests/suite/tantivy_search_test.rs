@@ -464,6 +464,49 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     assert!(m_final.entries.is_empty());
 }
 
+/// A multi-file entry must not take its live siblings down with it. A flush
+/// commit that adds more than one file publishes ONE entry covering all of
+/// them (`bucket-{uuid}`); compacting away a single member used to drop the
+/// whole entry, un-covering files nothing had touched. That collateral is
+/// proportional to compaction rate and is a standing source of the coverage
+/// divergence measured 2026-08-22 (~60 uncovered files/hr with every rewrite
+/// path reindexing its own output successfully).
+///
+/// Keeping the entry is sound because the index is a candidate generator:
+/// hits for the departed file's rows are false positives the scan filters, and
+/// `zero_hit` pruning only ever gets more conservative. Row ORDINALS are not
+/// sound across the change — they are per-file positions, and pruning a
+/// two-file entry down to one would make `covered_files.len() == 1` re-enable
+/// them against the wrong file — so the survivor gives them up.
+#[tokio::test]
+async fn gc_keeps_a_multi_file_entry_for_its_surviving_files() {
+    let (table_name, project_id) = ("otel_logs_and_spans", "p1");
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
+    // Two added files in ONE commit => one entry covering both.
+    svc.clone().callback()(
+        project_id.into(),
+        table_name.into(),
+        vec![batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR")])],
+        vec!["file_a".into(), "file_b".into()],
+    )
+    .await
+    .unwrap();
+
+    let report = svc.gc_after_compaction(table_name, project_id, &["file_b".to_string()]).await.unwrap();
+    assert_eq!(report.entries_removed, 0, "file_b is still live, so its entry must survive");
+    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let e = m.entries.values().next().expect("entry kept");
+    assert_eq!(e.covered_files, vec!["file_b".to_string()], "the departed file must be pruned from covered_files");
+    assert!(!e.ordinals_valid, "a pruned entry's ordinals no longer address its remaining file");
+
+    // Last member gone => nothing left to cover, entry and blob go.
+    let report = svc.gc_after_compaction(table_name, project_id, &[]).await.unwrap();
+    assert_eq!(report.entries_removed, 1, "an entry with no live covered file is stale");
+    assert!(load_manifest(store.as_ref(), table_name, project_id).await.unwrap().entries.is_empty());
+}
+
 #[tokio::test]
 async fn search_time_prunes_non_overlapping_indexes() {
     // Two indexes in disjoint time windows. A query whose window overlaps only

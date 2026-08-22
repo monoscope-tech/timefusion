@@ -1261,10 +1261,25 @@ impl TantivyIndexService {
         }
     }
 
-    /// Targeted compaction GC: drop manifest entries whose `covered_files`
-    /// reference any parquet URI no longer present in `live_uris`. Entries
-    /// whose covered files are fully alive are preserved (their index still
-    /// authoritatively covers live rows).
+    /// Targeted compaction GC: drop manifest entries none of whose
+    /// `covered_files` are still present in `live_uris`, and prune the departed
+    /// files from the entries that survive.
+    ///
+    /// It used to drop an entry as soon as ANY covered file died, which took
+    /// that entry's still-live siblings down with it — a multi-file flush
+    /// commit publishes ONE entry, so compacting a single member un-covered
+    /// files nothing had touched. That collateral is proportional to the
+    /// compaction rate and is a standing contributor to the coverage
+    /// divergence measured 2026-08-22, where every rewrite path was reindexing
+    /// its own output successfully and coverage still lost ~60 files/hr.
+    ///
+    /// Keeping the entry is sound because the index is a candidate generator:
+    /// hits belonging to the departed file are false positives the scan
+    /// filters out, and `zero_hit` pruning only ever gets more conservative.
+    /// Row ORDINALS are not sound across the change — they are per-file
+    /// positions, and pruning a two-file entry to one would make
+    /// `covered_files.len() == 1` re-enable them against the wrong file — so a
+    /// pruned entry gives them up.
     ///
     /// `live_uris` should be the current Delta table's `get_file_uris()` set
     /// after the compaction commit. Entries built before per-file tracking
@@ -1275,9 +1290,17 @@ impl TantivyIndexService {
     pub async fn gc_after_compaction(&self, table: &str, project_id: &str, live_uris: &[String]) -> Result<GcReport> {
         let live: HashSet<&str> = live_uris.iter().map(String::as_str).collect();
         let mut m = load_manifest(self.object_store.as_ref(), table, project_id).await?;
-        let (stale, kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut m.entries)
+        let (stale, mut kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut m.entries)
             .into_iter()
-            .partition(|(_, e)| e.covered_files.is_empty() || e.covered_files.iter().any(|u| !live.contains(u.as_str())));
+            .partition(|(_, e)| !e.covered_files.iter().any(|u| live.contains(u.as_str())));
+        let pruned = kept
+            .values_mut()
+            .filter(|e| e.covered_files.iter().any(|u| !live.contains(u.as_str())))
+            .map(|e| {
+                e.covered_files.retain(|u| live.contains(u.as_str()));
+                e.ordinals_valid = false;
+            })
+            .count();
         let mut report = GcReport { kept: kept.len(), entries_removed: stale.len(), ..Default::default() };
         m.entries = kept;
         // Effectful: delete stale blobs concurrently (serial deletes made a
@@ -1299,7 +1322,7 @@ impl TantivyIndexService {
             .await;
         report.blobs_deleted = results.iter().filter(|ok| **ok).count();
         report.blob_delete_errors = results.len() - report.blobs_deleted;
-        if report.entries_removed > 0 {
+        if report.entries_removed > 0 || pruned > 0 {
             save_manifest(self.object_store.as_ref(), table, project_id, &m).await?;
             if let Some(reader) = self.reader() {
                 reader.invalidate_manifest(table, project_id);

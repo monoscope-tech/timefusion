@@ -1162,6 +1162,11 @@ impl StatsTableProvider {
                     "dedup_eligible" => dedup_elig,
                     "dedup_skipped" => dedup_skipped,
                     "dedup_skipped_pct" => pct(dedup_skipped, dedup_elig),
+                    // The per-DATE split fires only AFTER the whole-window verdict
+                    // is denied, so it is invisible in `dedup_skipped` and shows up
+                    // inside `denied_uncertified` — without this row, enabling
+                    // `timefusion_read_dedup_skip_per_date` cannot be observed at all.
+                    "dedup_skipped_per_date" => cv(DEDUP_SKIPPED_PER_DATE),
                     "dedup_denied_uncertified" => cv(DEDUP_DENIED_UNCERTIFIED),
                     "dedup_denied_by_leg" => cv(DEDUP_DENIED_BY_LEG),
                     // The certification-survival split. `never_certified` is what a
