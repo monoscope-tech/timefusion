@@ -1,0 +1,208 @@
+# Rollup correctness, chart routing, and the dedup certification band
+
+2026-08-22, follow-on from `2026-08-22-dashboard-query-profile.md`. That
+document measured; this one diagnoses and plans. Investigation is complete
+and recorded below; implementation follows the ordering in §5.
+
+## 1. The P0, correctly diagnosed — it is NOT the interior/fringe split
+
+The profile reported the routed throughput chart returning 4.43M rows where
+raw returned 7.29M (P1, 3d), 18 of 73 hourly buckets absent. It attributed
+this to the hybrid interior failing to hand `not_built` dates to the raw
+fringe. **That attribution was wrong.** The split arithmetic is correct and
+already well tested:
+
+- `complement()` (`src/rollup.rs:554`) emits mid-window gaps, not just edges,
+  and `the_rollup_intervals_and_their_complement_always_partition_the_window`
+  proves ranges+gaps tile `[lo,hi)` exactly once for interior holes.
+- `sql()` (`rollup.rs:848`) unions a raw leg over `complement(...)` whenever
+  `fringes` is non-empty, so a mid-window gap does reach the raw table.
+
+The real cause is that **the rollup's CONTENT is short while its coverage
+claims the range.** Measured directly against the tier
+(`otel_logs_and_spans_rollup_dashboard_1h_v2`) for P1:
+
+| date | raw rows | rollup `sum(request_count)` | cells | verdict |
+|---|---|---|---|---|
+| 2026-08-17 | 2,915,666 | 2,915,666 | 231 | exact |
+| 2026-08-18 | 2,697,137 | 2,697,137 | 236 | exact |
+| 2026-08-19 | 2,467,916 | 2,467,916 | 258 | exact |
+| 2026-08-20 | 2,527,257 | **1,979,375** | 239 | **short 547,882 (21.7%)** |
+| 2026-08-21 | 2,319,379 | **90,109** | 59 | **short 2,229,270 (96%)** |
+| 2026-08-22 | 141,434 | 22,682 | 70 | today, partial by design |
+
+547,882 + 2,229,270 = 2,777,152, against the 2,855,431 shortfall the profile
+measured over 08-19..08-22 (remainder is today's partial). **The arithmetic
+closes.** A complete build is exact to the row — 08-17/18/19 match perfectly —
+so the builder is right; what fails is that a date whose build is incomplete
+or stale is still served as if complete.
+
+### Why the existing guards do not catch it
+
+Two coverage maps feed `rollup_rewrite_for` (`src/database/mod.rs:3451-3520`):
+
+- `rollup_coverage`, keyed per DATE, is checked hard: `coverage.source_fp !=
+  source_fp || coverage.source_epoch != source_epoch → StaleCoverage`, and
+  again at execution in `rollup_ticket_current` which *re-derives* the
+  fingerprint (`mod.rs:3615`). **This map is never inserted into anywhere in
+  the tree** — only `get`, `remove` and `retain`. It is dead.
+- `rollup_slice_coverage`, keyed per (project, source, target, start, end), is
+  what recovery populates (`maintain.rs:2525-2551`) and is therefore the only
+  live coverage. Its plan-time loop (`mod.rs:3495-3505`) checks **project,
+  source, target and range overlap — and nothing else.** No fingerprint, no
+  epoch. `rollup_ticket_current`'s slice arm (`mod.rs:3619`) only re-reads the
+  same in-memory entry, so it detects a concurrent map change and nothing
+  about the source.
+
+So all live coverage is the unguarded kind. `invalidate_rollup_hours`
+(`maintain.rs:2226`) does purge overlapping slices when TF observes a write,
+which is why this is intermittent rather than constant — it fails whenever a
+partition changes without that path running, or a build publishes short.
+
+**The fingerprints are not interchangeable, which is why the date-path check
+cannot simply be copied onto slices.** Build-time `source_fp` is an FNV hash
+of the slice's selected source FILE LIST (`maintain.rs:1455-1458`); read-time
+fingerprint is over the DATE partition's add-actions
+(`partition_stats_bounded`, `mod.rs:1481`). Different quantities. Comparing
+them would reject every slice and disable rollups outright.
+
+### The fix: carry source-row evidence and check it at plan time
+
+A complete rollup of a count-preserving measure satisfies one invariant that
+needs no file-identity agreement at all:
+
+> the source rows a slice was built from, summed over the slices covering a
+> date, equals the source rows that date holds now — unless rows arrived
+> since, which is exactly the staleness we must refuse.
+
+Both sides are already available at plan time with no extra IO:
+
+1. `partition_stats_bounded` already reads `num_records` per add-action to
+   build the fingerprint; `PartitionStats` (`mod.rs:1481`) just does not keep
+   the sum. Adding `rows: i64` is free — same pass, same scan.
+2. The slice does not yet carry what it was built from. Add
+   `TAG_SOURCE_ROWS` alongside the five coverage tags already written at
+   `maintain.rs:1606-1613`, and a `source_rows` field on `RollupCoverage`,
+   populated in `recover_rollup_coverage` exactly like `source_fp`.
+
+Then in the slice loop: group the covered slices by date; **when the covered
+slices span the whole date, require `sum(source_rows) == date rows now`, and
+drop the date's slices to the raw fringe when they disagree.** Under-coverage
+is the only direction staleness can take (rows only accrue), so a strict
+equality on a fully covered day is exactly the signal, and dropping to raw is
+always the safe direction.
+
+Deliberate limitation, stated rather than hidden: a date whose slices cover
+only PART of the day cannot be checked this way, because the uncovered hours
+legitimately hold the difference. 08-21 (59 cells of ~236) is such a case —
+its uncovered hours already go raw, but its covered hours could still be
+stale and this check will not catch it. Closing that needs per-range source
+counts, which `partition_stats_bounded` cannot give (it is per-date). **Not
+in scope here; the full-day case is what the measured under-count was.**
+
+A tag is a durable format addition, so: slices written before the tag exists
+have no `source_rows`. Treat absent as "cannot verify" and **decline the
+skip** — old slices fall to raw until rebuilt. That is a temporary throughput
+cost with zero correctness risk, and it self-heals as the coordinator
+republishes.
+
+### Also, separately: delete `rollup_coverage`
+
+It is dead — never inserted, so its careful fingerprint/epoch guards have
+never run. Keeping it makes the read path look safer than it is; it is the
+reason the profile's first diagnosis went to the wrong place. Removing it is
+a pure subtraction and makes the live path's missing guard obvious. Do this
+in the same change as the fix, not before, so one diff tells the whole story.
+
+## 2. Chart routing — two syntactic blockers and one missing measure
+
+Measured in the profile, A/B'd on prod (`ab.jsonl`):
+
+| arm | 3d | 7d | routing |
+|---|---|---|---|
+| `lat` as monoscope emits it | 3,525 | 7,926 | miss: unsupported_shape |
+| `lat`, `extract(epoch …)` lifted | 3,420 | 8,119 | miss: missing_measure |
+| `lat`, lifted + under the `server` filter | **278** | **1,035** | HIT |
+| `svc` as monoscope emits it | 3,237 | 6,826 | miss: unsupported_shape |
+| `svc`, bare dimension column | **276** | **754** | HIT |
+
+The group-expr matcher (`rollup.rs:1626-1648`) accepts a bare `Expr::Column`
+naming a dimension, or a bare `time_bucket(w, timestamp)`; everything else
+falls to `_ => Err(UnsupportedShape)`. monoscope emits neither form.
+
+**2a. Unwrap `extract(epoch from time_bucket(w, ts))`.** Sound without
+qualification: epoch-of-bucket is injective on the bucket, so the grouping is
+identical and the conversion lifts above the aggregate unchanged.
+
+**2b. Declare an unfiltered `duration_digest`** (`agg: tdigest, column:
+duration`) on both grains in `schemas/otel_logs_and_spans.yaml`. The only
+declared tdigest carries the `kind='server' OR name IN (…)` filter, while
+`duration_sum/min/max/count` are all declared unfiltered — the digest is the
+lone gap. Cost is one extra t-digest per cell; size it against the 1m grain's
+cardinality before committing.
+
+**2c. Unwrap `COALESCE(<dimension>, <literal>)` — gated.** COALESCE folds NULL
+and the literal into one group, so grouping the rollup by the raw dimension
+and coalescing above needs a re-aggregation or two groups leak where raw
+produced one. The A/B arms returned 165 vs 219 groups and I did not establish
+that the difference is only NULL-folding. **Requires a row-level equivalence
+test before it ships**; it does not ride along with 2a.
+
+## 3. Dedup and the sort — one lever, not two
+
+`DedupExec::required_input_distribution` is `SinglePartition` and
+`required_input_ordering` is the dedup key ordering (`read/mod.rs:481-486`).
+The `SortPreservingMergeExec` that costs as much as the dedup exists only to
+satisfy them, so removing the dedup for a partition removes both and lets the
+scan stay parallel. That is why the pair is ~4 s of a ~7.9 s 7-day query.
+
+The skip is already on by default and demonstrably pays (P1, full-day counts:
+certified 08-12 **189 ms**/2.43M rows vs uncertified 08-13 789 ms/2.27M and
+08-14 1,603 ms/2.58M — 4.2x and 8.5x). It is denied 100% of the time because
+the 97 durable certifications sit on dates nobody queries: P1 has exactly
+2026-08-08 and 2026-08-12.
+
+Certification is keyed on the partition's whole file-set fingerprint and any
+new file voids it, so recent partitions — rewritten continuously by ingest,
+hot-tail compaction and the sealed/repair backlog — churn faster than sweeps
+certify them.
+
+**3a. Additive file-set certification.** Certify the file SET a sweep proved
+clean; dedup runs over the uncertified remainder and the certified files
+union above. SOUNDNESS GATE, and it is not a formality: the per-date skip was
+sound because `date` derives from `timestamp` so no dedup key spans a date.
+The file-level split has no such argument — merge-on-read versions of one row
+can and do land in different files, so a key CAN span the split, and a naive
+union would return both versions. Establishing a correct rule here (e.g. only
+files whose dedup-key ranges provably do not overlap the uncertified set) is
+the design work. **Do not implement before that rule is written down and
+tested.**
+
+**3b. Bias sweep ordering to the newest ~7 days.** Cheap, immediate, partial.
+Behind an env kill switch. It fights churn rather than escaping it and
+competes with the sealed backlog for the same workers, so it is relief.
+
+**3c. Today's partition keeps full dedup.** Correct end state, not a gap.
+
+## 4. What this supersedes
+
+`2026-08-22-dashboard-query-profile.md` Finding 2's mechanism paragraph
+("the hybrid interior neither covers not-built dates nor hands them to the
+raw fringe") is **wrong** and is corrected by §1 here. The measurement in that
+finding — 4.43M vs 7.29M, 18 buckets absent — stands; only the attribution
+changes. Finding 2's `not_built` probe result also stands, but it showed the
+window declining ENTIRELY (correct behaviour), not the hybrid path; the
+under-count came from slices whose content was stale, not from dates that
+declined.
+
+## 5. Ordering
+
+1. **§1 — slice-coverage source-row guard + delete dead `rollup_coverage`.**
+   Correctness. Ships alone. Failing test first: a slice whose source gained
+   rows after the build must not be served.
+2. **§2a + §2b — extract-epoch unwrap and the unfiltered digest.** Only after
+   1, because both increase the share of traffic the tier answers.
+3. **§2c — COALESCE unwrap**, after its equivalence test.
+4. **§3b — sweep ordering bias.** Independent of the above; env-gated.
+5. **§3a — additive certification.** Design first, and only after the
+   soundness rule is established.
