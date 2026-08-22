@@ -72,6 +72,26 @@ Projects chosen by **measured** 1h volume, not by assumption:
 | lat | 488 | 2,669 | 7,161 |
 | svc | 444 | 5,612 | 11,228 |
 
+### W (whale) and P2 — 1h/24h only
+
+| shape | W 1h | W 24h | P2 1h | P2 24h |
+|---|---|---|---|---|
+| thrpt | 259 | 3,624 | 153 | 1,288 |
+| lat | 241 | 7,106 | 159 | 1,340 |
+| errs | 251 | 1,487 | 433 | 1,626 |
+| svc | 287 | TIMEOUT | 147 | 1,325 |
+| dcount | 235 | 6,689 | 255 | 1,162 |
+| topn | 232 | 1,476 | 366 | 1,110 |
+| count | 242 | 6,678 | 129 | 1,182 |
+| list | 255 | 385 | 242 | 207 |
+| trace | n/a | n/a | 135 | 380 |
+
+W is the one tenant where **`thrpt` is also slow** (3,624 ms at 24h against
+P1's 230 ms) — its 24h `svc` is the only 12 s timeout in the reduced grid.
+W has no `trace` cell: it had no `context___trace_id` in the last 90 minutes
+to use as a needle. It is a logs tenant, not a spans tenant (201 of 39,225
+rows in 30 minutes carry a `duration`).
+
 The shape of the table is the finding: **one chart is fast at every width
 (`thrpt`, 204–924 ms) and every other chart degrades roughly linearly with
 the window.** `thrpt` is the only one that routes to the rollup tier. The
@@ -178,12 +198,25 @@ scans — `dedup_denied_never_certified_pct = 100.0` — so the raw arm does car
 duplicates, but 0.2% of them, not 39%). The dropped bucket really holds
 ~69k rows and the chart really shows nothing there.
 
-I have the symptom, not the mechanism. The shape of it — whole buckets
-missing rather than uniformly scaled values — points at coverage bookkeeping
-(a rollup built against a partition that later moved, where `StaleCoverage` /
-`NotBuilt` should have forced a raw fringe and did not) rather than at the
-aggregation itself. That is the next thing to read, in
-`rollup_coverage`/hybrid-branch construction.
+**The mechanism is now identified.** Query either bucket *on its own*, as a
+one-hour window, and the correct value comes back:
+
+| probe | result | routing counter |
+|---|---|---|
+| dropped bucket alone (`2026-08-20 23:00 UTC`) | **69,225** — correct | miss: **`not_built`** → raw |
+| mis-valued bucket alone (`2026-08-20 20:00 UTC`) | **266,170** — correct | miss: **`not_built`** → raw |
+
+So no rollup has been built for P1 on 2026-08-20. When that date is the
+*whole* window, `NotBuilt` correctly declines and the query falls back to raw.
+When the same date sits *inside* a 3-day window, the query takes the hybrid
+path (`rollup_hits_hybrid_total`) and the not-built dates are **neither
+covered by the rollup nor added to the raw fringe** — their rows simply
+disappear from the result.
+
+That is a precise, testable defect: **the hybrid split's interior must exclude
+dates with no rollup and hand them to the raw leg.** It is not an aggregation
+bug and not a staleness bug; it is the interior/fringe partition treating
+"no rollup for this date" as "nothing to add".
 
 **This inverts the priority order.** Finding 1's whole content is "route more
 chart shapes to the rollup tier". Doing that while the tier under-reports by
@@ -191,32 +224,62 @@ chart shapes to the rollup tier". Doing that while the tier under-reports by
 it across the dashboard. Fix Finding 2 first; Finding 1 is the payoff that
 follows it, not a parallel track.
 
-## Finding 3 — everything not routed is bounded by scan width, and the
-existing caches are already doing their job
+## Finding 3 — for everything not routed, **half the compute is the dedup
+stack**, not the scan — and it is dedup that is denied on every scan
 
-For the non-routed shapes the per-cell `foyer` diffs show the cost is scan
-volume, not cache misses. P1 at 7d: `lat` 3,680 foyer hits against 144 misses
-(96% hit rate) and still 14.7 s; `dcount` 2,659 hits and **zero** misses and
-still 6.7 s. At 14d the misses grow (`lat` 475, `svc` 276) but never approach
-the hit counts. `foyer` fleet-wide sits at 1.73 M hits / 43.5 K misses
-(97.5%), l2 at 285 GB of a 600 GB budget, and `ttl_expirations = 0` — the
-35-day warm depth shipped on 08-22 is holding.
+68 `EXPLAIN ANALYZE` plans (`ea.jsonl`; the first pass emitted
+`EXPLAIN (ANALYZE)`, which TimeFusion's parser rejects — re-run with the
+correct syntax). Summing `elapsed_compute` per operator, P1:
 
-The corollary matters for planning: **there is no cache win left on these
-shapes.** They are slow because they decode every row in the window, and the
-only two structural fixes are routing them to a pre-aggregate (Finding 1) or
-reducing files per project-day. Tuning Foyer further will not move them.
+| win | shape | DedupExec | SortPreservingMergeExec | DeltaScanExec / Aggregate | wall |
+|---|---|---|---|---|---|
+| 24h | lat | 355 ms | 202 ms | Aggregate 321 ms | 2,826 |
+| 3d | lat | 1,030 ms | 666 ms | Aggregate 953 ms | 13,150 |
+| 3d | count | 917 ms | 531 ms | Scan 253 ms | 2,329 |
+| 7d | errs | 2,130 ms | 2,020 ms | Scan 615 ms | 7,912 |
+| 7d | topn | 2,370 ms | 2,120 ms | Scan 640 ms | 7,314 |
+| 7d | dcount | 1,970 ms | 1,950 ms | Scan 595 ms | 6,700 |
+| 14d | thrpt | 3,630 ms | 3,120 ms | Scan 1,070 ms | 678¹ |
 
-Two anomalies worth naming rather than smoothing over:
+¹ the 14d `thrpt` wall is the routed hybrid query; the EA above is the plan's
+own compute, which includes the raw fringe.
 
-- **`trace` at P1/24h is 1,757 ms but 258 ms at 3d and 332 ms at 7d** — a
-  narrower window costing 5–7x more than wider ones. The 24h cell is the only
-  `trace` cell with meaningful foyer misses (30). Consistent with today's
-  partition being fragmented by live ingest while sealed days are compacted;
-  the bloom sidecar prunes sealed files well and the hot tail not at all.
-- **`trace` at P1/14d is 15,356 ms**, an order of magnitude off the 3d/7d
-  cells, and `topn` at 14d is 20,090 ms. Both sit beyond where the sealed
-  compaction backlog has reached.
+**`DedupExec` is the single largest operator in every non-routed cell, and
+`SortPreservingMergeExec` — the sort that feeds it — is the second.** At 7d
+they are ~4 s of a ~7–8 s query: roughly half the compute, before any
+aggregation. `DeltaScanExec` is consistently a third of DedupExec.
+
+This corrects the intuition that these shapes are scan-bound. They are
+*dedup-bound*, and the dedup is doing nothing: `dedup_denied_uncertified`
+equals `dedup_eligible` (16,935 of 16,935) and
+`dedup_denied_never_certified_pct = 100.0`, so **every one of these scans pays
+for the dedup machinery and none of them is allowed to skip it.** The
+per-date dedup skip shipped default-off in d327df8 is aimed at exactly this
+cost, and this is the measurement that sizes it.
+
+The two shapes that escape are the two fast ones: `list` and `trace` show
+`DedupExec` at 1–2 ms, because TopK and a point lookup never materialise the
+window.
+
+The caches, by contrast, are healthy and have nothing left to give. P1 at 7d:
+`lat` 3,680 foyer hits against 144 misses; `dcount` 2,659 hits and **zero**
+misses, and still 6.7 s. Fleet-wide foyer is 1.73 M hits / 43.5 K misses
+(97.5%), l2 at 285 GB of a 600 GB budget, `ttl_expirations = 0` — the 35-day
+warm depth shipped on 08-22 is holding. **Tuning Foyer further will not move
+any of these shapes.**
+
+Two anomalies the plans explain:
+
+- **`trace` at P1/24h costs 1,757 ms against 258 ms at 3d and 332 ms at 7d.**
+  The plans show why: at 24h the trace lookup prunes to 9 files and 101 row
+  groups, at 3d to 11 files / 113 row groups, at 7d to 56 / 135 — the pruning
+  is *better* at 3d than at 24h relative to what remains, and the 24h cell is
+  the only `trace` cell with meaningful foyer misses (30). Consistent with
+  today's partition being fragmented by live ingest while sealed days are
+  compacted: the bloom sidecar prunes sealed files well and the hot tail
+  hardly at all.
+- **`trace` at P1/14d is 15,356 ms** and `topn` at 14d is 20,090 ms — both
+  beyond where the sealed compaction backlog has reached.
 
 ## Finding 4 — `statement_timeout` is enforced, but a cancelled wide query can
 wedge its connection for tens of minutes
@@ -228,8 +291,11 @@ The harness twice hung for 40+ minutes on a cell whose `statement_timeout` was
   at exactly 20.2 s and 20.0 s on two consecutive reps, and a `SELECT 1` and a
   `timefusion_stats` read on the *same connection* immediately afterwards both
   returned in 0.1 s. So cancellation is clean at 20 s.
-- At 30 s on the wide cells it is not: the client blocked indefinitely, and a
-  watchdog closing the connection from another thread did not unblock it.
+- **Both hangs occurred on cells configured at 30 s, and neither was
+  reproduced under control.** A watchdog closing the connection from another
+  thread did not unblock the client. That 30 s is the trigger is an inference
+  from two harness incidents, not a tested claim — the only controlled
+  cancellation test I ran was the 20 s one above, and it passed.
 
 Prod stayed healthy throughout (no restart, host at 60 GB of 188 GB), so this
 is not an availability finding — but a pooled dashboard client that cancels a
@@ -275,10 +341,13 @@ latency and per-service charts, and Finding 2 shows what has to be true first.
 
 ## Ranked next steps
 
-1. **Diagnose the rollup under-count (Finding 2).** Blocking. Start at hybrid
-   branch construction and the coverage predicates: 18 whole buckets absent is
-   a coverage-bookkeeping signature, not an aggregation one. Nothing else in
-   this document should ship before it.
+1. **Fix the hybrid interior to hand `not_built` dates to the raw leg
+   (Finding 2).** Blocking, and now a specific change rather than an
+   investigation: the same date returns correct rows when it is the whole
+   window (declines as `not_built` → raw) and vanishes when it is inside a
+   hybrid split. Add a regression test that asserts a routed window
+   containing a not-built date sums to the raw total. Nothing else in this
+   document should ship before it.
 2. **Unwrap `extract(epoch from time_bucket(…))` in the group-expr matcher**
    (`src/rollup.rs`) + **declare an unfiltered `duration_digest`** in both
    rollup grains. Measured 12.7x at 3d, 7.7x at 7d on the latency chart. Both
@@ -292,7 +361,12 @@ latency and per-service charts, and Finding 2 shows what has to be true first.
    `hll` measure on `attributes___user___id` for unique-users. Both are
    `missing_measure`/`unknown_group_by` declines with real cardinality cost —
    measure before declaring.
-6. **Bounded repro of the 30 s cancellation wedge** (Finding 4).
+6. **Evaluate turning on the per-date dedup skip** (shipped default-off in
+   d327df8). Finding 3 sizes the prize: `DedupExec` + the sort feeding it are
+   ~4 s of a ~7–8 s 7-day chart, on scans where dedup is denied 100% of the
+   time anyway. This is the largest single lever for the shapes that will
+   still not route after steps 2–5.
+7. **Bounded repro of the 30 s cancellation wedge** (Finding 4).
 
 Explicitly **not** on this list: Foyer tuning. Finding 3 shows the cache is at
 97.5% fleet-wide with zero TTL expirations and the slow shapes miss it barely
@@ -302,21 +376,19 @@ at all.
 
 Stated plainly rather than left as a gap in the tables:
 
-- **TOP was completed to 3d only; W and P2 were not run at all.** The harness
-  stalled on TOP's 7d/14d cells (Finding 4) and I stopped it in favour of the
-  A/B verification, which was worth more. P1 is the only full 1h→14d grid.
-- **W has no `trace` cell** — the whale had no `context___trace_id` in the last
-  90 minutes to use as a needle. It is a logs tenant, not a spans tenant
-  (201 of 39,225 rows in 30 min carry a `duration`).
-- **`EXPLAIN ANALYZE` per cell was lost.** The harness issued
-  `EXPLAIN (ANALYZE) …`; TimeFusion's parser accepts only `EXPLAIN ANALYZE …`
-  without parentheses, so every capture failed with a parse error. The
-  operator-level attribution in this document therefore comes from
-  `timefusion_stats` diffs and the rollup miss-reason counters, which turned
-  out to be the more decisive instrument anyway — the miss reasons are what
-  identified Findings 1 and 2. A re-run with the corrected syntax
-  (`ea.py` in the scratchpad, already fixed) would add per-operator timings
-  but is not needed to act on anything above.
+- **TOP was completed to 3d; W and P2 to 24h.** P1 is the only full 1h→14d
+  grid. The harness stalled on TOP's 7d/14d cells (Finding 4), so those and
+  W/P2's 3d+ cells were dropped in favour of the A/B verification and the
+  EXPLAIN ANALYZE pass, which were worth more.
+- **W has no `trace` cell** — no `context___trace_id` in the last 90 minutes
+  to use as a needle.
 - **`dcount` reads 0 for P1 and W** because those tenants do not populate
   `attributes___user___id`. The scan still happens, so the timing is valid;
-  the returned value is not interesting for them.
+  the returned value is not.
+- **The 08-20 and this run's `trace` needles differ** (fresh real trace ids
+  were fetched per project per run, as the method requires); P1's grid also
+  spans two needles, because the run was resumed after the first stall. Both
+  were real ≤100-row traces from the last 90 minutes.
+- **`errs`/`svc`/`dcount`/`topn` were not A/B'd** — only `lat` and `svc` were.
+  Their miss reasons come from the counters, and the remedies in steps 4–5 are
+  therefore reasoned from the schema, not measured. Size them before building.
