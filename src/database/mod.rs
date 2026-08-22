@@ -418,6 +418,11 @@ struct RollupCoverage {
     source_epoch: u64,
     generation: String,
     rows: u64,
+    /// The source DATE partition's `num_records` sum when this slice was built.
+    /// `None` for a slice written before `TAG_SOURCE_ROWS` existed, which the
+    /// read path treats as unverifiable and refuses — see
+    /// `rollup::slice_coverage_agrees`.
+    source_rows: Option<u64>,
     /// Exclusive upper bound on the source timestamps this build actually
     /// aggregated. `day_start + DAY_MICROS` for a sealed day — the whole
     /// partition — and less than that only for a day still being written.
@@ -1496,6 +1501,11 @@ pub(crate) struct PartitionStats {
     fingerprint: u64,
     min_ts: i64,
     max_ts: i64,
+    /// The partition's `num_records` sum. The witness rollup slice coverage is
+    /// checked against (`rollup::slice_coverage_agrees`), so it must stay THIS
+    /// computation on both sides — it counts tombstones and superseded
+    /// merge-on-read versions, which the builder's decoded input does not.
+    rows: i64,
 }
 
 impl PartitionStats {
@@ -3552,16 +3562,38 @@ impl Database {
                 generations.push((project.clone(), date.clone(), coverage.generation.clone()));
                 ticket.push((key, source_fp, source_epoch, coverage.generation.clone(), coverage.covered_through));
             }
+            // Slice coverage is the only live coverage, and until this guard it
+            // was checked for project/source/target/overlap and nothing else —
+            // no fingerprint, no epoch — so a slice went on claiming its range
+            // after the source partition moved under it. Collect the candidates
+            // per date first: a date is readable from the tier only if EVERY
+            // slice covering it witnessed the partition as it stands now.
+            let mut by_date: HashMap<String, Vec<(RollupSliceCoverageKey, RollupCoverage)>> = HashMap::new();
             for entry in self.rollup_slice_coverage.iter() {
                 let ((slice_project, source, target, start, end), coverage) = (entry.key(), entry.value());
                 if slice_project != project || source != &route.source || target != &route.target || *start >= route.hi || *end <= route.lo {
                     continue;
                 }
-                covered.push((*start, *end));
-                if let Some(date) = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()) {
-                    generations.push((project.clone(), date, coverage.generation.clone()));
+                let Some(date) = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()) else { continue };
+                by_date.entry(date).or_default().push((entry.key().clone(), coverage.clone()));
+            }
+            for (date, slices) in by_date {
+                let witnesses = slices.iter().map(|(_, coverage)| coverage.source_rows).collect::<Vec<_>>();
+                let current = fingerprints
+                    .get(&(project.clone(), date.clone()))
+                    .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
+                    .and_then(|stats| u64::try_from(stats.rows).ok());
+                if !crate::rollup::slice_coverage_agrees(&witnesses, current) {
+                    // Reading raw is always the safe direction, so a date that
+                    // cannot be verified simply stays in the fringe.
+                    miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
+                    continue;
                 }
-                slice_ticket.push((entry.key().clone(), coverage.source_fp, coverage.generation.clone()));
+                for (key, coverage) in slices {
+                    covered.push((key.3, key.4));
+                    generations.push((project.clone(), date.clone(), coverage.generation.clone()));
+                    slice_ticket.push((key, coverage.source_fp, coverage.generation.clone()));
+                }
             }
             let covered = crate::write::mem_buffer::merge_ranges(covered);
             // The honest NotBuilt: this project produced no covered range for the
@@ -10793,6 +10825,74 @@ mod tests {
         Ok(())
     }
 
+    /// The safety net for the slice-coverage source-row guard: a freshly built
+    /// rollup must STILL route, and a source that gains rows afterwards must
+    /// STOP routing and answer from raw.
+    ///
+    /// Both halves matter. Prod 2026-08-22 served a 3-day throughput chart that
+    /// returned 4.43M of 7.29M rows because nothing re-checked a slice against
+    /// its source; the guard that fixes it fails the opposite way, silently
+    /// refusing every rollup, and that failure is invisible in a correctness
+    /// assertion alone.
+    #[tokio::test]
+    #[serial]
+    async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        let mut cfg = (*create_test_config("slice-rows-guard")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("guard_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        let covered = |db: &Database| {
+            db.rollup_slice_coverage
+                .iter()
+                .filter(|entry| entry.key().0 == project && entry.key().1 == "otel_logs_and_spans")
+                .map(|entry| entry.value().source_rows)
+                .collect::<Vec<_>>()
+        };
+        let witnesses = covered(&db);
+        assert!(!witnesses.is_empty(), "the build must publish slice coverage");
+        assert!(witnesses.iter().all(Option::is_some), "every published slice must carry its source-row witness: {witnesses:?}");
+
+        // The partition as the build saw it — the same computation the read
+        // path compares against, so this is what the guard must accept.
+        let source = db.resolve_table(&project, "otel_logs_and_spans").await?;
+        let now = {
+            let table = source.read().await;
+            Database::partition_stats_bounded(&table, tiebreak_of("otel_logs_and_spans"), &|_, _| i64::MAX)?
+                .remove(&(project.clone(), day.to_string()))
+                .map(|stats| stats.rows)
+        };
+        assert_eq!(
+            witnesses.first().copied().flatten(),
+            now.and_then(|rows| u64::try_from(rows).ok()),
+            "a freshly built slice must agree with its source, or the guard refuses every rollup"
+        );
+        assert!(crate::rollup::slice_coverage_agrees(&witnesses, now.and_then(|rows| u64::try_from(rows).ok())), "a fresh build must be trusted");
+
+        // Rows arrive after the build. The witness is now stale, and the guard
+        // must refuse rather than serve an aggregate short of the partition.
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("b", "op", &project, at + 1)])?], true, None).await?;
+        let grown = {
+            let table = source.read().await;
+            Database::partition_stats_bounded(&table, tiebreak_of("otel_logs_and_spans"), &|_, _| i64::MAX)?
+                .remove(&(project.clone(), day.to_string()))
+                .map(|stats| stats.rows)
+        };
+        assert_ne!(now, grown, "the write must move the partition's row count, or this proves nothing");
+        assert!(
+            !crate::rollup::slice_coverage_agrees(&witnesses, grown.and_then(|rows| u64::try_from(rows).ok())),
+            "a slice built before the write must not be served afterwards"
+        );
+        Ok(())
+    }
+
     /// A partition still holding an untagged tier file must be QUEUED for rebuild.
     ///
     /// `slice_retires` can retire such a file, but only when something publishes that partition,
@@ -11103,7 +11203,7 @@ mod tests {
     /// profile once `missing_project` is fixed.
     #[test]
     fn a_partition_outside_the_window_does_not_join_the_coverage_requirement() {
-        let stats = |min_ts, max_ts| PartitionStats { fingerprint: 0, min_ts, max_ts };
+        let stats = |min_ts, max_ts| PartitionStats { fingerprint: 0, min_ts, max_ts, rows: 0 };
         // Wholly before, wholly after: not in the window.
         assert!(!stats(0, 50).overlaps(100, 200));
         assert!(!stats(300, 400).overlaps(100, 200));

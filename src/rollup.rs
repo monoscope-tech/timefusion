@@ -545,6 +545,40 @@ pub(crate) fn interiors(lo: i64, hi: i64, grain: i64, horizon: i64, covered: &[(
 /// range without an upper bound.
 pub(crate) const OPEN_END: i64 = i64::MAX;
 
+/// May a date's slice coverage be read from the tier at all?
+///
+/// Slice coverage is the ONLY live coverage (the per-date map was dead code),
+/// and until this guard existed it was checked for project/source/target/range
+/// overlap and nothing else — no fingerprint, no epoch. A slice therefore kept
+/// claiming its range after the source partition moved underneath it, and the
+/// tier served an aggregate built from fewer rows than the partition now holds.
+/// Prod 2026-08-22: P1's 08-20 rollup was short 21.7% and 08-21 short 96%, and
+/// those two shortfalls summed to the 2.86M-row under-count a 3-day throughput
+/// chart returned (`docs/plans/2026-08-22-rollup-correctness-and-routing.md`).
+///
+/// `witnesses` is each covering slice's record of how many rows the DATE
+/// partition held when it was built, and `current` is how many it holds now.
+/// Both must be the same computation — `PartitionStats::rows`, i.e. the
+/// add-action `num_records` sum — or this compares unlike quantities and is
+/// worthless: the build's decoded input excludes tombstones and superseded
+/// merge-on-read versions, `num_records` counts them.
+///
+/// Every slice must agree with every other AND with the present. Per-slice
+/// witnesses are not summed: slices of one day are built at different times
+/// against a churning partition, so each is a snapshot of the whole date, and
+/// summing snapshots would compare a total against one sample.
+///
+/// Equality is two-sided on purpose. "Rows only accrue" is false here — dedup
+/// rewrites and vacuum shrink `num_records` too — so a disagreement in either
+/// direction means the partition moved and the coverage cannot be trusted.
+///
+/// A slice with no witness predates the tag and CANNOT be verified, so it is
+/// refused; those dates read raw until the coordinator republishes them.
+pub(crate) fn slice_coverage_agrees(witnesses: &[Option<u64>], current: Option<u64>) -> bool {
+    let Some(current) = current else { return false };
+    !witnesses.is_empty() && witnesses.iter().all(|witness| *witness == Some(current))
+}
+
 /// `[lo, hi)` minus `ranges` — the raw leg's share.
 ///
 /// `ranges` must be ascending and disjoint, which `interiors` guarantees. Every
@@ -2725,6 +2759,22 @@ mod tests {
                 assert!(ranges.iter().all(|range| gap.1 <= range.0 || gap.0 >= range.1), "gap {gap:?} overlaps {ranges:?}");
             }
         }
+    }
+
+    /// The guard that stops the tier serving an aggregate built from a
+    /// partition that has since moved. Prod 2026-08-22: a 3-day throughput
+    /// chart returned 4.43M of 7.29M rows because nothing checked this.
+    #[test_case::test_case(&[Some(100)], Some(100), true ; "single slice, partition unchanged")]
+    #[test_case::test_case(&[Some(100), Some(100)], Some(100), true ; "every slice witnessed the same partition")]
+    #[test_case::test_case(&[Some(100)], Some(150), false ; "rows arrived after the build: the 08-20 shape")]
+    #[test_case::test_case(&[Some(100)], Some(90), false ; "rows REMOVED after the build — dedup and vacuum shrink num_records, so the check is two-sided")]
+    #[test_case::test_case(&[Some(100), Some(150)], Some(150), false ; "slices disagree with each other: one was built before a change")]
+    #[test_case::test_case(&[None], Some(100), false ; "a slice written before the tag cannot be verified, so it is refused")]
+    #[test_case::test_case(&[Some(100), None], Some(100), false ; "one unverifiable slice condemns the date")]
+    #[test_case::test_case(&[], Some(100), false ; "no slices cover the date")]
+    #[test_case::test_case(&[Some(100)], None, false ; "the source partition reports no row count")]
+    fn slice_coverage_is_trusted_only_when_every_witness_matches_the_partition_now(witnesses: &[Option<u64>], current: Option<u64>, trusted: bool) {
+        assert_eq!(slice_coverage_agrees(witnesses, current), trusted);
     }
 
     #[test]

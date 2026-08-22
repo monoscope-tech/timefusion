@@ -1306,10 +1306,19 @@ impl Database {
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
-        let (snapshot, log_store, selected, estimated_bytes) = {
+        let (snapshot, log_store, selected, estimated_bytes, source_rows) = {
             let table = from_table.read().await;
             let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
             let date_string = date.to_string();
+            // The witness the read path re-checks this slice against. Taken with
+            // the SAME call the read path uses and the same unbounded bound, so
+            // the two are the same computation — see `slice_coverage_agrees`.
+            let source_rows = Self::partition_stats_bounded(&table, tiebreak_of(&key.source), &|_, _| i64::MAX)
+                .ok()
+                .and_then(|mut stats| {
+                    stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
+                })
+                .map(|stats| stats.rows);
             let partition_paths = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string);
             let mut selected = Vec::new();
             let mut estimated = 0u64;
@@ -1411,7 +1420,7 @@ impl Database {
                 estimated = estimated.saturating_add(projected.saturating_mul(share).div_ceil(whole.max(1)));
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated)
+            (snapshot, table.log_store(), selected, estimated, source_rows)
         };
         if untagged_inputs > 0 {
             crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
@@ -1611,6 +1620,10 @@ impl Database {
                 (crate::maintenance_coordinator::TAG_SLICE_END, key.slice.end_micros.to_string()),
                 (crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT, source_fp.to_string()),
                 (crate::maintenance_coordinator::TAG_GENERATION, generation.clone()),
+                // Absent (older generations) means the read path cannot verify
+                // this slice and must refuse it, so write the sentinel rather
+                // than omitting the tag when the source reports no count.
+                (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
             ] {
                 tags.insert(name.to_owned(), Some(value));
             }
@@ -1806,9 +1819,9 @@ impl Database {
         if journal.state(&key) == Some(TaskState::Running) {
             self.rollup_slice_coverage.insert(
                 (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros),
-                RollupCoverage { source_fp, source_epoch: 0, generation: generation.clone(), rows, covered_through: key.slice.end_micros },
+                RollupCoverage { source_fp, source_epoch: 0, generation: generation.clone(), rows, source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()), covered_through: key.slice.end_micros },
             );
-            journal.publish(&key, crate::maintenance_coordinator::Publication { source_fingerprint: source_fp, generation: generation.clone(), rows });
+            journal.publish(&key, crate::maintenance_coordinator::Publication { source_fingerprint: source_fp, generation: generation.clone(), rows, source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()) });
             journal.checkpoint()?;
             // Per-unit outcome, because the counters are process-wide totals and
             // cannot answer "why has THIS project's coverage not moved". Prod
@@ -2408,7 +2421,7 @@ impl Database {
             .map(|(key, identity)| {
                 let mut hasher = fnv::FnvHasher::default();
                 identity.hash(&mut hasher);
-                (key, PartitionStats { fingerprint: hasher.finish(), min_ts: identity.1, max_ts: identity.2 })
+                (key, PartitionStats { fingerprint: hasher.finish(), min_ts: identity.1, max_ts: identity.2, rows: identity.0 })
             })
             .collect())
     }
@@ -2479,7 +2492,10 @@ impl Database {
             let tagged = match self.resolve_table("default", &target).await {
                 Ok(table) => {
                     let table = table.read().await;
-                    let mut groups: HashMap<(String, i64, i64, String, u64), u64> = HashMap::new();
+                    // (project, slice_start, slice_end, generation, source_fp, source_rows) -> rollup rows.
+                    // `source_rows` is part of the KEY so a partition rebuilt against a
+                    // different source count cannot merge with the older evidence.
+                    let mut groups: HashMap<(String, i64, i64, String, u64, Option<u64>), u64> = HashMap::new();
                     for add in table.snapshot()?.log_data().iter() {
                         #[allow(deprecated)]
                         let action = add.add_action();
@@ -2512,7 +2528,11 @@ impl Database {
                             continue;
                         };
                         let rows = action.get_stats().ok().flatten().map_or(0, |stats| u64::try_from(stats.num_records.max(0)).unwrap_or(0));
-                        let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp)).or_default();
+                        // Absent on generations written before the tag; `-1` is the
+                        // sentinel a build writes when the source reported no count.
+                        // Both become `None`, which the read path refuses to verify.
+                        let source_rows = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS).and_then(|value| value.parse::<i64>().ok()).and_then(|rows| u64::try_from(rows).ok());
+                        let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows)).or_default();
                         *entry = entry.saturating_add(rows);
                     }
                     groups
@@ -2531,13 +2551,14 @@ impl Database {
                         source_epoch: 0,
                         generation: publication.generation.clone(),
                         rows: publication.rows,
+                        source_rows: publication.source_rows,
                         covered_through: key.slice.end_micros,
                     },
                 );
                 recovered += 1;
             }
             if !tagged.is_empty() {
-                for ((project_id, slice_start, slice_end, generation, source_fp), rows) in tagged {
+                for ((project_id, slice_start, slice_end, generation, source_fp, source_rows), rows) in tagged {
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else { continue };
                     let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else { continue };
@@ -2546,7 +2567,7 @@ impl Database {
                     }
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
-                        RollupCoverage { source_fp, source_epoch: 0, generation, rows, covered_through: slice_end },
+                        RollupCoverage { source_fp, source_epoch: 0, generation, rows, source_rows, covered_through: slice_end },
                     );
                     recovered += 1;
                 }

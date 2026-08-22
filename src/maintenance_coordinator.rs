@@ -118,6 +118,15 @@ pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
 pub const TAG_SLICE_END: &str = "timefusion.slice_end_micros";
 pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
+/// How many rows the SOURCE DATE PARTITION held when this slice was built —
+/// the `num_records` sum, exactly as `partition_stats_bounded` computes it.
+///
+/// Read coverage is refused unless every slice covering a date still agrees
+/// with the partition's present count (`rollup::slice_coverage_agrees`). A row
+/// count rather than a fingerprint on purpose: a fingerprint folds file
+/// identity, so bin-packing would void it and recreate the certification-vs-
+/// churn race inside the rollup tier. Row counts survive compaction.
+pub const TAG_SOURCE_ROWS: &str = "timefusion.source_rows";
 pub const TAG_GENERATION: &str = "timefusion.generation";
 const JOURNAL_VERSION: u32 = 1;
 const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -295,6 +304,12 @@ pub struct Publication {
     pub source_fingerprint: u64,
     pub generation: String,
     pub rows: u64,
+    /// The source DATE partition's `num_records` sum when this slice was built,
+    /// mirroring [`TAG_SOURCE_ROWS`]. `default` so journals written before this
+    /// field deserialize: they yield `None`, the read path cannot verify them,
+    /// and those slices read raw until the coordinator republishes.
+    #[serde(default)]
+    pub source_rows: Option<u64>,
 }
 
 /// Split a unit until each estimated reservation fits.  A one-minute whale is
@@ -3066,7 +3081,7 @@ mod tests {
         let input = task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
         let key = input.key.clone();
         journal.upsert(input);
-        assert!(journal.publish(&key, Publication { source_fingerprint: 7, generation: "stable".to_owned(), rows: 0 }));
+        assert!(journal.publish(&key, Publication { source_fingerprint: 7, generation: "stable".to_owned(), rows: 0, source_rows: None }));
         journal.checkpoint().expect("checkpoint");
 
         let loaded = TaskJournal::load(dir.path()).expect("load checkpoint");
@@ -3125,7 +3140,7 @@ mod tests {
 
         // Coverage checkpoint is the only boundary that makes the slice
         // readable after restart, including an empty output.
-        assert!(recovered.publish(&key, Publication { source_fingerprint: 9, generation: "g".to_owned(), rows: 0 }));
+        assert!(recovered.publish(&key, Publication { source_fingerprint: 9, generation: "g".to_owned(), rows: 0, source_rows: None }));
         recovered.checkpoint().expect("coverage checkpoint");
         let recovered = TaskJournal::load(dir.path()).expect("recover publication");
         assert_eq!(recovered.published_rollups("source", "table").len(), 1);
