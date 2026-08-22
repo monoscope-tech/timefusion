@@ -8,6 +8,7 @@
 //! Run everything: `cargo nextest run`. Run one file: `cargo nextest run
 //! -E 'binary(suite)' <substring>`, e.g. `cargo nextest run dedup_compaction`.
 
+mod bloom_prune_test;
 mod buffer_consistency_test;
 mod cache_performance_test;
 mod connection_pressure_test;
