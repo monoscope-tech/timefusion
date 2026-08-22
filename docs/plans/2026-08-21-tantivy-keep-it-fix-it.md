@@ -440,3 +440,95 @@ averaging across it gave ~40/hr, which looked like a much slower divergence.
 Both clean single-container segments say ~81-85/hr. **Don't average a rate
 across a restart** — the census is a live diff, so a restart boundary can move
 it for reasons unrelated to drain throughput.
+
+## 2026-08-22 (morning): the deficit is ~11%, not 4x — accrual measured directly
+
+The previous section could not separate accrual from drain, and flagged its
+`48 files/hr vs 133/hr` split as INFERRED from a code comment. That split is
+now measured and it is wrong in both terms.
+
+**The measurement.** The bloom sidecar reconcile logs `built=N` every ~5
+minutes, and `built` has exactly the semantics needed: it counts live parquet
+files **absent from the per-(project,date) sidecar**, i.e. files that appeared
+since the last pass. Bloom has converged (a cell with nothing new and nothing
+retired is skipped outright), so in steady state its `built` per pass IS the
+rate at which new live parquet files come into existence — the same population
+tantivy has to cover.
+
+Steady state only starts at 05:28. Before that bloom was draining its own
+backlog and every pass printed `built=512`, which is
+`timefusion_bloom_sidecar_files_per_pass` — **a cap-bound counter measures the
+cap, not the rate.** Same trap as `cache_seeded`; the fix is the same, check
+what bounds a counter before dividing by time.
+
+| window (2026-08-22, container `rgfkdnu`, no restart) | measurement |
+|---|---|
+| 05:28 → 09:03, 42 bloom passes, Σ`built` = 1895 | **~529 new live parquet files/hr** |
+| 05:30 → 08:49 census, 5519 → 5717 | **~60 uncovered files/hr** |
+| difference | **tantivy builds ~469 files/hr at `build_concurrency = 2`** |
+
+So tantivy runs at **~89% of accrual**, and the earlier "~48/hr" was low by an
+order of magnitude. The divergence is real — 60/hr, matching the 81-85/hr of
+the two clean windows measured overnight — but it is an 11% shortfall, not a
+4x one. Every lever below is sized against ~530/hr accrual and a ~5,700 backlog.
+
+**What that changes.** Convergence does not need an architectural rewrite; it
+needs ~15% more throughput to hold the line and a surplus to drain 5,700. Two
+levers, in order:
+
+### L1 — `build_concurrency` 2 → 4 (one env var, immediate)
+`TIMEFUSION_TANTIVY_BUILD_CONCURRENCY` bounds `buffer_unordered` over
+`build_index_for_file`, and each build is dominated by an S3 read-back of a
+~1MB parquet, not by CPU. The "2 is safe alongside prod query load" comment
+predates the local-first change that took blob fetches to 0 and put the read
+path off the critical section. At 4 the drain goes to ~940/hr against ~530/hr
+accrual: **surplus ~410/hr, backlog cleared in ~14h**. Kill switch is the same
+env var. Watch `oversized_skipped` and peak anon RSS — the memory risk is
+concurrent decode of large files, which is why the oversized cap exists
+(currently `oversized = 0`, so nothing is being skipped today).
+
+### L2 — one index per (project, date), not per parquet file
+This is the right long-term shape and it is what the fan-out numbers already
+demand: `indexes_per_query = 5`, `index_opens = 1478`, and
+`blob_fetch_us_avg = 3.5s` on the 334 fetches that still miss. The per-file
+manifest is why a 30-day query consults hundreds of tiny indexes.
+
+The machinery is already there: `ManifestEntry.covered_files` is a `Vec`, and
+`ordinals_valid` is computed as `e.ordinals_valid && covered_files.len() == 1`.
+A multi-file entry therefore already degrades correctly — hits come back as
+`id` terms plus file-level coverage/zero-hit pruning, and row-ordinal selection
+switches itself off. Flush-built indexes already cover several files this way.
+
+The thing to design, and the reason this is not a one-line change: **a per-day
+index must not be rebuilt whenever one file lands in that day.** Two tiers,
+mirroring how sealed and hot data are already treated everywhere else:
+
+- **Sealed day index.** Built once per (project, date) when the day's
+  compaction has settled, covering every file then live. One blob, one manifest
+  entry, one index open per day on read.
+- **Hot tail.** Files landing after the seal keep today's cheap per-file
+  indexes until the next seal folds them in. Bounded by construction: only the
+  current date and any date still being compacted has a tail.
+
+Coverage stays honest — it is still `live files − covered files`, so a
+compaction rewrite still surfaces its output as uncovered. Per-day indexing
+does not reduce how many FILES must be covered; it reduces the number of build
+UNITS and the fixed cost per unit (one blob upload, one manifest upsert, one
+inline merge, one read-side open instead of hundreds).
+
+### L3 — build the index where the rows already are
+~530 files/hr is largely compaction output. Indexing at compaction time (the
+wave-reindex path does this for some cases already) removes the S3 read-back
+and the decode entirely — the rows are in memory when the output file is
+written. This is the lever that shrinks the work rather than racing it, and it
+composes with L2: a compaction that rewrites a whole date partition is exactly
+the moment to seal that date's index.
+
+### Also visible in this window, unrelated to throughput
+- `search_us_avg` has regressed 0.34ms → **2.1ms** and `reader_hit_pct` 96.9%
+  → **85.2%** since the increment-2 measurement. `manifest_hit_pct` is 33%
+  with `manifest_load_us_avg = 203ms`.
+- Seven-plus `tantivy build produced N segments (> 32); merging inline`
+  warnings per hour, N routinely 38-65. Every one of those pays an inline merge
+  on top of the build. Worth checking the writer's memory budget — that segment
+  count for a ~1MB file suggests one segment per commit rather than per batch.
