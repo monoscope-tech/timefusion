@@ -254,8 +254,9 @@ This corrects the intuition that these shapes are scan-bound. They are
 equals `dedup_eligible` (16,935 of 16,935) and
 `dedup_denied_never_certified_pct = 100.0`, so **every one of these scans pays
 for the dedup machinery and none of them is allowed to skip it.** The
-per-date dedup skip shipped default-off in d327df8 is aimed at exactly this
-cost, and this is the measurement that sizes it.
+per-date dedup skip is aimed at exactly this cost; **Finding 5 shows it is
+already on by default, already working, and denied 100% of the time for want
+of certification coverage on recent dates.**
 
 The two shapes that escape are the two fast ones: `list` and `trace` show
 `DedupExec` at 1–2 ms, because TopK and a point lookup never materialise the
