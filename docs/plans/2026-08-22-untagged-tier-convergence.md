@@ -173,6 +173,37 @@ Caveat, written rather than coded because no live file has it: a partition whose
 only untagged file carries no statistics gets an `untagged_cells` entry but no
 enqueued slice — a rank boost with no work attached.
 
+## Measured after the deploy — two more defects, both found by disbelieving a counter
+
+**The gap units run and publish.** Comparing log replays either side of the
+deploy, the 08-19 cells GREW tagged ranges (`00000000` 1 → 4, `87576849` 1 → 3)
+while the mid-tail cells consolidated (74 → 58, 89 → 68) as wider slices absorbed
+narrower ones. That is the mechanism working.
+
+**But the live untagged count did not move: still exactly 85.** Two reasons, both
+now fixed:
+
+1. **`rollup_tier_untagged_retired` counted INTENDED retirements.** It fired where
+   the replace-set is computed, ~80 lines before the commit, past `still_running`
+   and past `slice_occ_stale`. Prod read 21 retired inside an hour while the log
+   replay said nothing had left the table — three deploys had killed units in
+   between. The counter was the harmless half: `clear_untagged_cell` sat in the
+   same block and removed a partition's hole boost the moment a unit *decided* it
+   would be clean, which switches the prioritisation off on exactly the cells that
+   still need it. Both moved after the commit (`a60c87c`).
+2. **Coverage recovery ran ONCE at startup.** It is the only pass that sees an
+   untagged file, so it is the only thing that can enqueue the republish that
+   retires one — and a file becomes retirable when OTHER slices publish, long
+   after boot. An hour in, **30 of the 85 satisfied a proof and none had been
+   retired**, because nothing queued the publish that would evaluate it. Now
+   hourly (`b68f042`); it is metadata-only, far cheaper than the 60s planner tick
+   beside it.
+
+The general lesson, which cost most of the session: a gauge that only updates on
+publish reads 0 both when clean and when unset, and a counter placed before the
+commit reads progress that did not happen. The authority for "did a file leave
+the table" is a Delta-log replay, never a process-scoped counter.
+
 ## Explicitly rejected
 
 - **Journal-derived `covered`.** The journal knows which slices were built, but a
