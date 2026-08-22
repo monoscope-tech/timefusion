@@ -276,6 +276,30 @@ first; if it is 0, the measurement has not started. The compaction chart shows
 the same constraint from the write side — six sealed days frozen because units
 are re-claimed rather than finished.
 
+## A restart costs ~25 minutes of routing, and prod restarts often
+
+Not a measurement artifact — a real latency window, and it deserves naming
+because the goal is fast queries and this makes them slow on a schedule.
+
+Date-level `rollup_coverage` is **not persisted**. Only `rollup_slice_coverage`
+survives a restart (the read path says so itself: "after a restart only SLICE
+coverage is recovered, so this lookup misses for every date"). The date-level map
+is repopulated by the maintenance planning pass, which is also what recomputes
+`rollup_min_contiguous_days` — so the gauge reading 0 and the coverage being
+absent are the same event, and both clear only when that pass next runs.
+
+Measured tonight across three restarts: **~25 minutes** from container start to
+`rollup_min_contiguous_days` returning to 30. During that window the miss
+histogram reads `not_built` (43 of 85 misses at 11 minutes in), not
+`stale_coverage` — a different diagnosis for the same underlying "no coverage
+loaded yet".
+
+With prod restarting roughly hourly on a deploy day, that is a large fraction of
+the time with no date-level routing available at all. Two directions, neither
+attempted here: persist the date-level map the way slice coverage already is, or
+run the coverage recompute once at boot rather than waiting for the next
+scheduled pass. The second is much smaller and probably sufficient.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
