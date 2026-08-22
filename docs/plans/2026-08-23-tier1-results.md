@@ -41,9 +41,21 @@ that is easy to miss:
   Without it a bucket whose rows were ALL null returns as a zero instead of
   being absent — a *row-presence* change, not just a value change.
 
-Three tests. The first fails with `FilterNotEligible` without the change, which
-is the prod symptom exactly; the other two pin the cases that must keep
-declining.
+Four tests. The first fails with `FilterNotEligible` without the change, which
+is the prod symptom exactly; two pin the cases that must keep declining; the
+fourth covers the HYBRID path.
+
+**A review catch worth recording, because the single-leg test could not see
+it.** The guard flows through the existing `RoutedMeasure` construction whose
+no-filter arm emits a bare `COUNT(*)` — an arm that could not fire before, since
+filter promotion always had a declared filter. But the fringe's WHERE carries
+dimension filters only, and the promotion clears `duration IS NOT NULL`, so
+`COUNT(*)` counted the null rows and `HAVING > 0` kept exactly the all-null
+buckets the guard exists to eliminate — the same resurrection, reintroduced on
+the other leg. Since monoscope's windows end at `now()`, **every** routed latency
+chart has a fringe, so this was the common path. `COUNT(col)` skips nulls, which
+is precisely the dropped predicate. The lesson generalises: a rewrite with two
+legs needs a test per leg, and `horizon: None` is the half that hides this.
 
 ## 1.3 — a per-query byte ceiling *(shipped, default off)*
 
@@ -99,6 +111,18 @@ interruptible, a non-yielding one runs to completion regardless of the deadline
 — so it keeps passing and keeps the reason discoverable. Made exact with a
 paused clock.
 
+**This is a mitigation, not a proven fix, and should be read that way until
+reproduced.** The wedge itself was never reproduced locally; the change follows
+from the mechanism, not from a failing repro. Two known coverage limits:
+`make_cooperative` spends budget per *produced batch*, so a long poll that
+produces nothing still starves the timer; and `GatedScanExec` only wraps scans
+past the wide-scan threshold, so a below-threshold plan fed from an all-ready
+in-memory input is still uncovered.
+
+Post-deploy check: re-run the wedge shape (a 7-day aggregate on p5) and a clean
+statement-timeout error at ~60 s is the pass signal. A second >20 min run means
+the long poll is somewhere these two wrappers do not reach.
+
 ## 1.1 — measured, decided, and handed over
 
 The gate on this item was "read `rollup_stale_no_witness` vs `_moved` first; the
@@ -130,6 +154,13 @@ the flip is even readable.
 So: decision made and evidenced, execution handed over. After flipping, read
 `rollup_hits_hybrid_total` — but only once `rollup_min_contiguous_days` is back
 at 30, or the measurement has not started.
+
+**One in-repo alternative, named rather than taken.** Flipping the code default
+on this branch would ship the same behaviour through the deploy train without
+touching CapRover, and the 80/20 measurement is the evidence either way. I left
+it off because `a7a4eb0` set it to OFF deliberately and that is a concurrent
+session's call to reverse, not one to make unattended — but it is a one-line
+change at merge time if that is preferred.
 
 ## 1.2 — root-caused, and NOT shipped on purpose
 
