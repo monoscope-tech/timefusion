@@ -289,3 +289,67 @@ D1 alone may make the P0 flip unnecessary. Until D0 lands, treat the flip as
 the available mitigation rather than the plan, and re-measure after each step —
 prod contention moves `SELECT 1` between 63ms and 2.4s, so every comparison
 needs an in-round control.
+
+---
+
+## 2026-08-22: the residual attributed — it is not what any of us guessed
+
+Measured on prod against `eb796ac`, per-query counter deltas, in-round unrouted
+control of the identical shape and window (differing only in a predicate the
+rewriter never routes). Steady state, 7d, `trace_id` equality:
+
+| phase | cost |
+|---|---|
+| routed wall MINUS unrouted wall | **~470-680 ms** |
+| manifest loads / index opens / blob fetches | **0 / 0 / 0** |
+| `plan_us` (manifest -> work list) | 0.3-0.7 ms |
+| `prepare_us` (490x stat + LRU lookup) | 15-23 ms |
+| `search_us` (490 tantivy queries) | 32-58 ms |
+| `fanout_us` (WALL of the whole fan-out) | **49-83 ms** |
+| merge bookkeeping (`fanout - prepare - search`) | 1.4-1.7 ms |
+
+**The entire tantivy prefilter costs ~50-85 ms of a ~500 ms residual.** Roughly
+85% of the routing tax is spent outside the search service altogether.
+
+Three hypotheses died here, each of which would have justified real work:
+
+1. **"The 490 searches are serial CPU."** They ARE serial —
+   `buffer_unordered` over async blocks whose tantivy work is synchronous, with
+   no await left once an index is cached, so each future completes in a single
+   poll and `search_concurrency = 32` buys IO concurrency only. But they cost
+   ~0.09 ms each, so it does not matter. A `spawn_blocking` rewrite would have
+   bought ~40 ms.
+2. **"D2 — the per-file fan-out is too wide."** Same refutation. 490 indexes
+   cost 83 ms of wall, all in. Coarser indexes cannot repay their cost out of a
+   budget that small. **D2 is not justified by this measurement.**
+3. **"The hit list is expensive to plan."** The residual is FLAT from
+   `LIMIT 1` to `LIMIT 501` (~600-720 ms at every level, 490 indexes
+   throughout), so it does not scale with hits and is not the `id IN (...)`
+   expression. The plan cache is also innocent: 99.9% hit rate, and **zero**
+   misses for either shape.
+
+So the tax is **fixed per routed query**, independent of hits, independent of
+the search, and not IO. What remains is the scan-construction consumption of the
+result — partitioning the snapshot's file list against `tantivy_covered_files`
+(built over EVERY manifest entry, ~950, not just in-window ones), applying
+`tantivy_exclude`, and building per-file `ParquetAccessPlan`s from
+`tantivy_row_selections`. All three are fixed in the number of manifest entries
+and files, which is exactly the observed shape. One timer around that split
+would name the line; it was not deployed tonight so as not to kill the reconcile
+pass the coverage measurement needs.
+
+**Consequence for the deferred P0.** The unrouted control for this shape runs
+200-300 ms while the routed one runs ~700 ms, so for a `trace_id` point lookup
+at 7d, routing is currently a NET LOSS of ~450 ms. That is not an argument for
+flipping `route_equality` off wholesale — the control here is `>`, which cannot
+use parquet blooms either, and blooms prune 653 row groups to 1 in ~4 ms for
+this exact shape, so an unrouted `=` would likely be faster still. It IS a
+direct argument for **D4 (benefit-based routing)** over D2: the index should be
+consulted where it wins, and the fixed consumption cost is what decides that.
+
+**Method note worth keeping.** The first attribution probe reported NEGATIVE
+per-query search time, because it reconstructed totals as `avg * count` from the
+`*_us_avg` rows — and each of those divides by its own denominator
+(`search_us_avg` by per-index `searches`, not by `queries`, which was not
+exposed at all). A mean cannot be differenced. The `*_us_total` rows exist
+because of this.
