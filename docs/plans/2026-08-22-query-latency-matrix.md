@@ -180,6 +180,41 @@ the fixes are opposite.
   work, but it is a spec change requiring a full rebuild across 30 days, which is
   wall-clock physics and not an overnight change.
 
+## Post-deploy verdict (`ebfa7e0`)
+
+**The hint strip works, confirmed directly.** `rollup_promotion_unmatched` now
+logs a clean promoted filter — `((kind Eq "client") OR (kind Eq "server"))`, the
+`text_match` OR gone — and the `select distinct project_id … kind in (?,?,?,?)`
+query that monoscope fires every 5 minutes went from one unmatched decline per
+spec per run to **zero**.
+
+**The prefilter breakdown works, and it refutes the standing hypothesis.**
+`prefilter_attempts=65, used=27, skipped=38`, and the 38 splits as
+`no_index_or_cap` **29 (76%)**, `low_selectivity` 9 (24%), `field_coverage_gap`
+**0**, everything else 0. They sum exactly. `field_coverage_gap` was written into
+`pg_compat.rs` as the most plausible cause and it is flatly zero — the wasted
+fan-out is the index not being there, not a rule declining a usable one. That
+sends the fix back to coverage, not to `min_selectivity_pct`.
+
+**Everything I measured about ROUTING after the deploy is invalid**, and this is
+worth more than the measurements were:
+`rollup_min_contiguous_days` read **0** on the five-minute-old container against
+**30** before the restart. The gauge is process-scoped and rebuilds after boot.
+With coverage empty the router does not attempt routing at all — so a novel
+group-by shape (fresh literals, fresh bucket width, past the plan cache) produced
+**neither a hit nor a miss**, and `rollup_misses_total` sat flat at 3 across
+several distinct queries. A flat miss counter after a deploy is an artifact of
+the restart. **Absence of a miss is not evidence of a hit.** Read
+`rollup_min_contiguous_days` before quoting any routing number.
+
+So "does anything route now" is still open, and needs a re-measure once coverage
+is back at 30 days. Note also that `kind IN ('server','client')` has a second,
+independent blocker even with the hint gone: no declared measure matches that
+filter.
+
+`tantivy_manifest_commits` is likewise unverifiable on a young container — the
+reconcile cron fires at minute 20 and `tantivy_backfill_built` was still 0.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
