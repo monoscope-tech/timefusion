@@ -23,8 +23,13 @@ Wall-clock ms, `count`-shaped outputs, `rep2` (warm) unless noted. Projects:
 
 ## 30 days, which is where it breaks
 
-`fail` = did not return, cut off at ~60 s regardless of the client's
-`statement_timeout` (90 s here), so there is a server-side cap in the path.
+`fail` = `ERROR: canceling statement due to statement timeout` at ~60 s — with
+the client's `statement_timeout` set to 90 s and then 120 s. That is **not a
+bug**: `DEFAULT_MAX_STATEMENT_SECS = 60` (`timefusion_pgwire_max_statement_secs`)
+and `effective_statement_timeout` takes `min(client, server)`, so a client cannot
+raise its own ceiling past the server's. The cap is deliberate and tested. What
+it means for this table is simply that these queries genuinely exceed 60 s — the
+server is reporting the failure, not causing it.
 
 | shape | whale 30d | mid 30d | small 30d |
 |---|---|---|---|
@@ -214,6 +219,21 @@ filter.
 
 `tantivy_manifest_commits` is likewise unverifiable on a young container — the
 reconcile cron fires at minute 20 and `tantivy_backfill_built` was still 0.
+
+## Why the routing re-measure has not happened
+
+It needs a quiet window and there has not been one. Prod restarted twice during
+this session — `ebfa7e0` at 18:41, then `5062a7d` at ~18:55 — and each restart
+zeroes `rollup_min_contiguous_days`, which gates whether the router attempts
+anything at all. Fifty minutes after the second deploy it still reads 0, along
+with `tantivy_uncovered_files` and `tantivy_backfill_built`.
+
+This is the deploy-train problem, and it is worth stating as a constraint on the
+whole approach rather than as an excuse: **on this box the gauges that answer
+"did the fix work" take longer to rebuild than the interval between deploys.**
+Any routing conclusion drawn inside that interval is an artifact. The compaction
+chart shows the same constraint from the write side — six sealed days frozen
+because units are re-claimed rather than finished.
 
 ## Open, in priority order
 
