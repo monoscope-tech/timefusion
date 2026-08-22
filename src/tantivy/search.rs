@@ -58,6 +58,9 @@ pub struct SearchStats {
     /// dominated by. Divided by `queries`, this is indexes-per-query.
     pub indexes_searched: AtomicU64,
     pub queries: AtomicU64,
+    /// Hits actually materialized (doc-store reads) by prefilter searches.
+    /// The fat-needle abort must keep this O(max_hits), never O(matches).
+    pub hits_materialized: AtomicU64,
     /// Extracted-index dirs seeded by the indexer at publish time, i.e. S3
     /// round trips this process avoided by keeping what it just built.
     pub cache_seeded: AtomicU64,
@@ -186,8 +189,26 @@ impl TantivySearchService {
             let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
             let started = Instant::now();
             let out = match build_node_query(&index, node)? {
-                PredsQuery::MissingField => (None, rows, entry_covered, ordinals_valid),
-                PredsQuery::Query(q) => (Some(query_with_searcher(&reader.searcher(), &*q, None)?), rows, entry_covered, ordinals_valid),
+                PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
+                PredsQuery::Query(q) => {
+                    let searcher = reader.searcher();
+                    // Count-first: a raw per-index match count over `max_hits`
+                    // already forces the abort verdict (the prefilter can no
+                    // longer prove completeness), so establish it with the
+                    // cheap Count collector instead of materializing hits —
+                    // a 4.5M-match needle cost 4-6s of plan time per query
+                    // doing doc-store reads it then threw away (prod
+                    // 2026-08-22). The limit on the materializing search is a
+                    // backstop; `search()` passes usize::MAX, hence saturating.
+                    let count = searcher.search(&*q, &tantivy::collector::Count).map_err(|e| anyhow!("count: {e}"))?;
+                    if count > max_hits {
+                        None
+                    } else {
+                        let hits = query_with_searcher(&searcher, &*q, Some(max_hits.saturating_add(1)))?;
+                        SearchStats::add(&self.stats.hits_materialized, hits.len() as u64);
+                        Some((Some(hits), rows, entry_covered, ordinals_valid))
+                    }
+                }
             };
             SearchStats::timed(&self.stats.searches, &self.stats.search_us, started);
             Ok::<_, anyhow::Error>(out)
@@ -210,7 +231,10 @@ impl TantivySearchService {
         // — a partial selection would UNDER-select, so drop theirs entirely.
         let mut unselectable_files: HashSet<String> = HashSet::new();
         while let Some(res) = tasks.next().await {
-            let (hits, rows, entry_covered, ordinals_valid) = res?;
+            // Per-index overflow: some index alone exceeds `max_hits`.
+            let Some((hits, rows, entry_covered, ordinals_valid)) = res? else {
+                return Ok(None);
+            };
             let Some(hits) = hits else {
                 // An in-window index that can't answer a queried field (e.g.
                 // built before the column was indexed) is a coverage hole the

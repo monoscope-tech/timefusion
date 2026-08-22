@@ -693,8 +693,11 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_min_files_for_pushdown: usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
     /// the `id IN (...)` pushdown entirely — the IN-list itself becomes the
-    /// bottleneck above this point. Default 100k.
-    #[serde_inline_default(100_000)]
+    /// bottleneck above this point. Default 2k: measured 2026-08-22, a
+    /// 3,346-literal IN cost ~2.4s of planning and a 59k one ~28s, so the
+    /// old 100k cap admitted pushdowns that were strictly slower than the
+    /// scan they replaced.
+    #[serde_inline_default(2_000)]
     pub timefusion_tantivy_prefilter_max_hits: usize,
     /// If a tantivy prefilter selects more than this percentage of the
     /// indexed rows, the pushdown isn't worth the round-trip; skip it and

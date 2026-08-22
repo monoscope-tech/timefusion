@@ -1283,6 +1283,7 @@ impl StatsTableProvider {
                 "indexes_searched_total" => idx,
                 "indexes_per_query" => avg(idx, q),
                 "search_us_avg" => mean(&s.search_us, &s.searches),
+                "hits_materialized" => s.hits_materialized.load(Relaxed),
                 "manifest_loads" => ml,
                 "manifest_hits" => mh,
                 "manifest_hit_pct" => pct(mh, mh + ml),
