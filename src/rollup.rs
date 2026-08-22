@@ -1625,6 +1625,12 @@ async fn route_with_spec(
     let (mut lo, mut hi) = (None, None);
     let mut row_filters = Vec::new();
     let mut promotable: Vec<&Expr> = Vec::new();
+    // `col IS NOT NULL`, held apart from `promotable`. monoscope emits it on EVERY
+    // latency chart (`AND duration IS NOT NULL`), which made `filter_not_eligible`
+    // the largest miss reason on prod — 2026-08-22's A/B isolated the predicate
+    // exactly: the same p95 query declined `filter_not_eligible` with it and
+    // `stale_coverage` without it, three reps each.
+    let mut null_guards: Vec<&str> = Vec::new();
     // Strip tantivy hints BEFORE classifying, for the same reason `canonical`
     // strips them: they are accelerators the rewriter adds beside a predicate it
     // never removes. Here the stakes are higher than a cosmetic mismatch — a
@@ -1650,9 +1656,23 @@ async fn route_with_spec(
             (Some(value), _) if project_id.as_deref().is_some_and(|current| current != value) => return Err(MissReason::MissingProject),
             (Some(value), _) => project_id = Some(value.to_string()),
             (None, Some(filter)) => row_filters.push(filter),
-            (None, None) => promotable.push(term),
+            // `col IS NOT NULL` over a non-dimension is a residual like any other,
+            // except that a `count(col)` measure expresses it EXACTLY — so it is set
+            // aside here and resolved as the guard below rather than promoted.
+            (None, None) => match unaliased(term) {
+                Expr::IsNotNull(inner) if column_name(inner).is_some() => null_guards.push(column_name(inner).unwrap_or_default()),
+                _ => promotable.push(term),
+            },
         }
     }
+    // Two different columns cannot both be expressed by one count measure, and the
+    // guard is a single measure by construction. Fail closed rather than guard on
+    // one and silently ignore the other.
+    null_guards.dedup();
+    if null_guards.len() > 1 {
+        return Err(MissReason::FilterNotEligible);
+    }
+    let null_guard = null_guards.first().copied();
     // A query that neither pins nor groups by project_id would fold every
     // tenant into one row, so it stays refused. Grouping by it is answerable:
     // project_id is a real column on the rollup table, and the coverage check
@@ -1710,19 +1730,28 @@ async fn route_with_spec(
     // The guard must be a `count` with NO column: `count(col)` skips nulls, so a
     // bucket whose only matching rows had a null column would be dropped where
     // the raw query kept it.
+    //
+    // `col IS NOT NULL` is the same rule read one step wider. `count(col)` skips
+    // nulls, so a measure `{agg: count, column: col, filter: F}` IS
+    // `count(*) FILTER (WHERE F AND col IS NOT NULL)` — one lookup covers the bare
+    // predicate, the promoted filter, and their conjunction, and it fails closed
+    // when no such measure is declared. The conjunction matters: guarding on
+    // `server_request_count > 0` and `duration_count > 0` SEPARATELY is weaker than
+    // the raw query, because a bucket holding server rows with null duration beside
+    // non-server rows with duration passes both and raw eliminates it.
     let promoted = (!promotable.is_empty()).then(|| canonical_and(promotable.iter().copied()));
-    let guard = match &promoted {
-        None => None,
-        Some(promoted) => Some(
+    let guard = match (promoted.as_deref(), null_guard) {
+        (None, None) => None,
+        (promoted, column) => Some(
             configured_filters
                 .iter()
-                .find(|(measure, filter)| measure.agg == "count" && measure.column.is_none() && filter == promoted)
+                .find(|(measure, filter)| measure.agg == "count" && measure.column.as_deref() == column && filter.as_str() == promoted.unwrap_or_default())
                 .map(|(measure, _)| *measure)
                 .ok_or_else(|| {
                     let declared = || {
                         configured_filters
                             .iter()
-                            .filter(|(measure, _)| measure.agg == "count" && measure.column.is_none())
+                            .filter(|(measure, _)| measure.agg == "count" && measure.column.as_deref() == column)
                             .map(|(measure, filter)| format!("{}={filter}", measure.name))
                             .collect::<Vec<_>>()
                             .join(" | ")
@@ -1737,16 +1766,25 @@ async fn route_with_spec(
                     // distinguish "should have matched and didn't" from "never
                     // eligible" — and warning about them 84 times in 3h on a hot
                     // path is how the real case gets buried.
-                    if !promotable
-                        .iter()
-                        .flat_map(|expr| expr.column_refs())
-                        .any(|column| configured_filters.iter().any(|(_, filter)| filter.contains(column.name.as_str())))
+                    // A null guard is eligible on the same test read through the
+                    // measure's COLUMN rather than its filter text: `duration IS
+                    // NOT NULL` is a near-miss because `duration_count` exists,
+                    // while `attributes___…___name IS NOT NULL` is log-explorer
+                    // traffic no measure was ever going to answer.
+                    let guard_column_declared =
+                        column.is_some_and(|column| configured_filters.iter().any(|(measure, _)| measure.column.as_deref() == Some(column)));
+                    if !guard_column_declared
+                        && !promotable
+                            .iter()
+                            .flat_map(|expr| expr.column_refs())
+                            .any(|column| configured_filters.iter().any(|(_, filter)| filter.contains(column.name.as_str())))
                     {
                         tracing::debug!(
                             event = "rollup_promotion_not_eligible",
                             source,
                             spec = spec.name.as_deref().unwrap_or_default(),
-                            promoted = %promoted,
+                            promoted = promoted.unwrap_or_default(),
+                            null_guard = column.unwrap_or_default(),
                             "a residual row filter constrains columns no declared measure uses"
                         );
                         return MissReason::FilterNotEligible;
@@ -1760,7 +1798,8 @@ async fn route_with_spec(
                         event = "rollup_promotion_unmatched",
                         source,
                         spec = spec.name.as_deref().unwrap_or_default(),
-                        promoted = %promoted,
+                        promoted = promoted.unwrap_or_default(),
+                        null_guard = column.unwrap_or_default(),
                         declared = %declared(),
                         "a residual row filter matched no declared count measure"
                     );
@@ -1856,6 +1895,13 @@ async fn route_with_spec(
         let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
         let name = function.func.name().to_ascii_lowercase();
         let column = function.params.args.first().and_then(column_name).map(str::to_string);
+        // Dropping `col IS NOT NULL` is only sound for aggregates that skip nulls
+        // over THAT column. `SELECT count(*), p95(duration) … WHERE duration IS NOT
+        // NULL` is real monoscope traffic (the top-K tables) and its `count(*)`
+        // counts only rows with a duration, where `request_count` counts them all.
+        if null_guard.is_some() && column.as_deref() != null_guard {
+            return Err(MissReason::FilterNotEligible);
+        }
         let measure = |aggregate: &str, column: Option<&str>| {
             configured_filters
                 .iter()
@@ -1910,9 +1956,15 @@ async fn route_with_spec(
         alias: "__guard".to_string(),
         merge: Merge::Count,
         measures: vec![measure.name.clone()],
-        raw: vec![match measure.filter.as_ref() {
-            Some(filter) => format!("COUNT(*) FILTER (WHERE {filter})"),
-            None => "COUNT(*)".to_string(),
+        // `COUNT(col)` when the guard carries one — the raw leg must eliminate the
+        // same buckets the rollup leg's `HAVING sum(count(col)) > 0` does, and
+        // `COUNT(*)` there would keep an all-null bucket the rollup drops.
+        raw: vec![{
+            let counted = measure.column.as_deref().map_or_else(|| "COUNT(*)".to_string(), |column| format!("COUNT({column})"));
+            match measure.filter.as_ref() {
+                Some(filter) => format!("{counted} FILTER (WHERE {filter})"),
+                None => counted,
+            }
         }],
     });
 

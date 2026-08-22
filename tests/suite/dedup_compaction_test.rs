@@ -2284,6 +2284,188 @@ async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_th
     Ok(())
 }
 
+/// THE gate for dropping `duration IS NOT NULL` — the predicate monoscope emits
+/// on EVERY latency chart, and the one 2026-08-22's counter A/B isolated as the
+/// whole of `filter_not_eligible` (the same p95 query declined
+/// `filter_not_eligible` with it and `stale_coverage` without it, 3 reps each).
+///
+/// Dropping it is NOT free. `percentile_agg` skips nulls, so the VALUES are
+/// unaffected — but the raw query also ELIMINATES a bucket whose every row has a
+/// null duration, and the rollup, which aggregated all rows, would resurrect it
+/// as a 0. So the predicate is replaced by `HAVING sum(duration_count) > 0`,
+/// `duration_count` being `count(duration)` and therefore exactly the count of
+/// rows the predicate would have kept.
+///
+/// The fixture is built to break precisely that: one hour whose rows ALL have a
+/// null duration, beside hours that mix null and non-null. If the guard is wrong
+/// the routed answer gains a bucket the raw answer does not have.
+#[serial]
+#[tokio::test]
+async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollup() -> Result<()> {
+    struct ClockGuard;
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            timefusion::support::unfreeze();
+        }
+    }
+    let _clock_guard = ClockGuard;
+    let mut cfg = (*TestConfigBuilder::new("rollup_null_guard").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    let row = |id: &str, duration: Option<i64>, ts: i64| -> Result<_> {
+        json_to_batch(vec![serde_json::json!({
+            "timestamp": ts, "id": id, "name": "op", "project_id": project_id, "hashes": [], "summary": ["null-guard fixture"],
+            "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string(),
+            "duration": duration, "kind": "server", "status_code": "OK", "resource___service___name": "cart",
+        })])
+    };
+
+    // Hour 0 mixes null and non-null; hour 1 is ALL null (the bucket that must
+    // vanish); hour 2 is all non-null. Yesterday, so it certifies into the tier.
+    for (i, (duration, offset)) in
+        [(Some(100i64), 17i64), (None, 61_000_000), (Some(300), 130_000_000), (None, 3_661_000_000), (None, 3_700_000_000), (Some(500), 7_330_000_000)]
+            .iter()
+            .enumerate()
+    {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("y{i}"), *duration, yesterday_noon + offset)?], true, None).await?;
+    }
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    timefusion::support::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
+    assert!(db.run_maintenance_units(1024).await? > 0, "eligible yesterday slices must be drained");
+
+    // Today, reachable only through the raw leg — including its own all-null
+    // hour, so the guard has to hold on BOTH sides of the union.
+    for (i, (duration, offset)) in [(None, 5_000_000i64), (None, 60_000_000), (Some(700), 3_700_000_000)].iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("t{i}"), *duration, midnight + offset)?], true, None).await?;
+    }
+
+    let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
+    let window = format!("project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})");
+
+    // Without an all-null bucket the test proves nothing, so assert the fixture
+    // really contains one before trusting the comparison below.
+    let probe = db
+        .query_delta_only(&format!(
+            "SELECT COUNT(*)::BIGINT FROM (SELECT time_bucket('1 hours', timestamp) tb FROM otel_logs_and_spans WHERE {window} \
+             GROUP BY 1 HAVING COUNT(duration) = 0)"
+        ))
+        .await?;
+    let all_null_buckets = probe.iter().filter(|b| b.num_rows() > 0).map(|b| b.column(0).as_primitive::<Int64Type>().value(0)).next().expect("a probe row");
+    assert!(all_null_buckets > 0, "the fixture must contain a bucket whose rows ALL have a null duration, got {all_null_buckets}");
+
+    // monoscope's p95 chart, verbatim down to the IS NOT NULL.
+    let query = format!(
+        "SELECT time_bucket('1 hours', timestamp) AS tb, \
+                COALESCE(approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION))), 0) AS p95 \
+         FROM otel_logs_and_spans WHERE {window} AND duration IS NOT NULL GROUP BY 1 ORDER BY 1"
+    );
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+
+    let rows_of = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
+        batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .map(|r| {
+                        (
+                            b.column(0).as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(r),
+                            b.column(1).as_primitive::<datafusion::arrow::datatypes::Float64Type>().value(r).round() as i64,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let hits = || timefusion::observability::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
+    let before = hits();
+    let routed = rows_of(ctx.sql(&query).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "the p95 chart must route, or this proves nothing about the null guard");
+
+    let raw = rows_of(db.query_delta_only(&query).await?);
+    assert_eq!(routed, raw, "the guarded p95 must match the raw aggregate bucket for bucket");
+    assert!(!routed.is_empty(), "the fixture must produce buckets, or equality is vacuous: {routed:?}");
+    Ok(())
+}
+
+/// `count(*)` alongside the guarded percentile must NOT route: raw counts only the
+/// rows with a duration, while `request_count` counted every row. This is real
+/// monoscope traffic (the top-K endpoint tables put both in one query), so the
+/// disqualifier is load-bearing rather than defensive.
+#[serial]
+#[tokio::test]
+async fn a_count_star_beside_the_null_guard_refuses_to_route() -> Result<()> {
+    struct ClockGuard;
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            timefusion::support::unfreeze();
+        }
+    }
+    let _clock_guard = ClockGuard;
+    let mut cfg = (*TestConfigBuilder::new("rollup_null_guard_count").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    for (i, (duration, offset)) in [(Some(100i64), 17i64), (None, 61_000_000), (Some(300), 3_661_000_000)].iter().enumerate() {
+        let batch = json_to_batch(vec![serde_json::json!({
+            "timestamp": yesterday_noon + offset, "id": format!("y{i}"), "name": "op", "project_id": project_id, "hashes": [],
+            "summary": ["count fixture"], "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(yesterday_noon + offset).unwrap().date_naive().to_string(),
+            "duration": duration, "kind": "server", "status_code": "OK", "resource___service___name": "cart",
+        })])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    }
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    timefusion::support::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
+    db.run_maintenance_units(1024).await?;
+
+    let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
+    let query = format!(
+        "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c \
+         FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+           AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) \
+           AND duration IS NOT NULL GROUP BY 1 ORDER BY 1"
+    );
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let hits = || {
+        let stats = timefusion::observability::maintenance_stats();
+        stats.rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed) + stats.rollup_hits_full.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = hits();
+    let routed = ctx.sql(&query).await?.collect().await?;
+    assert_eq!(hits(), before, "count(*) under a null guard counts a different row set than the tier's request_count; it must NOT route");
+
+    let total = |batches: &[datafusion::arrow::array::RecordBatch]| {
+        batches.iter().filter(|b| b.num_rows() > 0).flat_map(|b| (0..b.num_rows()).map(|r| b.column(1).as_primitive::<Int64Type>().value(r))).sum::<i64>()
+    };
+    assert_eq!(total(&routed), total(&db.query_delta_only(&query).await?), "the refused query must still answer correctly from raw");
+    Ok(())
+}
+
 // This is the shape production actually sends: microsecond-precision bounds
 /// running up to now. Before the union it was refused outright, so the feature
 /// never served a single query. A hybrid that merely *runs* is worthless — the
