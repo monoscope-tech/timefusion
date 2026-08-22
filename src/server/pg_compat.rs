@@ -1195,6 +1195,17 @@ impl StatsTableProvider {
                     // batching bought; before it the ratio was 1.
                     // Splits tantivy_scan_us into its three steps, so the next
                     // fix targets the one that owns it rather than guessing.
+                    // Whether the prefilter is even REACHING the scan. The
+                    // predicate-aware mutable gate (761779d) removed a gate that
+                    // was provably dead on otel, and files-per-call did not move
+                    // — which it cannot if decide_prefilter is bailing before it,
+                    // most plausibly on field_coverage_gap (one in-window index
+                    // missing a queried field skips the WHOLE pushdown). These
+                    // three separate "never tried" / "tried and used" / "tried
+                    // and skipped" so that question stops being a guess.
+                    "prefilter_attempts" => crate::observability::counter_value("timefusion.tantivy.prefilter_attempts"),
+                    "prefilter_used" => crate::observability::counter_value("timefusion.tantivy.prefilter_used"),
+                    "prefilter_skipped" => crate::observability::counter_value("timefusion.tantivy.prefilter_skipped"),
                     "pruned_calls" => cv(PRUNED_CALLS),
                     "pruned_files_total" => cv(PRUNED_FILES),
                     "pruned_select_us_total" => cv(PRUNED_SELECT_US),

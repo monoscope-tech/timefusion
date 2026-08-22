@@ -667,3 +667,44 @@ The honest summary of the routing tax after a day of measurement: it is now
 landed), of which the tantivy fan-out is ~30-40 ms, and **none of the remaining
 cost is specific to tantivy** — it is DataFusion planning proportional to the
 number of files in the scan.
+
+## 2026-08-22: the mutable gate was dead — and removing it changed nothing
+
+`decide_prefilter` gated zero-hit file pruning and row-selection pushdown on
+`mutable.is_some()`, i.e. "does this TABLE have a version-mutable column".
+`otel_logs_and_spans` is `version_append` with a `mutable: true` field, so on
+the busiest table **both optimisations were dead**: every routed query carried
+the whole indexed leg — ~2,880 unpruned files — into a `scan()` costing ~14.5 µs
+per selected file.
+
+`761779d` narrowed that gate to ask whether the ROUTED PREDICATE touches a
+mutable column. Sound, and both links were checked in code rather than argued:
+`extract_dml_info` REFUSES at plan time any UPDATE assigning an undeclared
+column (so immutability is enforced, not assumed, and for exactly this reason),
+and a DELETE appends the FULL row with the tombstone marker set rather than a
+key-only stub (so a tombstone version carries the indexed columns, its file
+registers a hit, and it is never in `zero_hit_files`). Had tombstones been thin
+stubs the correct gate would have been `routed_touches_mutable ||
+table_has_tombstone_column` and this change would have resurrected deleted rows.
+
+**And it did not move the number.** Per-query scan construction on the probe was
+103-130 ms before and 105-131 ms after; fleet-wide files-per-pruned-call went
+3,496 → 3,768 (noise, and that average is dominated by traffic this change does
+not touch). So the gate was genuinely dead, removing it was correct — and
+something UPSTREAM is stopping the pruning from ever being applied.
+
+The most plausible candidate, from the code rather than from measurement:
+`decide_prefilter` bails before it with `field_coverage_gap`, which fires when
+ANY in-window index lacks a queried field and skips the WHOLE pushdown — id-list
+included. `low_selectivity` and `empty_index` do the same. None of those three
+were observable: `record_tantivy_prefilter_used`/`_skipped` have existed in
+`observability.rs` all along but were never surfaced in `timefusion_stats`, so
+"the prefilter ran and pruned nothing" and "the prefilter never ran" have been
+indistinguishable for this entire investigation. Now exposed as
+`prefilter_attempts` / `prefilter_used` / `prefilter_skipped`.
+
+**Fifth refuted theory on the same residual.** Serial CPU, index granularity
+(D2), provider-cache bypass, manifest-write batching, and now the mutable gate —
+each plausible, each cheap to act on, each wrong. The through-line is that every
+one was a mechanism *believed* to be on the hot path, and the counters kept
+showing the hot path was somewhere else entirely.
