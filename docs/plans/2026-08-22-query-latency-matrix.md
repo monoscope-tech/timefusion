@@ -276,29 +276,58 @@ first; if it is 0, the measurement has not started. The compaction chart shows
 the same constraint from the write side — six sealed days frozen because units
 are re-claimed rather than finished.
 
-## A restart costs ~25 minutes of routing, and prod restarts often
+## `rollup_coverage` has no producer — the date-level path is dead code
 
-Not a measurement artifact — a real latency window, and it deserves naming
-because the goal is fast queries and this makes them slow on a schedule.
+This corrects the section that stood here before, which said the date-level map
+was "not persisted" and was repopulated by the maintenance planning pass. It is
+worse and simpler than that.
 
-Date-level `rollup_coverage` is **not persisted**. Only `rollup_slice_coverage`
-survives a restart (the read path says so itself: "after a restart only SLICE
-coverage is recovered, so this lookup misses for every date"). The date-level map
-is repopulated by the maintenance planning pass, which is also what recomputes
-`rollup_min_contiguous_days` — so the gauge reading 0 and the coverage being
-absent are the same event, and both clear only when that pass next runs.
+`rollup_coverage` is a **private field**. Here is every use of it in the crate:
 
-Measured tonight across three restarts: **~25 minutes** from container start to
-`rollup_min_contiguous_days` returning to 30. During that window the miss
-histogram reads `not_built` (43 of 85 misses at 11 minutes in), not
-`stale_coverage` — a different diagnosis for the same underlying "no coverage
-loaded yet".
+```
+src/database/mod.rs:2259      declaration
+src/database/mod.rs:2926      DashMap::new()          <- construction
+src/database/mod.rs:3648      .get(&key)              <- read, in the routing path
+src/database/maintain.rs:2277 .remove(&key)
+src/database/maintain.rs:2333 .retain(...)
+```
 
-With prod restarting roughly hourly on a deploy day, that is a large fraction of
-the time with no date-level routing available at all. Two directions, neither
-attempted here: persist the date-level map the way slice coverage already is, or
-run the coverage recompute once at boot rather than waiting for the next
-scheduled pass. The second is much smaller and probably sufficient.
+Two reads and two removals. **No insert, no `entry`, no `or_insert` — nothing
+ever writes to it.** A private field with no producer cannot be non-empty, so
+`self.rollup_coverage.get(&key)` at the routing site returns `None` for every
+date, forever, on every process.
+
+`maintenance_coordinator.rs:1164` states "`recover_rollup_coverage` is the only
+producer and it runs ONCE at [boot]". That function writes only
+`rollup_slice_coverage` (two inserts, both to the slice map). The comment
+describes behaviour that no longer exists, and `maintain.rs:2572` documents the
+same vanished mechanism — "each stored `(date, generation)` is re-proved against
+the current source partition's generation". Nothing is stored, so nothing is
+re-proved. The insert was almost certainly lost in a refactor.
+
+**Why this matters more than it looks.** It is not a wrong-answer bug — the
+`None` branch deliberately `continue`s without setting a miss, so the query falls
+through to slice coverage and is correct, just unrouted. But it means:
+
+- **Every routed query in production depends solely on slice coverage**, and
+  always has — not merely for 25 minutes after a restart, as the previous version
+  of this section claimed.
+- Slice coverage is precisely the path gated by the per-slice witness rule, which
+  is what returns `stale_coverage` on every bare dashboard shape measured
+  tonight. **The two findings are one finding.** There is no second route to fall
+  back on, because the second route is inert.
+- `rollup_ticket_current` can only ever return `false` for a non-empty
+  `ticket.dates` — consistent, because `ticket.dates` is only pushed inside the
+  branch that the dead `.get` guards, so it is always empty.
+
+**Not fixed here, deliberately.** Restoring the producer means writing coverage
+identity (`source_fp`, `source_epoch`, `generation`, `covered_through`) that the
+read path trusts to decide a rollup may serve a range. Getting it wrong serves
+rows the rollup never aggregated — the silent-wrong-number failure this module's
+own comments warn about twice. That needs a failing test that exercises a commit
+→ read cycle, and a verification loop that costs ~25 minutes per iteration on
+prod. It is the wrong change to make unsupervised overnight. It is, however, the
+single highest-value item on this page.
 
 ## Open, in priority order
 
