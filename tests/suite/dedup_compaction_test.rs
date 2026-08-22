@@ -3165,3 +3165,42 @@ async fn per_date_dedup_skip_matches_the_all_or_nothing_result() -> Result<()> {
     assert_eq!(split, vec!["final".to_string(), "updated".to_string()], "each date must yield its winning version, got {split:?}");
     Ok(())
 }
+
+/// A selective point lookup whose needle is in no file, with the per-date split
+/// enabled: the bloom prefilter removes every file and the scan must return
+/// nothing without erroring.
+///
+/// HONEST SCOPE: this does NOT reproduce the `index out of bounds: the len is 0
+/// but the index is 0` panic that `wrap_result_split` took in prod on
+/// 2026-08-22 — it passes with and without the guard, because it does not
+/// manage to empty exactly one side of the split. It is kept as a behavioural
+/// test of the pruned-to-nothing shape, not as a regression guard for that
+/// panic. The panic itself is now unreachable by construction (`plans[0]` was
+/// removed in favour of `plans.first()` plus an explicit error), which is the
+/// guarantee a test could not give here.
+#[serial]
+#[tokio::test]
+async fn a_pruned_to_nothing_delta_scan_does_not_panic() -> Result<()> {
+    let mut cfg = (*TestConfigBuilder::new("pruned_to_nothing").with_buffer_mode(BufferMode::FlushImmediately).build()).clone();
+    cfg.maintenance.timefusion_file_bloom_pruning = true;
+    cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+    cfg.maintenance.timefusion_read_dedup_skip_per_date = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = chrono::Utc::now().timestamp_micros();
+    let rows: Vec<_> = (0..8).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + i)).collect();
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+    // Blooms are what prune whole files; without the sidecars the scan keeps
+    // every file and the leg is never emptied.
+    db.bloom_sidecar_reconcile().await?;
+
+    let sql = format!(
+        "SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'no-such-id-anywhere' \
+         AND timestamp >= to_timestamp_micros({}) AND timestamp <= to_timestamp_micros({})",
+        ts - 1_000,
+        ts + 1_000,
+    );
+    let found: usize = db.query_delta_only(&sql).await?.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(found, 0, "the needle is in no file — and getting there must not panic");
+    Ok(())
+}

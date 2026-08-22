@@ -9509,7 +9509,7 @@ impl TableProvider for ProjectRoutingTable {
                 let mut merge_req = None;
                 if dedup_on
                     && table_schema.is_some_and(|t| t.version_append)
-                    && let Some(req) = table_schema.and_then(|t| Self::keep_greatest_ordering(t, &plans[0].schema()))
+                    && let Some(req) = plans.first().and_then(|p| table_schema.and_then(|t| Self::keep_greatest_ordering(t, &p.schema())))
                 {
                     // Per-leg sortability: the DELTA leg is NEVER sortable — MOR
                     // UPDATEs make files overlap, and a read-time SortExec over
@@ -9542,7 +9542,16 @@ impl TableProvider for ProjectRoutingTable {
                         }
                     }
                 }
-                let plan = if plans.len() == 1 { plans.remove(0) } else { UnionExec::try_new(plans)? };
+                // `plans` is non-empty on every known path — the guard above takes
+                // the one-sided split, and a scan with no legs at all has not been
+                // observed. Belt-and-braces because the failure mode of being wrong
+                // is a PANICKED QUERY, not a failed one: index no element, and turn
+                // an impossible state into an error a caller can see.
+                let plan = match plans.len() {
+                    0 => return Err(datafusion::error::DataFusionError::Execution(format!("scan produced no legs to union (project_id={project_id})"))),
+                    1 => plans.remove(0),
+                    _ => UnionExec::try_new(plans)?,
+                };
                 let plan = match merge_req.clone() {
                     Some(req) => Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(req, plan)),
                     None => plan,
