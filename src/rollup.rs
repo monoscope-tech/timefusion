@@ -563,10 +563,17 @@ pub(crate) const OPEN_END: i64 = i64::MAX;
 /// worthless: the build's decoded input excludes tombstones and superseded
 /// merge-on-read versions, `num_records` counts them.
 ///
-/// Every slice must agree with every other AND with the present. Per-slice
-/// witnesses are not summed: slices of one day are built at different times
+/// Witnesses are never SUMMED: slices of one day are built at different times
 /// against a churning partition, so each is a snapshot of the whole date, and
 /// summing snapshots would compare a total against one sample.
+///
+/// Callers evaluate one slice at a time. A witness is a statement about the
+/// WHOLE partition ("it held N rows when I built"), so two slices that each
+/// still agree with the present N are both current, independently — and a slice
+/// that cannot be verified drops out alone instead of condemning its whole
+/// date. Condemning the date meant a single un-rebuilt slice kept a fully
+/// rebuilt day on the raw path, which with thousands of slices queued is
+/// indefinite.
 ///
 /// Equality is two-sided on purpose. "Rows only accrue" is false here — dedup
 /// rewrites and vacuum shrink `num_records` too — so a disagreement in either

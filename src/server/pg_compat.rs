@@ -1113,6 +1113,7 @@ impl StatsTableProvider {
         let scan = self.scan_metrics.as_ref().map_or_else(Vec::new, |m| {
             use crate::database::scan_metric_names::*;
             let cv = crate::observability::counter_value;
+            let skip_reason = |r: &str| cv(&format!("{PREFILTER_SKIPPED_REASON_PREFIX}{r}"));
             let (total, skipped) = (cv(SCANS_TOTAL), cv(SCANS_SKIPPED_DELTA));
             let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
             let (dedup_elig, dedup_skipped) = (cv(DEDUP_ELIGIBLE_SCANS), cv(DEDUP_SKIPPED));
@@ -1207,6 +1208,16 @@ impl StatsTableProvider {
                     "prefilter_attempts" => cv(PREFILTER_ATTEMPTS),
                     "prefilter_used" => cv(PREFILTER_USED),
                     "prefilter_skipped" => cv(PREFILTER_SKIPPED),
+                    // ...and WHY. These sum to `prefilter_skipped`; the first
+                    // three are decisions (the index answered, the rule declined
+                    // it), the rest are the index failing to answer at all —
+                    // opposite fixes, indistinguishable in the total alone.
+                    "prefilter_skipped_empty_index" => skip_reason("empty_index"),
+                    "prefilter_skipped_low_selectivity" => skip_reason("low_selectivity"),
+                    "prefilter_skipped_field_coverage_gap" => skip_reason("field_coverage_gap"),
+                    "prefilter_skipped_no_index_or_cap" => skip_reason("delta_no_index_or_cap_exceeded"),
+                    "prefilter_skipped_no_hits_returned" => skip_reason("delta_no_hits_returned"),
+                    "prefilter_skipped_delta_error" => skip_reason("delta_error"),
                     "pruned_calls" => cv(PRUNED_CALLS),
                     "pruned_files_total" => cv(PRUNED_FILES),
                     "pruned_select_us_total" => cv(PRUNED_SELECT_US),

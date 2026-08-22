@@ -216,6 +216,13 @@ pub mod scan_metric_names {
     pub const PREFILTER_ATTEMPTS: &str = "timefusion.scan.prefilter_attempts";
     pub const PREFILTER_USED: &str = "timefusion.scan.prefilter_used";
     pub const PREFILTER_SKIPPED: &str = "timefusion.scan.prefilter_skipped";
+    /// Per-reason breakdown of `PREFILTER_SKIPPED`, suffixed with the reason
+    /// string. FIVE reasons, not three: `decide_prefilter`'s exits
+    /// (`empty_index`, `low_selectivity`, `field_coverage_gap`) plus the two
+    /// search aborts (`delta_no_index_or_cap_exceeded`, `delta_error`), which
+    /// increment the same total from a different call site. Without the split,
+    /// "63% of attempts are skipped" cannot be attributed to a decision at all.
+    pub const PREFILTER_SKIPPED_REASON_PREFIX: &str = "timefusion.scan.prefilter_skipped.";
     /// Indexes built by the reconcile BACKFILL specifically — not by flush,
     /// compaction or the wave reindex, all of which also publish.
     pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
@@ -3645,18 +3652,27 @@ impl Database {
                 by_date.entry(date).or_default().push((entry.key().clone(), coverage.clone()));
             }
             for (date, slices) in by_date {
-                let witnesses = slices.iter().map(|(_, coverage)| coverage.source_rows).collect::<Vec<_>>();
                 let current = fingerprints
                     .get(&(project.clone(), date.clone()))
                     .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
                     .and_then(|stats| u64::try_from(stats.rows).ok());
-                if !crate::rollup::slice_coverage_agrees(&witnesses, current) {
-                    // Reading raw is always the safe direction, so a date that
-                    // cannot be verified simply stays in the fringe.
+                // PER SLICE, not all-or-nothing over the date. A slice with no
+                // witness is not evidence of DISAGREEMENT, it is an absence —
+                // condemning the whole date for it meant one un-rebuilt slice
+                // kept a fully rebuilt day on the raw path, and with thousands of
+                // slices queued that is indefinite. Dropping just the
+                // unverifiable slice sends its range to the raw fringe, which is
+                // the same safe direction at a fraction of the cost.
+                //
+                // Sound because the witness is a statement about the WHOLE
+                // partition ("it held N rows when I built"): two slices that both
+                // still agree with N are both current, independently.
+                let (fresh, stale): (Vec<_>, Vec<_>) =
+                    slices.into_iter().partition(|(_, coverage)| crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current));
+                if !stale.is_empty() {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
-                    continue;
                 }
-                for (key, coverage) in slices {
+                for (key, coverage) in fresh {
                     covered.push((key.3, key.4));
                     generations.push((project.clone(), date.clone(), coverage.generation.clone()));
                     slice_ticket.push((key, coverage.source_fp, coverage.generation.clone()));
@@ -8937,6 +8953,17 @@ fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate
     }
 }
 
+/// Charge one prefilter skip to the total AND to its reason.
+///
+/// The total alone is not attributable: it is incremented from two call sites —
+/// `decide_prefilter`'s three exits and the search-abort branch — so a high skip
+/// rate could be a decision or a missing index, and the fix differs.
+fn record_prefilter_skip(reason: &'static str) {
+    crate::observability::record_tantivy_prefilter_skipped();
+    metrics::counter!(scan_metric_names::PREFILTER_SKIPPED).increment(1);
+    metrics::counter!(format!("{}{reason}", scan_metric_names::PREFILTER_SKIPPED_REASON_PREFIX)).increment(1);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_prefilter(
     ids: HashSet<String>, indexed_rows: u64, min_selectivity_pct: u64, field_gap: bool, covered_files: HashSet<String>, zero_hit_files: HashSet<String>,
@@ -9362,8 +9389,7 @@ impl TableProvider for ProjectRoutingTable {
                     );
                     match decision {
                         PrefilterDecision::Skipped(reason) => {
-                            crate::observability::record_tantivy_prefilter_skipped();
-                            metrics::counter!(scan_metric_names::PREFILTER_SKIPPED).increment(1);
+                            record_prefilter_skip(reason);
                             debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
                         }
                         PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
@@ -9386,11 +9412,9 @@ impl TableProvider for ProjectRoutingTable {
                     }
                 }
             } else {
-                crate::observability::record_tantivy_prefilter_skipped();
-                metrics::counter!(scan_metric_names::PREFILTER_SKIPPED).increment(1);
-                if let Some(reason) = abort_reason {
-                    debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
-                }
+                let reason = abort_reason.unwrap_or("delta_no_hits_returned");
+                record_prefilter_skip(reason);
+                debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
             }
         }
 
