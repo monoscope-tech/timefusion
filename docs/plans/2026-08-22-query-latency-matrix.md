@@ -329,6 +329,65 @@ own comments warn about twice. That needs a failing test that exercises a commit
 prod. It is the wrong change to make unsupervised overnight. It is, however, the
 single highest-value item on this page.
 
+## The stale_coverage split, measured: 95% is unverifiable, not moved
+
+Captured 17:52 UTC on `ba87ed3` with `rollup_min_contiguous_days = 30`, after
+three bare dashboard shapes:
+
+```
+rollup_stale_no_witness      = 1567   (95.2%)
+rollup_stale_moved           =   78    (4.7%)
+rollup_stale_no_source_rows  =    0
+rollup_hits_full_total       =    0
+```
+
+**It is a throughput wall, not a correctness wall.** The slices exist and cover
+the days. They are refused because they were written before `TAG_SOURCE_ROWS` and
+so cannot be verified — `slice_coverage_agrees` refuses a `None` witness by
+design. Only 4.7% are partitions that genuinely moved, which is the irreducible
+share under live ingest.
+
+Combined with the dead date-level map above, the whole picture closes:
+
+1. Date-level coverage would not be subject to the witness rule at all — but it
+   has no producer, so it never contributes.
+2. Every query therefore depends on slice coverage.
+3. 95% of slice coverage is unverifiable and refused.
+4. It clears only when the coordinator republishes those slices, which needs the
+   same starved maintenance capacity that has left six compaction days frozen
+   bit-identical for 58 hours.
+
+**Rollup routing and frozen compaction are the same problem.** Both are units
+that need to run and do not.
+
+### Two ways out, and the choice is a real one
+
+**(a) Republish throughput.** Correct by construction — a republished slice
+carries a witness and verifies normally. But 1,567 slices against a maintenance
+pipeline whose units are re-claimed rather than finished (30 of 31 sealed starts
+already on `attempts > 3`) is exactly the convergence problem the compaction
+chart documents. This is wall-clock physics; it cannot be compressed.
+
+**(b) Fall back to `source_fp` for witness-less slices.** Slice coverage already
+carries `source_fp`, and the date-level path verifies with precisely that field.
+A witness-less slice whose fingerprint still matches the live partition could be
+trusted without a republish, unlocking most of the 1,567 immediately.
+
+The catch, and it is why this is not obviously right: **a fingerprint changes
+whenever the partition's file set is rewritten, and `num_records` does not.**
+That is very likely why the witness was chosen over the fingerprint in the first
+place — row count survives compaction, fingerprints do not. So (b) is *safe*
+(a mismatch only ever causes a miss, never a wrong answer) but *pessimistic*, and
+on a table that compacts normally it would go stale again immediately. On this
+table, where sealed partitions are frozen, it would hold.
+
+Recommendation: (b) as a fallback beneath the witness — never replacing it —
+gated behind a kill switch, measured against `rollup_stale_no_witness` dropping
+and `rollup_hits_*` rising. It is a read-path change with a silent-wrong-number
+failure mode if the fingerprint comparison is not exactly the one the date-level
+path makes, so it wants a waking pair of eyes and a staging run, not an overnight
+push.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
