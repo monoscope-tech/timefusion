@@ -200,8 +200,66 @@ The file-level split has no such argument — merge-on-read versions of one row
 can and do land in different files, so a key CAN span the split, and a naive
 union would return both versions. Establishing a correct rule here (e.g. only
 files whose dedup-key ranges provably do not overlap the uncertified set) is
-the design work. **Do not implement before that rule is written down and
-tested.**
+the design work.
+
+### The rule, now established and tested (`read/mod.rs::skippable_certified_files`)
+
+> **A certified file may skip `DedupExec` iff no UNCERTIFIED file's timestamp
+> span overlaps its own.**
+
+*Proof.* The dedup key is `(timestamp, id)` (`schemas/otel_logs_and_spans.yaml`)
+and merge-on-read re-appends preserve the original row's `timestamp` — the same
+fact the per-date skip rests on, one level finer. So every version and tombstone
+of a row carries that row's timestamp. A duplicate of a row in a certified file
+therefore has a timestamp inside that file's span, and any file holding it has a
+span containing that timestamp, i.e. overlapping. Excluding overlap with the
+uncertified files excludes every duplicate that could be split across the two
+legs. Duplicates *within* the certified set are excluded by construction — the
+sweep proved that set clean together. ∎
+
+**Per file, not per set.** Judging the certified set by its union span would let
+one new file sitting among the certified ones refuse every certified file behind
+it — which is exactly the churning-partition case this work exists to unblock.
+The case table pins this: `old(10,20) mid(45,55) new(80,90)` against an
+uncertified `(50,60)` keeps `old` and `new` and holds back only `mid`.
+
+**Fails closed** on: a missing-statistics span on either side (an unknown span
+overlaps everything — the direction `PartitionStats::overlaps` already takes);
+an empty certified set (absence of evidence must never read as proved clean);
+and inclusive-bound touching, because Delta min/max statistics are inclusive.
+
+**Caller obligations the function cannot check**, and which the wiring must
+honour: the scan must be Delta-only (a MemBuffer leg can hold an uncertified
+newer version with no file span to compare), and `certified` must be the
+sweep-proved set intersected with the LIVE file list, so a file compacted away
+cannot vouch for its replacement.
+
+### What remains, and why it is not in this deploy
+
+Two pieces:
+
+1. **Durable record of the clean FILE SET.** Certification stores a whole-
+   partition hash (`partition_file_fp`) today; it must store the paths it proved.
+   Sizing: ~200 files × 97 live certifications × ~100 B ≈ 2 MB against a 15 KB
+   sidecar today, which is acceptable now and does not scale to 1,000 projects —
+   so the alternative worth pricing first is a per-file Delta Add TAG, which
+   makes "certified" readable straight off the live file list, needs no sidecar
+   and is inherently additive. The blocker there is that Delta tags are set at
+   commit, so tagging already-written files needs a metadata-only remove+add.
+2. **Splitting the Delta leg by file set.** The plumbing already exists:
+   `scan_delta_with_tantivy` takes file-path sets (`tantivy_covered_files`,
+   `tantivy_exclude`), and the per-date skip already returns a second plan the
+   caller unions ABOVE `DedupExec` (`mod.rs:8085-8105`). The file-level version
+   is the same shape with a file set in place of a date set.
+
+Neither is shipped here. The failure mode of getting the wiring wrong is a
+silent over-count on every dashboard tile, it cannot be validated on prod inside
+one session, and the rule above is the part that had to be settled first. When
+it is wired, ship it behind a default-off env switch and compare
+`count(*)` with the switch on and off over a churning partition before making it
+the default — the same discipline
+`dedup_compaction_test::count_is_identical_with_and_without_the_dedup_skip`
+already applies to the partition-level skip.
 
 *Candidate rule to evaluate (not yet a verdict).* The dedup key is
 `[timestamp, id]`, and per-file timestamp min/max already exists in add-action
