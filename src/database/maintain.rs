@@ -2674,6 +2674,9 @@ impl Database {
         for spec in &schema.rollups {
             let target = spec.table_name(source);
             let (mut untagged_spans, mut tagged_spans): (SpansByPartition, SpansByPartition) = Default::default();
+            // Counted separately from `untagged_spans`, which drops a file with
+            // no statistics — the gauge must count FILES, including those.
+            let mut untagged_files = 0u64;
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
@@ -2705,10 +2708,13 @@ impl Database {
                             let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
                             match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
                                 (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
-                                _ => untagged_spans
-                                    .entry(partition)
-                                    .or_default()
-                                    .extend(action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1)))),
+                                _ => {
+                                    untagged_files = untagged_files.saturating_add(1);
+                                    untagged_spans
+                                        .entry(partition)
+                                        .or_default()
+                                        .extend(action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1))));
+                                }
                             }
                         }
                         let Some(tags) = action.tags.as_ref() else { continue };
@@ -2741,6 +2747,16 @@ impl Database {
             };
             // Before any `continue` below, so a partition still holding
             // untagged files is queued whatever the coverage verdict is.
+            // The gauge, from the WHOLE tier, hourly. Setting it only on publish
+            // meant it read 0 both when a tier was clean and when nothing had
+            // published yet — which on 2026-08-22 read as "converged" over 85
+            // live untagged files for the first 40 minutes of every boot. A
+            // reading that cannot distinguish "none" from "unmeasured" is not a
+            // measurement.
+            self.rollup_tier_untagged.insert(target.clone(), untagged_files);
+            crate::observability::maintenance_stats()
+                .rollup_tier_untagged_found
+                .store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), std::sync::atomic::Ordering::Relaxed);
             let untagged_partitions: UntaggedPartitions = untagged_spans
                 .drain()
                 .map(|(partition, untagged)| {
