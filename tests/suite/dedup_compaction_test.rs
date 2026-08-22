@@ -1608,6 +1608,35 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
     Ok(())
 }
 
+/// The hot-tail skip, end to end: with the default ON, a reconcile whose only
+/// uncovered files are in TODAY's partition builds nothing — while the census
+/// still counts them, so the today/week/older breakdown stays honest.
+///
+/// The unit case table pins the RULE; this pins the WIRING, which is the half
+/// that can silently regress (a flag read in the wrong place looks identical to
+/// a flag that works). It matters because this default ships ON: today's files
+/// are covered at birth by the flush callback and the two inline-reindex paths,
+/// so what is deferred is re-indexing churn, not first coverage.
+#[serial]
+#[tokio::test]
+async fn tantivy_backfill_skips_todays_partition_but_the_census_still_counts_it() -> Result<()> {
+    use timefusion::tantivy::search::TantivyIndexService;
+    const TABLE: &str = "otel_logs_and_spans";
+    let cfg = TestConfigBuilder::new("tantivy_skip_today").with_buffer_mode(BufferMode::Enabled).build();
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let svc = Arc::new(TantivyIndexService::new(store, Arc::new(cfg.tantivy.clone())));
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
+    db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("hot", "n", &project_id, ts)])?], true, None).await?;
+
+    let (uncovered, _, _) = db.tantivy_coverage_census().await?;
+    assert!(uncovered >= 1, "the census must still SEE today's uncovered files, got {uncovered}");
+    let (built, _, _) = db.tantivy_reconcile_table(TABLE).await?;
+    assert_eq!(built, 0, "today's partition is churn — the backfill must not spend the pass on it, built={built}");
+    Ok(())
+}
+
 /// Regression (2026-08-02): the optimize CLI built its `Database` without a
 /// tantivy service, so `tantivy_indexer()` was `None` and every off-box
 /// compaction silently skipped both the output reindex and the input GC —
@@ -1620,7 +1649,20 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
 async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     use timefusion::tantivy::{load_manifest, search::TantivyIndexService};
     const TABLE: &str = "otel_logs_and_spans";
-    let cfg = TestConfigBuilder::new("tantivy_reconcile").with_buffer_mode(BufferMode::Enabled).build();
+    // The rows below land in TODAY's partition, which the backfill skips by
+    // default (`timefusion_tantivy_backfill_skip_today`) because today is churn.
+    // This test is about the CLI repair path's backfill+GC mechanics, so it opts
+    // out — and asserts the default's effect first, so the opt-out cannot hide a
+    // regression in either direction.
+    let cfg = {
+        let mut cfg = (*TestConfigBuilder::new("tantivy_reconcile").with_buffer_mode(BufferMode::Enabled).build()).clone();
+        assert!(
+            cfg.tantivy.timefusion_tantivy_backfill_skip_today,
+            "the hot-tail skip must be ON by default — this test's opt-out is what makes it meaningful"
+        );
+        cfg.tantivy.timefusion_tantivy_backfill_skip_today = false;
+        Arc::new(cfg)
+    };
     let tantivy_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let svc = Arc::new(TantivyIndexService::new(tantivy_store.clone(), Arc::new(cfg.tantivy.clone())));
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));

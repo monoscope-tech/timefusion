@@ -842,6 +842,29 @@ pub struct TantivyConfig {
     /// 0 restores pure newest-first.
     #[serde_inline_default(33)]
     pub timefusion_tantivy_backfill_tail_share_pct: u8,
+    /// Skip TODAY's date partition in the backfill queue.
+    ///
+    /// Indexing today's files per-file is work with a half-life of hours: the
+    /// hot partition is rewritten continuously by flush and hot-tail
+    /// compaction, so an index built for one of its files is usually GC'd
+    /// before it is ever consulted. Measured 2026-08-22, `today` was the ONLY
+    /// growing class (586 -> 984 across the day) while `week`/`older` sat
+    /// frozen at ~1720/3453 — so a newest-first queue spends the whole pass on
+    /// files that will not survive, and the 5,171-file backlog never moves.
+    ///
+    /// Safe because today is already covered at birth by the paths that own it:
+    /// the flush callback publishes an index for the files each commit adds,
+    /// and both rewrite paths reindex their own output inline
+    /// (`compact.rs` post-optimize, `maintain.rs` `reindex_wave_outputs`). What
+    /// this skips is the RE-indexing of churn, not first coverage. A file that
+    /// slips through is covered tomorrow, when its partition is sealed and the
+    /// work lasts.
+    ///
+    /// Counted and logged as `skipped_today`, never silent, and the coverage
+    /// census still counts today so the today/week/older breakdown stays
+    /// legible. Set false to restore whole-corpus backfill.
+    #[serde_inline_default(true)]
+    pub timefusion_tantivy_backfill_skip_today: bool,
     /// Row-selection pushdown: when the prefilter engages, files whose index
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
     /// reader decodes only matching rows. Off switch for instant rollback to
@@ -1831,11 +1854,21 @@ pub struct MaintenanceConfig {
     /// restarts every few hours for deploys and OOM kills, so a process that
     /// never lived through 03:30 never reconciled AT ALL — which is how prod
     /// reached 5,506 uncovered files with a drain that looked implemented.
-    /// Safe to run hourly only because each pass is now bounded by
+    /// Safe to run often only because each pass is now bounded by
     /// `timefusion_tantivy_backfill_max_files_per_pass`; before that bound a
     /// pass attempted every uncovered file at once, which is what forced the
     /// nightly cadence in the first place.
-    #[serde_inline_default("0 20 * * * *".to_string())]
+    ///
+    /// Every 15 minutes, was `0 20 * * * *` (hourly, at minute 20). The hourly
+    /// form fires at ONE INSTANT per hour, and prod restarts more often than
+    /// that: measured 2026-08-22, **zero** `tantivy_backfill_started` in six
+    /// hours of logs, because no container lived through a `:20` boundary. The
+    /// drain was not slow, it was never running — every other coverage finding
+    /// that day (ordering, cap, tail reservation) sat downstream of this.
+    /// Four chances an hour means a container need only survive 15 minutes to
+    /// start draining. Overlapping ticks are already handled: the job logs
+    /// "run still in progress" and drops the tick rather than piling up.
+    #[serde_inline_default("0 */15 * * * *".to_string())]
     pub timefusion_tantivy_reconcile_schedule: String,
     /// File-level needle pruning: consult per-file bloom sidecars at
     /// file-selection time so point lookups (trace_id/id/span_id…) scan only
@@ -2455,6 +2488,18 @@ mod tests {
         // not deadlocked: zero concurrency would stall the per-index fan-out.
         assert_eq!(derived.search_concurrency(), 1);
         assert_eq!(derived.reader_cache_entries().get(), 1);
+    }
+
+    /// The tantivy drain's schedule is a correctness-adjacent default, not a
+    /// tuning knob: at `0 20 * * * *` it fires at ONE instant per hour, and a
+    /// box that restarts more often than hourly never reaches it. Measured
+    /// 2026-08-22 — zero `tantivy_backfill_started` across six hours of prod
+    /// logs, with every coverage finding that day sitting downstream of a drain
+    /// that never ran.
+    #[test]
+    fn the_tantivy_drain_gets_more_than_one_chance_an_hour() {
+        let cfg: MaintenanceConfig = serde_json::from_str("{}").expect("every field has a default");
+        assert_eq!(cfg.timefusion_tantivy_reconcile_schedule, "0 */15 * * * *");
     }
 
     /// Builds follow the global switch and NOTHING else. The read side keeps

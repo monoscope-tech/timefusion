@@ -2437,6 +2437,20 @@ pub struct Database {
     repair_pass_permit: Arc<tokio::sync::Semaphore>,
 }
 
+/// Drop the hot (today) partition from a backfill queue, returning how many
+/// URIs were removed. `marker` is `None` when the skip is disabled, which keeps
+/// the caller free of a second branch.
+///
+/// Separate from the queue build so the rule is testable without an object
+/// store: what matters is that TODAY goes and every other date stays, including
+/// dates that merely share a prefix with it.
+fn drop_hot_partition(uris: &mut Vec<String>, marker: Option<&str>) -> u64 {
+    let Some(marker) = marker else { return 0 };
+    let before = uris.len();
+    uris.retain(|uri| !uri.contains(marker));
+    (before - uris.len()) as u64
+}
+
 fn sort_backfill_uris_newest_first(uris: &mut [String]) {
     // Partition paths contain `date=YYYY-MM-DD`, so reverse lexical order is
     // chronological newest-first.
@@ -3435,11 +3449,22 @@ impl Database {
             };
             let (by_pid, _sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
             let mut queues = Vec::with_capacity(by_pid.len());
+            // Today's partition is churn: rewritten continuously by flush and
+            // hot-tail compaction, and already covered at birth by the flush
+            // callback and the two inline-reindex paths. Indexing it per-file
+            // spends the pass on work with a half-life of hours while the
+            // sealed backlog never moves. Counted, never silent.
+            let skip_today = self.config.tantivy.timefusion_tantivy_backfill_skip_today.then(|| format!("date={}", chrono::Utc::now().date_naive()));
+            let mut skipped_today = 0u64;
             for (pid, mut uris) in by_pid {
                 // Dashboard acceptance is governed by recent windows; a
                 // terabyte of legacy history must not stand in front of the
                 // last seven days after a migration.
+                // Counted BEFORE the hot-tail skip: the gauge must keep
+                // reporting the true uncovered total, or skipping today would
+                // look like progress.
                 uncovered_total = uncovered_total.saturating_add(uris.len() as u64);
+                skipped_today = skipped_today.saturating_add(drop_hot_partition(&mut uris, skip_today.as_deref()));
                 sort_backfill_uris_newest_first(&mut uris);
                 let queue = uris.into_iter().filter_map(|uri| Some((parquet_rel_of_uri(&uri)?.to_string(), uri))).collect::<VecDeque<_>>();
                 queues.push((pid, queue));
@@ -3459,7 +3484,7 @@ impl Database {
             // (Equivalent to the unmerged fix/tantivy-reconcile-progress-logging;
             // rewritten here because that branch predates the bounded pass.)
             let planned = work.len();
-            info!(table_name, root = %root, planned, cap, event = "tantivy_backfill_started");
+            info!(table_name, root = %root, planned, cap, skipped_today, event = "tantivy_backfill_started");
             let mut done = 0usize;
             // Manifest writes are batched per project: each is a full
             // read-modify-write of that project's manifest (745 KB / 950 entries
@@ -4358,7 +4383,7 @@ impl Database {
             }
         });
 
-        // Tantivy reconcile — nightly index consistency: backfill every live
+        // Tantivy reconcile — index consistency, every 15 min: backfill every live
         // parquet no manifest covers (wave commits carry no index hook; failed
         // builds; emergency-CLI compactions), then GC entries for dead files
         // across every per-uuid manifest. Gated at tick time: the indexer is
@@ -11998,11 +12023,27 @@ mod tests {
         assert!(uris[3].contains("date=2024-01-01"));
     }
 
+    /// The hot-tail skip: today's partition leaves the backfill queue, every
+    /// other date stays. Today is churn — rewritten by flush and hot-tail
+    /// compaction within hours, and already covered at birth by the flush
+    /// callback and the two inline-reindex paths — so indexing it per-file
+    /// spends the pass on work that does not survive while the sealed backlog
+    /// never moves (measured 2026-08-22: `today` the only growing class).
+    #[test_case::test_case(None => (3, 0) ; "disabled keeps the whole queue")]
+    #[test_case::test_case(Some("date=2026-08-22") => (2, 1) ; "today is dropped")]
+    #[test_case::test_case(Some("date=2026-08-2") => (0, 3) ; "a prefix marker is the caller's error, not silently ignored")]
+    #[test_case::test_case(Some("date=2026-01-01") => (3, 0) ; "a date with no files drops nothing")]
+    fn tantivy_backfill_drops_the_hot_partition(marker: Option<&str>) -> (usize, u64) {
+        let mut uris = ["date=2026-08-22/a.parquet", "date=2026-08-21/b.parquet", "date=2026-08-20/c.parquet"].map(String::from).to_vec();
+        let dropped = super::drop_hot_partition(&mut uris, marker);
+        (uris.len(), dropped)
+    }
+
     /// The tail must be REACHABLE, which pure newest-first plus a cap makes
     /// impossible: prod held `week`/`older` frozen at 1723/3459 across three
     /// census samples while `today` climbed, because today's 624 uncovered files
-    /// exceeded the 150-file cap on their own. Here the hot partition is 10 files
-    /// against a cap of 4 — newest-first alone can never emit the old one.
+    /// exceeded the 150-file cap on their own. Here the hot partition is 30 files
+    /// against a cap of 12 — newest-first alone can never emit the old one.
     #[test]
     fn tantivy_backfill_reserves_a_share_of_the_pass_for_the_oldest() {
         let hot = (0..30).map(|i| (format!("rel/2026-08-22-{i:02}"), format!("uri/2026-08-22-{i:02}")));
