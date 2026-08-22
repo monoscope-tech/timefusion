@@ -2760,7 +2760,10 @@ impl Database {
                 // of restarting at this boot. A clock that moved backwards (or an
                 // entry from the future) falls back to "granted now".
                 let since = crate::storage::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
-                dedup_clean_fp.insert((entry.project_id, entry.table_name, entry.date), Certification { fp: entry.fp, since, files: Arc::from(entry.files), stale: false });
+                dedup_clean_fp.insert(
+                    (entry.project_id, entry.table_name, entry.date),
+                    Certification { fp: entry.fp, since, files: Arc::from(entry.files), stale: false },
+                );
             }
             info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
         }
@@ -7908,8 +7911,7 @@ impl ProjectRoutingTable {
         // `date_restrict`, one level finer. A URI that yields no relative path
         // cannot be attributed to either side, so it fails this test and lands
         // on the uncertified (still-deduped) side — the safe default.
-        let in_files =
-            |uri: &String| file_restrict.is_none_or(|files| crate::tantivy::search::parquet_rel_of_uri(uri).is_some_and(|rel| files.contains(rel)));
+        let in_files = |uri: &String| file_restrict.is_none_or(|files| crate::tantivy::search::parquet_rel_of_uri(uri).is_some_and(|rel| files.contains(rel)));
         let in_leg = |uri: &String| in_dates(uri) && in_files(uri);
         // Bloom-rejected rels apply to EVERY branch here — unlike
         // `zero_hit_files` they must reach the raw (uncovered) leg, which is
@@ -8154,8 +8156,7 @@ impl ProjectRoutingTable {
             }
         };
         if !certified_plans.is_empty() {
-            let metric =
-                if certified_files.is_empty() { scan_metric_names::DEDUP_SKIPPED_PER_DATE } else { scan_metric_names::DEDUP_SKIPPED_PER_FILE };
+            let metric = if certified_files.is_empty() { scan_metric_names::DEDUP_SKIPPED_PER_DATE } else { scan_metric_names::DEDUP_SKIPPED_PER_FILE };
             metrics::counter!(metric).increment(1);
         }
         Ok((skip_dedup, plans, certified_plans))

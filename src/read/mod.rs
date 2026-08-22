@@ -205,9 +205,7 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     }
     certified
         .into_iter()
-        .filter(|(_, span)| {
-            span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi))
-        })
+        .filter(|(_, span)| span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi)))
         .map(|(path, _)| path)
         .collect()
 }

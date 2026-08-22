@@ -2795,8 +2795,9 @@ impl Database {
             // skip ask "which of these files are still live" after the partition
             // has gained one.
             let files: Arc<[String]> = Arc::from(post.clone());
-            if let Some(prev) =
-                self.dedup_clean_fp.insert(key, Certification { fp: fp_post, since: prior.as_ref().map_or_else(std::time::Instant::now, |p| p.since), files, stale: false })
+            if let Some(prev) = self
+                .dedup_clean_fp
+                .insert(key, Certification { fp: fp_post, since: prior.as_ref().map_or_else(std::time::Instant::now, |p| p.since), files, stale: false })
                 && prev.fp != fp_post
             {
                 self.scan_metrics.record_cert_dwell(prev.since);
