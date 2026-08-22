@@ -118,8 +118,46 @@ the second half of the ask: `warm_recent` currently warms every blob within
 for every project is a few hundred objects, and `reader_cache_entries = 2048`
 comfortably holds all of it.
 
+## Step 0 — carry the index forward across a compaction (cheapest converging change)
+
+Before building anything per-day, there is a change that gets the convergence
+property with no new index format at all, and it falls out of the same
+observation: a compaction output holds exactly the rows of its inputs, under
+the same ids.
+
+**So don't re-index it — extend the existing entries to cover it.** When a
+compaction rewrites A+B+C into D, add D to `covered_files` of the entries that
+covered A, B and C. D is then covered, the census stops counting it, and the
+backfill never reads it back.
+
+The read path needs no change, because every case is already handled:
+
+- `ordinals_valid` is `e.ordinals_valid && covered_files.len() == 1`
+  (`search.rs:218`), so a multi-covered entry stops claiming row ordinals by
+  itself.
+- Double coverage is already resolved conservatively:
+  `zero_hit_files.retain(|f| !unprunable_files.contains(f))` (`search.rs:318`),
+  so D is pruned only when EVERY entry covering it saw zero hits — which is
+  exactly the right rule, since D's rows are the union of those entries' rows.
+
+**The one guard that matters:** every input file must already be covered. If
+any of A, B, C had no index, D holds rows no index has seen and marking it
+covered would cause a false negative — the one failure mode that is not
+tolerable. So: extend only when the whole input set is covered, otherwise leave
+D uncovered and let the backfill build it as today.
+
+Cost: a manifest read-modify-write per compaction commit, no S3 read-back, no
+index build. Compare against ~160 files/hr of read-back-and-rebuild today.
+
+The trade-off, and why per-day still follows: entries accumulate
+`covered_files` and get coarser over time — pruning gets weaker with each
+generation of compaction, and nothing shrinks the number of index blobs or the
+read-side fan-out. Step 0 stops the divergence; the per-day design below is
+what makes the steady state good.
+
 ## Sequencing
 
+0. **Carry-forward on compaction** (above) — converges without a new format.
 1. **Raise `build_concurrency`** (`TIMEFUSION_TANTIVY_BUILD_CONCURRENCY`) to
    buy headroom over the ~160/hr while the rest is built. Sized honestly: 4
    gives ~200/hr, a ~40/hr surplus and a **~140h** drain of the 5,700 backlog;
