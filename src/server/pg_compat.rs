@@ -1204,9 +1204,9 @@ impl StatsTableProvider {
                     // missing a queried field skips the WHOLE pushdown). These
                     // three separate "never tried" / "tried and used" / "tried
                     // and skipped" so that question stops being a guess.
-                    "prefilter_attempts" => crate::observability::counter_value("timefusion.tantivy.prefilter_attempts"),
-                    "prefilter_used" => crate::observability::counter_value("timefusion.tantivy.prefilter_used"),
-                    "prefilter_skipped" => crate::observability::counter_value("timefusion.tantivy.prefilter_skipped"),
+                    "prefilter_attempts" => cv(PREFILTER_ATTEMPTS),
+                    "prefilter_used" => cv(PREFILTER_USED),
+                    "prefilter_skipped" => cv(PREFILTER_SKIPPED),
                     "pruned_calls" => cv(PRUNED_CALLS),
                     "pruned_files_total" => cv(PRUNED_FILES),
                     "pruned_select_us_total" => cv(PRUNED_SELECT_US),

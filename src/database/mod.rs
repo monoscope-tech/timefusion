@@ -208,6 +208,14 @@ pub mod scan_metric_names {
     pub const TANTIVY_SPLIT_DATE: &str = "timefusion.scan.tantivy_split_date";
     pub const TANTIVY_LIVE_FILES: &str = "timefusion.scan.tantivy_live_files";
     pub const TANTIVY_RAW_FILES: &str = "timefusion.scan.tantivy_raw_files";
+    // Mirrors of the OTel-only prefilter recorders. `recorders!` adds to an OTel
+    // meter, which `counter_value` (LOCAL_REGISTRY, fed by `metrics::counter!`)
+    // cannot see — so reading them through timefusion_stats returned 0 for
+    // everything and made "the prefilter never ran" look measured. Emit on the
+    // same path as every other row here instead.
+    pub const PREFILTER_ATTEMPTS: &str = "timefusion.scan.prefilter_attempts";
+    pub const PREFILTER_USED: &str = "timefusion.scan.prefilter_used";
+    pub const PREFILTER_SKIPPED: &str = "timefusion.scan.prefilter_skipped";
     /// Indexes built by the reconcile BACKFILL specifically — not by flush,
     /// compaction or the wave reindex, all of which also publish.
     pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
@@ -9286,6 +9294,7 @@ impl TableProvider for ProjectRoutingTable {
             let max_hits = tcfg.prefilter_max_hits();
             let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
             crate::observability::record_tantivy_prefilter_attempt();
+            metrics::counter!(scan_metric_names::PREFILTER_ATTEMPTS).increment(1);
 
             let mut delta_ids: Option<HashSet<String>> = None;
             let mut delta_indexed_rows: u64 = 0;
@@ -9353,10 +9362,12 @@ impl TableProvider for ProjectRoutingTable {
                     match decision {
                         PrefilterDecision::Skipped(reason) => {
                             crate::observability::record_tantivy_prefilter_skipped();
+                            metrics::counter!(scan_metric_names::PREFILTER_SKIPPED).increment(1);
                             debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
                         }
                         PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
                             crate::observability::record_tantivy_prefilter_used();
+                            metrics::counter!(scan_metric_names::PREFILTER_USED).increment(1);
                             tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
                                 expr: Box::new(datafusion::logical_expr::col("id")),
                                 list: ids.into_iter().map(lit).collect(),
@@ -9375,6 +9386,7 @@ impl TableProvider for ProjectRoutingTable {
                 }
             } else {
                 crate::observability::record_tantivy_prefilter_skipped();
+                metrics::counter!(scan_metric_names::PREFILTER_SKIPPED).increment(1);
                 if let Some(reason) = abort_reason {
                     debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
                 }
