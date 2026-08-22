@@ -186,6 +186,26 @@ sampling needles. Other shapes unaffected.
 - Verify on prod with the A-shape EA (a REAL ≤100-row trace): expect
   file_groups ~2-6 at 24h, sub-second wall at every window.
 
+## DEPLOYED 2026-08-22 (576e1c3) — verification results
+
+All four steps below PASSED on the live deploy:
+
+1. No crashloop; the only ERROR lines were the old replica's normal
+   drain-for-deployment messages during handoff.
+2. First cron pass: `bloom sidecar reconcile: built=512 errors=0` within
+   ~5 min of boot; second pass +512 (backlog converges over hours,
+   newest-first so the hot window is covered first).
+3. A-shape EA (real 12-row trace, dcad860a, 24h): delta leg selected
+   **24 files (was 284)**, 12/12 rows correct, wall 1.6-2.2s (execution
+   ~100ms; residual is the known ~1-1.5s planning floor). Live traffic
+   within minutes of boot: `queries_pruned=483, files_rejected=5186,
+   resident_bytes=130MB` — the feature fires fleet-wide, unprompted.
+4. Fat needle (P5's 4.5M-row trace 0025a61a…): planning **4.1-6.0s
+   (never warmed) → 1.0-1.5s**, 3 reps.
+
+Remaining ceiling for point lookups is now the non-tantivy planning
+residual (P2b of the point-lookup doc), not file selection.
+
 ## Post-deploy verification (in order)
 
 1. Watch service logs ~10 min for crashloop. If it restarts, check kern.log
