@@ -186,6 +186,30 @@ sampling needles. Other shapes unaffected.
 - Verify on prod with the A-shape EA (a REAL ≤100-row trace): expect
   file_groups ~2-6 at 24h, sub-second wall at every window.
 
+## Post-deploy verification (in order)
+
+1. Watch service logs ~10 min for crashloop. If it restarts, check kern.log
+   for the anon-125GB memcg signature BEFORE reverting anything (08-20
+   lesson: that OOM is pre-existing and deploy-independent).
+2. Confirm the first cron pass logged `bloom sidecar reconcile: built=N`
+   (≤5 min after boot). Full backlog at 512 files/pass is hours, but
+   newest-first covers the 24h window almost immediately.
+3. A-shape EA **twice** with a real ≤100-row trace: the first query spawns
+   registry loads and prunes nothing; the second is the measurement.
+   Expect `bloom_prune.files_rejected` > 0 and file_groups ~2-6 at 24h.
+4. Fat-needle fix separately: EXPLAIN on P5's degenerate trace (92.6% of
+   rows) should plan sub-second; `tantivy.hits_materialized` stays O(2k).
+   This deploy carries TWO levers (bloom pruning + prefilter cap 100k→2k)
+   with independent kill switches (`TIMEFUSION_FILE_BLOOM_PRUNING`,
+   `TIMEFUSION_TANTIVY_PREFILTER_MAX_HITS`) — attribute per-lever via the
+   counters before crediting either.
+
+Known fast-follow (recorded so it isn't rediscovered as a GET storm):
+`bloom_sidecar_reconcile` GETs every (project,date) sidecar per pass,
+including converged cells — thousands of GETs per 5-min pass on the
+unified table. Fix: in-memory per-cell file-count fingerprint to skip
+unchanged cells, or bound the walk to ~45 days.
+
 ## Companion small items in this branch
 
 - `journal.retry()` now logs `key/reason/attempts/not_before` at debug —

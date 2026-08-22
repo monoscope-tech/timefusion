@@ -123,3 +123,60 @@ async fn bloom_pruning_excludes_files_and_empty_needle_scans_zero_files() -> Res
     assert!(reg.stats.files_rejected.load(Relaxed) >= before2 + 2, "an all-rejected needle must reject every in-window file");
     Ok(())
 }
+
+/// The SPLIT path — the branch prod runs on nearly every point lookup: tantivy
+/// covers SOME files (equality routing engages the prefilter, `covered_files`
+/// is Some) while others are raw debt. Bloom rejection must reach BOTH legs
+/// without dropping rows, and the all-rejected case must take the
+/// empty-include arm, not the unrestricted fallback.
+#[tokio::test]
+async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use timefusion::tantivy::search::{TantivyIndexService, TantivySearchService};
+
+    let cfg = TestConfigBuilder::new("bloom_split").with_buffer_mode(BufferMode::Enabled).build();
+    let reg = Arc::new(BloomPruneRegistry::new(Arc::new(InMemory::new()), 64 << 20, Duration::from_secs(300)));
+    let db = Database::with_config(Arc::clone(&cfg)).await?;
+    let storage_uri = format!("s3://{}/{}/tantivy", cfg.aws.aws_s3_bucket.clone().unwrap(), cfg.core.timefusion_table_prefix);
+    let tstore = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+    let tcfg = Arc::new(cfg.tantivy.clone());
+    let svc = Arc::new(TantivyIndexService::new(tstore.clone(), tcfg.clone()));
+    let search = Arc::new(TantivySearchService::new(tstore, cfg.core.timefusion_data_dir.clone(), tcfg));
+    let db = Arc::new(db.with_tantivy_search(search.clone()).with_tantivy_indexer(svc.clone()).with_bloom_prune(reg));
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+
+    // File 1: tantivy-COVERED (manifest published via the indexer callback,
+    // exactly what the flush hook does). File 2: raw debt, never indexed.
+    let b1 = json_to_batch(vec![row("a1", &project_id, ts, "trace-covered")])?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b1.clone()], true, None).await?;
+    let file1: Vec<String> = db.list_file_uris(&project_id, "otel_logs_and_spans").await?;
+    svc.clone().callback()(project_id.clone(), "otel_logs_and_spans".into(), vec![b1], file1.clone()).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![row("b1", &project_id, ts, "trace-raw")])?], true, None).await?;
+    let all: Vec<String> = db.list_file_uris(&project_id, "otel_logs_and_spans").await?;
+    assert!(all.len() > file1.len(), "second insert must add an uncovered file");
+    db.bloom_sidecar_reconcile().await?;
+
+    let stats = &db.bloom_prune().unwrap().stats;
+    // Needle only in the RAW file: the raw leg must serve it (no row loss
+    // through the split) while bloom rejects the covered file.
+    let before = stats.files_rejected.load(Relaxed);
+    assert_eq!(count_by_trace_id(&db, &project_id, "trace-raw", ts).await?, 1, "raw-leg row must survive the split");
+    assert!(stats.files_rejected.load(Relaxed) > before, "covered file must be bloom-rejected for the raw needle");
+
+    // Needle only in the COVERED file: indexed leg serves it, raw file rejected.
+    let before = stats.files_rejected.load(Relaxed);
+    assert_eq!(count_by_trace_id(&db, &project_id, "trace-covered", ts).await?, 1, "indexed-leg row must survive");
+    assert!(stats.files_rejected.load(Relaxed) > before, "raw file must be bloom-rejected for the covered needle");
+
+    // Prove this exercised the SPLIT branch, not the no-coverage fallback:
+    // the prefilter ran (so `covered_files` was Some) while raw debt existed.
+    assert!(search.stats.queries.load(Relaxed) > 0, "equality routing must have engaged the tantivy prefilter");
+
+    // Needle in NEITHER: all in-window files rejected — the split path's
+    // empty-include arm, and still zero rows.
+    let before = stats.files_rejected.load(Relaxed);
+    assert_eq!(count_by_trace_id(&db, &project_id, "trace-nowhere", ts).await?, 0);
+    assert!(stats.files_rejected.load(Relaxed) >= before + 2, "an all-absent needle must reject every file on the split path");
+    Ok(())
+}
