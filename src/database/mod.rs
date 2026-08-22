@@ -3731,15 +3731,17 @@ impl Database {
                 // Sound because the witness is a statement about the WHOLE
                 // partition ("it held N rows when I built"): two slices that both
                 // still agree with N are both current, independently.
-                // The live fingerprint, for the witness-less fallback below only.
-                // Same field, same comparison the date-level path makes.
-                let current_fp = fingerprints
-                    .get(&(project.clone(), date.clone()))
-                    .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
-                    .map(|stats| stats.fingerprint);
-                let fp_fallback = self.config.maintenance.timefusion_rollup_slice_fp_fallback;
+                //
+                // And the witness is the ONLY question that can be asked here.
+                // Falling back to `coverage.source_fp` when the witness is absent
+                // looks obvious and does not work: a slice's `source_fp` is an
+                // FnvHasher over the files SELECTED FOR THAT SLICE, while the
+                // partition fingerprint is a DefaultHasher over the partition's
+                // WHOLE live file set — different hasher, different set, so they
+                // can never be equal. Built and measured 2026-08-22; it routed
+                // nothing, failing safe as a permanent miss.
                 let (fresh, stale): (Vec<_>, Vec<_>) =
-                    slices.into_iter().partition(|(_, coverage)| slice_is_current(coverage.source_rows, current, coverage.source_fp, current_fp, fp_fallback));
+                    slices.into_iter().partition(|(_, coverage)| crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current));
                 if !stale.is_empty() {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
                     // WHY it is stale, because the two answers demand opposite
@@ -9093,63 +9095,6 @@ fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate
     match (mutable, tree) {
         (Some(m), Some(t)) => t.columns().iter().any(|c| m.contains(*c)),
         _ => false,
-    }
-}
-
-/// May this slice's coverage still be read?
-///
-/// The row witness decides. `fp_fallback` adds a second question BENEATH it,
-/// never instead of it: a slice the witness could not JUDGE (absent witness — an
-/// absence, not a disagreement) may instead prove itself with the same
-/// fingerprint test the date-level path already applies. A slice whose witness
-/// DISAGREES can never be rescued this way, which is the property that keeps the
-/// fallback from weakening the rule.
-fn slice_is_current(witness: Option<u64>, current_rows: Option<u64>, slice_fp: u64, current_fp: Option<u64>, fp_fallback: bool) -> bool {
-    crate::rollup::slice_coverage_agrees(&[witness], current_rows) || (fp_fallback && witness.is_none() && current_fp.is_some_and(|fp| fp == slice_fp))
-}
-
-#[cfg(test)]
-mod slice_is_current_tests {
-    use super::*;
-
-    /// The fallback must widen ONLY the unverifiable case. Prod 2026-08-22 put
-    /// 95.2% of `stale_coverage` there (1,567 witness-less slices) against 4.7%
-    /// genuinely moved, so this is the whole value of the flag — and rescuing a
-    /// moved slice instead would serve rows the rollup never aggregated.
-    #[test]
-    fn the_fallback_rescues_only_the_unjudgeable_never_the_disagreeing() {
-        let (fp, other_fp) = (7u64, 8u64);
-        // (witness, current_rows, slice_fp, current_fp, off, on)
-        for (witness, rows, slice_fp, cur_fp, off, on) in [
-            // Witness agrees: current either way, fallback irrelevant.
-            (Some(10), Some(10), fp, Some(fp), true, true),
-            // Witness DISAGREES: stale either way — the fallback must not rescue
-            // it even though the fingerprint matches.
-            (Some(9), Some(10), fp, Some(fp), false, false),
-            // No witness, fingerprint matches: the case the flag exists for.
-            (None, Some(10), fp, Some(fp), false, true),
-            // No witness, fingerprint moved: still stale.
-            (None, Some(10), fp, Some(other_fp), false, false),
-            // No witness, no live fingerprint: nothing to compare, still stale.
-            (None, Some(10), fp, None, false, false),
-        ] {
-            assert_eq!(slice_is_current(witness, rows, slice_fp, cur_fp, false), off, "flag OFF: witness={witness:?} fp={slice_fp} current_fp={cur_fp:?}");
-            assert_eq!(slice_is_current(witness, rows, slice_fp, cur_fp, true), on, "flag ON: witness={witness:?} fp={slice_fp} current_fp={cur_fp:?}");
-        }
-    }
-
-    /// Default-off means the read path is bit-identical to `slice_coverage_agrees`.
-    #[test]
-    fn with_the_flag_off_nothing_changes() {
-        for witness in [None, Some(0), Some(10), Some(11)] {
-            for rows in [None, Some(10)] {
-                assert_eq!(
-                    slice_is_current(witness, rows, 7, Some(7), false),
-                    crate::rollup::slice_coverage_agrees(&[witness], rows),
-                    "flag OFF must not alter the witness verdict"
-                );
-            }
-        }
     }
 }
 

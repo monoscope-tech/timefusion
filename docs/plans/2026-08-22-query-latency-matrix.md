@@ -368,25 +368,37 @@ pipeline whose units are re-claimed rather than finished (30 of 31 sealed starts
 already on `attempts > 3`) is exactly the convergence problem the compaction
 chart documents. This is wall-clock physics; it cannot be compressed.
 
-**(b) Fall back to `source_fp` for witness-less slices.** Slice coverage already
-carries `source_fp`, and the date-level path verifies with precisely that field.
-A witness-less slice whose fingerprint still matches the live partition could be
-trusted without a republish, unlocking most of the 1,567 immediately.
+**(b) Fall back to `source_fp` for witness-less slices — BUILT, MEASURED, AND
+REMOVED. It cannot work.** Slice coverage carries a `source_fp` and the
+date-level path verifies with a field of the same name, so trusting a
+witness-less slice whose fingerprint still matches looked like it would unlock
+most of the 1,567 immediately.
 
-The catch, and it is why this is not obviously right: **a fingerprint changes
-whenever the partition's file set is rewritten, and `num_records` does not.**
-That is very likely why the witness was chosen over the fingerprint in the first
-place — row count survives compaction, fingerprints do not. So (b) is *safe*
-(a mismatch only ever causes a miss, never a wrong answer) but *pessimistic*, and
-on a table that compacts normally it would go stale again immediately. On this
-table, where sealed partitions are frozen, it would hold.
+The two fingerprints are **incomparable**, in two independent ways:
 
-Recommendation: (b) as a fallback beneath the witness — never replacing it —
-gated behind a kill switch, measured against `rollup_stale_no_witness` dropping
-and `rollup_hits_*` rising. It is a read-path change with a silent-wrong-number
-failure mode if the fingerprint comparison is not exactly the one the date-level
-path makes, so it wants a waking pair of eyes and a staging run, not an overnight
-push.
+| | slice `source_fp` (`maintain.rs:1480`) | partition `fingerprint` (`partition_file_fp`) |
+|---|---|---|
+| hasher | `FnvHasher` | `DefaultHasher` (SipHash) |
+| input | files selected **for that slice** | the partition's **whole live file set** |
+
+Either difference alone makes equality impossible. Implemented behind a flag and
+tested end-to-end: with the flag on, a stripped-witness slice routed **nothing**
+— the comparison fails safe as a permanent miss. The parity test is what caught
+it; the unit tests over the predicate all passed, because the predicate was
+correct and its *inputs* were meaningless.
+
+Removed rather than left disabled. A flag that does nothing is worse than no
+flag: it reads as an available lever. The finding is recorded in the read path
+itself so the next person does not re-derive it.
+
+That leaves **(a) republish throughput** as the only route, which is the same
+wall as frozen compaction.
+
+*Method note.* The unit tests passed and the integration test failed, and the
+integration test was right. Testing a pure predicate proves the predicate; it
+says nothing about whether the values fed to it mean what you think. Both
+fingerprints are `u64` named `source_fp`, so the type system had nothing to say
+either.
 
 ## Open, in priority order
 
