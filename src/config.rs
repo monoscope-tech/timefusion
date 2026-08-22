@@ -1980,6 +1980,27 @@ pub struct MaintenanceConfig {
     /// ever doubted.
     #[serde_inline_default(true)]
     pub timefusion_read_dedup_skip_swept: bool,
+    /// Per-DATE dedup skip: a window that is only partly certified skips
+    /// `DedupExec` over its certified date partitions instead of losing the
+    /// skip entirely.
+    ///
+    /// Why it exists: the all-or-nothing rule never fires in prod. 2026-08-22
+    /// measured 97 live certifications across 13 projects with a longest
+    /// consecutive run of **5 days**, against the 7 a week needs and the 30 a
+    /// month needs — so `dedup_skipped_pct` sat at 0.0 while certification was
+    /// working perfectly (docs/plans/2026-08-21-post-hot-tier-speed.md).
+    ///
+    /// Why it is sound: `date` is derived from `timestamp` and DML re-appends
+    /// preserve the original row's timestamp (`write/mod.rs:1104`), so every
+    /// version and tombstone of a row shares one date partition. No dedup key
+    /// spans dates, so dedup over the union equals dedup applied per date.
+    ///
+    /// **Default OFF.** The failure mode is a silent over-count on every
+    /// dashboard tile, and this table is `version_append` (merge-on-read), so
+    /// the uncertified legs must keep their keep-greatest ordering. Flip only
+    /// after a staging run comparing `count(*)` with it on and off.
+    #[serde_inline_default(false)]
+    pub timefusion_read_dedup_skip_per_date: bool,
     /// Dedup-as-you-compact experiment (docs/plans/2026-08-20-dedup-and-sort
     /// strategy §3): the on-demand compaction path (`compact_date`, i.e. pgwire
     /// `OPTIMIZE` and the CLI) upgrades its SortBy rewrite to SortByDedup, so

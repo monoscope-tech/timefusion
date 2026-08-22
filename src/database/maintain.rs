@@ -2680,9 +2680,32 @@ impl Database {
     /// systematically over-report `NeverCertified` because `window_dates` runs oldest-first.
     /// Short-circuiting on `FpMoved` avoids that bias. The extra work is one
     /// `partition_files_by_pid` per remaining date, bounded by `window_dates`'s 366-day cap.
-    pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> DedupSkipVerdict {
-        let Some(dates) = window_dates(lo, hi) else { return DedupSkipVerdict::NoWindow };
+    pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, window: (i64, i64)) -> DedupSkipVerdict {
+        self.dedup_window_certified(table, project_id, table_name, window).0
+    }
+
+    /// As `dedup_window_clean`, but also returns the `date=` values whose
+    /// certification still matches the live file set.
+    ///
+    /// The set is what makes a PER-DATE skip possible: a window that is only
+    /// partly certified used to lose the skip entirely, and prod never has a
+    /// fully certified window (2026-08-22: 97 live certifications, longest
+    /// consecutive run 5 days, against 7 for a week and 30 for a month). Per
+    /// date is sound because `date` is derived from `timestamp` and DML
+    /// re-appends preserve the original timestamp (`write/mod.rs:1104`), so
+    /// every version and tombstone of a row shares one date partition — no
+    /// dedup key can span dates.
+    ///
+    /// Unlike the old short-circuit, this does NOT return early on the first
+    /// stale certification: the whole window must be walked to collect the
+    /// certified set. `FpMoved` still outranks `NeverCertified` in the verdict.
+    pub(crate) fn dedup_window_certified(
+        &self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64),
+    ) -> (DedupSkipVerdict, HashSet<String>) {
+        let mut certified_dates: HashSet<String> = HashSet::new();
+        let Some(dates) = window_dates(lo, hi) else { return (DedupSkipVerdict::NoWindow, certified_dates) };
         let mut verdict = DedupSkipVerdict::Granted;
+        let mut saw_fp_moved = false;
         // Did any partition actually produce evidence? `Granted` is the loop's
         // seed, and every `continue` below leaves it untouched — so a window in
         // which EVERY date is skipped (no Delta files under this project's key)
@@ -2698,7 +2721,9 @@ impl Database {
         // dashboard tile — so the default must be to decline.
         let mut certified_any = false;
         for date in dates {
-            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &format!("date={date}")) else { return DedupSkipVerdict::Unresolved };
+            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &format!("date={date}")) else {
+                return (DedupSkipVerdict::Unresolved, HashSet::new());
+            };
             // The sweep keys custom-project tables (no project_id= path
             // segment) under "default"; match its grouping exactly.
             let Some((key_pid, files)) =
@@ -2714,6 +2739,7 @@ impl Database {
             match certified {
                 Some(cert) if cert.fp == partition_file_fp(files) => {
                     certified_any = true;
+                    certified_dates.insert(date.to_string());
                     continue;
                 }
                 Some(cert) => {
@@ -2725,12 +2751,25 @@ impl Database {
                     if self.dedup_clean_fp.remove_if(&fp_key, |_, live| live.fp == cert.fp).is_some() {
                         self.scan_metrics.record_cert_dwell(cert.since);
                     }
-                    return DedupSkipVerdict::FpMoved;
+                    saw_fp_moved = true;
                 }
                 None => verdict = DedupSkipVerdict::NeverCertified,
             }
         }
-        if certified_any { verdict } else { DedupSkipVerdict::NeverCertified }
+        // `FpMoved` outranks `NeverCertified` (see the doc comment) INCLUDING
+        // over the no-evidence fallback below — it is applied after the full
+        // walk rather than by an early return only so the certified set is
+        // complete for the per-date skip. Ordering it after `certified_any`
+        // instead reports a written-to partition as never-certified
+        // (regression caught by
+        // `a_denied_skip_says_whether_it_was_never_certified_or_written_to_since`).
+        if saw_fp_moved {
+            return (DedupSkipVerdict::FpMoved, certified_dates);
+        }
+        match certified_any {
+            true => (verdict, certified_dates),
+            false => (DedupSkipVerdict::NeverCertified, HashSet::new()),
+        }
     }
 
     pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, Vec<String>)> {

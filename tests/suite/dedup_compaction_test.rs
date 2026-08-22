@@ -2936,3 +2936,81 @@ async fn count_star_matches_the_scan_over_a_multi_day_window() -> Result<()> {
     }
     Ok(())
 }
+
+/// Per-DATE dedup skip (`timefusion_read_dedup_skip_per_date`): a window whose
+/// dates are only PARTLY certified must skip `DedupExec` over the certified
+/// partitions while the uncertified ones still dedup — and must return exactly
+/// what the all-or-nothing path returns.
+///
+/// This is the shape prod actually has: 2026-08-22 measured 97 live
+/// certifications with a longest consecutive run of 5 days, so a 7d window is
+/// never wholly certified and the old rule skipped nothing at all
+/// (`dedup_skipped_pct = 0.0`).
+///
+/// Over-counting is the failure mode that matters — this table is
+/// `version_append`, so a certified leg unioned above `DedupExec` must not
+/// resurrect superseded versions. The assertion is therefore equality between
+/// the flag on and off, plus the winning value, over a two-date window where
+/// BOTH dates carry merge-on-read duplicates.
+#[serial]
+#[tokio::test]
+async fn per_date_dedup_skip_matches_the_all_or_nothing_result() -> Result<()> {
+    // Two dates, each with two versions of its own key.
+    let days_ago = |n: i64| (chrono::Utc::now().date_naive() - chrono::Duration::days(n)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let (recent_ts, older_ts) = (days_ago(0), days_ago(3));
+
+    let run = |per_date: bool| async move {
+        let mut cfg = (*TestConfigBuilder::new(&format!("per_date_skip_{per_date}")).with_buffer_mode(BufferMode::Enabled).build()).clone();
+        cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+        cfg.maintenance.timefusion_read_dedup_skip_per_date = per_date;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let row = |key: &str, ts: i64, tag: &str| -> Result<_> {
+            let mut value = test_span_ts(key, "span", &project_id, ts);
+            value["hashes"] = serde_json::json!([tag]);
+            json_to_batch(vec![value])
+        };
+        for (key, ts) in [("recent_key", recent_ts), ("older_key", older_ts)] {
+            for tag in ["original", "updated"] {
+                db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(key, ts, tag)?], true, None).await?;
+            }
+        }
+        // Force PARTIAL certification, which is the case under test. The sweep
+        // certifies every partition it proves clean; writing to the older date
+        // AFTERWARDS moves that partition's fingerprint, so it is uncertified
+        // while the recent one stays certified. Without this the sweep
+        // certifies both dates, the plain all-or-nothing skip fires, and the
+        // split under test is never reached.
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("older_key", older_ts, "final")?], true, None).await?;
+
+        let sql = format!(
+            "SELECT array_element(hashes, 1) AS tag FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+             AND timestamp >= to_timestamp_micros({lo}) AND timestamp <= to_timestamp_micros({hi}) ORDER BY tag",
+            lo = older_ts - 1,
+            hi = recent_ts + 1,
+        );
+        let batches = db.query_delta_only(&sql).await?;
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = datafusion::arrow::compute::kernels::cast::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8).expect("cast");
+                let col = col.as_string::<i32>();
+                (0..b.num_rows()).map(|i| col.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort();
+        Ok::<Vec<String>, anyhow::Error>(rows)
+    };
+
+    let baseline = run(false).await?;
+    let split = run(true).await?;
+
+    assert_eq!(split, baseline, "per-date skip changed the result set — over/under-count regression");
+    assert_eq!(split.len(), 2, "one winning row per key across the two dates, got {split:?}");
+    // recent date (certified, skipped) keeps its swept winner; older date
+    // (fingerprint moved, still deduped) must collapse to its LATEST version.
+    assert_eq!(split, vec!["final".to_string(), "updated".to_string()], "each date must yield its winning version, got {split:?}");
+    Ok(())
+}
