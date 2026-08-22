@@ -215,9 +215,25 @@ with no IO — which would turn §3a from an open design task into a tractable
 one. Evaluate it properly (including the no-stats and sentinel-range cases,
 which must fail closed) before building on it.
 
-**3b. Bias sweep ordering to the newest ~7 days.** Cheap, immediate, partial.
-Behind an env kill switch. It fights churn rather than escaping it and
-competes with the sealed backlog for the same workers, so it is relief.
+**3b. Bias sweep ordering to the newest ~7 days — WITHDRAWN, already done.**
+Reading `scheduling_class` (`maintenance_coordinator.rs:2160-2200`) settles
+it: sealed work is *already* strictly newest-first, explicitly "for the same
+reason the dedup drain and the rollup backfill are newest-first: recent days
+are what dashboards read". Width outranks recency deliberately, because a
+day-sized backfill unit is the only kind that advances the horizon and
+newest-first alone spends every claim on yesterday's ten-minute leftovers.
+
+So the observation that drove this item — 97 certifications sitting on
+2026-08-04..08-21 rather than the last week — does **not** mean the scheduler
+is looking in the wrong place. It means those are the only days that *can*
+certify: recent partitions churn, and a write between clean slices voids the
+accumulated coverage by design (`a_write_between_clean_slices_voids_accumulated_coverage`).
+Adding a second recency bias would be a no-op at best, and at worst would
+starve the contiguity goal that width-over-recency exists to protect.
+
+**This makes §3a the only real lever, not merely the better one.** The
+blocker is churn voiding accumulation, which is exactly what an additive
+file-set certification escapes.
 
 **3c. Today's partition keeps full dedup.** Correct end state, not a gap.
 
@@ -259,6 +275,6 @@ declined.
 2. **§2a + §2b — extract-epoch unwrap and the unfiltered digest.** Only after
    1, because both increase the share of traffic the tier answers.
 3. **§2c — COALESCE unwrap**, after its equivalence test.
-4. **§3b — sweep ordering bias.** Independent of the above; env-gated.
+4. **§3b — WITHDRAWN**: already implemented (sealed work is newest-first).
 5. **§3a — additive certification.** Design first, and only after the
    soundness rule is established.
