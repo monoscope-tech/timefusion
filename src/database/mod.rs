@@ -11383,6 +11383,11 @@ mod tests {
             for add in live {
                 let path = format!("{}-stripped.parquet", add.path.trim_end_matches(".parquet"));
                 store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                // REPLACES the tagged original, as a delta-rs OPTIMIZE does.
+                // Leaving it live made the partition's only untagged file
+                // contained in a live tagged slice, which is the OTHER shape —
+                // covered by `a_covered_untagged_file_queues_the_covering_slice`.
+                actions.push(Action::Remove(remove_for_add(&add, true)));
                 actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
             }
             let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
@@ -11466,6 +11471,103 @@ mod tests {
             u64::try_from(before - untagged_live(&db)).unwrap_or_default(),
             counter() - counted_before,
             "the retired counter must equal the untagged files the commit actually removed"
+        );
+        Ok(())
+    }
+
+    /// An untagged file already CONTAINED in a live tagged slice queues that
+    /// slice, not the file's own span.
+    ///
+    /// Publishing the contained span cannot land: `covered_by_wider` refuses it
+    /// — two overlapping files would both stay live and a dashboard would SUM
+    /// both — and escalates to the covering slice, reaching the same place in
+    /// two claims instead of one. On prod 2026-08-22 this was the dominant
+    /// remaining shape, so the wasted hop was most of the work left.
+    #[tokio::test]
+    async fn a_covered_untagged_file_queues_the_covering_slice() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        use object_store::ObjectStoreExt as _;
+        let mut cfg = (*create_test_config("untagged-covered")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("cover_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        let tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+        let tier_ref = db.get_or_create_table(&project, &tier).await?;
+        // The stripped copy sits BESIDE its tagged original, so the partition
+        // holds an untagged file whose span a live tagged slice contains.
+        {
+            let mut table = tier_ref.read().await.clone();
+            let live: Vec<_> = table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .map(|file| {
+                    #[allow(deprecated)]
+                    file.add_action()
+                })
+                .collect();
+            let store = table.log_store().object_store(None);
+            let mut actions = Vec::new();
+            for add in live {
+                let path = format!("{}-stripped.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            *tier_ref.write().await = table;
+        }
+        let covering: Vec<(i64, i64)> = {
+            let table = tier_ref.read().await;
+            table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .filter_map(|file| {
+                    #[allow(deprecated)]
+                    let tags = file.add_action().tags?;
+                    let tag = |name: &str| tags.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
+                    Some((tag(crate::maintenance_coordinator::TAG_SLICE_START)?, tag(crate::maintenance_coordinator::TAG_SLICE_END)?))
+                })
+                .collect()
+        };
+        assert!(!covering.is_empty(), "the tagged original must stay live, or this tests the other shape");
+
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in &keys {
+                journal.complete(key);
+            }
+        }
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let queued: Vec<(i64, i64)> = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal
+                .tasks()
+                .filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier)
+                .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
+                .collect()
+        };
+        assert!(!queued.is_empty(), "a covered untagged file must still be queued");
+        assert!(
+            queued.iter().all(|slice| covering.contains(slice)),
+            "the rebuild must target the COVERING tagged slice, or `covered_by_wider` refuses it; got {queued:?} against {covering:?}"
         );
         Ok(())
     }

@@ -2622,6 +2622,19 @@ impl Database {
                 }
             });
             for (start, end) in slices {
+                // Where a live tagged slice already CONTAINS this span, queue
+                // that slice instead. Publishing the contained span is refused
+                // by the `covered_by_wider` guard — two overlapping files would
+                // both stay live — which escalates to the covering slice and
+                // gets there in two hops instead of one. Same destination, half
+                // the work, and it skips a wasted claim on the busiest cells:
+                // most of what remained on 2026-08-22 was this shape.
+                let (start, end) = tagged
+                    .iter()
+                    .filter(|(covering_start, covering_end)| *covering_start <= start && *covering_end >= end)
+                    .min_by_key(|(covering_start, covering_end)| covering_end - covering_start)
+                    .copied()
+                    .unwrap_or((start, end));
                 // Minute-aligned and clamped to the partition: gaps come from
                 // row statistics, so they land anywhere, and a slice that
                 // overran the day would select another partition's files.
