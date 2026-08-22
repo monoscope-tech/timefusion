@@ -1113,6 +1113,7 @@ impl StatsTableProvider {
         let scan = self.scan_metrics.as_ref().map_or_else(Vec::new, |m| {
             use crate::database::scan_metric_names::*;
             let cv = crate::observability::counter_value;
+            let q = |name: &str, p: f64| crate::observability::histogram_quantile(name, p).unwrap_or(0.0) as u64;
             let skip_reason = |r: &str| prefilter_skip_metric(r).map_or(0, cv);
             let (total, skipped) = (cv(SCANS_TOTAL), cv(SCANS_SKIPPED_DELTA));
             let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
@@ -1274,6 +1275,12 @@ impl StatsTableProvider {
                     "bounded_otel_scan_candidates" => cv(BOUNDED_OTEL_SCAN_CANDIDATES),
                     "bounded_otel_scan_rejections" => cv(BOUNDED_OTEL_SCAN_REJECTIONS),
                     "wide_scan_oversize_total" => cv(WIDE_SCAN_OVERSIZE_TOTAL),
+                    "wide_scan_refused_total" => cv(WIDE_SCAN_REFUSED_TOTAL),
+                    // Read these BEFORE setting TIMEFUSION_WIDE_SCAN_REFUSE_MB — the
+                    // threshold has to sit above p99 or it rejects working dashboards.
+                    "wide_scan_selected_mb_p50" => q(WIDE_SCAN_SELECTED_MB, 0.50),
+                    "wide_scan_selected_mb_p90" => q(WIDE_SCAN_SELECTED_MB, 0.90),
+                    "wide_scan_selected_mb_p99" => q(WIDE_SCAN_SELECTED_MB, 0.99),
                     "mem_plan_us_avg" => avg(cv(MEM_PLAN_US_TOTAL), mem_plans),
                     "mem_plan_total" => mem_plans,
                     "lat_p50_us_approx" => m.latency_percentile_us(0.50),

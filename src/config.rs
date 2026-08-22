@@ -2340,6 +2340,22 @@ pub struct MemoryConfig {
     // genuinely small, well-pruned history reads ungated.
     #[serde_inline_default(64)]
     pub timefusion_wide_scan_max_mb: u64,
+    /// Selected bytes above which a single scan is REFUSED outright, rather than admitted
+    /// into the gate above. **0 disables it, and 0 is the default.**
+    ///
+    /// The gate bounds how many wide scans decode concurrently; it has never bounded how
+    /// much any one of them decodes, and `wide_scan_oversize_total` was pure observation.
+    /// That gap is a distinct failure mode from a slow query: on 2026-08-18 one scan
+    /// selected 514 files / 32.8 GB and, while it ran, NEW CONNECTIONS TIMED OUT — the box
+    /// became unreachable, so every other tenant paid for one query. Refusing it instead
+    /// costs one client an error naming the limit and what to do about it.
+    ///
+    /// Deliberately not defaulted to a number: the threshold has to come from
+    /// `wide_scan_selected_mb_p50/p90/p99` in `timefusion_stats` on real traffic, or it
+    /// either never fires or rejects working dashboards. Set
+    /// `TIMEFUSION_WIDE_SCAN_REFUSE_MB` well above p99 and watch `wide_scan_refused_total`.
+    #[serde_inline_default(0)]
+    pub timefusion_wide_scan_refuse_mb: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
     /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
     /// set with room to spare. Each entry is one LogicalPlan (~KBs).

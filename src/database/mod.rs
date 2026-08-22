@@ -289,6 +289,8 @@ pub mod scan_metric_names {
     pub const BOUNDED_OTEL_SCAN_CANDIDATES: &str = "timefusion.scan.bounded_otel_scan_candidates";
     pub const BOUNDED_OTEL_SCAN_REJECTIONS: &str = "timefusion.scan.bounded_otel_scan_rejections";
     pub const WIDE_SCAN_OVERSIZE_TOTAL: &str = "timefusion.scan.wide_scan_oversize_total";
+    pub const WIDE_SCAN_REFUSED_TOTAL: &str = "timefusion.scan.wide_scan_refused_total";
+    pub const WIDE_SCAN_SELECTED_MB: &str = "timefusion.scan.wide_scan_selected_mb";
     pub const MEM_PLAN_US_TOTAL: &str = "timefusion.scan.mem_plan_us_total";
     pub const MEM_PLAN_TOTAL: &str = "timefusion.scan.mem_plan_total";
     pub const PGWIRE_TOTAL: &str = "timefusion.scan.pgwire_total";
@@ -8357,7 +8359,7 @@ impl ProjectRoutingTable {
         };
 
         let coerced = Self::coerce_plan_to_schema(delta_plan, &target_schema)?;
-        Ok(self.gate_if_wide(coerced, filters))
+        self.gate_if_wide(coerced, filters)
     }
 
     /// How far back a scan reaches (`now - min_ts`), in micros. `None` = no
@@ -8384,12 +8386,12 @@ impl ProjectRoutingTable {
     /// file's row groups are fully decoded — so its Parquet decoding draws from
     /// the shared `heavy_scan_sem`, bounding concurrent decode heap across all
     /// queries.
-    fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> Arc<dyn ExecutionPlan> {
+    fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> DFResult<Arc<dyn ExecutionPlan>> {
         let depth = self.scan_lookback_micros(filters);
         let deeper_than = |micros: i64| depth.is_none_or(|d| d > micros);
         let mem = &self.database.config.memory;
         if !deeper_than((mem.timefusion_wide_scan_lookback_hours as i64).saturating_mul(3_600_000_000)) {
-            return plan;
+            return Ok(plan);
         }
         // Depth is only a proxy for decode heap, and pruning breaks the proxy: a
         // deep query on a well-pruned partition selects one file and 8 KB, yet
@@ -8404,9 +8406,14 @@ impl ProjectRoutingTable {
             && files <= mem.timefusion_wide_scan_max_files
             && bytes <= mem.timefusion_wide_scan_max_mb.saturating_mul(1 << 20)
         {
-            return plan;
+            return Ok(plan);
         }
-        // Observation only, nothing is refused — see `wide_scan_oversize_total`.
+        // Every gated scan's size, so the refusal threshold below can be chosen from the
+        // distribution rather than guessed. Recorded here and not at the oversize warn
+        // because that one only ever sees the tail.
+        if let Some((_, bytes)) = selected {
+            metrics::histogram!(scan_metric_names::WIDE_SCAN_SELECTED_MB).record((bytes / (1 << 20)) as f64);
+        }
         // The gate below bounds how MANY wide scans decode at once, never how
         // much any one of them decodes, so this is the only place that can see
         // a single query large enough to take the process down.
@@ -8420,21 +8427,46 @@ impl ProjectRoutingTable {
                 selected_files = files,
                 selected_mb = bytes / (1 << 20),
                 threshold_mb = Self::WIDE_SCAN_OVERSIZE_BYTES / (1 << 20),
-                "wide scan selected more than the oversize threshold; admitted anyway"
+                "wide scan selected more than the oversize threshold"
             );
+        }
+        // …and past a second, much higher threshold, refuse it. A scan this size is not a
+        // slow query: 2026-08-18 one selected 514 files / 32.8 GB and took the process
+        // down, and while it ran new connections timed out, so the failure was the box,
+        // not the query. Admitting it degrades everyone; refusing it costs one client a
+        // legible error. Default 0 = disabled, because refusal is client-visible and the
+        // threshold has to come from `wide_scan_selected_mb_p*` on a real workload first.
+        if let Some((files, bytes)) = selected
+            && let Some(limit) = wide_scan_refusal_bytes(mem.timefusion_wide_scan_refuse_mb, bytes)
+        {
+            metrics::counter!(scan_metric_names::WIDE_SCAN_REFUSED_TOTAL).increment(1);
+            warn!(
+                event = "wide_scan_refused",
+                table.name = %self.table_name,
+                selected_files = files,
+                selected_mb = bytes / (1 << 20),
+                limit_mb = limit / (1 << 20),
+                "wide scan refused: selected more than the refusal threshold"
+            );
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "scan selected {} files / {} MiB, over the {} MiB per-scan limit; narrow the time window or add a more selective filter",
+                files,
+                bytes / (1 << 20),
+                limit / (1 << 20)
+            )));
         }
         // Two thresholds over one measure, not two notions of "wide": the gate
         // bounds decode HEAP and must fire early (hours), while the cache
         // bypass gives up cache population and must NOT fire on a merely-widish
         // dashboard that will be re-read — hence its own, higher, knob.
         let bypass_cache = self.database.config.cache.cache_bypass_scan_micros().is_some_and(deeper_than);
-        Arc::new(GatedScanExec::new(
+        Ok(Arc::new(GatedScanExec::new(
             plan,
             self.database.heavy_scan_sem.clone(),
             Some(self.database.scan_metrics.clone()),
             bypass_cache,
             mem.timefusion_max_concurrent_scan_readers.max(1) as u32 * DECODE_UNITS_PER_READER,
-        ))
+        )))
     }
 
     /// Lead sort key that makes `DedupExec`'s keep-greatest engage.
@@ -8761,6 +8793,14 @@ fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
     // Fold children so a `None` child (a leg with no file scan, e.g. the
     // in-memory leg) doesn't erase a sibling's real work.
     plan.children().into_iter().filter_map(selected_file_work).reduce(|(n, b), (n2, b2)| (n + n2, b + b2))
+}
+
+/// The per-scan refusal limit in bytes, when `selected` exceeds it. `refuse_mb == 0` disables the
+/// check entirely, which is the default — so the whole mechanism is one comparison away from the
+/// pre-existing admit-everything behaviour, and a misconfiguration can only fail open.
+fn wide_scan_refusal_bytes(refuse_mb: u64, selected: u64) -> Option<u64> {
+    let limit = refuse_mb.saturating_mul(1 << 20);
+    (refuse_mb > 0 && selected > limit).then_some(limit)
 }
 
 /// Decode-admission pressure valve: how many of the wide-scan semaphore's `total` permits one decode
@@ -12427,6 +12467,20 @@ mod tests {
                 .target_partitions,
             2
         );
+    }
+
+    /// The refusal is the ONE place a read path rejects rather than degrades, so its off
+    /// switch has to be exact: 0 must admit everything, including a scan far past any
+    /// plausible limit, and the comparison must be strictly-greater so a scan sitting
+    /// exactly on the threshold still runs.
+    #[test_case(0, 1 << 40 => None ; "disabled admits a terabyte")]
+    #[test_case(1024, 0 => None ; "no selected work")]
+    #[test_case(1024, 1023 * (1 << 20) => None ; "just under")]
+    #[test_case(1024, 1024 * (1 << 20) => None ; "exactly at the limit is admitted")]
+    #[test_case(1024, 1025 * (1 << 20) => Some(1024 * (1 << 20)) ; "just over")]
+    #[test_case(8192, 32_800 * (1 << 20) => Some(8192 * (1 << 20)) ; "the 32.8 GB scan that took prod down")]
+    fn wide_scan_refusal_fires_only_past_a_configured_limit(refuse_mb: u64, selected: u64) -> Option<u64> {
+        wide_scan_refusal_bytes(refuse_mb, selected)
     }
 
     /// GatedScanExec must release its permit BETWEEN batches: a per-stream hold
