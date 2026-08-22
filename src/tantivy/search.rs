@@ -813,7 +813,10 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
     let id_field = schema.get_field(ID_FIELD).map_err(|e| anyhow!("missing _id: {e}"))?;
 
     const HIT_CAP: usize = 1_000_000;
-    let top = searcher.search(query, &TopDocs::with_limit(limit.unwrap_or(HIT_CAP))).map_err(|e| anyhow!("search: {e}"))?;
+    // Clamp even explicit limits: `search()` passes usize::MAX through
+    // max_hits, and tantivy's TopDocs multiplies the limit internally —
+    // an unclamped huge limit overflows (debug panic).
+    let top = searcher.search(query, &TopDocs::with_limit(limit.unwrap_or(HIT_CAP).min(HIT_CAP))).map_err(|e| anyhow!("search: {e}"))?;
     // Per-segment fast-field columns, resolved lazily on first hit in that
     // segment. `None` in the outer Option = not yet resolved; inner `None`
     // = this segment has no fast `_id` (pre-fast-field index) → doc store.
