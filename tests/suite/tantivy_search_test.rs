@@ -289,6 +289,54 @@ async fn publishing_keeps_the_manifest_cache_warm_and_current() {
     assert!(ids.contains(&"b"), "the just-published entry must be visible without a reload, got {ids:?}");
 }
 
+/// Batched manifest commits must be indistinguishable from per-build ones.
+/// The backfill defers its manifest writes because each is a full
+/// read-modify-write of the whole manifest under a per-project lock — the
+/// measured cause of coverage not converging — so what matters is that N
+/// deferred entries committed together leave exactly the manifest N immediate
+/// upserts would have, and that a counting error (last-write-wins on a shared
+/// snapshot) would show up as missing entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batched_manifest_commit_lands_every_deferred_entry() {
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p-batch";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cfg = Arc::new(prod_defaults());
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
+    let cache = TempDir::new().unwrap();
+    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
+    svc.with_reader(&search);
+    let cb = svc.clone().callback();
+
+    // Three files, published normally, give us real blobs to point entries at.
+    for (ts, id, uri) in [(1_000_000, "a", "f1"), (2_000_000, "b", "f2"), (3_000_000, "c", "f3")] {
+        cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
+    }
+    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    assert_eq!(m.entries.len(), 3);
+
+    // Re-commit all three as ONE batch, plus a fresh key: the batch must add
+    // the new entry and preserve the existing ones, not replace the manifest.
+    // The batch carries ONLY the new entries — never the existing ones. That is
+    // what makes merge-vs-replace observable: a batch containing everything
+    // would still leave the manifest correct if the implementation cleared it
+    // first, and an earlier version of this test passed against exactly that
+    // injected bug. The keys are bucket/parquet-rel, not covered-file URIs.
+    let existing: Vec<String> = m.entries.keys().cloned().collect();
+    let template = m.entries.values().next().unwrap().clone();
+    let fresh: Vec<_> = ["k-fresh-1", "k-fresh-2"].iter().map(|k| ((*k).to_string(), template.clone())).collect();
+    timefusion::tantivy::upsert_manifest_many(store.as_ref(), table_name, project_id, fresh.clone()).await.unwrap();
+
+    let after = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    assert_eq!(after.entries.len(), existing.len() + fresh.len(), "batch must ADD to the manifest, not replace it");
+    for k in existing.iter().chain(fresh.iter().map(|(k, _)| k)) {
+        assert!(after.entries.contains_key(k), "batch lost an entry: {k}");
+    }
+    // An empty batch must not rewrite the manifest at all.
+    timefusion::tantivy::upsert_manifest_many(store.as_ref(), table_name, project_id, Vec::new()).await.unwrap();
+    assert_eq!(load_manifest(store.as_ref(), table_name, project_id).await.unwrap().entries.len(), after.entries.len());
+}
+
 /// The mirror image of the test above, and the reason both are needed: a
 /// publish must NOT drop the cached manifest, but a GC MUST. GC prunes entries
 /// on S3 and deletes their blobs; leaving this process's copy cached would keep

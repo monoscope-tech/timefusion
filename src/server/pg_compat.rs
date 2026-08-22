@@ -1191,6 +1191,10 @@ impl StatsTableProvider {
                     "tantivy_live_files_total" => cv(TANTIVY_LIVE_FILES),
                     "tantivy_raw_files_total" => cv(TANTIVY_RAW_FILES),
                     "tantivy_backfill_built" => cv(TANTIVY_BACKFILL_BUILT),
+                    // built / commits is the manifest-write amortisation the
+                    // batching bought; before it the ratio was 1.
+                    "tantivy_manifest_commits" => cv(TANTIVY_MANIFEST_COMMITS),
+                    "tantivy_manifest_commit_us_total" => cv(TANTIVY_MANIFEST_COMMIT_US),
                     "dedup_denied_never_certified" => cert_never,
                     "dedup_denied_fp_moved" => cert_moved,
                     "dedup_denied_never_certified_pct" => pct(cert_never, cert_never + cert_moved),

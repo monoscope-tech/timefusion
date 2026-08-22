@@ -1160,10 +1160,33 @@ impl TantivyIndexService {
     pub async fn build_index_for_file(
         &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>,
     ) -> Result<()> {
+        self.build_index_for_file_inner(table_name, project_id, parquet_rel, parquet_uri, delta_store, false).await.map(|_| ())
+    }
+
+    /// As `build_index_for_file`, but returns the manifest entry INSTEAD of
+    /// writing it, so a caller building many files for one project can commit
+    /// them in a single manifest write (see `upsert_manifest_many`).
+    ///
+    /// The blob is uploaded and the reader cache seeded exactly as usual, so
+    /// the only thing deferred is the manifest record. A crash between upload
+    /// and batch-commit therefore leaves an orphan blob and an uncovered file —
+    /// the next pass rebuilds it, which is idempotent. Batches are bounded for
+    /// that reason: the exposure is at most one batch of re-done work.
+    pub async fn build_index_for_file_deferred(
+        &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>,
+    ) -> Result<(String, crate::tantivy::ManifestEntry)> {
+        self.build_index_for_file_inner(table_name, project_id, parquet_rel, parquet_uri, delta_store, true)
+            .await?
+            .ok_or_else(|| anyhow!("deferred build returned no manifest entry"))
+    }
+
+    async fn build_index_for_file_inner(
+        &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>, defer: bool,
+    ) -> Result<Option<(String, crate::tantivy::ManifestEntry)>> {
         let path = super::index_path_for_parquet(table_name, parquet_rel);
         let table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
         let result = super::build_parquet_and_pack(delta_store, parquet_rel, table, self.config.compression_level(), MergeMode::Now).await;
-        self.publish_built_index(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], true, result).await
+        self.publish_built_index(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], true, result, defer).await
     }
 
     /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
@@ -1189,14 +1212,14 @@ impl TantivyIndexService {
         })
         .await
         .context("join build")?;
-        self.publish_built_index(table_name, project_id, manifest_key, blob_path, covered_files, ordinals_valid, pack_result).await
+        self.publish_built_index(table_name, project_id, manifest_key, blob_path, covered_files, ordinals_valid, pack_result, false).await.map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn publish_built_index(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>, ordinals_valid: bool,
-        result: Result<(bytes::Bytes, crate::tantivy::IndexBuildStats)>,
-    ) -> Result<()> {
+        result: Result<(bytes::Bytes, crate::tantivy::IndexBuildStats)>, defer: bool,
+    ) -> Result<Option<(String, crate::tantivy::ManifestEntry)>> {
         let (blob, stats) = match result {
             Ok(v) => v,
             Err(e) => {
@@ -1223,16 +1246,20 @@ impl TantivyIndexService {
             covered_files,
             ordinals_valid,
         };
-        upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry.clone()).await?;
+        if !defer {
+            upsert_manifest(self.object_store.as_ref(), table_name, project_id, manifest_key, entry.clone()).await?;
+        }
         // Our own write must never wait out the manifest TTL, which is what
-        // lets that TTL be minutes rather than seconds.
+        // lets that TTL be minutes rather than seconds. Applied for a deferred
+        // entry too: the blob IS uploaded, so consulting it is already correct,
+        // and the batch commit only makes it durable.
         if let Some(reader) = self.reader() {
-            reader.apply_published_entry(table_name, project_id, manifest_key, entry);
+            reader.apply_published_entry(table_name, project_id, manifest_key, entry.clone());
         }
         if let Some(ts) = stats.max_timestamp_micros {
             self.newest_indexed_micros.fetch_max(ts, Ordering::Relaxed);
         }
-        Ok(())
+        Ok(defer.then(|| (manifest_key.to_string(), entry)))
     }
 
     /// Install a just-published blob into the reader's extracted-index cache,

@@ -208,6 +208,10 @@ pub mod scan_metric_names {
     /// Indexes built by the reconcile BACKFILL specifically — not by flush,
     /// compaction or the wave reindex, all of which also publish.
     pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
+    /// Batched manifest commits made by the backfill, and entries they carried.
+    /// `entries / commits` is the amortisation actually achieved.
+    pub const TANTIVY_MANIFEST_COMMITS: &str = "timefusion.scan.tantivy_manifest_commits";
+    pub const TANTIVY_MANIFEST_COMMIT_US: &str = "timefusion.scan.tantivy_manifest_commit_us";
     // Why a dedup pass did NOT end in a certification. `cert_granted_total` has
     // sat at 0 since 2026-08-20 across three attempted fixes, each of which
     // guessed at the exit; these name the exits so the next fix is measured.
@@ -3106,6 +3110,25 @@ impl Database {
         Ok((result, sizes, delta_store))
     }
 
+    /// Commit one project's deferred manifest entries. Best-effort by design:
+    /// the blobs are already uploaded, so a failed commit costs a rebuild next
+    /// pass, and failing the whole backfill over one project's manifest write
+    /// would throw away every other project's completed work.
+    async fn commit_manifest_batch(
+        svc: &crate::tantivy::search::TantivyIndexService, table_name: &str, project_id: &str,
+        pending: &mut HashMap<String, Vec<(String, crate::tantivy::ManifestEntry)>>,
+    ) {
+        let Some(entries) = pending.remove(project_id).filter(|e| !e.is_empty()) else { return };
+        let (n, started) = (entries.len(), std::time::Instant::now());
+        match crate::tantivy::upsert_manifest_many(svc.object_store.as_ref(), table_name, project_id, entries).await {
+            Ok(()) => {
+                metrics::counter!(scan_metric_names::TANTIVY_MANIFEST_COMMITS).increment(1);
+                metrics::counter!(scan_metric_names::TANTIVY_MANIFEST_COMMIT_US).increment(started.elapsed().as_micros() as u64);
+            }
+            Err(e) => warn!(table_name, project_id, entries = n, %e, "tantivy backfill manifest batch commit failed; files stay uncovered for the next pass"),
+        }
+    }
+
     /// Count live parquet the Tantivy manifest does not cover, without building anything.
     ///
     /// `backfill_table_indexes` only runs from the daily reconcile cron, so after a deploy the
@@ -3284,9 +3307,17 @@ impl Database {
             let planned = work.len();
             info!(table_name, root = %root, planned, cap, event = "tantivy_backfill_started");
             let mut done = 0usize;
+            // Manifest writes are BATCHED per project. Each one is a full
+            // read-modify-write of that project's manifest (745 KB / 950 entries
+            // for the busiest) under a per-project lock, so publishing per build
+            // both pays that per file and serializes concurrent builds of the
+            // same project against each other — measured 2026-08-22 at ~60
+            // builds/hr against ~85/hr accrual, which is why coverage diverged
+            // no matter how the pass was capped.
+            let mut pending: HashMap<String, Vec<(String, crate::tantivy::ManifestEntry)>> = HashMap::new();
             let mut jobs = futures::stream::iter(work.into_iter().map(|(pid, rel, uri)| {
                 let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
-                async move { (pid.clone(), svc.build_index_for_file(&table, &pid, &rel, &uri, store).await) }
+                async move { (pid.clone(), svc.build_index_for_file_deferred(&table, &pid, &rel, &uri, store).await) }
             }))
             .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
             while let Some((pid, result)) = jobs.next().await {
@@ -3297,16 +3328,26 @@ impl Database {
                     // ever been guessed at, most recently from `cache_seeded`,
                     // which also counts flush publishes and overstated it ~10x.
                     // A monotonic counter gives the true rate from deltas mid-pass.
-                    Ok(()) => {
+                    Ok(entry) => {
                         built += 1;
                         metrics::counter!(scan_metric_names::TANTIVY_BACKFILL_BUILT).increment(1);
+                        pending.entry(pid.clone()).or_default().push(entry);
                     }
                     Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
+                }
+                // Bounded so an interrupted pass re-does at most one batch: the
+                // blobs are already uploaded, so a rebuild is wasted work, not
+                // wrong work.
+                if pending.get(&pid).is_some_and(|p| p.len() >= MANIFEST_BATCH) {
+                    Self::commit_manifest_batch(svc, table_name, &pid, &mut pending).await;
                 }
                 done += 1;
                 if done.is_multiple_of(25) {
                     info!(table_name, root = %root, done, planned, built, event = "tantivy_backfill_progress");
                 }
+            }
+            for pid in pending.keys().cloned().collect::<Vec<_>>() {
+                Self::commit_manifest_batch(svc, table_name, &pid, &mut pending).await;
             }
         }
         // Gauges, so each pass reports the CURRENT remaining work rather than a
@@ -6210,6 +6251,11 @@ fn wave_added_parquet(bins: &[StagedBin], live_uris: &[String]) -> Vec<(String, 
         })
         .collect()
 }
+
+/// Deferred manifest entries a backfill commits in one write. Bounds the work
+/// an interrupted pass re-does (the blobs are uploaded; only the record is
+/// pending) while still amortising a 745 KB read-modify-write over many builds.
+const MANIFEST_BATCH: usize = 25;
 
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
 type DirtyBinKey = (String, String, String, i64);

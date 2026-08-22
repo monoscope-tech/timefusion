@@ -441,6 +441,62 @@ Both clean single-container segments say ~81-85/hr. **Don't average a rate
 across a restart** — the census is a live diff, so a restart boundary can move
 it for reasons unrelated to drain throughput.
 
+## 2026-08-22: the routing tax has a name — the fast path is never taken
+
+`c4843b5` added counters for the failing conjunct of the single-provider fast
+path. Prod, 143 routed scans:
+
+| counter | value |
+|---|---|
+| `tantivy_fastpath` | **0** |
+| `tantivy_split_raw` | **143 (100%)** |
+| `tantivy_split_bloom` | 12 (8%) |
+| `tantivy_split_date` | 0 |
+| `tantivy_scan_us_total / calls` | **438 ms per routed scan** |
+| `tantivy_uris_us_total / calls` | 8 ms |
+| live / raw files per scan | 4265 / 302 |
+
+**The fast path has never once been taken, and raw coverage debt is the reason
+in 100% of cases.** Bloom rejection defeats it independently, but only 8% of the
+time. The mechanism is one comment in `scan_delta_table`:
+
+> File-pruned scans bypass the provider cache (the selection is query-specific).
+
+So a routed scan builds a FRESH table provider per leg — two legs when there is
+raw debt — while the unrouted twin reuses a cached provider. `scan_delta_table`
+also re-derives its file selection with its own `get_file_uris()`, so a routed
+query performs three full URI listings against the unrouted one's zero.
+
+**This makes coverage the routing tax's fix.** Full coverage restores the fast
+path for the ~92% of routed scans that do not bloom-prune, turning two uncached
+provider builds into one cached lookup. It does NOT help needle shapes that DO
+bloom-prune; those keep paying one uncached build forever.
+
+**Deferred, and named so they are not lost:** pass the already-computed rel
+paths into `scan_delta_table` instead of its internal re-listing (saves two full
+listings and two filter passes per routed query), and cache providers for
+file-pruned scans (the larger, riskier win). Neither is done.
+
+## 2026-08-22: uncovered files by age — it is a backlog, not a leak
+
+The census now splits by partition date. Prod: **uncovered=5733 — today=550,
+1-7d=1720, older=3463.** Sixty percent is more than a week old, so the accrual
+is NOT a rewrite path minting fresh uncovered files past a missing reindex hook
+(an audit found hooks on flush, OPTIMIZE and the wave — and dedup rewrites
+commit through the wave, so they inherit it). It is an old backlog plus
+rewrite-driven churn, which independently corroborates
+`docs/plans/2026-08-22-per-day-tantivy-index.md`: coverage is defined per FILE,
+so compaction manufactures index work that adds no information.
+
+**Manifest writes were a real throughput ceiling and are now batched.** Every
+build did a full read-modify-write of its project's manifest — 745 KB, 950
+entries — under a per-(table,project) lock, so concurrent builds of one project
+serialized on it and a 150-file pass paid it 150 times. The backfill now defers
+entries and commits ~one write per project per 25 builds. This is throughput,
+NOT the fix: per-day granularity is the fix, because it stops the work being
+created. Failed builds still write immediately, so a failure storm still pays
+per build — a deliberate asymmetry.
+
 ## 2026-08-22 (morning): the deficit is ~11%, not 4x — accrual measured directly
 
 The previous section could not separate accrual from drain, and flagged its
@@ -571,3 +627,4 @@ efficiency the uncorrected subtraction suggested. Two consequences:
 The lesson repeats the one two sections up, at one more remove: a difference of
 two rates is only a throughput number if both rates describe the same
 population. Flush-covered and backfill-covered files do not.
+||||||| parent of 9da810b (perf(tantivy): batch the backfill's manifest writes, and name why the routed fast path is never taken)

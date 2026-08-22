@@ -699,6 +699,27 @@ pub async fn upsert_manifest(store: &dyn ObjectStore, table: &str, project_id: &
     .await
 }
 
+/// Upsert many entries under ONE load+save of the manifest.
+///
+/// `upsert_manifest` costs a full read-modify-write of the whole manifest —
+/// 745 KB and 950 entries for the busiest project — under a per-(table,project)
+/// lock, so N builds for one project pay that N times and serialize on it. That
+/// is the backfill's throughput ceiling, not the indexing: measured 2026-08-22
+/// at ~60 builds/hr against ~85/hr accrual, i.e. coverage that cannot converge.
+/// Batching makes a 150-file pass cost roughly one manifest write per project.
+pub async fn upsert_manifest_many(store: &dyn ObjectStore, table: &str, project_id: &str, entries: Vec<(String, ManifestEntry)>) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    mutate(store, table, project_id, |m| {
+        for (key, entry) in entries {
+            m.entries.insert(key, entry);
+        }
+        ((), true)
+    })
+    .await
+}
+
 /// Remove entries by parquet key (used during compaction GC).
 pub async fn remove_manifest_entries(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_keys: &[String]) -> Result<()> {
     if parquet_keys.is_empty() {
