@@ -2945,6 +2945,89 @@ async fn an_uncertified_window_is_never_granted_the_dedup_skip() -> Result<()> {
     Ok(())
 }
 
+/// COUNT parity for the per-FILE skip, over a partition that CHURNED after it
+/// was certified — the case the whole-partition and per-date skips both refuse
+/// and the reason this exists.
+///
+/// Certification is keyed on a partition's entire file set, so one new file
+/// voids it. Recent partitions gain files continuously, which is why prod
+/// 2026-08-22 measured `dedup_denied_never_certified` at 100% of eligible
+/// scans. Per FILE, a new file costs only the files it OVERLAPS: the proved
+/// files stay skippable when no uncertified file could hold another version of
+/// their rows (`read::skippable_certified_files`).
+///
+/// The fixture makes that concrete: certified rows in one timestamp band, then
+/// a later batch — itself duplicated across flushes — in a DISJOINT band. The
+/// second batch moves the fingerprint, so the old skips must all decline; the
+/// per-file skip must still fire for the first band while the second is still
+/// deduplicated. Parity against the same data with the feature off is the
+/// assertion that matters, because the failure mode is a silent over-count.
+#[serial]
+#[tokio::test]
+async fn count_is_identical_with_and_without_the_per_file_dedup_skip() -> Result<()> {
+    init_local_metrics_for_test();
+    const DUPLICATED: usize = 200;
+    const UNIQUE: usize = 80;
+    const CHURN: usize = 60;
+    // A second apart, so the churn batch's file span cannot touch the certified
+    // band's. Overlapping bands would (correctly) refuse the skip, and the test
+    // would pass while proving nothing.
+    const CHURN_OFFSET: i64 = 1_000_000;
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    let run = |per_file: bool, tag: &'static str| async move {
+        let mut cfg = (*TestConfigBuilder::new(tag).with_buffer_mode(BufferMode::Enabled).build()).clone();
+        cfg.maintenance.timefusion_read_dedup_skip_per_file = per_file;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+        let batch = |lo: usize, hi: usize, offset: i64| -> Result<_> {
+            json_to_batch((lo..hi).map(|i| test_span_ts(&format!("k{i}"), "n", &project_id, ts + offset + i as i64)).collect())
+        };
+        // Cross-file duplicates plus keys written once, then certified.
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(0, DUPLICATED, 0)?], true, None).await?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(0, DUPLICATED, 0)?], true, None).await?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch(DUPLICATED, DUPLICATED + UNIQUE, 0)?], true, None).await?;
+
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+        // THE CHURN: written after certification, in a disjoint band, and itself
+        // duplicated across two flushes so the uncertified leg genuinely still
+        // has work to do. This moves the partition fingerprint, so every
+        // all-or-nothing skip must now decline.
+        let churn = |lo: usize, hi: usize| batch(lo, hi, CHURN_OFFSET);
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![churn(1000, 1000 + CHURN)?], true, None).await?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![churn(1000, 1000 + CHURN)?], true, None).await?;
+
+        let (lo, hi) = (ts - 1, ts + CHURN_OFFSET + (1000 + CHURN) as i64 + 1);
+        // Rows, not `count(*)`: a bare count is answered from Delta statistics
+        // without building a scan, so it exercises neither DedupExec nor the
+        // skip that removes it.
+        let sql = format!(
+            "SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
+             AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        );
+        // Warm the fast-resolve cache; a cold first query declines before it ever
+        // reaches the skip.
+        db.query_delta_only(&sql).await?;
+        let before = counter_value(scan_metric_names::DEDUP_SKIPPED_PER_FILE);
+        let batches = db.query_delta_only(&sql).await?;
+        let n = batches.iter().map(|b| b.num_rows()).sum::<usize>() as i64;
+        anyhow::Ok((n, counter_value(scan_metric_names::DEDUP_SKIPPED_PER_FILE) - before))
+    };
+
+    let (authoritative, control_skips) = run(false, "per_file_parity_off").await?;
+    let (with_skip, skips) = run(true, "per_file_parity_on").await?;
+
+    assert_eq!(authoritative, (DUPLICATED + UNIQUE + CHURN) as i64, "the control itself must be right: every key counted exactly once");
+    assert_eq!(control_skips, 0, "the control must run with the per-file skip genuinely off");
+    assert!(skips > 0, "the per-file skip never engaged, so this proves nothing — check the disjoint band and the fast-resolve warm-up");
+    assert_eq!(with_skip, authoritative, "the per-file skip changed the answer: it must never over-count");
+    Ok(())
+}
+
 /// COUNT parity — the precondition `timefusion_read_dedup_skip_swept`'s own doc
 /// names ("off by default until COUNT parity is validated on prod-shaped
 /// data"). The skip removes `DedupExec` and its key projection, so if the

@@ -189,6 +189,9 @@ pub mod scan_metric_names {
     pub const CERT_GRANTED_TOTAL: &str = "timefusion.scan.cert_granted_total";
     /// Scans that skipped `DedupExec` over SOME (not all) in-window dates.
     pub const DEDUP_SKIPPED_PER_DATE: &str = "timefusion.scan.dedup_skipped_per_date";
+    /// Scans where the per-FILE skip fired: some files of an UNCERTIFIED date
+    /// were proved clean and isolated, so they bypassed DedupExec.
+    pub const DEDUP_SKIPPED_PER_FILE: &str = "timefusion.scan.dedup_skipped_per_file";
     // Where the tantivy ROUTING TAX actually goes. Measured 2026-08-22: a routed
     // equality costs ~300-500ms more than the identical unrouted query while the
     // whole tantivy fan-out is 33-83ms of it, with zero IO — so ~85% is spent
@@ -374,10 +377,27 @@ impl ScanMetrics {
 /// One partition proved duplicate-free: the file fingerprint it was proved over,
 /// and when. `since` exists purely to measure how long certifications survive —
 /// the evidence that decides whether persisting them could ever pay.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Certification {
     fp: u64,
     since: std::time::Instant,
+    /// The file paths the certifying pass proved clean. `fp` is their hash and
+    /// answers "is the partition UNCHANGED"; this answers the weaker, additive
+    /// question "which of the files still live were proved" — the one that
+    /// survives a partition gaining a file. Empty for a certification restored
+    /// from a store written before the field existed, which simply means the
+    /// per-file skip cannot use it.
+    files: Arc<[String]>,
+    /// The partition has since MOVED, so this can never again grant the
+    /// whole-partition skip — but its file list is still true of the files it
+    /// names, which is exactly what the per-FILE skip needs.
+    ///
+    /// Before this, the read path DELETED a certification the moment its
+    /// fingerprint moved. That is right for the all-or-nothing question and
+    /// fatal for the per-file one: a single new file destroyed the evidence for
+    /// every file it did not overlap, so the per-file skip could never fire on a
+    /// churning partition — the only kind it exists for.
+    stale: bool,
 }
 
 /// Clean dedup slices accumulated toward certifying one (project, table, date)
@@ -2732,7 +2752,7 @@ impl Database {
                 // of restarting at this boot. A clock that moved backwards (or an
                 // entry from the future) falls back to "granted now".
                 let since = crate::storage::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
-                dedup_clean_fp.insert((entry.project_id, entry.table_name, entry.date), Certification { fp: entry.fp, since });
+                dedup_clean_fp.insert((entry.project_id, entry.table_name, entry.date), Certification { fp: entry.fp, since, files: Arc::from(entry.files), stale: false });
             }
             info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
         }
@@ -7867,6 +7887,7 @@ impl ProjectRoutingTable {
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>, id_filter: Option<&Expr>,
         covered_files: Option<&HashSet<String>>, zero_hit_files: Option<&HashSet<String>>, row_selections: Option<&HashMap<String, Vec<u64>>>,
         query_time_range: Option<(i64, i64)>, bloom_rejected: Option<&HashSet<String>>, date_restrict: Option<&HashSet<String>>,
+        file_restrict: Option<&HashSet<String>>,
     ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
         let narrow = |filters: &[Expr]| filters.iter().cloned().chain(id_filter.cloned()).collect::<Vec<_>>();
         // Per-date dedup skip: restrict this call's whole file universe to one
@@ -7875,6 +7896,13 @@ impl ProjectRoutingTable {
         // no `date=` partition cannot be attributed, so it fails this test and
         // lands on the uncertified (still-deduped) side — the safe default.
         let in_dates = |uri: &String| date_restrict.is_none_or(|dates| crate::storage::date_partition_of(uri).is_some_and(|d| dates.contains(&d.to_string())));
+        // Per-FILE dedup skip: the same one-side-of-the-split restriction as
+        // `date_restrict`, one level finer. A URI that yields no relative path
+        // cannot be attributed to either side, so it fails this test and lands
+        // on the uncertified (still-deduped) side — the safe default.
+        let in_files =
+            |uri: &String| file_restrict.is_none_or(|files| crate::tantivy::search::parquet_rel_of_uri(uri).is_some_and(|rel| files.contains(rel)));
+        let in_leg = |uri: &String| in_dates(uri) && in_files(uri);
         // Bloom-rejected rels apply to EVERY branch here — unlike
         // `zero_hit_files` they must reach the raw (uncovered) leg, which is
         // where the un-prunable file mass lives. `exclude_files` is ignored
@@ -7899,16 +7927,20 @@ impl ProjectRoutingTable {
             let narrowed = narrow(filters);
             let merged = merged_exclude(table);
             let exclude = merged.as_ref().or(zero_hit_files);
-            // Under a date split `exclude` is not enough — `scan_delta_table`
+            // Under a split `exclude` is not enough — `scan_delta_table`
             // ignores excludes whenever an include exists, and we need an
             // include to bound this call to its side. Build it explicitly.
-            let include: Option<HashSet<String>> = date_restrict
-                .map(|_| {
+            //
+            // Keyed on EITHER restriction. Keyed on `date_restrict` alone, a
+            // file-only split built no include at all, so both legs scanned the
+            // whole table and every certified row was counted twice.
+            let include: Option<HashSet<String>> = (date_restrict.is_some() || file_restrict.is_some())
+                .then(|| {
                     Ok::<_, DataFusionError>(
                         table
                             .get_file_uris()
                             .map_err(|e| DataFusionError::External(Box::new(e)))?
-                            .filter(|u| u.ends_with(".parquet") && uri_date_in_window(u, lo, hi) && in_dates(u) && !is_rejected(u))
+                            .filter(|u| u.ends_with(".parquet") && uri_date_in_window(u, lo, hi) && in_leg(u) && !is_rejected(u))
                             .filter(|u| !exclude.is_some_and(|e| e.contains(u)))
                             .collect::<HashSet<String>>(),
                     )
@@ -7938,7 +7970,7 @@ impl ProjectRoutingTable {
                 bloom_pruned_any |= rejected;
                 !rejected
             })
-            .filter(in_dates);
+            .filter(in_leg);
         let (mut indexed, raw): (HashSet<String>, HashSet<String>) = live.partition(|uri| covered.contains(uri));
         // Charge the fast path's LOSER, one counter per failing conjunct (they
         // are not exclusive — a scan can be defeated by two at once, and which
@@ -7948,7 +7980,7 @@ impl ProjectRoutingTable {
         for (defeated, name) in [
             (!raw.is_empty(), scan_metric_names::TANTIVY_SPLIT_RAW),
             (bloom_pruned_any, scan_metric_names::TANTIVY_SPLIT_BLOOM),
-            (date_restrict.is_some(), scan_metric_names::TANTIVY_SPLIT_DATE),
+            (date_restrict.is_some() || file_restrict.is_some(), scan_metric_names::TANTIVY_SPLIT_DATE),
         ] {
             if defeated {
                 metrics::counter!(name).increment(1);
@@ -8054,6 +8086,14 @@ impl ProjectRoutingTable {
                 .filter(|d| !per_date_dates.contains(d))
                 .collect(),
         };
+        // Per-FILE split, tried only where the per-DATE one did not already
+        // claim the window: within an uncertified date, the FILES a sweep proved
+        // clean can still skip when no uncertified file overlaps them. Empty
+        // unless `timefusion_read_dedup_skip_per_file` is on.
+        let (certified_files, uncertified_files) = match !skip_dedup && per_date_dates.is_empty() && !dedup_keys.is_empty() {
+            true => query_time_range.map_or_else(Default::default, |window| self.database.certified_file_split(&table, project_id, &self.table_name, window)),
+            false => Default::default(),
+        };
         if skip_dedup && readmit_mutable_filters {
             let mutable = Self::version_mutable_columns(&self.table_name);
             let leg_safe = |f: &Expr| {
@@ -8078,14 +8118,15 @@ impl ProjectRoutingTable {
                 query_time_range,
                 bloom_rejected,
                 (!per_date_dates.is_empty()).then_some(&uncertified_dates),
+                (!certified_files.is_empty()).then_some(&uncertified_files),
             )
             .await?;
         // The certified side: the same scan restricted to certified date
         // partitions, returned separately so the caller can union it ABOVE
         // DedupExec instead of feeding it through.
-        let certified_plans = match per_date_dates.is_empty() {
-            true => Vec::new(),
-            false => {
+        let certified_plans = match (per_date_dates.is_empty(), certified_files.is_empty()) {
+            (true, true) => Vec::new(),
+            (by_date_empty, _) => {
                 self.scan_delta_with_tantivy(
                     &table,
                     state,
@@ -8098,13 +8139,16 @@ impl ProjectRoutingTable {
                     tantivy_row_selections,
                     query_time_range,
                     bloom_rejected,
-                    Some(&per_date_dates),
+                    (!by_date_empty).then_some(&per_date_dates),
+                    (!certified_files.is_empty()).then_some(&certified_files),
                 )
                 .await?
             }
         };
         if !certified_plans.is_empty() {
-            metrics::counter!(scan_metric_names::DEDUP_SKIPPED_PER_DATE).increment(1);
+            let metric =
+                if certified_files.is_empty() { scan_metric_names::DEDUP_SKIPPED_PER_DATE } else { scan_metric_names::DEDUP_SKIPPED_PER_FILE };
+            metrics::counter!(metric).increment(1);
         }
         Ok((skip_dedup, plans, certified_plans))
     }
@@ -9785,6 +9829,7 @@ impl TableProvider for ProjectRoutingTable {
                 tantivy_row_selections.as_ref(),
                 query_time_range,
                 bloom_rejected.as_ref(),
+                None,
                 None,
             )
             .await?;

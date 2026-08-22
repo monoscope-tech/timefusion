@@ -1167,6 +1167,7 @@ impl StatsTableProvider {
                     // inside `denied_uncertified` — without this row, enabling
                     // `timefusion_read_dedup_skip_per_date` cannot be observed at all.
                     "dedup_skipped_per_date" => cv(DEDUP_SKIPPED_PER_DATE),
+                    "dedup_skipped_per_file" => cv(DEDUP_SKIPPED_PER_FILE),
                     "dedup_denied_uncertified" => cv(DEDUP_DENIED_UNCERTIFIED),
                     "dedup_denied_by_leg" => cv(DEDUP_DENIED_BY_LEG),
                     // The certification-survival split. `never_certified` is what a

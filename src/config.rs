@@ -2045,6 +2045,33 @@ pub struct MaintenanceConfig {
     /// `..._SKIP_SWEPT=false` to remove the skip entirely).
     #[serde_inline_default(true)]
     pub timefusion_read_dedup_skip_per_date: bool,
+    /// Per-FILE dedup skip: within an uncertified date, the FILES a sweep proved
+    /// clean still skip `DedupExec` when no uncertified file could hold another
+    /// version of their rows.
+    ///
+    /// Why it exists: certification is keyed on a partition's whole file set, so
+    /// ANY new file voids it. Recent partitions are rewritten continuously by
+    /// ingest, hot-tail compaction and the sealed backlog, so they churn faster
+    /// than sweeps can certify them — prod 2026-08-22 measured
+    /// `dedup_denied_never_certified` at 100% of eligible scans while the 97 live
+    /// certifications all sat on days nobody queries. Per-date skipping cannot
+    /// help there: the whole recent band is uncertified. Per FILE can, because a
+    /// new file voids only the files it overlaps.
+    ///
+    /// Soundness: the dedup key is `(timestamp, id)` and merge-on-read re-appends
+    /// preserve the original timestamp, so every version of a row carries that
+    /// row's timestamp and must land in a file whose span contains it. A
+    /// certified file may therefore skip iff no UNCERTIFIED file's span overlaps
+    /// its own — see `read::skippable_certified_files`, which fails closed on a
+    /// missing-statistics span, an empty certified set, and inclusive-bound
+    /// touching.
+    ///
+    /// **Default OFF.** The failure mode is a silent over-count on every
+    /// dashboard tile, and unlike the per-date skip this one has no prod
+    /// exposure yet. Turn on only after diffing `count(*)` with it on and off
+    /// over a CHURNING partition.
+    #[serde(default)]
+    pub timefusion_read_dedup_skip_per_file: bool,
     /// Dedup-as-you-compact experiment (docs/plans/2026-08-20-dedup-and-sort
     /// strategy §3): the on-demand compaction path (`compact_date`, i.e. pgwire
     /// `OPTIMIZE` and the CLI) upgrades its SortBy rewrite to SortByDedup, so

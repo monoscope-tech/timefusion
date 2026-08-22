@@ -2370,6 +2370,107 @@ impl Database {
     /// timestamps each partition's files span — one pass, since the fingerprint
     /// already folds those in and the add-actions scan is the dominant cost of
     /// planning a rollup route.
+    /// Split a window's live Delta files into the ones that may skip
+    /// `DedupExec` and the ones that may not.
+    ///
+    /// The two sets partition the window's in-window files exactly once, which
+    /// is what lets the caller run them as two legs and union the certified one
+    /// ABOVE the dedup — the same shape the per-DATE skip uses, one level finer.
+    /// Both are RELATIVE paths (`parquet_rel_of_uri`).
+    ///
+    /// Returns `(empty, empty)` when the feature is off or the window cannot be
+    /// enumerated, which the caller must read as "no split" rather than "nothing
+    /// certified" — an empty certified set with a populated uncertified set
+    /// would silently drop every file from the scan.
+    pub(crate) fn certified_file_split(
+        &self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64),
+    ) -> (HashSet<String>, HashSet<String>) {
+        let empty = (HashSet::new(), HashSet::new());
+        if !self.config.maintenance.timefusion_read_dedup_skip_per_file {
+            return empty;
+        }
+        let Some(dates) = window_dates(lo, hi) else { return empty };
+        let (mut certified, mut uncertified) = (HashSet::new(), HashSet::new());
+        for date in dates {
+            let date = date.to_string();
+            let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return empty };
+            let skippable = self.certified_files_in_partition(table, project_id, table_name, &date);
+            for rel in spans.into_keys() {
+                match skippable.contains(&rel) {
+                    true => certified.insert(rel),
+                    false => uncertified.insert(rel),
+                };
+            }
+        }
+        // Nothing proved means no split is worth its second scan, and returning
+        // a populated `uncertified` alone would be read as a restriction.
+        if certified.is_empty() { empty } else { (certified, uncertified) }
+    }
+
+    /// The live files of one date partition that a certification still vouches
+    /// for AND that no uncertified file could hold another version of.
+    ///
+    /// This is the additive half of certification. `dedup_window_certified`
+    /// answers the all-or-nothing question — is the partition byte-for-byte the
+    /// one that was proved — and any single new file makes it `false`. Recent
+    /// partitions gain files continuously (ingest, hot-tail compaction, the
+    /// sealed backlog), so in prod that question is `false` essentially always:
+    /// 2026-08-22 measured `dedup_denied_never_certified` at 100% of eligible
+    /// scans. This asks the weaker question instead — WHICH proved files are
+    /// still live and still isolated — and a new file now costs only the files
+    /// it overlaps.
+    ///
+    /// Returns the RELATIVE paths (`parquet_rel_of_uri`) that may skip, or an
+    /// empty set when nothing qualifies. Soundness lives in
+    /// `read::skippable_certified_files`; this only assembles its two inputs.
+    pub(crate) fn certified_files_in_partition(&self, table: &DeltaTable, project_id: &str, table_name: &str, date: &str) -> HashSet<String> {
+        let key = (project_id.to_string(), table_name.to_string(), date.to_string());
+        let Some(cert) = self.dedup_clean_fp.get(&key).map(|entry| entry.value().clone()) else { return HashSet::new() };
+        let Ok(spans) = Self::partition_file_spans(table, &format!("date={date}")) else { return HashSet::new() };
+        // A path the certification names but that no longer appears in `spans`
+        // was compacted away; it cannot vouch for its replacement, so it simply
+        // drops out of the certified side rather than being carried forward.
+        let proved: HashSet<&str> = cert.files.iter().filter_map(|uri| crate::tantivy::search::parquet_rel_of_uri(uri)).collect();
+        let (certified, uncertified): (Vec<_>, Vec<_>) = spans.iter().partition(|(rel, _)| proved.contains(rel.as_str()));
+        crate::read::skippable_certified_files(
+            certified.iter().map(|(rel, span)| (rel.as_str(), **span)),
+            &uncertified.iter().map(|(_, span)| **span).collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// Per-FILE row-timestamp spans for one date partition, keyed by the
+    /// `project_id=…/…parquet` RELATIVE path.
+    ///
+    /// Relative because the two sides of the join spell files differently:
+    /// `partition_files_by_pid` (and therefore a certification's stored list)
+    /// yields full object-store URIs, while the add-actions table yields
+    /// relative paths. `parquet_rel_of_uri` normalises either to the same key,
+    /// so callers must apply it to the certification side too.
+    ///
+    /// `partition_stats_bounded` folds these into one span per PARTITION, which
+    /// is the wrong granularity for the per-file dedup skip: that rule asks
+    /// whether one certified file overlaps one uncertified file. A file whose
+    /// statistics are missing maps to `None`, which the rule treats as
+    /// overlapping everything — never as empty.
+    pub(crate) fn partition_file_spans(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, crate::read::FileSpan>> {
+        let snapshot = table.snapshot()?.snapshot();
+        let actions = snapshot.add_actions_table(true)?;
+        let Some(paths) = actions.column_by_name("path").cloned() else { return Ok(HashMap::new()) };
+        let min_ts = crate::read::ts_micros_column(&actions, "min.timestamp");
+        let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
+        let at = |column: &Option<arrow::array::Int64Array>, row: usize| column.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row)));
+        Ok((0..actions.num_rows())
+            .filter_map(|row| {
+                let path = crate::support::test_helpers::array_get_str(paths.as_ref(), row);
+                let rel = crate::tantivy::search::parquet_rel_of_uri(&path)?.to_string();
+                rel.contains(date_marker).then(|| (rel, at(&min_ts, row).zip(at(&max_ts, row))))
+            })
+            .collect())
+    }
+
     pub(crate) fn partition_stats_bounded(
         table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
     ) -> Result<HashMap<(String, String), PartitionStats>> {
@@ -2688,8 +2789,14 @@ impl Database {
             // certification rather than starting a new one: the sweep re-proved a
             // partition nothing had touched. Keeping the original `since` is what
             // stops a 5-minute sweep cadence from capping every dwell at 5 minutes.
-            let prior = self.dedup_clean_fp.get(&key).map(|e| *e.value()).filter(|prev| prev.fp == fp_post);
-            if let Some(prev) = self.dedup_clean_fp.insert(key, Certification { fp: fp_post, since: prior.map_or_else(std::time::Instant::now, |p| p.since) })
+            let prior = self.dedup_clean_fp.get(&key).map(|e| e.value().clone()).filter(|prev| prev.fp == fp_post);
+            // `post` is the very file list the pass proved clean. It was hashed
+            // into `fp_post` and discarded; keeping it is what lets the per-FILE
+            // skip ask "which of these files are still live" after the partition
+            // has gained one.
+            let files: Arc<[String]> = Arc::from(post.clone());
+            if let Some(prev) =
+                self.dedup_clean_fp.insert(key, Certification { fp: fp_post, since: prior.as_ref().map_or_else(std::time::Instant::now, |p| p.since), files, stale: false })
                 && prev.fp != fp_post
             {
                 self.scan_metrics.record_cert_dwell(prev.since);
@@ -2778,7 +2885,7 @@ impl Database {
             // Bound in a `let`, NOT inlined as the match scrutinee: a DashMap `Ref`
             // temporary in a scrutinee lives until the end of the match, and the
             // stale arm below removes from the same shard — a self-deadlock.
-            let certified = self.dedup_clean_fp.get(&fp_key).map(|entry| *entry.value());
+            let certified = self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().clone());
             match certified {
                 Some(cert) if cert.fp == partition_file_fp(files) => {
                     certified_any = true;
@@ -2791,8 +2898,25 @@ impl Database {
                     // once rather than on every read that trips over it — but only if
                     // it is still the value we read, so a sweep that re-certified in
                     // the gap does not lose its fresh entry.
-                    if self.dedup_clean_fp.remove_if(&fp_key, |_, live| live.fp == cert.fp).is_some() {
-                        self.scan_metrics.record_cert_dwell(cert.since);
+                    // With the per-FILE skip on, the entry is KEPT and merely
+                    // marked stale: its file list stays true of the files it
+                    // names, and deleting it would destroy the evidence for
+                    // every file the new one does not overlap. Dwell is still
+                    // recorded exactly once, on the transition.
+                    match self.config.maintenance.timefusion_read_dedup_skip_per_file {
+                        false => {
+                            if self.dedup_clean_fp.remove_if(&fp_key, |_, live| live.fp == cert.fp).is_some() {
+                                self.scan_metrics.record_cert_dwell(cert.since);
+                            }
+                        }
+                        true if !cert.stale => {
+                            self.dedup_clean_fp.alter(&fp_key, |_, mut live| {
+                                live.stale = true;
+                                live
+                            });
+                            self.scan_metrics.record_cert_dwell(cert.since);
+                        }
+                        true => {}
                     }
                     saw_fp_moved = true;
                 }
@@ -3213,13 +3337,14 @@ impl Database {
             .dedup_clean_fp
             .iter()
             .map(|entry| {
-                let ((project_id, table_name, date), cert) = (entry.key().clone(), *entry.value());
+                let ((project_id, table_name, date), cert) = (entry.key().clone(), entry.value().clone());
                 crate::storage::StoredCertification {
                     project_id,
                     table_name,
                     date,
                     fp: cert.fp,
                     granted_unix_ms: now_ms.saturating_sub(cert.since.elapsed().as_millis() as u64),
+                    files: cert.files.to_vec(),
                 }
             })
             .collect();

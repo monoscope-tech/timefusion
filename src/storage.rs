@@ -3487,6 +3487,12 @@ pub struct StoredCertification {
     /// it exists so dwell measures a certification's real lifetime instead of
     /// restarting at every deploy.
     pub granted_unix_ms: u64,
+    /// The file paths the certifying pass proved clean, for the per-FILE skip.
+    /// `default` so stores written before this field load as "no per-file
+    /// evidence" rather than failing — those certifications still serve the
+    /// whole-partition skip through `fp`.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 /// Wall-clock ms since the epoch, now.
