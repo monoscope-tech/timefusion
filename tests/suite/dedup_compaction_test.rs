@@ -2737,6 +2737,74 @@ async fn backfill_covers_sealed_days_and_legacy_coverage_falls_back_after_restar
     let restarted = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let recovered = restarted.recover_rollup_coverage("otel_logs_and_spans").await?;
     assert!(recovered > 0, "tagged coverage must survive a restart without a fresh sweep");
+
+    // What recovery restores is SLICE coverage only. The date-level map is a
+    // separate route through `ProjectRoutingTable::scan`, and it is dead — see
+    // the ignored test below, which is this same state asserted as the bug.
+    assert_eq!(db.rollup_coverage_entries(), 0, "date-level coverage is currently never produced — see rollup_coverage_is_never_populated");
+    Ok(())
+}
+
+/// The date-level `rollup_coverage` map has **no producer**, so every routed
+/// query in production depends solely on slice coverage.
+///
+/// Every use of the private field in the crate is a read (the routing lookup in
+/// `mod.rs`) or a removal (`maintain.rs` x2). There is no `insert`, `entry` or
+/// `or_insert` anywhere — so it cannot be non-empty, and the date-level lookup
+/// returns `None` for every date on every process.
+/// `maintenance_coordinator.rs` still documents "`recover_rollup_coverage` is
+/// the only producer"; that function writes only `rollup_slice_coverage`.
+///
+/// It leaves no trace at runtime: the `None` branch deliberately `continue`s
+/// WITHOUT setting a miss reason, so queries fall through to slice coverage and
+/// are correct, merely unrouted. No miss, no error, no log — which is how it
+/// survived long enough for two comments to describe a mechanism that had gone.
+///
+/// Why it matters: slice coverage is exactly the path gated by the per-slice
+/// witness rule, and prod 2026-08-22 measured `stale_coverage` as the SOLE miss
+/// reason on every bare dashboard shape with `rollup_hits_* = 0`. There is no
+/// second route to fall back on because the second route is inert.
+///
+/// `#[ignore]`d because it FAILS today and the fix is not observability — it is
+/// writing coverage identity (`source_fp`, `source_epoch`, `generation`,
+/// `covered_through`) that the read path trusts to let a rollup serve a range.
+/// Getting that wrong serves rows the rollup never aggregated, the
+/// silent-wrong-number failure this module warns about twice. Un-ignore it as
+/// the first step of that fix.
+#[serial]
+#[ignore = "documents a known defect: rollup_coverage has no producer (2026-08-22)"]
+#[tokio::test]
+async fn rollup_coverage_is_never_populated() -> Result<()> {
+    // Same fixture as `backfill_covers_sealed_days_…` above, which is the test
+    // that proves these units really commit. Reusing its shape matters: a bare
+    // config drains ZERO units, and this test then fails on an empty drain while
+    // appearing to prove the defect. It did exactly that on first run.
+    let mut cfg = (*TestConfigBuilder::new("rollup_cov_producer").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    cfg.maintenance.timefusion_rollup_backfill_days = 7;
+    let cfg = Arc::new(cfg);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let today = chrono::Utc::now().date_naive();
+    for back in [5i64, 4] {
+        let ts = (today - chrono::Duration::days(back)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        let batch = json_to_batch(vec![serde_json::json!({
+            "timestamp": ts, "id": format!("d{back}"), "name": "op", "project_id": project_id, "hashes": [], "summary": ["coverage fixture"],
+            "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string(),
+            "duration": 100, "kind": "server", "status_code": "OK", "resource___service___name": "cart",
+        })])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    }
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+    db.plan_rollup_backfill().await?;
+    timefusion::support::advance_micros(16 * 60 * 1_000_000);
+    let built = db.drain_coordinator_rollups(64).await?;
+    // Guard against a vacuous verdict: an empty drain would "prove" the defect
+    // without ever exercising the commit path that should record coverage.
+    assert!(built > 0, "no rollup units ran, so this says nothing about coverage recording");
+    assert!(db.rollup_coverage_entries() > 0, "a committed rollup must record DATE-level coverage, not only slice coverage");
     Ok(())
 }
 
