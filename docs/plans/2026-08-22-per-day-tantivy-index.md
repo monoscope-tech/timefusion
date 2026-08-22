@@ -351,3 +351,35 @@ argument that stands on measurement alone is the narrower one — newest-first
 ordering starves the tail, which three frozen samples establish without needing
 any rate at all. Anyone reaching for the hot-tail change should re-measure
 `today`'s accrual in a quiet window first, not cite the retracted number.
+
+### 14:52 — `today` accrual is ~33/hr, and the reservation is not delivering
+
+| time | total | today | week | older |
+|---|---|---|---|---|
+| 13:13 | 5920 | 741 | 1723 | 3456 |
+| 14:13 | 5954 | 775 | 1723 | 3456 |
+| 14:52 | 5975 | 796 | 1723 | 3456 |
+
+Two spans that do not share an interval now agree: +34/hr and +32/hr for
+`today`. Both still cross restarts, so treat it as an order of magnitude rather
+than a figure — but **~33/hr, not ~220/hr**, and the retraction above was right
+to be made.
+
+That reframes the problem a third time. A 150-file pass is not remotely
+outmatched by 33 files/hr of accrual; it should cover `today` and still have
+~120 files of headroom for the tail every hour. Yet `week` has not moved off
+1723 in nearly two hours and `older` has not moved off 3456 since 13:13.
+
+**So the binding constraint is not accrual, not ordering, and not the cap — it
+is that a pass never finishes.** The tail reservation only pays out when a pass
+completes, and none has: restarts have come every 15-30 minutes all afternoon.
+Last night's note records the same thing without restarts to blame — a 60-minute
+pass with no completion line on a container that never restarted.
+
+**Do not ship another throughput or ordering change against this.** The next
+question is a different one: why does a 150-file pass take longer than an hour
+when the work is ~150 small-file index builds, and can a pass checkpoint its
+progress so a restart does not discard it? A pass that completes at ANY size
+beats a larger one that never does — and nothing in the cap's history
+(400 -> 150, sized for observability) considered that a pass must fit inside the
+mean time between restarts.
