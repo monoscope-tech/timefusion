@@ -693,8 +693,11 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_min_files_for_pushdown: usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
     /// the `id IN (...)` pushdown entirely — the IN-list itself becomes the
-    /// bottleneck above this point. Default 100k.
-    #[serde_inline_default(100_000)]
+    /// bottleneck above this point. Default 2k: measured 2026-08-22, a
+    /// 3,346-literal IN cost ~2.4s of planning and a 59k one ~28s, so the
+    /// old 100k cap admitted pushdowns that were strictly slower than the
+    /// scan they replaced.
+    #[serde_inline_default(2_000)]
     pub timefusion_tantivy_prefilter_max_hits: usize,
     /// If a tantivy prefilter selects more than this percentage of the
     /// indexed rows, the pushdown isn't worth the round-trip; skip it and
@@ -799,11 +802,11 @@ pub struct TantivyConfig {
     /// query takes 1.7-3.2s, so back-to-back queries routinely straddled it and
     /// re-GET + re-parsed a 745 KB, 950-entry manifest on the planning path.
     /// Safe to lengthen: publishing an index invalidates this process's cached
-    /// entry, so our own indexer is never unseen. It does still bound staleness
-    /// against writers we don't observe — other processes (the repair CLI), and
-    /// `gc_after_compaction`, which prunes entries without invalidating here. A
-    /// stale entry only ever costs a wasted lookup against a deleted blob, which
-    /// the prefilter treats as "no usable index" and falls back from.
+    /// entry, so our own indexer is never unseen; `gc_after_compaction` drops
+    /// it, so our own pruning is never unseen either. It does still bound
+    /// staleness against writers we don't observe — other processes, e.g. the
+    /// repair CLI. A stale entry only ever costs a wasted lookup against a
+    /// deleted blob, which the prefilter treats as "no usable index".
     #[serde_inline_default(300)]
     pub timefusion_tantivy_manifest_ttl_secs: u64,
     /// Max index builds one reconcile pass will start. Bounds a pass so it can
@@ -1820,6 +1823,29 @@ pub struct MaintenanceConfig {
     /// nightly cadence in the first place.
     #[serde_inline_default("0 20 * * * *".to_string())]
     pub timefusion_tantivy_reconcile_schedule: String,
+    /// File-level needle pruning: consult per-file bloom sidecars at
+    /// file-selection time so point lookups (trace_id/id/span_id…) scan only
+    /// files that can contain the needle. Kill switch for the read path; the
+    /// sidecar builder cron is keyed off the same flag.
+    /// docs/plans/2026-08-22-file-level-needle-pruning.md
+    #[serde_inline_default(true)]
+    pub timefusion_file_bloom_pruning: bool,
+    /// Bloom sidecar reconcile: lift parquet blooms of uncovered live files
+    /// into per-(project,date) sidecars, GC retired entries. Each pass is
+    /// bounded by `timefusion_bloom_sidecar_files_per_pass`, newest dates
+    /// first so hot partitions converge first.
+    #[serde_inline_default("0 */5 * * * *".to_string())]
+    pub timefusion_bloom_sidecar_schedule: String,
+    #[serde_inline_default(512)]
+    pub timefusion_bloom_sidecar_files_per_pass: usize,
+    /// Resident registry cap; sidecars beyond it are re-fetched on demand
+    /// (off the plan path — a miss only skips pruning for that query).
+    #[serde_inline_default(256)]
+    pub timefusion_bloom_registry_cap_mb: usize,
+    /// Re-fetch a resident sidecar this often so entries built since the
+    /// last load start pruning without a restart.
+    #[serde_inline_default(300)]
+    pub timefusion_bloom_registry_refresh_secs: u64,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.
@@ -2349,6 +2375,9 @@ mod tests {
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
         assert_eq!(cfg.manifest_ttl(), Duration::from_secs(300));
+        // Load-bearing against the hourly reconcile tick, not a free tuning
+        // knob: a cap whose pass outruns the interval stops reporting per pass.
+        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 150);
 
         let derived = TantivyConfig::default();
         assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");

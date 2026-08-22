@@ -43,8 +43,17 @@ lint-fix:
 # push passed local `cargo lint` and the full suite, then failed CI on two
 # rustfmt line-break diffs alone. A red CI on master blocks the deploy queue for
 # everyone, which is far more expensive than the second this costs.
+#
+# The e2e line is a SECOND invocation on purpose. `cargo nextest run` silently
+# skips that binary — it is behind `--features e2e` — so a gate without this
+# line reports green over tests it never compiled, which is how a tantivy change
+# shipped uncovered on 2026-08-21. Kept separate rather than folding `--features
+# e2e` into one run: feature unification would build the main suite differently
+# from the plain `cargo nextest run` CI uses, gating on a binary CI never tests.
+# Costs ~140s; that is the price of the gate meaning what it says.
 prepush: fmt lint
 	RUST_LOG=off cargo nextest run $${ARGS}
+	RUST_LOG=off cargo nextest run --features e2e -E 'binary(e2e)' $${ARGS}
 
 # CI's exact formatting gate (ci.yml "Format"). rust-toolchain.toml pins the
 # channel, so this is the same rustfmt CI runs.

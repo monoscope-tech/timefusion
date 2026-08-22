@@ -1702,6 +1702,7 @@ impl TaskJournal {
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let task = &mut self.snapshot.tasks[index];
         task.state = TaskState::Retry;
+        tracing::debug!(?key, %reason, attempts = task.attempts, not_before_micros, "maintenance task retry");
         crate::observability::set_maintenance_retry_reason(&reason);
         task.retry_reason = Some(reason);
         task.deadline_micros = not_before_micros;

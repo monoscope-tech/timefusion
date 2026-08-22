@@ -289,6 +289,39 @@ async fn publishing_keeps_the_manifest_cache_warm_and_current() {
     assert!(ids.contains(&"b"), "the just-published entry must be visible without a reload, got {ids:?}");
 }
 
+/// The mirror image of the test above, and the reason both are needed: a
+/// publish must NOT drop the cached manifest, but a GC MUST. GC prunes entries
+/// on S3 and deletes their blobs; leaving this process's copy cached would keep
+/// the plan path routing at a blob that no longer exists for up to a full TTL.
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_after_compaction_drops_the_cached_manifest() {
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p-manifest-gc";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cfg = Arc::new(prod_defaults());
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
+    let cache = TempDir::new().unwrap();
+    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
+    svc.with_reader(&search);
+    let cb = svc.clone().callback();
+
+    for (ts, id, uri) in [(1_000_000, "a", "f1"), (2_000_000, "b", "f2")] {
+        cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
+    }
+    let warm = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
+    assert_eq!(warm.len(), 2, "both publishes should be visible before the GC");
+    let loads_before = search.stats.manifest_loads.load(Relaxed);
+
+    // f2 is no longer live — compaction rewrote it away.
+    let report = svc.gc_after_compaction(table_name, project_id, &["f1".to_string()]).await.unwrap();
+    assert_eq!(report.entries_removed, 1);
+
+    let after = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
+    assert!(search.stats.manifest_loads.load(Relaxed) > loads_before, "GC must invalidate the cache so the next query reloads the pruned manifest");
+    let ids: Vec<_> = after.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, ["a"], "the GC'd entry must not be consulted, got {ids:?}");
+}
+
 /// An object store that serves normally until `arm()`, then fails every GET.
 /// Lets a test assert "this read did not go to S3" positively, rather than by
 /// inferring it from a counter that a future refactor could stop incrementing.
@@ -488,4 +521,33 @@ async fn search_skips_indexes_that_dont_have_the_field() {
     // ARE indexed now (P0 equality routing), so this uses a still-unindexed field.
     let hits = search.search(table_name, project_id, "context___trace_state", "anything").await.unwrap();
     assert!(hits.is_none());
+}
+
+#[tokio::test]
+async fn a_fat_needle_aborts_before_materializing_hits() {
+    // Prod 2026-08-22 (P5/P4 anomaly): a needle matching ~4.5M of 4.9M rows
+    // cost 4-6s of UNCACHEABLE plan time per query because search_with_stats
+    // materialized whole per-index hit vectors (TopDocs cap 1M, doc-store read
+    // per hit) before the cumulative max_hits abort threw the work away. The
+    // abort verdict must be reached by counting, not by materializing O(hits).
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p-fatneedle";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(prod_defaults())));
+    let cb = svc.callback();
+    let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
+    let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
+    cb(project_id.to_string(), table_name.to_string(), vec![batch(&rows_ref)], vec!["fat-uri".into()]).await.unwrap();
+
+    let cache = TempDir::new().unwrap();
+    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(prod_defaults()));
+    let r = search.search_with_stats(table_name, project_id, &level_error_node(), 10, None).await.unwrap();
+    assert!(r.is_none(), "an over-cap needle must abort the prefilter");
+    let materialized = search.stats.hits_materialized.load(Relaxed);
+    assert!(materialized <= 22, "abort must not materialize O(total hits); materialized {materialized} for cap 10");
+
+    // And a selective needle on the same index still completes untruncated.
+    let node = timefusion::tantivy::udf::PredNode::Leaf(TextMatchPred { column: "id".into(), query: "id-7".into() });
+    let r = search.search_with_stats(table_name, project_id, &node, 10, None).await.unwrap().expect("usable");
+    assert_eq!(r.hits.len(), 1);
 }

@@ -784,6 +784,7 @@ pub struct StatsTableProvider {
     query_pool: Option<PoolSnapshot>,
     logical_count: Option<LogicalCountSnapshot>,
     tantivy_search: Option<Arc<crate::tantivy::search::TantivySearchService>>,
+    bloom_prune: Option<Arc<crate::read::bloom_prune::BloomPruneRegistry>>,
     schema: SchemaRef,
 }
 
@@ -794,7 +795,17 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, query_pool: None, logical_count: None, tantivy_search: None, schema }
+        Self {
+            layer,
+            scan_metrics: None,
+            cache_sizes: None,
+            foyer_stats: None,
+            query_pool: None,
+            logical_count: None,
+            tantivy_search: None,
+            bloom_prune: None,
+            schema,
+        }
     }
 
     pub fn with_scan_metrics(self, m: Arc<ScanMetrics>) -> Self {
@@ -823,6 +834,11 @@ impl StatsTableProvider {
     /// look like an idle index.
     pub fn with_tantivy_search_opt(self, s: Option<Arc<crate::tantivy::search::TantivySearchService>>) -> Self {
         Self { tantivy_search: s, ..self }
+    }
+
+    /// Same posture as tantivy: absent registry ⇒ no `bloom_prune` component.
+    pub fn with_bloom_prune_opt(self, r: Option<Arc<crate::read::bloom_prune::BloomPruneRegistry>>) -> Self {
+        Self { bloom_prune: r, ..self }
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
@@ -1296,7 +1312,9 @@ impl StatsTableProvider {
                 "queries" => q,
                 "indexes_searched_total" => idx,
                 "indexes_per_query" => avg(idx, q),
+                "searches" => s.searches.load(Relaxed),
                 "search_us_avg" => mean(&s.search_us, &s.searches),
+                "hits_materialized" => s.hits_materialized.load(Relaxed),
                 "manifest_loads" => ml,
                 "manifest_hits" => mh,
                 "manifest_hit_pct" => pct(mh, mh + ml),
@@ -1314,10 +1332,56 @@ impl StatsTableProvider {
                 "search_concurrency" => svc.config.search_concurrency(),
                 "cache_seeded" => s.cache_seeded.load(Relaxed),
                 "cache_seed_failures" => s.cache_seed_failures.load(Relaxed),
+                // Raw cumulative microseconds, alongside the means above,
+                // because a MEAN CANNOT BE DIFFERENCED: each `*_us_avg` divides
+                // by its own denominator (`search_us_avg` by per-index
+                // `searches`, not by `queries`), so reconstructing a total as
+                // avg*count silently mixes denominators — an attribution probe
+                // built that way reported NEGATIVE per-query search time. These
+                // are monotonic, so a before/after delta around a single query
+                // is that query's exact spend, per phase.
+                //
+                // Read `search_us_total` as occupancy, not wall clock: per-index
+                // searches run `search_concurrency`-way, so the sum exceeds the
+                // wall time it cost, by up to that factor.
+                "manifest_load_us_total" => s.manifest_load_us.load(Relaxed),
+                "blob_fetch_us_total" => s.blob_fetch_us.load(Relaxed),
+                "index_open_us_total" => s.index_open_us.load(Relaxed),
+                "search_us_total" => s.search_us.load(Relaxed),
+                // Closes the attribution gap the four above left open: a routed
+                // 7d equality cost ~420ms more than its unrouted twin while
+                // search_us accounted for only ~45ms of it, with zero IO. The
+                // time is somewhere between "task starts" and "search timer
+                // starts", or in the merge — which is exactly what these three
+                // separate. fanout_us minus prepare_us minus search_us is the
+                // result-merge bookkeeping.
+                "plan_us_total" => s.plan_us.load(Relaxed),
+                "prepare_us_total" => s.prepare_us.load(Relaxed),
+                "prepares" => s.prepares.load(Relaxed),
+                "fanout_us_total" => s.fanout_us.load(Relaxed),
             ]
         });
 
-        let rows: Vec<Row> = [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, tantivy, parquet, cache_sizes]
+        // File-level needle pruning (bloom sidecars). `files_rejected` /
+        // `files_probed` is the pruning rate; `registry_misses` trending to 0
+        // says the resident set covers the queried window.
+        let bloom_prune = self.bloom_prune.as_ref().map_or_else(Vec::new, |reg| {
+            let s = &reg.stats;
+            rows!["bloom_prune";
+                "queries_pruned" => s.queries_pruned.load(Relaxed),
+                "files_probed" => s.files_probed.load(Relaxed),
+                "files_rejected" => s.files_rejected.load(Relaxed),
+                "registry_hits" => s.registry_hits.load(Relaxed),
+                "registry_misses" => s.registry_misses.load(Relaxed),
+                "loads" => s.loads.load(Relaxed),
+                "load_errors" => s.load_errors.load(Relaxed),
+                "build_files" => s.build_files.load(Relaxed),
+                "build_errors" => s.build_errors.load(Relaxed),
+                "resident_bytes" => reg.resident_bytes(),
+            ]
+        });
+
+        let rows: Vec<Row> = [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, tantivy, bloom_prune, parquet, cache_sizes]
             .into_iter()
             .flatten()
             .collect();

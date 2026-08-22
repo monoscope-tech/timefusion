@@ -2278,6 +2278,7 @@ pub struct Database {
     /// builders after boot has already cloned Database into sessions/planners.
     tantivy_search: Arc<std::sync::OnceLock<Arc<crate::tantivy::search::TantivySearchService>>>,
     tantivy_indexer: Arc<std::sync::OnceLock<Arc<crate::tantivy::search::TantivyIndexService>>>,
+    bloom_prune: Arc<std::sync::OnceLock<Arc<crate::read::bloom_prune::BloomPruneRegistry>>>,
     /// Same late-binding pattern; populated by `start_dml_coalescer` when
     /// `TIMEFUSION_DML_COALESCE_SECS > 0`.
     dml_coalescer: Arc<std::sync::OnceLock<Arc<crate::dml::DmlCoalescer>>>,
@@ -2817,6 +2818,7 @@ impl Database {
             maintenance_scan: false,
             tantivy_search: Arc::new(std::sync::OnceLock::new()),
             tantivy_indexer: Arc::new(std::sync::OnceLock::new()),
+            bloom_prune: Arc::new(std::sync::OnceLock::new()),
             dml_coalescer: Arc::new(std::sync::OnceLock::new()),
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
@@ -2898,6 +2900,15 @@ impl Database {
 
     pub fn tantivy_indexer(&self) -> Option<&Arc<crate::tantivy::search::TantivyIndexService>> {
         self.tantivy_indexer.get()
+    }
+
+    pub fn with_bloom_prune(self, reg: Arc<crate::read::bloom_prune::BloomPruneRegistry>) -> Self {
+        let _ = self.bloom_prune.set(reg);
+        self
+    }
+
+    pub fn bloom_prune(&self) -> Option<&Arc<crate::read::bloom_prune::BloomPruneRegistry>> {
+        self.bloom_prune.get().filter(|_| self.config.maintenance.timefusion_file_bloom_pruning)
     }
 
     /// Startup backfill (gated on `timefusion_tantivy_backfill`): build
@@ -3103,6 +3114,91 @@ impl Database {
         stats.tantivy_uncovered_files.store(uncovered, std::sync::atomic::Ordering::Relaxed);
         stats.tantivy_oversized_skipped.store(oversized, std::sync::atomic::Ordering::Relaxed);
         Ok((uncovered, oversized))
+    }
+
+    /// Bloom sidecar reconcile: for every table with bloom-enabled columns,
+    /// diff live parquet against the per-(project,date) sidecars, lift the
+    /// missing files' parquet blooms (footer + bloom ranges, no row decode)
+    /// and GC entries for retired files. Newest dates first; bounded per
+    /// pass. docs/plans/2026-08-22-file-level-needle-pruning.md
+    pub async fn bloom_sidecar_reconcile(&self) -> anyhow::Result<(usize, usize)> {
+        use crate::read::bloom_prune;
+        let Some(reg) = self.bloom_prune().cloned() else { return Ok((0, 0)) };
+        let mut budget = self.config.maintenance.timefusion_bloom_sidecar_files_per_pass;
+        let (mut built, mut errors) = (0usize, 0usize);
+        for table_name in crate::schema::registry().list_tables() {
+            let Some(schema) = crate::schema::get_schema(&table_name) else { continue };
+            let cols: Vec<String> = schema.fields.iter().filter(|f| f.bloom_filter).map(|f| f.name.clone()).collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let mut roots: Vec<String> = vec!["default".into()];
+            roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| *t == table_name).map(|(p, _)| p.clone()));
+            for root in roots {
+                if budget == 0 {
+                    return Ok((built, errors));
+                }
+                let Ok(table_ref) = self.resolve_table(&root, &table_name).await else { continue };
+                let (rels, delta_store) = {
+                    let t = table_ref.read().await;
+                    let rels: Vec<(String, u64)> = match t.snapshot() {
+                        Ok(s) => s.log_data().iter().map(|f| (f.path().into_owned(), f.size() as u64)).collect(),
+                        Err(_) => continue,
+                    };
+                    (rels, t.log_store().object_store(None))
+                };
+                // Group by (project, date); newest dates first so the hot
+                // partitions a 24h point lookup touches converge first.
+                let mut by_pd: HashMap<(String, String), Vec<(String, u64)>> = HashMap::new();
+                for (rel, size) in rels.into_iter().filter(|(rel, _)| rel.ends_with(".parquet")) {
+                    if let Some((pid, date)) = bloom_prune::project_date_of_rel(&rel) {
+                        by_pd.entry((pid.to_string(), date.to_string())).or_default().push((rel, size));
+                    }
+                }
+                let mut cells: Vec<_> = by_pd.into_iter().collect();
+                cells.sort_by(|a, b| b.0.1.cmp(&a.0.1));
+                for ((pid, date), files) in cells {
+                    if budget == 0 {
+                        return Ok((built, errors));
+                    }
+                    let existing = reg.load_sidecar_raw(&table_name, &pid, &date).await.unwrap_or_default();
+                    let existing_count = existing.files.len();
+                    let live: HashMap<&str, u64> = files.iter().map(|(rel, size)| (rel.as_str(), *size)).collect();
+                    let mut kept: Vec<bloom_prune::FileBlooms> = existing.files.into_iter().filter(|f| live.contains_key(f.rel.as_str())).collect();
+                    let known: HashSet<&str> = kept.iter().map(|f| f.rel.as_str()).collect();
+                    let missing: Vec<(String, u64)> =
+                        files.iter().filter(|(rel, _)| !known.contains(rel.as_str())).map(|(rel, size)| (rel.clone(), *size)).take(budget).collect();
+                    if missing.is_empty() && kept.len() == existing_count {
+                        continue; // converged: nothing new, nothing retired
+                    }
+                    budget = budget.saturating_sub(missing.len());
+                    let mut results = futures::stream::iter(missing.into_iter().map(|(rel, size)| {
+                        let store = delta_store.clone();
+                        let cols = cols.clone();
+                        async move { bloom_prune::build_file_blooms(store, &rel, size, &cols).await }
+                    }))
+                    .buffer_unordered(4);
+                    while let Some(res) = results.next().await {
+                        match res {
+                            Ok(fb) => {
+                                built += 1;
+                                reg.stats.build_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                kept.push(fb);
+                            }
+                            Err(e) => {
+                                errors += 1;
+                                reg.stats.build_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                debug!(table_name, project_id = %pid, date, "bloom sidecar build failed: {e:#}");
+                            }
+                        }
+                    }
+                    if let Err(e) = reg.store_sidecar(&table_name, &pid, &date, bloom_prune::DateSidecar { files: kept }).await {
+                        warn!(table_name, project_id = %pid, date, "bloom sidecar store failed: {e:#}");
+                    }
+                }
+            }
+        }
+        Ok((built, errors))
     }
 
     async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy::search::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
@@ -3938,6 +4034,18 @@ impl Database {
             }
         });
 
+        spawn_db_cron(&db, "Bloom sidecar reconcile", &self.config.maintenance.timefusion_bloom_sidecar_schedule, cancel.clone(), |db| async move {
+            if db.bloom_prune().is_none() {
+                return;
+            }
+            match db.bloom_sidecar_reconcile().await {
+                // Logged on no-op too: "ran and found nothing" must stay
+                // distinguishable from "never ran" (the tantivy lesson).
+                Ok((built, errors)) => info!("bloom sidecar reconcile: built={built} errors={errors}"),
+                Err(e) => warn!("bloom sidecar reconcile failed: {e:#}"),
+            }
+        });
+
         // Tantivy cache reap — bound the extracted-index disk tree. The only
         // thing that deletes from it: `gc_after_compaction` reaps manifest
         // entries and object-store blobs, but never the local extraction, and
@@ -4286,7 +4394,8 @@ impl Database {
                         let size = self.config.derived.query_pool_bytes();
                         Arc::new(move || (env.memory_pool.reserved(), size))
                     })
-                    .with_tantivy_search_opt(self.tantivy_search().cloned()),
+                    .with_tantivy_search_opt(self.tantivy_search().cloned())
+                    .with_bloom_prune_opt(self.bloom_prune().cloned()),
             ),
         )?;
 
@@ -7552,54 +7661,77 @@ impl ProjectRoutingTable {
     async fn scan_delta_with_tantivy(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>, id_filter: Option<&Expr>,
         covered_files: Option<&HashSet<String>>, zero_hit_files: Option<&HashSet<String>>, row_selections: Option<&HashMap<String, Vec<u64>>>,
-        query_time_range: Option<(i64, i64)>, date_restrict: Option<&HashSet<String>>,
+        query_time_range: Option<(i64, i64)>, bloom_rejected: Option<&HashSet<String>>, date_restrict: Option<&HashSet<String>>,
     ) -> DFResult<Vec<Arc<dyn ExecutionPlan>>> {
         let narrow = |filters: &[Expr]| filters.iter().cloned().chain(id_filter.cloned()).collect::<Vec<_>>();
-        let (lo, hi) = query_time_range.unwrap_or((i64::MIN, i64::MAX));
         // Per-date dedup skip: restrict this call's whole file universe to one
         // side of the certified/uncertified split, so two calls partition the
-        // in-window files exactly once between them. A file whose URI carries no
-        // `date=` partition cannot be attributed and is left to the uncertified
-        // side (`is_none_or` below is deliberately asymmetric: unknown ⇒ dedup).
-        let restricted: Option<HashSet<String>> = date_restrict
-            .map(|dates| {
-                Ok::<_, DataFusionError>(
-                    table
-                        .get_file_uris()
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?
-                        .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi))
-                        .filter(|uri| crate::storage::date_partition_of(uri).is_some_and(|d| dates.contains(&d.to_string())))
-                        .collect::<HashSet<String>>(),
-                )
-            })
-            .transpose()?;
-        // Nothing on this side of the split — emit no plan rather than falling
-        // through to an unrestricted scan, which would double-count.
-        if restricted.as_ref().is_some_and(HashSet::is_empty) {
-            return Ok(Vec::new());
-        }
+        // in-window files exactly once between them. A file whose URI carries
+        // no `date=` partition cannot be attributed, so it fails this test and
+        // lands on the uncertified (still-deduped) side — the safe default.
+        let in_dates = |uri: &String| date_restrict.is_none_or(|dates| crate::storage::date_partition_of(uri).is_some_and(|d| dates.contains(&d.to_string())));
+        // Bloom-rejected rels apply to EVERY branch here — unlike
+        // `zero_hit_files` they must reach the raw (uncovered) leg, which is
+        // where the un-prunable file mass lives. `exclude_files` is ignored
+        // by `scan_delta_table` whenever an include set exists, so the split
+        // path filters the live universe instead of passing excludes down.
+        let is_rejected = |uri: &String| bloom_rejected.is_some_and(|r| crate::tantivy::search::parquet_rel_of_uri(uri).is_some_and(|rel| r.contains(rel)));
+        // Full-URI exclude set for the single-provider paths (include=None,
+        // so exclude semantics apply), merged with any zero-hit excludes.
+        let merged_exclude = |table: &DeltaTable| -> Option<HashSet<String>> {
+            let rejected: HashSet<String> = bloom_rejected
+                .filter(|r| !r.is_empty())
+                .map(|_| table.get_file_uris().ok().map(|uris| uris.filter(|u| u.ends_with(".parquet") && is_rejected(u)).collect()).unwrap_or_default())
+                .unwrap_or_default();
+            match (rejected.is_empty(), zero_hit_files) {
+                (true, _) => None, // caller falls back to zero_hit_files alone
+                (false, Some(zero)) => Some(rejected.union(zero).cloned().collect()),
+                (false, None) => Some(rejected),
+            }
+        };
+        let (lo, hi) = query_time_range.unwrap_or((i64::MIN, i64::MAX));
         let Some(covered) = covered_files else {
             let narrowed = narrow(filters);
-            return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, restricted.as_ref(), zero_hit_files, row_selections).await?]);
+            let merged = merged_exclude(table);
+            let exclude = merged.as_ref().or(zero_hit_files);
+            // Under a date split `exclude` is not enough — `scan_delta_table`
+            // ignores excludes whenever an include exists, and we need an
+            // include to bound this call to its side. Build it explicitly.
+            let include: Option<HashSet<String>> = date_restrict
+                .map(|_| {
+                    Ok::<_, DataFusionError>(
+                        table
+                            .get_file_uris()
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?
+                            .filter(|u| u.ends_with(".parquet") && uri_date_in_window(u, lo, hi) && in_dates(u) && !is_rejected(u))
+                            .filter(|u| !exclude.is_some_and(|e| e.contains(u)))
+                            .collect::<HashSet<String>>(),
+                    )
+                })
+                .transpose()?;
+            if include.as_ref().is_some_and(HashSet::is_empty) {
+                return Ok(Vec::new()); // nothing on this side of the split
+            }
+            return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, include.as_ref(), exclude, row_selections).await?]);
         };
 
-        let live: Box<dyn Iterator<Item = String>> = match &restricted {
-            Some(files) => Box::new(files.iter().cloned()),
-            None => Box::new(
-                table
-                    .get_file_uris()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-                    .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi)),
-            ),
-        };
+        let mut bloom_pruned_any = false;
+        let live = table
+            .get_file_uris()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi))
+            .filter(|uri| {
+                let rejected = is_rejected(uri);
+                bloom_pruned_any |= rejected;
+                !rejected
+            })
+            .filter(in_dates);
         let (mut indexed, raw): (HashSet<String>, HashSet<String>) = live.partition(|uri| covered.contains(uri));
         // Complete coverage keeps the established single-provider fast path.
         // The split is only needed when the exact snapshot has raw debt.
-        if raw.is_empty() && !indexed.is_empty() {
+        if raw.is_empty() && !indexed.is_empty() && !bloom_pruned_any && date_restrict.is_none() {
             let narrowed = narrow(filters);
-            // `restricted` (not None) when a date split is active: an
-            // unrestricted scan here would read the other side's files too.
-            return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, restricted.as_ref(), zero_hit_files, row_selections).await?]);
+            return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?]);
         }
         if let Some(zero) = zero_hit_files {
             indexed.retain(|uri| !zero.contains(uri));
@@ -7613,13 +7745,27 @@ impl ProjectRoutingTable {
         if !raw.is_empty() {
             plans.push(self.scan_delta_table(table, state, projection, filters, limit, Some(&raw), None, None).await?);
         }
-        // A time window can be wholly outside the snapshot's partition dates.
-        // Keep the provider path available as a conservative fallback rather
-        // than manufacturing an empty plan with a subtly different schema.
-        // Not under a date split: there, an empty side is a real empty side and
-        // the unrestricted fallback would read the other side's files.
-        if plans.is_empty() && restricted.is_none() {
-            plans.push(self.scan_delta_table(table, state, projection, filters, limit, None, None, None).await?);
+        // Under a date split an empty side is a real empty side; the
+        // unrestricted fallback below would read the OTHER side's files.
+        if plans.is_empty() && date_restrict.is_some() {
+            return Ok(Vec::new());
+        }
+        if plans.is_empty() {
+            if bloom_pruned_any {
+                // Every in-window file was bloom-rejected: the needle provably
+                // matches nothing in Delta. An EMPTY include selection yields a
+                // schema-correct zero-file scan (the fork deselects all files),
+                // NOT the unrestricted fallback below — falling through would
+                // undo the pruning exactly when it worked best.
+                let none: HashSet<String> = HashSet::new();
+                plans.push(self.scan_delta_table(table, state, projection, filters, limit, Some(&none), None, None).await?);
+            } else {
+                // A time window can be wholly outside the snapshot's partition
+                // dates. Keep the provider path available as a conservative
+                // fallback rather than manufacturing an empty plan with a
+                // subtly different schema.
+                plans.push(self.scan_delta_table(table, state, projection, filters, limit, None, None, None).await?);
+            }
         }
         Ok(plans)
     }
@@ -7638,7 +7784,7 @@ impl ProjectRoutingTable {
         &self, state: &dyn Session, projection: Option<&Vec<usize>>, optimized_filters: &[Expr], unstripped_filters: &[Expr], project_id: &str,
         query_time_range: Option<(i64, i64)>, dedup_keys: &[String], pre_skip_dedup: bool, tombstone: &Option<String>, orig_limit: Option<usize>,
         limit: Option<usize>, readmit_mutable_filters: bool, tantivy_id_filter: Option<&Expr>, tantivy_covered_files: Option<&HashSet<String>>,
-        tantivy_exclude: Option<&HashSet<String>>, tantivy_row_selections: Option<&HashMap<String, Vec<u64>>>,
+        tantivy_exclude: Option<&HashSet<String>>, tantivy_row_selections: Option<&HashMap<String, Vec<u64>>>, bloom_rejected: Option<&HashSet<String>>,
     ) -> DFResult<(bool, Vec<Arc<dyn ExecutionPlan>>, Vec<Arc<dyn ExecutionPlan>>)> {
         let mut delta_only_filters = optimized_filters.to_vec();
         let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
@@ -7652,9 +7798,9 @@ impl ProjectRoutingTable {
         };
         let skip_dedup = pre_skip_dedup && verdict.granted();
         // Partial certification → the certified dates still skip. Only when the
-        // window is NOT wholly certified (otherwise the plain skip above is
-        // cheaper) and only on this Delta-only path, where no MemBuffer leg can
-        // hold an uncertified newer version.
+        // window is NOT wholly certified (the plain skip above is cheaper) and
+        // only here on the Delta-only path, where no MemBuffer leg can hold an
+        // uncertified newer version.
         let per_date_dates: HashSet<String> = match !skip_dedup
             && self.database.config.maintenance.timefusion_read_dedup_skip_per_date
             && !certified_dates.is_empty()
@@ -7664,7 +7810,7 @@ impl ProjectRoutingTable {
             false => HashSet::new(),
         };
         // Complement within the window: what the DedupExec leg must still read.
-        // Derived from `window_dates` (the same enumeration certification used)
+        // Derived from the same `window_dates` enumeration certification used,
         // so the two sides provably partition the window's dates.
         let uncertified_dates: HashSet<String> = match per_date_dates.is_empty() {
             true => HashSet::new(),
@@ -7698,10 +7844,11 @@ impl ProjectRoutingTable {
                 tantivy_exclude,
                 tantivy_row_selections,
                 query_time_range,
+                bloom_rejected,
                 (!per_date_dates.is_empty()).then_some(&uncertified_dates),
             )
             .await?;
-        // The certified side: same scan, restricted to certified date
+        // The certified side: the same scan restricted to certified date
         // partitions, returned separately so the caller can union it ABOVE
         // DedupExec instead of feeding it through.
         let certified_plans = match per_date_dates.is_empty() {
@@ -7718,6 +7865,7 @@ impl ProjectRoutingTable {
                     tantivy_exclude,
                     tantivy_row_selections,
                     query_time_range,
+                    bloom_rejected,
                     Some(&per_date_dates),
                 )
                 .await?
@@ -8762,6 +8910,22 @@ impl TableProvider for ProjectRoutingTable {
         // Per-file matching row ordinals (row-selection pushdown), for files
         // whose covering index was built in parquet row order.
         let mut tantivy_row_selections: Option<HashMap<String, Vec<u64>>> = None;
+        // File-level needle pruning: table-relative paths the resident bloom
+        // registry proves cannot contain the query's equality/IN needles.
+        // Memory-only consult — a cold registry spawns background loads and
+        // prunes nothing this query. Applied where the delta legs partition
+        // live files (unlike zero_hit_files it must reach the RAW leg too).
+        let bloom_rejected: Option<HashSet<String>> = (|| {
+            let reg = self.database.bloom_prune()?;
+            let dates = crate::read::bloom_prune::dates_in_range(query_time_range?)?;
+            let schema = crate::schema::get_schema(&self.table_name)?;
+            let needles = crate::read::bloom_prune::extract_needles(&optimized_filters, schema, Self::version_mutable_columns(&self.table_name).as_ref());
+            if needles.is_empty() {
+                return None;
+            }
+            let rejected = reg.rejected_rels(&self.table_name, &project_id, &dates, &needles);
+            (!rejected.is_empty()).then_some(rejected)
+        })();
         if let Some(tree) = text_match_tree.as_ref()
             && let Some(svc) = self.database.tantivy_search()
         {
@@ -8938,8 +9102,8 @@ impl TableProvider for ProjectRoutingTable {
         // `skip_legs` are Delta legs over date partitions certified
         // duplicate-free: they are unioned ABOVE DedupExec rather than fed
         // through it. Sound because `date` derives from `timestamp` and DML
-        // re-appends preserve it, so no dedup key spans a date boundary — dedup
-        // over the union equals dedup applied per date.
+        // re-appends preserve it, so no dedup key spans a date boundary —
+        // dedup over the union equals dedup applied per date.
         let wrap_result_split =
             |mut legs: Vec<(Arc<dyn ExecutionPlan>, crate::read::LegKind)>, skip_legs: Vec<Arc<dyn ExecutionPlan>>| -> DFResult<Arc<dyn ExecutionPlan>> {
                 // A leg pruned to nothing (tantivy split with zero surviving files,
@@ -9093,6 +9257,7 @@ impl TableProvider for ProjectRoutingTable {
                     tantivy_covered_files.as_ref(),
                     tantivy_exclude.as_ref(),
                     tantivy_row_selections.as_ref(),
+                    bloom_rejected.as_ref(),
                 )
                 .await?;
             if skip_dedup {
@@ -9179,6 +9344,7 @@ impl TableProvider for ProjectRoutingTable {
                     tantivy_covered_files.as_ref(),
                     tantivy_exclude.as_ref(),
                     tantivy_row_selections.as_ref(),
+                    bloom_rejected.as_ref(),
                 )
                 .await?;
             if skip_dedup {
@@ -9248,6 +9414,7 @@ impl TableProvider for ProjectRoutingTable {
                 tantivy_exclude.as_ref(),
                 tantivy_row_selections.as_ref(),
                 query_time_range,
+                bloom_rejected.as_ref(),
                 None,
             )
             .await?;

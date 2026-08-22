@@ -17,6 +17,7 @@
 //!
 //! The caller adds key/tiebreak columns, then restores the requested projection.
 
+pub mod bloom_prune;
 pub mod functions;
 pub mod optimizers;
 pub mod plan_cache;
