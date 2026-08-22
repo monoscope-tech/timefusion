@@ -303,6 +303,93 @@ wide query can lose the connection rather than reuse it, and it is the reason
 the TOP/W/P2 grids below are incomplete. Worth a bounded repro before it is
 theorised about further.
 
+## Finding 5 — what to do about the dedup and the sort
+
+Follow-up investigation, after the profile above. Prod had by then moved to
+`c4843b5` (deployed 12 min before these reads), so the counters are from a
+fresh process.
+
+**The sort is not a second problem.** `DedupExec::required_input_distribution`
+is `SinglePartition` and `required_input_ordering` is the dedup key ordering
+(`src/read/mod.rs:481-486`). The `SortPreservingMergeExec` that costs as much
+as the dedup itself exists *only* to satisfy those two requirements. Remove
+the dedup for a partition and the merge goes with it, and the scan stays
+multi-partition. That is why the pair is ~4 s of a ~7.9 s 7-day query rather
+than ~2 s, and why these shapes do not scale with cores: every file group is
+funnelled through one thread before aggregation.
+
+**The skip is already on, and it works.** Both
+`timefusion_read_dedup_skip_swept` and `timefusion_read_dedup_skip_per_date`
+default to `true` (`src/config.rs:2008,2033`) — my earlier note that the
+per-date skip shipped default-off was wrong. Measured on P1, a full-day
+count per date, warm rep:
+
+| date | certified? | wall | rows | dedup counters |
+|---|---|---|---|---|
+| 2026-08-12 | yes | **189 ms** | 2,431,232 | `dedup_skipped=2` |
+| 2026-08-13 | no | 789 ms | 2,273,057 | denied, never_certified |
+| 2026-08-14 | no | 1,603 ms | 2,580,617 | denied, never_certified |
+| 2026-08-08 | partly (2 of 9) | 2,364 ms | 2,174,059 | `dedup_skipped=2`, 7 denied |
+
+**4.2x and 8.5x on comparable row counts.** File counts per date are not
+controlled, so treat the multiple as indicative rather than exact — but the
+mechanism demonstrably fires and demonstrably pays.
+
+**The blocker is certification coverage, and it is concentrated in the wrong
+place.** The durable store
+(`/home/ubuntu/timefusion-data/.timefusion_meta/dedup_certifications.json`,
+last written 00:54, ~9 h before these reads) holds **97 certifications across
+13 projects** — and P1's are exactly **two dates: 2026-08-08 and 2026-08-12**.
+The busiest tenant has 9, spanning 08-04..08-21. Dashboards query the last
+1–14 days. So:
+
+- a 1h / 24h / 3d / 7d window contains **zero** certified dates → 100% denial,
+  which is exactly what `dedup_denied_never_certified_pct = 100.0` reports;
+- even the 14d window catches only 08-08 and 08-12 out of 15 dates, so the
+  skip fires on two old, cold days and the other 13 pay in full.
+
+Certification is not broken — it is being spent on dates nobody queries.
+
+**Why recent dates never certify.** A certification is keyed on the
+partition's whole file-set fingerprint, and any new file voids it
+(`maintain.rs`, the `entry.fp != fp` reset). Recent partitions are rewritten
+continuously by ingest, hot-tail compaction and the sealed/repair backlog, so
+they churn faster than sweeps can certify them. Today's partition legitimately
+can never certify; the last 7 days are the contested band.
+
+### Ranked, and the structural one first
+
+1. **Make certification additive over a FILE SET rather than exact over a
+   partition fingerprint.** Certify the set of files a sweep proved clean; a
+   file added afterwards is simply not in that set, and dedup runs over the
+   uncertified remainder while the certified files union in above it. This is
+   the same decomposition the per-date skip already performs one level up, and
+   it is the only option that survives ingest churn instead of racing it.
+   Soundness needs the same argument the per-date skip needed — that no dedup
+   key spans the split — which is *not* free here, because merge-on-read
+   versions of one row can land in different files. **That is the thing to
+   establish before building it**, and it is why this is a design task, not a
+   patch.
+2. **Bias sweep ordering to the newest ~7 days.** Cheap scheduling change,
+   immediate partial payoff, and it aligns the spend with what dashboards
+   query. But it fights churn rather than escaping it, and it competes with
+   the sealed backlog for the same workers — so treat it as relief, not a fix.
+3. **Accept that today's partition keeps full dedup.** With the per-date skip
+   already shipped, a window's today-slice paying while its older dates skip
+   is the correct end state, not a gap.
+
+Not recommended: turning the skip off, widening the fingerprint check, or
+touching `timefusion_read_dedup_bounded` — the mechanism is sound and the
+measurements above show it paying whenever it is allowed to.
+
+One thread left hanging: `src/rollup.rs`'s module doc states "a rollup is
+built only after its source partition is duplicate-free", while
+`maintenance_coordinator.rs:161` states "BaseRollup depend on NOTHING". If the
+first is really enforced somewhere, then certification throughput gates
+Finding 2's `not_built` dates as well and the two findings share one root
+cause. I did not establish that either way — worth ten minutes before planning
+Finding 2's fix.
+
 ## Comparison with the historical numbers
 
 Against the **08-20 baseline matrix** (deployed 493bb1b, same P1/P2, same
@@ -361,10 +448,8 @@ latency and per-service charts, and Finding 2 shows what has to be true first.
    `hll` measure on `attributes___user___id` for unique-users. Both are
    `missing_measure`/`unknown_group_by` declines with real cardinality cost —
    measure before declaring.
-6. **Evaluate turning on the per-date dedup skip** (shipped default-off in
-   d327df8). Finding 3 sizes the prize: `DedupExec` + the sort feeding it are
-   ~4 s of a ~7–8 s 7-day chart, on scans where dedup is denied 100% of the
-   time anyway. This is the largest single lever for the shapes that will
+6. **Raise certification coverage on RECENT dates — see Finding 5.** This, not
+   a flag flip, is what unlocks the dedup/sort cost for every shape that will
    still not route after steps 2–5.
 7. **Bounded repro of the 30 s cancellation wedge** (Finding 4).
 
