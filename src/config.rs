@@ -1977,6 +1977,33 @@ pub struct MaintenanceConfig {
     /// Allow raw fringes and a live raw tail around certified rollup windows.
     #[serde(default)]
     pub timefusion_rollup_realtime_tail: bool,
+    /// Accept a slice with NO row witness when its `source_fp` still matches the
+    /// live partition fingerprint — a fallback BENEATH the witness, never a
+    /// replacement for it.
+    ///
+    /// Why: prod 2026-08-22 measured `stale_coverage` as the sole blocker on
+    /// every bare dashboard shape, and the split put **95.2% of it on
+    /// `no_witness`** (1,567 slices written before `TAG_SOURCE_ROWS`) against
+    /// 4.7% genuinely moved. Those slices cover their days; they are refused
+    /// only because they cannot be verified, and they clear solely on a
+    /// republish that competes for the same starved capacity leaving six
+    /// compaction days frozen. The fingerprint is the *same field the date-level
+    /// path already verifies with*, so this re-uses an existing rule rather than
+    /// inventing a weaker one.
+    ///
+    /// Sound but PESSIMISTIC, and the asymmetry is the whole point: a mismatch
+    /// can only cause a MISS, never a wrong answer. It is pessimistic because a
+    /// fingerprint changes whenever the partition's file set is rewritten while
+    /// `num_records` does not — which is very likely why the witness was chosen
+    /// over the fingerprint originally. On a normally-compacting table this goes
+    /// stale again immediately; it holds only while sealed partitions are.
+    ///
+    /// **Default OFF.** It has no prod exposure. Canary by watching
+    /// `rollup_stale_no_witness` fall and `rollup_hits_*` rise, and confirm a
+    /// routed aggregate matches its raw answer on a churning day before trusting
+    /// it. See `docs/plans/2026-08-22-query-latency-matrix.md`.
+    #[serde(default)]
+    pub timefusion_rollup_slice_fp_fallback: bool,
     /// Optional comma-separated read canary projects.
     #[serde(default)]
     pub timefusion_rollup_read_projects: Option<String>,
