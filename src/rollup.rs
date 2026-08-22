@@ -961,6 +961,37 @@ fn unaliased(expr: &datafusion::logical_expr::Expr) -> &datafusion::logical_expr
     }
 }
 
+/// `extract(epoch from X)` — which DataFusion plans as `date_part('EPOCH', X)`
+/// — optionally under an integer cast, returning `X` and the cast's SQL type.
+///
+/// Only `EPOCH` qualifies: every other field (`hour`, `dow`, …) is many-to-one
+/// over buckets and would merge groups the raw path keeps apart. Only integer
+/// casts qualify, because those are the ones whose SQL spelling is reproduced
+/// exactly; anything else declines rather than guessing a type.
+fn epoch_of(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logical_expr::Expr, Option<&'static str>)> {
+    use datafusion::logical_expr::Expr;
+    let (expr, cast) = match expr {
+        Expr::Alias(alias) => (alias.expr.as_ref(), None),
+        expr => (expr, None),
+    };
+    let (expr, cast) = match expr {
+        Expr::Cast(inner) => (
+            inner.expr.as_ref(),
+            Some(match inner.field.data_type() {
+                arrow::datatypes::DataType::Int32 => "INT",
+                arrow::datatypes::DataType::Int64 => "BIGINT",
+                _ => return None,
+            }),
+        ),
+        expr => (expr, cast),
+    };
+    let Expr::ScalarFunction(function) = unaliased(expr) else { return None };
+    (function.name().eq_ignore_ascii_case("date_part")
+        && function.args.len() == 2
+        && string_literal(&function.args[0]).is_some_and(|field| field.eq_ignore_ascii_case("EPOCH")))
+    .then(|| (&function.args[1], cast))
+}
+
 fn column_name(expr: &datafusion::logical_expr::Expr) -> Option<&str> {
     match unaliased(expr) {
         datafusion::logical_expr::Expr::Column(column) => Some(&column.name),
@@ -1659,7 +1690,18 @@ async fn route_with_spec(
     let mut groups = Vec::new();
     for (index, expression) in aggregate.group_expr.iter().enumerate() {
         let alias = aggregate.schema.field(index).name();
-        let expression = match unaliased(expression) {
+        // monoscope's chart SQL groups by `extract(epoch from time_bucket(w,
+        // timestamp))::integer`, never by the bare bucket, so every percentile
+        // and grouped panel declined as `unsupported_shape` and scanned raw —
+        // 3,525 ms against 278 ms routed at 3 days (2026-08-22 A/B).
+        //
+        // Epoch-of-bucket is injective on the bucket, so the grouping is
+        // identical and only the spelling differs. The wrapper is REPRODUCED
+        // rather than lifted: the rewrite is substituted for this aggregate and
+        // must match its schema types, so dropping a cast here would fail
+        // `has_equivalent_names_and_types` instead of routing.
+        let epoch_wrapped = epoch_of(expression);
+        let expression = match epoch_wrapped.map_or_else(|| unaliased(expression), |(inner, _)| inner) {
             // `project_id` is not a declared dimension — it is the partition
             // column, written on every rollup row by `to_rollup_batches` — but
             // it groups exactly like one.
@@ -1680,6 +1722,19 @@ async fn route_with_spec(
             }
             Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
             _ => return Err(MissReason::UnsupportedShape),
+        };
+        // Only the bucket may wear the epoch wrapper; a dimension grouped by
+        // `extract(epoch …)` is nonsense and must not be silently accepted.
+        let expression = match epoch_wrapped {
+            Some((_, cast)) if expression.starts_with("time_bucket(") => {
+                let epoch = format!("date_part('EPOCH', {expression})");
+                match cast {
+                    Some(sql_type) => format!("CAST({epoch} AS {sql_type})"),
+                    None => epoch,
+                }
+            }
+            Some(_) => return Err(MissReason::UnsupportedShape),
+            None => expression,
         };
         groups.push((expression, alias.to_string()));
     }
@@ -2229,6 +2284,43 @@ mod tests {
     fn hybrid_sql(route: &RoutedRollup, horizon: i64) -> String {
         let interior = interior(route.lo, route.hi, route.grain, horizon).expect("a routable interior");
         route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[interior], &ProjectSplit::default())
+    }
+
+    /// THE shape monoscope's charts actually emit — `extract(epoch from
+    /// time_bucket(...))::integer` — which declined as `unsupported_shape` and
+    /// sent every percentile and grouped panel to a raw scan. 2026-08-22 A/B on
+    /// prod: 3,525 ms unrouted against 278 ms routed at 3 days.
+    ///
+    /// The wrapper must survive into the rewrite, cast and all: the rewrite is
+    /// substituted for this aggregate and has to match its schema types.
+    #[tokio::test]
+    async fn a_chart_grouping_by_extract_epoch_of_a_bucket_routes() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer AS tb, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("date_part('EPOCH', time_bucket('1 hours', timestamp))"), "the epoch wrapper must reach the rewrite: {generated}");
+        assert!(generated.contains("CAST(date_part('EPOCH'"), "the integer cast must be reproduced or the schemas will not match: {generated}");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// `extract(epoch …)` is accepted because it is 1:1 over buckets. Every
+    /// other field is many-to-one and would merge groups the raw path keeps
+    /// apart, so it must keep declining rather than quietly returning a
+    /// different answer.
+    #[tokio::test]
+    async fn extracting_any_field_but_epoch_from_a_bucket_still_declines() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT extract(hour from time_bucket('1 hours', timestamp))::integer AS tb, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
+        );
+        // Declining is the invariant; WHICH reason it declines with is not, so
+        // this accepts a miss as readily as a `None` route.
+        assert!(matches!(route_for(&state, &sql).await, Err(_) | Ok(None)), "a non-EPOCH field must not route");
     }
 
     #[tokio::test]
