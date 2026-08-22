@@ -2138,7 +2138,153 @@ async fn certifying_a_partition_builds_rollup_buckets_that_match_the_raw_aggrega
 /// The rollup must answer a window it only PARTLY covers, by unioning its
 /// certified interior with raw fringes, and the answer must equal the raw one.
 ///
-/// This is the shape production actually sends: microsecond-precision bounds
+//// THE gate for routing `COALESCE(<dimension>, 'null')` — the spelling every
+/// monoscope grouped chart emits, and one that declined as `unsupported_shape`
+/// until 2026-08-22 (3,237 ms raw against 276 ms routed at 3 days).
+///
+/// COALESCE folds NULL and the literal string `'null'` into ONE group, so the
+/// question this must settle is whether the rollup can reproduce that fold. It
+/// can, because `COALESCE(dim, lit)` is a function of `dim`: the tier's
+/// partition by `dim` REFINES the partition by `COALESCE(dim, lit)`, and
+/// re-aggregating decomposable states over a refinement equals aggregating raw
+/// rows. This asserts that claim on data engineered to break it — a NULL
+/// service AND a literal-'null' service, both in the rollup-covered day and in
+/// the raw tail, so the fold has to survive the union of the two legs.
+///
+/// Asserts routing as well as equality: a miss also returns the right answer,
+/// so equality alone would pass vacuously.
+#[serial]
+#[tokio::test]
+async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_the_rollup() -> Result<()> {
+    struct ClockGuard;
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            timefusion::support::unfreeze();
+        }
+    }
+    let _clock_guard = ClockGuard;
+    let mut cfg = (*TestConfigBuilder::new("rollup_coalesce").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    // `service: None` writes a genuine SQL NULL; "null" is the four-character
+    // string. Collapsing those two is the whole point of the test, so they must
+    // be distinct in the fixture — asserted below before anything else.
+    let row = |id: &str, service: Option<&str>, ts: i64| -> Result<_> {
+        json_to_batch(vec![serde_json::json!({
+            "timestamp": ts, "id": id, "name": "op", "project_id": project_id, "hashes": [], "summary": ["coalesce fixture"],
+            "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string(),
+            "duration": 100, "kind": "server", "status_code": "OK",
+            "resource___service___name": service,
+        })])
+    };
+
+    // Yesterday, spread over hours so the interior is worth a union. Each of the
+    // three service shapes appears in the COVERED day.
+    for (i, (service, offset)) in [
+        (None, 17i64),
+        (Some("cart"), 61_000_000),
+        (Some("null"), 130_000_000),
+        (None, 3_661_000_000),
+        (Some("null"), 7_330_000_000),
+        (Some("cart"), 10_810_000_000),
+        (None, 14_410_000_000),
+        (Some("cart"), 18_010_000_000),
+    ]
+    .iter()
+    .enumerate()
+    {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("y{i}"), *service, yesterday_noon + offset)?], true, None).await?;
+    }
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    timefusion::support::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
+    assert!(db.run_maintenance_units(1024).await? > 0, "eligible yesterday slices must be drained");
+
+    // Written AFTER certification, so these reach the query only via the raw
+    // leg — and both fold-participants appear here too, which is what forces the
+    // outer merge to combine a folded group ACROSS the two legs.
+    for (i, (service, offset)) in [(None, 5_000_000i64), (Some("null"), 3_600_000_000), (Some("cart"), 3_700_000_000)].iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("t{i}"), *service, midnight + offset)?], true, None).await?;
+    }
+
+    let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
+    let window = format!("project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})");
+
+    // The fixture is only meaningful if a real NULL and a real 'null' both
+    // exist. Without this the test could silently degrade into all-strings and
+    // still pass, proving nothing about the fold.
+    let shapes = db
+        .query_delta_only(&format!(
+            "SELECT COUNT(*) FILTER (WHERE resource___service___name IS NULL)::BIGINT, \
+                    COUNT(*) FILTER (WHERE resource___service___name = 'null')::BIGINT \
+             FROM otel_logs_and_spans WHERE {window}"
+        ))
+        .await?;
+    let (nulls, literals) = shapes
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .map(|b| (b.column(0).as_primitive::<Int64Type>().value(0), b.column(1).as_primitive::<Int64Type>().value(0)))
+        .next()
+        .expect("a probe row");
+    assert!(nulls > 0 && literals > 0, "the fixture must hold BOTH real NULLs and literal 'null's, got nulls={nulls} literals={literals}");
+
+    // monoscope's real two-key chart shape: bucket AND coalesced dimension.
+    let query = format!(
+        "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(resource___service___name, 'null') AS svc, \
+                COUNT(*) AS c, min(duration) AS lo, max(duration) AS hi \
+         FROM otel_logs_and_spans WHERE {window} GROUP BY 1, 2 ORDER BY 1, 2"
+    );
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+
+    let rows_of = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
+        batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .map(|r| {
+                        (
+                            b.column(0).as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(r),
+                            array_get_str(b.column(1).as_ref(), r),
+                            b.column(2).as_primitive::<Int64Type>().value(r),
+                            b.column(3).as_primitive::<Int64Type>().value(r),
+                            b.column(4).as_primitive::<Int64Type>().value(r),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let hits = || timefusion::observability::maintenance_stats().rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed);
+    let before = hits();
+    let routed = rows_of(ctx.sql(&query).await?.collect().await?);
+    assert_eq!(hits(), before + 1, "the coalesced chart must route, or this proves nothing about the rollup's fold");
+
+    // `query_delta_only` bypasses rollup and buffer, so it is the authority.
+    let raw = rows_of(db.query_delta_only(&query).await?);
+    assert_eq!(routed, raw, "the coalesced group must match the raw aggregate row for row");
+
+    // Every fixture row lands in exactly one group, and the NULLs really did
+    // fold in with the literals rather than forming their own group.
+    assert_eq!(routed.iter().map(|row| row.2).sum::<i64>(), 11, "every fixture row must be counted exactly once: {routed:?}");
+    assert!(routed.iter().all(|row| row.1 == "null" || row.1 == "cart"), "COALESCE must leave only folded labels: {routed:?}");
+    Ok(())
+}
+
+// This is the shape production actually sends: microsecond-precision bounds
 /// running up to now. Before the union it was refused outright, so the feature
 /// never served a single query. A hybrid that merely *runs* is worthless — the
 /// failure mode is a plausible wrong number — so this asserts row-for-row

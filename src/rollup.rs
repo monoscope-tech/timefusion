@@ -961,6 +961,33 @@ fn unaliased(expr: &datafusion::logical_expr::Expr) -> &datafusion::logical_expr
     }
 }
 
+/// `COALESCE(<column>, '<literal>')`, returning the column and the literal.
+///
+/// Two spellings, because DataFusion's simplifier rewrites `coalesce` into a
+/// `CASE` before the matcher ever sees it — the form prod logs show as
+/// `Case { expr: None, when_then_expr: [(IsNotNull(c), c)], else_expr: Some(lit) }`.
+/// Matching only the `ScalarFunction` spelling silently never fires, which is
+/// how this shape went unrouted in the first place.
+///
+/// Deliberately narrow: exactly one `WHEN`, whose predicate and result are the
+/// SAME column, and a string literal fallback. A three-argument coalesce, or one
+/// over an expression rather than a column, yields `None` and keeps declining.
+fn coalesced_column(expr: &datafusion::logical_expr::Expr) -> Option<(&str, &str)> {
+    use datafusion::logical_expr::Expr;
+    match unaliased(expr) {
+        Expr::ScalarFunction(function) if function.name().eq_ignore_ascii_case("coalesce") && function.args.len() == 2 => {
+            Some((column_name(&function.args[0])?, string_literal(&function.args[1])?))
+        }
+        Expr::Case(case) if case.expr.is_none() && case.when_then_expr.len() == 1 => {
+            let (when, then) = &case.when_then_expr[0];
+            let Expr::IsNotNull(probed) = when.as_ref() else { return None };
+            let column = column_name(probed)?;
+            (column_name(then)? == column).then_some((column, string_literal(case.else_expr.as_ref()?)?))
+        }
+        _ => None,
+    }
+}
+
 /// `extract(epoch from X)` — which DataFusion plans as `date_part('EPOCH', X)`
 /// — optionally under an integer cast, returning `X` and the cast's SQL type.
 ///
@@ -1720,6 +1747,25 @@ async fn route_with_spec(
                 }
                 format!("time_bucket({}, timestamp)", sql_literal(interval))
             }
+            // monoscope spells EVERY grouped chart's dimension
+            // `COALESCE(<dimension>, 'null')`, so the bare-column arm above
+            // never matched one and every such panel scanned raw — 3,237 ms
+            // against 276 ms routed at 3 days (2026-08-22 A/B).
+            //
+            // Sound because `COALESCE(dim, lit)` is a FUNCTION of `dim`: the
+            // rollup's partition by `dim` therefore REFINES the partition by
+            // `COALESCE(dim, lit)`, and re-aggregating decomposable states over
+            // a refinement equals aggregating the raw rows. So the expression is
+            // emitted verbatim onto both legs and NULL needs no special case —
+            // the NULL cell and the literal-'null' cell simply merge, exactly as
+            // the raw rows do.
+            other
+                if coalesced_column(other)
+                    .is_some_and(|(column, _)| column == "project_id" || spec.dimensions.iter().any(|dimension| dimension == column)) =>
+            {
+                let (column, fallback) = coalesced_column(other).ok_or(MissReason::UnsupportedShape)?;
+                format!("COALESCE({column}, {})", sql_literal(fallback))
+            }
             Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
             _ => return Err(MissReason::UnsupportedShape),
         };
@@ -2306,6 +2352,38 @@ mod tests {
         assert!(generated.contains("duration_digest"), "the unfiltered digest must answer it: {generated}");
         assert!(!generated.contains("server_duration_digest"), "the server-filtered digest must NOT answer an unfiltered percentile: {generated}");
         assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// THE shape monoscope's grouped charts emit for a dimension:
+    /// `COALESCE(<dimension>, 'null')`, never the bare column. Every such panel
+    /// declined as `unsupported_shape` and scanned raw — 3,237 ms against
+    /// 276 ms routed at 3 days (2026-08-22 A/B) — and the two-key form below is
+    /// the real one, bucket AND dimension together.
+    #[tokio::test]
+    async fn a_grouped_chart_coalescing_its_dimension_routes() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(resource___service___name, 'null') AS svc, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("COALESCE(resource___service___name, 'null')"), "the coalesce must reach the rewrite verbatim: {generated}");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The arm is deliberately narrow. A dimension the spec does not declare, a
+    /// three-argument coalesce, and a coalesce over an EXPRESSION (monoscope's
+    /// variant shape, `COALESCE(variant_to_json(resource)->…, 'null')`) all have
+    /// to keep declining rather than routing to a column that is not there.
+    #[test_case::test_case("COALESCE(status_message, 'null')" ; "a column that is not a declared dimension")]
+    #[test_case::test_case("COALESCE(resource___service___name, name, 'null')" ; "three-argument coalesce")]
+    #[test_case::test_case("COALESCE(CONCAT(resource___service___name, 'x'), 'null')" ; "coalesce over an expression, not a column")]
+    #[tokio::test]
+    async fn a_coalesce_the_matcher_cannot_prove_still_declines(group: &str) {
+        let state = session().await;
+        let sql = format!("SELECT {group} AS g, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
+        assert!(matches!(route_for(&state, &sql).await, Err(_) | Ok(None)), "{group} must not route");
     }
 
     /// THE shape monoscope's charts actually emit — `extract(epoch from
