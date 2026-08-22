@@ -221,3 +221,62 @@ alternatives — they can both be true:
 
 The first is fixed by this design. The second is fixed by not having a
 permanently-running backfill, which is also what this design delivers.
+
+## 2026-08-22 11:29 — the curve did NOT bend, and the census breakdown says why
+
+Two clean points, one container (`bfa454a`, up 38 min, no restart between them),
+using the per-age breakdown that landed with the sibling session's commit:
+
+| time | total | today | week | older |
+|---|---|---|---|---|
+| 11:13:35 | 5768 | 586 | 1722 | 3460 |
+| 11:29:54 | 5806 | **624** | 1723 | 3459 |
+
+**+38 in 16 minutes (~140/hr), and every single one of them is `today`.**
+`week` moved +1, `older` moved −1 — frozen to within a file.
+
+Two conclusions, and the second one supersedes a lot of this document.
+
+**1. The GC leak fix did not bend the curve.** Not disproven as a real defect —
+it was, and the fix stands — but its collateral falls on partitions that are
+being compacted, i.e. `week`/`older`, and those were already static. Note the
+measurement is confounded: `bfa454a` (backfill manifest-write batching) landed
+in the same restart, so this window measures both changes. It is thin evidence
+(one 16-minute interval on a 38-minute-old container) and should be re-taken
+after two quiet hours. But there is no sign of convergence in it.
+
+**2. The backlog is not accruing — it is starving.** `week + older` = 5,182
+files, flat. All churn is in `today`, which is exactly where flush and hot-tail
+compaction are constantly writing and rewriting. So the divergence measured all
+night was never a race between accrual and drain across the corpus; it was one
+hot partition churning while 5,182 files sat untouched.
+
+And that starvation is **structural, not a tuning problem**:
+
+- `sort_backfill_uris_newest_first` (`mod.rs:2344`) sorts each project's queue
+  reverse-lexically on `date=YYYY-MM-DD`, i.e. newest first.
+- a pass is capped at `timefusion_tantivy_backfill_max_files_per_pass` = 150.
+- `today` alone holds **624** uncovered files.
+
+624 > 150, so **every pass is consumed by today's files before it can reach
+yesterday, let alone `older`**. The older 5,182 can never be reached while
+today's uncovered count exceeds one pass — and today's count is replenished
+continuously by the churn. Raising the cap or the concurrency does not fix this;
+it just chases churn faster. This is the same pathology as
+`tf_horizon_frozen_by_newest_first_2026-08-17`, rediscovered in a new subsystem.
+
+**What this changes.** Convergence needs the ordering fixed before any
+throughput lever is worth pulling:
+
+- **Reserve a share of each pass for the tail** (e.g. 2/3 newest, 1/3
+  oldest-uncovered), so the backlog drains at a bounded rate no matter how
+  hot today is. This is the smallest change that makes the backlog finite.
+- **Stop indexing today's churn per-file at all.** Today's files are rewritten
+  within hours; indexing each one is work with a half-life. This is precisely
+  what the per-day design's *hot tail* is for — and it now looks like the main
+  event rather than a detail: seal a date once it stops changing, and let the
+  hot partition be served by the flush-built indexes it already has.
+
+The step-0 carry-forward remains correct and cheap, but it addresses
+`week`/`older` churn that this measurement says is already near zero. **Fix the
+ordering first.**
