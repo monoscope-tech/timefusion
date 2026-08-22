@@ -127,8 +127,23 @@ the same ids.
 
 **So don't re-index it — extend the existing entries to cover it.** When a
 compaction rewrites A+B+C into D, add D to `covered_files` of the entries that
-covered A, B and C. D is then covered, the census stops counting it, and the
-backfill never reads it back.
+covered A, B and C. D is then covered, and nothing reads it back.
+
+Note what this replaces, because it is not "add coverage that is missing":
+**both rewrite paths already reindex their own output inline**, each by reading
+the new file back from S3 and building a fresh index —
+`compact.rs:206` (post-optimize reindex) and `maintain.rs:4953`
+(`reindex_wave_outputs`), both at `build_concurrency`. Carry-forward turns that
+read-back-and-rebuild into a manifest read-modify-write. It is the same
+coverage for a tiny fraction of the IO, and it frees the build slots those two
+paths currently share with the backfill.
+
+That also sharpens the open question about the residual ~60/hr: if every
+rewrite path covers its own output, the uncovered growth must come from those
+inline reindexes **failing** or from a path with no reindex at all (footer
+repair, vacuum, multi-file flush commits whose build errored).
+`tantivy_wave_reindex_failed` and the post-optimize `errors=` counter are where
+to look, and that is a cheap thing to check before building anything.
 
 The read path needs no change, because every case is already handled:
 
