@@ -301,6 +301,15 @@ takes over an hour. No pass completed inside any container's life, so there is
 no clean window to measure. (This is the same deploy-cadence pathology recorded
 for maintenance units: restarts every ~13 min against a 15 min unit deadline.)
 
+Checked at 14:09 rather than assumed: every one of those restarts carried a
+DISTINCT image SHA (`7c73d19`, `c59f9eb`, `761779d`, `8f29584`, `1b5d375`)
+with an empty `Error` field, and there is no OOM or SIGKILL in the logs — the
+only `oom` matches are inside the word `bloom`. So this is a deploy train, not
+instability, and the fix is to stop deploying for two hours, not to touch the
+service. Re-confirmed the same hour: the tail share stays at 33 because
+lowering it would need another code-default flip and therefore another
+restart — spending the very thing the measurement is short of.
+
 **Left ON deliberately, on an argument rather than a measurement.** The backlog
 was provably unreachable before — `week`/`older` frozen within one file across
 three consecutive samples while `today` climbed — so any reservation converts an
