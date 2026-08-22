@@ -130,6 +130,36 @@ partition is missing coverage no matter how much tagged output sits beside it.
   out, `rows > 0` correctly refuses to delete what may be the only copy. Removable
   only by tier compaction (Phase 4), and worth ~0.3% of live files.
 
+Three speeds are expected, because two of the three blockers were fixed and the
+third — the preflight shred — was not:
+
+- **08-19 metrics cells: fast.** The whale's metrics day already completed
+  day-wide at ~537 MB / 537k rows, so it fits, and `-width` puts day-wide units
+  first within the hole set.
+- **08-19 logs cells for the big tenants: possibly still shredding.** Their
+  queued `estimated_decoded_bytes` is just the `MAX_DECODED_BYTES` passed at
+  enqueue — unmeasured. The preflight measures for real at claim time, and an 18h
+  gap for a large tenant may still be over budget. The fragments now inherit the
+  hole boost, so the union still closes, only slowly. **If these cells are still
+  more than half intact ~12h after the deploy, the next required change is the
+  preflight passing `MAX_DECODED_BYTES + 1` like `abandon_running` does — one
+  bisection with re-measurement, instead of a linear extrapolation to the floor.**
+- **Mid-tail gap units: fast.** A 22-minute gap sits at the row-group floor
+  (~270 MB), under budget.
+
+Two things that will appear in the logs and are correct, not failures:
+`maintenance_rollup_escalated_to_covering_slice` for the gap-free fallback units
+(their spans are contained in a live tagged slice, so `covered_by_wider` escalates
+once, and the covering slice then publishes and retires them via proof B); and the
+mid-tail's existing ~1,400 one-minute fragments now ranking as holes too — width
+ordering keeps them behind the day-wide and gap units, and `clear_untagged_cell`
+un-boosts the cell as soon as it is clean. That fragment debris remains as queue
+debt after convergence and is follow-up work, not a blocker here.
+
+Caveat, written rather than coded because no live file has it: a partition whose
+only untagged file carries no statistics gets an `untagged_cells` entry but no
+enqueued slice — a rank boost with no work attached.
+
 ## Explicitly rejected
 
 - **Journal-derived `covered`.** The journal knows which slices were built, but a
