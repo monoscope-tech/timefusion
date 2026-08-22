@@ -2738,47 +2738,40 @@ async fn backfill_covers_sealed_days_and_legacy_coverage_falls_back_after_restar
     let recovered = restarted.recover_rollup_coverage("otel_logs_and_spans").await?;
     assert!(recovered > 0, "tagged coverage must survive a restart without a fresh sweep");
 
-    // What recovery restores is SLICE coverage only. The date-level map is a
-    // separate route through `ProjectRoutingTable::scan`, and it is dead — see
-    // the ignored test below, which is this same state asserted as the bug.
-    assert_eq!(db.rollup_coverage_entries(), 0, "date-level coverage is currently never produced — see rollup_coverage_is_never_populated");
+    // Recovery restores SLICE coverage; the date-level map is a separate route
+    // through `ProjectRoutingTable::scan`, produced at publish time. Pinned here
+    // too so a regression shows up in the test that already builds rollups.
+    assert!(db.rollup_coverage_entries() > 0, "the build must have recorded date-level coverage as well as slice coverage");
     Ok(())
 }
 
-/// The date-level `rollup_coverage` map has **no producer**, so every routed
-/// query in production depends solely on slice coverage.
+/// A committed rollup must record DATE-level coverage, not only slice coverage.
 ///
-/// Every use of the private field in the crate is a read (the routing lookup in
-/// `mod.rs`) or a removal (`maintain.rs` x2). There is no `insert`, `entry` or
-/// `or_insert` anywhere — so it cannot be non-empty, and the date-level lookup
-/// returns `None` for every date on every process.
-/// `maintenance_coordinator.rs` still documents "`recover_rollup_coverage` is
-/// the only producer"; that function writes only `rollup_slice_coverage`.
+/// Until 2026-08-22 `rollup_coverage` had **no producer**: every use of the
+/// private field was a read (the routing lookup in `mod.rs`) or a removal
+/// (`maintain.rs` x2), with no `insert` anywhere, so it could not be non-empty
+/// and the date-level lookup returned `None` for every date on every process.
+/// Two comments still described the mechanism that had gone.
 ///
-/// It leaves no trace at runtime: the `None` branch deliberately `continue`s
-/// WITHOUT setting a miss reason, so queries fall through to slice coverage and
-/// are correct, merely unrouted. No miss, no error, no log — which is how it
-/// survived long enough for two comments to describe a mechanism that had gone.
+/// It left no runtime trace — the `None` branch deliberately `continue`s WITHOUT
+/// setting a miss reason, so queries fell through to slice coverage and were
+/// correct, merely unrouted. No miss, no error, no log.
 ///
-/// Why it matters: slice coverage is exactly the path gated by the per-slice
-/// witness rule, and prod 2026-08-22 measured `stale_coverage` as the SOLE miss
-/// reason on every bare dashboard shape with `rollup_hits_* = 0`. There is no
-/// second route to fall back on because the second route is inert.
+/// Why it mattered: slice coverage is the path gated by the per-slice witness
+/// rule, and prod 2026-08-22 measured `stale_coverage` as the SOLE miss reason
+/// on every bare dashboard shape with `rollup_hits_* = 0` — 95.2% of it
+/// witness-less slices. There was no second route to fall back on because the
+/// second route was inert. This one does not consult the witness at all.
 ///
-/// `#[ignore]`d because it FAILS today and the fix is not observability — it is
-/// writing coverage identity (`source_fp`, `source_epoch`, `generation`,
-/// `covered_through`) that the read path trusts to let a rollup serve a range.
-/// Getting that wrong serves rows the rollup never aggregated, the
-/// silent-wrong-number failure this module warns about twice. Un-ignore it as
-/// the first step of that fix.
+/// Asserts `built > 0` FIRST: an empty drain would satisfy the coverage
+/// assertion vacuously, and an earlier revision of this test did exactly that
+/// against a bare config that drained zero units.
 #[serial]
-#[ignore = "documents a known defect: rollup_coverage has no producer (2026-08-22)"]
 #[tokio::test]
-async fn rollup_coverage_is_never_populated() -> Result<()> {
+async fn a_committed_rollup_records_date_level_coverage() -> Result<()> {
     // Same fixture as `backfill_covers_sealed_days_…` above, which is the test
     // that proves these units really commit. Reusing its shape matters: a bare
-    // config drains ZERO units, and this test then fails on an empty drain while
-    // appearing to prove the defect. It did exactly that on first run.
+    // config drains ZERO units and the assertion then passes vacuously.
     let mut cfg = (*TestConfigBuilder::new("rollup_cov_producer").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     cfg.maintenance.timefusion_rollup_realtime_tail = true;
     cfg.maintenance.timefusion_rollup_backfill_days = 7;
