@@ -11373,6 +11373,48 @@ mod tests {
             queued.iter().all(|slice| chrono::DateTime::from_timestamp_micros(slice.start_micros).is_some_and(|time| time.date_naive() == day)),
             "the rebuild must land on the damaged partition's date"
         );
+
+        // The retired COUNTER must equal what actually left the table.
+        //
+        // It used to be incremented where the replace-set is computed, ~80 lines
+        // before the commit, so it counted INTENDED retirements. Prod 2026-08-22
+        // read 21 retired within an hour while a fresh Delta-log replay said the
+        // live count had not moved at all — two deploys had killed the units in
+        // between. The same block also cleared the partition's hole rank, which
+        // would have switched the prioritisation off on the cells that still
+        // needed it.
+        //
+        // HONEST LIMIT: this asserts the happy path, where the commit lands, so
+        // it would also pass against the old placement. The divergence needs a
+        // unit abandoned between the replace-set and the commit (`still_running`
+        // false, or `slice_occ_stale`), which there is no cheap way to induce
+        // from here. What it does guard is double-counting and counting files
+        // the replace-set selected but the commit did not remove.
+        let untagged_live = |db: &Database| {
+            let tier_ref = futures::executor::block_on(db.get_or_create_table(&project, &tier)).expect("tier");
+            let table = futures::executor::block_on(tier_ref.read());
+            table
+                .snapshot()
+                .expect("snapshot")
+                .log_data()
+                .iter()
+                .filter(|file| {
+                    #[allow(deprecated)]
+                    let add = file.add_action();
+                    add.tags.as_ref().is_none_or(|tags| !tags.contains_key(crate::maintenance_coordinator::TAG_SLICE_START))
+                })
+                .count()
+        };
+        let before = untagged_live(&db);
+        assert!(before > 0, "the stripped copies must be live for this to prove anything");
+        let counter = || crate::observability::maintenance_stats().rollup_tier_untagged_retired.load(std::sync::atomic::Ordering::Relaxed);
+        let counted_before = counter();
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+        assert_eq!(
+            u64::try_from(before - untagged_live(&db)).unwrap_or_default(),
+            counter() - counted_before,
+            "the retired counter must equal the untagged files the commit actually removed"
+        );
         Ok(())
     }
 

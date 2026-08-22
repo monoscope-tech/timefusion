@@ -1716,20 +1716,17 @@ impl Database {
             // failure it exists to catch.
             self.rollup_tier_untagged.insert(key.physical_table.clone(), live_adds.iter().filter(|add| untagged(add)).count() as u64);
             stats.rollup_tier_untagged_found.store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), Relaxed);
-            let retired = replaced.iter().filter(|add| untagged(add)).count() as u64;
-            // Cleared the moment nothing untagged is left HERE, so the hole rank
-            // stops favouring a partition it has already fixed.
-            if retired > 0 && !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(untagged) {
-                self.journal().clear_untagged_cell(&key.source, &key.physical_table, &key.project_id, &date_string);
-            }
-            if retired > 0 {
-                stats.rollup_tier_untagged_retired.fetch_add(retired, Relaxed);
-                warn!(
-                    table = %key.physical_table, project_id = %key.project_id, date = %date_string, retired,
-                    event = "rollup_tier_untagged_files_retired"
-                );
-            }
         }
+        // Deferred to AFTER the commit. Counted here, this read 21 retired
+        // within an hour on prod 2026-08-22 while a fresh Delta-log replay said
+        // the live count had not moved at all — two deploys had killed the units
+        // between the replace-set and the commit. Worse than the wrong number:
+        // `clear_untagged_cell` was removing the hole boost from partitions
+        // whose repair never landed, so the ranking fix would have switched
+        // itself off on exactly the cells that still needed it.
+        let no_identity = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
+        let retiring = replaced.iter().filter(|add| no_identity(add)).count() as u64;
+        let leaves_partition_clean = !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(no_identity);
         // A slice covered by a STRICTLY WIDER live file must not publish: the
         // replace-set only removes files CONTAINED in this slice, so both would
         // stay live and a dashboard SUMs both. Widths are not stable for a range
@@ -1830,6 +1827,16 @@ impl Database {
             table.state = Some(finalized.snapshot());
             drop(guard);
             self.swap_and_refresh_cache(&target_ref, table, None, &[&format!("date={date}")]).await;
+            if retiring > 0 {
+                crate::observability::maintenance_stats().rollup_tier_untagged_retired.fetch_add(retiring, Relaxed);
+                if leaves_partition_clean {
+                    self.journal().clear_untagged_cell(&key.source, &key.physical_table, &key.project_id, &date_string);
+                }
+                warn!(
+                    table = %key.physical_table, project_id = %key.project_id, date = %date_string, retired = retiring,
+                    event = "rollup_tier_untagged_files_retired"
+                );
+            }
         }
 
         let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
