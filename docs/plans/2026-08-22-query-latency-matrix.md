@@ -21,7 +21,28 @@ Wall-clock ms, `count`-shaped outputs, `rep2` (warm) unless noted. Projects:
 | `ORDER BY ts DESC LIMIT 100` | 333 | 255 | 221 | — | 226 | 168 |
 | `kind IN ('server','client')` | — | **22,753** | — | — | — | — |
 
-Two things the table says immediately:
+## 30 days, which is where it breaks
+
+`fail` = did not return, cut off at ~60 s regardless of the client's
+`statement_timeout` (90 s here), so there is a server-side cap in the path.
+
+| shape | whale 30d | mid 30d | small 30d |
+|---|---|---|---|
+| `count(*)` | **fail** | **fail** | 5,814 |
+| `trace_id =` (needle) | 95 | 200 | 75 |
+| `level = 'ERROR'` | **fail** | **fail** | 221 (0 rows) |
+| `service_name =` | 176 (0 rows) | 486 (0 rows) | 9,206 (307k rows) |
+| `name LIKE 'GET%'` | **fail** | **fail** | 512 (0 rows) |
+| `time_bucket(1h)` group-by | 36,942 | **fail** | 3,148 |
+| `ORDER BY ts DESC LIMIT 100` | 431 | 931 | 152 |
+
+The split is not 3d-versus-30d. It is **aggregate versus needle, and it holds at
+every window**: the needle and TopK rows stay double-digit-to-few-hundred ms
+across 3d, 7d and 30d, while every aggregate degrades until it stops returning.
+`small` is the control that rules out "the whale is just big" — 1.8M rows over
+30d still costs 5.8 s to count and 9.2 s to filter by service name.
+
+Two things the 3d/7d table says immediately:
 
 - **Point lookups and TopK are solved** (78–330 ms at every window). The tantivy
   + bloom + sorted-footer work landed; nothing here needs more of it.
@@ -119,6 +140,24 @@ before the change with `hinted=Err(UnknownFilter)` against `plain=Ok(routed)` �
 and the plain control routes through `row_filters: ["kind = 'server' OR kind =
 'client'"]`, so this shape genuinely serves from the 1h tier once the hint is
 gone. The blocked query measured **22.8 s** at 7d.
+
+## Also shipped: the manifest age bound could not fire
+
+Last session's 60-second durability bound is not merely unobserved — it is
+**broken, and prod says so**: `tantivy_backfill_built = 2` next to
+`tantivy_manifest_commits = 0` at 44 minutes of uptime, well past the bound.
+
+Both `full` and `stale` were evaluated only for the project whose build had just
+completed (`pending.get(&pid)`, `pending_since.get(&pid)`). A project with a
+single build per pass therefore set its `pending_since` once and was never
+re-examined — nothing else could flush it, so it waited for a pass end that on
+this box has never arrived. That is the same failure the bound was added to fix,
+reintroduced per project.
+
+`due_manifest_flushes` now sweeps every pending project on each build completion.
+It is a pure function, so the case is a unit test rather than another prod
+observation. A build costs 4-5 minutes, so a whole-map sweep runs at most every
+few minutes and its cost is noise against that.
 
 ## Also shipped: the prefilter skip breakdown
 
