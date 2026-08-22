@@ -1694,6 +1694,54 @@ async fn route_with_spec(
     let probe_project = project_id.as_deref().unwrap_or("rollup-probe");
     let configured_filters = measure_filters(session, source, spec, probe_project, lo, hi).await?;
 
+    // NULL-GUARD PROMOTION. monoscope emits `AND duration IS NOT NULL` on every
+    // latency chart (`docs/monoscope-query-shapes.md` §3a). `duration` is a
+    // MEASURE column and no declared filter mentions it, so the residual matched
+    // nothing and the row-filter promotion below declined `filter_not_eligible`
+    // — at every window, however complete coverage is. Prod 2026-08-22 A/B, 3
+    // reps per arm, the two queries differing in exactly this one predicate:
+    // with it `filter_not_eligible`, without it `not_built`.
+    //
+    // Dropping it is sound only when it cannot change the answer, and that needs
+    // BOTH halves. Neither is optional:
+    //
+    //   * Every aggregate reads the SAME column, so each already ignores null
+    //     rows. `count(*)` does NOT — it counts them — so dropping the predicate
+    //     beside one silently returns MORE than the raw query. That is not a
+    //     corner case: the §6 top-K panels are `count(*)` and a percentile over
+    //     `duration` under this very predicate.
+    //   * A declared `count` over that column exists to serve as the HAVING
+    //     guard. It counts exactly the non-null rows, so `> 0` eliminates
+    //     precisely the buckets the predicate eliminates. Without it a bucket
+    //     whose rows were ALL null comes back as a zero instead of being absent
+    //     — the same resurrection the row-filter promotion's guard prevents.
+    //
+    // When either fails the predicate stays and the query declines exactly as
+    // before, so this only ever converts a decline into a route.
+    let null_guard = promotable
+        .iter()
+        .map(|expr| match expr {
+            Expr::IsNotNull(inner) => column_name(inner),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|columns| !columns.is_empty() && columns.windows(2).all(|pair| pair[0] == pair[1]))
+        .map(|columns| columns[0])
+        .filter(|column| {
+            aggregate.aggr_expr.iter().all(|expr| {
+                matches!(unaliased(expr), Expr::AggregateFunction(function) if function.params.args.first().and_then(column_name) == Some(*column))
+            })
+        })
+        .and_then(|column| {
+            configured_filters
+                .iter()
+                .find(|(measure, filter)| measure.agg == "count" && measure.column.as_deref() == Some(column) && filter.is_empty())
+                .map(|(measure, _)| *measure)
+        });
+    if null_guard.is_some() {
+        promotable.clear();
+    }
+
     // ROW-FILTER PROMOTION. A residual predicate is normally fatal: the rollup
     // aggregated over every row, so re-aggregating it resurrects the groups the
     // raw query eliminated, as 0/NULL rows rather than absent ones.
@@ -1768,6 +1816,10 @@ async fn route_with_spec(
                 })?,
         ),
     };
+
+    // At most one of the two can be set: a null guard clears `promotable`, so
+    // the row-filter promotion above sees nothing to promote and yields None.
+    let guard = guard.or(null_guard);
 
     if too_narrow {
         return Err(MissReason::TinyInterior);
@@ -3178,6 +3230,75 @@ mod tests {
              GROUP BY time_bucket('1 hours', timestamp)"
         );
         assert_eq!(route_for(&state, &sql).await.err(), Some(MissReason::FilterNotEligible), "an unmatched residual must not be promoted");
+    }
+
+    /// monoscope's latency panel, spelled exactly as it ships it: a percentile
+    /// over `duration` under `AND duration IS NOT NULL`. Before the null-guard
+    /// promotion this declined `filter_not_eligible` — `duration` is a MEASURE
+    /// column, so no declared filter mentions it and the residual matched
+    /// nothing. It declined at every window no matter how complete coverage was,
+    /// which made it invisible to every coverage-side fix.
+    ///
+    /// Prod 2026-08-22, counter-diff A/B, 3 reps per arm, the arms differing in
+    /// this one predicate: with it `filter_not_eligible`, without it
+    /// `not_built`. `duration_digest` is declared and unfiltered precisely to
+    /// answer this panel.
+    #[tokio::test]
+    async fn the_latency_panels_null_guard_does_not_block_routing() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS t, \
+                    approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION))) AS p95 \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1"
+        );
+        let (_, generated) = assert_substitutes(&state, &sql, None).await;
+        assert!(generated.contains("duration_digest"), "the unfiltered digest must answer it: {generated}");
+        // The predicate eliminates buckets whose rows were ALL null. Dropping it
+        // without this guard resurrects them as a zero, which is the silent
+        // wrong-answer this promotion would otherwise introduce.
+        assert!(generated.contains("HAVING"), "the null guard must reproduce the bucket elimination: {generated}");
+        assert!(generated.contains("duration_count"), "the guard must be the count over the SAME column: {generated}");
+    }
+
+    /// The half that must NOT route, and the reason the promotion checks every
+    /// aggregate rather than the one it is matching. This is the §6 top-K shape:
+    /// `count(*)` beside a percentile, under the same null guard.
+    ///
+    /// `count(*)` counts null-`duration` rows; the predicate excludes them. Drop
+    /// it and `count(*)` silently returns MORE than the raw query — a wrong
+    /// number on a dashboard, which is worse than the slow scan it replaces. So
+    /// this must keep declining exactly as it did before.
+    #[tokio::test]
+    async fn a_null_guard_beside_a_count_star_must_not_be_dropped() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS t, COUNT(*) AS c, \
+                    approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION))) AS p95 \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1"
+        );
+        assert_eq!(
+            route_for(&state, &sql).await.err(),
+            Some(MissReason::FilterNotEligible),
+            "count(*) counts the null rows the predicate excludes, so the guard is load-bearing and the query must decline"
+        );
+    }
+
+    /// A null guard on a column NO measure aggregates is still ineligible — the
+    /// promotion must not become a blanket "drop every IS NOT NULL". This is
+    /// facet/log-explorer traffic, the exact shape the eligibility split was
+    /// added to keep out of `unknown_filter`.
+    #[tokio::test]
+    async fn a_null_guard_on_a_non_measure_column_stays_ineligible() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS t, COUNT(*) AS c \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND status_message IS NOT NULL GROUP BY 1"
+        );
+        assert_eq!(
+            route_for(&state, &sql).await.err(),
+            Some(MissReason::FilterNotEligible),
+            "no measure aggregates status_message, so nothing makes the predicate a no-op"
+        );
     }
 
     /// The other half of the split, and the reason it exists: a residual that
