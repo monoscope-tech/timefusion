@@ -1169,16 +1169,34 @@ impl TaskJournal {
         self.untagged_cells.remove(&(source.to_owned(), project.to_owned(), table.to_owned(), date.to_owned()))
     }
 
-    /// Is this task filling a hole rather than re-deriving a day that already
-    /// has tier output? Only meaningful for rollup operations.
-    fn fills_a_hole(&self, task: &MaintenanceTask) -> bool {
+    /// How badly this cell needs the work: 0 repairs DAMAGE, 1 fills a missing
+    /// day, 2 re-derives a day that already has output. Smaller runs first.
+    ///
+    /// Damage leads because a repair unit is narrow by construction — it targets
+    /// the uncovered span of one file, 39 to 308 minutes on prod 2026-08-22 —
+    /// and the `-width` tiebreak below therefore ranks it BELOW every day-wide
+    /// backfill hole. Sharing one rank with those made the damaged cells drain
+    /// at ~2.4 files/hour behind ~12,000 wider units, which is the slow tail
+    /// this ordering exists to prevent.
+    ///
+    /// Bounded, so it cannot starve the backfill: the set comes from files that
+    /// actually exist and shrinks as they are retired — 39 cells when this
+    /// shipped, and zero is the terminal state.
+    fn hole_rank(&self, task: &MaintenanceTask) -> u8 {
         if !matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup) {
-            return false;
+            return 2;
         }
-        chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
-            let cell = (task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), time.date_naive().to_string());
-            self.tier_holes.contains(&cell) || self.untagged_cells.contains(&cell)
-        })
+        let Some(date) = chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| time.date_naive().to_string()) else {
+            return 2;
+        };
+        let cell = (task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), date);
+        if self.untagged_cells.contains(&cell) {
+            0
+        } else if self.tier_holes.contains(&cell) {
+            1
+        } else {
+            2
+        }
     }
 
     pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
@@ -1652,7 +1670,7 @@ impl TaskJournal {
         // CONTIGUITY, and 30 contiguous days is a contiguity goal.
         let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, i64, i64) {
             let (class, starved, width, order) = scheduling_class(task, now_micros);
-            (class, starved, u8::from(!journal.fills_a_hole(task)), width, order)
+            (class, starved, journal.hole_rank(task), width, order)
         };
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, i64, i64)> {
             let mut class: Option<(u8, u8, u8, i64, i64)> = None;
@@ -3560,6 +3578,49 @@ mod tests {
             journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
             "zzz-damaged",
             "a partition holding unretirable untagged files must outrank a day that is merely being re-derived"
+        );
+    }
+
+    /// Damage repair leads a missing day, which leads a re-derive.
+    ///
+    /// The middle rank is not enough on its own: a repair unit targets one
+    /// file's uncovered span — 39 to 308 minutes on prod 2026-08-22 — so the
+    /// `-width` tiebreak ranks it below every day-wide backfill hole it shares a
+    /// rank with. That is why the damaged cells drained at ~2.4 files/hour.
+    #[test]
+    fn damage_outranks_a_missing_day_which_outranks_a_re_derive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        // The damaged unit is deliberately the NARROWEST and the newest, so it
+        // loses every other tiebreak and only the rank can put it first.
+        let seed = |journal: &mut TaskJournal| {
+            let mut narrow = task("damaged", 35 * DAY, 35 * DAY + 600_000_000, Operation::BaseRollup);
+            narrow.key.physical_table = "rollup_1m".to_owned();
+            narrow.deadline_micros = 0;
+            narrow.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            let mut wide_hole = task("missing", 20 * DAY, 21 * DAY, Operation::BaseRollup);
+            wide_hole.key.physical_table = "rollup_1m".to_owned();
+            wide_hole.deadline_micros = 0;
+            wide_hole.created_unix_ms = narrow.created_unix_ms;
+            journal.upsert(narrow);
+            journal.upsert(wide_hole);
+            journal.set_tier_holes(HashSet::from([("source".to_owned(), "missing".to_owned(), "rollup_1m".to_owned(), "1970-01-21".to_owned())]));
+        };
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+
+        // Sharing one rank, the day-wide hole wins on width — the old behaviour.
+        assert_eq!(journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id, "missing");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-02-05".to_owned())]);
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
+            "damaged",
+            "a ten-minute damage repair must outrank a day-wide backfill hole"
         );
     }
 

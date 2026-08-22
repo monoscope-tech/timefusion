@@ -1319,19 +1319,26 @@ impl Database {
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
-        let (snapshot, log_store, selected, estimated_bytes, source_rows) = {
+        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_fp) = {
             let table = from_table.read().await;
             let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
             let date_string = date.to_string();
-            // The witness the read path re-checks this slice against. Taken with
+            // The witness the read path re-checks this slice against, AND the
+            // whole-partition fingerprint the DATE-level path checks. Taken with
             // the SAME call the read path uses and the same unbounded bound, so
-            // the two are the same computation — see `slice_coverage_agrees`.
-            let source_rows = Self::partition_stats_bounded(&table, tiebreak_of(&key.source), &|_, _| i64::MAX)
-                .ok()
-                .and_then(|mut stats| {
-                    stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
-                })
-                .map(|stats| stats.rows);
+            // both are the same computation — see `slice_coverage_agrees` and
+            // the `coverage.source_fp != source_fp` test in `ProjectRoutingTable`.
+            //
+            // Taking the fingerprint HERE is what makes the date-level producer
+            // sound. It is read from the very snapshot this build aggregates, so
+            // it states what was true at build time rather than asserting
+            // freshness after the fact — and if the partition moves afterwards
+            // the read path sees a different fingerprint and refuses.
+            let partition_stats = Self::partition_stats_bounded(&table, tiebreak_of(&key.source), &|_, _| i64::MAX).ok().and_then(|mut stats| {
+                stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
+            });
+            let source_rows = partition_stats.map(|stats| stats.rows);
+            let partition_fp = partition_stats.map(|stats| stats.fingerprint);
             let partition_paths = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string);
             let mut selected = Vec::new();
             let mut estimated = 0u64;
@@ -1433,7 +1440,7 @@ impl Database {
                 estimated = estimated.saturating_add(projected.saturating_mul(share).div_ceil(whole.max(1)));
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated, source_rows)
+            (snapshot, table.log_store(), selected, estimated, source_rows, partition_fp)
         };
         if untagged_inputs > 0 {
             crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
@@ -1853,6 +1860,42 @@ impl Database {
                     covered_through: key.slice.end_micros,
                 },
             );
+            // DATE-level coverage, the second routing route. It had no producer
+            // at all — two reads and two removals against zero inserts — so the
+            // lookup in `ProjectRoutingTable::scan` returned `None` for every
+            // date on every process and ALL routing fell to slice coverage, the
+            // one path the per-slice witness rule can refuse. Prod 2026-08-22
+            // measured 95.2% of `stale_coverage` as witness-less slices with
+            // `rollup_hits_* = 0`; this route does not consult the witness at
+            // all, it compares the whole-partition fingerprint instead.
+            //
+            // Only when the slice reaches back to the start of the day. The read
+            // path serves `[day_start, covered_through)` from this entry, so a
+            // slice that begins mid-day would claim a morning it never
+            // aggregated — the silent-wrong-number failure. A later slice ending
+            // further into the day simply replaces this one, since
+            // `covered_through` grows monotonically for a fixed fingerprint.
+            // `date_start_micros` on purpose, not a local conversion: the read
+            // path derives `day_start` with that exact function, and this bound
+            // is the whole soundness argument.
+            if let Some(partition_fp) = partition_fp
+                && date_start_micros(&date.to_string()).is_some_and(|day_start| key.slice.start_micros <= day_start)
+            {
+                self.rollup_coverage.insert(
+                    (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), date.to_string()),
+                    RollupCoverage {
+                        source_fp: partition_fp,
+                        source_epoch: self
+                            .rollup_source_epochs
+                            .get(&(key.project_id.clone(), key.source.clone(), date.to_string()))
+                            .map_or(0, |epoch| *epoch.value()),
+                        generation: generation.clone(),
+                        rows,
+                        source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                        covered_through: key.slice.end_micros,
+                    },
+                );
+            }
             journal.publish(
                 &key,
                 crate::maintenance_coordinator::Publication {
