@@ -147,6 +147,19 @@ third — the preflight shred — was not:
 - **Mid-tail gap units: fast.** A 22-minute gap sits at the row-group floor
   (~270 MB), under budget.
 
+Replaying `uncovered_gaps` over the live log before the deploy predicts exactly
+what will be queued: **83 units across 42 cells, and not one of them day-wide.**
+The mid-tail cells come out at 3–90 minutes each (`dcad860a` 08-14 is 3 minutes,
+`6297304f` 08-17 is 22), which is the whole point — those replace day-wide units
+that shred. The 08-19 cells still come out at 21–22 hours where only one tagged
+range exists, so those remain the population at risk from the preflight.
+
+A behavioural consequence worth stating: because no queued slice spans a whole
+day, retirement now comes through proof B/C rather than proof A. That is sound —
+each slice is derived from the untagged file's own span and rounded OUTWARD to
+the minute, so `lo >= start && hi < end` holds by construction — but it does mean
+a partition converges as its files are individually contained, not all at once.
+
 Two things that will appear in the logs and are correct, not failures:
 `maintenance_rollup_escalated_to_covering_slice` for the gap-free fallback units
 (their spans are contained in a live tagged slice, so `covered_by_wider` escalates
