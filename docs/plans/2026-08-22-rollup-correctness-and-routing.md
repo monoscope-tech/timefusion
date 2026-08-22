@@ -444,3 +444,53 @@ is the right trade regardless — a slow right answer beats a fast wrong one.
 
 **Do not revert this change to "fix" it.** Reverting restores the 39%
 under-count and does nothing about the restart cadence.
+
+## 7. §2c and §3a shipped (2026-08-22 afternoon)
+
+**§2c — COALESCE unwrap (8f29584).** The soundness question turned out to be
+easy and the mechanical one hard.
+
+*Sound* because `COALESCE(dim, lit)` is a function of `dim`: the tier's
+partition by `dim` REFINES the partition by `COALESCE(dim, lit)`, and
+re-aggregating decomposable states over a refinement equals aggregating the raw
+rows. So the expression is emitted verbatim onto both legs — no re-aggregation
+machinery, no NULL special case. The NULL cell and the literal-`'null'` cell
+merge exactly as the raw rows do.
+
+*The trap*: DataFusion's simplifier rewrites `coalesce` into
+`CASE WHEN c IS NOT NULL THEN c ELSE lit END` before the matcher sees it.
+Matching only the `ScalarFunction("coalesce")` spelling compiles, reads
+correctly, and silently never fires — which is how the shape went unrouted in
+the first place. Both spellings are matched now.
+
+*And the 165-vs-219 group-count discrepancy that gated this is explained, not
+worked around*: NULL-folding can only REDUCE the group count, yet the COALESCE
+arm returned MORE. That A/B ran on `d327df8` while the §1 under-count was live,
+so the routed arm was reading a tier that dropped rows. Fixed in `7c73d19`.
+
+**§3a — additive file-set certification (4b91f8c), DEFAULT OFF.** Three things
+had to change beyond the rule proved in §3a above:
+
+1. A certification now records the file paths it proved, not just their hash
+   (`Certification::files`, `StoredCertification::files`, both `serde(default)`).
+2. **The read path no longer DELETES a certification whose fingerprint moved.**
+   `dedup_window_certified` dropped it on sight — right for the all-or-nothing
+   question, fatal for the per-file one, because it destroyed the evidence for
+   every file the new one did not overlap. It is now marked `stale` and kept,
+   and dwell is still recorded exactly once on the transition. This was the
+   reason the first parity run reported "the skip never engaged".
+3. **The scan's include set is built for EITHER restriction.** Keyed on the date
+   split alone, a file-only split built no include at all, both legs scanned the
+   whole table, and every certified row was counted twice — the parity gate
+   caught it at 740 against 340.
+
+Gate: `count_is_identical_with_and_without_the_per_file_dedup_skip` certifies
+one timestamp band, then churns a DISJOINT band across two flushes so the
+fingerprint moves and every all-or-nothing skip declines. It demands the
+per-file skip ENGAGE and the row count equal the feature-off control exactly.
+
+**Turning it on** (`TIMEFUSION_READ_DEDUP_SKIP_PER_FILE=true`): diff `count(*)`
+with it on and off over a churning prod partition first, and watch
+`dedup_skipped_per_file` in `timefusion_stats`. The failure mode is a silent
+over-count on every dashboard tile, so it stays off until that comparison is
+done on real data.
