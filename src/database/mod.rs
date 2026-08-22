@@ -189,6 +189,25 @@ pub mod scan_metric_names {
     pub const CERT_GRANTED_TOTAL: &str = "timefusion.scan.cert_granted_total";
     /// Scans that skipped `DedupExec` over SOME (not all) in-window dates.
     pub const DEDUP_SKIPPED_PER_DATE: &str = "timefusion.scan.dedup_skipped_per_date";
+    // Where the tantivy ROUTING TAX actually goes. Measured 2026-08-22: a routed
+    // equality costs ~300-500ms more than the identical unrouted query while the
+    // whole tantivy fan-out is 33-83ms of it, with zero IO — so ~85% is spent
+    // here, building the scan, and nothing could see it. The single-provider
+    // fast path needs `raw.is_empty() && !bloom_pruned && date_restrict.is_none()`;
+    // these name which conjunct failed, because "drain coverage" and "make the
+    // split cheap" are very different fixes and only the loser tells you which.
+    pub const TANTIVY_SCAN_CALLS: &str = "timefusion.scan.tantivy_scan_calls";
+    pub const TANTIVY_SCAN_US: &str = "timefusion.scan.tantivy_scan_us";
+    pub const TANTIVY_URIS_US: &str = "timefusion.scan.tantivy_uris_us";
+    pub const TANTIVY_FASTPATH: &str = "timefusion.scan.tantivy_fastpath";
+    pub const TANTIVY_SPLIT_RAW: &str = "timefusion.scan.tantivy_split_raw";
+    pub const TANTIVY_SPLIT_BLOOM: &str = "timefusion.scan.tantivy_split_bloom";
+    pub const TANTIVY_SPLIT_DATE: &str = "timefusion.scan.tantivy_split_date";
+    pub const TANTIVY_LIVE_FILES: &str = "timefusion.scan.tantivy_live_files";
+    pub const TANTIVY_RAW_FILES: &str = "timefusion.scan.tantivy_raw_files";
+    /// Indexes built by the reconcile BACKFILL specifically — not by flush,
+    /// compaction or the wave reindex, all of which also publish.
+    pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
     // Why a dedup pass did NOT end in a certification. `cert_granted_total` has
     // sat at 0 since 2026-08-20 across three attempted fixes, each of which
     // guessed at the exit; these name the exits so the next fix is measured.
@@ -3093,9 +3112,17 @@ impl Database {
     /// reindex has no reported remaining-work figure for hours. This is the same diff but
     /// metadata-only: the Delta log names live files and the manifest names covered ones. No
     /// parquet is read and no index is built, so it is safe to run far more often.
-    pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64)> {
-        let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0)) };
+    /// Returns `(uncovered, oversized, by_age)` where `by_age` is
+    /// `[today, 1-7d, older]` — see `CENSUS_AGE_BUCKETS`.
+    pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64, [u64; 3])> {
+        let Some(svc) = self.tantivy_indexer().cloned() else { return Ok((0, 0, [0; 3])) };
         let (mut uncovered, mut oversized) = (0u64, 0u64);
+        // Age of the UNCOVERED files, not just how many. A total alone cannot
+        // separate "a rewrite path is minting uncovered files right now" from
+        // "an old backlog the backfill has not chewed through yet", and those
+        // want opposite fixes — hook the rewriter vs. raise build throughput.
+        let mut by_age = [0u64; 3];
+        let today = crate::support::now_micros() / 86_400_000_000;
         for table_name in svc.config.indexed_tables() {
             if !svc.config.is_table_indexed(&table_name) {
                 continue;
@@ -3107,13 +3134,22 @@ impl Database {
                 let (by_pid, ..) = self.group_uncovered_files_by_project(&svc, &table_ref, &table_name, &mut oversized, false).await?;
                 for uris in by_pid.into_values() {
                     uncovered = uncovered.saturating_add(uris.len() as u64);
+                    for uri in &uris {
+                        // Partition date, not file mtime: a compaction rewrite
+                        // of old data must count as OLD, or every rewrite would
+                        // masquerade as fresh accrual and point at the wrong fix.
+                        let age_days = crate::storage::date_partition_of(uri)
+                            .and_then(|d| chrono::NaiveDate::parse_from_str(&d.to_string(), "%Y-%m-%d").ok())
+                            .map_or(i64::MAX, |d| today - d.and_hms_opt(0, 0, 0).map_or(0, |t| t.and_utc().timestamp_micros() / 86_400_000_000));
+                        by_age[usize::from(age_days > 0) + usize::from(age_days > 7)] += 1;
+                    }
                 }
             }
         }
         let stats = crate::observability::maintenance_stats();
         stats.tantivy_uncovered_files.store(uncovered, std::sync::atomic::Ordering::Relaxed);
         stats.tantivy_oversized_skipped.store(oversized, std::sync::atomic::Ordering::Relaxed);
-        Ok((uncovered, oversized))
+        Ok((uncovered, oversized, by_age))
     }
 
     /// Bloom sidecar reconcile: for every table with bloom-enabled columns,
@@ -3239,6 +3275,15 @@ impl Database {
                 deferred_total = deferred_total.saturating_add((work.len() - cap) as u64);
                 work.truncate(cap);
             }
+            // Announce the pass BEFORE the first build, with what it will
+            // attempt. `tantivy_backfill_pass` only prints at the very end, and
+            // on this box a pass has never once reached it — so "planned" was
+            // unobservable and the cap could not be shown to have applied.
+            // (Equivalent to the unmerged fix/tantivy-reconcile-progress-logging;
+            // rewritten here because that branch predates the bounded pass.)
+            let planned = work.len();
+            info!(table_name, root = %root, planned, cap, event = "tantivy_backfill_started");
+            let mut done = 0usize;
             let mut jobs = futures::stream::iter(work.into_iter().map(|(pid, rel, uri)| {
                 let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
                 async move { (pid.clone(), svc.build_index_for_file(&table, &pid, &rel, &uri, store).await) }
@@ -3246,8 +3291,21 @@ impl Database {
             .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
             while let Some((pid, result)) = jobs.next().await {
                 match result {
-                    Ok(()) => built += 1,
+                    // Counted live, not just at pass end: the `built=` pass line
+                    // has NEVER been harvested in prod — passes outrun their tick
+                    // or die to a deploy first — so backfill throughput has only
+                    // ever been guessed at, most recently from `cache_seeded`,
+                    // which also counts flush publishes and overstated it ~10x.
+                    // A monotonic counter gives the true rate from deltas mid-pass.
+                    Ok(()) => {
+                        built += 1;
+                        metrics::counter!(scan_metric_names::TANTIVY_BACKFILL_BUILT).increment(1);
+                    }
                     Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
+                }
+                done += 1;
+                if done.is_multiple_of(25) {
+                    info!(table_name, root = %root, done, planned, built, event = "tantivy_backfill_progress");
                 }
             }
         }
@@ -7715,10 +7773,18 @@ impl ProjectRoutingTable {
             return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, include.as_ref(), exclude, row_selections).await?]);
         };
 
+        // Everything from here to the `plans` return is the routed-only work the
+        // attribution could not see. Timed as a whole, with the file-listing
+        // step timed separately: materializing every URI is the one step whose
+        // cost scales with the table rather than with the query.
+        let scan_started = std::time::Instant::now();
         let mut bloom_pruned_any = false;
-        let live = table
-            .get_file_uris()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        let uris_started = std::time::Instant::now();
+        let all_uris = table.get_file_uris().map_err(|e| DataFusionError::External(Box::new(e)))?.collect::<Vec<_>>();
+        metrics::counter!(scan_metric_names::TANTIVY_URIS_US).increment(uris_started.elapsed().as_micros() as u64);
+        metrics::counter!(scan_metric_names::TANTIVY_LIVE_FILES).increment(all_uris.len() as u64);
+        let live = all_uris
+            .into_iter()
             .filter(|uri| uri.ends_with(".parquet") && uri_date_in_window(uri, lo, hi))
             .filter(|uri| {
                 let rejected = is_rejected(uri);
@@ -7727,11 +7793,28 @@ impl ProjectRoutingTable {
             })
             .filter(in_dates);
         let (mut indexed, raw): (HashSet<String>, HashSet<String>) = live.partition(|uri| covered.contains(uri));
+        // Charge the fast path's LOSER, one counter per failing conjunct (they
+        // are not exclusive — a scan can be defeated by two at once, and which
+        // ones co-occur is the whole question).
+        metrics::counter!(scan_metric_names::TANTIVY_SCAN_CALLS).increment(1);
+        metrics::counter!(scan_metric_names::TANTIVY_RAW_FILES).increment(raw.len() as u64);
+        for (defeated, name) in [
+            (!raw.is_empty(), scan_metric_names::TANTIVY_SPLIT_RAW),
+            (bloom_pruned_any, scan_metric_names::TANTIVY_SPLIT_BLOOM),
+            (date_restrict.is_some(), scan_metric_names::TANTIVY_SPLIT_DATE),
+        ] {
+            if defeated {
+                metrics::counter!(name).increment(1);
+            }
+        }
         // Complete coverage keeps the established single-provider fast path.
         // The split is only needed when the exact snapshot has raw debt.
         if raw.is_empty() && !indexed.is_empty() && !bloom_pruned_any && date_restrict.is_none() {
             let narrowed = narrow(filters);
-            return Ok(vec![self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?]);
+            metrics::counter!(scan_metric_names::TANTIVY_FASTPATH).increment(1);
+            let plan = self.scan_delta_table(table, state, projection, &narrowed, limit, None, zero_hit_files, row_selections).await?;
+            metrics::counter!(scan_metric_names::TANTIVY_SCAN_US).increment(scan_started.elapsed().as_micros() as u64);
+            return Ok(vec![plan]);
         }
         if let Some(zero) = zero_hit_files {
             indexed.retain(|uri| !zero.contains(uri));
@@ -7748,6 +7831,7 @@ impl ProjectRoutingTable {
         // Under a date split an empty side is a real empty side; the
         // unrestricted fallback below would read the OTHER side's files.
         if plans.is_empty() && date_restrict.is_some() {
+            metrics::counter!(scan_metric_names::TANTIVY_SCAN_US).increment(scan_started.elapsed().as_micros() as u64);
             return Ok(Vec::new());
         }
         if plans.is_empty() {
@@ -7767,6 +7851,7 @@ impl ProjectRoutingTable {
                 plans.push(self.scan_delta_table(table, state, projection, filters, limit, None, None, None).await?);
             }
         }
+        metrics::counter!(scan_metric_names::TANTIVY_SCAN_US).increment(scan_started.elapsed().as_micros() as u64);
         Ok(plans)
     }
 

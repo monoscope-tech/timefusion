@@ -1648,8 +1648,12 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
     // freshly deployed process reports "0 remaining" for up to 24h whether or
     // not the reindex is actually finished — the exact blind spot that had this
     // work being chased by hand from sibling containers.
-    let (uncovered_before, _) = db.tantivy_coverage_census().await?;
+    let (uncovered_before, _, by_age_before) = db.tantivy_coverage_census().await?;
     assert!(uncovered_before >= 2, "census must count uncovered live files before any build, got {uncovered_before}");
+    // The age split must partition the total, not merely exist: it is what
+    // separates "a rewrite path is minting uncovered files" from "an old
+    // backlog", and those want opposite fixes.
+    assert_eq!(by_age_before.iter().sum::<u64>(), uncovered_before, "age buckets must account for every uncovered file: {by_age_before:?}");
 
     let (built, removed, _) = db.tantivy_reconcile_table(TABLE).await?;
     assert!(built >= 2, "expected both uncovered live files indexed, built={built}");
@@ -1659,8 +1663,9 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
         0,
         "the pass must publish remaining work (sentinel not overwritten); 'uncovered -> 0' is the definition of a finished reindex"
     );
-    let (uncovered_after, _) = db.tantivy_coverage_census().await?;
+    let (uncovered_after, _, by_age_after) = db.tantivy_coverage_census().await?;
     assert_eq!(uncovered_after, 0, "after indexing every uncovered file the census must independently agree the reindex is done");
+    assert_eq!(by_age_after, [0; 3], "a finished reindex leaves no uncovered file in any age bucket");
     let m = load_manifest(tantivy_store.as_ref(), TABLE, &project_id).await?;
     assert_eq!(m.entries.len(), 2, "per-uuid manifest covers both files");
 

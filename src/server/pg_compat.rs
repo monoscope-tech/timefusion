@@ -1171,6 +1171,21 @@ impl StatsTableProvider {
                     // Read them together with cert_dwell_p50 below — a large
                     // never_certified share only justifies persistence if the
                     // certifications it would persist actually live a while.
+                    // The routing tax, where it actually goes. `tantivy_scan_us`
+                    // is the routed-only scan construction; compare its delta
+                    // against the routed-minus-unrouted wall gap, and read
+                    // fastpath vs the three split_* losers to see WHY the cheap
+                    // single-provider path was refused.
+                    "tantivy_scan_calls" => cv(TANTIVY_SCAN_CALLS),
+                    "tantivy_scan_us_total" => cv(TANTIVY_SCAN_US),
+                    "tantivy_uris_us_total" => cv(TANTIVY_URIS_US),
+                    "tantivy_fastpath" => cv(TANTIVY_FASTPATH),
+                    "tantivy_split_raw" => cv(TANTIVY_SPLIT_RAW),
+                    "tantivy_split_bloom" => cv(TANTIVY_SPLIT_BLOOM),
+                    "tantivy_split_date" => cv(TANTIVY_SPLIT_DATE),
+                    "tantivy_live_files_total" => cv(TANTIVY_LIVE_FILES),
+                    "tantivy_raw_files_total" => cv(TANTIVY_RAW_FILES),
+                    "tantivy_backfill_built" => cv(TANTIVY_BACKFILL_BUILT),
                     "dedup_denied_never_certified" => cert_never,
                     "dedup_denied_fp_moved" => cert_moved,
                     "dedup_denied_never_certified_pct" => pct(cert_never, cert_never + cert_moved),

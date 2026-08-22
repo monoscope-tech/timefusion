@@ -2068,7 +2068,9 @@ impl Database {
             && self.tantivy_census_at.compare_exchange(census_last, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
         {
             match self.tantivy_coverage_census().await {
-                Ok((uncovered, oversized)) => info!(uncovered, oversized, event = "tantivy_coverage_census"),
+                Ok((uncovered, oversized, by_age)) => {
+                    info!(uncovered, oversized, today = by_age[0], week = by_age[1], older = by_age[2], event = "tantivy_coverage_census")
+                }
                 Err(error) => warn!(%error, event = "tantivy_coverage_census_failed"),
             }
         }
