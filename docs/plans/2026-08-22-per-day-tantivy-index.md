@@ -280,3 +280,36 @@ throughput lever is worth pulling:
 The step-0 carry-forward remains correct and cheap, but it addresses
 `week`/`older` churn that this measurement says is already near zero. **Fix the
 ordering first.**
+
+## 2026-08-22 13:54 — tail reservation shipped; its verification is blocked
+
+`timefusion_tantivy_backfill_tail_share_pct` (default 33) is live. First
+evidence that it does what it was built to do — the tail moved for the first
+time in any sample taken today:
+
+| time | total | today | week | older |
+|---|---|---|---|---|
+| 12:59 | 5868 | 686 | 1723 | 3459 |
+| 13:13 | 5920 | 741 | 1723 | **3456** |
+
+`older` −3, having been frozen to within one file across every earlier sample.
+But `today` climbed ~220/hr against ~140/hr before, which is the expected cost
+of handing 50 of 150 slots to the tail. **Whether that trade is net-positive is
+NOT established**, and could not be established today: prod restarted at 12:5x,
+13:13, 13:40 and 13:53 — roughly every 13-30 minutes — while a backfill pass
+takes over an hour. No pass completed inside any container's life, so there is
+no clean window to measure. (This is the same deploy-cadence pathology recorded
+for maintenance units: restarts every ~13 min against a 15 min unit deadline.)
+
+**Left ON deliberately, on an argument rather than a measurement.** The backlog
+was provably unreachable before — `week`/`older` frozen within one file across
+three consecutive samples while `today` climbed — so any reservation converts an
+infinite backlog into a finite one. The cost is bounded and reversible: it is
+carved out of the cap, so pass cost is unchanged, and `=0` restores the previous
+behaviour exactly. If a quiet window later shows `today` diverging faster than
+the tail drains, lower it rather than reverting the concept.
+
+**What the numbers actually argue for.** ~220/hr of accrual in `today` against a
+150-file pass says per-file indexing of the hot partition can never keep up, no
+matter how the pass is divided. That is the hot-tail half of this document, and
+it is now the load-bearing change — not an optimisation.
