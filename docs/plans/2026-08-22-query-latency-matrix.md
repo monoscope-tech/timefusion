@@ -220,20 +220,61 @@ filter.
 `tantivy_manifest_commits` is likewise unverifiable on a young container — the
 reconcile cron fires at minute 20 and `tantivy_backfill_built` was still 0.
 
-## Why the routing re-measure has not happened
+## The routing re-measure, with valid coverage
 
-It needs a quiet window and there has not been one. Prod restarted twice during
-this session — `ebfa7e0` at 18:41, then `5062a7d` at ~18:55 — and each restart
-zeroes `rollup_min_contiguous_days`, which gates whether the router attempts
-anything at all. Fifty minutes after the second deploy it still reads 0, along
-with `tantivy_uncovered_files` and `tantivy_backfill_built`.
+Run at 17:03 UTC on `5062a7d` (which contains `ebfa7e0` — verified with
+`git merge-base --is-ancestor`), 20 min uptime, with
+`rollup_min_contiguous_days = 30` restored. Counters diffed around each query.
 
-This is the deploy-train problem, and it is worth stating as a constraint on the
-whole approach rather than as an excuse: **on this box the gauges that answer
-"did the fix work" take longer to rebuild than the interval between deploys.**
-Any routing conclusion drawn inside that interval is an artifact. The compaction
-chart shows the same constraint from the write side — six sealed days frozen
-because units are re-claimed rather than finished.
+| shape | before | now | miss reason | verdict |
+|---|---|---|---|---|
+| `kind IN ('server','client')` 7d | 22,753 | 21,186 | `unknown_filter` | unchanged |
+| 1h group-by 3d | 2,512 | 2,902 | `stale_coverage` | unchanged |
+| 1h group-by 7d | 10,570 | 6,077 | `stale_coverage` | cache, not routing |
+| plain `count(*)` 7d | 6,121 | 5,424 | `stale_coverage` | cache, not routing |
+
+`rollup_hits_full_total` and `rollup_hits_hybrid_total` are **still 0**. The
+timing movement is warm-cache variation, not routing — every one of these queries
+recorded a miss.
+
+**Two corrections to what this page said earlier.**
+
+*First*, the claim that the dashboard group-by "never reaches the router" was
+wrong twice over: it was measured with coverage at 0, and it used a
+`SELECT count(*) FROM (…)` wrapper whose outer aggregate changes the plan shape.
+The **bare** group-by — the shape monoscope actually issues — does reach the
+router, and misses `stale_coverage` every single time.
+
+*Second*, and this is the useful result: **`stale_coverage` is the sole blocker
+for both the dashboard group-by and plain `count(*)`.** Three separate bare
+shapes, three `stale_coverage` misses, no other reason. That is the largest
+latency item on this page and it is the per-slice witness change already in
+flight from a concurrent session — not something to duplicate.
+
+**On `kind IN`, the hint fix did what it claimed and it is not enough.** The
+promoted filter is clean in prod — `((kind Eq "client") OR (kind Eq "server"))`,
+hint gone — and the `distinct project_id … kind in (?,?,?,?)` shape stopped
+declining entirely. But this query still declines `unknown_filter`, because the
+clean filter matches no declared count measure: the specs declare
+`request_count` (unfiltered), `error_count`, and three `server_*` measures keyed
+on `kind='server' OR name IN (…)`. Nothing covers `kind IN ('server','client')`.
+The fix removed one of two layers, which is exactly the caveat recorded when it
+shipped. Closing this one needs a declared measure, i.e. a spec change.
+
+## Why it took three attempts to measure this
+
+Prod restarted twice during this session — `ebfa7e0`, then `5062a7d` fourteen
+minutes later — and each restart zeroes `rollup_min_contiguous_days`, which gates
+whether the router attempts anything at all. Coverage took **~25 minutes** to
+rebuild, during which every routing measurement is an artifact: with coverage at
+0 the router does not attempt, so shapes record neither a hit nor a miss and it
+reads exactly like "my fix did nothing".
+
+**On this box the gauges that answer "did the fix work" can take longer to
+rebuild than the interval between deploys.** Read `rollup_min_contiguous_days`
+first; if it is 0, the measurement has not started. The compaction chart shows
+the same constraint from the write side — six sealed days frozen because units
+are re-claimed rather than finished.
 
 ## Open, in priority order
 
