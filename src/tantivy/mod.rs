@@ -657,13 +657,19 @@ type ManifestLocks = dashmap::DashMap<TableKey, Arc<tokio::sync::Mutex<()>>>;
 /// manifest would otherwise interleave load/save and drop each other's
 /// entries (last-writer-wins), silently un-covering files and disabling
 /// the prefilter via the coverage gate.
-async fn mutate<F: FnOnce(&mut Manifest)>(store: &dyn ObjectStore, table: &str, project_id: &str, f: F) -> Result<()> {
+/// `f` returns whatever the caller needs out of the mutation (GC needs the
+/// entries it removed, so it can delete their blobs) plus whether the manifest
+/// actually changed — a no-op mutation must not rewrite the object.
+pub async fn mutate<R, F: FnOnce(&mut Manifest) -> (R, bool)>(store: &dyn ObjectStore, table: &str, project_id: &str, f: F) -> Result<R> {
     static LOCKS: std::sync::OnceLock<ManifestLocks> = std::sync::OnceLock::new();
     let lock = LOCKS.get_or_init(Default::default).entry((table.into(), project_id.into())).or_default().clone();
     let _guard = lock.lock().await;
     let mut m = load_manifest(store, table, project_id).await?;
-    f(&mut m);
-    save_manifest(store, table, project_id, &m).await
+    let (out, dirty) = f(&mut m);
+    if dirty {
+        save_manifest(store, table, project_id, &m).await?;
+    }
+    Ok(out)
 }
 
 /// Idempotent upsert: load, mutate, save.
@@ -688,6 +694,7 @@ impl ManifestEntry {
 pub async fn upsert_manifest(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_key: &str, entry: ManifestEntry) -> Result<()> {
     mutate(store, table, project_id, |m| {
         m.entries.insert(parquet_key.to_string(), entry);
+        ((), true)
     })
     .await
 }
@@ -698,9 +705,8 @@ pub async fn remove_manifest_entries(store: &dyn ObjectStore, table: &str, proje
         return Ok(());
     }
     mutate(store, table, project_id, |m| {
-        for k in parquet_keys {
-            m.entries.remove(k);
-        }
+        let removed = parquet_keys.iter().filter(|k| m.entries.remove(*k).is_some()).count();
+        ((), removed > 0)
     })
     .await
 }

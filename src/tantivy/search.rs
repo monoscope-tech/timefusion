@@ -1289,20 +1289,26 @@ impl TantivyIndexService {
     /// post-filter until the next flush rebuilds.
     pub async fn gc_after_compaction(&self, table: &str, project_id: &str, live_uris: &[String]) -> Result<GcReport> {
         let live: HashSet<&str> = live_uris.iter().map(String::as_str).collect();
-        let mut m = load_manifest(self.object_store.as_ref(), table, project_id).await?;
-        let (stale, mut kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut m.entries)
-            .into_iter()
-            .partition(|(_, e)| !e.covered_files.iter().any(|u| live.contains(u.as_str())));
-        let pruned = kept
-            .values_mut()
-            .filter(|e| e.covered_files.iter().any(|u| !live.contains(u.as_str())))
-            .map(|e| {
-                e.covered_files.retain(|u| live.contains(u.as_str()));
-                e.ordinals_valid = false;
-            })
-            .count();
-        let mut report = GcReport { kept: kept.len(), entries_removed: stale.len(), ..Default::default() };
-        m.entries = kept;
+        // Under the per-manifest lock: this is a read-modify-write like every
+        // other manifest mutation, and doing it outside `mutate` raced concurrent
+        // upserts (last writer wins, silently un-covering files).
+        let (stale, kept_len, changed) = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
+            let (stale, mut kept): (BTreeMap<_, _>, BTreeMap<_, _>) =
+                std::mem::take(&mut m.entries).into_iter().partition(|(_, e)| !e.covered_files.iter().any(|u| live.contains(u.as_str())));
+            let pruned = kept
+                .values_mut()
+                .filter(|e| e.covered_files.iter().any(|u| !live.contains(u.as_str())))
+                .map(|e| {
+                    e.covered_files.retain(|u| live.contains(u.as_str()));
+                    e.ordinals_valid = false;
+                })
+                .count();
+            let (kept_len, dirty) = (kept.len(), !stale.is_empty() || pruned > 0);
+            m.entries = kept;
+            ((stale, kept_len, dirty), dirty)
+        })
+        .await?;
+        let mut report = GcReport { kept: kept_len, entries_removed: stale.len(), ..Default::default() };
         // Effectful: delete stale blobs concurrently (serial deletes made a
         // 100k-blob GC take hours). A blob already gone counts as deleted —
         // re-runs after an interrupted GC must not report errors.
@@ -1322,11 +1328,10 @@ impl TantivyIndexService {
             .await;
         report.blobs_deleted = results.iter().filter(|ok| **ok).count();
         report.blob_delete_errors = results.len() - report.blobs_deleted;
-        if report.entries_removed > 0 || pruned > 0 {
-            save_manifest(self.object_store.as_ref(), table, project_id, &m).await?;
-            if let Some(reader) = self.reader() {
-                reader.invalidate_manifest(table, project_id);
-            }
+        // A pruned entry changes what the plan path may consult, so the cached
+        // manifest must go whenever the stored one did.
+        if changed && let Some(reader) = self.reader() {
+            reader.invalidate_manifest(table, project_id);
         }
         Ok(report)
     }
