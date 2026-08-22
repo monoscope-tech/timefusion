@@ -1113,7 +1113,7 @@ impl StatsTableProvider {
         let scan = self.scan_metrics.as_ref().map_or_else(Vec::new, |m| {
             use crate::database::scan_metric_names::*;
             let cv = crate::observability::counter_value;
-            let skip_reason = |r: &str| cv(&format!("{PREFILTER_SKIPPED_REASON_PREFIX}{r}"));
+            let skip_reason = |r: &str| prefilter_skip_metric(r).map_or(0, cv);
             let (total, skipped) = (cv(SCANS_TOTAL), cv(SCANS_SKIPPED_DELTA));
             let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
             let (dedup_elig, dedup_skipped) = (cv(DEDUP_ELIGIBLE_SCANS), cv(DEDUP_SKIPPED));

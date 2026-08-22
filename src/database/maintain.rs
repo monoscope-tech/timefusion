@@ -13,6 +13,15 @@ fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
 
+/// Time ranges keyed by `(project, date)` — the untagged files' statistics
+/// spans, and separately the tagged files' slice ranges.
+type SpansByPartition = HashMap<(String, String), Vec<(i64, i64)>>;
+
+/// Per `(project, date)`: the timestamp spans of its UNTAGGED tier files, and
+/// the slice ranges of its tagged ones. `uncovered_gaps` turns the pair into the
+/// work that would let `slice_retires` reach the untagged files.
+type UntaggedPartitions = HashMap<(String, String), (Vec<(i64, i64)>, Vec<(i64, i64)>)>;
+
 impl Database {
     /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
     fn retry_task(&self, key: &crate::maintenance_coordinator::TaskKey, reason: String, delay: std::time::Duration) -> Result<()> {
@@ -1708,6 +1717,11 @@ impl Database {
             self.rollup_tier_untagged.insert(key.physical_table.clone(), live_adds.iter().filter(|add| untagged(add)).count() as u64);
             stats.rollup_tier_untagged_found.store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), Relaxed);
             let retired = replaced.iter().filter(|add| untagged(add)).count() as u64;
+            // Cleared the moment nothing untagged is left HERE, so the hole rank
+            // stops favouring a partition it has already fixed.
+            if retired > 0 && !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(untagged) {
+                self.journal().clear_untagged_cell(&key.source, &key.physical_table, &key.project_id, &date_string);
+            }
             if retired > 0 {
                 stats.rollup_tier_untagged_retired.fetch_add(retired, Relaxed);
                 warn!(
@@ -2573,10 +2587,11 @@ impl Database {
     /// Self-limiting — the set is read from the log each recovery, so it shrinks
     /// as partitions are repaired and reaches zero. `rollup_tier_untagged_found`
     /// is the gauge that says whether it is converging.
-    fn enqueue_untagged_rebuilds(
-        &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, partitions: &std::collections::HashSet<(String, String)>,
-    ) {
-        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
+    fn enqueue_untagged_rebuilds(&self, source: &str, spec: &crate::schema::RollupSpec, target: &str, partitions: &UntaggedPartitions) {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, MIN_SLICE_MICROS, Operation, TaskKey, TimeSlice};
+        // Published before the empty check, so a tier that has just converged
+        // CLEARS its cells instead of ranking a clean partition forever.
+        self.journal().set_untagged_cells(source, target, partitions.keys().cloned());
         if partitions.is_empty() {
             return;
         }
@@ -2585,16 +2600,41 @@ impl Database {
         let created = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
         let mut journal = self.journal();
         let mut queued = 0usize;
-        for (project_id, date) in partitions {
+        for ((project_id, date), (untagged, tagged)) in partitions {
             let Ok(day) = date.parse::<chrono::NaiveDate>() else { continue };
-            let Some(start) = day.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
-            let Ok(slice) = TimeSlice::new(start, start.saturating_add(crate::maintenance_coordinator::DAY_MICROS)) else { continue };
-            let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice, operation };
-            journal.enqueue(key, now, MAX_DECODED_BYTES, created);
-            queued += 1;
+            let Some(day_start) = day.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
+            let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
+            // No gaps means the proofs already HOLD and the file is still live
+            // only because a proof is evaluated at publish time and nothing has
+            // republished this partition — 15 of prod's 85 stalled files on
+            // 2026-08-22. Republishing the untagged spans themselves is what
+            // fires it, and is still bounded by those files rather than the day.
+            let slices = crate::rollup::uncovered_gaps(untagged, tagged).tap_mut(|gaps| {
+                if gaps.is_empty() {
+                    gaps.extend_from_slice(untagged);
+                }
+            });
+            for (start, end) in slices {
+                // Minute-aligned and clamped to the partition: gaps come from
+                // row statistics, so they land anywhere, and a slice that
+                // overran the day would select another partition's files.
+                let start = start.max(day_start).div_euclid(MIN_SLICE_MICROS) * MIN_SLICE_MICROS;
+                let end = end.min(day_end).saturating_add(MIN_SLICE_MICROS - 1).div_euclid(MIN_SLICE_MICROS) * MIN_SLICE_MICROS;
+                let Ok(slice) = TimeSlice::new(start.max(day_start), end.min(day_end)) else { continue };
+                let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice, operation };
+                journal.enqueue(key, now, MAX_DECODED_BYTES, created);
+                queued += 1;
+            }
         }
         let _ = journal.checkpoint();
-        warn!(source, target, queued, event = "rollup_tier_untagged_rebuild_queued", "partitions still hold tier files with no identity tags");
+        warn!(
+            source,
+            target,
+            queued,
+            partitions = partitions.len(),
+            event = "rollup_tier_untagged_rebuild_queued",
+            "partitions still hold tier files with no identity tags"
+        );
     }
 
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
@@ -2605,7 +2645,7 @@ impl Database {
         let mut recovered = 0;
         for spec in &schema.rollups {
             let target = spec.table_name(source);
-            let mut untagged_partitions: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+            let (mut untagged_spans, mut tagged_spans): (SpansByPartition, SpansByPartition) = Default::default();
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
@@ -2627,10 +2667,21 @@ impl Database {
                         // Remember the partition so the rebuild can be requested
                         // below, which is what makes the tail self-healing rather
                         // than a manual list someone has to keep.
-                        if action.tags.as_ref().is_none_or(|tags| !tags.contains_key(crate::maintenance_coordinator::TAG_SLICE_START))
-                            && let Some(partition) = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default")
-                        {
-                            untagged_partitions.insert(partition);
+                        // Both arms feed `uncovered_gaps`: the untagged file's
+                        // own statistics span is the work, and the tagged
+                        // ranges beside it are what is already done. `hi + 1`
+                        // because statistics bounds are inclusive while a slice
+                        // end is not.
+                        if let Some(partition) = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default") {
+                            let tags = action.tags.as_ref();
+                            let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
+                            match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
+                                (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
+                                _ => untagged_spans
+                                    .entry(partition)
+                                    .or_default()
+                                    .extend(action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1)))),
+                            }
                         }
                         let Some(tags) = action.tags.as_ref() else { continue };
                         let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
@@ -2662,6 +2713,13 @@ impl Database {
             };
             // Before any `continue` below, so a partition still holding
             // untagged files is queued whatever the coverage verdict is.
+            let untagged_partitions: UntaggedPartitions = untagged_spans
+                .drain()
+                .map(|(partition, untagged)| {
+                    let tagged = tagged_spans.remove(&partition).unwrap_or_default();
+                    (partition, (untagged, tagged))
+                })
+                .collect();
             self.enqueue_untagged_rebuilds(source, spec, &target, &untagged_partitions);
             let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {

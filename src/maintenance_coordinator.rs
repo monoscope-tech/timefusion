@@ -429,6 +429,16 @@ pub struct TaskJournal {
     ///
     /// Runtime only, rebuilt from coverage every 60s, same as `base_tier_ready`.
     tier_holes: HashSet<(String, String, String, String)>,
+    /// `(source, project, tier table, date)` for partitions still holding tier
+    /// files with NO identity tags — ranked exactly like `tier_holes`, because
+    /// they are one. Such a file cannot be certified and cannot be retired until
+    /// something republishes the partition, so the partition is missing coverage
+    /// however much tagged output sits beside it.
+    ///
+    /// Kept separate from `tier_holes` rather than merged into it because the
+    /// two are published by different passes at different cadences, and a
+    /// wholesale replace by either would erase the other's evidence.
+    untagged_cells: HashSet<(String, String, String, String)>,
     /// Rotates so a fixed share of claims is reserved for sealed work. Runtime
     /// only — never journalled; losing it across a restart costs nothing.
     claim_tick: u64,
@@ -553,6 +563,7 @@ impl TaskJournal {
             fair_cursors: HashMap::new(),
             base_tier_ready: HashSet::new(),
             tier_holes: HashSet::new(),
+            untagged_cells: HashSet::new(),
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
         })
@@ -1137,6 +1148,27 @@ impl TaskJournal {
         self.tier_holes.len()
     }
 
+    /// Replace the untagged set for ONE `(source, tier table)`, leaving every
+    /// other producer's cells alone — see the field.
+    pub fn set_untagged_cells(&mut self, source: &str, table: &str, cells: impl IntoIterator<Item = (String, String)>) {
+        self.untagged_cells.retain(|(cell_source, _, cell_table, _)| cell_source != source || cell_table != table);
+        self.untagged_cells.extend(cells.into_iter().map(|(project, date)| (source.to_owned(), project, table.to_owned(), date)));
+    }
+
+    pub fn untagged_cells_len(&self) -> usize {
+        self.untagged_cells.len()
+    }
+
+    /// Forget one cell, for a publish that has just left the partition clean.
+    ///
+    /// `recover_rollup_coverage` is the only producer and it runs ONCE at
+    /// startup, so without this a converged cell keeps out-ranking real work
+    /// until the next restart — the ranking would spend claims re-deriving the
+    /// day it already fixed.
+    pub fn clear_untagged_cell(&mut self, source: &str, table: &str, project: &str, date: &str) -> bool {
+        self.untagged_cells.remove(&(source.to_owned(), project.to_owned(), table.to_owned(), date.to_owned()))
+    }
+
     /// Is this task filling a hole rather than re-deriving a day that already
     /// has tier output? Only meaningful for rollup operations.
     fn fills_a_hole(&self, task: &MaintenanceTask) -> bool {
@@ -1144,7 +1176,8 @@ impl TaskJournal {
             return false;
         }
         chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
-            self.tier_holes.contains(&(task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), time.date_naive().to_string()))
+            let cell = (task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), time.date_naive().to_string());
+            self.tier_holes.contains(&cell) || self.untagged_cells.contains(&cell)
         })
     }
 
@@ -3484,6 +3517,67 @@ mod tests {
             "recent",
             "a missing day must outrank an OLDER day that already has output — holes rank above backlog age"
         );
+    }
+
+    /// A partition still holding UNTAGGED tier files is a hole, whatever else
+    /// is live in it.
+    ///
+    /// Measured on prod 2026-08-22. Every one of the 08-19 damaged partitions
+    /// had its day-wide rebuild already queued, already past its deadline, at
+    /// `attempts=0`, and cheap enough to run unsplit (268-537 MB) — and none had
+    /// been claimed in three days. The reason is this rank: those cells DO have
+    /// tier output, so `fills_a_hole` was false and they sat behind ~12,000
+    /// hole-filling units that the backfill mints faster than it drains. The
+    /// untagged files themselves cannot be certified, so the partition is
+    /// missing coverage no matter how much output sits beside them.
+    #[test]
+    fn a_partition_holding_untagged_files_outranks_a_re_derive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        let at = |project: &str, day: i64| {
+            let mut t = task(project, day * DAY, day * DAY + DAY, Operation::BaseRollup);
+            t.key.physical_table = "rollup_1m".to_owned();
+            t.deadline_micros = 0;
+            t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            t
+        };
+        // The damaged cell is deliberately the one that loses every other tie:
+        // it is the NEWER day and its project sorts last, so only the untagged
+        // rank can put it first.
+        let seed = |journal: &mut TaskJournal| {
+            journal.upsert(at("aaa-clean", 20));
+            journal.upsert(at("zzz-damaged", 35));
+        };
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        assert_eq!(journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id, "aaa-clean");
+
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        journal.set_untagged_cells("source", "rollup_1m", [("zzz-damaged".to_owned(), "1970-02-05".to_owned())]);
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
+            "zzz-damaged",
+            "a partition holding unretirable untagged files must outrank a day that is merely being re-derived"
+        );
+    }
+
+    /// Each (source, tier) owns its own slice of the untagged set.
+    ///
+    /// `recover_rollup_coverage` runs per source AND per tier, so a wholesale
+    /// replace would leave the journal holding only whichever tier ran last —
+    /// the exact bug that made `base_tier_ready` and `tier_holes` inert on prod
+    /// (`base_tier_ready=374` then `272`, each wiping the other).
+    #[test]
+    fn setting_untagged_cells_replaces_only_that_sources_tier() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        journal.set_untagged_cells("logs", "logs_1m", [("p".to_owned(), "2026-08-19".to_owned())]);
+        journal.set_untagged_cells("metrics", "metrics_1m", [("p".to_owned(), "2026-08-19".to_owned())]);
+        assert_eq!(journal.untagged_cells_len(), 2, "a second source must not wipe the first");
+        journal.set_untagged_cells("metrics", "metrics_1m", []);
+        assert_eq!(journal.untagged_cells_len(), 1, "an emptied tier clears its own cells and only those");
     }
 
     /// The day-keyed ready set must unblock a derived task of ANY width.

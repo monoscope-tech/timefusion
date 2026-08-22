@@ -778,6 +778,49 @@ pub(crate) fn ranges_cover(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool 
     false
 }
 
+/// The sub-ranges of `untagged` that no live tagged slice covers — the exact
+/// work that would close proof C for this partition.
+///
+/// Queueing the whole DAY instead is what stalled the 2026-08-22 mid-tail: a
+/// day's rollup input is far over `MAX_DECODED_BYTES`, so the preflight shreds
+/// it down the bisection ladder to the one-minute floor — prod held 3,455 units
+/// for a single (project, tier, day), 1,423 of them pending. The actual holes
+/// were 22 MINUTES wide (`18:00-18:22`, `12:00-12:22` — the leftovers of an
+/// earlier shred), each one unit that fits the budget whole.
+///
+/// A partition with no tagged ranges at all yields the untagged spans
+/// themselves, so this is a refinement of "rebuild the day", never a narrowing
+/// below what was already queued.
+///
+/// Ends are EXCLUSIVE here, but a file's statistics `hi` is a row timestamp, so
+/// callers pass `hi + 1`.
+pub(crate) fn uncovered_gaps(untagged: &[(i64, i64)], tagged: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut covered = tagged.to_vec();
+    covered.sort_unstable();
+    let mut gaps: Vec<(i64, i64)> = Vec::new();
+    for &(lo, hi) in untagged {
+        let mut reached = lo;
+        for &(start, end) in covered.iter().filter(|(_, end)| *end > lo) {
+            if start >= hi {
+                break;
+            }
+            if start > reached {
+                gaps.push((reached, start.min(hi)));
+            }
+            reached = reached.max(end);
+            if reached >= hi {
+                break;
+            }
+        }
+        if reached < hi {
+            gaps.push((reached, hi));
+        }
+    }
+    gaps.sort_unstable();
+    gaps.dedup();
+    gaps
+}
+
 /// A slice covering exactly one UTC calendar day — the partition granularity.
 const fn spans_whole_day(start: i64, end: i64) -> bool {
     start.rem_euclid(crate::maintenance_coordinator::DAY_MICROS) == 0 && end.saturating_sub(start) == crate::maintenance_coordinator::DAY_MICROS
@@ -1216,13 +1259,22 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
 /// `text_match` the USER wrote against some other column is preserved and the
 /// filter correctly fails to match any declared measure.
 fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
-    use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::{Expr, Operator};
     fn hint_column(expr: &Expr) -> Option<String> {
         match unaliased(expr) {
             Expr::ScalarFunction(function) if function.name() == "text_match" => match unaliased(function.args.first()?) {
                 Expr::Column(column) => Some(column.name.clone()),
                 _ => None,
             },
+            // The IN-list spelling: the rewriter expands `col IN (a, b, …)`
+            // into an OR of per-item `text_match` calls, so the hint arrives as
+            // a whole subtree rather than a node. Only an OR whose EVERY leaf
+            // hints the SAME column counts — a mixed OR is a real predicate and
+            // dropping it would widen the filter.
+            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+                let (left, right) = (hint_column(&binary.left)?, hint_column(&binary.right)?);
+                (left == right).then_some(left)
+            }
             _ => None,
         }
     }
@@ -2003,6 +2055,27 @@ mod tests {
         assert!(!ranges_cover(&[(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 9 * HOUR)], (DAY, DAY + 3 * HOUR)));
     }
 
+    /// The complement is what must be REBUILT, and it is what makes the repair
+    /// affordable: prod 2026-08-22's mid-tail holes were 22 minutes wide inside
+    /// a day whose rollup input shreds into ~1,440 units.
+    #[test]
+    fn uncovered_gaps_are_the_complement_of_the_live_tagged_ranges() {
+        // Nothing tagged: the whole span is the gap, which is the old
+        // rebuild-the-day behaviour and the floor this must never fall below.
+        assert_eq!(uncovered_gaps(&[(DAY, DAY + 2 * HOUR)], &[]), vec![(DAY, DAY + 2 * HOUR)]);
+        // One interior hole between two published slices.
+        assert_eq!(uncovered_gaps(&[(DAY, DAY + 3 * HOUR)], &[(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 3 * HOUR)]), vec![(DAY + HOUR, DAY + 2 * HOUR)]);
+        // Fully covered — no work at all, and the last range reaching exactly
+        // the exclusive end is enough.
+        assert!(uncovered_gaps(&[(DAY, DAY + HOUR)], &[(DAY, DAY + HOUR)]).is_empty());
+        // Ranges that overrun the span are clipped to it, out-of-order input is
+        // fine, and two files sharing a hole report it once.
+        assert_eq!(
+            uncovered_gaps(&[(DAY + HOUR, DAY + 2 * HOUR), (DAY + HOUR, DAY + 2 * HOUR)], &[(DAY + 90 * 60_000_000, DAY + 9 * HOUR), (DAY, DAY + HOUR)]),
+            vec![(DAY + HOUR, DAY + 90 * 60_000_000)]
+        );
+    }
+
     #[test]
     fn hours_from_stats_json_bounds_the_hours_a_file_can_touch() {
         let day_start = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
@@ -2110,6 +2183,27 @@ mod tests {
         let (with, without) = (route_for(&state, &hinted).await, route_for(&state, &plain).await);
         assert!(without.is_ok(), "the un-hinted control must route: {without:?}");
         assert_eq!(with.is_ok(), without.is_ok(), "a hint must not change whether the query routes: {with:?}");
+    }
+
+    /// The IN-list spelling of the same hint, which is the one prod actually
+    /// carries. `tantivy_rewriter` expands `kind IN (a, b)` into an **OR of
+    /// per-item `text_match` calls**, so the leftover hint is not a bare
+    /// `text_match` node but an `Or` tree — invisible to a stripper that only
+    /// looks at the top of each conjunct. Measured 2026-08-22 on prod
+    /// `b6d8c86`: `select distinct project_id … kind in (?,?,?,?)` promoted
+    /// exactly `(text_match(kind,"client") OR … OR text_match(kind,"server"))`
+    /// with its own `IN` already consumed as a dimension filter, and declined
+    /// `unknown_filter` — 33 of 155 misses, against `rollup_hits_* = 0`.
+    #[tokio::test]
+    async fn an_in_list_hint_or_tree_does_not_become_a_residual() {
+        let state = session().await;
+        let hint = " AND (text_match(kind, 'server') OR text_match(kind, 'client'))";
+        let plain = format!(
+            "SELECT count(*) FROM {SOURCE} WHERE project_id = 'p' AND kind IN ('server', 'client')              AND timestamp >= to_timestamp_micros(1786500000000000) AND timestamp < to_timestamp_micros(1786530000000000)              GROUP BY resource___service___name"
+        );
+        let hinted = plain.replace(" AND timestamp >=", &format!("{hint} AND timestamp >="));
+        let (with, without) = (route_for(&state, &hinted).await, route_for(&state, &plain).await);
+        assert_eq!(with.is_ok(), without.is_ok(), "an OR-of-text_match hint must not change whether the query routes: hinted={with:?} plain={without:?}");
     }
 
     /// The Golden Signals miss, reproduced exactly as prod produced it.

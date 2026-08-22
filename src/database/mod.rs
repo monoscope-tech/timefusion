@@ -216,13 +216,27 @@ pub mod scan_metric_names {
     pub const PREFILTER_ATTEMPTS: &str = "timefusion.scan.prefilter_attempts";
     pub const PREFILTER_USED: &str = "timefusion.scan.prefilter_used";
     pub const PREFILTER_SKIPPED: &str = "timefusion.scan.prefilter_skipped";
-    /// Per-reason breakdown of `PREFILTER_SKIPPED`, suffixed with the reason
-    /// string. FIVE reasons, not three: `decide_prefilter`'s exits
-    /// (`empty_index`, `low_selectivity`, `field_coverage_gap`) plus the two
-    /// search aborts (`delta_no_index_or_cap_exceeded`, `delta_error`), which
-    /// increment the same total from a different call site. Without the split,
-    /// "63% of attempts are skipped" cannot be attributed to a decision at all.
-    pub const PREFILTER_SKIPPED_REASON_PREFIX: &str = "timefusion.scan.prefilter_skipped.";
+    /// Per-reason breakdown of `PREFILTER_SKIPPED`. SIX reasons, not three:
+    /// `decide_prefilter`'s exits (`empty_index`, `low_selectivity`,
+    /// `field_coverage_gap`) plus the search aborts, which increment the same
+    /// total from a different call site. Without the split, "63% of attempts are
+    /// skipped" cannot be attributed to a decision at all — and the fix for a
+    /// declined decision is the opposite of the fix for a missing index.
+    ///
+    /// `counter_value` reads by `&'static str`, so the names are consts and this
+    /// is the one place reason strings and metric names are tied together.
+    pub const PREFILTER_SKIP_REASONS: [(&str, &str); 6] = [
+        ("empty_index", "timefusion.scan.prefilter_skipped.empty_index"),
+        ("low_selectivity", "timefusion.scan.prefilter_skipped.low_selectivity"),
+        ("field_coverage_gap", "timefusion.scan.prefilter_skipped.field_coverage_gap"),
+        ("delta_no_index_or_cap_exceeded", "timefusion.scan.prefilter_skipped.no_index_or_cap"),
+        ("delta_no_hits_returned", "timefusion.scan.prefilter_skipped.no_hits_returned"),
+        ("delta_error", "timefusion.scan.prefilter_skipped.delta_error"),
+    ];
+
+    pub fn prefilter_skip_metric(reason: &str) -> Option<&'static str> {
+        PREFILTER_SKIP_REASONS.iter().find(|(r, _)| *r == reason).map(|(_, m)| *m)
+    }
     /// Indexes built by the reconcile BACKFILL specifically — not by flush,
     /// compaction or the wave reindex, all of which also publish.
     pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
@@ -2431,9 +2445,22 @@ fn fair_tantivy_backfill_work_split(queues: Vec<(String, VecDeque<(String, Strin
         let head_uris: HashSet<&str> = work.iter().take(head_n).map(|(_, _, uri)| uri.as_str()).collect();
         fair_tantivy_backfill_work(oldest_first).into_iter().filter(|(_, _, uri)| !head_uris.contains(uri.as_str())).take(tail_n).collect()
     };
+    // INTERLEAVE, do not append. A pass is routinely killed long before it
+    // finishes — prod restarts every 15-30 min against a ~1.5h pass — so work
+    // placed at the END is the first thing lost. Appending the reservation
+    // reproduced the very starvation it exists to prevent, one level down:
+    // measured 2026-08-22, 18 minutes into a live pass, `older` had not moved
+    // off 3456 because execution was still working through the 100 newest.
+    // Interleaved, the tail is attempted from the first minute.
     work.truncate(head_n);
-    work.extend(tail);
-    work
+    let (mut head, mut tail): (VecDeque<_>, VecDeque<_>) = (work.into(), tail.into());
+    let per_tail = head.len().div_ceil(tail.len().max(1)).max(1);
+    let mut out = Vec::with_capacity(head.len() + tail.len());
+    while !head.is_empty() || !tail.is_empty() {
+        out.extend((0..per_tail).filter_map(|_| head.pop_front()));
+        out.extend(tail.pop_front());
+    }
+    out
 }
 
 /// A file's decoded contribution to a slice, scaled by the share of its time span the slice covers.
@@ -3438,11 +3465,19 @@ impl Database {
                 // MANIFEST_MAX_AGE of durability: the blobs are already uploaded,
                 // so what is lost is the record and the next pass rebuilds them —
                 // wasted work, never wrong work.
-                let full = pending.get(&pid).is_some_and(|p| p.len() >= MANIFEST_BATCH);
-                let stale = pending_since.get(&pid).is_some_and(|t| t.elapsed() >= MANIFEST_MAX_AGE);
-                if full || stale {
-                    pending_since.remove(&pid);
-                    Self::commit_manifest_batch(svc, table_name, &pid, &mut pending).await;
+                //
+                // Swept over EVERY pending project, not just the one that just
+                // built. Checking only `pid` made the age bound unreachable for
+                // any project with one build per pass: nothing re-examines it,
+                // so its entries wait for a pass end that on this box has never
+                // arrived. Prod `b6d8c86` at 44 min uptime read
+                // `tantivy_backfill_built=2, tantivy_manifest_commits=0` — the
+                // bound was deployed and still could not fire. A build costs
+                // ~4-5 minutes, so a whole-map sweep runs at most every few
+                // minutes and its cost is noise against that.
+                for project in due_manifest_flushes(&pending, &pending_since) {
+                    pending_since.remove(&project);
+                    Self::commit_manifest_batch(svc, table_name, &project, &mut pending).await;
                 }
                 done += 1;
                 if done.is_multiple_of(25) {
@@ -6396,6 +6431,43 @@ const MANIFEST_BATCH: usize = 8;
 /// never arrived — losing work the per-build write used to make durable.
 const MANIFEST_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Which projects' deferred manifest entries are due to be committed.
+///
+/// Over EVERY pending project, not just the one whose build has just finished.
+/// Checking only that project left the age bound unreachable for any project
+/// with a single build per pass — nothing ever re-examined it, so its entries
+/// waited on a pass end that this box has never reached.
+fn due_manifest_flushes<T>(pending: &HashMap<String, Vec<T>>, since: &HashMap<String, std::time::Instant>) -> Vec<String> {
+    pending
+        .iter()
+        .filter(|(project, entries)| entries.len() >= MANIFEST_BATCH || since.get(*project).is_some_and(|t| t.elapsed() >= MANIFEST_MAX_AGE))
+        .map(|(project, _)| project.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod due_manifest_flush_tests {
+    use super::*;
+
+    /// The prod failure, as a unit: a project that built once and then went
+    /// quiet must still flush on age. Prod `b6d8c86` read
+    /// `tantivy_backfill_built=2, tantivy_manifest_commits=0` at 44 minutes.
+    #[test]
+    fn an_aged_project_flushes_even_though_another_one_is_building() {
+        let pending = HashMap::from([("quiet".to_string(), vec![()]), ("busy".to_string(), vec![()])]);
+        let since = HashMap::from([("quiet".to_string(), std::time::Instant::now() - MANIFEST_MAX_AGE * 2), ("busy".to_string(), std::time::Instant::now())]);
+        assert_eq!(due_manifest_flushes(&pending, &since), vec!["quiet".to_string()]);
+    }
+
+    #[test]
+    fn a_full_batch_flushes_regardless_of_age() {
+        let pending = HashMap::from([("p".to_string(), vec![(); MANIFEST_BATCH])]);
+        let since = HashMap::from([("p".to_string(), std::time::Instant::now())]);
+        assert_eq!(due_manifest_flushes(&pending, &since), vec!["p".to_string()]);
+        assert!(due_manifest_flushes(&HashMap::from([("p".to_string(), vec![(); MANIFEST_BATCH - 1])]), &since).is_empty());
+    }
+}
+
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
 type DirtyBinKey = (String, String, String, i64);
 
@@ -8961,7 +9033,11 @@ fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate
 fn record_prefilter_skip(reason: &'static str) {
     crate::observability::record_tantivy_prefilter_skipped();
     metrics::counter!(scan_metric_names::PREFILTER_SKIPPED).increment(1);
-    metrics::counter!(format!("{}{reason}", scan_metric_names::PREFILTER_SKIPPED_REASON_PREFIX)).increment(1);
+    let named = scan_metric_names::prefilter_skip_metric(reason);
+    debug_assert!(named.is_some(), "unregistered prefilter skip reason {reason:?} — it would vanish from the breakdown");
+    if let Some(name) = named {
+        metrics::counter!(name).increment(1);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11214,11 +11290,30 @@ mod tests {
         }
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
 
-        let queued = {
+        let queued: Vec<_> = {
             let journal = db.maintenance_tasks.lock().unwrap();
-            journal.tasks().filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier).count()
+            journal
+                .tasks()
+                .filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier)
+                .map(|task| task.key.slice)
+                .collect()
         };
-        assert!(queued > 0, "a partition holding an untagged tier file must be queued for rebuild, got {queued}");
+        assert!(!queued.is_empty(), "a partition holding an untagged tier file must be queued for rebuild");
+        // Bounded by the FILE, not the day. A day-wide unit is over
+        // `MAX_DECODED_BYTES` for any real tenant, so the preflight shreds it
+        // down the bisection ladder to one-minute slices — prod 2026-08-22 held
+        // 3,455 units for a single (project, tier, day), 1,423 still pending,
+        // and that cell had not converged in days.
+        assert!(
+            queued.iter().all(|slice| slice.width() < crate::maintenance_coordinator::DAY_MICROS),
+            "the rebuild must target the untagged file's own span, got {queued:?}"
+        );
+        // And it must be the cell the untagged file is IN, not merely the same
+        // project on some other day.
+        assert!(
+            queued.iter().all(|slice| chrono::DateTime::from_timestamp_micros(slice.start_micros).is_some_and(|time| time.date_naive() == day)),
+            "the rebuild must land on the damaged partition's date"
+        );
         Ok(())
     }
 
@@ -11518,18 +11613,24 @@ mod tests {
     /// against a cap of 4 — newest-first alone can never emit the old one.
     #[test]
     fn tantivy_backfill_reserves_a_share_of_the_pass_for_the_oldest() {
-        let hot = (0..10).map(|i| (format!("rel/2026-08-22-{i}"), format!("uri/2026-08-22-{i}")));
+        let hot = (0..30).map(|i| (format!("rel/2026-08-22-{i:02}"), format!("uri/2026-08-22-{i:02}")));
         let cold = std::iter::once(("rel/2026-01-01".to_string(), "uri/2026-01-01".to_string()));
         let queues = || vec![("p".to_string(), hot.clone().chain(cold.clone()).collect::<VecDeque<_>>())];
         let uris = |w: Vec<super::TantivyBackfillWork>| w.into_iter().map(|(_, _, uri)| uri).collect::<Vec<_>>();
 
-        let starved = uris(super::fair_tantivy_backfill_work_split(queues(), 4, 0));
+        let starved = uris(super::fair_tantivy_backfill_work_split(queues(), 12, 0));
         assert!(!starved.contains(&"uri/2026-01-01".to_string()), "pure newest-first must starve the tail — otherwise this test proves nothing");
 
-        let split = uris(super::fair_tantivy_backfill_work_split(queues(), 4, 33));
-        assert_eq!(split.len(), 4, "the reservation is carved OUT of the cap, so pass cost is unchanged");
+        let split = uris(super::fair_tantivy_backfill_work_split(queues(), 12, 33));
+        assert_eq!(split.len(), 12, "the reservation is carved OUT of the cap, so pass cost is unchanged");
         assert!(split.contains(&"uri/2026-01-01".to_string()), "the oldest uncovered file must be reachable, got {split:?}");
-        assert!(split.contains(&"uri/2026-08-22-0".to_string()), "the hot window must still converge");
+        // Reaching it LAST is the same starvation one level down: a pass is
+        // routinely killed part-way, so a reservation at the end never executes.
+        // Measured in prod 2026-08-22 — 18 min into a live pass, `older` had not
+        // moved because the run was still on the newest files.
+        let oldest_at = split.iter().position(|u| u == "uri/2026-01-01").expect("present");
+        assert!(oldest_at < split.len() / 2, "the reserved tail must be interleaved, not appended — it was at {oldest_at} of {}", split.len());
+        assert!(split.contains(&"uri/2026-08-22-29".to_string()), "the hot window must still converge");
         assert_eq!(split.iter().collect::<HashSet<_>>().len(), split.len(), "a file must not be scheduled twice in one pass: {split:?}");
     }
 
