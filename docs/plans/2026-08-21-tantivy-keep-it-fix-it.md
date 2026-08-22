@@ -628,3 +628,42 @@ The lesson repeats the one two sections up, at one more remove: a difference of
 two rates is only a throughput number if both rates describe the same
 population. Flush-covered and backfill-covered files do not.
 ||||||| parent of 9da810b (perf(tantivy): batch the backfill's manifest writes, and name why the routed fast path is never taken)
+
+## 2026-08-22: the pruned scan, split three ways — and the provider cache is innocent
+
+`ed13804` timed the three steps inside the file-pruned scan. Prod, 180 pruned
+calls over 717,120 selected files (~3,984 files per call):
+
+| step | per call | share |
+|---|---|---|
+| `pruned_select_us` — build the file selection | 8.8 ms | 13% |
+| `pruned_build_us` — **build the table provider** | **0.10 ms** | **0.1%** |
+| `pruned_scan_us` — `provider.scan()` | **57.9 ms** | **87%** |
+
+**This refutes the root cause stated one section above.** That section blamed
+`scan_delta_table`'s "file-pruned scans bypass the provider cache" comment, on
+the reasoning that a routed scan builds a fresh provider per leg while the
+unrouted twin reuses a cached one. The bypass is real — and it costs **0.10 ms**.
+Building a provider cache for pruned scans, which is what that section proposed
+as the structural fix, would buy essentially nothing. Do not build it.
+
+The cost is `scan()` over a large `FileSelection`: ~14.5 µs per selected file,
+so ~58 ms for a ~4,000-file leg, twice when there is raw debt — which matches
+the 103-130 ms of scan construction measured per routed query in the same run.
+
+**What this leaves as the real lever, and it is the same one as everywhere else:
+fewer files.** Two of them:
+
+1. **Coverage** — with no raw debt the fast path takes ONE leg instead of two,
+   roughly halving this (116 ms → ~60 ms). Confirmed as the sole blocker: across
+   242 routed scans `tantivy_fastpath = 0` with `split_raw = 242` (100%) and
+   `split_bloom = 0`, so raw debt alone defeats it every time.
+2. **File count itself** — the per-file cost is linear, so this is the same
+   fragmentation root cause that drives compaction, maintenance and OOM work.
+   Nothing tantivy-specific is left in the routing tax.
+
+The honest summary of the routing tax after a day of measurement: it is now
+~110-130 ms of scan construction (down from ~430 ms earlier today as other work
+landed), of which the tantivy fan-out is ~30-40 ms, and **none of the remaining
+cost is specific to tantivy** — it is DataFusion planning proportional to the
+number of files in the scan.
