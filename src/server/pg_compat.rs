@@ -1331,6 +1331,17 @@ impl StatsTableProvider {
                 "blob_fetch_us_total" => s.blob_fetch_us.load(Relaxed),
                 "index_open_us_total" => s.index_open_us.load(Relaxed),
                 "search_us_total" => s.search_us.load(Relaxed),
+                // Closes the attribution gap the four above left open: a routed
+                // 7d equality cost ~420ms more than its unrouted twin while
+                // search_us accounted for only ~45ms of it, with zero IO. The
+                // time is somewhere between "task starts" and "search timer
+                // starts", or in the merge — which is exactly what these three
+                // separate. fanout_us minus prepare_us minus search_us is the
+                // result-merge bookkeeping.
+                "plan_us_total" => s.plan_us.load(Relaxed),
+                "prepare_us_total" => s.prepare_us.load(Relaxed),
+                "prepares" => s.prepares.load(Relaxed),
+                "fanout_us_total" => s.fanout_us.load(Relaxed),
             ]
         });
 
