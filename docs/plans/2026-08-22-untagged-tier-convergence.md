@@ -204,6 +204,28 @@ publish reads 0 both when clean and when unset, and a counter placed before the
 commit reads progress that did not happen. The authority for "did a file leave
 the table" is a Delta-log replay, never a process-scoped counter.
 
+## It is converging — 85 → 47, and the stall was my ruler
+
+The count sat at exactly 85 across three snapshots while the service logged real
+retirements (`dcad860a` 08-19 retired 3, `28f62f01` retired 4 + 1 + 4). Both
+could not be true.
+
+The enumerator merged **every** checkpoint parquet in the log directory — 34 of
+them for the 1m tier — unioning their adds. The removes that retired those files
+live in commits at or below the newest checkpoint, which the replay then skips by
+design. So the count was a high-water mark that could never fall. Reading only
+the NEWEST checkpoint version (keeping every part of it, since multi-part
+checkpoints share a version) gives **47**, down from 85 and still falling.
+
+Fixed in `scripts/rollup_untagged_cells.py`, which had the same defect and is the
+tool anyone else would reach for. This is the THIRD measurement error in one day
+on the same question, after the pre-commit counter and the publish-only gauge —
+and the tell was the same each time: **a number that will not move is a claim
+about the ruler, not about the system.**
+
+What actually cleared: the whale's 17 metrics files and `28f62f01`'s 17 log files
+for 08-19 — exactly the population the hole-rank fix targeted.
+
 ## Explicitly rejected
 
 - **Journal-derived `covered`.** The journal knows which slices were built, but a

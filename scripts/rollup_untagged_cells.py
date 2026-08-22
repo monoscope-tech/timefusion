@@ -57,11 +57,22 @@ def live_files(tier_dir):
     commits, so a repair of 26 units leaves its last commits outside the newest
     checkpoint — reading only the parquet reported a day as untouched on
     2026-08-20 when it had in fact been repaired.
+
+    But only the NEWEST checkpoint. Merging every checkpoint parquet in the
+    directory unions their adds, while the removes that retired those files sit
+    in commits at or below the newest checkpoint — which the loop below then
+    skips. The count becomes a high-water mark that can never fall. On
+    2026-08-22 that reported exactly 85 untagged files across three snapshots,
+    unchanged, while the service logs showed retirements landing; the true count
+    was 47 and falling. A number that will not move is a claim about the ruler.
+
+    Multi-part checkpoints share a single version, so every part OF the newest
+    version is kept.
     """
+    versions = [(int(re.search(r"(\d{20})\.", os.path.basename(path)).group(1)), path) for path in glob.glob(os.path.join(tier_dir, "*.checkpoint*.parquet"))]
+    checkpoint_version = max((version for version, _ in versions), default=-1)
     live = {}
-    checkpoint_version = -1
-    for path in sorted(glob.glob(os.path.join(tier_dir, "*.checkpoint*.parquet"))):
-        checkpoint_version = max(checkpoint_version, int(re.search(r"(\d{20})\.", os.path.basename(path)).group(1)))
+    for _, path in sorted(entry for entry in versions if entry[0] == checkpoint_version):
         for add in pq.read_table(path).column("add").to_pylist():
             if add is not None:
                 live[add["path"]] = add
