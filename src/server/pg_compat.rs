@@ -1193,6 +1193,13 @@ impl StatsTableProvider {
                     "tantivy_backfill_built" => cv(TANTIVY_BACKFILL_BUILT),
                     // built / commits is the manifest-write amortisation the
                     // batching bought; before it the ratio was 1.
+                    // Splits tantivy_scan_us into its three steps, so the next
+                    // fix targets the one that owns it rather than guessing.
+                    "pruned_calls" => cv(PRUNED_CALLS),
+                    "pruned_files_total" => cv(PRUNED_FILES),
+                    "pruned_select_us_total" => cv(PRUNED_SELECT_US),
+                    "pruned_build_us_total" => cv(PRUNED_BUILD_US),
+                    "pruned_scan_us_total" => cv(PRUNED_SCAN_US),
                     "tantivy_manifest_commits" => cv(TANTIVY_MANIFEST_COMMITS),
                     "tantivy_manifest_commit_us_total" => cv(TANTIVY_MANIFEST_COMMIT_US),
                     "dedup_denied_never_certified" => cert_never,

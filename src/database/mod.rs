@@ -208,6 +208,16 @@ pub mod scan_metric_names {
     /// Indexes built by the reconcile BACKFILL specifically — not by flush,
     /// compaction or the wave reindex, all of which also publish.
     pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
+    // Inside the file-pruned scan: which of its three steps owns the ~430ms.
+    // The provider cache comment above records ~30ms for a pure provider build,
+    // so the cost is expected in selection construction or in scan() over a
+    // multi-thousand-file selection — but that is a guess until measured, and
+    // guesses about this path have been wrong three times.
+    pub const PRUNED_SELECT_US: &str = "timefusion.scan.pruned_select_us";
+    pub const PRUNED_BUILD_US: &str = "timefusion.scan.pruned_build_us";
+    pub const PRUNED_SCAN_US: &str = "timefusion.scan.pruned_scan_us";
+    pub const PRUNED_CALLS: &str = "timefusion.scan.pruned_calls";
+    pub const PRUNED_FILES: &str = "timefusion.scan.pruned_files";
     /// Batched manifest commits made by the backfill, and entries they carried.
     /// `entries / commits` is the amortisation actually achieved.
     pub const TANTIVY_MANIFEST_COMMITS: &str = "timefusion.scan.tantivy_manifest_commits";
@@ -3307,14 +3317,18 @@ impl Database {
             let planned = work.len();
             info!(table_name, root = %root, planned, cap, event = "tantivy_backfill_started");
             let mut done = 0usize;
-            // Manifest writes are BATCHED per project. Each one is a full
+            // Manifest writes are batched per project: each is a full
             // read-modify-write of that project's manifest (745 KB / 950 entries
             // for the busiest) under a per-project lock, so publishing per build
-            // both pays that per file and serializes concurrent builds of the
-            // same project against each other — measured 2026-08-22 at ~60
-            // builds/hr against ~85/hr accrual, which is why coverage diverged
-            // no matter how the pass was capped.
+            // pays that per file. Worth ~6x fewer object-store writes per pass.
+            //
+            // It is NOT a throughput fix, and the measurement says so plainly:
+            // builds ran 16/hr before and 13/hr after, because a build costs
+            // ~4-5 MINUTES and the manifest write it saves costs ~1 second. The
+            // ~60 builds/hr this was originally sized against was itself wrong —
+            // the direct counter put it at ~16/hr. Kept for the write reduction.
             let mut pending: HashMap<String, Vec<(String, crate::tantivy::ManifestEntry)>> = HashMap::new();
+            let mut pending_since: HashMap<String, std::time::Instant> = HashMap::new();
             let mut jobs = futures::stream::iter(work.into_iter().map(|(pid, rel, uri)| {
                 let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
                 async move { (pid.clone(), svc.build_index_for_file_deferred(&table, &pid, &rel, &uri, store).await) }
@@ -3332,13 +3346,18 @@ impl Database {
                         built += 1;
                         metrics::counter!(scan_metric_names::TANTIVY_BACKFILL_BUILT).increment(1);
                         pending.entry(pid.clone()).or_default().push(entry);
+                        pending_since.entry(pid.clone()).or_insert_with(std::time::Instant::now);
                     }
                     Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
                 }
-                // Bounded so an interrupted pass re-does at most one batch: the
-                // blobs are already uploaded, so a rebuild is wasted work, not
-                // wrong work.
-                if pending.get(&pid).is_some_and(|p| p.len() >= MANIFEST_BATCH) {
+                // Bounded by count AND age, so an interrupted pass loses at most
+                // MANIFEST_MAX_AGE of durability: the blobs are already uploaded,
+                // so what is lost is the record and the next pass rebuilds them —
+                // wasted work, never wrong work.
+                let full = pending.get(&pid).is_some_and(|p| p.len() >= MANIFEST_BATCH);
+                let stale = pending_since.get(&pid).is_some_and(|t| t.elapsed() >= MANIFEST_MAX_AGE);
+                if full || stale {
+                    pending_since.remove(&pid);
                     Self::commit_manifest_batch(svc, table_name, &pid, &mut pending).await;
                 }
                 done += 1;
@@ -6252,10 +6271,15 @@ fn wave_added_parquet(bins: &[StagedBin], live_uris: &[String]) -> Vec<(String, 
         .collect()
 }
 
-/// Deferred manifest entries a backfill commits in one write. Bounds the work
-/// an interrupted pass re-does (the blobs are uploaded; only the record is
-/// pending) while still amortising a 745 KB read-modify-write over many builds.
-const MANIFEST_BATCH: usize = 25;
+/// Deferred manifest entries a backfill commits in one write.
+const MANIFEST_BATCH: usize = 8;
+
+/// A deferred entry is never left unwritten longer than this. DURABILITY, not
+/// batching, is the binding constraint here: a build takes minutes and a pass on
+/// this box is routinely killed by a deploy before it ends, so a count-only
+/// bound of 25 against ~5 builds per pass deferred everything to a pass end that
+/// never arrived — losing work the per-build write used to make durable.
+const MANIFEST_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
 type DirtyBinKey = (String, String, String, i64);
@@ -7595,6 +7619,7 @@ impl ProjectRoutingTable {
         // query-specific). Bail to the unrestricted path unless EVERY
         // surviving live file maps to a table-relative path — a restriction
         // that silently missed an unmappable file would drop its rows.
+        let select_started = std::time::Instant::now();
         let file_selection: Option<Vec<String>> = include_files.or_else(|| exclude_files.filter(|e| !e.is_empty())).and_then(|_selection| {
             // Scoped so the (non-Send) file-view iterator drops before any await.
             // `collect::<Option<_>>` reproduces the bail-the-whole-selection
@@ -7617,6 +7642,7 @@ impl ProjectRoutingTable {
         if file_selection.is_some() || !ordinal_selections.is_empty() {
             use deltalake::delta_datafusion::{FileSelection, MissingSelectedFilePolicy};
             if let Some(sel) = &file_selection {
+                metrics::counter!(scan_metric_names::PRUNED_FILES).increment(sel.len() as u64);
                 debug!(
                     "tantivy file pruning: {}/{} scanning {} files (excluded {})",
                     cache_key.0,
@@ -7645,8 +7671,15 @@ impl ProjectRoutingTable {
             if let Some(ss) = session_state {
                 builder = builder.with_session(Arc::new(ss));
             }
+            metrics::counter!(scan_metric_names::PRUNED_SELECT_US).increment(select_started.elapsed().as_micros() as u64);
+            let build_started = std::time::Instant::now();
             let provider: Arc<dyn TableProvider> = Arc::new(builder.build().await.map_err(|e| DataFusionError::External(Box::new(e)))?);
-            return self.scan_via_provider(provider, state, projection, filters, limit).await;
+            metrics::counter!(scan_metric_names::PRUNED_BUILD_US).increment(build_started.elapsed().as_micros() as u64);
+            let scan_started = std::time::Instant::now();
+            let plan = self.scan_via_provider(provider, state, projection, filters, limit).await;
+            metrics::counter!(scan_metric_names::PRUNED_SCAN_US).increment(scan_started.elapsed().as_micros() as u64);
+            metrics::counter!(scan_metric_names::PRUNED_CALLS).increment(1);
+            return plan;
         }
 
         // Per-(project,table) provider cache: only rebuild when the Delta
