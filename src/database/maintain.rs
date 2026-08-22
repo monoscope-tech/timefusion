@@ -9,6 +9,10 @@ fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
 }
 
+/// (project, slice_start, slice_end, generation, source_fp, source_rows) — the
+/// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
+type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
+
 impl Database {
     /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
     fn retry_task(&self, key: &crate::maintenance_coordinator::TaskKey, reason: String, delay: std::time::Duration) -> Result<()> {
@@ -1819,9 +1823,24 @@ impl Database {
         if journal.state(&key) == Some(TaskState::Running) {
             self.rollup_slice_coverage.insert(
                 (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros),
-                RollupCoverage { source_fp, source_epoch: 0, generation: generation.clone(), rows, source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()), covered_through: key.slice.end_micros },
+                RollupCoverage {
+                    source_fp,
+                    source_epoch: 0,
+                    generation: generation.clone(),
+                    rows,
+                    source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                    covered_through: key.slice.end_micros,
+                },
             );
-            journal.publish(&key, crate::maintenance_coordinator::Publication { source_fingerprint: source_fp, generation: generation.clone(), rows, source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()) });
+            journal.publish(
+                &key,
+                crate::maintenance_coordinator::Publication {
+                    source_fingerprint: source_fp,
+                    generation: generation.clone(),
+                    rows,
+                    source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                },
+            );
             journal.checkpoint()?;
             // Per-unit outcome, because the counters are process-wide totals and
             // cannot answer "why has THIS project's coverage not moved". Prod
@@ -2492,10 +2511,9 @@ impl Database {
             let tagged = match self.resolve_table("default", &target).await {
                 Ok(table) => {
                     let table = table.read().await;
-                    // (project, slice_start, slice_end, generation, source_fp, source_rows) -> rollup rows.
                     // `source_rows` is part of the KEY so a partition rebuilt against a
                     // different source count cannot merge with the older evidence.
-                    let mut groups: HashMap<(String, i64, i64, String, u64, Option<u64>), u64> = HashMap::new();
+                    let mut groups: HashMap<TaggedSliceIdentity, u64> = HashMap::new();
                     for add in table.snapshot()?.log_data().iter() {
                         #[allow(deprecated)]
                         let action = add.add_action();
@@ -2531,7 +2549,9 @@ impl Database {
                         // Absent on generations written before the tag; `-1` is the
                         // sentinel a build writes when the source reported no count.
                         // Both become `None`, which the read path refuses to verify.
-                        let source_rows = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS).and_then(|value| value.parse::<i64>().ok()).and_then(|rows| u64::try_from(rows).ok());
+                        let source_rows = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS)
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .and_then(|rows| u64::try_from(rows).ok());
                         let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows)).or_default();
                         *entry = entry.saturating_add(rows);
                     }
