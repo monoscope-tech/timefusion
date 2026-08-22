@@ -393,9 +393,8 @@ pair returned 4.43M against 7.29M before. Both currently decline as
 carries `TAG_SOURCE_ROWS` and the added digest measure changed every
 `generation_id`.
 
-**BLOCKING FOLLOW-UP, and it is NOT this change: the maintenance coordinator is
-stalled, and has been since ~09:30 UTC — about three hours before this deploy
-landed at 12:26.**
+**Maintenance has completed nothing since ~09:30 UTC — three hours before this
+deploy landed at 12:26 — and the cause is the deploy cadence itself.**
 
 Evidence, from the host:
 
@@ -412,16 +411,36 @@ repair and packing too (`rollup_commit_actions_total`, `rollup_output_rows_total
 `dirty_bin_queue_depth = 16,791`, `pending_dedup = 5,638`, `pending_repair = 390`
 and `oldest_task_age_seconds = 523,750` (6 days).
 
-Work is being ENQUEUED and never CLAIMED. That is a coordinator-wide stall, it
-touches none of the code this change modifies, and it is dated three hours
-before the deploy.
+**Cause found, and it is DEPLOY CADENCE, not a broken coordinator.** Restart
+history at 12:53 UTC:
 
-**Why it matters here anyway:** the tier can only come back when the
-coordinator rebuilds it. Until the stall is fixed, the dark period is
-indefinite rather than temporary, so dashboards stay on the raw path
-(~6-10 s at 3d) instead of recovering over the next few hours. The correctness
-fix is still the right trade — a slow right answer beats a fast wrong one — but
-the recovery half of the plan is blocked on this.
+| image | state |
+|---|---|
+| c59f9eb | running 14 min |
+| 7c73d19 | shutdown 14 min ago |
+| ed13804 | shutdown 27 min ago |
+| bfa454a | shutdown 40 min ago |
+| 9489163 | shutdown 2 h ago |
 
-**Do not "fix" it by reverting this change.** Reverting restores the 39%
-under-count and does not start the coordinator.
+That is a restart every **~13 minutes**, every one a clean shutdown (a deploy,
+not a crash). `BaseRollup`, `DerivedRollup`, `Repair`, `HotPacking` and
+`SealedConsolidation` all carry a **15-minute** deadline
+(`maintenance_coordinator.rs:99`). A unit therefore cannot finish before the
+next deploy kills it, so nothing ever completes and the journal never
+checkpoints a completion — which is exactly the 09:30 timestamp. This repo has
+the failure mode on file already: `tf_deploy_cadence_starves_dedup_2026-08-18`,
+whose lesson is *check uptime before diagnosing maintenance*. I did not, at
+first, and called it a coordinator stall.
+
+**So the dark period is TEMPORARY after all, conditional on a quiet window.**
+The correction matters: the tier will rebuild on its own once deploys stop.
+It needs roughly **1-2 hours without a deploy** — long enough for units to run
+to completion and for the newest days (which the scheduler builds first) to come
+back. Nothing needs fixing in the coordinator.
+
+**What to do:** stop deploying for 1-2 hours and the tier rebuilds itself.
+Until then dashboards stay on the raw path (~6-10 s at 3d). The correctness fix
+is the right trade regardless — a slow right answer beats a fast wrong one.
+
+**Do not revert this change to "fix" it.** Reverting restores the 39%
+under-count and does nothing about the restart cadence.
