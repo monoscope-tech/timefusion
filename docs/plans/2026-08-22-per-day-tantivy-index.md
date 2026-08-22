@@ -10,15 +10,19 @@ Measured this morning (method and caveats in the sibling doc):
 
 | quantity | value |
 |---|---|
-| new live parquet files/hr | **~529** |
-| tantivy build rate at `build_concurrency = 2` | **~469/hr** |
-| uncovered growth | **~60/hr** |
+| new live parquet files/hr | ~529 |
+| of which flush output, self-indexed at commit | ~370 |
+| **uncovered accrual** — arriving with no index | **~160/hr** |
+| **backfill drain** at `build_concurrency = 2` | **~100/hr** |
+| uncovered growth | ~60/hr |
 | standing backlog | ~5,700 files |
 
-The instinct is to chase the 60/hr with throughput. That is treating a symptom.
-Ask instead where 529 files/hr of *new information* comes from — and it does
-not. Ingest adds rows; **compaction adds files without adding a single row**,
-and compaction is the bulk of that 529. Coverage is computed as
+The instinct is to chase the 60/hr with throughput. That is treating a symptom,
+and the decomposition says why. Flush indexes its own output at commit, so
+**new rows are covered at birth**. Everything the backfill spends its life on —
+that whole ~160/hr — is compaction rewriting rows that were already indexed.
+Ingest adds rows; **compaction adds files without adding a single row**.
+Coverage is computed as
 
 ```
 uncovered = live parquet files − ∪ manifest_entry.covered_files
@@ -40,9 +44,9 @@ the same rows carry the same ids, and the index's answer ("these ids match
 **date**, not of a file list, and it is invalidated only by rows the index has
 never seen, i.e. by genuinely new data.
 
-That is the whole convergence argument. Accrual drops from ~529 files/hr to
-roughly one unit per active (project, date) per seal — two to three orders of
-magnitude less work — because it stops counting rewrites as new information.
+That is the whole convergence argument. Uncovered accrual drops from ~160
+files/hr to roughly one unit per active (project, date) per seal — because it
+stops counting rewrites as new information, and rewrites are ~all of it.
 
 ### Division of labour with the blooms
 
@@ -116,11 +120,12 @@ comfortably holds all of it.
 
 ## Sequencing
 
-1. **`build_concurrency` 2 → 4** — one env var
-   (`TIMEFUSION_TANTIVY_BUILD_CONCURRENCY`), buys the ~14h drain of the
-   existing 5,700 backlog while the rest is built. Independent of everything
-   below and reversible by the same var. Watch peak anon RSS and
-   `oversized_skipped`.
+1. **Raise `build_concurrency`** (`TIMEFUSION_TANTIVY_BUILD_CONCURRENCY`) to
+   buy headroom over the ~160/hr while the rest is built. Sized honestly: 4
+   gives ~200/hr, a ~40/hr surplus and a **~140h** drain of the 5,700 backlog;
+   clearing it inside a day needs ~8. Reversible by the same var, but 8
+   concurrent parquet decodes is a real memory question on a box that OOMs —
+   watch peak anon RSS and `oversized_skipped`. This is headroom, not the fix.
 2. **Day-index builder + manifest key**, behind
    `timefusion_tantivy_day_index`, default off. Prove it on staging: a day
    index plus the bloom prune must return the same rows as per-file indexes for
@@ -133,12 +138,14 @@ comfortably holds all of it.
 
 ## The measurement that decides step 1 alone is not enough
 
-If accrual were genuinely new rows, ~530/hr would be real work and only
-throughput would help. The test is cheap and should be run before step 2: split
-the bloom `built=` population into files whose `(project, date)` was already
-covered (rewrites) versus dates seen for the first time (new data). The
-prediction of this design is that the first group dominates. If it does not,
-step 3 buys far less than claimed and the ordering should change.
+The flush-vs-backfill split above was derived from `flush_completed_total`
+assuming ~1 file per flush commit. That is the load-bearing assumption, and it
+is worth one direct check before step 3: log the added-file count on the flush
+commit path, or count `tantivy_backfill_pass built=` against the census over a
+pass that actually completes. If flush commits routinely add several files, the
+uncovered accrual is larger than ~160/hr and step 1 needs to be more aggressive
+— but the shape of the fix does not change, because those files are still
+covered at birth.
 
 ## Not addressed here
 
