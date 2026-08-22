@@ -1963,9 +1963,21 @@ async fn route_with_spec(
         alias: "__guard".to_string(),
         merge: Merge::Count,
         measures: vec![measure.name.clone()],
-        raw: vec![match measure.filter.as_ref() {
-            Some(filter) => format!("COUNT(*) FILTER (WHERE {filter})"),
-            None => "COUNT(*)".to_string(),
+        // The RAW-FRINGE spelling of the guard, and it must reproduce the same
+        // elimination the rollup leg gets from the stored measure.
+        //
+        // `COUNT(col)` is the null-guard case: the residual `col IS NOT NULL`
+        // was dropped from `promotable`, and the fringe's WHERE never carried it
+        // (`row_filters` holds dimension filters only), so a bare `COUNT(*)`
+        // here would count the null rows and `HAVING > 0` would keep a bucket
+        // whose rows were ALL null — rendering it as a zero where the raw query
+        // drops it. `COUNT(col)` skips nulls, which is exactly the predicate.
+        // Every routed latency chart has a fringe (monoscope windows end at
+        // `now()`), so this is the common path, not an edge.
+        raw: vec![match (measure.filter.as_ref(), measure.column.as_deref()) {
+            (Some(filter), _) => format!("COUNT(*) FILTER (WHERE {filter})"),
+            (None, Some(column)) => format!("COUNT({column})"),
+            (None, None) => "COUNT(*)".to_string(),
         }],
     });
 
@@ -3259,6 +3271,32 @@ mod tests {
         // wrong-answer this promotion would otherwise introduce.
         assert!(generated.contains("HAVING"), "the null guard must reproduce the bucket elimination: {generated}");
         assert!(generated.contains("duration_count"), "the guard must be the count over the SAME column: {generated}");
+    }
+
+    /// The same panel on the HYBRID path, which is the common one: monoscope's
+    /// windows end at `now()`, so every routed latency chart has a raw fringe.
+    ///
+    /// The fringe's WHERE carries dimension filters only — the dropped
+    /// `duration IS NOT NULL` is nowhere in it — so the guard must reproduce the
+    /// elimination itself. `COUNT(*)` would count the null rows and keep a
+    /// bucket whose rows were ALL null, rendering it as a zero where the raw
+    /// query drops it. `COUNT(duration)` skips nulls, which IS the predicate.
+    ///
+    /// The single-leg test above cannot see this: it never builds a fringe.
+    #[tokio::test]
+    async fn the_null_guards_raw_fringe_counts_the_column_not_the_rows() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS t, \
+                    approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION))) AS p95 \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1"
+        );
+        let (_, generated) = assert_substitutes(&state, &sql, Some(360000000)).await;
+        assert!(generated.contains("COUNT(duration)"), "the fringe guard must skip nulls the way the predicate did: {generated}");
+        assert!(
+            !generated.contains("COUNT(*) AS __guard") && !generated.contains("COUNT(*) AS \"__guard\""),
+            "a bare COUNT(*) guard resurrects all-null buckets as zeros: {generated}"
+        );
     }
 
     /// The half that must NOT route, and the reason the promotion checks every
