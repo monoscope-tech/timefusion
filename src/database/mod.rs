@@ -2449,8 +2449,8 @@ fn fair_tantivy_backfill_work_split(queues: Vec<(String, VecDeque<(String, Strin
     // finishes — prod restarts every 15-30 min against a ~1.5h pass — so work
     // placed at the END is the first thing lost. Appending the reservation
     // reproduced the very starvation it exists to prevent, one level down:
-    // measured 2026-08-22, 18 minutes into a live pass, `older` had not moved
-    // off 3456 because execution was still working through the 100 newest.
+    // measured 2026-08-22 on a live pass, `older` had not moved off 3456 after
+    // 33 minutes because execution was still working through the newest 100.
     // Interleaved, the tail is attempted from the first minute.
     work.truncate(head_n);
     let (mut head, mut tail): (VecDeque<_>, VecDeque<_>) = (work.into(), tail.into());
@@ -11624,13 +11624,13 @@ mod tests {
         let split = uris(super::fair_tantivy_backfill_work_split(queues(), 12, 33));
         assert_eq!(split.len(), 12, "the reservation is carved OUT of the cap, so pass cost is unchanged");
         assert!(split.contains(&"uri/2026-01-01".to_string()), "the oldest uncovered file must be reachable, got {split:?}");
-        // Reaching it LAST is the same starvation one level down: a pass is
+        assert!(split.contains(&"uri/2026-08-22-29".to_string()), "the hot window must still converge");
+        // Reaching the tail LAST is the same starvation one level down: a pass is
         // routinely killed part-way, so a reservation at the end never executes.
-        // Measured in prod 2026-08-22 — 18 min into a live pass, `older` had not
+        // Measured in prod 2026-08-22 — 33 min into a live pass, `older` had not
         // moved because the run was still on the newest files.
         let oldest_at = split.iter().position(|u| u == "uri/2026-01-01").expect("present");
         assert!(oldest_at < split.len() / 2, "the reserved tail must be interleaved, not appended — it was at {oldest_at} of {}", split.len());
-        assert!(split.contains(&"uri/2026-08-22-29".to_string()), "the hot window must still converge");
         assert_eq!(split.iter().collect::<HashSet<_>>().len(), split.len(), "a file must not be scheduled twice in one pass: {split:?}");
     }
 
