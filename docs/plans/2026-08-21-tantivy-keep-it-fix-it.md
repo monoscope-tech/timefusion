@@ -532,3 +532,42 @@ the moment to seal that date's index.
   warnings per hour, N routinely 38-65. Every one of those pays an inline merge
   on top of the build. Worth checking the writer's memory budget — that segment
   count for a ~1MB file suggests one segment per commit rather than per batch.
+
+### Correction, same morning: ~469/hr was wrong — most accrual arrives ALREADY covered
+
+The subtraction above (`accrual − census growth = build rate`) assumes every
+new parquet file arrives uncovered. It does not. `TantivyIndexService::callback`
+runs on the flush path and publishes an index for the files the flush commit
+just added (`search.rs:1134`), so flush output is covered the moment it lands.
+
+`buffered_layer.flush_completed_total = 2321` against a boot at 03:05 (6.3h)
+is **~368 flushes/hr**, at ~11.3k rows each — i.e. the large majority of the
+~529 files/hr is flush output that never needs a backfill build. The corrected
+decomposition:
+
+| quantity | value |
+|---|---|
+| new live parquet files/hr (bloom `built=`) | ~529 |
+| of which flush output, self-indexed at commit | ~370 |
+| **uncovered accrual** — files arriving with no index | **~160/hr** |
+| census growth | ~60/hr |
+| **backfill drain** | **~100/hr** |
+
+So the honest numbers are ~100/hr drain against ~160/hr uncovered accrual —
+close to the `48 vs 133` the code comment implied, and nothing like the 89%
+efficiency the uncorrected subtraction suggested. Two consequences:
+
+1. **`build_concurrency` 2 → 4 does not converge on its own.** ~200/hr against
+   ~160/hr leaves a ~40/hr surplus and a **~140-hour** drain of the 5,700
+   backlog. Converging in a day needs ~8, which is a real memory question, not
+   a free knob.
+2. **The uncovered accrual is ~entirely compaction rewriting rows that were
+   already indexed.** Flush covers new rows at birth; what the backfill spends
+   its life on is re-indexing bytes it has already read, because coverage is
+   keyed per FILE. That is the argument for
+   `2026-08-22-per-day-tantivy-index.md`, and this decomposition is what makes
+   it a measurement rather than a hunch.
+
+The lesson repeats the one two sections up, at one more remove: a difference of
+two rates is only a throughput number if both rates describe the same
+population. Flush-covered and backfill-covered files do not.
