@@ -1728,9 +1728,10 @@ async fn route_with_spec(
         .filter(|columns| !columns.is_empty() && columns.windows(2).all(|pair| pair[0] == pair[1]))
         .map(|columns| columns[0])
         .filter(|column| {
-            aggregate.aggr_expr.iter().all(|expr| {
-                matches!(unaliased(expr), Expr::AggregateFunction(function) if function.params.args.first().and_then(column_name) == Some(*column))
-            })
+            aggregate
+                .aggr_expr
+                .iter()
+                .all(|expr| matches!(unaliased(expr), Expr::AggregateFunction(function) if function.params.args.first().and_then(column_name) == Some(*column)))
         })
         .and_then(|column| {
             configured_filters
