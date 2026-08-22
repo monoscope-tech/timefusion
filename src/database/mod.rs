@@ -986,6 +986,13 @@ const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration =
 /// or dispatcher without racing the file-rewrite timeout at the same instant.
 const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
 
+/// How often coverage recovery re-reads the tiers' Delta logs.
+///
+/// Long on purpose: it exists to notice slow-moving facts — a partition holding
+/// untagged files, coverage that a restart lost — not to schedule work. Its cost
+/// is one log read per tier and no parquet at all.
+const COVERAGE_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// How long before a unit whose source is still buffered could possibly run.
 ///
 /// `has_rows_in_range` is not transient when the slice reaches into time that has not finished
@@ -2256,6 +2263,21 @@ pub struct Database {
     /// Monotonic invalidation epoch for each source `(project, table, date)`.
     rollup_source_epochs: Arc<dashmap::DashMap<RollupSourceKey, u64>>,
     /// Certified rollup generations keyed by `(project, source, target, date)`.
+    ///
+    /// **Has no producer.** Every use of this field in the crate is a read
+    /// (`mod.rs` routing lookup) or a removal (`maintain.rs` x2) — there is no
+    /// `insert`, `entry` or `or_insert` anywhere, so on a private field it is
+    /// permanently empty and the date-level routing lookup returns `None` for
+    /// every date on every process. `maintenance_coordinator.rs` still claims
+    /// "`recover_rollup_coverage` is the only producer"; that function writes
+    /// only `rollup_slice_coverage`. The insert was lost in a refactor and two
+    /// comments outlived it.
+    ///
+    /// Not a wrong-answer bug — the `None` branch `continue`s without setting a
+    /// miss, so queries fall through to slice coverage and are correct, merely
+    /// unrouted. Which is why it left no trace. See
+    /// `rollup_coverage_entries` and
+    /// `docs/plans/2026-08-22-query-latency-matrix.md`.
     rollup_coverage: Arc<dashmap::DashMap<RollupCoverageKey, RollupCoverage>>,
     rollup_slice_coverage: Arc<dashmap::DashMap<RollupSliceCoverageKey, RollupCoverage>>,
     /// Untagged live files per tier TABLE (tiers publish independently, so one
@@ -4057,9 +4079,30 @@ impl Database {
                             if !coverage_db.wait_for_preload(&coverage_cancel).await {
                                 return;
                             }
-                            for source in crate::schema::registry().list_tables() {
-                                if let Err(error) = coverage_db.recover_rollup_coverage(&source).await {
-                                    warn!(source, %error, "rollup coverage recovery failed; those partitions stay on raw scans");
+                            // RECURRING, not once at startup. This pass is the
+                            // only thing that sees an untagged tier file, so it
+                            // is the only thing that can enqueue the republish
+                            // that retires one — and a file becomes retirable
+                            // when OTHER slices publish, which happens long
+                            // after boot. Prod 2026-08-22, an hour after the
+                            // ranking fix: 30 of the 85 untagged files satisfied
+                            // a retirement proof and none had been retired,
+                            // because the publish that would evaluate the proof
+                            // was never queued. Startup-only made convergence
+                            // run at the DEPLOY cadence.
+                            //
+                            // Metadata only — it reads each tier's Delta log and
+                            // never touches parquet — so hourly is far cheaper
+                            // than the 60s planner tick beside it.
+                            loop {
+                                for source in crate::schema::registry().list_tables() {
+                                    if let Err(error) = coverage_db.recover_rollup_coverage(&source).await {
+                                        warn!(source, %error, "rollup coverage recovery failed; those partitions stay on raw scans");
+                                    }
+                                }
+                                tokio::select! {
+                                    _ = coverage_cancel.cancelled() => return,
+                                    _ = tokio::time::sleep(COVERAGE_RECOVERY_INTERVAL) => {}
                                 }
                             }
                         });

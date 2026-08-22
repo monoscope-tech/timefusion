@@ -2644,6 +2644,14 @@ impl Database {
         );
     }
 
+    /// How many DATE-level coverage entries exist. Currently always 0 — nothing
+    /// writes `rollup_coverage` — which is the whole reason this is exposed:
+    /// the dead map produced no miss, no error and no log, so only counting it
+    /// makes it visible. A restored producer must move this off zero.
+    pub fn rollup_coverage_entries(&self) -> usize {
+        self.rollup_coverage.len()
+    }
+
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
         if !self.config.maintenance.timefusion_rollup_enabled {
