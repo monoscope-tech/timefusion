@@ -63,6 +63,48 @@ of them already past their deadline. A damaged cell cannot converge because
 closing its coverage union requires *all* of its ~1,440 units to publish, and they
 are queued behind everything else.
 
+## Correction: the shred is the MID-TAIL's problem, not 08-19's
+
+The fragmented cells above are 08-11..08-15, not 08-19 — a day-bucket arithmetic
+slip on my part. 08-19 is the opposite shape, and its own evidence is decisive:
+
+- Every untagged 08-19 file carries `delta-rs.optimize.sort_by` and was written
+  on **08-19**, the newest at 22:54. The tag-stripping OPTIMIZE has not run since.
+  That is why there is no new damage — the stripper is already dead.
+- Every tagged file in those partitions was written on **08-20**, after the
+  retirement code shipped.
+- Every damaged 08-19 partition has its day-wide rebuild **already queued, already
+  past its deadline, at `attempts=0`**, estimated at 268–537 MB — small enough to
+  run unsplit.
+
+So the 08-19 work is queued, due, cheap, and simply never claimed. The reason is
+`claim_next`'s `hole_rank`: a cell whose tier output is missing outranks one that
+"already has output and is merely being re-derived". These partitions DO have
+output, so they rank last — behind ~12,000 hole-filling units that the backfill
+mints about as fast as it drains them.
+
+That is the bug. An untagged file cannot be certified and cannot be retired; the
+partition is missing coverage no matter how much tagged output sits beside it.
+
+## Shipped
+
+1. **`untagged_cells` ranks as a hole.** `recover_rollup_coverage` already reads
+   which partitions hold untagged files; it now publishes them to the journal and
+   `fills_a_hole` consults them. Kept as a separate set from `tier_holes` because
+   the two are produced by different passes — a wholesale replace by either would
+   erase the other, which is exactly how `base_tier_ready` and `tier_holes` were
+   both made inert on prod once already. Cleared per `(source, tier)`, and cleared
+   again by the publish that leaves a partition clean, because recovery runs only
+   at startup.
+2. **Rebuild the GAPS, not the day.** `enqueue_untagged_rebuilds` queued a day-wide
+   unit, which is what fed the shred. It now queues `uncovered_gaps(untagged
+   spans, tagged ranges)` — minute-aligned and clamped to the partition. A cell
+   with nothing tagged still yields the file's own span, so this is a refinement of
+   the old behaviour and never narrower than what it replaced.
+3. **A gap-free partition still gets a publish.** ~15 of the 85 files satisfy a
+   proof ALREADY and are live only because proofs are evaluated at publish time
+   and nothing has republished the partition. Those now re-publish their own spans.
+
 ## What this means
 
 - The damage is no longer wrong data — both tiers declare identity and reads
@@ -73,3 +115,31 @@ are queued behind everything else.
   "partitions whose day was shredded to the minimum slice", which is a property of
   file count, not tenant size — that is why the *default* project is the worst
   offender, with 3,455 units for a single day.
+
+## Expected, and how to falsify it
+
+- **08-19 (54 files)** — 20 due day-wide units that now rank as holes and fit the
+  budget. Should clear within hours. If `rollup_tier_untagged_found` does not move
+  for those cells, the hole rank is not reaching them and the next thing to check
+  is whether `recover_rollup_coverage` ran at all after the deploy.
+- **Mid-tail (~13 files)** — now queued as minute-to-hour gaps instead of days, so
+  each is one unit that fits. If these stall, the gap computation is wrong, not the
+  scheduling: compare `uncovered_gaps` against the printed per-file gaps.
+- **Old tail (18 files)** — **accepted floor, no ETA.** Several of those cells have
+  no tagged ranges at all and their source dates are 30+ days old; if raw has aged
+  out, `rows > 0` correctly refuses to delete what may be the only copy. Removable
+  only by tier compaction (Phase 4), and worth ~0.3% of live files.
+
+## Explicitly rejected
+
+- **Journal-derived `covered`.** The journal knows which slices were built, but a
+  built slice whose file was later rewritten into the untagged file proves nothing
+  — retiring on that record would delete the only copy. Only LIVE tags prove
+  reproducibility.
+- **Zero-row coverage markers.** The theory was that empty sub-slices leave
+  permanent holes in the union. The 08-19 gaps are 12–18 hours of real data, so
+  this is the wrong mechanism for this population.
+- **Tagging the untagged files in place.** Circular: their tags would then count
+  as coverage proving themselves redundant.
+- **Damaged-cell scheduling priority beyond the hole rank.** The last change to
+  the sealed claim share OOM-killed prod at 124.9 GB. Measure the hole rank first.
