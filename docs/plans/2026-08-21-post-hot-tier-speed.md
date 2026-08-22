@@ -168,3 +168,30 @@ attribution of every miss (raw: scratchpad bench_final_cycle/matrix.md):
   EA evidence), (3) sealed backlog drain [wall-clock], (4) shipped, (5) P5
   A-shape warm anomaly (5.9s/43 files — roundtrip overhead, investigate
   before optimizing).
+
+## Cert instrumentation shipped (cdaadc4) — and the hypothesis to test with it
+
+`cert_slice_{outside_day,dirty,partial,day_covered}` +
+`cert_refused_{dropped,incomplete,empty,fp_moved}` are now in
+`timefusion_stats`. Read them together; the slice counters should sum to
+`record_clean_slice`'s call count.
+
+**Hypothesis: `cert_slice_partial` dominates, via fingerprint RESET rather
+than genuinely-incomplete coverage.** `record_clean_slice` accumulates clean
+intervals until they cover the UTC day, but keyed on one unmoved file
+fingerprint — `if entry.fp != fp { *entry = SliceCoverage { fp, intervals:
+vec![(start, end)] } }` (`maintain.rs`). Any change to the partition's file
+set discards every interval accumulated so far. For today's partition that is
+correct (ingest churns files). For sealed days it should be stable — except
+compaction, repair and rollup rewrite them continuously, and there is a
+529-day repair backlog doing precisely that. If so, certification and the
+maintenance tier are in a livelock: the work that makes a day clean is also
+the work that keeps resetting the proof that it is.
+
+**Known gap in what shipped:** `cert_slice_dirty` catches the partition moving
+*during* a pass; the reset above happens *between* passes and is not
+separately counted, so a dominant `cert_slice_partial` will not by itself
+distinguish "still accumulating" from "repeatedly reset". If the first read
+points at `partial`, add `cert_slice_fp_reset` (one counter, in the `entry.fp
+!= fp` branch) before theorising further. Deliberately not stacked onto this
+deploy — one change per deploy, and the first read may already be decisive.
