@@ -415,3 +415,28 @@ convergence and should not be credited with it.
 None of these were deployed — the measurement is the deliverable, and picking
 among them is a throughput decision that wants the `sim`/`run-unit` loop rather
 than another prod deploy at 03:00.
+
+### Confirmed on a second, cleaner window
+
+Container `d327df8` came up 03:05, survived the 03:20 tick and never restarted:
+
+| time | uncovered |
+|---|---|
+| 03:29 | 5622 |
+| 03:44 | 5649 |
+| 03:59 | 5674 |
+| 04:14 | 5683 |
+
+**+61 in 45 min (~81/hr), monotonic**, matching the first window's ~85/hr — two
+independent measurements on different containers agreeing. And the 03:20 pass
+ran **60+ minutes with no completion line** on a container that never
+restarted, which is the cleanest evidence that a 150-file pass does not fit an
+hourly tick. Earlier passes could always be excused as deploy-killed; this one
+cannot.
+
+One methodological note, since it briefly produced a wrong number: a single dip
+(5684 at 02:56 -> 5622 at 03:29) spans the 03:05 restart boundary, and
+averaging across it gave ~40/hr, which looked like a much slower divergence.
+Both clean single-container segments say ~81-85/hr. **Don't average a rate
+across a restart** — the census is a live diff, so a restart boundary can move
+it for reasons unrelated to drain throughput.
