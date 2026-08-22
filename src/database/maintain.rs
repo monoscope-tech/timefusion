@@ -2709,6 +2709,38 @@ impl Database {
         );
     }
 
+    /// Republish the slices whose coverage can never be verified.
+    ///
+    /// Same shape as `enqueue_untagged_rebuilds` and for the same reason: work the
+    /// coordinator will not reach on its own, because nothing about a sealed,
+    /// fully-covered day says "republish me" — the claim is unverifiable, not
+    /// missing. Enqueue is idempotent (keyed), so re-running hourly re-queues only
+    /// what has not drained.
+    fn enqueue_witnessless_rebuilds(
+        &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, slices: &[(String, crate::maintenance_coordinator::TimeSlice)],
+    ) {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey};
+        if slices.is_empty() {
+            return;
+        }
+        let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
+        let now = crate::support::now_micros();
+        let created = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        let mut journal = self.journal();
+        for (project_id, slice) in slices {
+            let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice: *slice, operation };
+            journal.enqueue(key, now, MAX_DECODED_BYTES, created);
+        }
+        let _ = journal.checkpoint();
+        warn!(
+            source,
+            target,
+            queued = slices.len(),
+            event = "rollup_witnessless_rebuild_queued",
+            "slices predating the row witness cannot be verified and were queued for republish"
+        );
+    }
+
     /// How many DATE-level coverage entries exist. Currently always 0 — nothing
     /// writes `rollup_coverage` — which is the whole reason this is exposed:
     /// the dead map produced no miss, no error and no log, so only counting it
@@ -2723,6 +2755,11 @@ impl Database {
             return Ok(0);
         }
         let mut recovered = 0;
+        // Summed over every declared tier, then stored ONCE. Storing per tier made
+        // the last spec's count the whole reading, which is zero whenever only the
+        // base tier has a backlog — the same "cannot tell none from unmeasured"
+        // failure the untagged gauge already had.
+        let mut unverifiable = 0u64;
         for spec in &schema.rollups {
             let target = spec.table_name(source);
             let (mut untagged_spans, mut tagged_spans): (SpansByPartition, SpansByPartition) = Default::default();
@@ -2817,8 +2854,22 @@ impl Database {
                 })
                 .collect();
             self.enqueue_untagged_rebuilds(source, spec, &target, &untagged_partitions);
+            // Slices recovered WITHOUT a row witness. They predate `TAG_SOURCE_ROWS`
+            // and carry no evidence any read-side rule can verify — not the witness
+            // (absent) and not a partition fingerprint (never persisted; the slice's
+            // own `source_fp` is incomparable, see 7e5bb5a). They are refused as
+            // `stale_coverage` forever, and 2026-08-22/23 measured them as ~80% of
+            // every stale decline on the whale (612 no_witness against 156 moved per
+            // three reps, constant across query shapes — a fixed population re-judged,
+            // not churn). Republishing is the only thing that clears them, and left in
+            // the general queue they compete with ~7,000 other units behind a restart
+            // cadence measured in tens of minutes. Queue them explicitly instead.
+            let mut witnessless: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
             let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {
+                if publication.source_rows.is_none() {
+                    witnessless.push((key.project_id.clone(), key.slice));
+                }
                 self.rollup_slice_coverage.insert(
                     (key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros),
                     RollupCoverage {
@@ -2840,14 +2891,21 @@ impl Database {
                     if !complete || crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
                         continue;
                     }
+                    if source_rows.is_none() {
+                        witnessless.push((project_id.clone(), slice));
+                    }
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
                         RollupCoverage { source_fp, source_epoch: 0, generation, rows, source_rows, covered_through: slice_end },
                     );
                     recovered += 1;
                 }
+                unverifiable += witnessless.len() as u64;
+                self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
                 continue;
             }
+            unverifiable += witnessless.len() as u64;
+            self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
             if !published.is_empty() {
                 continue;
             }
@@ -2858,7 +2916,8 @@ impl Database {
             // the coordinator will replace them with tagged slices whose
             // coverage is recoverable from Delta metadata alone.
         }
-        info!(source, recovered, event = "rollup_coverage_recovered");
+        crate::observability::maintenance_stats().rollup_witnessless_slices.store(unverifiable, std::sync::atomic::Ordering::Relaxed);
+        info!(source, recovered, unverifiable, event = "rollup_coverage_recovered");
         Ok(recovered)
     }
 

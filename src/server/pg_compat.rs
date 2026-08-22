@@ -1002,6 +1002,9 @@ impl StatsTableProvider {
             "rollup_skipped_covered_by_wider" => m.rollup_skipped_covered_by_wider,
             "rollup_untagged_inputs" => m.rollup_untagged_inputs,
             "rollup_tier_untagged_found" => m.rollup_tier_untagged_found,
+            // The republish backlog that gates wide-window routing. Watch it fall;
+            // `rollup_stale_no_witness` per query falls with it.
+            "rollup_witnessless_slices" => m.rollup_witnessless_slices,
             "rollup_tier_untagged_retired_total" => m.rollup_tier_untagged_retired,
             "rollup_min_contiguous_days" => m.rollup_min_contiguous_days,
             "rollup_median_contiguous_days" => m.rollup_median_contiguous_days,

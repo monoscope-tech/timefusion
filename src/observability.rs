@@ -838,6 +838,12 @@ atomic_stats! {
     /// which is exactly what the first repair attempt did.
     rollup_tier_untagged_found,
     rollup_tier_untagged_retired,
+    /// Recovered slices carrying NO row witness — published before
+    /// `TAG_SOURCE_ROWS` existed. Every read refuses them `stale_coverage` and no
+    /// rule can ever rescue them, so this is the size of the backlog that has to
+    /// republish before wide dashboards route. Set from the whole recovery pass,
+    /// hourly, so it reads 0 only when there genuinely are none.
+    rollup_witnessless_slices,
     /// Contiguous sealed days of rollup coverage, counting back from yesterday,
     /// minimised over every (project, declared tier).
     ///

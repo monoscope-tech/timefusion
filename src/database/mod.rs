@@ -11378,6 +11378,68 @@ mod tests {
         Ok(())
     }
 
+    /// A slice with no ROW WITNESS must be queued for republish.
+    ///
+    /// It is not damaged and not missing — it is UNVERIFIABLE. Published before
+    /// `TAG_SOURCE_ROWS` existed, it carries no evidence any read-side rule can
+    /// check: the witness is absent, and the partition fingerprint the date-level
+    /// path compares was never persisted (a slice's own `source_fp` is an FnvHasher
+    /// over selected files and is incomparable with it — 7e5bb5a). So every read
+    /// refuses it `stale_coverage` forever, and nothing about a sealed, fully-covered
+    /// day tells the coordinator to republish it. 2026-08-22/23 measured these as
+    /// ~80% of every stale decline on the whale.
+    #[tokio::test]
+    async fn recovery_queues_a_republish_for_a_slice_with_no_row_witness() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let mut cfg = (*create_test_config("witnessless-republish")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("wit_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        let tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+
+        // Blank the witness on the journal publication. `Publication::source_rows`
+        // is `#[serde(default)]`, so this is exactly what a journal written before
+        // the field deserializes to — the real prod shape, not a synthetic one.
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let published = journal.published_rollups("otel_logs_and_spans", &tier);
+            assert!(!published.is_empty(), "the unit must have published, or the strip below proves nothing");
+            for (key, publication) in published {
+                assert!(publication.source_rows.is_some(), "a fresh build must carry the witness this test removes");
+                journal.publish(&key, crate::maintenance_coordinator::Publication { source_rows: None, ..publication });
+            }
+        }
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let queued: Vec<_> = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal
+                .tasks()
+                .filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier)
+                .map(|task| task.key.slice)
+                .collect()
+        };
+        assert!(!queued.is_empty(), "a slice with no row witness can never be verified and must be queued for republish");
+        assert!(
+            queued.iter().all(|slice| chrono::DateTime::from_timestamp_micros(slice.start_micros).is_some_and(|time| time.date_naive() == day)),
+            "the republish must land on the unverifiable slice's own date, got {queued:?}"
+        );
+        assert!(
+            crate::observability::maintenance_stats().rollup_witnessless_slices.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the backlog gauge must be able to distinguish 'none' from 'unmeasured'"
+        );
+        Ok(())
+    }
+
     /// A partition still holding an untagged tier file must be QUEUED for rebuild.
     ///
     /// `slice_retires` can retire such a file, but only when something publishes that partition,
