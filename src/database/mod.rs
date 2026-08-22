@@ -8864,11 +8864,26 @@ enum PrefilterDecision {
 /// Pure decision over an already-completed tantivy search's stats — no IO, mirrors the branches
 /// in `ProjectRoutingTable::scan`'s prefilter block exactly (skip reasons in the same order).
 ///
-/// `is_mutable`: whether the leg is on a `version_append` (merge-on-read) table. On such a
+/// `is_mutable`: whether the ROUTED PREDICATE touches a version-mutable column —
+/// not merely whether the table has one. Narrowed 2026-08-22: the table-wide
+/// form was true for `otel_logs_and_spans`, which silently disabled both
+/// optimisations below on the busiest table in production. On such a
 /// table a "hitless" file may hold the NEWEST version of a key whose match lives only in an
 /// older version, and dropping it below `DedupExec` would serve the stale row — so file
 /// exclusion/row-selection narrowing NEVER applies there; only the id-set does (sound at
 /// whole-key granularity).
+/// Does the routed predicate reference a version-mutable column?
+///
+/// The prefilter's file pruning is only unsound when it does. `None` mutable set
+/// means the table is not merge-on-read at all; `None` tree means nothing was
+/// routed, so there is no predicate to be unsound about.
+fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate::tantivy::udf::PredNode>) -> bool {
+    match (mutable, tree) {
+        (Some(m), Some(t)) => t.columns().iter().any(|c| m.contains(*c)),
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_prefilter(
     ids: HashSet<String>, indexed_rows: u64, min_selectivity_pct: u64, field_gap: bool, covered_files: HashSet<String>, zero_hit_files: HashSet<String>,
@@ -8924,6 +8939,67 @@ mod decide_prefilter_tests {
             true,
             true,
         )
+    }
+
+    /// The narrowing itself: which predicates count as touching a mutable
+    /// column. Getting this wrong in the permissive direction is a correctness
+    /// bug on a merge-on-read table, so pin every arm.
+    #[test]
+    fn routed_touches_mutable_only_when_a_predicate_column_is_mutable() {
+        use crate::tantivy::udf::{PredNode, TextMatchPred};
+        let leaf = |c: &str| PredNode::Leaf(TextMatchPred { column: c.into(), query: "x".into() });
+        let mutable: HashSet<String> = ["status".to_string(), "_version".to_string()].into_iter().collect();
+
+        assert!(!routed_touches_mutable(Some(&mutable), Some(&leaf("trace_id"))), "immutable column");
+        assert!(routed_touches_mutable(Some(&mutable), Some(&leaf("status"))), "mutable column");
+        // A conjunction is only as safe as its least safe branch.
+        assert!(routed_touches_mutable(Some(&mutable), Some(&PredNode::And(vec![leaf("trace_id"), leaf("status")]))), "AND with a mutable branch");
+        assert!(routed_touches_mutable(Some(&mutable), Some(&PredNode::Or(vec![leaf("trace_id"), leaf("_version")]))), "OR with a mutable branch");
+        // Not merge-on-read, or nothing routed: nothing to be unsound about.
+        assert!(!routed_touches_mutable(None, Some(&leaf("status"))), "non-MOR table");
+        assert!(!routed_touches_mutable(Some(&mutable), None), "nothing routed");
+    }
+
+    /// Against the REAL schema, not a fixture: the narrowing is only sound while
+    /// the columns queries actually route on are declared immutable. This is the
+    /// guard that fires if someone later marks an indexed column `mutable: true`
+    /// — the unit tests above would still pass, and the pruning would silently
+    /// become unsound on a merge-on-read table.
+    #[test]
+    fn otel_routes_on_immutable_columns_so_pruning_stays_sound() {
+        use crate::tantivy::udf::{PredNode, TextMatchPred};
+        let mutable = ProjectRoutingTable::version_mutable_columns("otel_logs_and_spans").expect("otel is version_append, so it has a mutable set");
+        let leaf = |c: &str| PredNode::Leaf(TextMatchPred { column: c.into(), query: "x".into() });
+        for column in ["context___trace_id", "id", "name"] {
+            assert!(
+                !routed_touches_mutable(Some(&mutable), Some(&leaf(column))),
+                "`{column}` is routed by real queries and must stay immutable, or zero-hit file pruning is unsound"
+            );
+        }
+        // ...and the set is not vacuously empty, which would make the assertions above meaningless.
+        assert!(!mutable.is_empty(), "otel declares mutable columns; an empty set would make this test prove nothing");
+    }
+
+    /// The mutable gate is what keeps merge-on-read correct, and narrowing it
+    /// from table-wide to predicate-aware is the whole point of the change — so
+    /// pin BOTH directions. A predicate on a mutable column must still refuse
+    /// to prune (a newer version could match where the indexed one did not);
+    /// an immutable-only predicate must prune, because every version of a
+    /// matching row carries the same values and a zero-hit file therefore holds
+    /// no version of one.
+    #[test]
+    fn only_a_mutable_predicate_blocks_file_pruning() {
+        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 100, false) else {
+            panic!("immutable predicate must use the prefilter");
+        };
+        assert!(exclude_files.is_some(), "an immutable-only predicate must prune zero-hit files");
+        assert!(row_selections.is_some(), "...and push row selections");
+
+        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 100, true) else {
+            panic!("mutable predicate still uses the prefilter, just without pruning");
+        };
+        assert!(exclude_files.is_none(), "a mutable predicate must NOT prune: a newer version may match");
+        assert!(row_selections.is_none(), "...nor push row selections");
     }
 
     /// Each skip reason fires independently and in the documented priority order —
@@ -9202,6 +9278,7 @@ impl TableProvider for ProjectRoutingTable {
 
             if delta_any_usable {
                 if let Some(ids) = delta_ids {
+                    let routed_touches_mutable = routed_touches_mutable(mutable.as_ref(), text_match_tree.as_ref());
                     let decision = decide_prefilter(
                         ids,
                         delta_indexed_rows,
@@ -9210,7 +9287,22 @@ impl TableProvider for ProjectRoutingTable {
                         delta_covered,
                         delta_zero_hit,
                         delta_row_sel,
-                        mutable.is_some(),
+                        // Predicate-aware, not table-wide. `mutable.is_some()`
+                        // asked "does this TABLE have a mutable column", which is
+                        // true for otel_logs_and_spans (version_append + a mutable
+                        // field) — so on the busiest table both zero-hit file
+                        // pruning and row-selection pushdown were dead, and the
+                        // indexed leg carried ~2,880 unpruned files into a
+                        // scan() that costs ~14.5us per selected file.
+                        //
+                        // Sound to narrow: if every ROUTED predicate column is
+                        // immutable, every version of a matching row carries the
+                        // same values, so a file whose index found no match cannot
+                        // hold any version of one — tombstone versions included,
+                        // since they carry the same keys. A predicate touching a
+                        // mutable column (or the tiebreak/tombstone, both of which
+                        // are in that set) still takes the old conservative path.
+                        routed_touches_mutable,
                         tcfg.timefusion_tantivy_file_pruning,
                         tcfg.timefusion_tantivy_row_selection,
                     );
