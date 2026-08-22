@@ -419,3 +419,41 @@ retries (e.g. `0 */15 * * * *`, so a container that misses one boundary catches
 the next) or a run-on-boot-if-overdue, so the drain is not hostage to a single
 minute of the hour. Deliberately NOT shipped here: it wants one quiet deploy and
 a measurement, and prod has taken seven today.
+
+### 17:52 — the interleaved reservation moves the tail, barely
+
+First pass to run with the tail interleaved rather than appended (`5062a7d`,
+deployed 16:51; pass started 17:20:08, container killed ~17:32 — 12 minutes of
+run):
+
+| time | total | today | week | older |
+|---|---|---|---|---|
+| 17:16 | 6085 | 912 | 1719 | 3454 |
+| 17:31 | 6108 | 937 | **1718** | **3453** |
+| 17:52 | 6116 | 945 | 1718 | 3453 |
+
+`week` -1 and `older` -1 inside the pass window, against **zero movement in 33
+minutes** of the appended version. Directionally exactly what interleaving
+predicts, and it is the first time all day the tail has moved while a pass was
+observably running.
+
+**Do not oversell it: that is two files.** The comparison is one 12-minute
+window against one 33-minute window, both on containers that were killed, and
+the census is a live diff sampled every 15 minutes — a ±1 change is close to
+its resolution. The honest claim is "consistent with the fix working", not
+"the fix is verified".
+
+**And two files per pass does not converge anything.** Against 5,171 files in
+`week`+`older` it is arithmetic on the order of weeks, and `today` is still
+accruing (885 -> 945 over 50 minutes, ~72/hr — a third different figure for
+that rate today, which is itself a reason to distrust all of them). No progress
+line appeared in 12 minutes, so fewer than 25 files were built: the ~100/hr
+build rate is unchanged and remains the ceiling on everything.
+
+**Where that leaves the three fixes shipped today.** The ordering defect was
+real, the append bug in the fix was real, and both are now corrected — but the
+sequence of constraints is: the pass must START (cron at `:20`, missed by most
+containers), it must SURVIVE (>1h pass against 15-30 min restarts), and only
+then does ordering matter. Today's work fixed the third while the first two
+remain. That is the right order to fix them in only if the first two are
+addressed next; fixing ordering alone changes nothing measurable.
