@@ -1296,6 +1296,7 @@ impl StatsTableProvider {
                 "queries" => q,
                 "indexes_searched_total" => idx,
                 "indexes_per_query" => avg(idx, q),
+                "searches" => s.searches.load(Relaxed),
                 "search_us_avg" => mean(&s.search_us, &s.searches),
                 "manifest_loads" => ml,
                 "manifest_hits" => mh,
@@ -1314,6 +1315,22 @@ impl StatsTableProvider {
                 "search_concurrency" => svc.config.search_concurrency(),
                 "cache_seeded" => s.cache_seeded.load(Relaxed),
                 "cache_seed_failures" => s.cache_seed_failures.load(Relaxed),
+                // Raw cumulative microseconds, alongside the means above,
+                // because a MEAN CANNOT BE DIFFERENCED: each `*_us_avg` divides
+                // by its own denominator (`search_us_avg` by per-index
+                // `searches`, not by `queries`), so reconstructing a total as
+                // avg*count silently mixes denominators — an attribution probe
+                // built that way reported NEGATIVE per-query search time. These
+                // are monotonic, so a before/after delta around a single query
+                // is that query's exact spend, per phase.
+                //
+                // Read `search_us_total` as occupancy, not wall clock: per-index
+                // searches run `search_concurrency`-way, so the sum exceeds the
+                // wall time it cost, by up to that factor.
+                "manifest_load_us_total" => s.manifest_load_us.load(Relaxed),
+                "blob_fetch_us_total" => s.blob_fetch_us.load(Relaxed),
+                "index_open_us_total" => s.index_open_us.load(Relaxed),
+                "search_us_total" => s.search_us.load(Relaxed),
             ]
         });
 

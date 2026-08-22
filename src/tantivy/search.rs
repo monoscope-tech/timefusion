@@ -338,11 +338,29 @@ impl TantivySearchService {
         let (loaded_at, current) = occupied.get();
         // Keep the ORIGINAL load time. Refreshing it here would mean a project
         // that publishes every few minutes never re-reads its manifest at all,
-        // so writers we don't observe (the repair CLI, `gc_after_compaction`)
-        // would be invisible forever rather than for at most one TTL.
+        // so writers we don't observe (the repair CLI) would be invisible
+        // forever rather than for at most one TTL.
         let (loaded_at, mut updated) = (*loaded_at, (**current).clone());
         updated.entries.insert(key.to_string(), entry);
         occupied.insert((loaded_at, Arc::new(updated)));
+    }
+
+    /// Drop a cached manifest so the next read reloads it from S3. The GC
+    /// counterpart of `apply_published_entry`, and deliberately the opposite
+    /// treatment: GC deletes blobs, so a manifest cached across it routes the
+    /// plan path at objects that are gone for up to a full TTL. That is soft —
+    /// the prefilter reads a missing blob as "no usable index" — but it is a
+    /// wasted lookup where latency is the whole point.
+    ///
+    /// Drop rather than install the pruned manifest: a concurrent publish may
+    /// have folded in an entry the GC's snapshot predates, and installing would
+    /// silently drop it, recreating the covered-file-looks-uncovered bug
+    /// `apply_published_entry` exists to avoid. A reload from S3 is
+    /// authoritative. Affordable only because GC runs once per project per
+    /// hour — on the publish path, which fires constantly, this same `remove`
+    /// is what drove the hit rate to 0%.
+    pub fn invalidate_manifest(&self, table: &str, project_id: &str) {
+        self.manifests.remove(&(table.to_string(), project_id.to_string()));
     }
 
     /// LRU-cached open, keyed by cache dir — 1:1 with the (immutable) blob
@@ -1213,6 +1231,9 @@ impl TantivyIndexService {
         report.blob_delete_errors = results.len() - report.blobs_deleted;
         if report.entries_removed > 0 {
             save_manifest(self.object_store.as_ref(), table, project_id, &m).await?;
+            if let Some(reader) = self.reader() {
+                reader.invalidate_manifest(table, project_id);
+            }
         }
         Ok(report)
     }

@@ -799,11 +799,11 @@ pub struct TantivyConfig {
     /// query takes 1.7-3.2s, so back-to-back queries routinely straddled it and
     /// re-GET + re-parsed a 745 KB, 950-entry manifest on the planning path.
     /// Safe to lengthen: publishing an index invalidates this process's cached
-    /// entry, so our own indexer is never unseen. It does still bound staleness
-    /// against writers we don't observe — other processes (the repair CLI), and
-    /// `gc_after_compaction`, which prunes entries without invalidating here. A
-    /// stale entry only ever costs a wasted lookup against a deleted blob, which
-    /// the prefilter treats as "no usable index" and falls back from.
+    /// entry, so our own indexer is never unseen; `gc_after_compaction` drops
+    /// it, so our own pruning is never unseen either. It does still bound
+    /// staleness against writers we don't observe — other processes, e.g. the
+    /// repair CLI. A stale entry only ever costs a wasted lookup against a
+    /// deleted blob, which the prefilter treats as "no usable index".
     #[serde_inline_default(300)]
     pub timefusion_tantivy_manifest_ttl_secs: u64,
     /// Max index builds one reconcile pass will start. Bounds a pass so it can
@@ -2328,6 +2328,9 @@ mod tests {
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
         assert_eq!(cfg.manifest_ttl(), Duration::from_secs(300));
+        // Load-bearing against the hourly reconcile tick, not a free tuning
+        // knob: a cap whose pass outruns the interval stops reporting per pass.
+        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 150);
 
         let derived = TantivyConfig::default();
         assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");
