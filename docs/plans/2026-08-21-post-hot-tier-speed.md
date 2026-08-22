@@ -195,3 +195,64 @@ distinguish "still accumulating" from "repeatedly reset". If the first read
 points at `partial`, add `cert_slice_fp_reset` (one counter, in the `entry.fp
 != fp` branch) before theorising further. Deliberately not stacked onto this
 deploy — one change per deploy, and the first read may already be decisive.
+
+## Cert diagnosis CLOSED (2026-08-22) — the premise was wrong
+
+**`cert_granted_total = 0` was a red herring.** It is a process-scoped counter
+and prod restarts constantly (5 deploys in ~90 min during this diagnosis), so
+it reads 0 on a young process no matter how well certification works. Every
+prior fix — coordinator deadline, day-wide units, restart-straddling
+persistence — was aimed at a mechanism that was not broken.
+
+Read the durable sidecar instead (`.timefusion_meta/dedup_certifications.json`,
+NOT the data-dir root — read-only via `sudo cat` on the host; note `ubuntu`
+does have sudo, contrary to CLAUDE.md):
+
+- **97 certifications across 13 projects**, granted continuously from
+  2026-08-12 through 2026-08-22 00:54 — i.e. minutes before this read.
+  Certification works and is actively granting.
+
+The exit counters shipped in `cdaadc4` are still useful and agree: over 33 min,
+`cert_slice_partial=8`, `cert_slice_dirty=4` (all four → `cert_refused_dropped`,
+i.e. real duplicates found), `cert_slice_day_covered=0`.
+
+### What actually blocks the skip: contiguity, not grants
+
+The read path refuses the skip if **any** in-window partition lacks an entry
+(`maintain.rs:1056`). Certified dates per project, and the longest consecutive
+run:
+
+| project | certified dates | longest consecutive run |
+|---|---|---|
+| 94c5dc1f | 11 | **5** |
+| 8100121c | 11 | 3 |
+| 28f62f01 | 9 | 4 |
+| 98fdd4f3 | 9 | 4 |
+| 6297304f (whale) | 7 | 3 (newest 08-16) |
+
+**A 7-day query needs 7 consecutive certified dates. The best any project
+achieves is 5. A 30-day query needs 30.** So `dedup_skipped_pct = 0.0` despite
+97 live certifications — the grants are real but never form a contiguous
+window, and they decay as compaction/repair move file fingerprints on sealed
+days, punching holes faster than slices fill them.
+
+Corroborating, from `dedup_slice_coverage.json`: 51 days in flight, median
+**12.5%** of a day covered, max 87.5%, and **zero** at ≥99%. New day-grants
+complete slowly, so runs grow slower than they are broken.
+
+### The fix follows directly, and it is not more instrumentation
+
+**Make the skip per-date (or per-file-group) instead of all-or-nothing over the
+window.** With 5-day runs already existing, per-date skipping would convert
+today's 97 grants into real savings immediately, with no change to how
+certification is earned. This is the IOx model already named in this file's
+own end-state ("per-file-group overlap check, dedup only where ranges
+overlap") — it was listed as the ideal and is in fact the unblocking change.
+
+Second, stop invalidating certifications that maintenance did not need to
+disturb: a compaction that rewrites an already-clean sealed day moves the
+fingerprint and voids the proof, which is the livelock in the small.
+
+**Do not add `cert_slice_fp_reset`** (queued in the previous section) — the
+question it was to answer is now answered by the sidecars, and it would cost a
+deploy to learn nothing new.
