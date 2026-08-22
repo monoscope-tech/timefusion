@@ -2582,6 +2582,7 @@ impl Database {
         let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
         let (start, end) = (slice.start_micros.max(day_start), slice.end_micros.min(day_end));
         if start >= end {
+            metrics::counter!(scan_metric_names::CERT_SLICE_OUTSIDE_DAY).increment(1);
             return Ok(None); // a slice outside the day proves nothing about it
         }
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
@@ -2591,6 +2592,7 @@ impl Database {
         };
         let fp = partition_file_fp(post.clone());
         if dropped != 0 || post.is_empty() || partition_file_fp(pre.to_vec()) != fp {
+            metrics::counter!(scan_metric_names::CERT_SLICE_DIRTY).increment(1);
             if self.dedup_slice_coverage.remove(&key).is_some() {
                 self.persist_slice_coverage();
             }
@@ -2613,8 +2615,10 @@ impl Database {
         // durable or a restart strands the day at partial coverage forever.
         self.persist_slice_coverage();
         if !covered {
+            metrics::counter!(scan_metric_names::CERT_SLICE_PARTIAL).increment(1);
             return Ok(None);
         }
+        metrics::counter!(scan_metric_names::CERT_SLICE_DAY_COVERED).increment(1);
         self.dedup_slice_coverage.remove(&key);
         self.persist_slice_coverage();
         self.record_certification(table_ref, table_name, project_id, date, &post, (0, true)).await
@@ -2652,6 +2656,17 @@ impl Database {
             }
             return Ok(Some(fp_post));
         }
+        // Name the failing conjunct. Each is a different bug: `dropped` means the
+        // pass genuinely removed rows, `incomplete` means chunks were skipped,
+        // `empty` means the partition has no live files, and `fp_moved` means a
+        // concurrent commit landed mid-pass (the irreducible one under ingest).
+        metrics::counter!(match () {
+            _ if dropped != 0 => scan_metric_names::CERT_REFUSED_DROPPED,
+            _ if !complete => scan_metric_names::CERT_REFUSED_INCOMPLETE,
+            _ if post.is_empty() => scan_metric_names::CERT_REFUSED_EMPTY,
+            _ => scan_metric_names::CERT_REFUSED_FP_MOVED,
+        })
+        .increment(1);
         if let Some((_, prev)) = self.dedup_clean_fp.remove(&key) {
             self.scan_metrics.record_cert_dwell(prev.since);
         }

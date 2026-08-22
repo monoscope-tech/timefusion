@@ -65,6 +65,23 @@ pub struct SearchStats {
     /// round trips this process avoided by keeping what it just built.
     pub cache_seeded: AtomicU64,
     pub cache_seed_failures: AtomicU64,
+    /// Turning the manifest into the work list: the schema-version scan, the
+    /// time-prune, and the `covered_files` union — all of which walk EVERY
+    /// entry, not just the in-window ones, and clone their URI strings.
+    pub plans: AtomicU64,
+    pub plan_us: AtomicU64,
+    /// Per-index setup that precedes the search proper: `ensure_cached`'s
+    /// `last_used` stamp and segment stat, plus the reader-LRU lookup. Charged
+    /// separately because a fully-resident, fully-open index still pays it once
+    /// per index per query, and `search_us` deliberately starts after it.
+    pub prepares: AtomicU64,
+    pub prepare_us: AtomicU64,
+    /// WALL time of the whole fan-out — driving every per-index task to
+    /// completion and merging their hits. `fanout_us - prepare_us - search_us`
+    /// is the result-merge bookkeeping (the hit/coverage/row-selection sets),
+    /// which no other counter can see.
+    pub fanouts: AtomicU64,
+    pub fanout_us: AtomicU64,
 }
 
 impl SearchStats {
@@ -75,6 +92,27 @@ impl SearchStats {
     fn timed(count: &AtomicU64, micros: &AtomicU64, started: Instant) {
         Self::add(count, 1);
         Self::add(micros, started.elapsed().as_micros() as u64);
+    }
+}
+
+/// `timed` as an RAII guard, for a phase with early returns. The fan-out exits
+/// three ways (`?`, the max_hits abort, the no-usable-index path); charging it
+/// only on the happy path would make the abort — the expensive case — invisible.
+struct TimedPhase<'a> {
+    count: &'a AtomicU64,
+    micros: &'a AtomicU64,
+    started: Instant,
+}
+
+impl<'a> TimedPhase<'a> {
+    fn new(count: &'a AtomicU64, micros: &'a AtomicU64) -> Self {
+        Self { count, micros, started: Instant::now() }
+    }
+}
+
+impl Drop for TimedPhase<'_> {
+    fn drop(&mut self) {
+        SearchStats::timed(self.count, self.micros, self.started);
     }
 }
 
@@ -165,6 +203,7 @@ impl TantivySearchService {
         if m.entries.is_empty() {
             return Ok(None);
         }
+        let plan_started = Instant::now();
         let current = || m.entries.iter().filter(|(_, e)| e.schema_version == SCHEMA_VERSION);
         // Coverage ignores the time-prune below: a pruned entry still covers its
         // file, its rows are merely out of window (see SearchResult docs).
@@ -184,9 +223,13 @@ impl TantivySearchService {
         // `None` hits = the index lacks a queried field (coverage gap).
         SearchStats::add(&self.stats.queries, 1);
         SearchStats::add(&self.stats.indexes_searched, work.len() as u64);
+        SearchStats::timed(&self.stats.plans, &self.stats.plan_us, plan_started);
+        let _fanout = TimedPhase::new(&self.stats.fanouts, &self.stats.fanout_us);
         let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid)| async move {
+            let prepare_started = Instant::now();
             let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
             let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
+            SearchStats::timed(&self.stats.prepares, &self.stats.prepare_us, prepare_started);
             let started = Instant::now();
             let out = match build_node_query(&index, node)? {
                 PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
@@ -362,11 +405,29 @@ impl TantivySearchService {
         let (loaded_at, current) = occupied.get();
         // Keep the ORIGINAL load time. Refreshing it here would mean a project
         // that publishes every few minutes never re-reads its manifest at all,
-        // so writers we don't observe (the repair CLI, `gc_after_compaction`)
-        // would be invisible forever rather than for at most one TTL.
+        // so writers we don't observe (the repair CLI) would be invisible
+        // forever rather than for at most one TTL.
         let (loaded_at, mut updated) = (*loaded_at, (**current).clone());
         updated.entries.insert(key.to_string(), entry);
         occupied.insert((loaded_at, Arc::new(updated)));
+    }
+
+    /// Drop a cached manifest so the next read reloads it from S3. The GC
+    /// counterpart of `apply_published_entry`, and deliberately the opposite
+    /// treatment: GC deletes blobs, so a manifest cached across it routes the
+    /// plan path at objects that are gone for up to a full TTL. That is soft —
+    /// the prefilter reads a missing blob as "no usable index" — but it is a
+    /// wasted lookup where latency is the whole point.
+    ///
+    /// Drop rather than install the pruned manifest: a concurrent publish may
+    /// have folded in an entry the GC's snapshot predates, and installing would
+    /// silently drop it, recreating the covered-file-looks-uncovered bug
+    /// `apply_published_entry` exists to avoid. A reload from S3 is
+    /// authoritative. Affordable only because GC runs once per project per
+    /// hour — on the publish path, which fires constantly, this same `remove`
+    /// is what drove the hit rate to 0%.
+    pub fn invalidate_manifest(&self, table: &str, project_id: &str) {
+        self.manifests.remove(&(table.to_string(), project_id.to_string()));
     }
 
     /// LRU-cached open, keyed by cache dir — 1:1 with the (immutable) blob
@@ -1240,6 +1301,9 @@ impl TantivyIndexService {
         report.blob_delete_errors = results.len() - report.blobs_deleted;
         if report.entries_removed > 0 {
             save_manifest(self.object_store.as_ref(), table, project_id, &m).await?;
+            if let Some(reader) = self.reader() {
+                reader.invalidate_manifest(table, project_id);
+            }
         }
         Ok(report)
     }

@@ -802,11 +802,11 @@ pub struct TantivyConfig {
     /// query takes 1.7-3.2s, so back-to-back queries routinely straddled it and
     /// re-GET + re-parsed a 745 KB, 950-entry manifest on the planning path.
     /// Safe to lengthen: publishing an index invalidates this process's cached
-    /// entry, so our own indexer is never unseen. It does still bound staleness
-    /// against writers we don't observe — other processes (the repair CLI), and
-    /// `gc_after_compaction`, which prunes entries without invalidating here. A
-    /// stale entry only ever costs a wasted lookup against a deleted blob, which
-    /// the prefilter treats as "no usable index" and falls back from.
+    /// entry, so our own indexer is never unseen; `gc_after_compaction` drops
+    /// it, so our own pruning is never unseen either. It does still bound
+    /// staleness against writers we don't observe — other processes, e.g. the
+    /// repair CLI. A stale entry only ever costs a wasted lookup against a
+    /// deleted blob, which the prefilter treats as "no usable index".
     #[serde_inline_default(300)]
     pub timefusion_tantivy_manifest_ttl_secs: u64,
     /// Max index builds one reconcile pass will start. Bounds a pass so it can
@@ -817,7 +817,16 @@ pub struct TantivyConfig {
     ///
     /// A truncated pass logs how much it left behind — a silent cap reads as
     /// "coverage is converging" when it is not.
-    #[serde_inline_default(400)]
+    ///
+    /// 150 (was 400): at measured prod throughput a 400-file pass runs ~2h, so
+    /// the "hourly" reconcile was effectively continuous — prod logged
+    /// `still in progress after 600s (skips=1)`, i.e. ticks correctly dropped
+    /// rather than piling up. The drain was healthy, but `deferred_to_next_pass`
+    /// and the `uncovered` gauge only update at pass end, so a 2h pass reports
+    /// a quarter as often as the bounded-pass design intended. ~150 gives a
+    /// ~30-minute pass that fits inside the tick and reports every time.
+    /// This is an observability fix, not a throughput one.
+    #[serde_inline_default(150)]
     pub timefusion_tantivy_backfill_max_files_per_pass: usize,
     /// Row-selection pushdown: when the prefilter engages, files whose index
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
@@ -2345,6 +2354,9 @@ mod tests {
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
         assert_eq!(cfg.manifest_ttl(), Duration::from_secs(300));
+        // Load-bearing against the hourly reconcile tick, not a free tuning
+        // knob: a cap whose pass outruns the interval stops reporting per pass.
+        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 150);
 
         let derived = TantivyConfig::default();
         assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");

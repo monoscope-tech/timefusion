@@ -187,6 +187,19 @@ pub mod scan_metric_names {
     pub const DEDUP_DENIED_UNRESOLVED: &str = "timefusion.scan.dedup_denied_unresolved";
     pub const DEDUP_DENIED_DISABLED: &str = "timefusion.scan.dedup_denied_disabled";
     pub const CERT_GRANTED_TOTAL: &str = "timefusion.scan.cert_granted_total";
+    // Why a dedup pass did NOT end in a certification. `cert_granted_total` has
+    // sat at 0 since 2026-08-20 across three attempted fixes, each of which
+    // guessed at the exit; these name the exits so the next fix is measured.
+    // Sum of the four ~= calls to `record_clean_slice`.
+    pub const CERT_SLICE_OUTSIDE_DAY: &str = "timefusion.scan.cert_slice_outside_day";
+    pub const CERT_SLICE_DIRTY: &str = "timefusion.scan.cert_slice_dirty";
+    pub const CERT_SLICE_PARTIAL: &str = "timefusion.scan.cert_slice_partial";
+    pub const CERT_SLICE_DAY_COVERED: &str = "timefusion.scan.cert_slice_day_covered";
+    // Why `record_certification` refused, split by the failing conjunct.
+    pub const CERT_REFUSED_DROPPED: &str = "timefusion.scan.cert_refused_dropped";
+    pub const CERT_REFUSED_INCOMPLETE: &str = "timefusion.scan.cert_refused_incomplete";
+    pub const CERT_REFUSED_EMPTY: &str = "timefusion.scan.cert_refused_empty";
+    pub const CERT_REFUSED_FP_MOVED: &str = "timefusion.scan.cert_refused_fp_moved";
     pub const CERT_DWELL_TOTAL: &str = "timefusion.scan.cert_dwell_total";
     pub const CERT_DWELL_SECS_TOTAL: &str = "timefusion.scan.cert_dwell_secs_total";
     pub const FAST_RESOLVE_HITS: &str = "timefusion.scan.fast_resolve_hits";

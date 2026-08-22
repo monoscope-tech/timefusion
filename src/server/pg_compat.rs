@@ -1168,6 +1168,20 @@ impl StatsTableProvider {
                     "dedup_denied_unresolved" => cv(DEDUP_DENIED_UNRESOLVED),
                     "dedup_denied_disabled" => cv(DEDUP_DENIED_DISABLED),
                     "cert_granted_total" => cv(CERT_GRANTED_TOTAL),
+                    // Why certification never happens. `cert_slice_*` are the exits
+                    // of `record_clean_slice` (they should sum to its call count);
+                    // `cert_refused_*` split `record_certification`'s refusal by the
+                    // conjunct that failed. cert_granted_total has been 0 since
+                    // 2026-08-20 through three fixes that each guessed the exit —
+                    // read these before attempting a fourth.
+                    "cert_slice_outside_day" => cv(CERT_SLICE_OUTSIDE_DAY),
+                    "cert_slice_dirty" => cv(CERT_SLICE_DIRTY),
+                    "cert_slice_partial" => cv(CERT_SLICE_PARTIAL),
+                    "cert_slice_day_covered" => cv(CERT_SLICE_DAY_COVERED),
+                    "cert_refused_dropped" => cv(CERT_REFUSED_DROPPED),
+                    "cert_refused_incomplete" => cv(CERT_REFUSED_INCOMPLETE),
+                    "cert_refused_empty" => cv(CERT_REFUSED_EMPTY),
+                    "cert_refused_fp_moved" => cv(CERT_REFUSED_FP_MOVED),
                     "cert_dwell_total" => cert_dwells,
                     "cert_dwell_secs_avg" => avg(cv(CERT_DWELL_SECS_TOTAL), cert_dwells),
                     "cert_dwell_p50_secs" => m.cert_dwell_percentile_secs(0.50),
@@ -1288,6 +1302,7 @@ impl StatsTableProvider {
                 "queries" => q,
                 "indexes_searched_total" => idx,
                 "indexes_per_query" => avg(idx, q),
+                "searches" => s.searches.load(Relaxed),
                 "search_us_avg" => mean(&s.search_us, &s.searches),
                 "hits_materialized" => s.hits_materialized.load(Relaxed),
                 "manifest_loads" => ml,
@@ -1307,7 +1322,33 @@ impl StatsTableProvider {
                 "search_concurrency" => svc.config.search_concurrency(),
                 "cache_seeded" => s.cache_seeded.load(Relaxed),
                 "cache_seed_failures" => s.cache_seed_failures.load(Relaxed),
-                "hits_materialized" => s.hits_materialized.load(Relaxed),
+                // Raw cumulative microseconds, alongside the means above,
+                // because a MEAN CANNOT BE DIFFERENCED: each `*_us_avg` divides
+                // by its own denominator (`search_us_avg` by per-index
+                // `searches`, not by `queries`), so reconstructing a total as
+                // avg*count silently mixes denominators — an attribution probe
+                // built that way reported NEGATIVE per-query search time. These
+                // are monotonic, so a before/after delta around a single query
+                // is that query's exact spend, per phase.
+                //
+                // Read `search_us_total` as occupancy, not wall clock: per-index
+                // searches run `search_concurrency`-way, so the sum exceeds the
+                // wall time it cost, by up to that factor.
+                "manifest_load_us_total" => s.manifest_load_us.load(Relaxed),
+                "blob_fetch_us_total" => s.blob_fetch_us.load(Relaxed),
+                "index_open_us_total" => s.index_open_us.load(Relaxed),
+                "search_us_total" => s.search_us.load(Relaxed),
+                // Closes the attribution gap the four above left open: a routed
+                // 7d equality cost ~420ms more than its unrouted twin while
+                // search_us accounted for only ~45ms of it, with zero IO. The
+                // time is somewhere between "task starts" and "search timer
+                // starts", or in the merge — which is exactly what these three
+                // separate. fanout_us minus prepare_us minus search_us is the
+                // result-merge bookkeeping.
+                "plan_us_total" => s.plan_us.load(Relaxed),
+                "prepare_us_total" => s.prepare_us.load(Relaxed),
+                "prepares" => s.prepares.load(Relaxed),
+                "fanout_us_total" => s.fanout_us.load(Relaxed),
             ]
         });
 
