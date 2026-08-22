@@ -148,70 +148,6 @@ pub fn ordering_violations_by_leg() -> [(&'static str, u64); 2] {
 
 /// Diagnostic wrapper that answers "which leg's declared ordering is false?".
 ///
-/// A file's row-timestamp span, as Delta add-action statistics report it.
-///
-/// `None` means the file carries no timestamp statistics. It is NOT "empty" and
-/// must never be treated as disjoint from anything — the same direction
-/// `PartitionStats::overlaps` takes for a partition with no stats.
-pub(crate) type FileSpan = Option<(i64, i64)>;
-
-/// May a set of files a sweep proved duplicate-free skip `DedupExec`, given the
-/// files in the same scan that were NOT proved clean?
-///
-/// This is the soundness rule for making certification ADDITIVE over a file set
-/// instead of exact over a whole-partition fingerprint. Today any new file voids
-/// a partition's certification, so recent partitions — rewritten continuously by
-/// ingest, hot-tail compaction and the sealed backlog — churn faster than sweeps
-/// can certify them, and prod 2026-08-22 measured `dedup_denied_never_certified`
-/// at 100% of eligible scans with the 97 live certifications sitting on days
-/// nobody queries.
-///
-/// **The rule, applied PER FILE.** A certified file may skip iff no uncertified
-/// file's timestamp span overlaps ITS span. Per file rather than per set on
-/// purpose: in a churning partition the newest files interleave with the oldest
-/// certified ones, so judging the certified set by its union span lets a single
-/// neighbouring file poison every certified file behind it — which is exactly
-/// the case this work exists to unblock.
-///
-/// **Why it holds.** The dedup key is `(timestamp, id)` and merge-on-read
-/// re-appends preserve the original row's `timestamp` (`write/mod.rs`), which is
-/// the same fact the per-date skip rests on. So every version and tombstone of a
-/// row carries that row's timestamp. A duplicate of a row inside the certified
-/// set therefore has a timestamp within the certified span, and any file holding
-/// it must have a span containing that timestamp — i.e. overlapping. Excluding
-/// overlap with the uncertified files therefore excludes every duplicate that
-/// could be split across the two legs. Duplicates *within* the certified set are
-/// excluded by construction: the sweep proved that set clean together.
-///
-/// **Fail-closed cases, all of which decline:**
-/// - a certified or uncertified file with no timestamp statistics (`None` span)
-///   — an unknown span overlaps everything;
-/// - an empty certified set — the result is empty, and "no evidence" must never
-///   read as "proved clean" (the bug `certified_any` exists to prevent);
-/// - any uncertified span touching the certified span, on either side.
-///
-/// Spans are INCLUSIVE of both bounds, because Delta min/max statistics are.
-///
-/// Caller obligations this function cannot check, and which must hold:
-/// - the scan is Delta-only; a MemBuffer leg can hold an uncertified newer
-///   version whose file span does not exist to be compared;
-/// - `certified` really is the sweep-proved set intersected with the LIVE file
-///   list, so a file compacted away cannot vouch for its replacement.
-pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = (&'a str, FileSpan)>, uncertified: &[FileSpan]) -> HashSet<&'a str> {
-    // One uncertified file without statistics has an unknown span, which
-    // overlaps everything, so nothing in the scan can skip.
-    if uncertified.iter().any(Option::is_none) {
-        return HashSet::new();
-    }
-    certified
-        .into_iter()
-        .filter(|(_, span)| {
-            span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi))
-        })
-        .map(|(path, _)| path)
-        .collect()
-}
-
 /// `ORDERING_VIOLATIONS` is counted inside `DedupExec`, which is single-partition
 /// and sits above the mem ∪ hot ∪ delta union — so by the time a violation is
 /// seen the row's leg is gone, and the plan algebra alone cannot say which leg
@@ -1079,37 +1015,6 @@ fn dedup_first(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileSpan, skippable_certified_files};
-
-    /// The soundness rule for additive, file-set certification. Getting this
-    /// wrong silently over-counts every dashboard tile, so the cases that must
-    /// DECLINE are enumerated as carefully as the ones that may skip.
-    ///
-    /// `("a", span)` names the file; the assertion is on which names survive.
-    #[test_case::test_case(&[("a", Some((10, 20)))], &[Some((30, 40))], &["a"] ; "uncertified sits entirely after")]
-    #[test_case::test_case(&[("a", Some((30, 40)))], &[Some((10, 20))], &["a"] ; "entirely before")]
-    #[test_case::test_case(&[("a", Some((10, 20)))], &[], &["a"] ; "nothing uncertified to collide with")]
-    #[test_case::test_case(&[("a", Some((10, 20)))], &[Some((20, 30))], &[] ; "touching at a single microsecond is an overlap — Delta min/max are INCLUSIVE")]
-    #[test_case::test_case(&[("a", Some((10, 20)))], &[Some((5, 10))], &[] ; "touching on the low side")]
-    #[test_case::test_case(&[("a", Some((10, 20)))], &[Some((12, 15))], &[] ; "uncertified contained by the certified file")]
-    #[test_case::test_case(&[("a", Some((10, 20)))], &[Some((0, 99))], &[] ; "uncertified spanning it")]
-    #[test_case::test_case(&[("a", Some((10, 20)))], &[None], &[] ; "an uncertified file with no stats overlaps everything, so NOTHING skips")]
-    #[test_case::test_case(&[("a", None)], &[Some((30, 40))], &[] ; "a certified file with no stats has an unknown span")]
-    #[test_case::test_case(&[], &[Some((30, 40))], &[] ; "an empty certified set proves nothing")]
-    #[test_case::test_case(&[], &[], &[] ; "nothing at all still proves nothing")]
-    // THE case the per-file rule exists for: a churning partition where one new
-    // file sits among the certified ones. Judged by the certified set's UNION
-    // span every file would be refused; judged per file, only the genuine
-    // neighbour is.
-    #[test_case::test_case(&[("old", Some((10, 20))), ("mid", Some((45, 55))), ("new", Some((80, 90)))], &[Some((50, 60))], &["new", "old"] ; "only the overlapping certified file is held back")]
-    fn certified_files_skip_dedup_only_when_no_uncertified_file_could_hold_another_version(
-        certified: &[(&str, FileSpan)], uncertified: &[FileSpan], skippable: &[&str],
-    ) {
-        let mut got: Vec<&str> = skippable_certified_files(certified.iter().copied(), uncertified).into_iter().collect();
-        got.sort_unstable();
-        assert_eq!(got, skippable.to_vec());
-    }
-
     use datafusion::{
         arrow::{
             array::{Array, Int64Array, StringArray},

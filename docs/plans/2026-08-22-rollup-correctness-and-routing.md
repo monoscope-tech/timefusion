@@ -202,7 +202,7 @@ union would return both versions. Establishing a correct rule here (e.g. only
 files whose dedup-key ranges provably do not overlap the uncertified set) is
 the design work.
 
-### The rule, now established and tested (`read/mod.rs::skippable_certified_files`)
+### The rule, established and tested — reference implementation below
 
 > **A certified file may skip `DedupExec` iff no UNCERTIFIED file's timestamp
 > span overlaps its own.**
@@ -252,7 +252,54 @@ Two pieces:
    caller unions ABOVE `DedupExec` (`mod.rs:8085-8105`). The file-level version
    is the same shape with a file set in place of a date set.
 
-Neither is shipped here. The failure mode of getting the wiring wrong is a
+### The implementation, ready to drop in
+
+Written and its case table run green before being lifted out here: an unused
+`pub(crate)` function fails `cargo lint` (`-D dead-code`), and an `#[allow]` to
+hold it in the tree is exactly the evasion this repo's review skills exist to
+catch. It lands with the wiring, not before.
+
+```rust
+/// A file's row-timestamp span, as Delta add-action statistics report it.
+///
+/// `None` means the file carries no timestamp statistics. It is NOT "empty" and
+/// must never be treated as disjoint from anything.
+pub(crate) type FileSpan = Option<(i64, i64)>;
+
+pub(crate) fn skippable_certified_files<'a>(
+    certified: impl IntoIterator<Item = (&'a str, FileSpan)>, uncertified: &[FileSpan],
+) -> HashSet<&'a str> {
+    // One uncertified file without statistics has an unknown span, which
+    // overlaps everything, so nothing in the scan can skip.
+    if uncertified.iter().any(Option::is_none) {
+        return HashSet::new();
+    }
+    certified
+        .into_iter()
+        .filter(|(_, span)| span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi)))
+        .map(|(path, _)| path)
+        .collect()
+}
+```
+
+Its case table, all twelve green (`read::tests`):
+
+| certified | uncertified | skippable |
+|---|---|---|
+| `a(10,20)` | `(30,40)` | `a` |
+| `a(30,40)` | `(10,20)` | `a` |
+| `a(10,20)` | — | `a` |
+| `a(10,20)` | `(20,30)` | none — inclusive bounds touch |
+| `a(10,20)` | `(5,10)` | none — touching low |
+| `a(10,20)` | `(12,15)` | none — contained |
+| `a(10,20)` | `(0,99)` | none — spanning |
+| `a(10,20)` | `None` | none — unknown span overlaps everything |
+| `a(None)` | `(30,40)` | none — unknown certified span |
+| — | `(30,40)` | none — absence of evidence never grants |
+| — | — | none |
+| `old(10,20) mid(45,55) new(80,90)` | `(50,60)` | `old`, `new` — **the per-file win** |
+
+Neither piece is shipped here. The failure mode of getting the wiring wrong is a
 silent over-count on every dashboard tile, it cannot be validated on prod inside
 one session, and the rule above is the part that had to be settled first. When
 it is wired, ship it behind a default-off env switch and compare
