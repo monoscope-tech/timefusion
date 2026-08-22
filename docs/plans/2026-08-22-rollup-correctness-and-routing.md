@@ -383,3 +383,45 @@ declined.
 4. **§3b — WITHDRAWN**: already implemented (sealed work is newest-first).
 5. **§3a — additive certification.** Design first, and only after the
    soundness rule is established.
+
+## 6. Post-deploy state (2026-08-22 12:40 UTC, 7c73d19 live)
+
+**The fix is verified on prod.** The routed shape and its unroutable control now
+return byte-identical totals — 73 buckets, 7,293,464 rows each — where the same
+pair returned 4.43M against 7.29M before. Both currently decline as
+`not_built`: the tier is dark, exactly as §5 predicted, because no slice yet
+carries `TAG_SOURCE_ROWS` and the added digest measure changed every
+`generation_id`.
+
+**BLOCKING FOLLOW-UP, and it is NOT this change: the maintenance coordinator is
+stalled, and has been since ~09:30 UTC — about three hours before this deploy
+landed at 12:26.**
+
+Evidence, from the host:
+
+| file | last written | meaning |
+|---|---|---|
+| `.timefusion_meta/maintenance_tasks.json` | **09:30** | the journal is checkpointed on every claim/complete — nothing has been claimed for 3h |
+| `.timefusion_meta/rollup_invalidations.json` | 12:39 | the write path is alive and still invalidating |
+| `.timefusion_meta/dedup_dirty_bins.json` | 12:36 | enqueueing works |
+
+and from `timefusion_stats`: `tasks_running = 0` against `tasks_pending =
+12,684`, with **every** work counter at zero — not just rollup, but dedup,
+repair and packing too (`rollup_commit_actions_total`, `rollup_output_rows_total`,
+`rollup_scan_duration_ms_total` all 0 after 25 minutes of uptime). Meanwhile
+`dirty_bin_queue_depth = 16,791`, `pending_dedup = 5,638`, `pending_repair = 390`
+and `oldest_task_age_seconds = 523,750` (6 days).
+
+Work is being ENQUEUED and never CLAIMED. That is a coordinator-wide stall, it
+touches none of the code this change modifies, and it is dated three hours
+before the deploy.
+
+**Why it matters here anyway:** the tier can only come back when the
+coordinator rebuilds it. Until the stall is fixed, the dark period is
+indefinite rather than temporary, so dashboards stay on the raw path
+(~6-10 s at 3d) instead of recovering over the next few hours. The correctness
+fix is still the right trade — a slow right answer beats a fast wrong one — but
+the recovery half of the plan is blocked on this.
+
+**Do not "fix" it by reverting this change.** Reverting restores the 39%
+under-count and does not start the coordinator.
