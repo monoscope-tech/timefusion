@@ -828,6 +828,20 @@ pub struct TantivyConfig {
     /// This is an observability fix, not a throughput one.
     #[serde_inline_default(150)]
     pub timefusion_tantivy_backfill_max_files_per_pass: usize,
+    /// Percentage of each backfill pass reserved for the OLDEST uncovered files.
+    ///
+    /// Without it the pass is pure newest-first and the tail starves. Measured
+    /// on prod 2026-08-22 across three consecutive census samples: `week` and
+    /// `older` sat at 1723 and 3459 — frozen to within one file — while `today`
+    /// climbed 586 → 624 → 643. Today's partition alone held 624 uncovered files
+    /// against a 150-file cap, so no pass could ever reach yesterday, and flush
+    /// plus hot-tail compaction refill today faster than it drains. Throughput
+    /// cannot fix that ordering; only a reservation can.
+    ///
+    /// Carved OUT of the cap, never added to it, so pass cost is unchanged.
+    /// 0 restores pure newest-first.
+    #[serde_inline_default(33)]
+    pub timefusion_tantivy_backfill_tail_share_pct: u8,
     /// Row-selection pushdown: when the prefilter engages, files whose index
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
     /// reader decodes only matching rows. Off switch for instant rollback to

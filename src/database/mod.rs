@@ -2363,6 +2363,44 @@ fn sort_backfill_uris_newest_first(uris: &mut [String]) {
 
 type TantivyBackfillWork = (String, String, String); // project, relative parquet, absolute URI
 
+/// `fair_tantivy_backfill_work`, but reserving `tail_pct` of the pass for the
+/// OLDEST uncovered files instead of spending all of it on the newest.
+///
+/// Newest-first plus a per-pass cap starves the tail outright, and prod proved
+/// it rather than merely risking it (2026-08-22): the census breakdown held
+/// `week` and `older` at 1723/3459 across three consecutive samples — frozen to
+/// within one file — while `today` climbed 586 → 624 → 643. With a 150-file cap
+/// and 624 uncovered files in today's partition alone, a pass can never reach
+/// yesterday, and today's count is replenished continuously by flush and
+/// hot-tail compaction. More throughput just chases churn faster; only reserving
+/// part of the pass makes the 5,182-file backlog finite.
+///
+/// The tail is built by running the same fair round-robin over reversed queues,
+/// so oldest-first is fair across projects too — one deep-history project cannot
+/// own the whole reservation.
+fn fair_tantivy_backfill_work_split(queues: Vec<(String, VecDeque<(String, String)>)>, cap: usize, tail_pct: u8) -> Vec<TantivyBackfillWork> {
+    let tail_n = (cap > 0).then(|| cap * usize::from(tail_pct.min(100)) / 100).filter(|n| *n > 0);
+    let Some(tail_n) = tail_n else {
+        let mut work = fair_tantivy_backfill_work(queues);
+        if cap > 0 {
+            work.truncate(cap);
+        }
+        return work;
+    };
+    let oldest_first: Vec<_> = queues.iter().map(|(p, q)| (p.clone(), q.iter().rev().cloned().collect())).collect();
+    let mut work = fair_tantivy_backfill_work(queues);
+    // Head keeps the hot window converging; the reservation is carved out of the
+    // cap, never added to it, so the pass cost is unchanged.
+    let head_n = cap.saturating_sub(tail_n);
+    let tail: Vec<_> = {
+        let head_uris: HashSet<&str> = work.iter().take(head_n).map(|(_, _, uri)| uri.as_str()).collect();
+        fair_tantivy_backfill_work(oldest_first).into_iter().filter(|(_, _, uri)| !head_uris.contains(uri.as_str())).take(tail_n).collect()
+    };
+    work.truncate(head_n);
+    work.extend(tail);
+    work
+}
+
 /// A file's decoded contribution to a slice, scaled by the share of its time span the slice covers.
 ///
 /// Counting the whole file for any overlap made splitting a no-op. A narrow slice of a day-spanning
@@ -3312,12 +3350,10 @@ impl Database {
             // Bound the pass so the cron can run hourly. Fair round-robin
             // ordering means truncation drops the OLDEST round across every
             // project, never one project's whole queue.
-            let mut work = fair_tantivy_backfill_work(queues);
             let cap = self.config.tantivy.timefusion_tantivy_backfill_max_files_per_pass;
-            if cap > 0 && work.len() > cap {
-                deferred_total = deferred_total.saturating_add((work.len() - cap) as u64);
-                work.truncate(cap);
-            }
+            let available: usize = queues.iter().map(|(_, q)| q.len()).sum();
+            let work = fair_tantivy_backfill_work_split(queues, cap, self.config.tantivy.timefusion_tantivy_backfill_tail_share_pct);
+            deferred_total = deferred_total.saturating_add((available - work.len()) as u64);
             // Announce the pass BEFORE the first build, with what it will
             // attempt. `tantivy_backfill_pass` only prints at the very end, and
             // on this box a pass has never once reached it — so "planned" was
@@ -9319,6 +9355,43 @@ impl TableProvider for ProjectRoutingTable {
                         false => legs.truncate(1),
                     }
                 }
+                // Under a per-date split the deduped side can end up with NO legs
+                // while the certified side carries every row. Everything below
+                // indexes `plans[0]` and unions a non-empty vec, so the scan panics
+                // with `index out of bounds: the len is 0 but the index is 0`.
+                //
+                // Observed, not theorised: `a_certification_survives_a_restart_and
+                // _still_grants_the_skip` took this panic under full-suite load on
+                // 2026-08-22, where the sweep had time to reach the state. It is
+                // NOT date composition that empties the leg — a window date with no
+                // files for this project leaves the verdict `Granted`, which takes
+                // the whole-window skip instead. It is file-level pruning: the
+                // uncertified dates' files are all removed by the tantivy/bloom
+                // prefilter, which is the ordinary case for a selective point
+                // lookup. That is why there is no unit regression test here — a
+                // deterministic repro needs the prefilter to empty exactly one side
+                // of the split, and a test that passes with and without the guard
+                // would be false confidence.
+                //
+                // The certified legs need no dedup, only the projection debt that
+                // the `dedup_on == false` branch below pays.
+                if legs.is_empty() && !skip_legs.is_empty() {
+                    let projected = skip_legs
+                        .into_iter()
+                        .map(|leg| match &output_projection {
+                            Some(idxs) => Self::project_indices(leg, idxs),
+                            None => Ok(leg),
+                        })
+                        .collect::<DFResult<Vec<_>>>()?;
+                    let plan = match projected.len() {
+                        1 => projected.into_iter().next().expect("len checked"),
+                        _ => UnionExec::try_new(projected)? as Arc<dyn ExecutionPlan>,
+                    };
+                    return match &tombstone {
+                        Some(marker) => Self::filter_tombstones(plan, marker, tombstone_keep),
+                        None => Ok(plan),
+                    };
+                }
                 let leg_sortable: Vec<bool> = legs.iter().map(|(_, k)| k.sortable()).collect();
                 let legs: Vec<Arc<dyn ExecutionPlan>> = legs
                     .into_iter()
@@ -11253,6 +11326,28 @@ mod tests {
         assert!(uris[0].contains("date=2026-08-16") && uris[1].contains("date=2026-08-16"));
         assert!(uris[2].contains("date=2025-06-10"));
         assert!(uris[3].contains("date=2024-01-01"));
+    }
+
+    /// The tail must be REACHABLE, which pure newest-first plus a cap makes
+    /// impossible: prod held `week`/`older` frozen at 1723/3459 across three
+    /// census samples while `today` climbed, because today's 624 uncovered files
+    /// exceeded the 150-file cap on their own. Here the hot partition is 10 files
+    /// against a cap of 4 — newest-first alone can never emit the old one.
+    #[test]
+    fn tantivy_backfill_reserves_a_share_of_the_pass_for_the_oldest() {
+        let hot = (0..10).map(|i| (format!("rel/2026-08-22-{i}"), format!("uri/2026-08-22-{i}")));
+        let cold = std::iter::once(("rel/2026-01-01".to_string(), "uri/2026-01-01".to_string()));
+        let queues = || vec![("p".to_string(), hot.clone().chain(cold.clone()).collect::<VecDeque<_>>())];
+        let uris = |w: Vec<super::TantivyBackfillWork>| w.into_iter().map(|(_, _, uri)| uri).collect::<Vec<_>>();
+
+        let starved = uris(super::fair_tantivy_backfill_work_split(queues(), 4, 0));
+        assert!(!starved.contains(&"uri/2026-01-01".to_string()), "pure newest-first must starve the tail — otherwise this test proves nothing");
+
+        let split = uris(super::fair_tantivy_backfill_work_split(queues(), 4, 33));
+        assert_eq!(split.len(), 4, "the reservation is carved OUT of the cap, so pass cost is unchanged");
+        assert!(split.contains(&"uri/2026-01-01".to_string()), "the oldest uncovered file must be reachable, got {split:?}");
+        assert!(split.contains(&"uri/2026-08-22-0".to_string()), "the hot window must still converge");
+        assert_eq!(split.iter().collect::<HashSet<_>>().len(), split.len(), "a file must not be scheduled twice in one pass: {split:?}");
     }
 
     #[test]
