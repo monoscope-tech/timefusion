@@ -353,3 +353,56 @@ per-query search time, because it reconstructed totals as `avg * count` from the
 (`search_us_avg` by per-index `searches`, not by `queries`, which was not
 exposed at all). A mean cannot be differenced. The `*_us_total` rows exist
 because of this.
+
+## 2026-08-22: coverage does NOT converge — and the cap was never the constraint
+
+Measured over a 90-minute window on `576e1c3`, container up since 01:41 and
+uninterrupted across the 02:20 tick (the first clean pass of the night).
+`tantivy_coverage_census` computes the diff LIVE every 15 minutes (metadata-only
+Delta-live-files vs manifest-covered-files), so these are real measurements, not
+the pass-end gauge:
+
+| time | uncovered |
+|---|---|
+| 01:26 | 5557 |
+| 02:07 | 5607 |
+| 02:22 | 5646 |
+| 02:38 | 5668 |
+| 02:56 | 5684 |
+
+**+127 in 90 minutes (~85/hr) — including 36 minutes with an uninterrupted
+backfill pass in flight.** The 02:20 reconcile finished its GC phase in 9
+seconds and then ran for 40+ minutes without emitting `tantivy_backfill_pass`,
+without a failure warning, and without bending the curve.
+
+**Root cause, from the config's own comment:** `build_concurrency = 2`, and
+"each 1 GB parquet takes ~2-3 min to index". So a 150-file pass costs
+`150 x 2.5min / 2` = **~3 HOURS**, and the backfill's real build rate is
+**~48 files/hour** against **~133/hour gross accrual**. Coverage cannot
+converge at ANY cap, because the cap is never reached inside a tick — the
+binding constraint is build throughput, not pass bounding.
+
+**This corrects the premise of the cap change (400 -> 150).** The 150 was sized
+against a measured "~456 builds/hr", taken from the `cache_seeded` counter —
+but that counter also counts FLUSH publishes, which are ordinary ingest work,
+not backfill. So a number ~10x the true backfill rate was used to size a pass.
+This is the same proxy-metric trap as the `tantivy build produced N segments`
+WARN that undercounted by 20x, in the opposite direction: **before sizing
+anything from a counter, check what else increments it.** The cap change is
+harmless and its observability rationale still holds, but it cannot deliver
+convergence and should not be credited with it.
+
+**What would actually converge, in rough cost order:**
+1. **Reduce accrual.** ~133 uncovered files/hr are being created, largely by
+   compaction rewriting files whose indexes are then GC'd as stale. Indexing at
+   compaction time (the wave-reindex path already does this for some) removes
+   the work rather than racing it.
+2. **Raise `build_concurrency`** above 2. The comment says 2 is "safe alongside
+   prod query load", but the box now has the query path off the critical
+   section (blob fetches are 0, everything resident); this is worth re-testing.
+3. **Cheaper builds.** Seven "produced N segments (> 32); merging inline"
+   warnings in 45 minutes say some builds pay an inline merge on top.
+
+None of these were deployed — the measurement is the deliverable, and picking
+among them is a throughput decision that wants the `sim`/`run-unit` loop rather
+than another prod deploy at 03:00.
