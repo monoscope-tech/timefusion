@@ -708,3 +708,40 @@ indistinguishable for this entire investigation. Now exposed as
 each plausible, each cheap to act on, each wrong. The through-line is that every
 one was a mechanism *believed* to be on the hot path, and the counters kept
 showing the hot path was somewhere else entirely.
+
+## 2026-08-22: prefilter reach — 63% of attempts are thrown away
+
+With the counters finally reading the right registry (`b6d8c86`):
+
+| counter | value |
+|---|---|
+| `prefilter_attempts` | 35 |
+| `prefilter_used` | **13 (37%)** |
+| `prefilter_skipped` | **22 (63%)** |
+| `tantivy_split_raw` | 13 — exactly `prefilter_used` |
+| `tantivy_fastpath` | 0 |
+
+Two distinct problems, and neither is the one this plan spent the day chasing:
+
+1. **63% of prefilter attempts are skipped.** Those queries pay the full tantivy
+   fan-out — the manifest, the per-index searches, ~30-40 ms — and then discard
+   the result, falling back to the unrouted scan. That is pure loss, and it is
+   the largest single item left on the routed path. `decide_prefilter` has three
+   exits (`field_coverage_gap`, `low_selectivity`, `empty_index`) and **which
+   one fires is still not broken out** — that is the next counter to add, and it
+   is one line per exit.
+2. **Every use is a split.** `split_raw == prefilter_used == 13` with
+   `fastpath = 0`: when the prefilter IS applied, raw coverage debt forces two
+   scan providers, every single time.
+
+**This also corrects the negative result recorded above.** That section reported
+the mutable-gate narrowing as "did not move the number" partly on
+files-per-pruned-call being flat. But `pruned_calls = 139` against
+`prefilter_used = 13` shows pruned calls are dominated by traffic that has
+nothing to do with the tantivy prefilter (bloom-rejection paths), so a 13-call
+effect could never have shown up in that average. And the per-query scan timing,
+the better evidence, was taken on a probe query that may itself have been in the
+skipped 63%. **The narrowing's effect is therefore UNMEASURED, not measured-null.**
+It is still sound and still removes a provably dead gate; its benefit simply has
+not been established either way, and establishing it needs the skip-reason
+breakdown first.
