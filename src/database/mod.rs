@@ -7667,8 +7667,7 @@ impl ProjectRoutingTable {
         // where the un-prunable file mass lives. `exclude_files` is ignored
         // by `scan_delta_table` whenever an include set exists, so the split
         // path filters the live universe instead of passing excludes down.
-        let is_rejected =
-            |uri: &String| bloom_rejected.is_some_and(|r| crate::tantivy::search::parquet_rel_of_uri(uri).is_some_and(|rel| r.contains(rel)));
+        let is_rejected = |uri: &String| bloom_rejected.is_some_and(|r| crate::tantivy::search::parquet_rel_of_uri(uri).is_some_and(|rel| r.contains(rel)));
         // Full-URI exclude set for the single-provider paths (include=None,
         // so exclude semantics apply), merged with any zero-hit excludes.
         let merged_exclude = |table: &DeltaTable| -> Option<HashSet<String>> {
