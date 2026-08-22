@@ -2340,6 +2340,23 @@ pub struct MemoryConfig {
     // genuinely small, well-pruned history reads ungated.
     #[serde_inline_default(64)]
     pub timefusion_wide_scan_max_mb: u64,
+    /// Refuse a single scan that selects more than this many MB of compressed
+    /// parquet. **0 disables it**, which is the default — this rejects work the
+    /// server would otherwise attempt, so it is opt-in.
+    ///
+    /// The decode gate bounds how MANY wide scans run at once and never how much
+    /// any one of them decodes, so before this knob one query could select 32.8
+    /// GB (2026-08-18) and take the process with it. Measured 2026-08-22: while
+    /// a single 30-day aggregate ran, new connections timed out entirely — a
+    /// `SELECT 1` against `timefusion_stats` could not get in. That is an
+    /// availability failure caused by one query, and refusing it with a clear
+    /// error is strictly better for every other session than serving it.
+    ///
+    /// Set it above `WIDE_SCAN_OVERSIZE_BYTES` (1 GB, the observe-only warn
+    /// threshold) so the warning still precedes the refusal and the counter
+    /// shows how often the ceiling would bite before anyone turns it on.
+    #[serde_inline_default(0)]
+    pub timefusion_wide_scan_reject_mb: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
     /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
     /// set with room to spare. Each entry is one LogicalPlan (~KBs).

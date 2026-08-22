@@ -1271,6 +1271,7 @@ impl StatsTableProvider {
                     "provider_build_total" => provider_builds,
                     "provider_scan_us_avg" => avg(cv(PROVIDER_SCAN_US_TOTAL), provider_scans),
                     "provider_scan_total" => provider_scans,
+                    "wide_scan_rejected_total" => cv(WIDE_SCAN_REJECTED_TOTAL),
                     "bounded_otel_scan_candidates" => cv(BOUNDED_OTEL_SCAN_CANDIDATES),
                     "bounded_otel_scan_rejections" => cv(BOUNDED_OTEL_SCAN_REJECTIONS),
                     "wide_scan_oversize_total" => cv(WIDE_SCAN_OVERSIZE_TOTAL),

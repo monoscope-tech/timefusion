@@ -289,6 +289,7 @@ pub mod scan_metric_names {
     pub const BOUNDED_OTEL_SCAN_CANDIDATES: &str = "timefusion.scan.bounded_otel_scan_candidates";
     pub const BOUNDED_OTEL_SCAN_REJECTIONS: &str = "timefusion.scan.bounded_otel_scan_rejections";
     pub const WIDE_SCAN_OVERSIZE_TOTAL: &str = "timefusion.scan.wide_scan_oversize_total";
+    pub const WIDE_SCAN_REJECTED_TOTAL: &str = "timefusion.scan.wide_scan_rejected_total";
     pub const MEM_PLAN_US_TOTAL: &str = "timefusion.scan.mem_plan_us_total";
     pub const MEM_PLAN_TOTAL: &str = "timefusion.scan.mem_plan_total";
     pub const PGWIRE_TOTAL: &str = "timefusion.scan.pgwire_total";
@@ -8357,7 +8358,7 @@ impl ProjectRoutingTable {
         };
 
         let coerced = Self::coerce_plan_to_schema(delta_plan, &target_schema)?;
-        Ok(self.gate_if_wide(coerced, filters))
+        self.gate_if_wide(coerced, filters)
     }
 
     /// How far back a scan reaches (`now - min_ts`), in micros. `None` = no
@@ -8384,12 +8385,12 @@ impl ProjectRoutingTable {
     /// file's row groups are fully decoded — so its Parquet decoding draws from
     /// the shared `heavy_scan_sem`, bounding concurrent decode heap across all
     /// queries.
-    fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> Arc<dyn ExecutionPlan> {
+    fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> DFResult<Arc<dyn ExecutionPlan>> {
         let depth = self.scan_lookback_micros(filters);
         let deeper_than = |micros: i64| depth.is_none_or(|d| d > micros);
         let mem = &self.database.config.memory;
         if !deeper_than((mem.timefusion_wide_scan_lookback_hours as i64).saturating_mul(3_600_000_000)) {
-            return plan;
+            return Ok(plan);
         }
         // Depth is only a proxy for decode heap, and pruning breaks the proxy: a
         // deep query on a well-pruned partition selects one file and 8 KB, yet
@@ -8404,7 +8405,29 @@ impl ProjectRoutingTable {
             && files <= mem.timefusion_wide_scan_max_files
             && bytes <= mem.timefusion_wide_scan_max_mb.saturating_mul(1 << 20)
         {
-            return plan;
+            return Ok(plan);
+        }
+        // The admission guard proper, and the only one that bounds a SINGLE
+        // query. `bounded_otel_scan_reason` upstream checks the query's SHAPE —
+        // that it names a project and carries a lower bound — and a 30-day
+        // dashboard aggregate satisfies both while still selecting tens of GB,
+        // so nothing before this point can refuse it. Default 0 = off; see the
+        // config field for why refusing beats serving it.
+        if let Some((files, bytes, ceiling)) = wide_scan_rejection(selected, mem.timefusion_wide_scan_reject_mb) {
+            metrics::counter!(scan_metric_names::WIDE_SCAN_REJECTED_TOTAL).increment(1);
+            warn!(
+                event = "wide_scan_rejected",
+                table.name = %self.table_name,
+                selected_files = files,
+                selected_mb = bytes / (1 << 20),
+                ceiling_mb = ceiling / (1 << 20),
+                "refusing a scan larger than the per-query ceiling"
+            );
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "this query selects {} MB across {files} files, over the {} MB per-query scan ceiling; narrow the time window or add a more selective filter",
+                bytes / (1 << 20),
+                ceiling / (1 << 20)
+            )));
         }
         // Observation only, nothing is refused — see `wide_scan_oversize_total`.
         // The gate below bounds how MANY wide scans decode at once, never how
@@ -8428,13 +8451,13 @@ impl ProjectRoutingTable {
         // bypass gives up cache population and must NOT fire on a merely-widish
         // dashboard that will be re-read — hence its own, higher, knob.
         let bypass_cache = self.database.config.cache.cache_bypass_scan_micros().is_some_and(deeper_than);
-        Arc::new(GatedScanExec::new(
+        Ok(Arc::new(GatedScanExec::new(
             plan,
             self.database.heavy_scan_sem.clone(),
             Some(self.database.scan_metrics.clone()),
             bypass_cache,
             mem.timefusion_max_concurrent_scan_readers.max(1) as u32 * DECODE_UNITS_PER_READER,
-        ))
+        )))
     }
 
     /// Lead sort key that makes `DedupExec`'s keep-greatest engage.
@@ -8866,6 +8889,18 @@ fn decode_units(last_batch_bytes: u64) -> u32 {
         0 => DECODE_UNITS_PER_READER,
         b => (b.saturating_mul(k).div_ceil(NOMINAL_DECODE_BATCH_BYTES)).clamp(1, k) as u32,
     }
+}
+
+/// Ceiling math for the per-query scan refusal, separated for testability.
+/// Returns `(files, bytes, ceiling_bytes)` when the scan must be refused.
+///
+/// `reject_mb == 0` disables it, and that is the default: this refuses work the
+/// server would otherwise attempt, so it must be turned on deliberately. A scan
+/// whose file work could not be read (`None`) is never refused — absence of a
+/// measurement is not evidence of a large scan.
+fn wide_scan_rejection(selected: Option<(usize, u64)>, reject_mb: u64) -> Option<(usize, u64, u64)> {
+    let ceiling = reject_mb.checked_mul(1 << 20).filter(|ceiling| *ceiling > 0)?;
+    selected.filter(|(_, bytes)| *bytes > ceiling).map(|(files, bytes)| (files, bytes, ceiling))
 }
 
 /// Tier math for `scan_pressure_permits`, separated for testability.
@@ -16329,6 +16364,28 @@ mod tests {
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1);
         Ok(())
+    }
+
+    /// The per-query scan ceiling. `bounded_otel_scan_reason` checks a query's
+    /// SHAPE — a project filter and a lower bound — and a 30-day dashboard
+    /// aggregate satisfies both while selecting tens of GB, so nothing upstream
+    /// refuses it. Measured 2026-08-18: one scan selected 514 files / 32.8 GB.
+    /// Measured 2026-08-22: while such a scan ran, new connections timed out —
+    /// one query denying service to every other session.
+    #[test]
+    fn the_scan_ceiling_refuses_only_an_oversize_scan_and_only_when_enabled() {
+        let gb = 1024 * 1024 * 1024;
+        // Off by default: the ceiling must never bite unless someone set it.
+        assert_eq!(wide_scan_rejection(Some((514, 32 * gb)), 0), None, "0 disables the ceiling");
+        // Enabled and exceeded ⇒ refuse, reporting what it saw and the ceiling.
+        assert_eq!(wide_scan_rejection(Some((514, 32 * gb)), 8 * 1024), Some((514, 32 * gb, 8 * gb)));
+        // Under the ceiling ⇒ admitted. Boundary is strict: equal is not over.
+        assert_eq!(wide_scan_rejection(Some((10, 8 * gb)), 8 * 1024), None, "at the ceiling is not over it");
+        // An unreadable file list is not evidence of a large scan.
+        assert_eq!(wide_scan_rejection(None, 8 * 1024), None, "never refuse what was not measured");
+        // A ceiling so large it overflows the MB→byte multiply must disable the
+        // rule, not wrap around to a tiny ceiling that refuses everything.
+        assert_eq!(wide_scan_rejection(Some((1, 1)), u64::MAX), None, "an overflowing ceiling disables, never inverts");
     }
 
     /// `date = '…'` and `BETWEEN` bound a scan but are invisible to
