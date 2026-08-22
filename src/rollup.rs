@@ -1760,8 +1760,7 @@ async fn route_with_spec(
             // the NULL cell and the literal-'null' cell simply merge, exactly as
             // the raw rows do.
             other
-                if coalesced_column(other)
-                    .is_some_and(|(column, _)| column == "project_id" || spec.dimensions.iter().any(|dimension| dimension == column)) =>
+                if coalesced_column(other).is_some_and(|(column, _)| column == "project_id" || spec.dimensions.iter().any(|dimension| dimension == column)) =>
             {
                 let (column, fallback) = coalesced_column(other).ok_or(MissReason::UnsupportedShape)?;
                 format!("COALESCE({column}, {})", sql_literal(fallback))
