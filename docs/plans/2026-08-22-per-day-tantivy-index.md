@@ -322,3 +322,32 @@ the tail drains, lower it rather than reverting the concept.
 150-file pass says per-file indexing of the hot partition can never keep up, no
 matter how the pass is divided. That is the hot-tail half of this document, and
 it is now the load-bearing change — not an optimisation.
+
+### 14:13 — retract the "~220/hr" figure
+
+A third point lands and the headline number from this section does not survive:
+
+| time | total | today | week | older |
+|---|---|---|---|---|
+| 12:59 | 5868 | 686 | 1723 | 3459 |
+| 13:13 | 5920 | 741 | 1723 | 3456 |
+| 14:13 | 5954 | 775 | 1723 | **3456** |
+
+`13:13 -> 14:13` is **+34 over a full hour**, against the "~220/hr" derived
+above from the 14-minute 12:59->13:13 step. **A 14-minute interval is not a
+rate** — the same error this document twice catches other people making (the
+cap-bound `built=512`, the rate averaged across a restart), committed here by
+me. Neither figure is trustworthy: the hour-long span crosses the 13:40 and
+13:53 restarts, so it is contaminated in the other direction.
+
+**The honest state: there is still no reliable accrual rate for `today`.** What
+survives is the composition finding, which does not depend on a rate — `week`
+has not moved off 1723 in any sample today, and `older` has moved exactly once
+(-3, after the reservation shipped). The tail is still effectively frozen.
+
+This weakens, but does not overturn, the argument for the hot tail: it rested on
+"~220/hr against a 150-file pass", and that premise is now retracted. The
+argument that stands on measurement alone is the narrower one — newest-first
+ordering starves the tail, which three frozen samples establish without needing
+any rate at all. Anyone reaching for the hot-tail change should re-measure
+`today`'s accrual in a quiet window first, not cite the retracted number.
