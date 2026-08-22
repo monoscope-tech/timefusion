@@ -198,6 +198,14 @@ scans — `dedup_denied_never_certified_pct = 100.0` — so the raw arm does car
 duplicates, but 0.2% of them, not 39%). The dropped bucket really holds
 ~69k rows and the chart really shows nothing there.
 
+> **SUPERSEDED 2026-08-22 (same day).** The mechanism paragraph below is
+> WRONG — it is not the interior/fringe split, which is correct and
+> property-tested. The under-count comes from STALE SLICE CONTENT: all live
+> coverage is `rollup_slice_coverage`, whose plan-time loop has no staleness
+> guard at all, while the per-date map that does have one is dead code. The
+> measurements in this finding stand; only the attribution changes. See
+> `2026-08-22-rollup-correctness-and-routing.md` §1.
+
 **The mechanism is now identified.** Query either bucket *on its own*, as a
 one-hour window, and the correct value comes back:
 

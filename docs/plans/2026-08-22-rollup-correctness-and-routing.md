@@ -75,22 +75,47 @@ needs no file-identity agreement at all:
 > date, equals the source rows that date holds now — unless rows arrived
 > since, which is exactly the staleness we must refuse.
 
-Both sides are already available at plan time with no extra IO:
+**Both sides must be the SAME computation, or the check is worthless.** The
+decoded input row count a build sees is not add-action `num_records`:
+`num_records` counts tombstones and superseded merge-on-read versions, while
+every read plan carries `deleted IS DISTINCT FROM true` and the builder
+aggregates post-dedup rows. Those differ here — measured dup rate 0.2%, and
+tombstones exist. So the recorded quantity is **the date partition's
+`num_records` sum, computed exactly as `partition_stats_bounded` computes it**,
+snapshotted at build time. It is a witness of "what the partition looked like",
+not of "what the build ingested", and that is precisely what makes it
+comparable.
 
 1. `partition_stats_bounded` already reads `num_records` per add-action to
    build the fingerprint; `PartitionStats` (`mod.rs:1481`) just does not keep
    the sum. Adding `rows: i64` is free — same pass, same scan.
-2. The slice does not yet carry what it was built from. Add
-   `TAG_SOURCE_ROWS` alongside the five coverage tags already written at
-   `maintain.rs:1606-1613`, and a `source_rows` field on `RollupCoverage`,
-   populated in `recover_rollup_coverage` exactly like `source_fp`.
+2. The slice does not yet carry it. Add `TAG_SOURCE_ROWS` alongside the five
+   coverage tags at `maintain.rs:1606-1613`, and a `source_rows` field on
+   `RollupCoverage`, populated in `recover_rollup_coverage` like `source_fp`.
 
-Then in the slice loop: group the covered slices by date; **when the covered
-slices span the whole date, require `sum(source_rows) == date rows now`, and
-drop the date's slices to the raw fringe when they disagree.** Under-coverage
-is the only direction staleness can take (rows only accrue), so a strict
-equality on a fully covered day is exactly the signal, and dropping to raw is
-always the safe direction.
+**Semantics: all-must-agree, not sum-over-slices.** Slices of one day are
+built at different times against a churning partition, so per-slice snapshots
+of the *date* cannot be summed — summing them would be comparing a total
+against one sample. Instead: for each date, every covered slice must carry the
+same `source_rows`, and it must equal the date's current value. Any
+disagreement — between slices, or against now — drops that date's slices to
+the raw fringe.
+
+*(The alternative form, recording each slice's own selected-file row sum, was
+rejected: files whose timestamp range spans a slice boundary would be counted
+by both slices unless selection provably partitions files, which is not
+established.)*
+
+**The check is two-sided — strict equality, not `>=`.** "Rows only accrue" is
+false in this codebase: dedup rewrites and vacuum shrink `num_records` too.
+Any disagreement in either direction means the partition moved under the
+build, so any disagreement declines.
+
+**Do not substitute a read-style fingerprint for the row count.** A fingerprint
+folds file identity, so any bin-pack or compaction would void it and we would
+recreate the Finding-5 churn dynamics — coverage racing maintenance — inside
+the rollup tier. Row counts are invariant under bin-packing, which is exactly
+the tolerance this needs.
 
 Deliberate limitation, stated rather than hidden: a date whose slices cover
 only PART of the day cannot be checked this way, because the uncovered hours
@@ -178,6 +203,18 @@ files whose dedup-key ranges provably do not overlap the uncertified set) is
 the design work. **Do not implement before that rule is written down and
 tested.**
 
+*Candidate rule to evaluate (not yet a verdict).* The dedup key is
+`[timestamp, id]`, and per-file timestamp min/max already exists in add-action
+stats. So "no key spans the split" may reduce to: **a certified file may skip
+dedup iff no uncertified file's timestamp range overlaps it.** MoR re-appends
+preserve the original row's timestamp (`write/mod.rs:1104` — the same fact the
+per-date skip rests on), so any late version of a certified row necessarily
+lands in an overlapping range and correctly pulls that certified file back
+into dedup. This is computable at plan time from statistics already in hand,
+with no IO — which would turn §3a from an open design task into a tractable
+one. Evaluate it properly (including the no-stats and sentinel-range cases,
+which must fail closed) before building on it.
+
 **3b. Bias sweep ordering to the newest ~7 days.** Cheap, immediate, partial.
 Behind an env kill switch. It fights churn rather than escaping it and
 competes with the sealed backlog for the same workers, so it is relief.
@@ -200,6 +237,25 @@ declined.
 1. **§1 — slice-coverage source-row guard + delete dead `rollup_coverage`.**
    Correctness. Ships alone. Failing test first: a slice whose source gained
    rows after the build must not be served.
+
+   **The test must inject the staleness out-of-band.** Writing rows through the
+   normal path calls `invalidate_rollup_hours`, which purges exactly the slices
+   under test — the leak cannot be reproduced that way. Append to the source
+   Delta table directly, or re-insert the slice-coverage entry after the write,
+   to recreate the leaked state.
+
+   **The `rollup_coverage` deletion cascades**: `ticket.dates`, the date arm of
+   `rollup_ticket_current` (`mod.rs:3603-3617`) and `rollup_source_fingerprint`'s
+   only caller all go with it. The diff grows; keep it in the one commit so a
+   single change tells the whole story.
+
+   **Deploy expectation, stated up front: the tier goes dark until rebuilds
+   attach the tag.** Slices written before `TAG_SOURCE_ROWS` exists cannot be
+   verified and therefore decline, so `thrpt` — the one currently-fast chart —
+   regresses to raw (~6-10 s at 3d on today's measurements) until the
+   coordinator republishes. That is the correct trade (a slow right answer over
+   a fast wrong one), but check the republish cadence before pushing so the
+   duration of "dark" is known rather than discovered.
 2. **§2a + §2b — extract-epoch unwrap and the unfiltered digest.** Only after
    1, because both increase the share of traffic the tier answers.
 3. **§2c — COALESCE unwrap**, after its equivalence test.
