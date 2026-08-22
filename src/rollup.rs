@@ -2286,6 +2286,28 @@ mod tests {
         route.sql(&[("project".into(), "1970-01-01".into(), "generation".into())], &[interior], &ProjectSplit::default())
     }
 
+    /// The latency panel percentiles EVERY span, but the only declared tdigest
+    /// carried the `server` filter, so even with the group-by fixed the query
+    /// declined as `missing_measure` and scanned raw (2026-08-22: 3,420 ms with
+    /// the group-by lifted, 278 ms once an unfiltered digest existed).
+    ///
+    /// Adding a measure changes `generation_id` — it hashes the whole spec — so
+    /// every pre-existing cell becomes unreadable and the tier rebuilds rather
+    /// than serving NULL digests as zeroed percentiles.
+    #[tokio::test]
+    async fn an_unfiltered_percentile_routes_to_the_unfiltered_digest() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
+        );
+        let route = route_for(&state, &sql).await.expect("match percentile").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("duration_digest"), "the unfiltered digest must answer it: {generated}");
+        assert!(!generated.contains("server_duration_digest"), "the server-filtered digest must NOT answer an unfiltered percentile: {generated}");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
     /// THE shape monoscope's charts actually emit — `extract(epoch from
     /// time_bucket(...))::integer` — which declined as `unsupported_shape` and
     /// sent every percentile and grouped panel to a raw scan. 2026-08-22 A/B on

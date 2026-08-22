@@ -430,6 +430,7 @@ rollups:
       - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
       - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
       - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+      - { name: duration_digest, agg: tdigest, column: duration }
   # Coarse tier for wide windows. The matcher picks the coarsest grain that
   # divides the requested bucket width, so a 30-day chart (1d/6h buckets)
   # reads this and a 5-minute chart still reads the 1m tier. Derived from
@@ -455,3 +456,4 @@ rollups:
          - { name: server_error_scope_count, agg: count, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
          - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
          - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
+         - { name: duration_digest, agg: tdigest, column: duration }
