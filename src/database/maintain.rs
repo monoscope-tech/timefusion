@@ -1867,8 +1867,8 @@ impl Database {
             self.swap_and_refresh_cache(&target_ref, table, None, &[&format!("date={date}")]).await;
             if retiring > 0 {
                 crate::observability::maintenance_stats().rollup_tier_untagged_retired.fetch_add(retiring, Relaxed);
-                if leaves_partition_clean {
-                    self.journal().clear_untagged_cell(&key.source, &key.physical_table, &key.project_id, &date_string);
+                if leaves_partition_clean && self.journal().clear_untagged_cell(&key.source, &key.physical_table, &key.project_id, &date_string) {
+                    self.persist_untagged_cells();
                 }
                 warn!(
                     table = %key.physical_table, project_id = %key.project_id, date = %date_string, retired = retiring,
@@ -2668,11 +2668,29 @@ impl Database {
     /// Self-limiting — the set is read from the log each recovery, so it shrinks
     /// as partitions are repaired and reaches zero. `rollup_tier_untagged_found`
     /// is the gauge that says whether it is converging.
+    /// Write the damage set through to its sidecar. Best-effort by design: a
+    /// lost or stale file costs one mis-ranked claim, never correctness, because
+    /// recovery replaces each tier's slice and a clean publish clears its cell.
+    fn persist_untagged_cells(&self) {
+        let cells = self
+            .journal()
+            .untagged_cells()
+            .map(|(source, project_id, table_name, date)| crate::storage::StoredUntaggedCell {
+                source: source.clone(),
+                project_id: project_id.clone(),
+                table_name: table_name.clone(),
+                date: date.clone(),
+            })
+            .collect::<Vec<_>>();
+        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::UNTAGGED_CELLS, &cells);
+    }
+
     fn enqueue_untagged_rebuilds(&self, source: &str, spec: &crate::schema::RollupSpec, target: &str, partitions: &UntaggedPartitions) {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, MIN_SLICE_MICROS, Operation, TaskKey, TimeSlice};
         // Published before the empty check, so a tier that has just converged
         // CLEARS its cells instead of ranking a clean partition forever.
         self.journal().set_untagged_cells(source, target, partitions.keys().cloned());
+        self.persist_untagged_cells();
         if partitions.is_empty() {
             return;
         }

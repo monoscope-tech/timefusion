@@ -1159,6 +1159,27 @@ impl TaskJournal {
         self.untagged_cells.len()
     }
 
+    /// Seed the set from the sidecar at boot, so the damage rank is live from
+    /// the first claim instead of from the first recovery pass ~40 minutes in.
+    ///
+    /// The repair UNITS were already durable — they live in this journal — but
+    /// their priority was not. Prod 2026-08-23 restarted four times in one hour,
+    /// so the rank was never once active and queued repairs drained at the slow
+    /// unprioritised rate.
+    ///
+    /// Additive, and safe if stale: `set_untagged_cells` replaces its own tier's
+    /// slice on the next recovery, and a publish that leaves a partition clean
+    /// clears its cell. A stale entry costs one mis-ranked claim, never
+    /// correctness.
+    pub fn restore_untagged_cells(&mut self, cells: impl IntoIterator<Item = (String, String, String, String)>) {
+        self.untagged_cells.extend(cells);
+    }
+
+    /// Every cell currently ranked as damaged, for persisting.
+    pub fn untagged_cells(&self) -> impl Iterator<Item = &(String, String, String, String)> {
+        self.untagged_cells.iter()
+    }
+
     /// Forget one cell, for a publish that has just left the partition clean.
     ///
     /// `recover_rollup_coverage` is the only producer and it runs ONCE at
@@ -3632,6 +3653,38 @@ mod tests {
             journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
             "damaged",
             "a ten-minute damage repair must outrank a day-wide backfill hole"
+        );
+    }
+
+    /// A restored cell ranks exactly like a freshly discovered one.
+    ///
+    /// The repair units are durable in this journal; their PRIORITY was not,
+    /// and prod restarted four times an hour on 2026-08-23, so the rank was
+    /// never active. `restore_untagged_cells` is what closes that, and it is
+    /// only worth anything if the restored entries rank identically.
+    #[test]
+    fn a_restored_untagged_cell_ranks_like_a_discovered_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut damaged = task("zzz-damaged", 35 * DAY, 35 * DAY + 600_000_000, Operation::BaseRollup);
+        damaged.key.physical_table = "rollup_1m".to_owned();
+        damaged.deadline_micros = 0;
+        damaged.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        let mut clean = task("aaa-clean", 20 * DAY, 21 * DAY, Operation::BaseRollup);
+        clean.key.physical_table = "rollup_1m".to_owned();
+        clean.deadline_micros = 0;
+        clean.created_unix_ms = damaged.created_unix_ms;
+        journal.upsert(damaged);
+        journal.upsert(clean);
+        // Restored from the sidecar rather than set by a recovery pass.
+        journal.restore_untagged_cells([("source".to_owned(), "zzz-damaged".to_owned(), "rollup_1m".to_owned(), "1970-02-05".to_owned())]);
+        assert_eq!(journal.untagged_cells().count(), 1, "the restored cell must be readable back for persisting");
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
+            "zzz-damaged",
+            "a cell restored from the sidecar must carry the damage rank, or a restart un-prioritises the repair"
         );
     }
 

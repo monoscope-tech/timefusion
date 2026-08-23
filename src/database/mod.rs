@@ -2817,6 +2817,19 @@ impl Database {
             maintenance_tasks.checkpoint()?;
             info!(requeued_tasks, event = "maintenance_tasks_requeued");
         }
+        // The repair UNITS survive a restart in the journal above; their
+        // PRIORITY did not. `claim_next` ranks damage from a runtime set that
+        // only `recover_rollup_coverage` fills, ~40 minutes after boot — and
+        // prod restarted four times in one hour on 2026-08-23, so the rank was
+        // never once active while the repairs it exists to accelerate sat in the
+        // queue.
+        {
+            let restored = crate::storage::load_sidecar::<crate::storage::StoredUntaggedCell>(&cfg.core.timefusion_data_dir, crate::storage::UNTAGGED_CELLS);
+            if !restored.is_empty() {
+                info!(cells = restored.len(), event = "rollup_untagged_cells_restored");
+                maintenance_tasks.restore_untagged_cells(restored.into_iter().map(|cell| (cell.source, cell.project_id, cell.table_name, cell.date)));
+            }
+        }
         for entry in crate::rollup_journal::load(&cfg.core.timefusion_data_dir) {
             let key = (entry.project_id, entry.source, entry.date);
             rollup_source_epochs.insert(key.clone(), entry.epoch);

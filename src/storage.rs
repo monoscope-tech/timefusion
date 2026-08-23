@@ -3555,6 +3555,23 @@ pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&s
 /// Sidecar file names, paired with the label their warnings use.
 pub const CERTIFICATIONS: (&str, &str) = ("dedup_certifications.json", "certification store");
 pub const SLICE_COVERAGE: (&str, &str) = ("dedup_slice_coverage.json", "slice coverage store");
+pub const UNTAGGED_CELLS: (&str, &str) = ("rollup_untagged_cells.json", "untagged tier cell store");
+
+/// A `(source, project, tier table, date)` partition holding tier files with no
+/// identity tags, persisted so the DAMAGE RANK survives a restart.
+///
+/// The repair units themselves are already durable — they live in the task
+/// journal — but their priority was not: `claim_next` reads a runtime set that
+/// only `recover_rollup_coverage` fills, and that runs ~40 minutes after boot.
+/// Prod 2026-08-23 restarted four times in one hour, so the rank was never once
+/// active and the queued repairs drained at the slow unprioritised rate.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StoredUntaggedCell {
+    pub source: String,
+    pub project_id: String,
+    pub table_name: String,
+    pub date: String,
+}
 
 /// One partition's accumulated clean-slice intervals, persisted write-through so
 /// certification evidence survives the restarts that the journal's Complete
