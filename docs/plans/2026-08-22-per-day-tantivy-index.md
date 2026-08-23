@@ -1830,3 +1830,42 @@ The two open questions, in order: whether `skip_today` should apply to tables
 whose writes land in today's partition continuously, and why the fair-split's
 reserved tail share is not translating into `older` progress now that passes are
 16x larger.
+
+## 23:55 — `week` drains at ~233/hr, `older` is at equilibrium, and the count cap is binding again
+
+| time | today | week | older | sealed |
+|---|---|---|---|---|
+| 19:24 | 686 | 2026 | 4061 | 6087 |
+| 21:18 | 1247 | 1635 | 4057 | 5692 |
+| 21:27 | 1276 | 1636 | 4080 | 5716 |
+| 21:42 | 1355 | **1490** | 4063 | 5553 |
+
+The split is now sharp enough to name:
+
+- **`week`: 2026 -> 1490 in 2.3 hours, ~-233/hr.** Monotone apart from one flat
+  interval. Nothing writes into 1-7-day-old partitions except rewrites, so this
+  tier has almost no inflow and the drain shows up undiluted.
+- **`older`: 4061 -> 4063. Flat to within two files across 2.3 hours.**
+
+Flat is not the same as stuck, and the difference matters for what to do next.
+`older` is precisely where the rollup backfills write — historical date
+partitions, measured earlier at ~77/hr from `1m_v3` alone. A tier draining at
+roughly its inflow reads as motionless. **Equilibrium, not starvation** — which
+means the lever is throughput, not fairness, and fairness is already fixed.
+
+**And the count ceiling is binding again, exactly as it was at 8.** The first
+budgeted pass logged `planned=128 cap=128 planned_mb=29 budget_mb=2048`: it
+stopped on the *count*, having spent **1.4% of its byte budget**.
+
+So the cost model needs one correction I got wrong when I introduced the budget.
+For small files the cost is **per-file overhead, not bytes** — ~1.75s/build on
+rollup files, where 128 builds is ~29 MB. Bytes bound the whale case and cannot
+bound the many-small-files case; the two need different limiters, which is why
+keeping both is right and why the ceiling has to be sized against wall clock
+rather than left at a token value.
+
+`max_files_per_pass` 128 -> **320**: ~9 minutes at the measured rate, inside the
+~15-minute gap between prod restarts, with the byte budget still cutting a
+whale-heavy queue short. At 320/slot and four slots an hour that is ~1,280
+files/hr per table against ~77/hr of accrual — the first setting all day where
+drain exceeds inflow by an order of magnitude rather than trailing it.

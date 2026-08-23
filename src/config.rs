@@ -832,7 +832,14 @@ pub struct TantivyConfig {
     /// by two orders of magnitude in cost throttles the cheap tables to protect
     /// against the expensive one — which is exactly the rollup tables whose
     /// coverage had been frozen since 08-20.
-    #[serde_inline_default(128)]
+    /// Sized against WALL CLOCK, because for small files the cost is per-file
+    /// overhead rather than bytes: prod measured ~1.75s/build on rollup files,
+    /// and a pass at 128 stopped on this ceiling having spent 29 MB of a
+    /// 2048 MB budget — 98.6% unused, so the count was binding again exactly as
+    /// it was at 8. 320 x 1.75s is ~9 minutes, which fits inside the ~15-minute
+    /// gap between prod restarts; the byte budget still bounds the pass when the
+    /// queue holds spans whales instead.
+    #[serde_inline_default(320)]
     pub timefusion_tantivy_backfill_max_files_per_pass: usize,
     /// The real per-pass bound: total INPUT bytes a backfill pass will read.
     ///
@@ -2516,7 +2523,7 @@ mod tests {
         // in 14 seconds), and one count cap across populations differing by two
         // orders of magnitude throttled the cheap tables to protect the
         // expensive one. See the field's own comment.
-        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 128);
+        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 320);
 
         let derived = TantivyConfig::default();
         assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");
