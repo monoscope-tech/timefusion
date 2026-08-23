@@ -1355,3 +1355,45 @@ is a design decision — a rollup row is an aggregate, and a `text_match` on a
 low-cardinality dimension is a different proposition from one on `body` — and it
 is the user's call, not mine to make silently. The spans index, by contrast, is
 demonstrably load-bearing and should not be touched.
+
+## 16:55 — the rollup and metrics manifests have been FROZEN since 2026-08-20
+
+The manifest mtimes settle where the accrual comes from:
+
+| table | newest manifest write |
+|---|---|
+| otel_logs_and_spans | **today, 17:09** (continuous) |
+| otel_metrics | 2026-08-20 12:41 |
+| …rollup_dashboard_1m_v3 | 2026-08-20 00:59 |
+| …rollup_dashboard_1h_v2 | 2026-08-20 00:59 |
+
+Only the spans table is being indexed. **Every rollup and metrics file created
+since 2026-08-20 has been accumulating as uncovered** — which is exactly the
+`older` curve, at exactly the ~77/hr one rollup table commits, and it is why the
+spans-only drain could never catch up: it was never working on the same
+population that was growing.
+
+**And the reconcile that should service them has not run at all.** The cron loops
+over `indexed_tables()` and logs unconditionally per table — deliberately, per
+its own comment: *"a silent no-op arm made 'ran and found nothing'
+indistinguishable from 'never ran', and the cron not firing at all was the actual
+bug."* In the last **60 minutes**: `grep -c "tantivy reconcile"` = **0**.
+
+Checked and eliminated:
+- Schedule is `0 */15 * * * *` in the deployed tree `c7cd4bf` (serde default, and
+  a unit test asserts it), so this is not the old hourly-at-:20 gate.
+- No env override: `docker service inspect` shows no
+  `TIMEFUSION_TANTIVY_RECONCILE_SCHEDULE`, and the only tantivy-related env is
+  `RUST_LOG=…,tantivy=warn`, which silences the *crate*, not this
+  `timefusion::database` line.
+
+So the schedule is right, nothing overrides it, the process has been up ~35
+minutes, and the job has produced zero lines. The remaining candidates are that
+`db.tantivy_indexer()` returns `None` in this path (the early `return` before any
+logging is the one silent exit the job has), or that the cron is not registered
+at all. The flush path clearly *has* an indexer — 121 builds — but it holds its
+own reference, so that does not settle it.
+
+**This is the strongest open lead and it is upstream of everything else**: the
+start gate I believed I fixed this morning is still shut, just for a different
+reason than the schedule.
