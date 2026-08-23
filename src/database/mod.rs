@@ -3287,7 +3287,6 @@ impl Database {
         &self, svc: &crate::tantivy::search::TantivyIndexService, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, oversized: &mut u64,
         warn_skipped: bool,
     ) -> anyhow::Result<(HashMap<String, Vec<String>>, HashMap<String, u64>, Arc<dyn object_store::ObjectStore>)> {
-        
         let (uris, sizes, delta_store) = {
             let t = table_ref.read().await;
             let sizes: HashMap<String, u64> = match t.snapshot() {
