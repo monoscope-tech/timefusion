@@ -3663,8 +3663,7 @@ impl Database {
             // Comparing the whole partition is the safe direction: a day still
             // being written moves its fingerprint and is refused, which costs a
             // raw scan rather than serving a stale aggregate.
-            Self::partition_stats_bounded(&table, tiebreak_of(&route.source), &|_, _| i64::MAX)
-            .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
+            Self::partition_stats_bounded(&table, tiebreak_of(&route.source), &|_, _| i64::MAX).map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         // Pinned: the one project. Grouped: every project the SOURCE holds rows
         // for IN THIS WINDOW — from the source, never the tier, so a project
