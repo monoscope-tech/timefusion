@@ -226,3 +226,45 @@ redundant fixed cost.
   right order of magnitude, not a precise figure.
 - `complete` base_rollup is 3,000 of which 889 are sealed, consistent with the
   sealed share of drain being small but non-zero.
+
+## Lever 1 shipped and verified: the queue collapsed 85%
+
+`ac962ba` (partition-byte ceiling on the fusion price) reached prod at 17:2x.
+Measured immediately after:
+
+```
+                      before      after     change
+pending_base_rollup   12,460      1,861      -85%
+tasks_pending         22,499      5,086      -77%
+```
+
+From the journal, the part that matters:
+
+```
+sealed units          11,174        637
+sealed cells             458        424
+inflation              24.4x       1.5x
+sealed slice widths   1-10 min   {1440 min: 637}
+```
+
+**Every remaining sealed unit is exactly one day wide** — nothing narrower
+survives, which is the goal stated as "one unit per (project, date)". The 1.5x
+residual is cells carrying more than one tier/table, not shredding.
+
+### Why it took a ceiling rather than a smarter sum
+
+The concurrent session's `GroupPrice` was already the better mechanism: it
+charges members sharing an `InputFootprint` once, because they re-read the same
+row groups. But it prices only members that HAVE a footprint, and prod's entire
+backlog predates footprints — those members keep the old summed price and stay
+stuck. The ceiling covers exactly that legacy set: no unit over one partition can
+decode more than the partition holds, whatever produced its estimate. The two
+compose — footprint de-duplication for new work, the partition ceiling as the
+backstop for everything already queued.
+
+### What this does to the drain estimate
+
+637 sealed units instead of 11,174, and each now does a day in ONE scan instead
+of ~24.6 redundant ones. The earlier projection of ~124 hours for the sealed
+cells no longer applies; the remaining work is a few hundred units, not five
+figures.
