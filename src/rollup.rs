@@ -826,6 +826,43 @@ pub(crate) fn uncovered_gaps(untagged: &[(i64, i64)], tagged: &[(i64, i64)]) -> 
     crate::write::mem_buffer::merge_ranges(gaps)
 }
 
+/// The units `enqueue_untagged_rebuilds` should actually queue for one
+/// partition: gaps snapped to the claimable floor, then merged.
+///
+/// ALIGN, then merge — the order is the whole point. Merging raw gaps is not
+/// enough, because they come from row statistics: two holes either side of one
+/// file's last row are separated by MILLISECONDS, far too little to matter and
+/// far too much for `merge_ranges` to bridge. Snapped to `MIN_SLICE_MICROS`
+/// they become the same minute, and one unit instead of two overlapping ones.
+///
+/// Aligning first cannot swallow real coverage: no published slice is narrower
+/// than the floor.
+///
+/// Where a live tagged slice already CONTAINS a gap, that slice is queued
+/// instead. Publishing the contained span is refused by the `covered_by_wider`
+/// guard — two overlapping files would both stay live — which escalates to the
+/// covering slice and gets there in two hops instead of one.
+pub(crate) fn rebuild_slices(gaps: Vec<(i64, i64)>, tagged: &[(i64, i64)], day_start: i64, day_end: i64) -> Vec<(i64, i64)> {
+    let floor = crate::maintenance_coordinator::MIN_SLICE_MICROS;
+    let aligned = gaps
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let (start, end) = tagged
+                .iter()
+                .filter(|(covering_start, covering_end)| *covering_start <= start && *covering_end >= end)
+                .min_by_key(|(covering_start, covering_end)| covering_end - covering_start)
+                .copied()
+                .unwrap_or((start, end));
+            // Clamped to the partition: a slice that overran the day would
+            // select another partition's files.
+            let start = start.max(day_start).div_euclid(floor) * floor;
+            let end = end.min(day_end).saturating_add(floor - 1).div_euclid(floor) * floor;
+            (end > start).then_some((start.max(day_start), end.min(day_end)))
+        })
+        .collect();
+    crate::write::mem_buffer::merge_ranges(aligned)
+}
+
 /// A slice covering exactly one UTC calendar day — the partition granularity.
 const fn spans_whole_day(start: i64, end: i64) -> bool {
     start.rem_euclid(crate::maintenance_coordinator::DAY_MICROS) == 0 && end.saturating_sub(start) == crate::maintenance_coordinator::DAY_MICROS
@@ -2156,6 +2193,34 @@ mod tests {
             vec![(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 3 * HOUR)],
             "a real separation must NOT be merged away"
         );
+    }
+
+    /// Merging raw gaps is not enough on real data, which is why
+    /// `rebuild_slices` aligns FIRST.
+    ///
+    /// Gaps come from row statistics, so two holes either side of one file's
+    /// last row are separated by milliseconds — `merge_ranges` cannot bridge
+    /// that, and minute-aligning afterwards turns them into two OVERLAPPING
+    /// units. Aligning first makes them the same minute, and one unit.
+    #[test]
+    fn rebuild_slices_aligns_before_merging_so_a_sub_minute_separation_is_one_unit() {
+        const DAY: i64 = 86_400_000_000;
+        let floor = crate::maintenance_coordinator::MIN_SLICE_MICROS;
+        let day_end = DAY + DAY;
+        let near = vec![(DAY, DAY + floor / 3), (DAY + floor / 3 + 247_000, DAY + floor / 2)];
+        assert_eq!(rebuild_slices(near.clone(), &[], DAY, day_end), vec![(DAY, DAY + floor)], "a 247ms separation is one minute of work");
+        // Merging without aligning is exactly what does not work.
+        assert_eq!(crate::write::mem_buffer::merge_ranges(near).len(), 2);
+        // A separation wider than the floor still yields two units, and a gap
+        // contained by a live tagged slice is queued as that slice.
+        assert_eq!(
+            rebuild_slices(vec![(DAY, DAY + floor), (DAY + 3 * floor, DAY + 4 * floor)], &[], DAY, day_end),
+            vec![(DAY, DAY + floor), (DAY + 3 * floor, DAY + 4 * floor)]
+        );
+        assert_eq!(rebuild_slices(vec![(DAY + floor, DAY + 2 * floor)], &[(DAY, DAY + 9 * floor)], DAY, day_end), vec![(DAY, DAY + 9 * floor)]);
+        // Clamped to the partition: an overrunning gap must not select another
+        // day's files.
+        assert_eq!(rebuild_slices(vec![(day_end - floor, day_end + 5 * floor)], &[], DAY, day_end), vec![(day_end - floor, day_end)]);
     }
 
     #[test]

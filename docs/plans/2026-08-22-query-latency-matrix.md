@@ -829,3 +829,26 @@ previous fix at the wrong mechanism.
 `fusion_charges_a_shared_file_set_once_and_disjoint_sets_twice` pins both
 directions, including that footprint equality is order-independent (a snapshot
 lists files in no fixed order).
+
+### Correction to FIX A: merging raw gaps is not enough
+
+Adjacent-gap merging as first written would mostly not have fired. Gaps come
+from row statistics, so two holes either side of one file's last row are
+separated by **milliseconds** — far too little to matter, far too much for
+`merge_ranges` to bridge. Minute-aligning afterwards then turned them into two
+*overlapping* `TaskKey`s: the shredding the fix targets, plus overlap for the
+subsume pass to clean up.
+
+`rollup::rebuild_slices` now does align → substitute-covering-slice → clamp →
+**merge**, in that order, and `rebuild_slices_aligns_before_merging_so_a_sub_minute_separation_is_one_unit`
+pins it with a 247 ms separation and asserts the raw-merge alternative still
+returns two. Aligning first cannot swallow real coverage: no published slice is
+narrower than `MIN_SLICE_MICROS`.
+
+### Backward compatibility, proven rather than assumed
+
+`timefusion sim` on the real 95,655-task prod journal (written before
+`MaintenanceTask.input` existed) loads and runs unchanged, and its coarsen
+figures are the old ones — `over_budget 456,374` against `fused 69`. That is the
+design, not a disappointment: footprint-less units price exactly as before, so
+**the migration, not the pricing rule, is what clears the legacy queue.**

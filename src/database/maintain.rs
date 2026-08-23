@@ -2768,7 +2768,7 @@ impl Database {
     }
 
     fn enqueue_untagged_rebuilds(&self, source: &str, spec: &crate::schema::RollupSpec, target: &str, partitions: &UntaggedPartitions) {
-        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, MIN_SLICE_MICROS, Operation, TaskKey, TimeSlice};
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
         // Published before the empty check, so a tier that has just converged
         // CLEARS its cells instead of ranking a clean partition forever.
         self.journal().set_untagged_cells(source, target, partitions.keys().cloned());
@@ -2798,26 +2798,8 @@ impl Database {
                     *gaps = crate::write::mem_buffer::merge_ranges(untagged.clone());
                 }
             });
-            for (start, end) in slices {
-                // Where a live tagged slice already CONTAINS this span, queue
-                // that slice instead. Publishing the contained span is refused
-                // by the `covered_by_wider` guard — two overlapping files would
-                // both stay live — which escalates to the covering slice and
-                // gets there in two hops instead of one. Same destination, half
-                // the work, and it skips a wasted claim on the busiest cells:
-                // most of what remained on 2026-08-22 was this shape.
-                let (start, end) = tagged
-                    .iter()
-                    .filter(|(covering_start, covering_end)| *covering_start <= start && *covering_end >= end)
-                    .min_by_key(|(covering_start, covering_end)| covering_end - covering_start)
-                    .copied()
-                    .unwrap_or((start, end));
-                // Minute-aligned and clamped to the partition: gaps come from
-                // row statistics, so they land anywhere, and a slice that
-                // overran the day would select another partition's files.
-                let start = start.max(day_start).div_euclid(MIN_SLICE_MICROS) * MIN_SLICE_MICROS;
-                let end = end.min(day_end).saturating_add(MIN_SLICE_MICROS - 1).div_euclid(MIN_SLICE_MICROS) * MIN_SLICE_MICROS;
-                let Ok(slice) = TimeSlice::new(start.max(day_start), end.min(day_end)) else { continue };
+            for (start, end) in crate::rollup::rebuild_slices(slices, tagged, day_start, day_end) {
+                let Ok(slice) = TimeSlice::new(start, end) else { continue };
                 let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice, operation };
                 journal.enqueue(key, now, MAX_DECODED_BYTES, created);
                 queued += 1;

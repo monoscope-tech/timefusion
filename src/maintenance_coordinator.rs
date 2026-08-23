@@ -360,7 +360,12 @@ pub struct Publication {
 /// Members naming the same [`InputFootprint`] are charged ONCE — they re-read
 /// the same row groups, so one wider unit does their work in one scan. Members
 /// with no footprint (older journals, planner-minted units) keep the old summed
-/// price, so this can only ever lower an estimate, never raise one.
+/// price.
+///
+/// This prices the fused unit at what it will actually READ, which is not
+/// always lower than the old sum: two members prorated at 100 each over a file
+/// set worth 400 now price at 400, because that is what one scan of the set
+/// costs and the sum under-stated it.
 #[derive(Default)]
 struct GroupPrice {
     /// Distinct footprints, each charged its unprorated whole-file cost.
