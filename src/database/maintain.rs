@@ -325,8 +325,26 @@ impl Database {
                 // Object storage agrees with the size-only policy: of 1,033
                 // partitions, 877 are already compliant and 108 sealed ones are
                 // genuinely out of policy — against 2,130 pending tasks.
-                let small = files.iter().filter(|file| file.size < small_target).collect::<Vec<_>>();
-                if small.len() >= 2 {
+                let mut small = files.iter().filter(|file| file.size < small_target).collect::<Vec<_>>();
+                // The policy must agree with what the PACKER can actually do.
+                // `select_coordinator_compaction_candidates` merges files whose
+                // SUM fits the target, so two files that are each under target
+                // but together exceed it are unmergeable — admitting them queues
+                // a unit that selects one file, retires nothing, and is re-minted
+                // 60s later forever.
+                //
+                // Prod 2026-08-23, straight off the funnel log:
+                //
+                //   SealedConsolidation dcad860a/2026-08-22
+                //     after_range_filter=2 under_target=2 selected=0
+                //
+                // Two files, both "small", nothing selectable. Cells of this
+                // shape were claimed every 30-60s for hours and never lost a
+                // file. Requiring the two SMALLEST to fit together is the same
+                // test the packer applies, so a queued unit can always do work.
+                small.sort_by_key(|file| file.size);
+                let mergeable = small.len() >= 2 && small[0].size.saturating_add(small[1].size) <= small_target;
+                if mergeable {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
                     let estimate = small.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
