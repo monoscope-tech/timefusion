@@ -2054,6 +2054,18 @@ impl Database {
             .map(|time| time.date_naive().to_string())
             .ok_or_else(|| anyhow::anyhow!("invalid compaction slice timestamp"))?;
         let date_marker = format!("date={date}/");
+        // Per-stage survivor counts. `run_coordinator_compaction_once` marks a
+        // unit COMPLETE when this returns empty and logs nothing, so a partition
+        // that is out of policy but selects no files is retired silently and
+        // re-minted 60s later — a treadmill that is invisible from every counter.
+        //
+        // Prod 2026-08-23: `SealedConsolidation` claimed units for
+        // `6297304f/2026-08-17` (275 files), `87576849/2026-08-19` (238) and
+        // `28f62f01/2026-08-18` (230) every 30-60s for ~45 minutes and not one
+        // file was retired. Two hypotheses were tried against that and one was
+        // shipped and refuted; the reason guessing was all that was available is
+        // that this function reports only its final length.
+        let (mut seen, mut after_date, mut after_project) = (0usize, 0usize, 0usize);
         let mut candidates = {
             let table = table_ref.read().await;
             table
@@ -2062,13 +2074,16 @@ impl Database {
                 .iter()
                 .filter_map(|file| {
                     let path = file.path();
+                    seen += 1;
                     if !path.contains(&date_marker) {
                         return None;
                     }
+                    after_date += 1;
                     let path_project = path_partition_value(&path, "project_id");
                     if path_project.is_some_and(|project| project != key.project_id) {
                         return None;
                     }
+                    after_project += 1;
                     let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), file.stats().as_deref());
                     if add.event_range.is_some_and(|(start, end)| start >= key.slice.end_micros || end < key.slice.start_micros) {
                         return None;
@@ -2077,6 +2092,7 @@ impl Database {
                 })
                 .collect::<Vec<_>>()
         };
+        let after_range = candidates.len();
         candidates.sort_by_key(|add| add.event_range.map_or(i64::MIN, |range| range.0));
         if key.operation == Operation::Repair {
             return Ok(candidates.into_iter().filter(|add| !self.repair_verified_sorted.contains(&add.path)).take(1).map(|add| add.path).collect());
@@ -2086,7 +2102,31 @@ impl Database {
             Operation::SealedConsolidation => COORDINATOR_SEALED_TARGET_BYTES,
             _ => return Ok(Vec::new()),
         };
-        Ok(select_coordinator_compaction_candidates(candidates, target))
+        let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
+        let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
+        let selected = select_coordinator_compaction_candidates(candidates, target);
+        // Only when the unit will do NOTHING, so this cannot become chatter: a
+        // selection of one file is a 1:1 rewrite and retires no files either.
+        if selected.len() < 2 {
+            let unsorted = unsorted_candidates;
+            info!(
+                operation = ?key.operation,
+                project_id = %key.project_id,
+                table = %key.physical_table,
+                date = %date,
+                snapshot_files = seen,
+                after_date_filter = after_date,
+                after_project_filter = after_project,
+                after_range_filter = after_range,
+                unsorted_candidates = unsorted,
+                under_target = under_target_candidates,
+                selected = selected.len(),
+                target,
+                event = "compaction_unit_selected_nothing",
+                "a compaction unit selected fewer than two files and will retire none"
+            );
+        }
+        Ok(selected)
     }
 
     async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
