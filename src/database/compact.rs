@@ -32,6 +32,10 @@ impl Database {
         // Snapshot the current live file set once: drives both the ZOrder
         // idempotence guard (below) and PR #39's warm/evict (`pre_uris`).
         let all_uris: Vec<String> = file_uris(&table_clone);
+        // Version of the snapshot `all_uris`/`pre_uris` describe. The tantivy
+        // carry-forward below is only sound when the optimize commit is the ONLY
+        // commit since it — see the `sole_commit` check.
+        let pre_version = table_clone.version();
         let table_url = table_clone.table_url().to_string();
         let current = Self::filesets_for_dates(&all_uris, &window_dates);
 
@@ -179,6 +183,16 @@ impl Database {
                 // Swap the optimized table in and refresh the cache (warm
                 // newly-added files, evict tombstoned ones). Returns the new
                 // live file URIs for the tantivy GC hook below.
+                // `added` below is `live_uris - pre_uris`, i.e. everything that
+                // appeared while optimize ran — NOT necessarily what optimize
+                // wrote. Optimize holds a 10-minute commit interval and retries
+                // on OCC conflict, so a flush can land its own parquet in that
+                // window. Carrying coverage forward onto such a file would mark
+                // it covered when no index has seen its rows: a FALSE NEGATIVE,
+                // the one failure the read path cannot tolerate. Exactly one
+                // version of movement proves the optimize commit is the only
+                // one, and `added` is therefore exactly its output.
+                let sole_commit = matches!((pre_version, new_table.version()), (Some(before), Some(after)) if after == before + 1);
                 let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &[]).await;
                 // Tantivy compaction reindex + GC. Order matters: build
                 // indexes for the compaction's OUTPUT files first, then GC the
@@ -217,7 +231,7 @@ impl Database {
                     // this needs — asking the manifest again per file would cost
                     // one 745 KB load each to learn what the call already knew.
                     let mut carried: HashSet<String> = HashSet::new();
-                    for (pid, removed) in &removed_by_pid {
+                    for (pid, removed) in removed_by_pid.iter().filter(|_| sole_commit) {
                         let for_pid: Vec<String> = added.iter().filter(|(p, _, _)| p == pid).map(|(_, _, uri)| uri.clone()).collect();
                         match svc.carry_forward_after_compaction(table_name, pid, removed, &for_pid).await {
                             Ok(true) => carried.extend(for_pid),

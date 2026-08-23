@@ -1627,7 +1627,11 @@ async fn tantivy_backfill_skips_todays_partition_but_the_census_still_counts_it(
     let svc = Arc::new(TantivyIndexService::new(store, Arc::new(cfg.tantivy.clone())));
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let ts = (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
+    // Must land in TODAY's partition whatever the hour: `now - 2h` falls into
+    // YESTERDAY between 00:00 and 02:00 UTC, which is not skipped, and the test
+    // would fail for two hours a day.
+    let now = chrono::Utc::now();
+    let ts = (now - chrono::Duration::hours(2)).max(now.date_naive().and_hms_opt(0, 0, 1).unwrap().and_utc()).timestamp_micros();
     db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![test_span_ts("hot", "n", &project_id, ts)])?], true, None).await?;
 
     let (uncovered, _, _) = db.tantivy_coverage_census().await?;

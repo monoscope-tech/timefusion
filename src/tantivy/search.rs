@@ -1316,7 +1316,11 @@ impl TantivyIndexService {
             return Ok(false);
         }
         let applied = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
-            let usable = |e: &ManifestEntry| e.index.is_some() && e.error.is_none();
+            // EXACTLY the reader's usability predicate, schema_version included.
+            // An entry the reader filters out cannot be evidence that an input
+            // is covered: it would vouch for a file at carry-forward time and be
+            // invisible at query time, which is a false negative.
+            let usable = |e: &ManifestEntry| e.index.is_some() && e.error.is_none() && e.schema_version == SCHEMA_VERSION;
             let covered: HashSet<&str> = m.entries.values().filter(|e| usable(e)).flat_map(|e| e.covered_files.iter().map(String::as_str)).collect();
             if !removed.iter().all(|u| covered.contains(u.as_str())) {
                 return (false, false);

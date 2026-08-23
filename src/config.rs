@@ -851,13 +851,22 @@ pub struct TantivyConfig {
     /// frozen at ~1720/3453 — so a newest-first queue spends the whole pass on
     /// files that will not survive, and the 5,171-file backlog never moves.
     ///
-    /// Safe because today is already covered at birth by the paths that own it:
-    /// the flush callback publishes an index for the files each commit adds,
-    /// and both rewrite paths reindex their own output inline
-    /// (`compact.rs` post-optimize, `maintain.rs` `reindex_wave_outputs`). What
-    /// this skips is the RE-indexing of churn, not first coverage. A file that
-    /// slips through is covered tomorrow, when its partition is sealed and the
-    /// work lasts.
+    /// The flush callback still covers today's files at birth, so this is not
+    /// first coverage. **But be honest about the gap:** today's partition is
+    /// owned by `light_optimize_tail`, which has NO tantivy hook — only the full
+    /// `optimize_table` path reindexes (or now carries forward) its output. So a
+    /// hot-tail merge drops its inputs' coverage and the output stays uncovered
+    /// until the date rolls over and the backfill picks it up. That costs the
+    /// hottest query window its prefilter for up to a day: correctness is
+    /// unaffected (an uncovered file goes to the raw leg with the original
+    /// filters), latency is not.
+    ///
+    /// It is still the right trade while a build costs ~15 minutes and runs at
+    /// ~4/hr: spending the entire pass on files that will be rewritten within
+    /// hours is what kept the 5,171-file sealed backlog frozen all day. The
+    /// principled fix is to give `light_optimize_tail` the same carry-forward
+    /// hook `optimize_table` now has, which makes today cheap to cover instead
+    /// of skipped — do that and this flag can go back to false.
     ///
     /// Counted and logged as `skipped_today`, never silent, and the coverage
     /// census still counts today so the today/week/older breakdown stays
