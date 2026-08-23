@@ -603,6 +603,25 @@ Two further fixes, and the first already exists for one operation:
    what overran was WALL TIME — a day-sized slice with modest bytes still pays an
    object-store round trip per file."
 
+## The clean before/after for the producer
+
+The first post-deploy reading (936 full + 691 hybrid) was taken against a
+historical "always 0", which is a weak control — those zeros came from processes
+whose coverage map had not rebuilt. This is the honest baseline, measured
+2026-08-23 on `45b9ab4` (the reverted state) with coverage fully loaded:
+
+```
+rollup_min_contiguous_days = 30      <- coverage IS loaded
+rollup_hits_full_total     = 0
+rollup_hits_hybrid_total   = 2
+rollup_misses_total        = 136
+```
+
+So with slice coverage alone and a fully-warmed map, routing serves 2 of 138
+attempts. That is the number the re-landed producer (`82bb304`) has to beat, and
+comparing against it — rather than against a cold-start zero — is what makes the
+claim mean anything.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
