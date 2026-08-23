@@ -898,3 +898,35 @@ and sorting bin candidates by size breaks the `event_range` ordering that keeps
 output runs time-disjoint for range pruning.
 
 `sealed_hygiene_ranks_by_files_removed_not_by_date` pins all four properties.
+
+## #5 — `level` is a real filter shape, and it must NOT be added tonight
+
+The check the task asked for, done against monoscope's actual query surface
+rather than a dashboard inventory: queries are user-authored KQL compiled to
+SQL, and `level == "ERROR"` is canonical enough to appear three times in
+`src/Pkg/AI.hs`'s prompt examples and in `src/Pkg/LiveTail.hs`'s doctests. So
+the premise holds — `level` is not an incidental filter, and it is genuinely
+absent from the spec (`[resource___service___name, kind, status_code]`).
+Cardinality is 4. On the merits it should be a dimension.
+
+**The cost is the whole tier, and the timing is wrong.** `rollup::generation_id`
+hashes `format!("{spec:?}")` (src/rollup.rs:69) precisely so a measure added
+without a table-name bump cannot serve rows built under the old spec. Adding
+`level` therefore invalidates **every existing rollup file**, and the tier stays
+dark until 30 days rebuild. That would delete tonight's only measured win — the
+2.8x routed 7d group-by — for days, and it would do so at the exact moment the
+queue has just acquired its first working shrink mechanism. Two changes whose
+effects cannot be told apart is also how the last four measurements lied.
+
+**What makes it cheap, and is the real task.** Tag each rollup file with the
+dimension set it was built with, and let the router accept a file whose
+dimensions are a SUPERSET of what the query needs. Then a spec addition stops
+being invalidation: old files keep serving every query that does not filter on
+the new dimension, and new files serve both. `generation_id` would narrow to the
+things that genuinely change row semantics (measures, filters, grain) rather
+than the whole `Debug` of the spec. That is a self-contained change to the
+identity/routing pair and it converts #5 from a 30-day outage into an
+incremental rollout.
+
+Sequenced, not dropped: do the dimension-set tag first, then add `level` behind
+it.
