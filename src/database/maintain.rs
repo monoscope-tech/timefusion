@@ -2758,6 +2758,96 @@ impl Database {
         );
     }
 
+    /// How far a date is covered contiguously, starting from its first row.
+    ///
+    /// `None` when the spans leave a hole. The read path serves
+    /// `[day_start, covered_through)` from a date entry, so the answer must be a
+    /// run with no gap in it — a union that merely SPANS the day would claim
+    /// hours no build aggregated, which is the silent-wrong-number failure this
+    /// whole path is careful about.
+    ///
+    /// Anchored on the partition's earliest row rather than on midnight, for the
+    /// same reason the producer is: units are planned from row statistics, so a
+    /// day's first slice begins at its first row, and `[day_start, first_row)`
+    /// holds nothing a raw scan would find either.
+    fn contiguous_coverage_end(partition_min_ts: i64, spans: &mut [(i64, i64)]) -> Option<i64> {
+        spans.sort_unstable();
+        let (first_start, first_end) = *spans.first()?;
+        if first_start > partition_min_ts {
+            return None;
+        }
+        spans.iter().skip(1).try_fold(first_end, |cursor, &(start, end)| (start <= cursor).then(|| cursor.max(end)))
+    }
+
+    /// Rebuild DATE-level coverage from the slices recovery just restored.
+    ///
+    /// Without this the date-level map is empty after every restart and refills
+    /// only as new units publish, so the second routing route — the one that does
+    /// NOT consult the per-slice witness — is unavailable exactly when the
+    /// process is youngest. Measured 2026-08-23: coverage takes ~25 minutes to
+    /// become usable while prod redeploys every ~15, so a 7d dashboard group-by
+    /// ran raw (8.98s, zero hits) on a 15-minute-old container while the same
+    /// query on a container that HAD stayed up routed in 3.7s.
+    ///
+    /// Soundness is the whole of this function. Stamping the CURRENT partition
+    /// fingerprint asserts the rollup is current, which recovery cannot know from
+    /// the tier alone — so it is proven first, using the row WITNESS the read
+    /// path already trusts: every slice of the date must carry a witness that
+    /// still equals the partition's live `num_records`. That pays the witness
+    /// check once at boot instead of on every query, and a date with even one
+    /// unverifiable slice is skipped rather than guessed at.
+    async fn recover_date_coverage(&self, source: &str, target: &str) {
+        let Ok(table_ref) = self.resolve_table("default", source).await else { return };
+        let stats = {
+            let table = table_ref.read().await;
+            match Self::partition_stats_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX) {
+                Ok(stats) => stats,
+                Err(_) => return,
+            }
+        };
+        let mut by_date: HashMap<(String, String), Vec<(i64, RollupCoverage)>> = HashMap::new();
+        for entry in self.rollup_slice_coverage.iter() {
+            let ((project, entry_source, entry_target, start, _), coverage) = (entry.key(), entry.value());
+            if entry_source != source || entry_target != target {
+                continue;
+            }
+            let Some(date) = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()) else { continue };
+            by_date.entry((project.clone(), date)).or_default().push((*start, coverage.clone()));
+        }
+        let mut recovered = 0u64;
+        for ((project, date), slices) in by_date {
+            let Some(partition) = stats.get(&(project.clone(), date.clone())).or_else(|| stats.get(&("default".to_string(), date.clone()))) else {
+                continue;
+            };
+            let Ok(current_rows) = u64::try_from(partition.rows) else { continue };
+            // Every slice must be verifiable AND agree. One unverifiable slice
+            // means the date cannot be proven current, and an unproven date must
+            // not be stamped — that is the difference between this and the
+            // `source_fp` fallback that had to be removed (7e5bb5a).
+            if !slices.iter().all(|(_, coverage)| coverage.source_rows == Some(current_rows)) {
+                continue;
+            }
+            let mut spans: Vec<(i64, i64)> = slices.iter().map(|(start, coverage)| (*start, coverage.covered_through)).collect();
+            let Some(covered_through) = Self::contiguous_coverage_end(partition.min_ts, &mut spans) else { continue };
+            let newest = slices.iter().map(|(_, coverage)| coverage).max_by_key(|coverage| coverage.covered_through).expect("non-empty");
+            self.rollup_coverage.insert(
+                (project.clone(), source.to_string(), target.to_string(), date.clone()),
+                RollupCoverage {
+                    source_fp: partition.fingerprint,
+                    source_epoch: self.rollup_source_epochs.get(&(project, source.to_string(), date)).map_or(0, |epoch| *epoch.value()),
+                    generation: newest.generation.clone(),
+                    rows: slices.iter().map(|(_, coverage)| coverage.rows).sum(),
+                    source_rows: Some(current_rows),
+                    covered_through,
+                },
+            );
+            recovered += 1;
+        }
+        if recovered != 0 {
+            info!(source, target, recovered, event = "rollup_date_coverage_recovered", "date-level coverage rebuilt from witnessed slices");
+        }
+    }
+
     /// Republish the slices whose coverage can never be verified.
     ///
     /// Same shape as `enqueue_untagged_rebuilds` and for the same reason: work the
@@ -2976,9 +3066,11 @@ impl Database {
                     recovered += 1;
                 }
                 self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
+                self.recover_date_coverage(source, &target).await;
                 continue;
             }
             self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
+            self.recover_date_coverage(source, &target).await;
             if !published.is_empty() {
                 continue;
             }
@@ -6404,5 +6496,33 @@ impl Database {
 
         info!("Database shutdown complete");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod date_coverage_recovery_tests {
+    use super::*;
+
+    /// The read path serves `[day_start, covered_through)` from a date entry, so
+    /// a hole anywhere in the run would claim hours no build aggregated. These
+    /// pin that a gap refuses outright rather than being papered over by taking
+    /// the maximum end — which a span-based union would silently do.
+    #[test]
+    fn a_gap_refuses_and_only_a_true_run_answers() {
+        let hour = 3_600_000_000i64;
+        // Contiguous from the first row: answers the end of the run.
+        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(hour, 2 * hour), (2 * hour, 5 * hour)]), Some(5 * hour));
+        // Overlapping slices are still a run.
+        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(hour, 3 * hour), (2 * hour, 4 * hour)]), Some(4 * hour));
+        // Out of order input is sorted, not rejected.
+        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(2 * hour, 5 * hour), (hour, 2 * hour)]), Some(5 * hour));
+        // A HOLE between 2h and 3h: refuse, do not answer 5h.
+        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(hour, 2 * hour), (3 * hour, 5 * hour)]), None);
+        // Coverage starts AFTER the partition's first row, so the opening rows
+        // were never aggregated — refuse.
+        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(2 * hour, 5 * hour)]), None);
+        // Starting at or before the first row is fine; the read path clamps.
+        assert_eq!(Database::contiguous_coverage_end(2 * hour, &mut [(hour, 5 * hour)]), Some(5 * hour));
+        assert_eq!(Database::contiguous_coverage_end(hour, &mut []), None);
     }
 }
