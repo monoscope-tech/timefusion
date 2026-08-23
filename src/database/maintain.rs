@@ -41,10 +41,21 @@ impl Database {
     ///
     /// Must be the bound stored with the coverage, never one recomputed here — for a day still
     /// being written the two would differ and invalidate good coverage every query.
-    pub(crate) async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str, bound: i64) -> Result<u64> {
+    /// The partition fingerprint the ticket re-check compares against
+    /// `coverage.source_fp`.
+    ///
+    /// UNBOUNDED, because `source_fp` is RECORDED unbounded — it is
+    /// `partition_identity.0`, taken from
+    /// `partition_stats_bounded(.., &|_, _| i64::MAX)` at publish time. Passing
+    /// the coverage's `covered_through` here recomputed a DIFFERENT fingerprint
+    /// over a smaller file set, so the re-check failed for every partition whose
+    /// bound excluded anything: the rewrite planned, the physical plan built,
+    /// and `rollup_ticket_current` then rejected it as `StaleCoverage` at the
+    /// last step. Same mismatch as the planning path, one site further on.
+    pub(crate) async fn rollup_source_fingerprint(&self, project_id: &str, source: &str, date: &str) -> Result<u64> {
         let table = self.resolve_table(project_id, source).await?;
         let table = table.read().await;
-        let mut fingerprints = Self::partition_fingerprints_bounded(&table, tiebreak_of(source), &|_, _| bound)?;
+        let mut fingerprints = Self::partition_fingerprints_bounded(&table, tiebreak_of(source), &|_, _| i64::MAX)?;
         Ok(fingerprints
             .remove(&(project_id.to_string(), date.to_string()))
             .or_else(|| fingerprints.remove(&("default".to_string(), date.to_string())))
@@ -1296,6 +1307,21 @@ impl Database {
             return Ok(true);
         }
 
+        // The witness must describe the RAW source partition, because that is
+        // what the read path verifies it against: `route.source` is the raw
+        // table for EVERY tier. A DERIVED unit reads its parent tier, so taking
+        // the witness from `from_table` states a fact about the wrong table and
+        // can never match.
+        let witness_table = match derived {
+            false => None,
+            true => match self.resolve_table(&key.project_id, &key.source).await {
+                Ok(table) => Some(table),
+                Err(error) => {
+                    retry(format!("resolve_witness_source: {error:#}"), std::time::Duration::from_secs(30))?;
+                    return Ok(true);
+                }
+            },
+        };
         let from_table = match self.resolve_table(&key.project_id, &from).await {
             Ok(table) => table,
             Err(error) => {
@@ -1321,6 +1347,11 @@ impl Database {
         let mut untagged_inputs = 0u64;
         let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_fp) = {
             let table = from_table.read().await;
+            let witness_guard = match &witness_table {
+                Some(table) => Some(table.read().await),
+                None => None,
+            };
+            let witness_source: &DeltaTable = witness_guard.as_deref().unwrap_or(&table);
             let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
             let date_string = date.to_string();
             // The witness the read path re-checks this slice against, AND the
@@ -1334,7 +1365,7 @@ impl Database {
             // it states what was true at build time rather than asserting
             // freshness after the fact — and if the partition moves afterwards
             // the read path sees a different fingerprint and refuses.
-            let partition_stats = Self::partition_stats_bounded(&table, tiebreak_of(&key.source), &|_, _| i64::MAX).ok().and_then(|mut stats| {
+            let partition_stats = Self::partition_stats_bounded(witness_source, tiebreak_of(&key.source), &|_, _| i64::MAX).ok().and_then(|mut stats| {
                 stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
             });
             let source_rows = partition_stats.map(|stats| stats.rows);

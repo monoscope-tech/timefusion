@@ -504,7 +504,10 @@ struct RollupCoverage {
 /// the build's, not something the re-check may recompute — see
 /// `RollupCoverage::covered_through`.
 pub(crate) struct RollupReadTicket {
-    dates: Vec<(RollupCoverageKey, u64, u64, String, i64)>,
+    /// No bound is carried: the fingerprint is recorded and re-checked over
+    /// the WHOLE partition, so a per-date bound here would only invite the two
+    /// sides to drift apart again.
+    dates: Vec<(RollupCoverageKey, u64, u64, String)>,
     slices: Vec<(RollupSliceCoverageKey, u64, String)>,
 }
 
@@ -3751,7 +3754,7 @@ impl Database {
                 }
                 covered.push((day_start, end));
                 generations.push((project.clone(), date.clone(), coverage.generation.clone()));
-                ticket.push((key, source_fp, source_epoch, coverage.generation.clone(), coverage.covered_through));
+                ticket.push((key, source_fp, source_epoch, coverage.generation.clone()));
             }
             // Slice coverage is the only live coverage, and until this guard it
             // was checked for project/source/target/overlap and nothing else —
@@ -3916,7 +3919,7 @@ impl Database {
     }
 
     pub(crate) async fn rollup_ticket_current(&self, ticket: &RollupReadTicket) -> bool {
-        for ((project_id, source, target, date), source_fp, source_epoch, generation, bound) in &ticket.dates {
+        for ((project_id, source, target, date), source_fp, source_epoch, generation) in &ticket.dates {
             if self
                 .rollup_coverage
                 .get(&(project_id.clone(), source.clone(), target.clone(), date.clone()))
@@ -3927,7 +3930,7 @@ impl Database {
             if self.rollup_source_epochs.get(&(project_id.clone(), source.clone(), date.clone())).map_or(0, |epoch| *epoch.value()) != *source_epoch {
                 return false;
             }
-            if self.rollup_source_fingerprint(project_id, source, date, *bound).await.map_or(true, |fingerprint| fingerprint != *source_fp) {
+            if self.rollup_source_fingerprint(project_id, source, date).await.map_or(true, |fingerprint| fingerprint != *source_fp) {
                 return false;
             }
         }
