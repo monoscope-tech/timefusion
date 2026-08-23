@@ -622,6 +622,33 @@ attempts. That is the number the re-landed producer (`82bb304`) has to beat, and
 comparing against it — rather than against a cold-start zero — is what makes the
 claim mean anything.
 
+## Why the producer underperforms its own result: coverage rebuilds slower than prod redeploys
+
+`recover_rollup_coverage` restores SLICE coverage at boot. It does NOT restore
+the DATE-level map — that is filled only by the producer at publish time. So
+after every restart the date-level route starts empty and refills as units
+publish.
+
+Measured 2026-08-23, and the two numbers do not fit together:
+
+- Coverage takes **~25 minutes** to become usable after a restart (three
+  observations).
+- Prod deploys landed **~15 minutes** apart: `45b9ab4` → `82bb304` → `e6315af`.
+
+So the window never opens. Verified directly rather than inferred: on a
+15-minute-old container with `rollup_min_contiguous_days = 0`, a 7d dashboard
+group-by ran **8.98 s and incremented hits by exactly zero**. It went raw.
+
+That is the honest caveat on the 936-full + 691-hybrid result — it was measured
+on a container that happened to stay up long enough. On a box redeploying faster
+than coverage rebuilds, the date-level route is empty most of the time.
+
+The fix is to rebuild the date-level map at boot from the tags recovery already
+reads, using the slice row-witness to prove currency once at boot rather than per
+query. Stamping the current partition fingerprint without that proof would assert
+freshness nobody established — which is the same trap the `source_fp` fallback
+fell into.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
