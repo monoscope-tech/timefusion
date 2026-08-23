@@ -823,3 +823,27 @@ number and this did within fourteen minutes.
 5,600-file standing backlog still needs draining at ~30/hr, and no
 `from_reserved_tail=true` build has ever completed. Carry-forward stops the hole
 getting deeper; it does not fill it.
+
+### 14:14 — the next census: confirmed as a bend, not as flatness
+
+| time | today | week | older |
+|---|---|---|---|
+| 13:45 | 467 | 2035 | 3742 |
+| 13:59 | 473 | 2035 | 3742 |
+| **14:14** | 481 | 2033 | **3749** |
+
+`older` +7 in 15 minutes = **~28/hr**, not 0. So the "+0" reading at 13:59 was a
+single short interval landing on a quiet stretch, exactly the failure mode the
+entry above warned about — and the warning was right to be there. The correct
+number is a drop from ~128/hr to ~28/hr: a ~78% reduction, not elimination.
+
+That revision does not weaken the diagnosis, it sharpens it. Sealed accrual
+(~28/hr) is now at or just below drain (~30/hr), which is the threshold that
+actually matters: `older` was diverging and is now at breakeven, so the backlog
+can begin to fall instead of merely growing more slowly. The residual ~28/hr is
+the share of wave/dedup outputs that carry-forward legitimately cannot cover
+(entries whose inputs are not all present, or whose schema_version is stale) and
+is the next thing to attribute — `tantivy_wave_carried_forward` logs
+`carried`/`rebuilding` per call, so the split is already readable.
+
+`week` also ticked 2035 -> 2033, the first decline of the day in that bucket.
