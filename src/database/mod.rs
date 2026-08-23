@@ -4483,7 +4483,14 @@ impl Database {
         // attached after construction, and may be absent entirely (no indexed
         // tables / no bucket).
         spawn_db_cron(&db, "Tantivy reconcile", &self.config.maintenance.timefusion_tantivy_reconcile_schedule, cancel.clone(), |db| async move {
-            let Some(svc) = db.tantivy_indexer().cloned() else { return };
+            // The one silent exit this job has. Left unobservable, "the indexer
+            // was absent" and "the cron never ticked" look identical from the
+            // logs — and on 2026-08-23 they were indistinguishable for an hour
+            // while rollup manifests sat frozen since 08-20.
+            let Some(svc) = db.tantivy_indexer().cloned() else {
+                warn!(event = "tantivy_reconcile_no_indexer");
+                return;
+            };
             for table_name in svc.config.indexed_tables() {
                 match db.tantivy_reconcile_table(&table_name).await {
                     // Logged even when it did nothing: a silent no-op arm made
