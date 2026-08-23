@@ -1582,3 +1582,46 @@ otel_logs_and_spans                          2026-08-23 20:22   <- served
 …rollup_dashboard_1m_v2                      2026-08-19 09:13   <- still frozen
 otel_metrics                                 2026-08-20 12:41   <- orphan, expected
 ```
+
+## 20:35 — three tables served in 24 seconds: the passes are cheap, and they build nothing
+
+```
+…rollup_dashboard_1h_v2   2026-08-23 20:30:15
+…rollup_dashboard_1m_v2   2026-08-23 20:30:25
+…rollup_dashboard_1m_v3   2026-08-23 20:30:39
+…rollup_dashboard_1h_v1   2026-08-19 09:45      <- still frozen
+```
+
+Three tables written within **24 seconds** of each other. That refines the root
+cause rather than confirming my cost model: a rollup pass is not slow at all —
+it is `otel_logs_and_spans` specifically that consumes the window, and being
+sorted first it starved everything behind it. Rotation works because once a
+rollup leads, the rollups behind it finish in seconds.
+
+`…1h_v1` is still frozen and that is consistent, not a failure: it sorts
+*first*, so under the current offset it sits immediately **after** spans in the
+cycle and gets reached only when spans finishes. Its own lead slot arrives within
+~4 slots. **Prediction: `1h_v1` carries a 2026-08-23 manifest by ~21:35.**
+
+**But coverage is still not converging**, and 24 seconds is why:
+
+| census (log time) | uncovered | older |
+|---|---|---|
+| 17:59 | 6704 | 4024 |
+| 18:14 | 6721 | 4032 |
+| 18:28 | 6745 | 4046 |
+
+Post-fix, `older` still grows ~56/hr — down from ~130/hr, and a lower bound
+since two restarts fall inside that window and restarts bias accrual down. A pass
+that GCs three tables in 24 seconds cannot have **built** anything: at the
+measured ~4 min/build, eight builds would take half an hour. So the reconcile is
+now *reaching* the rollup tables and doing GC, while building approximately zero
+indexes.
+
+So the fix opened the door and the room is empty. Next question, and it is
+concrete: **why does `backfill_table_indexes` build nothing for a rollup table?**
+Candidates, cheapest first — `timefusion_tantivy_backfill_skip_today` (which I
+set to `true` this morning, and which would matter if rollup writes land in
+today's partition after all), `max_file_mb`, or a candidate list that is empty
+for a reason worth knowing. The per-table summary line carries `built=`, so one
+`grep` after the next pass distinguishes them.
