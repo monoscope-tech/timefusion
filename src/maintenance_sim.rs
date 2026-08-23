@@ -594,6 +594,7 @@ mod tests {
                 retry_reason: None,
                 publication: None,
                 base_tier_present: false,
+                input: None,
             };
             journal.upsert(task.clone());
             task.key.operation = Operation::DerivedRollup;

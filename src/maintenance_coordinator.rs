@@ -297,6 +297,49 @@ pub struct MaintenanceTask {
     /// than the journal's, which is why this overrides rather than supplements.
     #[serde(default)]
     pub base_tier_present: bool,
+    /// What this unit's slice actually READS, measured when its estimate was
+    /// taken. `default` so older journals deserialize as `None` and price
+    /// exactly as they did before.
+    #[serde(default)]
+    pub input: Option<InputFootprint>,
+}
+
+/// The file set behind a unit's byte estimate.
+///
+/// `estimated_decoded_bytes` prorates a file by the share of its time span the
+/// slice covers, which is right for ONE unit and wrong the moment
+/// `coarsen_to_width` sums siblings: a parquet file is pruned at row-group
+/// granularity, so `slice_share_of_file` floors every slice at one row group —
+/// and on ~10 MB files that is the WHOLE file. 1,440 one-minute children of the
+/// same day therefore each estimated ~282 MB honestly, summed to 391 GB against
+/// a 512 MB budget, and fusion refused them at every width (prod 2026-08-23:
+/// 92.9% of 5.1M candidates `over_budget`). The queue could not shrink by the
+/// one mechanism built to shrink it.
+///
+/// Pricing a group by DISTINCT `fp` fixes exactly that and nothing else:
+/// children that read the same files are one scan, children that read different
+/// files still sum. Partial overlap counts twice, which refuses a fusion that
+/// would have fit — the safe direction, and the behaviour that already existed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct InputFootprint {
+    /// Hash of the live file paths the slice overlaps.
+    pub fp: u64,
+    /// Decoded, projected bytes of that whole set — one scan, unprorated.
+    pub whole_file_bytes: u64,
+}
+
+impl InputFootprint {
+    /// Fingerprint a selected file set. Order-independent (a snapshot's file
+    /// order is not stable), so two units over the same files agree.
+    pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(paths: I, whole_file_bytes: u64) -> Self {
+        use std::hash::{Hash, Hasher};
+        let fp = paths.into_iter().fold(0u64, |acc, path| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.as_ref().hash(&mut hasher);
+            acc ^ hasher.finish()
+        });
+        Self { fp, whole_file_bytes }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -310,6 +353,46 @@ pub struct Publication {
     /// and those slices read raw until the coordinator republishes.
     #[serde(default)]
     pub source_rows: Option<u64>,
+}
+
+/// What one fusion bucket would cost to scan, accumulated member by member.
+///
+/// Members naming the same [`InputFootprint`] are charged ONCE — they re-read
+/// the same row groups, so one wider unit does their work in one scan. Members
+/// with no footprint (older journals, planner-minted units) keep the old summed
+/// price, so this can only ever lower an estimate, never raise one.
+#[derive(Default)]
+struct GroupPrice {
+    /// Distinct footprints, each charged its unprorated whole-file cost.
+    distinct: HashMap<u64, u64>,
+    /// Members with nothing better to say than their prorated share.
+    unpriced_bytes: u64,
+    unpriced_members: usize,
+}
+
+impl GroupPrice {
+    fn add(&mut self, task: &MaintenanceTask) {
+        match task.input {
+            Some(input) => {
+                self.distinct.insert(input.fp, input.whole_file_bytes);
+            }
+            None => {
+                self.unpriced_bytes = self.unpriced_bytes.saturating_add(task.estimated_decoded_bytes);
+                self.unpriced_members += 1;
+            }
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.distinct.values().fold(self.unpriced_bytes, |total, bytes| total.saturating_add(*bytes))
+    }
+
+    fn unanimous_input(&self) -> Option<InputFootprint> {
+        match (self.unpriced_members, self.distinct.iter().next()) {
+            (0, Some((&fp, &whole_file_bytes))) if self.distinct.len() == 1 => Some(InputFootprint { fp, whole_file_bytes }),
+            _ => None,
+        }
+    }
 }
 
 /// Split a unit until each estimated reservation fits.  A one-minute whale is
@@ -493,7 +576,17 @@ impl TaskJournal {
     // v3 runs once with commit-range reconciliation and forced compaction.
     const BOOTSTRAP_BACKLOG_MIGRATION: &'static str = "__maintenance_bootstrap_backlog_v3";
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
-    const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v1";
+    /// v2, because the shredded units it exists to remove came BACK by a route
+    /// v1 could not see. `split_time_task` bisects a unit that times out, and
+    /// each bisect halves again, so a day that kept failing reached the
+    /// one-minute floor — prod 2026-08-23 held 1,440 sixty-second units for
+    /// `base_rollup / 00000000 / 2026-08-13` alone, and 21,598 pending resolving
+    /// to 1,452 real cells (14.9x). Those children predate [`InputFootprint`],
+    /// so fusion still prices them by summing, still refuses every width, and
+    /// they are stuck exactly as before. Re-running clears them; the planner
+    /// re-derives what coverage actually lacks, and the split that follows now
+    /// stamps its children so the next fusion collapses them.
+    const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v2";
     /// v2, because v1 ran and threw its own work away. It cleared 85,047
     /// estimates in memory and persisted only its CURSOR — `checkpoint` writes
     /// dirty cursors but cannot express the task rewrites, and the `compact`
@@ -906,7 +999,7 @@ impl TaskJournal {
         }
 
         let mut report = CoarsenReport::default();
-        let mut groups: HashMap<(String, String, String, Operation, i64), u64> = HashMap::new();
+        let mut groups: HashMap<(String, String, String, Operation, i64), GroupPrice> = HashMap::new();
         let mut members: HashMap<(String, String, String, Operation, i64), usize> = HashMap::new();
         // The OLDEST member's creation time, because the fused unit inherits its
         // members' work and must inherit their age with it.
@@ -924,7 +1017,7 @@ impl TaskJournal {
                 report.blocked += 1;
                 continue;
             }
-            *groups.entry(group.clone()).or_default() += task.estimated_decoded_bytes;
+            groups.entry(group.clone()).or_default().add(task);
             *members.entry(group.clone()).or_default() += 1;
             oldest.entry(group).and_modify(|at| *at = (*at).min(task.created_unix_ms)).or_insert(task.created_unix_ms);
         }
@@ -952,8 +1045,8 @@ impl TaskJournal {
         //
         // The children's own estimates are already summed here, so the test is
         // free.
-        groups.retain(|group, bytes| {
-            let fits = *bytes <= MAX_DECODED_BYTES;
+        groups.retain(|group, price| {
+            let fits = price.bytes() <= MAX_DECODED_BYTES;
             if !fits {
                 report.over_budget += members.get(group).copied().unwrap_or(0);
             }
@@ -972,7 +1065,7 @@ impl TaskJournal {
                     bucket_of(task.key.slice.start_micros),
                 ))
         });
-        for ((physical_table, source, project_id, operation, bucket), bytes) in groups {
+        for ((physical_table, source, project_id, operation, bucket), price) in groups {
             let Ok(slice) = TimeSlice::new(bucket, bucket.saturating_add(width)) else { continue };
             let oldest_member = oldest
                 .get(&(physical_table.clone(), source.clone(), project_id.clone(), operation, bucket))
@@ -982,7 +1075,7 @@ impl TaskJournal {
                 key: TaskKey { physical_table, source, project_id, slice, operation },
                 state: TaskState::Pending,
                 deadline_micros: now_micros,
-                estimated_decoded_bytes: bytes,
+                estimated_decoded_bytes: price.bytes(),
                 hash_shard: 0,
                 hash_shards: 1,
                 attempts: 0,
@@ -1005,6 +1098,10 @@ impl TaskJournal {
                 retry_reason: None,
                 publication: None,
                 base_tier_present: false,
+                // Only when every member agreed. A fused unit over several file
+                // sets reads their union, which no scalar here can state, and
+                // guessing one would let the next width up under-price itself.
+                input: price.unanimous_input(),
             });
         }
         report
@@ -1244,6 +1341,24 @@ impl TaskJournal {
         proven
     }
 
+    /// Remember what a unit reads, measured by the claim-time preflight.
+    ///
+    /// Recorded on EVERY claim, not only when the preflight splits. The split
+    /// that shredded prod was not the byte one — a unit that fits its estimate
+    /// and then times out is bisected by `abandon_running`, which knows only a
+    /// key. Without a footprint already on the parent, those children carry
+    /// none, fusion sums them, and the bisect ladder is one-way again.
+    pub fn record_input(&mut self, key: &TaskKey, input: InputFootprint) -> bool {
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let task = &mut self.snapshot.tasks[index];
+        if task.input == Some(input) {
+            return false;
+        }
+        task.input = Some(input);
+        self.dirty_tasks.insert(key.clone());
+        true
+    }
+
     pub fn upsert(&mut self, task: MaintenanceTask) {
         // A key removed earlier in this write window and re-created now must not
         // still carry a tombstone; the upsert is the later truth. Every path
@@ -1360,6 +1475,7 @@ impl TaskJournal {
             retry_reason: None,
             publication: None,
             base_tier_present,
+            input: None,
         });
     }
 
@@ -1480,6 +1596,7 @@ impl TaskJournal {
                         retry_reason: None,
                         publication: None,
                         base_tier_present: false,
+                        input: None,
                     });
                     self.dirty_tasks.insert(key);
                 }
@@ -1702,18 +1819,24 @@ impl TaskJournal {
         let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, u8, i64, i64) {
             let (class, starved, width, order) = scheduling_class(task, now_micros);
             let hole = journal.hole_rank(task);
-            // NARROWEST first for damage, widest first for everything else.
+            // Damage does not order by width OR recency — every damage unit
+            // ties, so the per-project cursor below rotates across the damaged
+            // CELLS instead of draining one to exhaustion.
             //
-            // `-width` is right for backfill, where a day-wide unit is the only
-            // kind that advances the horizon. It is exactly wrong for repair: a
-            // damage unit is the uncovered span of one file, so the narrow ones
-            // are both the cheapest AND the ones that retire a file, while the
-            // wide ones are whale days that split into ladders and re-split.
-            // Prod 2026-08-23: three 5-8 minute units sat Pending at attempts=0
-            // with their deadlines nine hours past, behind 800-1400 minute
-            // ladders belonging to the same damage rank, and the count plateaued
-            // at 24 for two hours.
-            let width = if hole == 0 { -width } else { width };
+            // Both width orderings starve. `-width` (widest first) buried the
+            // narrow repair units: prod 2026-08-23 had three 5-8 minute units
+            // Pending at attempts=0 with deadlines nine hours past, behind
+            // 800-1400 minute ladders of the same rank. Reversing it starved the
+            // opposite end — the selection loop matches the winning tuple
+            // EXACTLY, so ordering by width makes the single narrowest unit win
+            // every claim, and one whale cell's shredded ladder always contains a
+            // narrower child than another project's 3-minute hole. Five cells
+            // with 3-11 minute holes sat untouched for eight hours while that
+            // one cell ground down its ladder.
+            //
+            // Tying them puts every damage unit in one rank group, which is what
+            // `fair_cursors` is for.
+            let (width, order) = if hole == 0 { (0, 0) } else { (width, order) };
             (class, u8::from(hole > 0), starved, hole, width, order)
         };
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, u8, i64, i64)> {
@@ -1862,7 +1985,7 @@ impl TaskJournal {
         // `MAX_DECODED_BYTES + 1` is the smallest input that makes
         // `byte_bounded_units` bisect: it asks for one split, not a full
         // recursive shred down to the minimum slice.
-        if attempts >= 2 && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1)) {
+        if attempts >= 2 && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1), None) {
             return;
         }
         // Floored at this operation's OWN deadline. A unit that cannot be split
@@ -1907,7 +2030,7 @@ impl TaskJournal {
     /// 50-80s of object-store work per pass, and each guarding a partition that
     /// stayed uncertified — which keeps `DedupExec` in every query plan over it.
     pub fn retry_or_split(&mut self, key: &TaskKey, reason: String, when_micros: i64, attempts: u32) {
-        if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1)) {
+        if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1), None) {
             return;
         }
         // Split refused (already at minimum width, or would hash-shard) on a
@@ -1924,9 +2047,14 @@ impl TaskJournal {
         self.retry(key, reason, when_micros);
     }
 
-    pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64) -> bool {
+    pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64, input: Option<InputFootprint>) -> bool {
         let Some(index) = self.task_indices.get(key).copied() else { return false };
-        let parent = self.snapshot.tasks[index].clone();
+        let mut parent = self.snapshot.tasks[index].clone();
+        // Children of a split read the parent's files — every one of them, since
+        // a row group cannot be pruned below. Stamping them here is what lets
+        // `coarsen_to_width` put them back together later for the price of one
+        // scan instead of N.
+        parent.input = input.or(parent.input);
         let children = byte_bounded_units(&parent, observed_bytes);
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
             return false;
@@ -2722,6 +2850,7 @@ mod tests {
             retry_reason: None,
             publication: None,
             base_tier_present: false,
+            input: None,
         }
     }
 
@@ -3668,15 +3797,18 @@ mod tests {
         );
     }
 
-    /// Damage drains NARROWEST first; everything else stays widest first.
+    /// Damage ROTATES across cells; one cell's ladder cannot monopolise it.
     ///
-    /// `-width` is right for backfill — only a day-wide unit advances the
-    /// horizon — and exactly wrong for repair, where the narrow unit is both the
-    /// cheapest and the one that actually retires a file. Prod 2026-08-23 had
-    /// three 5-8 minute repair units Pending at attempts=0 with deadlines nine
-    /// hours past, queued behind 800-1400 minute ladders of the same rank.
+    /// Both width orderings starve, because the selection loop matches the
+    /// winning rank tuple EXACTLY, so any width ordering makes a single unit win
+    /// every claim. Widest-first buried the narrow repair units (three 5-8
+    /// minute units Pending at attempts=0, deadlines nine hours past);
+    /// narrowest-first buried everyone behind one whale cell whose shredded
+    /// ladder always held a narrower child — five cells with 3-11 minute holes
+    /// sat untouched for eight hours. Tying every damage unit puts them in one
+    /// rank group so `fair_cursors` rotates across projects.
     #[test]
-    fn damage_drains_narrowest_first_while_backfill_stays_widest_first() {
+    fn damage_rotates_across_cells_instead_of_draining_one() {
         let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
@@ -3687,28 +3819,18 @@ mod tests {
             t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
             t
         };
-        // Same cell, same day: only width separates them.
-        let seed = |journal: &mut TaskJournal| {
-            journal.upsert(unit("p", 35 * DAY, 300_000_000));
-            journal.upsert(unit("p", 35 * DAY + DAY / 2, 6 * 3_600_000_000));
-        };
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
-        assert_eq!(
-            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.slice.width(),
-            6 * 3_600_000_000,
-            "control: ordinary sealed work still takes the widest unit first"
-        );
+        // A whale ladder of very narrow children, and ONE other cell holding a
+        // slightly wider hole — the prod shape exactly.
+        for minute in 0..6 {
+            journal.upsert(unit("whale", 35 * DAY + minute * 60_000_000, 60_000_000));
+        }
+        journal.upsert(unit("small", 35 * DAY, 180_000_000));
+        journal.set_untagged_cells("source", "rollup_1m", [("whale".to_owned(), "1970-02-05".to_owned()), ("small".to_owned(), "1970-02-05".to_owned())]);
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
-        journal.set_untagged_cells("source", "rollup_1m", [("p".to_owned(), "1970-02-05".to_owned())]);
-        assert_eq!(
-            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.slice.width(),
-            300_000_000,
-            "a damaged cell must take its five-minute unit before its six-hour one"
-        );
+        // Six claims: the other cell must get a turn, not wait for the ladder.
+        let claimed: Vec<String> = (0..6).filter_map(|_| journal.claim_next(Operation::BaseRollup, now, true).map(|task| task.key.project_id)).collect();
+        assert!(claimed.iter().any(|project| project == "small"), "one cell's ladder must not monopolise damage repair; claimed {claimed:?}");
     }
 
     /// A restored cell ranks exactly like a freshly discovered one.
@@ -4228,7 +4350,7 @@ mod tests {
 
         let parent = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
-        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1));
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
         assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "the parent must be superseded for this to prove anything");
         let children = journal.tasks().filter(|t| t.state == TaskState::Pending && t.key.operation == Operation::BaseRollup).count();
         assert!(children > 0, "the split must have produced children");
@@ -4340,7 +4462,7 @@ mod tests {
         }
         let parent = task("p", 5 * DAY_MICROS, 6 * DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
-        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1));
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
         assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "the parent must be superseded for the guard to be exercised");
 
         let collapsed = journal.coarsen_sealed_slices(now);
@@ -4445,47 +4567,74 @@ mod tests {
     ///     MAX_DECODED_BYTES:        512 MB
     ///
     /// An hour is 30-40x over budget, so every width is refused and the cell is
-    /// stuck forever. And the estimates are not merely pessimistic, they are
-    /// impossible: that partition holds **35 files totalling 0.36 GB**, while
-    /// these 1,440 units claim **391 GB** between them. A single SIXTY-SECOND
-    /// slice is estimated at 282 MB — roughly the whole partition — which is the
-    /// pre-`slice_share_of_file` whole-file accounting, frozen into the journal
-    /// at enqueue time and never recomputed.
+    /// stuck forever. That partition holds **35 files totalling 0.36 GB** while
+    /// these 1,440 units claim **391 GB** between them — but each individual
+    /// estimate is HONEST, not stale (`__maintenance_stale_estimate_v2` had
+    /// already run). A row group cannot be pruned below, and on ~10 MB files one
+    /// row group IS the file, so a sixty-second slice really does decode ~282 MB.
     ///
-    /// So the 14.9x queue inflation is not a scheduling problem: it is stale
-    /// estimates blocking the one mechanism that would collapse it.
+    /// The defect is the SUM. 1,440 children reading the same 35 files are one
+    /// scan, and charging them 1,440 times is what blocks the one mechanism that
+    /// would collapse the 14.9x inflation.
     ///
-    /// `#[ignore]`d because it FAILS. Un-ignore it as the first step of the fix,
-    /// which has to make the budget test stop trusting a stored estimate that
-    /// exceeds what the whole partition could possibly decode to.
+    /// The fix is [`InputFootprint`]: children of a split read the parent's
+    /// files, so fusion charges that set ONCE instead of once per child.
     #[test]
-    #[ignore = "documents a known defect: stale whole-file estimates block coarsening (2026-08-23)"]
     fn a_day_shredded_to_the_minute_floor_collapses() {
         const DAY_MICROS: i64 = 86_400_000_000;
-        const MINUTE: i64 = 60_000_000;
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         let now = 10 * DAY_MICROS;
-        // The estimate prod actually stored for a one-minute slice.
-        let prod_estimate = 282_280_533u64;
-        for slot in 0..1440 {
-            let start = DAY_MICROS + slot * MINUTE;
-            journal.enqueue(task("p", start, start + MINUTE, Operation::BaseRollup).key, 0, prod_estimate, 0);
-        }
-        let report = journal.coarsen_sealed_slices_reporting(now);
-        let pending = journal
-            .tasks()
-            .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
-            .count();
-        assert!(
-            pending < 1440,
-            "a contiguous shredded day must collapse; {pending} units remain (subsumed={} fused={} candidates={} blocked={} over_budget={})",
-            report.subsumed,
-            report.fused,
-            report.candidates,
-            report.blocked,
-            report.over_budget
-        );
+        let parent = task("p", DAY_MICROS, 2 * DAY_MICROS, Operation::BaseRollup).key;
+        journal.enqueue(parent.clone(), 0, 0, 0);
+        // The 391 GB prod's 1,440 units claimed between them, against a
+        // partition holding 35 files that decode to well under the budget.
+        let footprint = InputFootprint::new((0..35).map(|n| format!("part-{n}.parquet")), MAX_DECODED_BYTES / 2);
+        assert!(journal.split_time_task(&parent, 391 * 1024 * 1024 * 1024, Some(footprint)));
+
+        let shredded = |journal: &TaskJournal| {
+            journal
+                .tasks()
+                .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
+                .count()
+        };
+        assert!(shredded(&journal) > 1_000, "precondition: the bisect ladder reaches the floor");
+        assert!(journal.tasks().filter(|t| t.state == TaskState::Pending).all(|t| t.input == Some(footprint)), "children inherit what they read");
+
+        // The cascade lands them at a width they can actually finish. One pass
+        // is enough because every child names the same file set.
+        journal.coarsen_sealed_slices(now);
+        assert!(shredded(&journal) <= 24, "a contiguous shredded day must collapse; {} units remain", shredded(&journal));
+    }
+
+    /// Fusion charges a file set once, and only when the members agree it IS
+    /// one set. Two children over different files still sum — a fused unit
+    /// would read both, and under-pricing that is how a split/fuse loop starts.
+    #[test]
+    fn fusion_charges_a_shared_file_set_once_and_disjoint_sets_twice() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let now = 10 * DAY_MICROS;
+        let half = MAX_DECODED_BYTES / 2 + 1;
+        let fuse = |footprints: [InputFootprint; 2]| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            for (slot, footprint) in footprints.into_iter().enumerate() {
+                let slot = i64::try_from(slot).unwrap_or(0);
+                let start = DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+                let key = task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key;
+                journal.enqueue(key.clone(), 0, half, 0);
+                let index = journal.task_indices[&key];
+                journal.snapshot.tasks[index].input = Some(footprint);
+            }
+            journal.coarsen_sealed_slices_reporting(now)
+        };
+        let shared = InputFootprint::new(["a.parquet", "b.parquet"], half);
+        // Order-independent: a snapshot lists files in no fixed order, and two
+        // units over the same partition must still recognise each other.
+        assert_eq!(shared, InputFootprint::new(["b.parquet", "a.parquet"], half));
+        assert_eq!(fuse([shared, shared]).fused, 2, "same files, one scan, one charge");
+        let disjoint = fuse([shared, InputFootprint::new(["c.parquet"], half)]);
+        assert_eq!((disjoint.fused, disjoint.over_budget > 0), (0, true), "different files must still sum");
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with
@@ -4525,7 +4674,7 @@ mod tests {
         // collapse, or the split is undone and the two fight forever.
         let parent = task("p", 6 * DAY_MICROS, 7 * DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
-        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1));
+        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
         assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "precondition");
 
         journal.coarsen_sealed_slices(now);
@@ -4763,7 +4912,7 @@ mod tests {
         let input = task("p", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup);
         let key = input.key.clone();
         journal.upsert(input);
-        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES));
+        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None));
         assert_eq!(journal.tasks().filter(|task| task.state == TaskState::Pending).count(), 2);
         assert_eq!(journal.state(&key), Some(TaskState::Superseded));
     }
@@ -4777,7 +4926,7 @@ mod tests {
         input.deadline_micros = now - 2 * 60 * 1_000_000;
         let key = input.key.clone();
         journal.upsert(input);
-        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES));
+        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None));
         assert_eq!(live_frontier_lag_secs(journal.tasks(), now), 2 * 60);
     }
 
@@ -4789,7 +4938,7 @@ mod tests {
         let base_key = base.key.clone();
         journal.upsert(base);
         journal.upsert(task("p", 0, NORMAL_SLICE_MICROS, Operation::DerivedRollup));
-        assert!(journal.split_time_task(&base_key, 2 * MAX_DECODED_BYTES));
+        assert!(journal.split_time_task(&base_key, 2 * MAX_DECODED_BYTES, None));
         let children = journal
             .tasks()
             .filter(|task| task.key.operation == Operation::BaseRollup && task.state == TaskState::Pending)

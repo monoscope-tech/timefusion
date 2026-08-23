@@ -816,9 +816,14 @@ pub(crate) fn uncovered_gaps(untagged: &[(i64, i64)], tagged: &[(i64, i64)]) -> 
             gaps.push((reached, hi));
         }
     }
-    gaps.sort_unstable();
-    gaps.dedup();
-    gaps
+    // Adjacent holes are ONE hole. Each untagged file contributes its own
+    // statistics span, so a day whose files tile it end-to-end yields a gap per
+    // file; `dedup` alone removes only exact repeats, and the leftovers became a
+    // unit each (prod 2026-08-23: 1,440 sixty-second units for one cell, and
+    // 92.9% of fusion candidates then refused on budget trying to re-assemble
+    // what shredding split). Cheaper never to shred: the coordinator still
+    // bisects a merged hole that genuinely does not fit.
+    crate::write::mem_buffer::merge_ranges(gaps)
 }
 
 /// A slice covering exactly one UTC calendar day — the partition granularity.
@@ -2125,6 +2130,31 @@ mod tests {
         assert_eq!(
             uncovered_gaps(&[(DAY + HOUR, DAY + 2 * HOUR), (DAY + HOUR, DAY + 2 * HOUR)], &[(DAY + 90 * 60_000_000, DAY + 9 * HOUR), (DAY, DAY + HOUR)]),
             vec![(DAY + HOUR, DAY + 90 * 60_000_000)]
+        );
+        // ADJACENT gaps are ONE hole, and must be reported as one.
+        //
+        // Each untagged file contributes its own statistics span, so a day whose
+        // files tile it end-to-end produces a gap per file. `dedup` only removes
+        // exact duplicates, so those stayed separate and
+        // `enqueue_untagged_rebuilds` minted a UNIT EACH — measured on prod
+        // 2026-08-23 as 1,440 sixty-second units for a single (project, date),
+        // 14.9x queue inflation overall, and 92.9% of fusion candidates then
+        // refused on budget because fusion SUMS what shredding split.
+        //
+        // Cheaper to never shred than to reassemble: one contiguous hole is one
+        // scan, and the coordinator still splits it if it genuinely does not fit.
+        let minute = 60 * 1_000_000;
+        assert_eq!(
+            uncovered_gaps(&[(DAY, DAY + minute), (DAY + minute, DAY + 2 * minute), (DAY + 2 * minute, DAY + 3 * minute)], &[]),
+            vec![(DAY, DAY + 3 * minute)],
+            "three back-to-back holes are one hole"
+        );
+        // Overlapping spans likewise collapse, and a genuine separation survives.
+        assert_eq!(uncovered_gaps(&[(DAY, DAY + 2 * HOUR), (DAY + HOUR, DAY + 3 * HOUR)], &[]), vec![(DAY, DAY + 3 * HOUR)]);
+        assert_eq!(
+            uncovered_gaps(&[(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 3 * HOUR)], &[]),
+            vec![(DAY, DAY + HOUR), (DAY + 2 * HOUR, DAY + 3 * HOUR)],
+            "a real separation must NOT be merged away"
         );
     }
 

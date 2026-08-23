@@ -364,6 +364,7 @@ impl Database {
                         retry_reason: None,
                         publication: None,
                         base_tier_present: false,
+                        input: None,
                     });
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
@@ -389,6 +390,7 @@ impl Database {
                             retry_reason: None,
                             publication: None,
                             base_tier_present: false,
+                            input: None,
                         });
                     }
                 }
@@ -1017,7 +1019,7 @@ impl Database {
         // overlap this exact slice. Without this preflight a whale project's
         // ordinary no-duplicate probe occupied one worker for 235 seconds in
         // production while still reporting `estimated_decoded_bytes=0`.
-        let estimated_bytes = {
+        let (estimated_bytes, whole_file_bytes, selected_paths) = {
             let schema = schema_or_default(&key.source);
             let required_columns = 3usize.saturating_add(schema.dedup_keys.len()).saturating_add(usize::from(schema.dedup_tiebreak.is_some()));
             let projected_numerator = u64::try_from(required_columns).unwrap_or(u64::MAX);
@@ -1050,13 +1052,26 @@ impl Database {
                     let decoded = estimated_decoded_bytes(add.size);
                     let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
                     let (share, whole) = slice_share_of_file(min, max, key.slice, estimated_row_groups(add.size));
-                    Some(projected.saturating_mul(share).div_ceil(whole.max(1)))
+                    Some((file.path().to_string(), projected.saturating_mul(share).div_ceil(whole.max(1)), projected))
                 })
-                .fold(0u64, u64::saturating_add)
+                // The prorated sum is this unit's own estimate; the unprorated
+                // one is what a SIBLING over the same files would re-read, and
+                // fusion needs both to price a bucket without counting a row
+                // group once per child.
+                .fold((0u64, 0u64, Vec::new()), |(share, whole, mut paths), (path, file_share, file_whole)| {
+                    paths.push(path);
+                    (share.saturating_add(file_share), whole.saturating_add(file_whole), paths)
+                })
         };
+        let input_footprint = crate::maintenance_coordinator::InputFootprint::new(selected_paths, whole_file_bytes);
+        // Before the split test, because a unit that FITS still needs this: a
+        // later timeout bisect knows only the key.
+        if self.journal().record_input(&key, input_footprint) {
+            self.journal().checkpoint()?;
+        }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
-            if journal.split_time_task(&key, estimated_bytes) {
+            if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) {
                 journal.checkpoint()?;
                 info!(
                     table = %key.physical_table,
@@ -1200,6 +1215,7 @@ impl Database {
                     // A synthetic COMPLETE base for the day is exactly the proof
                     // `dependencies_complete` looks for, so say so.
                     base_tier_present: true,
+                    input: None,
                 });
             }
             journal.enqueue(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());
@@ -1345,7 +1361,7 @@ impl Database {
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
-        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity) = {
+        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes) = {
             let table = from_table.read().await;
             let witness_guard = match &witness_table {
                 Some(table) => Some(table.read().await),
@@ -1377,6 +1393,7 @@ impl Database {
             let partition_paths = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string);
             let mut selected = Vec::new();
             let mut estimated = 0u64;
+            let mut whole_file_bytes = 0u64;
             for file in snapshot.log_data().iter() {
                 let path = file.path().to_string();
                 if !partition_paths.contains(&path) {
@@ -1473,10 +1490,21 @@ impl Database {
                     .unwrap_or((None, None));
                 let (share, whole) = slice_share_of_file(file_min, file_max, key.slice, estimated_row_groups(add.size));
                 estimated = estimated.saturating_add(projected.saturating_mul(share).div_ceil(whole.max(1)));
+                // Unprorated: what a SIBLING slice over these same files would
+                // re-read. `coarsen_to_width` charges that once per distinct
+                // file set instead of once per child.
+                whole_file_bytes = whole_file_bytes.saturating_add(projected);
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity)
+            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes)
         };
+        let input_footprint = crate::maintenance_coordinator::InputFootprint::new(&selected, whole_file_bytes);
+        // Same reason as the dedup preflight: record it on every claim, not only
+        // when this one splits, or a timeout bisect mints footprint-less
+        // children that fusion can only sum.
+        if self.journal().record_input(&key, input_footprint) {
+            self.journal().checkpoint()?;
+        }
         if untagged_inputs > 0 {
             crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
             // Since #169 these files are KEPT — pruned on their own timestamp
@@ -1502,7 +1530,7 @@ impl Database {
         }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
-            if journal.split_time_task(&key, estimated_bytes) {
+            if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) {
                 journal.checkpoint()?;
                 return Ok(true);
             }
