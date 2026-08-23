@@ -649,6 +649,34 @@ query. Stamping the current partition fingerprint without that proof would asser
 freshness nobody established — which is the same trap the `source_fp` fallback
 fell into.
 
+## THE RESULT: the 7d dashboard group-by routes, and it is 2.8x faster
+
+2026-08-23, `e6315af` (contains the producer), coverage rebuilt to 30, per-query
+hit verification and non-routing controls in the SAME round:
+
+| | routed? | rep1 | rep2 |
+|---|---|---|---|
+| CONTROL `trace_id =` needle 7d | no | 79 ms | 80 ms |
+| CONTROL `ORDER BY ts DESC LIMIT 100` | no | 112 ms | 131 ms |
+| **`time_bucket(1h)` group-by 7d** | **yes, 1 hit each rep** | **3,713 ms** | **3,667 ms** |
+
+Two comparisons, both honest:
+
+- against the original raw baseline of **10,570 ms** → **2.8x faster**
+- against the best UNROUTED-on-a-quiet-box figure measured this session
+  (5,839 / 6,335 ms) → **~1.6x faster**
+
+The controls are the reason this reading is trustworthy where the first
+post-deploy attempt was not: they sit at their best-ever values, so the box is not
+flattering the routed number. Note `cpu_tokens_used = 16` throughout — maintenance
+saturation does not imply query saturation, and conflating the two is what made
+the earlier reading unusable.
+
+Not everything routes yet. The 3d group-by missed `not_built` (30 of them) and
+stayed at 2,905 ms, because on a young container the date-level map has only the
+days that have published since boot — which is exactly the ceiling described in
+the section above, and the case for rebuilding that map at boot.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
