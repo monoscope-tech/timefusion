@@ -2524,11 +2524,14 @@ mod tests {
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
         assert_eq!(cfg.manifest_ttl(), Duration::from_secs(300));
-        // Load-bearing against the reconcile tick, not a free tuning knob: a
-        // cap whose pass outruns the interval stops reporting per pass, blocks
-        // every later tick, and works from an ever-staler file list. Sized at
-        // the MEASURED ~4 builds/hr, not at an assumed one — 150 was ~35 hours.
-        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 8);
+        // A COUNT ceiling against a pathological queue of tiny files, NOT the
+        // pass bound — `timefusion_tantivy_backfill_max_bytes_per_pass` is. It
+        // was 8, sized on `otel_logs_and_spans` where a build costs 4-5 minutes;
+        // that is false by ~150x for the rollup tables (a pass logged `built=8`
+        // in 14 seconds), and one count cap across populations differing by two
+        // orders of magnitude throttled the cheap tables to protect the
+        // expensive one. See the field's own comment.
+        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 128);
 
         let derived = TantivyConfig::default();
         assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");
