@@ -226,6 +226,40 @@ about the ruler, not about the system.**
 What actually cleared: the whale's 17 metrics files and `28f62f01`'s 17 log files
 for 08-19 — exactly the population the hole-rank fix targeted.
 
+## Overnight: 85 → 26, and a FOURTH broken ruler
+
+The count reached 30 by 00:48 and then read **0 for six consecutive hours**. It
+was not converged: the hourly script's `aws s3 sync` had silently downloaded
+nothing, every tier replayed as "0 live, 0 untagged", and a total of zero is
+indistinguishable from success. The real figure at 07:07 was **26**.
+
+The measurement script now refuses to report at all unless every tier has commit
+files on disk and the replay finds >1,000 live files — it prints `MEASURE FAILED`
+and exits non-zero instead. It is also incremental now; re-downloading ~150 MB
+hourly had degraded to 17 KiB/s.
+
+That is four measurement failures in one investigation — a publish-only gauge, a
+counter before its commit, an enumerator that could only ratchet up, and a sync
+that reported success over an empty directory. Every one of them read as *good
+news*. **Build the guard into the instrument, not into the reader's memory.**
+
+## Damage repair was ranked below the starvation window
+
+`scheduling_class` returns `(class, starved, …)` and `starved` is compared BEFORE
+`hole_rank`. It is set only for work aged **3 to 31 days**. Every untagged file
+still standing on 08-23 was **32 to 37 days old**, so it fell outside the window,
+sorted below the entire ~12,000-unit backfill queue, and could never be reached
+no matter what its hole rank said. Damage now leads its class outright
+(`fa5d2f7`): the starvation window is a freshness heuristic, and damage is not a
+freshness question.
+
+Observed while diagnosing this, and NOT yet addressed: narrow units repeatedly
+escalate to a covering slice — a 10-minute unit escalates, its 1.5h or 3h covering
+slice rebuilds and publishes, and another 10-minute unit inside the same day
+arrives and does it again. Each cycle spends a multi-hour rebuild on a
+ten-minute invalidation. It is correct (the escalation exists to prevent a double
+count) but it is a treadmill, and it is where sealed-tier capacity is going.
+
 ## Explicitly rejected
 
 - **Journal-derived `covered`.** The journal knows which slices were built, but a
