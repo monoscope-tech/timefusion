@@ -90,26 +90,41 @@ merge-on-read table answers with the pre-update row. So this is a cost to
       `no_witness` at ~95% — then enabling that flag is the cheapest available
       test of item 1.1, with a kill switch. Read the two counters first; the
       flag does nothing for `moved`.
-- [ ] **1.2 Bound `log_list` so TopK never deduplicates the whole window.**
-      `ORDER BY timestamp DESC LIMIT 251` should resolve versions for ~251
-      rows, not 30 days of them. p4 answers this shape at 30d in 879 ms and p1
-      OOMs on it — so the blowup tracks duplicate density, not window width.
-      Fixes mode B directly and is the narrowest change on this page.
-- [ ] **1.3 Add an admission guard so one wide scan cannot make the box
-      unreachable.** Mode C. Today the failure is silent and global; at minimum
-      it should be a rejected query with a clear error, not refused
-      connections. (Note a scan-pressure valve / `GatedScanExec` already exists
-      in `database/scan.rs` — establish why it did not fire here before
-      building anything new.)
-- [ ] **1.4 Treat `col IS NOT NULL` as a no-op against a measure that already
-      skips nulls. CONFIRMED BY MEASUREMENT — see §"The p95 finding" below.**
-      monoscope emits `AND duration IS NOT NULL` on every latency chart. That
-      single predicate flips the miss reason from `not_built` to
-      `filter_not_eligible`, i.e. **the latency charts can never route no
-      matter how good coverage gets.** `p95_latency` is one of the two shapes
-      that fails most often at 30d, `duration_digest` is already declared, and
-      this is a planner change with no spec change and no rebuild. Highest
-      value-per-effort item on this page.
+- [x] **1.2 `log_list@30d` is a FOOTER-REPAIR problem — rescoped 2026-08-23.**
+      Not a read-path bug. 38 of p1's 86 file groups carry no footer
+      `sorting_columns`; they form their own branch of the `DeltaScanExec` union,
+      that union declares no ordering, so the delta leg declares none,
+      `ordered_children` bails, no `SortPreservingMergeExec` is built,
+      `detect_bound` returns `None`, and `DedupExec` runs `full-set` — the only
+      mode with no LIMIT early termination and the only one charging the 2 GiB
+      budget. The whale answers the identical shape at 30d in `bounded[timestamp]`.
+      Both available read-path fixes are wrong (see the write-up: sorting the
+      unordered branch is the reverted 2026-08-07 attempt; a top-K watermark is
+      defeated by the `deleted IS DISTINCT FROM true` FilterExec between the sort
+      and the dedup). Shipped `dedup_full_set_pct` instead, which reads **3.0** on
+      prod — the backlog is now a number. Real fix is 2.3.
+      `2026-08-23-log-list-30d-is-a-footer-repair-problem.md`.
+
+- [x] **1.3 Wide scans can now be refused — shipped 2026-08-23.** `GatedScanExec`
+      never failed to fire; it fires and refuses NOTHING by design, bounding how
+      many wide scans decode at once and never how much any one of them decodes
+      (`wide_scan_oversize_total` was pure observation, and read 4 within a minute
+      of a restart). Shipped the refusal plus the distribution needed to size it,
+      default 0; a day later `wide_scan_selected_mb_p99` read **3,506 MB** and the
+      default became **16,384 MB** — 4.7x p99, about half the 32.8 GB scan that
+      took the box down. `TIMEFUSION_WIDE_SCAN_REFUSE_MB=0` is the kill switch.
+
+- [x] **1.4 `col IS NOT NULL` now routes — shipped 2026-08-23 (91030f9).**
+      Dropped onto a `HAVING sum(count(col)) > 0` guard, which reads as one
+      widening of the existing promotion rule: a measure
+      `{agg: count, column: col, filter: F}` IS
+      `count(*) FILTER (WHERE F AND col IS NOT NULL)`, so a single lookup covers
+      the bare predicate, the promoted filter and — the case that matters — their
+      CONJUNCTION. Two fail-closed disqualifiers: two different guard columns, and
+      any aggregate not null-skipping over that same column (`count(*)` beside
+      p95, which the top-K tables really send). Gate test fails without the fix on
+      its routing assertion and passes with it.
+
 - [ ] **1.5 Make the statement timeout actually fire.** Mode D: a 7d query ran
       >20 min against an effective 60 s cap and never cancelled, on a
       server that was otherwise healthy. Until this is understood, "it will at
