@@ -682,3 +682,35 @@ Three things follow, in confidence order.
 been emitted on this box, so `built=`, `deferred_to_next_pass` and the
 end-of-pass gauges remain unverified, and the §4 tail-share verdict still has no
 data. The pass above is the closest any has come.
+
+### 12:50 — "a completed pass" was the wrong success criterion
+
+Six restarts in the hour (12:06, 12:22, 12:35, 12:36, 12:49 …), each killing a
+pass 2-4 builds in. Two of the day's were mine; the rest are a sibling session's.
+No pass has completed and, on a box deploying this often, none will.
+
+**That does not matter any more, and holding to it was my error.** I chose
+"first `tantivy_backfill_pass` completion" as the headline observable when the
+manifest flush was driven by build completions — in that world an unfinished
+pass banked nothing, so completion really was the thing to wait for. With the
+timer-driven flush (`cefcdc3`) each build is committed within 30 seconds of
+finishing, so **progress accrues per BUILD, not per pass.** A pass killed after
+three builds now keeps three builds.
+
+**Revised success criteria**, replacing the pre-registered table's row (b):
+
+| observable | why it is the right one |
+|---|---|
+| `week`+`older` declining steadily | the only thing that matters; survives restarts because the census is a live diff |
+| the same `rows=` value never appearing twice | proves work is banked rather than repeated — the 759,809-row whale built at 11:57 and again at 12:22 is the failure this replaces |
+| `from_reserved_tail` distribution over many builds | decides `tail_share_pct` without needing a whole pass |
+
+All three are per-build or per-sample, so they accumulate across container
+generations instead of being reset by them. That is the property the old
+criterion lacked.
+
+**Current reading**: `week`+`older` = 5,668 → 5,667 → 5,664 across the morning.
+Downward, but ~-4 in 2.5 hours, which is months. Expect that to change once the
+timer flush is live, because until now the expensive builds were being redone;
+if it does NOT change, the drain rate is genuinely the problem and the whale
+handling (`max_file_mb`, or sharding the unit) is next.
