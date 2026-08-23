@@ -1397,3 +1397,45 @@ own reference, so that does not settle it.
 **This is the strongest open lead and it is upstream of everything else**: the
 start gate I believed I fixed this morning is still shut, just for a different
 reason than the schedule.
+
+### 17:10 — the reconcile IS registered and the cron machinery works, so it is exiting at the gate
+
+Two checks against existing logging, no deploy needed:
+
+```
+Tantivy reconcile job scheduled with cron expression: 0 */15 * * * *   <- registered
+bloom sidecar reconcile: built=28 errors=0   @16:32                    <- machinery fires
+bloom sidecar reconcile: built=55 errors=0   @16:39
+grep -c "tantivy reconcile"  (60m)  =  0                               <- never a line
+```
+
+So the job is registered with the right schedule, on the same cron machinery that
+demonstrably fires a sibling job every five minutes, in the same process — and it
+has never produced a line. The job logs unconditionally once past its gate, and
+it has exactly one silent exit:
+
+```rust
+let Some(svc) = db.tantivy_indexer().cloned() else { return };
+```
+
+**The overwhelming reading is that the tantivy indexer is absent from the
+`Database` the cron holds.** The flush path still builds indexes because it holds
+its own service reference (121 builds), which is why the failure is invisible
+from the outside: indexing *appears* to work while every table-wide reconcile
+never starts.
+
+That is the root cause of the day, and everything else was a symptom of it: no
+reconcile means no backfill of any table, which means rollup and metrics
+manifests frozen since 08-20, which means `older` climbing forever against a
+drain that only ever touched files the flush path happened to create.
+
+`1608958` makes the gate observable (`tantivy_reconcile_no_indexer`) rather than
+guessing which branch it takes. `with_tantivy_indexer` publishes through a shared
+`OnceLock` so clone ordering should not matter, and `let _ = …set(svc)` swallows a
+second set — both worth checking against the warning once it deploys, rather than
+reasoning further from the source.
+
+**Deliberately not fixed blind.** The attachment path in `server/mod.rs` looks
+correct on the page, so patching it on suspicion would risk another change
+shipped on a false premise — the mistake already made once today with the census
+dedupe. One instrument, one deploy, then the fix.
