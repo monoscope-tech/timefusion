@@ -930,3 +930,26 @@ incremental rollout.
 
 Sequenced, not dropped: do the dimension-set tag first, then add `level` behind
 it.
+
+### Fix B verified in production, on the instrument built for it
+
+Six consecutive coarsen ticks on `fd99a91`, 18:15–18:23 UTC:
+
+| tick | fused | priced_by_footprint |
+|---|---|---|
+| 18:15 | 0 | 0 |
+| 18:16 | 4 | **2** |
+| 18:17 | 0 | 0 |
+| 18:20 | 4 | **2** |
+| 18:21 | 10 | **5** |
+| 18:23 | 9 | **2** |
+
+`priced_by_footprint` counts buckets whose summed member estimates exceeded
+`MAX_DECODED_BYTES` and which fit ONLY because members sharing a file set were
+charged once — **11 of the 27 buckets fused in that window would have been
+refused before this change.** `input_fp` is populated on claims and repeats
+across units of the same partition, which is the shape the pricing depends on.
+
+Not quoted: `over_budget` per tick (12–27). There is no pre-deploy reading from
+the same instrument at the same cadence, and the sim's cumulative figure is not
+comparable.
