@@ -1789,3 +1789,44 @@ midnight that partition ages into `week` wholesale, so the sealed backlog takes 
 be read as a regression when it appears — it is deferred work arriving on
 schedule, and it is the strongest argument yet that `skip_today` deserves
 revisiting for tables whose writes land in today's partition continuously.
+
+## 23:20 — two more intervals: `week` is draining, `older` is not
+
+First, a measurement I nearly reported: my parser printed
+`uncovered=0 today=0 week=0 older=0` for both samples. The census returns exactly
+`(0, 0, [0;3])` when the indexer is absent, so all-zeros is a real failure mode
+and it looked like one. It was not — my regex allowed up to 12 non-digit
+characters between the field name and its value, and the ANSI escape `\x1b[0m`
+between them contains a `0`. Stripping escapes first gives the real numbers.
+**Sixth measurement error of the day, and the first that read as bad news
+instead of good.**
+
+| time | uncovered | today | week | older | **sealed (week+older)** |
+|---|---|---|---|---|---|
+| 19:24 (pre-budget) | 6773 | 686 | 2026 | 4061 | **6087** |
+| 20:02 | 6294 | 714 | 1832 | 3748 | 5580 |
+| 20:16 | 6383 | 778 | 1833 | 3772 | 5605 |
+| 20:31 | 7024 | 1208 | 1854 | 3962 | 5816 |
+| 21:05 | 7252 | 1235 | 1772 | 4245 | 6017 |
+| 21:18 | 6939 | 1247 | 1635 | 4057 | **5692** |
+
+Separating the tiers is what makes this readable:
+
+- **`week` is draining steadily**: 2026 → 1832 → 1833 → 1854 → 1772 → **1635**.
+  -391 over two hours, monotone apart from one interval. This is the byte budget
+  working.
+- **`older` is not**: 4061 → 3748 → 3772 → 3962 → 4245 → 4057. Noisy and net
+  flat. The deepest tier is holding, not shrinking.
+- **`today` climbs and is deferred by design**: 686 → 1247.
+
+Net sealed backlog **-395 in two hours**, entirely attributable to `week`. Across
+a window containing at least four deploys, so the drain is a lower bound.
+
+**Honest position: no longer diverging, not yet converging.** The starvation is
+fixed and one tier is draining; the deepest tier is not, and `today` is
+accumulating ~1,250 files that will land in `week` wholesale at UTC midnight.
+
+The two open questions, in order: whether `skip_today` should apply to tables
+whose writes land in today's partition continuously, and why the fair-split's
+reserved tail share is not translating into `older` progress now that passes are
+16x larger.
