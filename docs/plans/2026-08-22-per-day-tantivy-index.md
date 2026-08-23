@@ -586,3 +586,49 @@ each completed build (the data is already in `IndexBuildStats`, currently only
 at `debug!`). Until the size distribution of the backlog is known, neither the
 tail reservation nor the cap can be sized honestly — and I have now twice sized
 something against an assumed rate rather than a measured one.
+
+### 11:30 — builds are not slow; the backfill's FILE SELECTION is
+
+One log window settles what two days of rate-guessing could not. Between 11:25
+and 11:27 on a single container:
+
+```
+11:25:52  tantivy_wave_reindex_complete built=1 failed=0
+11:25:54  tantivy_wave_reindex_complete built=1 failed=0
+   ... 8 of these in ~2 minutes ...
+11:27:22  WARN tantivy build produced 69 segments (> 32); merging inline
+```
+
+**The wave-reindex path did ~8 builds in 2 minutes — on the order of 240/hr —
+against the backfill's measured 4-6/hr.** Same `build_index_for_file` primitive,
+same object store, same process. The only difference is which files each one
+picks:
+
+- **wave reindex** builds the file a compaction just wrote: small, fresh.
+- **backfill**, ordered newest-first *within* an oldest-reserved queue, reaches
+  for the most-compacted files, which are the largest. The 69-segment warning in
+  the same window is one of those — at a 64 MB writer arena, ~4 GB of content.
+
+So `~4-6 builds/hr` was never a property of the indexing code. It is the average
+cost of the *particular* files the backfill selects. There is no ceiling to
+attribute and no build path to optimise.
+
+**This is evidence against a change already shipped.** The tail reservation
+(`timefusion_tantivy_backfill_tail_share_pct`, default 33) hands a third of
+every pass to the OLDEST uncovered files — which this says are the LARGEST, and
+therefore the slowest possible way to spend those slots. The reservation was
+justified by a real defect (newest-first starves the tail) but may be the wrong
+remedy for it.
+
+**Do not just lower the knob.** The backlog IS the old files; draining it
+necessarily means indexing them, so a smaller reservation only defers the
+problem. What the evidence actually argues is that multi-GB files need a
+DIFFERENT MECHANISM, not a scheduling share — either a size cap that lets the
+many small files drain while whales wait (`max_file_mb` is 4096 today, and its
+own comment says that number exists to bound `pack_dir`'s tar, not because 4 GB
+is a sensible unit), or the per-day index, which changes the unit outright.
+
+**Confirming measurement is already shipped** (`e6315af`): every build now logs
+`rows`, `index_bytes`, `segments`. One pass's worth of those lines gives the
+size distribution directly, and turns this from a well-supported hypothesis into
+a number. Do not re-tune the reservation or the cap before reading it.
