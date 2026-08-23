@@ -78,3 +78,44 @@ build throughput (~4 builds/hr by the concurrent session's own measurement), and
 a prod that is quiet long enough to measure, which the deploy train has not
 provided: coverage takes ~25 min to rebuild and prod restarted roughly every
 15-25 min throughout this session.
+
+## Pass-condition re-measure (prod `45b9ab4`, 49 min uptime, coverage 30)
+
+First quiet window of the session. `count(*)` by 6h bucket, 6 projects x 14d/30d,
+serial, 70 s cap:
+
+| project | 14d | 30d |
+|---|---|---|
+| `87576849` | **timeout** (60.9 s) | **refused** (8.5 s) |
+| `edb04135` | 1.0 s | 22.7 s |
+| `00000000` | 13.6 s | 55.2 s |
+| `dcad860a` | 11.0 s | 29.7 s |
+| `be87ebc1` | 8.7 s | 28.1 s |
+| `28f62f01` | 46.5 s | **refused** (11.6 s) |
+
+**9 of 12 complete**, against a baseline where most 14d/30d cells failed —
+`00000000` 30d and `28f62f01` 14d both went from `fail` to answering, and
+`dcad860a` 30d from 30.9 s cold to 29.7 s.
+
+**The two "failures" are the size guard working, not a regression.**
+`TIMEFUSION_WIDE_SCAN_REJECT_MB` is now enabled in prod at 16 GiB, and it refuses:
+
+```
+scan selected 1458 files / 461034 MiB, over the 16384 MiB per-scan limit
+scan selected  586 files /  25971 MiB, over the 16384 MiB per-scan limit
+```
+
+**461 GB in a single scan.** That query was never going to complete; before the
+guard it was an availability event for every other session on the box (mode C,
+measured 2026-08-22 as new connections timing out). Refusing it in 8.5 s with a
+message naming the size is the correct outcome, and it is what the guard was
+built for — but it does mean "complete" is not reachable for those two cells by
+scanning. They need the tier BUILT, which is `not_built`: 135 of ~147 misses,
+with `pending_base_rollup` at 12,443.
+
+So the goal now decomposes cleanly:
+
+- routing RULES: solved (`stale_coverage` 0, `filter_not_eligible` 0 on driven
+  queries; `rollup_hits_hybrid_total` climbing, 1 -> 3 during this window)
+- the widest cells: blocked on build throughput, not on query-side work
+- one genuine timeout left (`87576849` at 14d, 60.9 s)
