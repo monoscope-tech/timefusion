@@ -1869,3 +1869,48 @@ rather than left at a token value.
 whale-heavy queue short. At 320/slot and four slots an hour that is ~1,280
 files/hr per table against ~77/hr of accrual — the first setting all day where
 drain exceeds inflow by an order of magnitude rather than trailing it.
+
+## 00:35 — 128 builds in one pass, and the spans pass still never completes
+
+Ceiling of 320 is live (`cap=320` in the 22:15 pass). Ninety minutes of summary
+lines:
+
+```
+1m_v3                        built=128       <- the byte budget + ceiling delivering
+…level_1m_v1                 built=0   (x2)  <- nothing to do
+otel_logs_and_spans          (no summary line at all)
+```
+
+**`built=128` is the win, measured**: one pass now does 16x what the cap allowed
+this morning. And `otel_logs_and_spans` has not printed a completion in ninety
+minutes — its pass is 7 files at ~4-5 min/build ≈ **30 minutes**, against a
+~15-minute restart window. The starvation is fixed *between* tables and now
+reproduces *inside* the spans table.
+
+That also explains why the census went flat rather than converging:
+
+| time | today | week | older | sealed |
+|---|---|---|---|---|
+| 22:00 | 1361 | 1404 | 4074 | 5478 |
+| 22:16 | 1361 | **1404** | 4096 | 5500 |
+| 22:31 | 1428 | **1404** | 4125 | 5529 |
+
+`week` fell 2026 -> 1404 and then stopped dead — three identical samples. `older`
+is creeping up again. The arithmetic fits: **only one `1m_v3` pass completed in
+ninety minutes**, so the rollup drain is ~128 files per ~90 min ≈ 85-100/hr
+against ~77/hr of accrual. Barely above water, which is what a flat tier looks
+like. The rollup tables are not slow — they are *rarely reached*, because the
+spans pass eats the slot whenever it is not the leader.
+
+**So one change would unlock the rest: stop letting the spans pass block the
+cheap ones.** Running the tables concurrently is the structural answer (rollup
+passes take seconds; spans takes half an hour), with a small bound because this
+box has an OOM history.
+
+**Not shipping it tonight.** Three changes are already in flight and unevaluated
+— rotation, the byte budget, and the 320 ceiling — and prod restarts every ~15
+minutes from other work, so a fourth would land in a window where none of them
+can be measured. Today already produced one change shipped on a false premise
+and reverted; the failure mode is not caution, it is stacking. The diagnosis is
+recorded and the change is one function call when there is a quiet process to
+measure it against.
