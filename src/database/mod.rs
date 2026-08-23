@@ -11440,6 +11440,28 @@ mod tests {
         Ok(())
     }
 
+    /// The republish bound keeps the NEWEST slices and defers the rest.
+    ///
+    /// Not a detail: prod's first pass found 23,337 witness-less slices, and
+    /// queueing them flat took `pending_base_rollup` from 7,075 to 12,131 against
+    /// ~16 builds/hr. An undrainable queue does not just take longer — it makes the
+    /// coordinator's ranking meaningless, because a two-week-old slice nobody
+    /// queries competes with yesterday's. Dashboards need contiguous RECENT days,
+    /// so newest-first is what the bound has to preserve.
+    #[test]
+    fn the_republish_bound_keeps_the_newest_slices() {
+        use crate::maintenance_coordinator::TimeSlice;
+        const BOUND: usize = 512;
+        let day = 86_400_000_000i64;
+        let slices: Vec<_> = (0..600).map(|i| TimeSlice::new(i as i64 * day, (i as i64 + 1) * day).expect("slice")).collect();
+        let mut ordered: Vec<_> = slices.iter().collect();
+        ordered.sort_unstable_by_key(|slice| std::cmp::Reverse(slice.start_micros));
+        let kept: Vec<_> = ordered.into_iter().take(BOUND).map(|slice| slice.start_micros).collect();
+        assert_eq!(kept.len(), BOUND, "the bound must cap the pass");
+        assert_eq!(kept[0], 599 * day, "the newest slice must be first");
+        assert_eq!(*kept.last().expect("bounded"), 88 * day, "the bound must cut from the OLD end, not the new one");
+    }
+
     /// A partition still holding an untagged tier file must be QUEUED for rebuild.
     ///
     /// `slice_retires` can retire such a file, but only when something publishes that partition,

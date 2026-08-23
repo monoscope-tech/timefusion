@@ -2726,8 +2726,23 @@ impl Database {
         let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
         let now = crate::support::now_micros();
         let created = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        // NEWEST FIRST, and bounded. The first pass on prod found 23,337 of these
+        // across the two sources — 92% of ALL recovered coverage — and queueing
+        // them flat took `pending_base_rollup` from 7,075 to 12,131 against a
+        // measured ~16 builds/hr. That backlog cannot drain, and an undrainable
+        // queue is not merely slow: it makes the coordinator's ranking meaningless,
+        // because a two-week-old slice nobody queries competes with yesterday's.
+        //
+        // A dashboard needs CONTIGUOUS RECENT days, so the newest slice is worth
+        // more than any older one and the bound costs nothing it would have got.
+        // Re-running hourly advances the frontier: a republished slice carries a
+        // witness, leaves this list, and the next pass takes the next `BOUND`.
+        let mut ordered: Vec<_> = slices.iter().collect();
+        ordered.sort_unstable_by_key(|(_, slice)| std::cmp::Reverse(slice.start_micros));
+        const BOUND: usize = 512;
+        let queued = ordered.len().min(BOUND);
         let mut journal = self.journal();
-        for (project_id, slice) in slices {
+        for (project_id, slice) in ordered.into_iter().take(BOUND) {
             let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice: *slice, operation };
             journal.enqueue(key, now, MAX_DECODED_BYTES, created);
         }
@@ -2735,9 +2750,12 @@ impl Database {
         warn!(
             source,
             target,
-            queued = slices.len(),
+            queued,
+            // Named, never silent: a cap that does not say what it dropped reads
+            // as "everything is queued" and hides the real size of the backlog.
+            deferred = slices.len().saturating_sub(queued),
             event = "rollup_witnessless_rebuild_queued",
-            "slices predating the row witness cannot be verified and were queued for republish"
+            "slices predating the row witness cannot be verified and were queued for republish, newest first"
         );
     }
 
