@@ -161,3 +161,52 @@ re-mints them from the file list, giving each unit a narrow window to be claimed
 So lever 2 does not need a new mechanism. It needs the 48 cells to drain, and the
 thing that most slows that is the same deploy cadence that has truncated every
 measurement in this session.
+
+## Compaction attempted by hand: one cell done, and why the rest cannot go that way
+
+`OPTIMIZE <table> WHERE date = '…' AND project_id = '…'` is partition-bounded and
+works. Verified end to end against the Delta snapshot:
+
+```
+6297304f / 2026-08-19    15 files -> 1 file      (OPTIMIZE 15 1, ~2 min)
+out-of-policy cells      48 -> 47
+small files              1,784 -> 1,769
+```
+
+Three other attempts FAILED, all the same way:
+
+```
+p1 / 2026-08-19  (238 files, 1.93 GB)  Failed to allocate 298.4 MB … 264.8 MB remain
+p1 / 2026-08-21  ( 58 files, 0.82 GB)  Failed to allocate  98.8 MB …  27.7 MB remain
+6297304f / 08-17 (275 files, 0.90 GB)  Failed to allocate  19.6 MB …  19.2 MB remain
+                                       (retry)              22.7 MB …  22.3 MB remain
+                                       (retry)               9.4 MB …   9.0 MB remain
+```
+
+Interactive `OPTIMIZE` sorts the whole partition inside the **shared 5 GB query
+pool**, so it competes with live dashboard traffic. That alone makes it unusable
+for the cells that matter — the 238- and 275-file ones.
+
+**And the failures appear to LEAK the reservation.** `RepartitionExec[1]#107738`
+appears at exactly 77.3 MB in three separate failed statements, and the pool's
+free space trends down across attempts — 264.8 -> 27.7 -> 19.2 -> 22.3 -> 9.0 MB.
+The same operator id surviving into later statements is not contention, it is a
+reservation that was never released. Worth its own investigation; it means a
+failed OPTIMIZE degrades the pool for everything after it.
+
+Live queries stayed healthy throughout (a 1-hour `count(*)` returned in 1.7 s,
+no restart), so the damage is confined to that pool's headroom — but I stopped
+attempting further OPTIMIZEs rather than keep draining it.
+
+## Conclusion for lever 2
+
+The remaining 47 cells must go through the SYSTEM's consolidation path, not by
+hand. That path bin-packs, runs on the maintenance pool rather than the query
+pool, and commits incrementally — which is exactly why it exists — and it is
+running (23 consolidation events in a 20-minute window). Lever 2 is therefore a
+matter of that queue draining, with two things slowing it:
+
+1. `SealedConsolidation` is a DERIVED operation, so every deploy discards the
+   queued units and the planner re-mints them; prod restarts every 20-40 min.
+2. The pool leak above, if confirmed, reduces headroom for everything sharing
+   the query pool.
