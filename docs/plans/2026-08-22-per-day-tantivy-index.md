@@ -994,3 +994,48 @@ Open question, not a claim: are those 62 builds 62 distinct files, or a few
 files rebuilt repeatedly? The `tantivy_index_built` line does not carry the
 file path in a form my grep found, so this needs the field checked in code
 before the next read.
+
+### 15:05 — the 2:1 claim dissolves: 121 of 121 builds are the flush path
+
+The entry above compared two different populations. Attributing the same 25-minute
+window by thread pool settles it:
+
+| builds by pool | count |
+|---|---|
+| `tokio-rt-worker` (flush self-indexing new files) | **121** |
+| `maintenance-worker` (backfill / wave) | **0** |
+| `tantivy_backfill_unit` events | **3** |
+
+`tantivy_index_built` fires from the shared build fn for *every* producer, so
+counting it measures flush volume, not drain. Flush covers files **at creation**
+and never touches `uncovered`. So "builds outpace accrual 2:1 yet coverage falls"
+was never a paradox — it was one number from the flush path set against another
+from the backfill path. **"Indexes are not sticking" is withdrawn**; it was
+invented to explain an artifact of my own arithmetic. (The not-sticking
+hypothesis does still have a live counter-test: the monitor watches for
+`rows=1304769` reappearing, and it has not.)
+
+**The corrected numbers make the picture worse, not better:**
+
+| flow | rate |
+|---|---|
+| flush self-indexing (irrelevant to the backlog) | ~290/hr |
+| **backfill drain** | **~7/hr** (3 units / 25 min) |
+| accrual into `older` | ~96-124/hr |
+
+The drain is not ~30/hr. It is **~7/hr** — four times worse than the figure I
+have quoted all day, against ~100/hr of accrual. The backlog diverges by more
+than an order of magnitude, and with `max_files_per_pass = 8` even a perfect
+15-minute reconcile cadence caps the drain at 32/hr. **The cap and the pass
+cadence cannot close a 100/hr gap arithmetically, no matter how well they run.**
+
+Also provisional, flagged rather than trusted: the 12/12 `carried/rebuilding`
+exoneration of the wave path came from a process 5-20 minutes old, inside the
+same warm-up window that has now burned me twice. It is not retracted, it is
+*unconfirmed* — re-read the ratio once this process passes ~40-60 min.
+
+**Next, and it needs no deploy and no quiet window:** stop inferring the producer
+from rates (three rate-inferences retracted today). Take ~20 files newly
+uncovered in `older` this hour and read from the Delta commit info which
+operation added each — OPTIMIZE, dedup, wave, or flush. That is a direct
+attribution the census series structurally cannot give.
