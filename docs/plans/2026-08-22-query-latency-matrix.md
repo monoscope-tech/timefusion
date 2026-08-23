@@ -501,7 +501,50 @@ The journal persists correctly — `dirty_bin_queue_depth` and
 `pending_base_rollup` both survived the 07:17 restart to the unit. What is lost
 is the work, not the plan.
 
-Two fixes, and the first already exists for one operation:
+### The real journal, copied out and counted: the queue is 14.9x inflated
+
+`docker cp <container>:/app/data/timefusion/.timefusion_meta/maintenance_tasks.json`
+(note the in-container path is `/app/data/timefusion`, not `/data`; the host
+volume itself is root-owned and unreadable as `ubuntu`). 46 MB, 94,223 tasks:
+
+```
+superseded  61,267   (65% — dead parent records from splitting)
+pending     21,598
+complete    11,120
+retry          231
+running          7
+```
+
+Pending resolves to **1,452 distinct (operation, project, date) cells — 14.9x
+inflation**. The worst single cell:
+
+```
+base_rollup  00000000  2026-08-13   1,474 units
+base_rollup  87576849  2026-07-25     660
+base_rollup  87576849  2026-07-23     571
+base_rollup  87576849  2026-07-29     539
+```
+
+And the widths say why:
+
+```
+600s  2,714 units      60s  1,860 units      360s  1,651
+300s  1,380            180s  1,531           86400s  678
+```
+
+**1,860 units sit at the 60-second floor.** This is the shredding pattern memory
+already records once — "3,455 units for ONE cell from shredding a day to the 1m
+floor when the real holes were 22 MINUTES". It is here again at 1,474.
+
+So question 1 is answered: **the queue is not 21,598 pieces of real work, it is
+~1,452 cells wearing 21,598 costumes.** Since unit cost is dominated by the
+commit and the object-store round trips rather than by width, 14.9x inflation is
+close to 14.9x wasted fixed cost. Coarsening pending slices per cell before
+execution is worth more than any amount of extra worker capacity — and
+`coarsen_sealed_slices` already exists to do exactly this, so the question is why
+these survived it.
+
+Two further fixes, and the first already exists for one operation:
 
 1. **Resume instead of redo.** `timefusion_repair_resume_enabled` (default true,
    on in prod) already commits a matching staged-but-uncommitted rewrite rather
