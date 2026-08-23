@@ -494,3 +494,51 @@ still do not move once passes complete, the reservation is not the lever.
    prefilter for up to a day. The fix is to give `light_optimize_tail` the
    carry-forward hook `optimize_table` now has — then today is cheap to cover
    and `timefusion_tantivy_backfill_skip_today` can go back to false.
+
+### Verdict on the four pre-registered observables (2026-08-23 10:29)
+
+Live `bceea08` then `9c704e2`. Judged against the table above, not against what
+would have been nice.
+
+| observable | verdict |
+|---|---|
+| `tantivy_backfill_started` within 15 min of boot | **MET.** 08:45, and 09:00 on a container booted 08:49 — 11 minutes. Baseline was ZERO starts in six hours. |
+| `cap=8`, `skipped_today` reported | **MET.** `planned=8 cap=8 skipped_today=1` in the live log. |
+| first-ever `tantivy_backfill_pass` completion | **NOT MET.** 2 starts, 0 completions in the last 100 minutes. |
+| `tantivy_carried_forward > 0` | **NOT MET.** 0. Needs an `optimize_table` whose inputs are all covered AND which is the sole commit in its window. |
+
+**Why the last two are unmet is not the code.** A cap-8 pass is ~2 hours at the
+measured rate and no container has lived that long: prod took another restart at
+10:19 and the in-process counters reset with it. The start gate is exactly what
+was broken and it is exactly what is now fixed; the completion evidence needs a
+quiet window that today has not contained.
+
+**§4 tail-share: still NO VERDICT, deliberately.** `week+older` went 5673 → 5668
+across 70 minutes (-5) — the right direction, inside the noise floor of a
+15-minute live diff. The pre-registered condition was decline ACROSS container
+generations once passes complete. Passes have not completed. Recording -5 as
+success would be fitting the answer to the data available.
+
+**Two corrections to earlier claims in this document.**
+
+1. `TANTIVY_CARRIED_FORWARD` was incremented but never surfaced in
+   `timefusion_stats`, so observable (d) was unreadable when it was
+   pre-registered. Fixed in `bceea08`. A counter nobody can read is not
+   instrumentation.
+2. Pass survivability was called "already implemented, no work needed" from a
+   code read. Live counters then showed `tantivy_backfill_built = 2` with
+   `tantivy_manifest_commits = 0` — the exact signature the sibling's own commit
+   message describes as the durability bug they had fixed. The benign
+   explanation (builds complete in PAIRS under `buffer_unordered(2)`, so both
+   sweeps see an age under the 60s bound and the flush lands on the next pair)
+   fits and is testable, but it is a hypothesis, not the verification the
+   original claim implied. **Unresolved**: restarts reset the counters faster
+   than the next pair arrives.
+
+**The ceiling nobody has attributed: ~4-6 builds/hr.** Two independent readings
+today — 30 builds in 7 hours, and 2 in 19 minutes. That is ~15 minutes to index
+a ~1 MB parquet, which is pathological and is now the top item. Every fix in
+this batch was downstream of a drain that could not run; this is what remains
+once it can, and at this rate the 5,668-file backlog is months regardless of
+schedule, cap or ordering. **Do not tune the drain further before attributing
+the build cost.**
