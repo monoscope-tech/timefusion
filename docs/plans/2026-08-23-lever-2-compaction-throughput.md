@@ -256,3 +256,67 @@ command:
    (12 of 16 jobs) with Dedup, whose queue is ~6,000 units. A reserved slot for
    file debt would stop a large dedup backlog from crowding out the 47 cells,
    the same argument the sealed-work reservation already makes for rollups.
+
+## The mechanism runs, claims the right work, and retires nothing
+
+Measured over ~45 minutes on one container:
+
+```
+Delta version            498924 -> 498987   (~30 commits, so work IS committing)
+out-of-policy cells          48 -> 48
+small files in them       1,784 -> 1,772
+6297304f / 2026-08-17       275 files -> 275 files
+87576849 / 2026-08-19       238 files -> 238 files
+28f62f01 / 2026-08-18       230 files -> 230 files
+```
+
+`SealedConsolidation` units are claimed every 30-60 seconds, for exactly the
+right projects (28f62f01, 87576849, 6297304f, dcad860a, 00000000). So this is
+not starvation, not the debt-slot cap, and not a missing caller — the work is
+being scheduled and something is committing. The file counts simply do not move.
+
+## The most likely cause, with the numbers that point at it
+
+`select_coordinator_compaction_candidates` walks candidates in EVENT-TIME order,
+not size order, and the L0 budget is `COORDINATOR_L0_SORT_TARGET_BYTES` = 16 MB:
+
+```rust
+if !selected.is_empty() && bytes + add.size > limit { break; }
+selected.push(add);
+```
+
+The first candidate is pushed unconditionally. If it is larger than 16 MB — and
+`6297304f / 2026-08-17` holds files up to 124 MB among 3.3 MB ones — the very
+next candidate breaks the loop and the unit returns ONE file. A one-file
+"compaction" rewrites one file into one file and retires nothing, which is
+exactly the flat file count observed.
+
+That single-file selection is DELIBERATE for the legacy transition sort (there is
+a test asserting `[legacy 40 MB] -> ["legacy"]`, and the design note explains an
+unsorted file's first rewrite is a one-time blocking sort). So the bug is not
+that it selects one file; it is that a large-but-under-target file early in the
+day can be selected repeatedly while the hundreds of small files that made the
+partition out of policy are never reached.
+
+The output IS tagged `SORTED_RUN_TAG` when the pass sorts, so a tagged file
+should be skipped next tick and the cell should advance. Whether it actually
+advances — or re-selects the same file forever — is the open question, and it is
+answerable with one log line this code does not currently emit: the unit logs
+nothing when its selection is empty or single-file.
+
+## Why I did not ship a fix for this
+
+I tried the obvious change — skip a candidate that alone meets the budget — and
+it breaks `coordinator_compaction_sorts_small_l0_units_before_merging_sorted_runs`,
+which asserts that exact single-file behaviour on purpose. Reverted. A selector
+whose deliberate cases I can still get wrong is not one to change speculatively
+against a live box, especially while a concurrent session is working in it.
+
+What the next person needs, in order:
+
+1. A log/counter on the empty and single-file selection paths, so a unit that
+   retires nothing is visible instead of silent. This codebase has been burned
+   repeatedly by exactly this shape (`dirty_bin` drain with no caller, the
+   untagged-tier stall, the counter that fired before the commit).
+2. With that, decide whether large-file-first selection is starving the small
+   files, and if so pack smallest-first within the L0 budget.
