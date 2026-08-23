@@ -400,6 +400,78 @@ says nothing about whether the values fed to it mean what you think. Both
 fingerprints are `u64` named `source_fp`, so the type system had nothing to say
 either.
 
+## 2026-08-23: routing works for the first time — and latency did not move
+
+`937350c` restored the `rollup_coverage` producer. First read after the deploy:
+
+```
+rollup_hits_full_total   = 936      (was 0, always)
+rollup_hits_hybrid_total = 691      (was 0, always)
+rollup_misses_total      = 1512
+```
+
+**Hits now exceed misses.** The date-level route does not consult the per-slice
+witness at all, so it is unaffected by the 95.2% of slices that cannot be
+verified — which is exactly why it was the right thing to fix first.
+
+**But the latency measurement is worthless, and the controls prove it.** The
+routed shapes read 3d group-by 9.5-11.6 s (baseline 2.5 s) and 7d group-by
+6.9-7.9 s (baseline 10.6 s). Before reading anything into that, the in-round
+controls — shapes that do not route at all:
+
+| control | baseline | now |
+|---|---|---|
+| `trace_id =` needle 7d | 78-170 ms | 215-225 ms |
+| `ORDER BY ts DESC LIMIT 100` | 255 ms | 932 ms |
+
+TopK is 3.6x slower and it cannot have been touched by rollup routing. The cause
+is on the same page: `cpu_tokens_used = 16` of 16, and `pending_base_rollup`
+climbed **7,026 → 12,247 in ~25 minutes**. The box is saturated draining its own
+queue, so every number in that window is a load measurement, not a query
+measurement.
+
+So: routing is achieved and verified; the latency claim is **not yet made**. It
+needs the quiet window CLAUDE.md already prescribes (≥2 h, no redeploys), which
+this box has not had all session.
+
+## The queue is the live problem, and it is not what task #2 assumed
+
+`abandon_running` ALREADY does what "stop re-claiming doomed units" asks: it
+bisects at `attempts >= 2` and otherwise backs off floored at the operation's own
+deadline, with comments citing the 2026-08-18 and 2026-08-21 incidents that
+prompted it. And `retry_reason = compaction_debt_remaining` is a by-design
+requeue, not a failure — memory records that `attempts` is a LOOP COUNTER for
+Repair, so the "30 of 31 on attempts > 3" reading from the compaction chart does
+not mean what it appeared to.
+
+What the current binary actually shows:
+
+```
+pending_base_rollup            12,231      eligible_base_rollup     6,892
+pending_dedup                   6,024      dirty_bin_queue_depth   18,904
+pending_sealed_consolidation       67      eligible_sealed_total    9,736
+oldest_task_age_seconds     7,166,084  = 83 days
+rollup_stale_moved            222,410      rollup_stale_no_witness      0
+```
+
+Two things to chase, in order:
+
+1. **Is the queue real?** Memory `tf_queue_is_339x_inflated` records 88,100
+   pending resolving to 260 real cells — a 339x inflation from shredding days to
+   the 1m floor. If 12,231 is similarly inflated, this is a de-shredding problem,
+   not a capacity one, and adding workers would do nothing.
+2. **Is it a feedback loop?** `rollup_stale_moved` at 222,410 says partitions are
+   moving constantly. Every compaction or dedup rewrite changes a partition's
+   fingerprint, which invalidates its rollup coverage, which enqueues a rebuild.
+   With 18,904 dirty bins that loop would mint rollup work faster than it can be
+   drained, and no amount of rollup throughput would converge. That would make
+   compaction and rollup one problem in a far more precise sense than "they share
+   a worker pool".
+
+Neither is settled. `timefusion sim <journal.json>` over the real prod journal
+answers both offline, in seconds, without a deploy — that is the next step, not
+another prod experiment.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
