@@ -4,10 +4,10 @@
 at least COMPLETE for every project.** Baseline and failure-mode taxonomy:
 `2026-08-22-make-14d-30d-complete.md`.
 
-Four of five items shipped. Item 1.1's decision is measured and made; the action
-it implies is a production credential change and is handed over rather than
-taken. Item 1.2 was root-caused and deliberately not shipped — the reason is
-below and it is not "ran out of time".
+Three of five shipped and verified. **1.1 is closed, not deferred** — its lever
+was deleted from the codebase ninety minutes after the build the checklist named,
+because it was measured to do nothing. **1.2 is blocked on a rebuild-class fix**;
+the reason is below and it is not "ran out of time".
 
 ## 1.4 — a null guard on a measure column is a no-op *(shipped)*
 
@@ -123,11 +123,14 @@ Post-deploy check: re-run the wedge shape (a 7-day aggregate on p5) and a clean
 statement-timeout error at ~60 s is the pass signal. A second >20 min run means
 the long poll is somewhere these two wrappers do not reach.
 
-## 1.1 — measured, decided, and handed over
+## 1.1 — investigated and CLOSED: the lever no longer exists
 
-The gate on this item was "read `rollup_stale_no_witness` vs `_moved` first; the
-flag does nothing for `moved`." Read with **coverage valid at 30**, not during a
-post-restart rebuild:
+The item said "first action is flipping `TIMEFUSION_ROLLUP_SLICE_FP_FALLBACK` on
+the currently-deployed `a7a4eb0`, after reading `rollup_stale_no_witness` vs
+`_moved`". I did the read. The flip is not possible, and would be wrong.
+
+**The measurement, taken with coverage valid at 30** (not during a post-restart
+rebuild):
 
 | sub-reason | count | share |
 |---|---|---|
@@ -135,32 +138,39 @@ post-restart rebuild:
 | `rollup_stale_moved` | 624 | 20.3% |
 | `rollup_stale_no_source_rows` | 0 | 0% |
 
-`no_witness` dominates, so **`TIMEFUSION_ROLLUP_SLICE_FP_FALLBACK=true` is the
-right call** — it targets ~80% of stale slices, and the fallback is pessimistic
-rather than unsound (a fingerprint changes on compaction where `num_records`
-does not, so it refuses more than strictly necessary, never serves stale rows).
-The remaining ~20% are genuinely `moved` and no flag helps them.
+`no_witness` dominates, which is what the flag was built for — so on this
+evidence alone the flip looks right. **It is not.** The flag was removed in
+`7e5bb5a`, ninety minutes after the `a7a4eb0` that introduced it, and removed
+*because it does nothing*:
 
-**Not done here, deliberately.** The flag lives in CapRover's app env, not in
-this repo — `deploy/caprover-service-override.yml` documents the service
-override and explicitly is not env. Setting it needs the CapRover admin
-credential and restarts prod, and this repo's standing rule is that the
-production host is read-only: no restart, redeploy, or scale. Flipping it while
-unattended also lands in the middle of an unusually busy deploy train (prod moved
-`5062a7d` → `ba87ed3` → `7e5bb5a` → `11cd17a` → `a7a4eb0` inside two hours),
-where `rollup_min_contiguous_days` needs ~25 min to rebuild before the result of
-the flip is even readable.
+> The two fingerprints are incomparable in two independent ways: slice
+> `source_fp` is an `FnvHasher` over the files SELECTED FOR THAT SLICE; the
+> partition fingerprint is a `DefaultHasher` over the partition's WHOLE live
+> file set. Either difference alone makes equality impossible. Measured
+> end-to-end: with the flag on, a stripped-witness slice routed NOTHING.
 
-So: decision made and evidenced, execution handed over. After flipping, read
-`rollup_hits_hybrid_total` — but only once `rollup_min_contiguous_days` is back
-at 30, or the measurement has not started.
+It was deleted rather than left default-off with the explicit reasoning that "a
+flag that does nothing is worse than no flag: it reads as an available lever,
+and the next person costs themselves a night finding out it is not." Re-adding
+it — which is the only way to "flip" it now — would reintroduce dead code that a
+teammate had just deleted with an end-to-end measurement behind it.
 
-**One in-repo alternative, named rather than taken.** Flipping the code default
-on this branch would ship the same behaviour through the deploy train without
-touching CapRover, and the 80/20 measurement is the evidence either way. I left
-it off because `a7a4eb0` set it to OFF deliberately and that is a concurrent
-session's call to reverse, not one to make unattended — but it is a one-line
-change at merge time if that is preferred.
+**So the correct status is closed, not deferred, and my earlier note in
+`2026-08-22-make-14d-30d-complete.md` recommending the flip is wrong and is
+corrected there.** What the 79.7% actually says is that `no_witness` clears only
+by republishing those slices — throughput, which is the same wall as frozen
+compaction. That is a rebuild, and this goal excluded rebuilds. The remaining
+20.3% are genuinely `moved` and no amount of rebuilding fixes a churning
+partition.
+
+The three split counters (`ba87ed3`) survive and are what made both this
+measurement and the revert possible.
+
+Worth carrying forward, from the revert's own note: its unit tests over the
+predicate all passed and the integration test failed, and the integration test
+was right. Both fingerprints are `u64` fields named `source_fp`, so the types
+had nothing to say. Testing a pure predicate proves the predicate, not that the
+values fed to it mean what you think.
 
 ## 1.2 — root-caused, and NOT shipped on purpose
 
@@ -191,8 +201,40 @@ compaction workstream, which is Tier 2/3 and a rebuild — not a change to the
 Both are silent-wrong-answer changes in version resolution, which is the last
 place to make a speculative fix unattended. Mode B already fails safely today
 (the reservation is registered with the memory pool, so an oversize window fails
-its own query and the server survives). Leaving it is the correct call; the
-honest status is "blocked on ordering", not "done".
+its own query and the server survives).
+
+### The design that WOULD work, and the one hazard it has to clear
+
+Not shipped, but specified, because the blocking fact turned out to be in our
+favour and the next person should not re-derive it.
+
+`dedup_keys` for this table is `[timestamp, id]`, and the schema states that an
+UPDATE "appends the row's ORIGINAL timestamp into a NEW file". **`timestamp` is
+part of the dedup key, so every version of a key carries the same timestamp.**
+That licenses a bounded top-N *inside* the operator: for `ORDER BY timestamp
+DESC LIMIT n`, a key whose timestamp is below the n-th best distinct-key
+timestamp can never reach the output, and neither can any of its other versions.
+Evicting it caps state at O(n) instead of O(window).
+
+This is NOT the truncation the optimizer already forbids. `OrderedUnionForTopK`
+refuses to push a fetch through a `DedupExec` because "a `with_fetch` cut on a
+leg below it truncates that input... an equal-timestamp cut can keep a stale
+version whose newer sibling was truncated away." The eviction above still
+consumes the WHOLE input, so every version of every retained key is seen; it
+only bounds what is *remembered*.
+
+The hazard it inherits is that same tie: eviction must be **inclusive of ties**
+at the boundary (keep every key whose timestamp equals the n-th best), or a key
+can lose a version to the cut. Tie-inclusivity means the bound is O(n + tie
+width), which a bulk insert sharing one timestamp can inflate — so the ceiling
+has to stay as a backstop.
+
+Cost: a `fetch` on `DedupExec`, a rule to set it from a `SortExec(fetch, on a
+dedup-key column)` directly above (DataFusion will not do this for us — it
+pushes fetch into the sort, not below it), the eviction, and a test for the
+stale-version-across-a-tie case specifically. That is a change to version
+resolution, which has produced two logged prod incidents from this exact class,
+so it wants a review and a day, not an unattended night.
 
 ## Verification
 

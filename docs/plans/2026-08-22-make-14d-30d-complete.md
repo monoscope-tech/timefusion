@@ -74,6 +74,15 @@ merge-on-read table answers with the pre-update row. So this is a cost to
       now exist in prod — read them before choosing a fix, because
       `no_witness` is a *throughput* problem (republish clears it) and `moved`
       is not (the partition really is churning). Opposite fixes, same miss.
+
+      **READ, 2026-08-23: `no_witness` 2,448 (79.7%) vs `moved` 624 (20.3%),
+      `no_source_rows` 0, coverage valid at 30.** The `source_fp` fallback that
+      would have rescued the 79.7% without a republish was removed in `7e5bb5a`
+      — the slice and partition fingerprints are computed by different hashers
+      over different file sets, so with the flag on a witness-less slice routed
+      NOTHING, measured end-to-end. There is no lever here short of republish
+      throughput, which is rebuild-class and outside this tier. Closed, not
+      deferred — see `2026-08-23-tier1-results.md` §1.1.
 - [ ] **1.2 Bound `log_list` so TopK never deduplicates the whole window.**
       `ORDER BY timestamp DESC LIMIT 251` should resolve versions for ~251
       rows, not 30 days of them. p4 answers this shape at 30d in 879 ms and p1
