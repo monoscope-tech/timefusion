@@ -1288,6 +1288,59 @@ impl TantivyIndexService {
         }
     }
 
+    /// Carry existing coverage FORWARD across a compaction instead of
+    /// re-indexing its output.
+    ///
+    /// A rewrite's output holds exactly its inputs' rows under the same ids, so
+    /// an index that answered "these ids match" for the inputs still answers it
+    /// for the output. Extending `covered_files` therefore buys the same
+    /// coverage for a manifest read-modify-write, where re-indexing costs a full
+    /// S3 read-back and a build — and a build was measured at ~4/hr on this box,
+    /// so this is the difference between keeping up and not.
+    ///
+    /// **The guard is the whole correctness argument:** every removed file must
+    /// already be covered. If even one was not, the output holds rows no index
+    /// has seen, and marking it covered would cause a FALSE NEGATIVE — the one
+    /// failure mode that is not tolerable, since the read path trusts coverage
+    /// to skip files. In that case this returns `false` and the caller rebuilds
+    /// exactly as before.
+    ///
+    /// Stale membership is safe in the other direction: an entry may now list a
+    /// file whose rows it also indexed under an older path, which yields false
+    /// POSITIVES that the scan filters. `ordinals_valid` is surrendered because
+    /// row ordinals are per-file positions and the output's are not the inputs'.
+    ///
+    /// Returns whether the carry-forward applied.
+    pub async fn carry_forward_after_compaction(&self, table: &str, project_id: &str, removed: &[String], added: &[String]) -> Result<bool> {
+        if removed.is_empty() || added.is_empty() {
+            return Ok(false);
+        }
+        let applied = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
+            let usable = |e: &ManifestEntry| e.index.is_some() && e.error.is_none();
+            let covered: HashSet<&str> = m.entries.values().filter(|e| usable(e)).flat_map(|e| e.covered_files.iter().map(String::as_str)).collect();
+            if !removed.iter().all(|u| covered.contains(u.as_str())) {
+                return (false, false);
+            }
+            let removed_set: HashSet<&str> = removed.iter().map(String::as_str).collect();
+            let mut touched = false;
+            for e in m.entries.values_mut().filter(|e| usable(e) && e.covered_files.iter().any(|u| removed_set.contains(u.as_str()))) {
+                let fresh: Vec<String> = added.iter().filter(|u| !e.covered_files.contains(u)).cloned().collect();
+                e.covered_files.extend(fresh);
+                e.ordinals_valid = false;
+                touched = true;
+            }
+            (touched, touched)
+        })
+        .await?;
+        if applied {
+            metrics::counter!(crate::database::scan_metric_names::TANTIVY_CARRIED_FORWARD).increment(added.len() as u64);
+            if let Some(reader) = self.reader() {
+                reader.invalidate_manifest(table, project_id);
+            }
+        }
+        Ok(applied)
+    }
+
     /// Targeted compaction GC: drop manifest entries none of whose
     /// `covered_files` are still present in `live_uris`, and prune the departed
     /// files from the entries that survive.

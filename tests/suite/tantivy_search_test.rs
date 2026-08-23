@@ -512,6 +512,37 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     assert!(m_final.entries.is_empty());
 }
 
+/// Carry-forward: a compaction whose inputs were ALL covered leaves its output
+/// covered without a single build — and one whose inputs were not must refuse,
+/// because the output would then hold rows no index has seen and the read path
+/// trusts coverage to skip files. The refusal is the correctness half; the
+/// no-build is the throughput half (builds run ~4/hr on prod).
+#[tokio::test]
+async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
+    let (table_name, project_id) = ("otel_logs_and_spans", "p-carry");
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
+    let cb = svc.clone().callback();
+    for (ts, id, uri) in [(1_000_000, "a", "in_a"), (2_000_000, "b", "in_b")] {
+        cb(project_id.into(), table_name.into(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
+    }
+
+    // An input nobody indexed => refuse, and change nothing.
+    let refused = svc.carry_forward_after_compaction(table_name, project_id, &["in_a".into(), "never_indexed".into()], &["out".into()]).await.unwrap();
+    assert!(!refused, "an uncovered input means the output holds unseen rows — carrying forward would be a false negative");
+    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    assert!(m.entries.values().all(|e| !e.covered_files.contains(&"out".to_string())), "a refused carry-forward must not half-apply");
+
+    // Both inputs covered => the output is covered, by edit not by build.
+    let applied = svc.carry_forward_after_compaction(table_name, project_id, &["in_a".into(), "in_b".into()], &["out".into()]).await.unwrap();
+    assert!(applied, "every input was covered, so the output's rows are all already indexed");
+    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let covering: Vec<_> = m.entries.values().filter(|e| e.covered_files.contains(&"out".to_string())).collect();
+    assert_eq!(covering.len(), 2, "every entry covering an input must cover the output, or zero-hit pruning could drop rows it holds");
+    assert!(covering.iter().all(|e| !e.ordinals_valid), "row ordinals are per-file positions; the output's are not the inputs'");
+}
+
 /// A multi-file entry must not take its live siblings down with it. A flush
 /// commit that adds more than one file publishes ONE entry covering all of
 /// them (`bucket-{uuid}`); compacting away a single member used to drop the

@@ -198,6 +198,35 @@ impl Database {
                         .filter(|u| !pre_uris.as_ref().is_some_and(|p| p.contains(*u)) && u.ends_with(".parquet"))
                         .filter_map(|u| Some((project_id_of_uri(u)?.to_string(), parquet_rel_of_uri(u)?.to_string(), u.clone())))
                         .collect();
+                    // Carry coverage forward first: a rewrite's output holds its
+                    // inputs' rows under the same ids, so when EVERY input was
+                    // already covered this is a manifest edit instead of an S3
+                    // read-back plus a build (~4 builds/hr on this box). Files
+                    // still uncovered afterwards fall through to the rebuild below.
+                    let removed_by_pid: HashMap<String, Vec<String>> = pre_uris
+                        .as_ref()
+                        .map(|pre| {
+                            pre.iter()
+                                .filter(|u| !live_uris.contains(*u) && u.ends_with(".parquet"))
+                                .filter_map(|u| Some((project_id_of_uri(u)?.to_string(), u.clone())))
+                                .into_group_map()
+                        })
+                        .unwrap_or_default();
+                    // `carry_forward_after_compaction` applies to a project's
+                    // whole output set or to none of it, so its verdict is all
+                    // this needs — asking the manifest again per file would cost
+                    // one 745 KB load each to learn what the call already knew.
+                    let mut carried: HashSet<String> = HashSet::new();
+                    for (pid, removed) in &removed_by_pid {
+                        let for_pid: Vec<String> = added.iter().filter(|(p, _, _)| p == pid).map(|(_, _, uri)| uri.clone()).collect();
+                        match svc.carry_forward_after_compaction(table_name, pid, removed, &for_pid).await {
+                            Ok(true) => carried.extend(for_pid),
+                            Ok(false) => {}
+                            Err(e) => warn!("tantivy carry-forward failed table={} project={}: {}", table_name, pid, e),
+                        }
+                    }
+                    // Whatever carry-forward covered needs no build.
+                    let added: Vec<_> = added.into_iter().filter(|(_, _, uri)| !carried.contains(uri)).collect();
                     let mut built = 0usize;
                     let mut reindex_errs = 0usize;
                     let table_owned = table_name.to_string();
@@ -216,8 +245,8 @@ impl Database {
                         }
                     }
                     drop(jobs);
-                    if built > 0 || reindex_errs > 0 {
-                        info!("tantivy post-optimize reindex: table={} built={} errors={}", table_name, built, reindex_errs);
+                    if built > 0 || reindex_errs > 0 || !carried.is_empty() {
+                        info!("tantivy post-optimize reindex: table={} built={} carried_forward={} errors={}", table_name, built, carried.len(), reindex_errs);
                     }
                 }
                 // Drop sidecar index entries for files rewritten away.

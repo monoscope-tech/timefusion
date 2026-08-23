@@ -247,6 +247,10 @@ pub mod scan_metric_names {
     /// Indexes built by the reconcile BACKFILL specifically — not by flush,
     /// compaction or the wave reindex, all of which also publish.
     pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
+    /// Output files covered by extending an existing entry across a compaction
+    /// instead of re-indexing them. Read against `TANTIVY_BACKFILL_BUILT`: the
+    /// ratio is how much of the rewrite churn stopped costing a build.
+    pub const TANTIVY_CARRIED_FORWARD: &str = "timefusion.scan.tantivy_carried_forward";
     // Inside the file-pruned scan: which of its three steps owns the ~430ms.
     // The provider cache comment above records ~30ms for a pure provider build,
     // so the cost is expected in selection construction or in scan() over a

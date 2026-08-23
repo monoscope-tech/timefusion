@@ -809,24 +809,23 @@ pub struct TantivyConfig {
     /// deleted blob, which the prefilter treats as "no usable index".
     #[serde_inline_default(300)]
     pub timefusion_tantivy_manifest_ttl_secs: u64,
-    /// Max index builds one reconcile pass will start. Bounds a pass so it can
-    /// run hourly and drain incrementally instead of attempting the entire
-    /// backlog once a night; work not taken this pass is taken by the next, and
-    /// the fair round-robin across projects means no project can monopolise a
-    /// pass. 0 = unbounded (the previous behaviour).
+    /// Files a single backfill pass will attempt.
     ///
-    /// A truncated pass logs how much it left behind — a silent cap reads as
-    /// "coverage is converging" when it is not.
+    /// Sized against the MEASURED build rate, which is the thing that actually
+    /// bounds throughput: prod 2026-08-23, a container up 7 hours had
+    /// `tantivy_backfill_built = 30` — **~4 builds/hr**. At the old cap of 150
+    /// that is a ~35-HOUR pass, and the consequences were all visible in the
+    /// same 7 hours: **1** `tantivy_backfill_started`, **0**
+    /// `tantivy_backfill_pass` completions, and **19** ticks dropped as "run
+    /// still in progress". A pass that never ends never refreshes its work
+    /// list, never reports its end-line, and blocks every later tick.
     ///
-    /// 150 (was 400): at measured prod throughput a 400-file pass runs ~2h, so
-    /// the "hourly" reconcile was effectively continuous — prod logged
-    /// `still in progress after 600s (skips=1)`, i.e. ticks correctly dropped
-    /// rather than piling up. The drain was healthy, but `deferred_to_next_pass`
-    /// and the `uncovered` gauge only update at pass end, so a 2h pass reports
-    /// a quarter as often as the bounded-pass design intended. ~150 gives a
-    /// ~30-minute pass that fits inside the tick and reports every time.
-    /// This is an observability fix, not a throughput one.
-    #[serde_inline_default(150)]
+    /// 8 is ~2 hours at the measured rate: it completes inside a normal
+    /// container life, so the end-line fires and the work list is re-derived
+    /// from a fresh snapshot rather than one hours stale. The cap does NOT
+    /// throttle throughput — build rate does — so lowering it costs nothing
+    /// and buys the observability the pass has never once delivered on this box.
+    #[serde_inline_default(8)]
     pub timefusion_tantivy_backfill_max_files_per_pass: usize,
     /// Percentage of each backfill pass reserved for the OLDEST uncovered files.
     ///
@@ -2478,9 +2477,11 @@ mod tests {
         assert_eq!(cfg.search_concurrency(), 32);
         assert_eq!(cfg.reader_cache_entries().get(), 2048);
         assert_eq!(cfg.manifest_ttl(), Duration::from_secs(300));
-        // Load-bearing against the hourly reconcile tick, not a free tuning
-        // knob: a cap whose pass outruns the interval stops reporting per pass.
-        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 150);
+        // Load-bearing against the reconcile tick, not a free tuning knob: a
+        // cap whose pass outruns the interval stops reporting per pass, blocks
+        // every later tick, and works from an ever-staler file list. Sized at
+        // the MEASURED ~4 builds/hr, not at an assumed one — 150 was ~35 hours.
+        assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 8);
 
         let derived = TantivyConfig::default();
         assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");
