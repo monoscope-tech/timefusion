@@ -2481,14 +2481,21 @@ type TantivyBackfillWork = (String, String, String); // project, relative parque
 /// The tail is built by running the same fair round-robin over reversed queues,
 /// so oldest-first is fair across projects too — one deep-history project cannot
 /// own the whole reservation.
-fn fair_tantivy_backfill_work_split(queues: Vec<(String, VecDeque<(String, String)>)>, cap: usize, tail_pct: u8) -> Vec<TantivyBackfillWork> {
+/// Returns the pass's work list plus the URIs that came from the RESERVED tail.
+/// The caller logs which side each build came from: whether the oldest-first
+/// reservation is spending its slots on the largest files is the open question
+/// about it, and a build line that cannot say which side it served cannot
+/// answer it (prod 2026-08-23 saw two 600-700 MB whales in one 8-file pass).
+fn fair_tantivy_backfill_work_split(
+    queues: Vec<(String, VecDeque<(String, String)>)>, cap: usize, tail_pct: u8,
+) -> (Vec<TantivyBackfillWork>, HashSet<String>) {
     let tail_n = (cap > 0).then(|| cap * usize::from(tail_pct.min(100)) / 100).filter(|n| *n > 0);
     let Some(tail_n) = tail_n else {
         let mut work = fair_tantivy_backfill_work(queues);
         if cap > 0 {
             work.truncate(cap);
         }
-        return work;
+        return (work, HashSet::new());
     };
     let oldest_first: Vec<_> = queues.iter().map(|(p, q)| (p.clone(), q.iter().rev().cloned().collect())).collect();
     let mut work = fair_tantivy_backfill_work(queues);
@@ -2510,11 +2517,12 @@ fn fair_tantivy_backfill_work_split(queues: Vec<(String, VecDeque<(String, Strin
     let (mut head, mut tail): (VecDeque<_>, VecDeque<_>) = (work.into(), tail.into());
     let per_tail = head.len().div_ceil(tail.len().max(1)).max(1);
     let mut out = Vec::with_capacity(head.len() + tail.len());
+    let reserved: HashSet<String> = tail.iter().map(|(_, _, uri)| uri.clone()).collect();
     while !head.is_empty() || !tail.is_empty() {
         out.extend((0..per_tail).filter_map(|_| head.pop_front()));
         out.extend(tail.pop_front());
     }
-    out
+    (out, reserved)
 }
 
 /// A file's decoded contribution to a slice, scaled by the share of its time span the slice covers.
@@ -3495,7 +3503,7 @@ impl Database {
             // project, never one project's whole queue.
             let cap = self.config.tantivy.timefusion_tantivy_backfill_max_files_per_pass;
             let available: usize = queues.iter().map(|(_, q)| q.len()).sum();
-            let work = fair_tantivy_backfill_work_split(queues, cap, self.config.tantivy.timefusion_tantivy_backfill_tail_share_pct);
+            let (work, reserved_tail) = fair_tantivy_backfill_work_split(queues, cap, self.config.tantivy.timefusion_tantivy_backfill_tail_share_pct);
             deferred_total = deferred_total.saturating_add((available - work.len()) as u64);
             // Announce the pass BEFORE the first build, with what it will
             // attempt. `tantivy_backfill_pass` only prints at the very end, and
@@ -3533,6 +3541,11 @@ impl Database {
                     // A monotonic counter gives the true rate from deltas mid-pass.
                     Ok(entry) => {
                         built += 1;
+                        // Which side of the split this build served. Without it the
+                        // oldest-first reservation cannot be judged: whales and the
+                        // reservation are correlated by hypothesis, not by evidence.
+                        let from_reserved_tail = entry.1.covered_files.iter().any(|u| reserved_tail.contains(u));
+                        info!(table_name, project_id = %pid, from_reserved_tail, event = "tantivy_backfill_unit");
                         metrics::counter!(scan_metric_names::TANTIVY_BACKFILL_BUILT).increment(1);
                         pending.entry(pid.clone()).or_default().push(entry);
                         pending_since.entry(pid.clone()).or_insert_with(std::time::Instant::now);
@@ -12091,19 +12104,25 @@ mod tests {
         let queues = || vec![("p".to_string(), hot.clone().chain(cold.clone()).collect::<VecDeque<_>>())];
         let uris = |w: Vec<super::TantivyBackfillWork>| w.into_iter().map(|(_, _, uri)| uri).collect::<Vec<_>>();
 
-        let starved = uris(super::fair_tantivy_backfill_work_split(queues(), 12, 0));
+        let starved = uris(super::fair_tantivy_backfill_work_split(queues(), 12, 0).0);
         assert!(!starved.contains(&"uri/2026-01-01".to_string()), "pure newest-first must starve the tail — otherwise this test proves nothing");
 
-        let split = uris(super::fair_tantivy_backfill_work_split(queues(), 12, 33));
+        let (split_work, reserved) = super::fair_tantivy_backfill_work_split(queues(), 12, 33);
+        let split = uris(split_work);
         assert_eq!(split.len(), 12, "the reservation is carved OUT of the cap, so pass cost is unchanged");
         assert!(split.contains(&"uri/2026-01-01".to_string()), "the oldest uncovered file must be reachable, got {split:?}");
-        assert!(split.contains(&"uri/2026-08-22-29".to_string()), "the hot window must still converge");
+        // The HEAD is the queue's front (`-00`); `-29` is its tail end, so asserting
+        // on `-29` would be satisfied by the reservation rather than by the head.
+        assert!(split.contains(&"uri/2026-08-22-00".to_string()), "the hot window must still converge");
         // Reaching the tail LAST is the same starvation one level down: a pass is
         // routinely killed part-way, so a reservation at the end never executes.
         // Measured in prod 2026-08-22 — 33 min into a live pass, `older` had not
         // moved because the run was still on the newest files.
         let oldest_at = split.iter().position(|u| u == "uri/2026-01-01").expect("present");
         assert!(oldest_at < split.len() / 2, "the reserved tail must be interleaved, not appended — it was at {oldest_at} of {}", split.len());
+        // The reserved set is what lets a build line say which side it served.
+        assert!(reserved.contains("uri/2026-01-01"), "the oldest file must be reported as coming from the reservation, got {reserved:?}");
+        assert!(!reserved.contains("uri/2026-08-22-00"), "the hot-window head must not be labelled as reserved");
         assert_eq!(split.iter().collect::<HashSet<_>>().len(), split.len(), "a file must not be scheduled twice in one pass: {split:?}");
     }
 
