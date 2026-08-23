@@ -1229,7 +1229,13 @@ impl TantivyIndexService {
                 return Err(e);
             }
         };
-        debug!("tantivy index for {project_id}/{table_name} built: rows={} bytes={} segments={}", stats.rows, blob.len(), stats.segments);
+        // INFO, not debug: the size distribution of what the backfill indexes is
+        // the input to every sizing decision around it — the pass cap, the
+        // oldest-first reservation, and `max_file_mb` (4096, i.e. 4 GB) were all
+        // set without it. At ~4-6 builds/hr this is a handful of lines an hour.
+        // `segments` is the cheap proxy for scale: the writer serializes one each
+        // time its 64 MB arena fills, so 40+ segments means multi-GB of content.
+        tracing::info!(project_id, table_name, rows = stats.rows, index_bytes = blob.len(), segments = stats.segments, event = "tantivy_index_built");
         // S3 first, always: it is the source of truth and the local copy is
         // only ever a cache. Seeding after a failed upload would leave a
         // locally-readable index no manifest entry points at.
