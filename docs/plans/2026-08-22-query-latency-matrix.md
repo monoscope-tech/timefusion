@@ -1044,3 +1044,40 @@ is how a reason silently vanishes from a breakdown.
 
 Read these before sizing the per-day index work: if the split says
 `cap_exceeded`, more indexing does not help.
+
+### #5 built, priced, and reverted — the cost is 2x rollup maintenance for zero measured misses
+
+My earlier objection ("a spec change darkens the tier for 30 days") was **wrong
+about the mechanism**, and the codebase says so in two places. `generation_id`'s
+own comment names the sanctioned path — "adding a measure *without bumping the
+table name*" is the failure mode — and `route_for`'s candidate loop states the
+guarantee outright: every declared rollup is tried, one that cannot serve a query
+declines, so *"adding a spec can only ever widen what routes."* The consumer then
+takes **the first tier actually BUILT** across the window, so an unbuilt tier is
+skipped, not served. A NEW spec is safe. Editing v3 is what would be fatal.
+
+So I built it: `dashboard_level_1m_v1` + a derived `dashboard_level_1h_v1`,
+dimensioned on `level` alone rather than duplicating v3's three, because a
+tier's build cost scales with its group count.
+
+**Then the tests priced it.** `first_rollup_invalidation_enqueues_only_the_touched_hour`
+went `6 -> 12`: enqueued rollup work scales with `schema.rollups.len()`
+(src/database/maintain.rs:214), so two new tiers **double rollup maintenance
+work** — immediately, fleet-wide, on the cluster whose rollup build throughput is
+the binding constraint and whose backlog only became able to shrink tonight.
+Three further tests showed the narrower spec also wins the candidate tie-break,
+so every dimensionless query would prefer a tier that is unbuilt for 30 days.
+
+Against that: **zero** of the observed declining queries involve `level` — they
+are all endpoint-hash-scoped status-class charts, which `level` does not touch.
+
+Reverted. This is no longer a judgment call about risk; it is arithmetic. 2x the
+maintenance cost for 0 measured misses fixed is a strictly worse system on the
+metric this whole investigation has been about.
+
+**What to build instead, in order.** The `status_class` gap is expressible as
+declared count MEASURES on the existing spec shape (`error_count` already does
+exactly this at `>= 500`), so it needs no new dimension — but it still needs the
+endpoint hash to be routable, and that is the real open design question:
+per-project high cardinality, no obvious tier that holds it. Answer that first;
+`level` is cheap to add to whatever tier that produces, and worthless on its own.
