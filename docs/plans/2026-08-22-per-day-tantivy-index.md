@@ -1540,3 +1540,45 @@ smaller live set. A large manifest here would have been the bug.
 
 A monitor now watches which tables get a manifest written today, so the cycle
 either completes or visibly does not.
+
+### 20:25 — correction: five indexed tables, not six, and `otel_metrics` is an orphan
+
+`schemas/otel_metrics.yaml` contains **zero** `tantivy` declarations, and its
+rollups are synthesized from it, so neither it nor its rollup tiers can satisfy
+`indexed_set()`. The indexed population is therefore:
+
+| table | live files |
+|---|---|
+| otel_logs_and_spans | 4,550 |
+| …rollup_dashboard_1m_v3 | 3,221 |
+| …rollup_dashboard_1h_v2 | 858 |
+| …rollup_dashboard_1m_v2 | 417 |
+| …rollup_dashboard_1h_v1 | 410 |
+| **total** | **9,456** — rollups are 4,906 of it, **52%** |
+
+Two consequences.
+
+**The rotation cycle is 75 minutes, not 90** (five slots, not six), so the
+prediction is now: by ~21:00, the **three** remaining spans-rollup tables should
+carry a 2026-08-23 manifest. `otel_metrics` will never light up, and I would have
+read its silence as a partial failure of the fix — the monitor was armed to watch
+for something that cannot happen.
+
+**`index_manifests/otel_metrics/` is dead weight**: 10 objects, 774 KB of
+manifests describing indexes for a table nothing reconciles. Because reconcile is
+the only thing that GCs manifests and it never visits an unindexed table, these
+can never be collected — along with whatever index blobs they still reference,
+which are much larger than the manifests. Left in place: deleting prod objects on
+a Sunday evening off a schema read is not a call to make unattended, and it costs
+nothing to defer.
+
+Current state at 20:23:
+
+```
+otel_logs_and_spans                          2026-08-23 20:22   <- served
+…rollup_dashboard_1m_v3                      2026-08-23 19:45   <- served
+…rollup_dashboard_1h_v1                      2026-08-19 09:45   <- still frozen
+…rollup_dashboard_1h_v2                      2026-08-20 00:59   <- still frozen
+…rollup_dashboard_1m_v2                      2026-08-19 09:13   <- still frozen
+otel_metrics                                 2026-08-20 12:41   <- orphan, expected
+```
