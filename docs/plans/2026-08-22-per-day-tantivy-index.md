@@ -1709,3 +1709,47 @@ Coverage is still climbing (`uncovered=6773 older=4061` at 19:24) — expected,
 since 8 builds per slot per table is ~32/hr against ~77/hr accrual on `1m_v3`
 alone. The byte budget is the change that should close that, and it has not run
 yet.
+
+## 22:05 — the byte budget does exactly what it was built to do, in both directions
+
+First pass on `6691031`:
+
+```
+1m_v3                planned=128  planned_mb=29    cap=128  budget_mb=2048  skipped_today=711
+otel_logs_and_spans  planned=7    planned_mb=1885  cap=128  budget_mb=2048  skipped_today=3
+```
+
+Both halves of the intent are visible in one pass:
+
+- **The cheap table is unleashed** — `1m_v3` plans **128 files for 29 MB**, where
+  the old cap gave it 8. It is now limited by the count ceiling, not the budget,
+  and 29 MB against a 2048 MB budget shows how far the count cap was from the
+  real cost.
+- **The expensive table is bounded** — spans plans **7 files for 1885 MB**,
+  stopping just under the budget. The old cap would have allowed 8 files of
+  unbounded size. So the pass is now bounded by work rather than by an arbitrary
+  count, which is what makes one number safe for both populations.
+
+**And coverage fell for the first time today:**
+
+| | uncovered | today | week | older |
+|---|---|---|---|---|
+| 19:24 (pre-budget) | 6773 | 686 | 2026 | 4061 |
+| **20:02 (post-budget)** | **6294** | 714 | 1832 | **3748** |
+
+**-479 uncovered and -313 `older` in 38 minutes** — after climbing all day. The
+count is derived from storage rather than from process-local state, so a restart
+between the two samples cannot manufacture a drop; this is work landing.
+
+Provisional, and the caveat is the day's lesson rather than politeness: **one
+interval is one point.** The mechanism is directly observed (`planned` 8 → 128,
+16x the builds per slot), which is stronger than the inference behind the
+retracted readings this morning, but the confirming point is the next census and
+a monitor is now watching that trend rather than the manifests.
+
+**One more population correction.** Two tables I had never seen appeared in this
+pass — `…rollup_dashboard_level_1h_v1` and `…level_1m_v1`, both `planned=0`. So
+the indexed set is larger than the five I counted twice today. It changes nothing
+quantitative here (they have no work), but "I have finally enumerated the
+population" has now been wrong three times, and it is worth writing down that I
+should stop asserting it.
