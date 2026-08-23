@@ -632,3 +632,53 @@ is a sensible unit), or the per-day index, which changes the unit outright.
 `rows`, `index_bytes`, `segments`. One pass's worth of those lines gives the
 size distribution directly, and turns this from a well-supported hypothesis into
 a number. Do not re-tune the reservation or the cap before reading it.
+
+### 11:52 — the size distribution, measured at last
+
+One backfill pass (`planned=8 cap=8 skipped_today=3`, started 11:45:02) with the
+new `tantivy_index_built` logging. Its eight builds:
+
+| rows | index_bytes |
+|---|---|
+| 45 | 73 KB |
+| 1 | 8 KB |
+| 14 | 24 KB |
+| 10,833 | 9 MB |
+| 19,445 | 12 MB |
+| 25,333 | 38 MB |
+| 61,536 | 35 MB |
+| **1,290,298** | **718 MB** |
+
+**One file is ~50x the next largest and ~90,000x the smallest.** That single
+build took ~7 of the pass's ~7 minutes. This is what "~4-6 builds/hr" was
+averaging over — not a slow indexing path, and not uniformly large inputs, but a
+distribution with a very long tail where one whale IS the pass.
+
+Three things follow, in confidence order.
+
+1. **Both earlier framings were wrong.** "~15 min/build is pathological" assumed
+   ~1 MB inputs (retracted above). "The backfill selects huge files" assumed
+   uniformly large ones — also wrong: six of eight builds here were under 40 MB
+   and finished in seconds. The truth is a skew, and neither a rate nor an
+   average describes it. **Stop quoting a mean for this population.**
+
+2. **The pass did 8 builds in ~7 minutes** — ~68 files/hr, an order of magnitude
+   above the 4-6/hr measured on the previous container. Tempting to credit the
+   cap change (150 -> 8, which re-derives the work list every pass instead of
+   grinding a 35-hour list). But the file MIX differs too, and one pass is one
+   sample. **Do not claim the cap improved throughput until several completed
+   passes show it.** The `built=` on the completion line is the number to use.
+
+3. **The whale is the design problem, and it is bounded.** `max_file_mb = 4096`
+   permits a 4 GB parquet as ONE indexing unit; here a 718 MB index came from
+   1.29M rows. A unit that large is also the unit a later compaction discards
+   whole. Options, cheapest first: lower `max_file_mb` so whales defer and the
+   many small files drain (costs those files their prefilter, same trade as
+   `skip_today`); or shard the build by row-group/day so a whale is many small
+   units — which is the per-day design arriving from the cost side for the
+   second time.
+
+**What is still not shown:** no `tantivy_backfill_pass` completion line has ever
+been emitted on this box, so `built=`, `deferred_to_next_pass` and the
+end-of-pass gauges remain unverified, and the §4 tail-share verdict still has no
+data. The pass above is the closest any has come.
