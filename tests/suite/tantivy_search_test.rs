@@ -512,6 +512,29 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     assert!(m_final.entries.is_empty());
 }
 
+/// Carry-forward must match inputs whatever PATH FORM the caller uses. The
+/// optimize path passes absolute URIs (`get_file_uris`); the wave path passes
+/// Delta-relative `add.path`. Comparing them raw never matches, so the whole
+/// mechanism would refuse every time — implemented and inert, which is this
+/// subsystem's recurring failure mode.
+#[tokio::test]
+async fn carry_forward_matches_relative_and_absolute_paths_alike() {
+    let (table_name, project_id) = ("otel_logs_and_spans", "p-relpaths");
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
+    // Covered under an ABSOLUTE uri, exactly as the flush/optimize paths record it.
+    let abs = "s3://bucket/timefusion/default/otel_logs_and_spans/project_id=p-relpaths/date=2026-08-01/in.parquet";
+    svc.clone().callback()(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec![abs.into()]).await.unwrap();
+
+    // Removed given RELATIVE, as `StagedBin::target_paths` holds it.
+    let rel = "project_id=p-relpaths/date=2026-08-01/in.parquet";
+    let applied = svc.carry_forward_after_compaction(table_name, project_id, &[rel.into()], &["out".into()]).await.unwrap();
+    assert!(applied, "a relative input path must match an absolute covered_files entry, or the wave path silently never carries forward");
+    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    assert!(m.entries.values().any(|e| e.covered_files.contains(&"out".to_string())), "the output must end up covered");
+}
+
 /// Carry-forward: a compaction whose inputs were ALL covered leaves its output
 /// covered without a single build — and one whose inputs were not must refuse,
 /// because the output would then hold rows no index has seen and the read path

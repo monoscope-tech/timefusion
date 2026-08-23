@@ -1321,19 +1321,26 @@ impl TantivyIndexService {
         if removed.is_empty() || added.is_empty() {
             return Ok(false);
         }
+        // Callers disagree on path form: the optimize path passes absolute URIs
+        // (`get_file_uris`), the wave path passes Delta-relative `add.path`.
+        // Comparing them raw would never match and this would silently refuse
+        // every time — implemented and inert. Anchor both on the table-relative
+        // form, which `parquet_rel_of_uri` derives from either.
+        let rel_of = |u: &str| parquet_rel_of_uri(u).unwrap_or(u).to_string();
+        let removed_rel: HashSet<String> = removed.iter().map(|u| rel_of(u)).collect();
         let applied = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
             // EXACTLY the reader's usability predicate, schema_version included.
             // An entry the reader filters out cannot be evidence that an input
             // is covered: it would vouch for a file at carry-forward time and be
             // invisible at query time, which is a false negative.
             let usable = |e: &ManifestEntry| e.index.is_some() && e.error.is_none() && e.schema_version == SCHEMA_VERSION;
-            let covered: HashSet<&str> = m.entries.values().filter(|e| usable(e)).flat_map(|e| e.covered_files.iter().map(String::as_str)).collect();
-            if !removed.iter().all(|u| covered.contains(u.as_str())) {
+            let covered: HashSet<String> = m.entries.values().filter(|e| usable(e)).flat_map(|e| e.covered_files.iter().map(|u| rel_of(u))).collect();
+            if !removed_rel.iter().all(|u| covered.contains(u)) {
                 return (false, false);
             }
-            let removed_set: HashSet<&str> = removed.iter().map(String::as_str).collect();
+            let removed_set = &removed_rel;
             let mut touched = false;
-            for e in m.entries.values_mut().filter(|e| usable(e) && e.covered_files.iter().any(|u| removed_set.contains(u.as_str()))) {
+            for e in m.entries.values_mut().filter(|e| usable(e) && e.covered_files.iter().any(|u| removed_set.contains(&rel_of(u)))) {
                 let fresh: Vec<String> = added.iter().filter(|u| !e.covered_files.contains(u)).cloned().collect();
                 e.covered_files.extend(fresh);
                 e.ordinals_valid = false;

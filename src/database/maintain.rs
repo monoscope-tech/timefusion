@@ -5493,6 +5493,31 @@ impl Database {
         }
         let store = { table_ref.read().await.log_store().object_store(None) };
         let table = table_name.to_owned();
+        // Carry coverage forward first. A wave output holds exactly its inputs'
+        // rows under the same ids — a dedup unit DROPS superseded versions, which
+        // leaves the index a superset (false positives the scan filters), never a
+        // false negative — so when every input was already covered this is a
+        // manifest edit instead of a full S3 read-back and rebuild.
+        //
+        // This path, not the optimize one, is where the cost lands: `older` grew
+        // ~70/hr on 2026-08-23 from sealed-partition rewrites, each output
+        // rebuilt from scratch (a 195 MB build at 12:57 was one of them).
+        let mut carried: HashSet<String> = HashSet::new();
+        for bin in bins {
+            let for_bin: Vec<String> = files.iter().filter(|(project, _, _)| *project == bin.project_id).map(|(_, _, uri)| uri.clone()).collect();
+            if for_bin.is_empty() {
+                continue;
+            }
+            match svc.carry_forward_after_compaction(table_name, &bin.project_id, &bin.target_paths, &for_bin).await {
+                Ok(true) => carried.extend(for_bin),
+                Ok(false) => {}
+                Err(error) => warn!(table_name, %error, event = "tantivy_wave_carry_forward_failed"),
+            }
+        }
+        let files: Vec<_> = files.into_iter().filter(|(_, _, uri)| !carried.contains(uri)).collect();
+        if !carried.is_empty() {
+            info!(table_name, carried = carried.len(), rebuilding = files.len(), event = "tantivy_wave_carried_forward");
+        }
         let (built, failed) = futures::stream::iter(files.into_iter().map(|(project, rel, uri)| {
             let (svc, store, table) = (svc.clone(), store.clone(), table.clone());
             async move { svc.build_index_for_file(&table, &project, &rel, &uri, store).await }
