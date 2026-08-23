@@ -542,3 +542,47 @@ this batch was downstream of a drain that could not run; this is what remains
 once it can, and at this rate the 5,668-file backlog is months regardless of
 schedule, cap or ordering. **Do not tune the drain further before attributing
 the build cost.**
+
+### 2026-08-23 11:20 — the "pathological build cost" was my own bad premise
+
+I named `~4-6 builds/hr` the top item on the grounds that ~15 minutes to index
+"a ~1 MB parquet" is pathological. **The ~1 MB premise is wrong**, and two
+things in the tree say so:
+
+- `timefusion_tantivy_backfill_max_file_mb = 4096`. The backfill accepts files
+  up to **4 GB**. Nothing is being skipped for size either — the census reports
+  `oversized=0`.
+- The recurring `tantivy build produced 40-65 segments (> 32); merging inline`
+  warnings. `build_stream_to_dir` uses `NoMergePolicy` and commits once, so
+  segments are not per-commit — tantivy serializes one each time the writer's
+  `WRITER_HEAP_BYTES` (64 MB) arena fills. **40-65 segments implies ~2.5-4 GB of
+  indexed content per build.**
+
+At that size ~15 minutes is unremarkable: roughly 4 MB/s of decode plus inverted
+index construction. There is no mystery ceiling to attribute — the builds are
+slow because the inputs are huge, and `~4-6 builds/hr` is a rate over
+multi-gigabyte units, not over 1 MB ones. **Retract the "attribute the build
+cost" item as posed.**
+
+**What this changes, and it is not small:**
+
+1. **The unit is wrong, not the speed.** Indexing a 4 GB file as ONE unit means
+   a single build can consume a whole pass, and it produces an index that a
+   later compaction of that file discards wholesale. That is the argument for
+   per-day indexing restated from the cost side rather than the coverage side.
+2. **The tail reservation may be self-defeating.** Oldest files are the most
+   compacted, therefore the largest. Reserving a third of every pass for the
+   OLDEST uncovered files reserves it for the BIGGEST ones — so the reservation
+   that was meant to drain the backlog may be the slowest possible way to spend
+   those slots. This is a live hypothesis against a change already shipped
+   (default 33), and it is testable: log the file SIZE alongside each build.
+3. **`max_file_mb = 4096` deserves re-examination.** Its own doc comment says
+   4096 exists to bound `pack_dir`'s in-memory tar, not because 4 GB is a
+   sensible indexing unit. A much lower cap would let the many small files drain
+   while whales wait for a design that can handle them.
+
+**Next measurement, replacing the retracted one:** emit `bytes=` and `rows=` on
+each completed build (the data is already in `IndexBuildStats`, currently only
+at `debug!`). Until the size distribution of the backlog is known, neither the
+tail reservation nor the cap can be sized honestly — and I have now twice sized
+something against an assumed rate rather than a measured one.
