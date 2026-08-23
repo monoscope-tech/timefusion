@@ -124,3 +124,30 @@ is the difference between a backlog that drains and one that only grows.
 The honest next check is whether the tier reaches the sealed days the widest
 windows need — `rollup_miss_not_built_total` falling, and `14d`/`30d` cells
 turning from `not_built` into hits.
+
+### Reproducible across restarts, which is the point
+
+A second container (`cefcdc3`) booted ~14:50 and started work at 14:55 — the
+300 s bound again, to the minute:
+
+```
+14:54  running=0   rebuilds=0   output_rows=0
+14:55  running=16  rebuilds=14  output_rows=17914
+14:59  running=16  rebuilds=27  output_rows=20425
+```
+
+The durable evidence is the journal, which survives restarts: `tasks_pending`
+went 22,445 -> 22,253 and `pending_base_rollup` 12,663 -> 12,544 ACROSS a deploy.
+Before the fix those numbers only grew.
+
+### The open question is convergence, not correctness
+
+`tasks_running` sits at 16 every sample — `coordinator_jobs`, the ceiling. Drain
+is therefore capped by that concurrency, and `tasks_pending` hovers near 22,25x
+because ingest enqueues continuously. Whether drain beats accrual needs a longer
+baseline than one deploy window.
+
+Raising `coordinator_jobs` is the obvious lever and is deliberately NOT taken
+here: the box is memory-tight and this pool has been mis-sized into OOMs before
+(the budget tree derives every pool from `detected_limit_gb`). It wants a
+supervised change with the OOM banner in view, not an unattended one.
