@@ -184,3 +184,35 @@ moved between the checklist being written and the work being done:
 Writing code for either would produce dead code or duplicate code. What the goal
 actually needed was the thing neither item named: **nothing was being built at
 all**, which is `319c5a8`.
+
+## Tier 1 scored by objective, with the prod number for each
+
+The five items were each written as an objective plus a suggested first step.
+Scoring the objectives, measured on prod `cefcdc3`:
+
+| item | objective | measured |
+|---|---|---|
+| 1.1 | fix `stale_coverage` | `rollup_miss_stale_coverage_total` = **0** |
+| 1.2 | bound `log_list`, "fixes mode B" | mode B no longer occurs — moot |
+| 1.3 | admission guard for mode C, and why `GatedScanExec` didn't fire | guard live, observed refusing 460 GB; cause: it never denies, it is a decode throttle |
+| 1.4 | treat `col IS NOT NULL` as a no-op | live; the p95 shape no longer declines `filter_not_eligible` |
+| 1.5 | make the statement timeout fire | shipped `6a5975a` |
+
+1.1's named lever — flipping `TIMEFUSION_ROLLUP_SLICE_FP_FALLBACK` — was a
+suggested FIRST STEP, and it was dead (deleted in `7e5bb5a` for routing nothing).
+The objective it served was reached by a different route: the three-site
+witness/bound fix. Scoring the item by its lever rather than its objective
+reports a failure where the measurement says zero.
+
+`filter_not_eligible` is 3 rather than 0 on this container, and that is correct:
+it is the §6 top-K shape, `count(*)` beside `p95(duration)` under the null guard,
+which must decline because `count(*)` counts the null-duration rows the predicate
+excludes. There is a test asserting exactly that.
+
+## Convergence: not yet
+
+`tasks_pending` 22,253 -> 22,499 and `pending_base_rollup` 12,544 -> 12,602 over
+the last half hour. With the coordinator finally running, drain is real but
+`tasks_running` is pinned at 16 (`coordinator_jobs`) and ingest enqueues
+continuously, so accrual is currently ahead. Converging needs either more
+concurrency — a supervised change on a memory-tight box — or less accrual.
