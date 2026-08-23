@@ -14,6 +14,7 @@ use crate::maintenance_coordinator::{Invalidation, MaintenanceTask, Operation, T
 
 const MICROS: i64 = 1_000_000;
 const DAY_MICROS: i64 = 86_400_000_000;
+const HOUR_MICROS: i64 = 3_600_000_000;
 /// Matches the write path's bucket cadence.
 const MINT_INTERVAL_MICROS: i64 = crate::maintenance_coordinator::NORMAL_SLICE_MICROS;
 /// Lets idle workers notice newly mature deadlines.
@@ -36,14 +37,23 @@ pub struct SimConfig {
     pub streams: Option<usize>,
     #[educe(Default = 1.0)]
     pub duration_scale: f64,
-    /// Model deploy/OOM restarts: re-invalidate the whole current day for
-    /// every stream — exactly what `reconcile_maintenance_task_cursors` does
-    /// on boot (per changed partition: `enqueue_maintenance_hours(ALL_HOURS)`,
-    /// which resets the day's COMPLETE frontier tasks back to Pending). The
-    /// dominant enqueue source under deploy churn: ~312 tasks per active
-    /// project per restart. `restart_every_micros` repeats on an interval
-    /// (0 = no periodic restarts); `restart_at_micros` fires ONE restart at a
-    /// fixed offset (backtesting a known boot time).
+    /// Model deploy/OOM restarts: re-invalidate the CURRENT HOUR for every
+    /// stream, which is what `reconcile_maintenance_task_cursors` does on boot
+    /// since 2026-08-18 — touched hours are derived from commit file statistics
+    /// rather than resetting the whole partition-day, so it is ~13 tasks per
+    /// stream rather than ~312.
+    ///
+    /// That distinction decides what a restart backtest is worth. Measured
+    /// 2026-08-23 on the real prod journal, 2 virtual hours, 16 workers: with
+    /// the day-scoped model pending ended at 57,444 against 22,484 calm; with
+    /// the hour-scoped one it is 23,948. **Restarts are a ~6% tax, not a 2.6x
+    /// one** — so deploy churn is no longer the queue's dominant growth source,
+    /// and sizing a fix against the old number would price work that already
+    /// shipped.
+    ///
+    /// `restart_every_micros` repeats on an interval (0 = no periodic restarts);
+    /// `restart_at_micros` fires ONE restart at a fixed offset (backtesting a
+    /// known boot time).
     pub restart_every_micros: i64,
     pub restart_at_micros: Option<i64>,
     #[educe(Default = 0x5EED)]
@@ -325,15 +335,21 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         if now >= next_restart {
             for stream in &streams {
                 // The boot reconcile enqueues per partition that saw commits
-                // while down. PRE-FIX behavior modeled here: ALL_HOURS per
-                // partition (~312 tasks per active stream per restart), because
-                // Delta commit granularity is the partition-day. The 2026-08-18
-                // fix derives the touched hours from commit file stats, which
-                // shrinks this to ~13 tasks per stream — rerun the backtest
-                // with restarts after it deploys and the queue growth should
-                // be gone; this model is the before/after measurement.
-                let day_start = now.div_euclid(DAY_MICROS) * DAY_MICROS;
-                mint_stream(&mut journal, stream, day_start, day_start + DAY_MICROS, now);
+                // while down. Models the 2026-08-18 behavior: touched hours are
+                // derived from commit file statistics, so a brief restart
+                // reconciles the CURRENT hour rather than the whole partition-day
+                // — ~13 tasks per stream rather than ~312, and 13/312 is 1/24,
+                // which is exactly this one-hour-instead-of-one-day change.
+                //
+                // It used to mint `[day_start, day_start + DAY)`. That was the
+                // PRE-fix shape and it dominated every restart backtest: measured
+                // 2026-08-23 on the real prod journal, 2 virtual hours of hourly
+                // restarts left pending at 57,444 against 22,484 with no
+                // restarts, for IDENTICAL work done (2,190 executions, identical
+                // completions). Keeping a stale model is worse than having none —
+                // it prices a fix that already shipped.
+                let hour_start = now.div_euclid(HOUR_MICROS) * HOUR_MICROS;
+                mint_stream(&mut journal, stream, hour_start, hour_start + HOUR_MICROS, now);
             }
             none_until = [0; 6];
             next_restart = if cfg.restart_every_micros > 0 { next_restart + cfg.restart_every_micros } else { i64::MAX };
@@ -627,17 +643,29 @@ mod tests {
     }
 
     #[test]
-    fn restarts_reenqueue_whole_days_and_grow_the_queue() {
-        // The 2026-08-18 backtest finding: with no restarts the frontier is
-        // self-draining; each restart re-invalidates the whole current day per
-        // stream (the boot reconcile's ALL_HOURS), which is the queue's
-        // dominant growth source under deploy churn.
+    fn a_restart_reconciles_only_the_touched_hour() {
+        // Pins the 2026-08-18 boot-reconcile behavior the model now mirrors:
+        // touched hours come from commit file statistics, so a restart
+        // re-invalidates the CURRENT HOUR per stream, not the whole
+        // partition-day. That is ~13 tasks per stream rather than ~312.
+        //
+        // The previous version of this test asserted the opposite — that hourly
+        // restarts add >100 pending — and it passed because the model still
+        // minted a whole day. Keeping it would have pinned a fix out of the
+        // model: measured 2026-08-23 on the real prod journal, the stale model
+        // reported 57,444 pending against 22,484 calm, while the corrected one
+        // reports 23,948. A backtest that prices an already-shipped fix as still
+        // broken is worse than no backtest.
         let start = 100 * DAY_MICROS;
         let calm = run(journal_with_streams(4), &cfg(2), start).unwrap();
         let churning = run(journal_with_streams(4), &SimConfig { restart_every_micros: HOUR, ..cfg(2) }, start).unwrap();
+        assert!(churning.pending_end >= calm.pending_end, "a restart cannot REDUCE the queue: calm {} vs churning {}", calm.pending_end, churning.pending_end);
+        // An hour of reconcile per stream per restart, not a day of it. The
+        // bound is deliberately far below the old >100 assertion — that gap IS
+        // the fix.
         assert!(
-            churning.pending_end > calm.pending_end + 100,
-            "hourly restarts must re-enqueue whole days: calm {} vs churning {}",
+            churning.pending_end < calm.pending_end + 100,
+            "an hour-scoped reconcile must not grow the queue like a day-scoped one: calm {} vs churning {}",
             calm.pending_end,
             churning.pending_end
         );
