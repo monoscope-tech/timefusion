@@ -1479,3 +1479,31 @@ every table leads a pass every 90 minutes instead of never. It does not make the
 pass faster — bounding GC and the build cost is the real repair — but it converts
 "three tables permanently starved" into "every table served on a cycle", which
 is the difference between a backlog that grows without bound and one that drains.
+
+### 17:45 — pass condition for the rotation fix
+
+Landed as `34508ee`. The test is not a rate and not a census total, both of which
+have misled today. It is a **file mtime**:
+
+> `index_manifests/otel_logs_and_spans_rollup_dashboard_1m_v3/*/manifest.json`
+> gets a write dated after 2026-08-23.
+
+Frozen at 2026-08-20 for three days, so any write at all is unambiguous and
+needs no baseline, no quiet process and no rate arithmetic. Check with:
+
+```bash
+aws s3 ls "s3://$AWS_S3_BUCKET/index_manifests/otel_logs_and_spans_rollup_dashboard_1m_v3/" \
+  --recursive --endpoint-url "$AWS_S3_ENDPOINT" | sort -k1,2 | tail -3
+```
+
+If it stays frozen, the rotation reached the table but the pass still cannot
+finish inside a restart window, and the next repair is bounding the work rather
+than reordering it: cap the per-project GC the way builds are already capped, or
+give the pass a wall-clock budget so it yields mid-table instead of dying.
+
+**Unrelated, noticed not touched:** two doctests in `src/maintenance_coordinator.rs`
+(`clear_stale_estimates:780`, `claimability_census:1231`) fail to compile — log
+output pasted into a bare ``` fence, which rustdoc tries to parse as Rust. It
+belongs to another agent's in-flight commit `955f05f`, and `cargo nextest` does
+not run doctests so CI will not catch it. Two-character fix (` ```text `), left
+for its owner rather than editing a file being actively worked.
