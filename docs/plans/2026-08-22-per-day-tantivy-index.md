@@ -1194,3 +1194,56 @@ inference.
 repeats paths, the census is not the only consumer. Whether the scan path can
 double-read a file is a correctness question well outside the tantivy work, and
 it should be answered deliberately rather than patched on suspicion.
+
+## 16:10 — RETRACTED: there is no phantom. I compared a six-table census to a one-table checkpoint.
+
+The "subset larger than the set" proof is wrong, and it was the day's headline.
+
+The census sums over **every indexed table** (`svc.config.indexed_tables()` —
+any table with a tantivy-indexed field). There are six:
+
+| table | live files (`numOfAddFiles`) |
+|---|---|
+| otel_logs_and_spans | 4,550 |
+| otel_metrics | 3,287 |
+| …rollup_dashboard_1m_v3 | 3,221 |
+| …rollup_dashboard_1h_v2 | 858 |
+| …rollup_dashboard_1m_v2 | 417 |
+| …rollup_dashboard_1h_v1 | 410 |
+| **total** | **12,743** |
+
+`uncovered = 6,484` sits comfortably inside 12,743. **No contradiction, no
+doubling, no phantom backlog.** I checked 4,490 against a number that summed six
+tables — the identical population mismatch I had called out two hours earlier in
+my own "builds outpace accrual 2:1" claim, committed again with more confidence
+and a push notification behind it.
+
+The checkpoint itself is clean, which should have been the tell: **4,550 add
+rows, 4,550 distinct, zero duplicates.** I read that result and kept going.
+
+**Consequences, all mine to undo:**
+- `c47c22c` reverts the census dedupe. It guarded a defect for which there is no
+  evidence, and its doctest documented that defect as real. Speculative code on a
+  false premise is worse than no code.
+- The memory file is being rewritten, not deleted — a future session that reads
+  "bound file metrics against numOfAddFiles" would repeat the error unless it
+  also reads "and make sure both sides cover the same tables".
+
+**And the real producer falls straight out of the correction.** Scanning the
+rollup table's own commit log — which I never did, because I assumed the census
+was about `otel_logs_and_spans`:
+
+```
+otel_logs_and_spans_rollup_dashboard_1m_v3:
+  70 commits / 0.51h, 39 adds to SEALED partitions  ->  ~77/hr
+```
+
+**One** rollup table mints ~77 sealed uncovered files an hour, against the 4.6/hr
+I measured on `otel_logs_and_spans` and mistook for the whole picture. Rollups
+write into historical date partitions by design — that is what a backfill *is* —
+so every rollup commit lands in `older`. Five such tables plus `otel_metrics`
+comfortably explain the ~130/hr.
+
+So the backlog is real, the accrual is real, and its source is **rollup and
+metrics tables, not the spans table** — which no amount of tantivy scheduling,
+carry-forward, or cap tuning on the spans path was ever going to touch.
