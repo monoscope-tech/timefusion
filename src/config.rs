@@ -2358,6 +2358,10 @@ pub struct MemoryConfig {
     ///
     /// Re-read `wide_scan_selected_mb_p99` before changing this — a workload shift
     /// moves the percentile, and a threshold below it rejects working dashboards.
+    /// **That reading is PROCESS-SCOPED**: measured across one boot it went 0 at 11
+    /// minutes, 1,057 at an hour and 3,506 at seven hours, because the wide scans
+    /// that populate it are rare. Sizing from a young process would set the
+    /// threshold far too low. Read it off an instance with hours of uptime.
     /// `TIMEFUSION_WIDE_SCAN_REFUSE_MB=0` is the kill switch back to admit-everything.
     #[serde_inline_default(16384)]
     pub timefusion_wide_scan_refuse_mb: u64,
