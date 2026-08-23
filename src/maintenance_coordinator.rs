@@ -4428,6 +4428,66 @@ mod tests {
         assert!(widths("q", 4).iter().all(|w| *w < DAY_MICROS));
     }
 
+    /// The prod shape: a whole day shredded to the one-minute floor, with the
+    /// ESTIMATES prod actually stored. Currently fails — this is a live defect.
+    ///
+    /// Copied out of the real journal 2026-08-23 (94,223 tasks; 21,598 pending
+    /// resolving to 1,452 cells, a 14.9x inflation). Worst cell: `base_rollup /
+    /// 00000000 / 2026-08-13`, **1,440 pending units of exactly 60 seconds each,
+    /// perfectly contiguous, covering exactly 24 hours**, nothing wider on that
+    /// table. Nothing wider means `subsume_covered_units` cannot fire, so fusion
+    /// is the only way out.
+    ///
+    /// Fusion cannot fire either, and the stored estimates say why:
+    ///
+    ///     estimated_decoded_bytes:  282 MB x1220,  188 MB x203,  537 MB x17
+    ///     summed per HOUR:          15.3 - 20.1 GB
+    ///     MAX_DECODED_BYTES:        512 MB
+    ///
+    /// An hour is 30-40x over budget, so every width is refused and the cell is
+    /// stuck forever. And the estimates are not merely pessimistic, they are
+    /// impossible: that partition holds **35 files totalling 0.36 GB**, while
+    /// these 1,440 units claim **391 GB** between them. A single SIXTY-SECOND
+    /// slice is estimated at 282 MB — roughly the whole partition — which is the
+    /// pre-`slice_share_of_file` whole-file accounting, frozen into the journal
+    /// at enqueue time and never recomputed.
+    ///
+    /// So the 14.9x queue inflation is not a scheduling problem: it is stale
+    /// estimates blocking the one mechanism that would collapse it.
+    ///
+    /// `#[ignore]`d because it FAILS. Un-ignore it as the first step of the fix,
+    /// which has to make the budget test stop trusting a stored estimate that
+    /// exceeds what the whole partition could possibly decode to.
+    #[test]
+    #[ignore = "documents a known defect: stale whole-file estimates block coarsening (2026-08-23)"]
+    fn a_day_shredded_to_the_minute_floor_collapses() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        const MINUTE: i64 = 60_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        // The estimate prod actually stored for a one-minute slice.
+        let prod_estimate = 282_280_533u64;
+        for slot in 0..1440 {
+            let start = DAY_MICROS + slot * MINUTE;
+            journal.enqueue(task("p", start, start + MINUTE, Operation::BaseRollup).key, 0, prod_estimate, 0);
+        }
+        let report = journal.coarsen_sealed_slices_reporting(now);
+        let pending = journal
+            .tasks()
+            .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
+            .count();
+        assert!(
+            pending < 1440,
+            "a contiguous shredded day must collapse; {pending} units remain (subsumed={} fused={} candidates={} blocked={} over_budget={})",
+            report.subsumed,
+            report.fused,
+            report.candidates,
+            report.blocked,
+            report.over_budget
+        );
+    }
+
     /// A COMPLETE day unit must not block coarsening, or the queue fills with
     /// sub-day slices that can never collapse.
     ///
