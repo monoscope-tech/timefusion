@@ -677,6 +677,42 @@ stayed at 2,905 ms, because on a young container the date-level map has only the
 days that have published since boot — which is exactly the ceiling described in
 the section above, and the case for rebuilding that map at boot.
 
+## Boot recovery (#7, `2321c47`) verified — and 3d/30d still do not route
+
+`recover_date_coverage` fires: prod logged `rollup_date_coverage_recovered`
+three times with **recovered = 20, 7, 20**. The date map is populated from
+restart now rather than refilling only as units publish.
+
+| | routed? | rep1 | rep2 |
+|---|---|---|---|
+| CONTROL needle 7d | no | 159 ms | 75 ms |
+| CONTROL topk 7d | no | 149 ms | 103 ms |
+| groupby 3d | **no** | 2,397 ms | 2,693 ms |
+| **groupby 7d** | **yes** | 3,883 ms | 4,718 ms |
+| groupby 30d | **no** | 29,624 ms | 28,450 ms |
+
+So 7d holds up across containers (3.7 / 3.9 / 4.7 s against a 10.6 s baseline),
+and **7d is still the only window that routes**. Two open questions, neither
+answered yet:
+
+- **30d** needs 30 contiguous covered days and recovery restored 20. That is a
+  coverage-depth problem, not a routing one — it is the queue, which is the
+  stale-estimate defect below.
+- **3d not routing is the surprising one**, since three days should be easier
+  than seven. The likely mechanism is the hybrid cost guard: a 3d window whose
+  today-and-yesterday are still churning has a covered interior near the 20%
+  threshold below which routing is declined as not worth it. Worth confirming
+  before acting — a guess about a threshold is exactly the kind of thing that has
+  been wrong repeatedly here.
+
+One caveat on the earlier claim that this would not shorten the blind window:
+coverage came up **183 s** after this container started, against ~25 minutes
+observed on earlier ones. But `rollup_min_contiguous_days` is computed by the
+maintenance planner pass, which this change does not touch, so that is more
+likely variance in when the planner ran than an effect of boot recovery. One
+observation, and the mechanism does not support the attribution — so it is
+recorded, not claimed.
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
