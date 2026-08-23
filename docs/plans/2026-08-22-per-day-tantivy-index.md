@@ -1671,3 +1671,41 @@ the next person does not re-derive it.
 
 **Still outstanding:** `…1h_v1` remains at 2026-08-19 — the ~21:35 prediction has
 not come due yet.
+
+## 21:35 — every indexed table served, and the whole cycle now takes 40 seconds
+
+The `1h_v1` prediction came due and landed: **all five indexed tables have a
+2026-08-23 manifest.** Better than predicted, the 19:30 pass served the entire
+set in one go:
+
+```
+19:30:00  …1h_v1   planned=8 cap=8            19:30:06  built=8
+19:30:07  …1h_v2   planned=8 cap=8            19:30:11  built=8
+19:30:12  …1m_v2   planned=8 cap=8            19:30:18  built=8
+19:30:19  …1m_v3   planned=8 cap=8 skipped_today=690   19:30:22  built=8
+19:30:38  otel_logs_and_spans  planned=8 cap=8 skipped_today=3
+```
+
+**38 seconds for the whole cycle.** So rotation was not merely a fairness patch —
+with the rollup passes costing seconds, every table now gets served every slot,
+and the starvation is gone rather than merely redistributed. Three days of frozen
+manifests closed.
+
+Two things this run shows that were invisible before:
+
+- **`cap=8` and no `planned_mb`** — this pass ran on the pre-budget image, so the
+  byte budget has not been exercised yet. `6691031` is deployed now; the next
+  pass either shows `planned` well above 8 with `planned_mb ≤ 2048`, or the
+  budget is not doing what I think.
+- **`skipped_today=690` on `1m_v3`** against `planned=8`. The 1m rollup writes
+  into *today's* partition continuously, so `skip_today` — which I turned on this
+  morning for the spans hot-tail — is deferring ~690 files on that table alone.
+  That is consistent with `today=686` in the census, and it is deliberate rather
+  than broken, but it means the pass sees only the sealed remainder. Whether
+  `skip_today` should apply to rollup tables at all is a separate question from
+  the byte budget, and I am not changing two things at once.
+
+Coverage is still climbing (`uncovered=6773 older=4061` at 19:24) — expected,
+since 8 builds per slot per table is ~32/hr against ~77/hr accrual on `1m_v3`
+alone. The byte budget is the change that should close that, and it has not run
+yet.
