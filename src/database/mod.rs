@@ -238,7 +238,8 @@ pub mod scan_metric_names {
     /// Unverifiable (predates `TAG_SOURCE_ROWS`) and genuinely-moved are the same
     /// miss with opposite fixes: the first clears on republish, the second cannot.
     pub const ROLLUP_STALE_NO_WITNESS: &str = "timefusion.scan.rollup_stale_no_witness";
-    pub const ROLLUP_STALE_MOVED: &str = "timefusion.scan.rollup_stale_moved";
+    pub const ROLLUP_STALE_SHRANK: &str = "timefusion.scan.rollup_stale_shrank";
+    pub const ROLLUP_STALE_GREW: &str = "timefusion.scan.rollup_stale_grew";
     pub const ROLLUP_STALE_NO_SOURCE_ROWS: &str = "timefusion.scan.rollup_stale_no_source_rows";
 
     pub fn prefilter_skip_metric(reason: &str) -> Option<&'static str> {
@@ -9277,11 +9278,26 @@ fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate
 /// The split exists because the three demand opposite work: an absent witness
 /// clears itself on republish (build throughput), a moved partition never will,
 /// and an absent live row count means nothing could be compared at all.
+/// `moved` is split by DIRECTION, because the two directions have opposite causes
+/// and the fix depends on which dominates.
+///
+/// `num_records` counts PHYSICAL rows — tombstones and every merge-on-read
+/// version — while the build aggregated LOGICAL rows through `DedupExec`. So the
+/// count can only GROW by rows arriving (a real write, a DML re-append: the tier
+/// genuinely is stale), and it SHRINKS when dedup, compaction or vacuum collapses
+/// physical rows the logical set never contained (the tier is still exactly
+/// correct and is refused anyway).
+///
+/// Both are still refused — this only names them. Whether `shrank` can be
+/// accepted outright is NOT obvious and must not be assumed from this counter:
+/// a retention delete would also shrink while genuinely removing logical rows.
+/// See `docs/plans/2026-08-23-the-row-witness-counts-the-wrong-rows.md`.
 fn stale_coverage_metric(witness: Option<u64>, current: Option<u64>) -> &'static str {
     match (witness, current) {
         (None, _) => scan_metric_names::ROLLUP_STALE_NO_WITNESS,
         (_, None) => scan_metric_names::ROLLUP_STALE_NO_SOURCE_ROWS,
-        _ => scan_metric_names::ROLLUP_STALE_MOVED,
+        (Some(witness), Some(current)) if current < witness => scan_metric_names::ROLLUP_STALE_SHRANK,
+        _ => scan_metric_names::ROLLUP_STALE_GREW,
     }
 }
 
@@ -9298,8 +9314,12 @@ mod stale_coverage_metric_tests {
             (None, Some(10), scan_metric_names::ROLLUP_STALE_NO_WITNESS),
             (None, None, scan_metric_names::ROLLUP_STALE_NO_WITNESS),
             (Some(10), None, scan_metric_names::ROLLUP_STALE_NO_SOURCE_ROWS),
-            (Some(9), Some(10), scan_metric_names::ROLLUP_STALE_MOVED),
-            (Some(11), Some(10), scan_metric_names::ROLLUP_STALE_MOVED),
+            // Witness 9, live 10: rows ARRIVED since the build — really stale.
+            (Some(9), Some(10), scan_metric_names::ROLLUP_STALE_GREW),
+            // Witness 11, live 10: physical rows were COLLAPSED (dedup/compaction/
+            // vacuum). The logical set the tier aggregated may be untouched, which
+            // is the whole reason this direction is named separately.
+            (Some(11), Some(10), scan_metric_names::ROLLUP_STALE_SHRANK),
         ] {
             assert!(!crate::rollup::slice_coverage_agrees(&[witness], current), "{witness:?}/{current:?} must be a refusal to be classified");
             assert_eq!(stale_coverage_metric(witness, current), expected, "for witness={witness:?} current={current:?}");

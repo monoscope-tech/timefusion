@@ -1234,7 +1234,13 @@ impl StatsTableProvider {
                     // because the partition really is churning. Same miss, opposite
                     // fix, and indistinguishable before this.
                     "rollup_stale_no_witness" => cv(ROLLUP_STALE_NO_WITNESS),
-                    "rollup_stale_moved" => cv(ROLLUP_STALE_MOVED),
+                    "rollup_stale_moved" => cv(ROLLUP_STALE_SHRANK) + cv(ROLLUP_STALE_GREW),
+                    // GREW = rows arrived, the tier really is stale. SHRANK = physical
+                    // rows were collapsed by dedup/compaction/vacuum, which the logical
+                    // set the tier aggregated may not even contain. Both are refused;
+                    // this says which is worth building for.
+                    "rollup_stale_grew" => cv(ROLLUP_STALE_GREW),
+                    "rollup_stale_shrank" => cv(ROLLUP_STALE_SHRANK),
                     "rollup_stale_no_source_rows" => cv(ROLLUP_STALE_NO_SOURCE_ROWS),
                     "pruned_calls" => cv(PRUNED_CALLS),
                     "pruned_files_total" => cv(PRUNED_FILES),
