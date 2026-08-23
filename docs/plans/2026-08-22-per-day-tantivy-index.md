@@ -1247,3 +1247,41 @@ comfortably explain the ~130/hr.
 So the backlog is real, the accrual is real, and its source is **rollup and
 metrics tables, not the spans table** — which no amount of tantivy scheduling,
 carry-forward, or cap tuning on the spans path was ever going to touch.
+
+### 16:20 — why rollup tables are indexed at all: one struct-update in `synthesize`
+
+Rollup schemas are generated, not written. `RollupSpec::synthesize`
+(`src/schema.rs`) builds the structural columns through a `plain()` helper that
+deliberately sets `tantivy: None` — the author clearly considered indexing for
+synthesized fields. But dimensions are copied wholesale from the source schema:
+
+```rust
+for d in &self.dimensions {
+    let f = src_field(d)?;
+    fields.push(FieldDef { nullable: true, ..f });   // <- carries `tantivy` too
+}
+```
+
+`..f` inherits `tantivy: Some { indexed: true, … }` from the spans schema for
+every dimension (`level`, `name`, `status_code`, `kind`, …). That single struct
+update is why the four rollup tables satisfy `indexed_set()`, appear in
+`indexed_tables()`, own manifests, and carry a per-file coverage obligation the
+census counts and the backfill tries to discharge.
+
+Population, corrected: the indexed set is `otel_logs_and_spans` (4,550 live
+files) plus the four rollup tables (3,221 + 858 + 417 + 410) = **9,456**, of
+which **~4,900 are rollup files — 52%**. `otel_metrics` has a manifest directory
+but its YAML declares no tantivy fields, so its 3,287 files are most likely a
+stale artifact of an earlier config rather than a current obligation; that needs
+confirming before it is counted either way.
+
+**The consequence, if these indexes are never read:** roughly half the coverage
+obligation and essentially all of the ~77/hr sealed accrual exist to serve
+indexes nobody queries, and disabling tantivy on synthesized dimensions would
+remove both at a stroke — no scheduling, no throughput, no per-day index.
+
+**That "if" is not yet established, and I am not going to infer it.** The
+argument that rollup routing strips tantivy hints (`strip_index_hints`, and the
+`ebfa7e0` fix behind it) suggests no `text_match` ever reaches a rollup scan, but
+that is exactly the shape of reasoning that has failed repeatedly today. A log
+query for tantivy activity by table is running; the claim waits for it.
