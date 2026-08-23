@@ -457,3 +457,40 @@ containers), it must SURVIVE (>1h pass against 15-30 min restarts), and only
 then does ordering matter. Today's work fixed the third while the first two
 remain. That is the right order to fix them in only if the first two are
 addressed next; fixing ordering alone changes nothing measurable.
+
+## 2026-08-23 — the drain had never run; four changes, and what each must show
+
+`tantivy_backfill_built = 30` on a container up **7 hours** (~4 builds/hr), with
+**1** `tantivy_backfill_started`, **0** `tantivy_backfill_pass` completions and
+**19** ticks dropped as "run still in progress". One pass began at boot, was
+still going 7 hours later, and blocked every tick behind it. At 150 files and
+~4/hr that pass was a **35-hour** job.
+
+Shipped together, each with its own observable so the batch attributes:
+
+| change | from → to | must show |
+|---|---|---|
+| reconcile schedule | `0 20 * * * *` → `0 */15 * * * *` | `tantivy_backfill_started` within 15 min of ANY boot (was 0-in-6h) |
+| pass cap | 150 → 8 | `tantivy_backfill_pass` end-lines firing — never once seen on this box |
+| hot-tail skip | new, default ON | `skipped_today` ≈ today's uncovered; `planned=` is backlog-only |
+| carry-forward | new | `tantivy_carried_forward` > 0, and `built=` per optimize falling |
+
+**The verdict on the tail reservation (§4) comes from this, not before it.** It
+has still never executed a full pass; with cap 8 a pass completes in ~2h, and
+`week`+`older` declining ACROSS container generations is the signal. If they
+still do not move once passes complete, the reservation is not the lever.
+
+**Two things this does NOT fix, stated so they are not silently assumed.**
+
+1. **~4 builds/hr is the real ceiling** and nobody has attributed it. 15 minutes
+   to index one ~1MB parquet is pathological; at that rate the 5,171-file
+   backlog is ~two months even with everything above working perfectly. This is
+   now the top item — the cap, the ordering and the schedule were all
+   downstream of a drain that could not run, and this is what remains once it can.
+2. **Today's coverage regresses.** `light_optimize_tail` owns today's partition
+   and has no tantivy hook, so a hot-tail merge drops its inputs' coverage and
+   the output stays uncovered until the date rolls over. Correctness is fine
+   (uncovered → raw leg with the original filters); the hot window loses its
+   prefilter for up to a day. The fix is to give `light_optimize_tail` the
+   carry-forward hook `optimize_table` now has — then today is cheap to cover
+   and `timefusion_tantivy_backfill_skip_today` can go back to false.
