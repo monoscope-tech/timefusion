@@ -757,3 +757,34 @@ mechanism for exactly this churn, but it is wired only into `optimize_table` —
 the wave path still pays a full rebuild per output. **Wiring carry-forward into
 `reindex_wave_outputs` is now the highest-value remaining change**, ahead of
 `max_file_mb` and ahead of the per-day index.
+
+### 13:40 — the reservation is EXONERATED; whales come from the head
+
+I hypothesised that the oldest-first reservation was spending a third of every
+pass on the largest files ("oldest means most-compacted means largest") and said
+`tail_share_pct` should come down. **The attribution refutes it.** A 755 MB /
+1,304,769-row build completed at 13:38:42 and its unit line, 13 seconds later,
+reads `from_reserved_tail=false`. The whale came from the HEAD.
+
+That makes sense in hindsight and I should have seen it: the head is
+newest-first *within the backlog* (today is excluded by `skip_today`), and the
+newest backlog files are the ones compaction most recently merged — which is
+exactly what makes a file big. Age and size are correlated far more weakly than
+the hypothesis assumed, and both ends of the queue can hold whales.
+
+**So do not touch `tail_share_pct`.** It was a well-supported story, instrumented
+specifically to test it, and the instrument said no. Recording that here because
+I came close to shipping the change on the strength of the story alone.
+
+**A limit of the tail-first fix, worth stating.** Tail-first fixes which build
+STARTS first, not which COMPLETES. With `build_concurrency = 2`, positions 0
+(tail) and 1 (head) start together; if the tail file is large it finishes last,
+and nothing is banked until a build completes. No `from_reserved_tail=true` has
+been observed yet for that reason. On a box restarting every few minutes, a
+reservation cannot drain large files however it is ordered — which converges,
+from a third independent direction, on the same conclusion:
+
+**the unit has to stop being "one whole parquet file".** Either stop rebuilding
+it (carry-forward, now on both the optimize and wave paths) or make it smaller
+(`max_file_mb`, or sharding the build). Scheduling changes cannot fix work that
+does not fit between interruptions.
