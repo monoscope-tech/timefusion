@@ -374,3 +374,56 @@ That single line converts this from a guessing game into a one-tick answer. This
 repo has been burned by precisely this shape before — the dirty-bin drain with no
 caller, the untagged-tier stall, the counter that fired before its commit — and
 each was found the same way: make the silent refusal say why.
+
+## Resolved: three defects, found by instrumentation rather than guessing
+
+After two failed hypotheses I stopped guessing and shipped the funnel log
+(`680acac`): on the path where a unit selects fewer than two files, report
+candidate counts at every filter stage. It answered on its first tick and then
+kept answering — each of the following came from reading it, not theorising.
+
+**1. Smallest-first packing (`8844064`).**
+
+```
+87576849 / 2026-08-22
+  after_range_filter=47  unsorted_candidates=0  under_target=47  selected=0
+```
+
+47 files, p50 = 14 MB, max 252 MB — 46 of 47 pair trivially. But candidates
+arrive in EVENT-TIME order and the loop pushes the first unconditionally, so the
+252 MB file consumed the whole 256 MB budget and the next candidate broke the
+loop. One file selected is a 1:1 rewrite, which trips the `< 2` guard. Sorting by
+size ascending is the standard bin-packing answer.
+
+This also explains why the earlier attempt (02e3778) failed: it filtered
+`size < limit`, and when `limit` IS the target a 252 MB file passes. The problem
+was the ORDER, not the eligibility.
+
+**2. The policy disagreed with the packer (`e16f157`).**
+
+```
+dcad860a / 2026-08-22   after_range_filter=2  under_target=2  selected=0
+00000000 / 2026-08-22   after_range_filter=2  under_target=2  selected=0
+```
+
+The planner admits a partition when two files are under target; the packer merges
+files whose SUM fits the target. Two files each just under target are therefore
+"small" forever and unmergeable forever — queued every 60 s, selecting one file,
+retiring nothing. The planner now applies the packer's own test.
+
+**3. The silent branch itself (`680acac`).** `run_coordinator_compaction_once`
+marked a unit COMPLETE on an empty selection and logged nothing, which is what
+made the first two invisible. That is the same shape as the dirty-bin drain with
+no caller and the counter that fired before its commit — and the same fix:
+make the refusal explain itself.
+
+## What this cost, and the lesson
+
+Two hypotheses were shipped before the instrumentation, and both were wrong:
+skipping over-budget files (broke two deliberate tests, reverted) and filtering
+`size < limit` (deployed, ran 20 minutes, changed nothing). Both were plausible
+readings of the same flat numbers. The funnel log took one commit and answered
+immediately — and then answered a second, different defect that no amount of
+staring at file counts would have separated from the first.
+
+Instrument the silent branch BEFORE the second guess, not after the third.
