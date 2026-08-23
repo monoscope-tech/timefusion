@@ -13,3 +13,6 @@ dis-newstyle
 wal_files/
 bench/__pycache__/
 bench/data/query_latency_state.json
+# Local benchmark harness: prod creds in bench/local/tfurl, and result CSVs
+# are machine-specific. See bench/local/README.md after creating it.
+bench/local/
