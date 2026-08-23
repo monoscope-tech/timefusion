@@ -119,3 +119,36 @@ So the goal now decomposes cleanly:
   queries; `rollup_hits_hybrid_total` climbing, 1 -> 3 during this window)
 - the widest cells: blocked on build throughput, not on query-side work
 - one genuine timeout left (`87576849` at 14d, 60.9 s)
+
+## 1.2 — CLOSED as superseded, with the measurement that closes it
+
+1.2 was "bound `log_list` so `LIMIT 251` doesn't dedup 30 days — fixes mode B".
+Re-measured on prod `45b9ab4`, the cell that defined mode B (p1, 30d,
+`ORDER BY timestamp DESC LIMIT 251`) no longer reaches the dedup budget at all:
+
+```
+ERROR:  Resources exhausted: scan selected 1447 files / 460311 MiB,
+        over the 16384 MiB per-scan limit
+```
+
+It fails in **2.9 s at the scan guard**, not at the 2 GiB unordered-dedup
+ceiling. Mode B does not reproduce in prod any more, so bounding the dedup fixes
+nothing observable — and it would not make this cell complete either, because
+the scan is **460 GB**. What that query needs is to not select 460 GB: sorted
+footers so a `LIMIT` can stop early, or file pruning. Neither is dedup work.
+
+There is also a structural reason not to do it as specified. `Greatest` retains
+whole `RecordBatch`es plus winner masks, so evicting a KEY does not release
+memory unless the retained batches are also compacted down to surviving rows —
+turning a "bound the top-N" change into a rework of the buffer, its masks and its
+pool accounting. That is the operator that resolves merge-on-read versions, with
+two logged prod incidents in its history, for a failure mode that no longer
+fires.
+
+The design remains recorded above (`dedup_keys` is `[timestamp, id]`, so all
+versions of a key share a timestamp and a tie-inclusive top-N is sound) in case
+the trade changes. Today it does not: 1.2 is closed as superseded by 1.3, not
+deferred.
+
+Worth flagging on its own: one project selecting **1,447 files / 460 GB** for a
+30-day `count(*)` is a compaction signal, not a query signal.
