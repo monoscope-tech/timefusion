@@ -3638,11 +3638,32 @@ impl Database {
             // to, so a day still being written is compared on the part the build
             // actually read. A partition with no coverage gets the whole-partition
             // question and simply fails to match below.
-            Self::partition_stats_bounded(&table, tiebreak_of(&route.source), &|project, date| {
-                self.rollup_coverage
-                    .get(&(project.to_string(), route.source.clone(), route.target.clone(), date.to_string()))
-                    .map_or(i64::MAX, |coverage| coverage.covered_through)
-            })
+            // UNBOUNDED, matching how both witnesses are RECORDED. The write
+            // side stamps `source_rows` and the date-level `source_fp` from
+            // `partition_stats_bounded(.., &|_, _| i64::MAX)` (maintain.rs), so
+            // bounding here compared two different computations — exactly what
+            // `PartitionStats::rows` warns against ("it must stay THIS
+            // computation on both sides").
+            //
+            // It was harmless only while the date-level `rollup_coverage` map
+            // had no producer and the bound was always `i64::MAX`. Once that map
+            // was given one, the bound became real: every file whose `max_ts` sat
+            // at or past it was dropped, and a partition that lost ALL its files
+            // vanished from the map entirely rather than reporting a smaller
+            // count. `current` then read `None`, `slice_coverage_agrees` returns
+            // false on its first line whatever the witness says, and EVERY slice
+            // for a sealed day was refused `stale_coverage`.
+            //
+            // Reproduced by three rollup integration tests (`an_all_null_duration
+            // _bucket_…`, `a_coalesced_dimension_folds_…`, `a_partly_covered_
+            // window_…`), all of which assert routing and all of which failed
+            // with `reason delta [not_built, stale, …] = [0, 1, 0, 0, 0]` while
+            // holding perfectly good witnesses against `current = None`.
+            //
+            // Comparing the whole partition is the safe direction: a day still
+            // being written moves its fingerprint and is refused, which costs a
+            // raw scan rather than serving a stale aggregate.
+            Self::partition_stats_bounded(&table, tiebreak_of(&route.source), &|_, _| i64::MAX)
             .map_err(|_| crate::rollup::MissReason::IncompleteCoverage)?
         };
         // Pinned: the one project. Grouped: every project the SOURCE holds rows
