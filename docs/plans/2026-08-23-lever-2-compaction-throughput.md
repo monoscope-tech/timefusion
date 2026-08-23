@@ -56,3 +56,57 @@ The next question is where a pass's 240 s actually goes: `stage_dedup_chunk`'s
 rewrite, the batch probe, or the commit. `dedup_bin_rewrite_duration_ms_total`
 exists and read 0 on this container, so it wants a longer window rather than more
 hypotheses.
+
+## Correction and the real shape of lever 2
+
+Two earlier readings on this page were taken on 2-minute-old containers and were
+wrong. The compaction planner needs a scan cycle before its numbers mean
+anything:
+
+```
+17:46  eligible_sealed=1235  pending_sealed_consolidation=0   <- planner mid-scan
+17:48  eligible_sealed=1305  pending_sealed_consolidation=72  pending_hot_packing=20
+17:51  ...                   pending_sealed_consolidation=75
+```
+
+So partitions genuinely out of policy DO exist, and the number is small:
+**~75 sealed partitions**, consistent with the 2026-08-19 object-storage audit
+("108 sealed ones genuinely out of policy" against 2,130 queued tasks). Lever 2
+is not a 20,000-item backlog. The 19,891 `dirty_bin_queue_depth` is the DEDUP
+queue, a different mechanism.
+
+## What is actually blocking it
+
+Watched over five minutes with the coordinator healthy:
+
+```
+17:51  pending_sealed_consolidation=75  tasks_running=16
+17:53  pending_sealed_consolidation=75  tasks_running=16
+17:56  pending_sealed_consolidation=75  tasks_running=16
+17:57  everything 0                                    <- restart
+```
+
+Not draining, while all 16 workers are busy on rollup work. Both operation
+cycles give `SealedConsolidation` one slot in ten, so the cycle is not starving
+it by construction — the claim is failing for some other reason, and that is the
+open question. Note also that these units are DERIVED (`is_derived_operation`),
+so a restart discards them and the planner re-mints from the file list; with prod
+restarting every 20-40 minutes, a unit has a narrow window to be claimed at all.
+
+## The part that matters for the 14d/30d goal, stated carefully
+
+Lever 2 was motivated as "what makes a 1-minute slice cost 4.5 GB". After lever 1
+there are no 1-minute sealed slices, so that specific cost is already gone.
+
+What remains is the READ side: project 87576849 selects 1,447 files / 460 GB for
+30 days and is refused. Whether compaction can help that is NOT established here.
+1,447 files over 460 GB averages ~318 MB, above the 256 MB sealed target — but a
+mean does not describe a population, and this repo has already been burned by
+exactly that inference (the tantivy size distribution, 2026-08-23: one 718 MB
+whale among eight builds under 40 MB). The honest statement is that p1's file
+size DISTRIBUTION has not been measured, and until it is, "compact p1" is a
+hypothesis rather than a plan.
+
+If p1's files really are mostly at target, then its 460 GB is data volume, not
+fragmentation, and no compaction will make a 30-day raw scan cheap — only routing
+to the rollup tier will, which is lever 1's territory and now unblocked.
