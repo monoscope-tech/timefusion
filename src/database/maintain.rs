@@ -330,6 +330,11 @@ impl Database {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
                     let estimate = small.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
+                    // The file count IS the benefit for hygiene: consolidation
+                    // removes these and leaves one. `scheduling_class` ranks
+                    // sealed hygiene on it, so a cell worth 200 files outranks
+                    // one worth 3 regardless of which sealed first.
+                    let footprint = crate::maintenance_coordinator::InputFootprint::new(small.iter().map(|file| &file.path), estimate);
                     // A sealed partition's age is measured from when it SEALED,
                     // not from when this scan happened to notice it again.
                     //
@@ -364,7 +369,7 @@ impl Database {
                         retry_reason: None,
                         publication: None,
                         base_tier_present: false,
-                        input: None,
+                        input: Some(footprint),
                     });
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
@@ -372,6 +377,7 @@ impl Database {
                     if !suspects.is_empty() {
                         planned_keys.insert((project_id.clone(), date, Operation::Repair));
                         let estimate = suspects.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
+                        let footprint = crate::maintenance_coordinator::InputFootprint::new(suspects.iter().map(|file| &file.path), estimate);
                         planned.push(MaintenanceTask {
                             key: TaskKey {
                                 physical_table: source.clone(),
@@ -390,7 +396,7 @@ impl Database {
                             retry_reason: None,
                             publication: None,
                             base_tier_present: false,
-                            input: None,
+                            input: Some(footprint),
                         });
                     }
                 }

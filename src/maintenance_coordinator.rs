@@ -331,6 +331,12 @@ pub struct InputFootprint {
     pub fp: u64,
     /// Decoded, projected bytes of that whole set — one scan, unprorated.
     pub whole_file_bytes: u64,
+    /// How many files. For file hygiene this IS the benefit: a consolidation
+    /// removes them and leaves one. `default` so journals written between
+    /// 5582105 and this change still deserialize, reporting zero benefit —
+    /// which orders them last rather than wrongly.
+    #[serde(default)]
+    pub files: u32,
 }
 
 impl InputFootprint {
@@ -338,12 +344,12 @@ impl InputFootprint {
     /// order is not stable), so two units over the same files agree.
     pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(paths: I, whole_file_bytes: u64) -> Self {
         use std::hash::{Hash, Hasher};
-        let fp = paths.into_iter().fold(0u64, |acc, path| {
+        let (fp, files) = paths.into_iter().fold((0u64, 0u32), |(acc, count), path| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             path.as_ref().hash(&mut hasher);
-            acc ^ hasher.finish()
+            (acc ^ hasher.finish(), count.saturating_add(1))
         });
-        Self { fp, whole_file_bytes }
+        Self { fp, whole_file_bytes, files }
     }
 }
 
@@ -374,7 +380,7 @@ pub struct Publication {
 #[derive(Default)]
 struct GroupPrice {
     /// Distinct footprints, each charged its unprorated whole-file cost.
-    distinct: HashMap<u64, u64>,
+    distinct: HashMap<u64, InputFootprint>,
     /// Members with nothing better to say than their prorated share.
     unpriced_bytes: u64,
     unpriced_members: usize,
@@ -388,7 +394,7 @@ impl GroupPrice {
         self.summed_bytes = self.summed_bytes.saturating_add(task.estimated_decoded_bytes);
         match task.input {
             Some(input) => {
-                self.distinct.insert(input.fp, input.whole_file_bytes);
+                self.distinct.insert(input.fp, input);
             }
             None => {
                 self.unpriced_bytes = self.unpriced_bytes.saturating_add(task.estimated_decoded_bytes);
@@ -398,7 +404,7 @@ impl GroupPrice {
     }
 
     fn bytes(&self) -> u64 {
-        self.distinct.values().fold(self.unpriced_bytes, |total, bytes| total.saturating_add(*bytes))
+        self.distinct.values().fold(self.unpriced_bytes, |total, input| total.saturating_add(input.whole_file_bytes))
     }
 
     /// Bound the price by what the partition can actually decode to.
@@ -408,13 +414,13 @@ impl GroupPrice {
     /// members are summed and pre-date the footprint entirely. Prod's stuck
     /// backlog is all unpriced.
     fn cap_at(&mut self, ceiling: u64) {
-        let priced: u64 = self.distinct.values().fold(0, |total, bytes| total.saturating_add(*bytes));
+        let priced: u64 = self.distinct.values().fold(0, |total, input| total.saturating_add(input.whole_file_bytes));
         self.unpriced_bytes = self.unpriced_bytes.min(ceiling.saturating_sub(priced.min(ceiling)));
     }
 
     fn unanimous_input(&self) -> Option<InputFootprint> {
         match (self.unpriced_members, self.distinct.iter().next()) {
-            (0, Some((&fp, &whole_file_bytes))) if self.distinct.len() == 1 => Some(InputFootprint { fp, whole_file_bytes }),
+            (0, Some((_, &input))) if self.distinct.len() == 1 => Some(input),
             _ => None,
         }
     }
@@ -963,8 +969,22 @@ impl TaskJournal {
                 }
             }
         }
+        // Damage repairs are exempt here for the same reason they are exempt
+        // from fusion: the repair unit is sized to one file's uncovered span,
+        // and the wider unit that subsumes it does NOT replace it — the
+        // preflight measures that one over budget and shreds it back down.
+        // Prod 2026-08-23: after exempting only the fuse pass, five cells still
+        // had NO unit covering their hole at all — `dcad860a` 08-15's units
+        // began at 18:11 against a hole of 18:00-18:11 — because this pass had
+        // deleted them first.
+        let damaged = self.untagged_cells.clone();
+        let is_damage = |task: &MaintenanceTask| {
+            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
+                damaged.contains(&(task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), time.date_naive().to_string()))
+            })
+        };
         self.retain_tasks(|task| {
-            if !matches!(task.state, TaskState::Pending | TaskState::Retry) || is_live_frontier(task.key.slice, now_micros) {
+            if !matches!(task.state, TaskState::Pending | TaskState::Retry) || is_live_frontier(task.key.slice, now_micros) || is_damage(task) {
                 return true;
             }
             // The NARROWEST ladder width this unit fits inside, so that every
@@ -1915,8 +1935,8 @@ impl TaskJournal {
         //
         // Bounded and self-terminating: the set comes from files that exist and
         // empties as they are retired.
-        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, u8, i64, i64) {
-            let (class, starved, width, order) = scheduling_class(task, now_micros);
+        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, u8, i64, i64, i64) {
+            let (class, starved, width, benefit, order) = scheduling_class(task, now_micros);
             let hole = journal.hole_rank(task);
             // Damage does not order by width OR recency — every damage unit
             // ties, so the per-project cursor below rotates across the damaged
@@ -1935,11 +1955,13 @@ impl TaskJournal {
             //
             // Tying them puts every damage unit in one rank group, which is what
             // `fair_cursors` is for.
+            // `benefit` is carried through untouched — it is 0 for the rollup
+            // operations damage repair uses, so it cannot disturb the tie.
             let (width, order) = if hole == 0 { (0, 0) } else { (width, order) };
-            (class, u8::from(hole > 0), starved, hole, width, order)
+            (class, u8::from(hole > 0), starved, hole, width, benefit, order)
         };
-        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, u8, i64, i64)> {
-            let mut class: Option<(u8, u8, u8, u8, i64, i64)> = None;
+        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, u8, i64, i64, i64)> {
+            let mut class: Option<(u8, u8, u8, u8, i64, i64, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_live_frontier(task.key.slice, now_micros))) {
                 let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
@@ -2380,7 +2402,7 @@ impl TaskJournal {
 
 /// `(class, operation priority, -width, -recency)` -> project -> that project's
 /// queue. Ordered so smaller tuples run first; see `scheduling_class`.
-type ReadyGroups<'a> = BTreeMap<(u8, u8, u8, i64, i64), HashMap<&'a str, VecDeque<&'a MaintenanceTask>>>;
+type ReadyGroups<'a> = BTreeMap<(u8, u8, u8, i64, i64, i64), HashMap<&'a str, VecDeque<&'a MaintenanceTask>>>;
 
 /// Deadline ordering with round-robin selection among projects at the same
 /// operation priority. This prevents one whale from consuming an entire pass.
@@ -2388,9 +2410,9 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
     let mut groups: ReadyGroups<'_> = BTreeMap::new();
     for task in tasks {
         if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
-            let (class, starved, width_key, order_key) = scheduling_class(task, now_micros);
+            let (class, starved, width_key, benefit_key, order_key) = scheduling_class(task, now_micros);
             groups
-                .entry((class, starved, task.key.operation.priority(), width_key, order_key))
+                .entry((class, starved, task.key.operation.priority(), width_key, benefit_key, order_key))
                 .or_default()
                 .entry(&task.key.project_id)
                 .or_default()
@@ -2479,12 +2501,12 @@ const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 /// ordering. It is deprioritised, not abandoned.
 const STARVATION_HORIZON_MICROS: i64 = 31 * 24 * 60 * 60 * 1_000_000;
 
-fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64) {
+fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
     if is_live_frontier(task.key.slice, now_micros) {
         // Smaller tuples run first. Negating makes the newest minute the most
         // urgent while keeping all projects in that minute deadline-equivalent.
         // Width is not a frontier concern — these are all one slice wide.
-        (0, 0, 0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
+        (0, 0, 0, 0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     } else {
         // Newest slice first here too, for the same reason the dedup drain and
         // the rollup backfill are newest-first: recent days are what dashboards
@@ -2554,7 +2576,27 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         // contiguity, while fresh work is what dashboards read and belongs
         // newest-first. `STARVATION_HORIZON_MICROS` is what keeps the two apart.
         let recency = task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS);
-        (1, starved, -task.key.slice.width(), if starved == 0 { recency } else { -recency })
+        // File hygiene ranks by BENEFIT, not by date. Every hygiene unit is
+        // day-wide, so `-width` is constant among them and the tie-break was
+        // pure recency — which says nothing about how much debt a claim
+        // retires. Prod 2026-08-23: four sealed cells held ~850 removable files
+        // in 4.9 GB, and capacity went to whichever happened to be newest.
+        //
+        // `files` is what the planner already counted to decide the partition
+        // was out of policy, so this costs nothing to know. Zero (a journal
+        // written before the field, or a unit from another path) orders LAST,
+        // which is the safe reading of "benefit unknown".
+        //
+        // Starvation still leads the tuple, so this cannot strand a small cell
+        // forever — it only decides the order among work nothing has escalated.
+        // And benefit is self-limiting: a consolidated partition becomes
+        // compliant and is retired, so the queue drains toward the small cells
+        // by itself.
+        let benefit = match task.key.operation {
+            Operation::SealedConsolidation | Operation::HotPacking | Operation::Repair => -i64::from(task.input.map_or(0, |input| input.files)),
+            _ => 0,
+        };
+        (1, starved, -task.key.slice.width(), benefit, if starved == 0 { recency } else { -recency })
     }
 }
 
@@ -3700,6 +3742,46 @@ mod tests {
     /// `scheduling_class`'s own comment as sending 10 of 10 historical starts to
     /// data months old while the last 30 days went untouched — so fresh work
     /// must STILL be newest-first, and only genuinely starved tasks escalate.
+    /// Sealed hygiene ranks by how much debt a claim RETIRES, not by date.
+    ///
+    /// Every hygiene unit is day-wide, so `-width` ties among them and the
+    /// tie-break was pure recency — which says nothing about benefit. Prod
+    /// 2026-08-23: four sealed cells held ~850 removable files in 4.9 GB while
+    /// capacity went to whichever sealed most recently.
+    #[test]
+    fn sealed_hygiene_ranks_by_files_removed_not_by_date() {
+        const HOUR: i64 = 3_600_000_000;
+        const DAY: i64 = 24 * HOUR;
+        let now = 400 * DAY;
+        let cell = |project: &str, hours_ago: i64, files: u32, operation| {
+            let end = now - hours_ago * HOUR;
+            let mut unit = task(project, end - DAY, end, operation);
+            unit.input = Some(InputFootprint { fp: 1, whole_file_bytes: 1, files });
+            unit
+        };
+        let class = |unit: &MaintenanceTask| super::scheduling_class(unit, now);
+
+        // A big older cell beats a small newer one — the reversal.
+        let big_old = cell("a", 60, 200, Operation::SealedConsolidation);
+        let small_new = cell("b", 30, 3, Operation::SealedConsolidation);
+        assert!(class(&big_old) < class(&small_new), "200 files outrank 3, whichever sealed first");
+        // Within a band they TIE, so `fair_cursors` can still rotate projects
+        // instead of one cell winning every claim.
+        assert_eq!(
+            class(&cell("a", 60, 200, Operation::SealedConsolidation)).3,
+            class(&cell("b", 30, 210, Operation::SealedConsolidation)).3,
+            "comparable cells must tie"
+        );
+        // Unknown benefit orders LAST, never first: a journal written before the
+        // field must not jump the queue.
+        let mut unknown = cell("c", 60, 0, Operation::SealedConsolidation);
+        unknown.input = None;
+        assert!(class(&big_old) < class(&unknown));
+        // And benefit is hygiene-only — it must not perturb rollup ordering,
+        // which damage repair relies on tying.
+        assert_eq!(class(&cell("d", 60, 200, Operation::BaseRollup)).3, class(&cell("e", 60, 3, Operation::BaseRollup)).3);
+    }
+
     #[test]
     fn sealed_work_ages_out_of_starvation_without_becoming_oldest_first() {
         const HOUR: i64 = 3_600_000_000;
@@ -3936,6 +4018,39 @@ mod tests {
         journal.coarsen_sealed_slices(now);
         assert_eq!(survives(&journal, "damaged"), 2, "a damaged cell's repair units must survive coarsening");
         assert_eq!(survives(&journal, "ordinary"), 0, "control: ordinary narrow sealed units are still fused");
+    }
+
+    /// Nor may SUBSUMPTION eat one, which is the other half of the same pass.
+    ///
+    /// A wider pending unit does not replace the repair it swallows: the
+    /// preflight measures that one over budget and shreds it back down. Prod
+    /// 2026-08-23, after exempting only fusion: five cells still had NO unit
+    /// covering their hole — `dcad860a` 08-15's units began at 18:11 against a
+    /// hole of 18:00-18:11.
+    #[test]
+    fn subsumption_leaves_damage_repairs_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        let unit = |project: &str, start: i64, width: i64| {
+            let mut t = task(project, start, start + width, Operation::BaseRollup);
+            t.key.physical_table = "rollup_1m".to_owned();
+            t.deadline_micros = 0;
+            t.estimated_decoded_bytes = 1;
+            t
+        };
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // A narrow repair inside a much wider pending unit for the same cell —
+        // exactly what subsumption exists to delete.
+        for project in ["damaged", "ordinary"] {
+            journal.upsert(unit(project, 10 * DAY, DAY));
+            journal.upsert(unit(project, 10 * DAY + 600_000_000, 300_000_000));
+        }
+        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-01-11".to_owned())]);
+        journal.coarsen_sealed_slices(now);
+        let narrow = |project: &str| journal.tasks().filter(|t| t.key.project_id == project && t.key.slice.width() == 300_000_000).count();
+        assert_eq!(narrow("damaged"), 1, "the repair must survive a wider pending unit that would subsume it");
+        assert_eq!(narrow("ordinary"), 0, "control: an ordinary narrow unit inside a wider one is still subsumed");
     }
 
     /// Damage ROTATES across cells; one cell's ladder cannot monopolise it.
