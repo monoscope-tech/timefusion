@@ -6971,9 +6971,33 @@ impl TailAdd {
 /// physical target. Mixing the two levels forces a full sort of the entire
 /// 256/512 MiB group; in production those units either exhausted the 512 MiB
 /// pool or timed out after five minutes and made no durable progress.
-fn select_coordinator_compaction_candidates(candidates: Vec<TailAdd>, target: i64) -> Vec<String> {
+fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target: i64) -> Vec<String> {
     let has_unsorted = candidates.iter().any(|add| !add.is_sorted_run);
     let limit = if has_unsorted { COORDINATOR_L0_SORT_TARGET_BYTES } else { target };
+    // SMALLEST FIRST. Candidates arrive in EVENT-TIME order, and the loop below
+    // pushes the first one unconditionally, so a single large file fills the
+    // budget by itself, the next candidate breaks the loop, and the unit selects
+    // ONE file — a 1:1 rewrite that retires nothing, tripping the `< 2` guard.
+    //
+    // Read straight off the funnel log, prod 2026-08-23,
+    // `87576849 / 2026-08-22`: `after_range_filter=47 unsorted_candidates=0
+    // under_target=47 selected=0`. Those 47 files are p50 = 14 MB with a 252 MB
+    // maximum — 46 of 47 are under half the target and pair trivially — but with
+    // every file already a sorted run the budget IS the target, so the 252 MB
+    // file sorted first by event time and consumed all of it. The cell was
+    // claimed every 30-60 s for 45 minutes and never lost a file; fleet-wide 48
+    // cells and ~1,772 small files sat flat.
+    //
+    // Bin-packing smallest-first is the standard answer and it is what packing
+    // is FOR — retiring many small files. Large files are left to a later unit
+    // or converge on their own at target.
+    //
+    // TRADEOFF, accepted: choosing by size rather than event time means one
+    // output run can span a wider event range, which weakens range pruning on
+    // that file. The rewrite still sorts rows by the table's sorting columns, so
+    // the file is internally ordered; only its min/max widens. A partition that
+    // never compacts prunes worse than one whose runs overlap slightly.
+    candidates.sort_by_key(|add| add.size);
     let mut bytes = 0i64;
     let mut selected = Vec::new();
     for add in candidates {
@@ -13593,6 +13617,31 @@ mod tests {
             super::select_coordinator_compaction_candidates(done, 256 * MB).is_empty(),
             "an already-packed partition must produce no work, whatever its tags say"
         );
+    }
+
+    /// The prod shape that a size-blind selection stalls on forever.
+    ///
+    /// `87576849 / 2026-08-22`, read off the `compaction_unit_selected_nothing`
+    /// funnel: 47 candidates, every one under the 256 MB target, every one
+    /// already a sorted run, and `selected=0`. The files are p50 = 14 MB with a
+    /// 252 MB maximum, so 46 of 47 pair trivially — but candidates arrive in
+    /// EVENT-TIME order and the 252 MB file came first, took the whole budget,
+    /// and the next candidate broke the loop. One file selected is a 1:1 rewrite,
+    /// which trips the `< 2` guard and retires the unit having done nothing.
+    ///
+    /// Measured consequence: that cell was claimed every 30-60 s for 45 minutes
+    /// and never lost a file, across 48 out-of-policy cells and ~1,772 small
+    /// files that were equally flat.
+    #[test]
+    fn packing_takes_the_small_files_even_when_a_large_one_sorts_first() {
+        const MB: i64 = 1024 * 1024;
+        let run = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: true, event_range: None };
+
+        // Event-time order puts the 252 MB file first; the rest are tiny.
+        let cell = vec![run("big-252", 252), run("t-a", 14), run("t-b", 14), run("t-c", 14)];
+        let picked = super::select_coordinator_compaction_candidates(cell, super::COORDINATOR_SEALED_TARGET_BYTES);
+        assert!(picked.len() >= 2, "a unit must merge the small files rather than retire empty, got {picked:?}");
+        assert!(!picked.contains(&"big-252".to_string()), "the file that fills the budget alone must not preempt the pack: {picked:?}");
     }
 
     /// Coordinator sealed units must fit their deadline and file-count contract.
