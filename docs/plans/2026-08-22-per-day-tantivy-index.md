@@ -1507,3 +1507,36 @@ output pasted into a bare ``` fence, which rustdoc tries to parse as Rust. It
 belongs to another agent's in-flight commit `955f05f`, and `cargo nextest` does
 not run doctests so CI will not catch it. Two-character fix (` ```text `), left
 for its owner rather than editing a file being actively worked.
+
+## 19:50 — PASS: the rotation fix broke a three-day freeze
+
+`34508ee` deployed, and the pre-registered condition is met:
+
+```
+index_manifests/otel_logs_and_spans_rollup_dashboard_1m_v3/…/manifest.json
+  2026-08-23 19:45:31    <- first write since 2026-08-20
+```
+
+Frozen for three days, so a single write settles it with no baseline, no quiet
+process and no rate arithmetic — which is why the condition was chosen that way
+after four rate-based readings misled me today.
+
+The other four tables are **still frozen** (`otel_metrics` 08-20,
+`…1h_v1` 08-19, `…1h_v2` 08-20, `…1m_v2` 08-19), and that is the predicted
+behaviour rather than a partial failure: rotation gives one table the lead per
+15-minute slot and the pass still cannot finish inside a restart window, so only
+the leader is served. **Prediction, registered before the data:** by ~21:15 —
+90 minutes, one full cycle of six slots — at least three of the four should carry
+a 2026-08-23 manifest. If they do not, the rotation is reaching them but the pass
+is dying before it does useful work, and the next repair is bounding the work,
+not reordering it.
+
+One detail worth reading correctly: the new rollup manifests are **882-2,582
+bytes** where the 08-20 ones were ~105 KB. That is a shrink of ~40x and it looks
+alarming, but it is what GC is supposed to do — three days of rollup rewrites
+means almost every entry from 08-20 points at a file that no longer exists, so
+the first pass in three days prunes nearly all of them and rebuilds from a much
+smaller live set. A large manifest here would have been the bug.
+
+A monitor now watches which tables get a manifest written today, so the cycle
+either completes or visibly does not.
