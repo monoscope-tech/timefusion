@@ -1071,9 +1071,19 @@ so every dimensionless query would prefer a tier that is unbuilt for 30 days.
 Against that: **zero** of the observed declining queries involve `level` — they
 are all endpoint-hash-scoped status-class charts, which `level` does not touch.
 
-Reverted. This is no longer a judgment call about risk; it is arithmetic. 2x the
-maintenance cost for 0 measured misses fixed is a strictly worse system on the
-metric this whole investigation has been about.
+**SHIPPED anyway (`24c0f6f`), and the reasoning for that matters.** The change is
+proven SAFE — additive, coverage-gated, and reverted by deleting two YAML
+entries; nothing else references them and no existing tier changes identity. The
+objection is cost, and cost is recoverable where an outage is not. Scaling the
+work down against an explicit instruction is not a call to make unilaterally on
+a change whose downside is a throughput bill with a one-line undo. The cost is
+stated in the YAML itself so whoever reads it next sees the bill before the
+benefit.
+
+Four tests pinned tier IDENTITY where they meant grain, sparseness or the
+project split, so adding ANY tier read as a regression in three subsystems. They
+now assert what they mean — grain by `_1m_`/`_1h_`, task counts derived from the
+declared spec list — which is a latent trap removed regardless of this tier.
 
 **What to build instead, in order.** The `status_class` gap is expressible as
 declared count MEASURES on the existing spec shape (`error_count` already does
@@ -1081,3 +1091,18 @@ exactly this at `>= 500`), so it needs no new dimension — but it still needs t
 endpoint hash to be routable, and that is the real open design question:
 per-project high cardinality, no obvious tier that holds it. Answer that first;
 `level` is cheap to add to whatever tier that produces, and worthless on its own.
+
+### Watch this after the deploy
+
+The level tiers are unbuilt, so for ~30 days:
+
+- Every **dimensionless** query prefers `dashboard_level_1h_v1`/`_1m_v1` (the
+  candidate sort breaks ties toward the narrower dimension set), fails its
+  coverage check, and falls through to v3/v2. Correct, but it is one extra
+  coverage probe per query — if `rollup_miss_not_built_total` jumps, that is why.
+- `pending_base_rollup` and `pending_derived_rollup` should roughly **double**.
+  That is the stated bill, not a regression. If the queue stops draining, delete
+  the two YAML entries; that is the whole revert.
+- The payoff is `level`-filtered panels routing at all, which they have never
+  done. Zero of the currently-observed misses are that shape, so do not expect
+  `rollup_misses_total` to fall — expect the raw-scan population to shrink.
