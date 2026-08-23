@@ -135,6 +135,25 @@ nor rollups.
 "point lookups and TopK are solved" holds for dedicated projects but not for
 the shared unified-default table.
 
+> **RESOLVED 2026-08-23 — the 7d cliff is a cold first touch, not a band.**
+> Re-measured three reps per window, both projects:
+>
+> | | 3d | 7d | 14d |
+> |---|---|---|---|
+> | p3 | 3239 / 2678 / 2201 | **33489** / 2600 / 1679 | 4610 / 3942 / 1850 |
+> | p4 | 2569 / 2434 / 1575 | **46127** / 4477 / 1102 | 3914 / 1714 / 1799 |
+>
+> Warm, 7d is *faster* than both neighbours on both projects, and the counter
+> diffs are the same shape at every window — `prefilter_used=3`,
+> `tantivy_scan_calls=3`, one bloom/raw split, with `tantivy_raw_files_total`
+> rising smoothly (3615 → 6417 → 7246). There is no 7d-specific plan and no
+> coverage boundary. 14d looked fine only because the sweep ran windows
+> narrowest-first, so the 7d rep paid the warm-in that 14d then reused.
+>
+> What survives is not an anomaly but a level: a point lookup costs **1.1–3.2 s
+> warm and 15–40× that cold**, so the real item is cold-start cost. Any future
+> sweep must run ≥2 reps per cell or it measures cache state.
+
 **7. A single 30-day aggregate makes the box unreachable.** During the sweep, a
 trivial `timefusion_stats` query could not open a connection —
 `Operation timed out` — and the same condition killed the harness's first run.

@@ -100,18 +100,15 @@ merge-on-read table answers with the pre-update row. So this is a cost to
       read path wants every in-window date certified). Per-date dedup skip
       shipped default-OFF — evaluate enabling it, since partial certification
       only pays once that lands.
-- [ ] **2.2 Investigate the 7-day cold-needle cliff.** Non-monotonic and
-      reproduced on two independent projects:
+- [x] **2.2 The 7-day cliff was a cold first touch — closed 2026-08-23.** Three
+      reps per window on both projects: p3 7d = 33489 / 2600 / 1679 ms, p4 7d =
+      46127 / 4477 / 1102 ms. Warm, 7d beats BOTH neighbours; counter diffs are
+      identical in shape at every window and `tantivy_raw_files_total` rises
+      smoothly. 14d only looked fine because the sweep ran narrowest-first and
+      reused 7d's warm-in. No band, no plan difference. What remains is the
+      LEVEL — 1.1–3.2 s warm for a point lookup, 15–40x cold — which is
+      cold-start cost, tracked with the rest of the scan work.
 
-      | project | 3d | 7d | 14d | 30d |
-      |---|---|---|---|---|
-      | p3 | 395 ms | **43,401 ms** | 1,155 ms | — |
-      | p4 | 258 ms | **35,106 ms** | 1,032 ms | 6,012 ms |
-
-      7d is 30-160x its neighbours on both sides. That is a coverage-band
-      boundary (foyer warm window, or tantivy's newest-first backfill starving
-      a band), not a smooth degradation — and it is invisible if you only
-      sample 3d/7d/30d without the neighbours.
 - [ ] **2.3 Compaction / file count.** Fewer, larger files reduce both planning
       and open cost. Already the subject of its own workstream; listed so the
       dependency is explicit rather than because it needs new analysis.
