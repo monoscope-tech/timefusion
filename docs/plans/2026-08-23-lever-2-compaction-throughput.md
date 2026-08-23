@@ -210,3 +210,49 @@ matter of that queue draining, with two things slowing it:
    queued units and the planner re-mints them; prod restarts every 20-40 min.
 2. The pool leak above, if confirmed, reduces headroom for everything sharing
    the query pool.
+
+## Correction to the leak claim, and the structural reason OPTIMIZE cannot finish this
+
+I wrote above that failed OPTIMIZEs LEAK their reservation, on the evidence that
+`RepartitionExec[1]#107738` reappeared at exactly 77.3 MB across three
+statements. A later retry — on a container with 42 minutes of uptime — failed the
+same way but with a **fresh** operator id (`#266442`, 48.2 MB) and 2.6 MB free.
+A new id each time is not a surviving reservation, so **the leak claim is
+withdrawn**; it was one plausible reading of a repeated id, and the retry does
+not support it. What is left is the pool being genuinely, persistently full.
+
+The structural reason is in the error text itself: `fair(pool_size: 5.0 GB)`.
+A FAIR pool divides its budget among concurrent consumers, so an OPTIMIZE running
+beside live dashboard traffic gets a small share of 5 GB — 2.6 to 264 MB across
+the five attempts here — while a whole-partition sort of a 238- or 275-file cell
+wants hundreds of MB at once. Normal queries were unaffected throughout (a 1-hour
+`count(*)` returned in 1.7 s), which is the fair pool working as designed: it
+starves the greedy operator, not the cheap ones.
+
+So this is not "compaction is broken" and not "the box is out of memory". It is
+that **interactive OPTIMIZE is the wrong vehicle on a live box**, and the system's
+consolidation path — maintenance pool, bin-packed, incremental commits, one
+partition at a time — exists precisely because of this.
+
+## Where lever 2 actually stands
+
+```
+compacted by hand and verified:  6297304f / 2026-08-19   15 files -> 1
+out-of-policy cells:             48 -> 47
+small files:                     1,784 -> 1,769
+```
+
+1 of 48 cells, and the other 47 are not reachable by hand while prod serves
+traffic. They need the consolidation queue to drain, which is running. The two
+things that would actually finish lever 2, neither of which is a hand-run
+command:
+
+1. **Stop discarding the queue.** `SealedConsolidation` is derived, so every
+   deploy throws the units away and the planner re-mints them. With restarts
+   every 20-40 minutes a unit has a narrow window to be claimed at all. Making
+   these units survive a restart — or simply deploying less often — is the
+   highest-leverage change available.
+2. **Give consolidation a claim it cannot lose.** It shares `maintenance_debt_slots`
+   (12 of 16 jobs) with Dedup, whose queue is ~6,000 units. A reserved slot for
+   file debt would stop a large dedup backlog from crowding out the 47 cells,
+   the same argument the sealed-work reservation already makes for rollups.
