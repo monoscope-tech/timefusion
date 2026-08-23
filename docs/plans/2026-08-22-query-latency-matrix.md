@@ -953,3 +953,29 @@ across units of the same partition, which is the shape the pricing depends on.
 Not quoted: `over_budget` per tick (12–27). There is no pre-deploy reading from
 the same instrument at the same cadence, and the sim's cumulative figure is not
 comparable.
+
+### #6 re-verified from object storage, because counters cannot answer it
+
+`timefusion_stats` read `tantivy_manifest_commits=0` — on a process **two
+minutes old**, with the box being redeployed every few minutes. That is the trap
+this repo already documents: every one of those counters is process-scoped, and
+a zero on a young process means "unexercised", not "broken".
+
+R2 object MTIMEs are durable and settle it. `index_manifests/otel_logs_and_spans/`:
+
+```
+2026-08-23 20:23:26  8100121c…  94c5dc1f…  d062e010…
+2026-08-23 20:23:27  2a39bd83…  6297304f…  dcad860a…
+2026-08-23 20:23:29  00000000…  be87ebc1…
+2026-08-23 20:23:30  87576849…  98fdd4f3…
+2026-08-23 20:23:33  28f62f01…
+```
+
+**Eleven projects committed in seven seconds** — one sweep over the whole pending
+map, which is precisely what `ebfa7e0` changed (before it, only the project that
+had just built was examined, so a project with one build per pass could never
+reach the age bound). #6 is confirmed.
+
+Worth keeping: when the deploy cadence is minutes, *reach for the object store,
+not the counter*. Three separate questions tonight were unanswerable from
+`timefusion_stats` for exactly this reason.
