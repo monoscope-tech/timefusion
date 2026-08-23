@@ -1702,6 +1702,18 @@ impl TaskJournal {
         let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, u8, i64, i64) {
             let (class, starved, width, order) = scheduling_class(task, now_micros);
             let hole = journal.hole_rank(task);
+            // NARROWEST first for damage, widest first for everything else.
+            //
+            // `-width` is right for backfill, where a day-wide unit is the only
+            // kind that advances the horizon. It is exactly wrong for repair: a
+            // damage unit is the uncovered span of one file, so the narrow ones
+            // are both the cheapest AND the ones that retire a file, while the
+            // wide ones are whale days that split into ladders and re-split.
+            // Prod 2026-08-23: three 5-8 minute units sat Pending at attempts=0
+            // with their deadlines nine hours past, behind 800-1400 minute
+            // ladders belonging to the same damage rank, and the count plateaued
+            // at 24 for two hours.
+            let width = if hole == 0 { -width } else { width };
             (class, u8::from(hole > 0), starved, hole, width, order)
         };
         let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, u8, i64, i64)> {
@@ -3653,6 +3665,49 @@ mod tests {
             journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
             "damaged",
             "a ten-minute damage repair must outrank a day-wide backfill hole"
+        );
+    }
+
+    /// Damage drains NARROWEST first; everything else stays widest first.
+    ///
+    /// `-width` is right for backfill — only a day-wide unit advances the
+    /// horizon — and exactly wrong for repair, where the narrow unit is both the
+    /// cheapest and the one that actually retires a file. Prod 2026-08-23 had
+    /// three 5-8 minute repair units Pending at attempts=0 with deadlines nine
+    /// hours past, queued behind 800-1400 minute ladders of the same rank.
+    #[test]
+    fn damage_drains_narrowest_first_while_backfill_stays_widest_first() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        let unit = |project: &str, start: i64, width: i64| {
+            let mut t = task(project, start, start + width, Operation::BaseRollup);
+            t.key.physical_table = "rollup_1m".to_owned();
+            t.deadline_micros = 0;
+            t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            t
+        };
+        // Same cell, same day: only width separates them.
+        let seed = |journal: &mut TaskJournal| {
+            journal.upsert(unit("p", 35 * DAY, 300_000_000));
+            journal.upsert(unit("p", 35 * DAY + DAY / 2, 6 * 3_600_000_000));
+        };
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.slice.width(),
+            6 * 3_600_000_000,
+            "control: ordinary sealed work still takes the widest unit first"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        journal.set_untagged_cells("source", "rollup_1m", [("p".to_owned(), "1970-02-05".to_owned())]);
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.slice.width(),
+            300_000_000,
+            "a damaged cell must take its five-minute unit before its six-hour one"
         );
     }
 
