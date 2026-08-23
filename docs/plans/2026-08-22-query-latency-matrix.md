@@ -1018,3 +1018,29 @@ tag first, so a spec addition stops being invalidation; then `status_class`,
 which is cheap and answers both observed shapes; then the endpoint hash, which
 needs a cardinality decision. `level` drops to last — it is a real filter shape
 in monoscope's query language, but it is not what production is refusing.
+
+## #4 — the measurement half, sharpened (the design half stays elsewhere)
+
+"76% of prefilter skips are a missing index" rests on a label that four
+different refusals shared. `search_with_stats` had four `Ok(None)` exits, all
+reported as `delta_no_index_or_cap_exceeded`:
+
+| now | meaning | fix |
+|---|---|---|
+| `delta_no_index` | manifest empty | backfill |
+| `delta_no_usable_index` | entries exist, none usable (time-pruned / wrong `schema_version` / field-gapped) | reindex |
+| `delta_cap_exceeded_one_index` | one index alone exceeds `max_hits` | raise cap or narrow the query |
+| `delta_cap_exceeded_combined` | the union does | same family |
+
+A backlog and a too-small cap send the work in opposite directions, and the
+76% figure cannot tell them apart. `search_with_stats` keeps its signature and
+delegates to `search_detailed`, so every existing caller and test is untouched;
+only the prod scan path takes the detailed form.
+
+`every_search_refusal_is_a_registered_prefilter_reason` pins that each refusal
+has a metric and that the names are distinct — the existing `debug_assert` in
+`record_prefilter_skip` only fires if a query happens to take that path, which
+is how a reason silently vanishes from a breakdown.
+
+Read these before sizing the per-day index work: if the split says
+`cap_exceeded`, more indexing does not help.
