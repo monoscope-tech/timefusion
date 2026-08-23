@@ -1581,6 +1581,10 @@ pub(crate) struct PartitionStats {
     /// computation on both sides — it counts tombstones and superseded
     /// merge-on-read versions, which the builder's decoded input does not.
     rows: i64,
+    /// Sum of the partition's file sizes. The CEILING on what any unit over this
+    /// partition can decode — used to sanity-bound stored per-unit estimates,
+    /// which are whole-file and frozen at enqueue time.
+    pub(crate) bytes: u64,
 }
 
 impl PartitionStats {
@@ -12159,7 +12163,7 @@ mod tests {
     /// profile once `missing_project` is fixed.
     #[test]
     fn a_partition_outside_the_window_does_not_join_the_coverage_requirement() {
-        let stats = |min_ts, max_ts| PartitionStats { fingerprint: 0, min_ts, max_ts, rows: 0 };
+        let stats = |min_ts, max_ts| PartitionStats { fingerprint: 0, min_ts, max_ts, rows: 0, bytes: 0 };
         // Wholly before, wholly after: not in the window.
         assert!(!stats(0, 50).overlaps(100, 200));
         assert!(!stats(300, 400).overlaps(100, 200));

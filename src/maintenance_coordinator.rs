@@ -387,6 +387,17 @@ impl GroupPrice {
         self.distinct.values().fold(self.unpriced_bytes, |total, bytes| total.saturating_add(*bytes))
     }
 
+    /// Bound the price by what the partition can actually decode to.
+    ///
+    /// Applied to `unpriced_bytes`, because that is the term that double-counts:
+    /// footprint-priced members are already charged once each, while unpriced
+    /// members are summed and pre-date the footprint entirely. Prod's stuck
+    /// backlog is all unpriced.
+    fn cap_at(&mut self, ceiling: u64) {
+        let priced: u64 = self.distinct.values().fold(0, |total, bytes| total.saturating_add(*bytes));
+        self.unpriced_bytes = self.unpriced_bytes.min(ceiling.saturating_sub(priced.min(ceiling)));
+    }
+
     fn unanimous_input(&self) -> Option<InputFootprint> {
         match (self.unpriced_members, self.distinct.iter().next()) {
             (0, Some((&fp, &whole_file_bytes))) if self.distinct.len() == 1 => Some(InputFootprint { fp, whole_file_bytes }),
@@ -839,13 +850,38 @@ impl TaskJournal {
     /// blocked, groups over budget, or simply few candidates is invisible from
     /// a single collapsed count, and every answer implies a different fix.
     pub fn coarsen_sealed_slices_reporting(&mut self, now_micros: i64) -> CoarsenReport {
+        self.coarsen_sealed_slices_capped(now_micros, &|_, _, _| None)
+    }
+
+    /// `coarsen_sealed_slices_reporting`, with a ceiling on what a partition can
+    /// possibly decode to.
+    ///
+    /// The fit test sums the children's stored `estimated_decoded_bytes`, and
+    /// those are WHOLE-FILE figures frozen at enqueue time. On an uncompacted
+    /// sealed partition every child re-reads the same files, so the sum counts
+    /// the same bytes once per child and grows with the shredding — the test is
+    /// most certain to refuse exactly where fusing is worth the most.
+    ///
+    /// Prod 2026-08-23: `base_rollup / 00000000 / 2026-08-13` held 1,440
+    /// one-minute units claiming 391 GB between them, over a partition holding
+    /// **35 files totalling 0.36 GB**. Every width was refused and the cell was
+    /// stuck. Separately, project 87576849's consecutive one-minute units each
+    /// reported an IDENTICAL 4,466,185,462 bytes — the signature of re-reading
+    /// one file set.
+    ///
+    /// `partition_bytes(project, source, date)` returns what that partition
+    /// actually holds. The fused estimate is capped by it, because no unit over
+    /// one partition can decode more than the partition contains. Returning
+    /// `None` keeps the old summed behaviour, so a caller without storage access
+    /// — every unit test — is unaffected.
+    pub fn coarsen_sealed_slices_capped(&mut self, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>) -> CoarsenReport {
         // SUBSUME before fusing. Fusion cannot touch a bucket that a wider
         // pending unit already covers — it would duplicate claimed work — so on
         // its own it leaves exactly the redundancy it exists to remove.
         let subsumed = self.subsume_covered_units(now_micros);
         let mut report = CoarsenReport { subsumed, ..Default::default() };
         for &width in COARSEN_WIDTHS.iter() {
-            let stage = self.coarsen_to_width_reporting(width, now_micros);
+            let stage = self.coarsen_to_width_reporting(width, now_micros, partition_bytes);
             report.fused += stage.fused;
             report.candidates += stage.candidates;
             report.blocked += stage.blocked;
@@ -942,7 +978,7 @@ impl TaskJournal {
     /// Fuses every strictly-narrower sealed unit in a bucket into one unit of
     /// `width`, when the bucket's summed estimate fits `MAX_DECODED_BYTES` and
     /// nothing at least that wide already covers it.
-    fn coarsen_to_width_reporting(&mut self, width: i64, now_micros: i64) -> CoarsenReport {
+    fn coarsen_to_width_reporting(&mut self, width: i64, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>) -> CoarsenReport {
         let bucket_of = |start: i64| start.div_euclid(width) * width;
         let coarsenable = |task: &MaintenanceTask| {
             matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
@@ -1045,6 +1081,27 @@ impl TaskJournal {
         //
         // The children's own estimates are already summed here, so the test is
         // free.
+        // ...and then bound the result by what the partition can actually hold.
+        //
+        // `GroupPrice` charges members sharing an `InputFootprint` once, which is
+        // the exact de-duplication. But members with NO footprint keep the old
+        // summed price, and prod's backlog is entirely of that kind: those units
+        // were enqueued before footprints existed, so they are the ones still
+        // stuck. 2026-08-23: `base_rollup / 00000000 / 2026-08-13` held 1,440
+        // one-minute units summing to 391 GB over a partition of 35 files /
+        // 0.36 GB, and project 87576849's consecutive minutes each carried an
+        // IDENTICAL 4,466,185,462 bytes.
+        //
+        // No unit over one partition can decode more than the partition holds,
+        // so that is a sound ceiling on any price however it was computed. It
+        // only ever removes double-counting — it never argues a big partition is
+        // small.
+        for ((_table, source, project_id, _op, bucket), price) in groups.iter_mut() {
+            let Some(date) = chrono::DateTime::from_timestamp_micros(*bucket).map(|time| time.date_naive().to_string()) else { continue };
+            if let Some(ceiling) = partition_bytes(project_id, source, &date) {
+                price.cap_at(ceiling);
+            }
+        }
         groups.retain(|group, price| {
             let fits = price.bytes() <= MAX_DECODED_BYTES;
             if !fits {
@@ -4635,6 +4692,69 @@ mod tests {
         assert_eq!(fuse([shared, shared]).fused, 2, "same files, one scan, one charge");
         let disjoint = fuse([shared, InputFootprint::new(["c.parquet"], half)]);
         assert_eq!((disjoint.fused, disjoint.over_budget > 0), (0, true), "different files must still sum");
+    }
+
+    /// The prod shape, WITH the partition ceiling that makes it collapsible.
+    ///
+    /// Same fixture as `a_day_shredded_to_the_minute_floor_collapses` (which is
+    /// `#[ignore]`d because it calls the uncapped entry point and therefore still
+    /// documents the defect): 1,440 contiguous one-minute units for one day, each
+    /// carrying the whole-file estimate prod actually stored.
+    ///
+    /// Summed they claim 391 GB. The partition holds **35 files totalling
+    /// 0.36 GB** — the sum is not pessimistic, it is impossible, because it
+    /// counts the same files once per child. Given the real ceiling the day fuses
+    /// in one pass.
+    #[test]
+    fn a_shredded_day_collapses_once_the_estimate_is_capped_by_its_partition() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        const MINUTE: i64 = 60_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let prod_estimate = 282_280_533u64; // one 60-second slice, whole-file accounting
+        for slot in 0..1440 {
+            let start = DAY_MICROS + slot * MINUTE;
+            journal.enqueue(task("p", start, start + MINUTE, Operation::BaseRollup).key, 0, prod_estimate, 0);
+        }
+        let partition = 386_547_056u64; // 35 files, 0.36 GB — what the day actually holds
+        let report = journal.coarsen_sealed_slices_capped(now, &|_, _, _| Some(partition));
+        let remaining = journal
+            .tasks()
+            .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
+            .count();
+        assert!(
+            remaining < 1440,
+            "the shredded day must collapse once its estimate is bounded by the partition; {remaining} remain (fused={} over_budget={})",
+            report.fused,
+            report.over_budget
+        );
+        assert_eq!(remaining, 1, "and it should land as ONE day-wide unit, got {remaining}");
+    }
+
+    /// The ceiling must not become a licence to fuse anything. A partition whose
+    /// REAL size is over budget still cannot be scanned in one unit, so the day
+    /// keeps its slices exactly as before — the cap only ever removes
+    /// double-counting, it never argues a big partition is small.
+    #[test]
+    fn the_partition_ceiling_does_not_fuse_a_genuinely_oversized_day() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        for slot in 0..6 {
+            let start = DAY_MICROS + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, MAX_DECODED_BYTES / 2, 0);
+        }
+        // The partition really is 4 GB; the sum was not double-counting here.
+        journal.coarsen_sealed_slices_capped(now, &|_, _, _| Some(4 * 1024 * 1024 * 1024));
+        let widths: Vec<i64> = journal
+            .tasks()
+            .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
+            .map(|t| t.key.slice.width())
+            .collect();
+        assert_eq!(widths.len(), 6, "a genuinely oversized day must keep its slices, got {widths:?}");
+        assert!(widths.iter().all(|w| *w < DAY_MICROS));
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with

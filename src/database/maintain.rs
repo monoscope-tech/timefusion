@@ -2192,9 +2192,29 @@ impl Database {
             // do — and every midnight mints another day of them. Collapsing
             // them is what keeps the queue from growing at the rate projects
             // are added.
+            // What each partition can actually decode to, so the fit test stops
+            // trusting whole-file estimates frozen at enqueue time. Built once
+            // per pass from the same `partition_stats_bounded` the read path
+            // uses; a table that cannot be resolved simply contributes nothing
+            // and those groups keep the old summed behaviour.
+            let ceilings: HashMap<(String, String), u64> = {
+                let mut ceilings = HashMap::new();
+                for source in crate::schema::registry().list_tables() {
+                    let Ok(table_ref) = self.resolve_table("default", &source).await else { continue };
+                    let table = table_ref.read().await;
+                    if let Ok(stats) = Self::partition_stats_bounded(&table, tiebreak_of(&source), &|_, _| i64::MAX) {
+                        for ((project, date), stat) in stats {
+                            ceilings.insert((project, date), stat.bytes);
+                        }
+                    }
+                }
+                ceilings
+            };
             let report = {
                 let mut journal = self.journal();
-                let report = journal.coarsen_sealed_slices_reporting(crate::support::now_micros());
+                let report = journal.coarsen_sealed_slices_capped(crate::support::now_micros(), &|project, _source, date| {
+                    ceilings.get(&(project.to_string(), date.to_string())).or_else(|| ceilings.get(&("default".to_string(), date.to_string()))).copied()
+                });
                 if report.total() != 0 {
                     // `checkpoint` again, not `compact`. It briefly had to be
                     // `compact` because the WAL could not express a deletion, so
@@ -2644,7 +2664,16 @@ impl Database {
             crate::read::ts_micros_column(&actions, &name)
                 .or_else(|| actions.column_by_name(&name)?.as_any().downcast_ref::<arrow::array::Int64Array>().cloned())
         });
-        let by_partition: HashMap<(String, String), (i64, i64, i64, i64)> = (0..actions.num_rows()).fold(HashMap::new(), |mut acc, row| {
+        // File size, for the partition-byte ceiling. Delta spells it `size_bytes`
+        // in the flattened add-actions batch; fall back to `size` rather than
+        // silently reporting a zero ceiling that would cap every estimate to 0.
+        let sizes = actions
+            .column_by_name("size_bytes")
+            .or_else(|| actions.column_by_name("size"))
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>().cloned());
+        // (rows, min_ts, max_ts, max_stamp, bytes) per partition.
+        type Identity = (i64, i64, i64, i64, i64);
+        let by_partition: HashMap<(String, String), Identity> = (0..actions.num_rows()).fold(HashMap::new(), |mut acc, row| {
             let Some(date) = string_at(&dates, row) else { return acc };
             // Custom-project tables carry no `project_id` partition; the sweep
             // groups those under "default", so match it exactly.
@@ -2655,8 +2684,9 @@ impl Database {
                 return acc;
             }
             let key = (project, date);
-            let entry = acc.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN));
+            let entry = acc.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN, 0));
             entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
+            entry.4 += sizes.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))).unwrap_or(0);
             if let Some(lo) = min_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
                 entry.1 = entry.1.min(lo);
             }
@@ -2672,8 +2702,23 @@ impl Database {
             .into_iter()
             .map(|(key, identity)| {
                 let mut hasher = fnv::FnvHasher::default();
-                identity.hash(&mut hasher);
-                (key, PartitionStats { fingerprint: hasher.finish(), min_ts: identity.1, max_ts: identity.2, rows: identity.0 })
+                // (rows, min_ts, max_ts, stamp) ONLY. `identity.4` is the
+                // partition's byte size, added for the coarsening ceiling, and it
+                // must NOT enter the fingerprint: every stored `source_fp` and
+                // every slice witness was recorded against the 4-tuple, so
+                // hashing a 5th field would invalidate all existing coverage at
+                // once and send every query back to the raw path.
+                (identity.0, identity.1, identity.2, identity.3).hash(&mut hasher);
+                (
+                    key,
+                    PartitionStats {
+                        fingerprint: hasher.finish(),
+                        min_ts: identity.1,
+                        max_ts: identity.2,
+                        rows: identity.0,
+                        bytes: u64::try_from(identity.4).unwrap_or(0),
+                    },
+                )
             })
             .collect())
     }
