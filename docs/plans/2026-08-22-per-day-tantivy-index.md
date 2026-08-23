@@ -788,3 +788,38 @@ from a third independent direction, on the same conclusion:
 it (carry-forward, now on both the optimize and wave paths) or make it smaller
 (`max_file_mb`, or sharding the build). Scheduling changes cannot fix work that
 does not fit between interruptions.
+
+### 13:59 — `older` stops growing within one interval of wave carry-forward
+
+Deployed `3654960` (carry-forward on the wave path) at ~13:45.
+
+| time | today | week | older |
+|---|---|---|---|
+| 13:08 | 414 | 2036 | 3663 |
+| 13:28 | 428 | 2036 | 3712 |
+| 13:45 | 467 | 2035 | 3742 |
+| **13:59** | 473 | 2035 | **3742** |
+
+`older` grew +79 in the 37 minutes before the deploy (~128/hr) and **+0** in the
+14 minutes after. The mechanism is directly observed, not inferred:
+`carried=1 rebuilding=0` fires roughly 8 times per 90 seconds — every wave
+output covered by extending an existing manifest entry, zero rebuilds. That is
+~320 avoided rebuilds/hr against a drain that manages ~30/hr.
+
+**One interval is one point** — this morning's retracted "~220/hr" came from
+exactly that kind of reading, so the claim here is deliberately narrow: the
+prediction was registered before the data, the mechanism is observed rather than
+assumed, and the next census either confirms it or does not.
+
+**If it holds, it settles the day's central question.** The sealed backlog was
+not a static pile the drain was too slow to clear, nor a throughput problem: it
+was being *manufactured* at ~128/hr by rewrites that un-covered rows already
+indexed, and the drain was re-indexing bytes it had read before. Every earlier
+framing — pathological build cost, oldest-first starvation, cap sizing, the
+tail reservation — was downstream of that, which is why none of them moved the
+number and this did within fourteen minutes.
+
+**What remains, unchanged by this:** `today` still accrues (467 -> 473), the
+5,600-file standing backlog still needs draining at ~30/hr, and no
+`from_reserved_tail=true` build has ever completed. Carry-forward stops the hole
+getting deeper; it does not fill it.
