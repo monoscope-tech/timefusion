@@ -544,6 +544,54 @@ execution is worth more than any amount of extra worker capacity — and
 `coarsen_sealed_slices` already exists to do exactly this, so the question is why
 these survived it.
 
+### The sim on the real journal: restarts RE-MINT, they do not (mainly) destroy
+
+`timefusion sim maintenance_tasks.json --hours 2 --workers 16`, same seed, with
+and without hourly restarts:
+
+| | no restarts | `--restarts-every-hours 1` |
+|---|---|---|
+| pending 83,103 → | **22,484** | **57,444** |
+| executions | 2,190 | 2,190 |
+| completions | BaseRollup 1325, Dedup 120, DerivedRollup 662, Repair 32 | identical |
+| timeouts | Repair 23 | identical |
+
+**Identical work done, 2.6x the queue left behind.** Restarts do not slow the
+workers at all in this model — they flood the queue, because the boot reconcile
+re-enqueues per partition that saw commits while down. Two virtual hours of
+hourly restarts mint ~35,000 tasks.
+
+**This corrects the diagnosis written above.** That section argued in-flight work
+is destroyed by process exit. The sim does not model that at all — its restart
+branch only calls `mint_stream` and never touches `workers[].current` — so it
+cannot speak to it either way. What it does show is that **re-minting alone is
+sufficient to explain the queue never converging**, without any in-flight loss.
+With prod taking 8 deploys in one session, that is the dominant term.
+
+Two caveats, both load-bearing:
+
+- The sim's restart model is explicitly **pre-fix**: its own comment says it
+  enqueues `ALL_HOURS` per partition (~312 tasks per stream per restart) and that
+  the 2026-08-18 change derives touched hours from commit stats, shrinking it to
+  ~13. So 57,444 is the *before* number. **The model needs updating to measure
+  the post-fix state** — that is a concrete task in itself, and until it is done
+  this comparison overstates today's damage.
+- Coarsening demonstrably works at scale: 83,103 → 22,484 in two virtual hours,
+  and prod's live `pending` of 21,598 sits right at that post-coarsen figure. So
+  prod is already coarsened, and my earlier suspicion that the pass never runs
+  (from zero log hits) is not supported — it was very likely a grep artifact, the
+  same class of error as the `event=` count that returned 0 across 3,271 lines.
+
+Which sharpens the 1,440-unit cell: those units **survive** coarsening. With
+nothing wider on that table subsume cannot fire, so fusion is the only route, and
+the remaining suspect is the budget test — for a sealed day each 60s unit selects
+nearly all the day's files (their statistics span the whole day), so 60 children
+can sum far past `MAX_DECODED_BYTES` even though the real work is one hour. That
+is a specific, testable hypothesis and the next thing to check.
+
+Also from the sim, unrelated but worth having: **Repair timed out 23 times
+against 32 completions** — a 42% timeout rate, by far the worst of any operation.
+
 Two further fixes, and the first already exists for one operation:
 
 1. **Resume instead of redo.** `timefusion_repair_resume_enabled` (default true,
