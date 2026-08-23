@@ -498,17 +498,11 @@ rollups:
       - { name: duration_min, agg: min, column: duration }
       - { name: duration_max, agg: max, column: duration }
       - { name: duration_digest, agg: tdigest, column: duration }
-  # Coarse tier for 7d/30d windows, derived so it re-aggregates the 1m rows
-  # instead of scanning the raw partition a second time.
-  - grain: 1h
-    name: dashboard_level_1h_v1
-    derive_from: dashboard_level_1m_v1
-    dimensions: [level]
-    measures:
-      - { name: request_count, agg: count }
-      - { name: duration_count, agg: count, column: duration }
-      - { name: error_count, agg: count, filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500" }
-      - { name: duration_sum, agg: sum, column: duration }
-      - { name: duration_min, agg: min, column: duration }
-      - { name: duration_max, agg: max, column: duration }
-      - { name: duration_digest, agg: tdigest, column: duration }
+
+  # NOT re-added until `dashboard_level_1m_v1` has coverage. A derived tier whose
+  # base is unbuilt is still CLAIMABLE, and it publishes empty: measured 20
+  # minutes after this shipped, `dashboard_level_1h_v1` published 489 rollups of
+  # which 3 had rows, while taking ~10x the base tier's claims — and it starved
+  # `dashboard_1h_v2`, the tier every 7d/30d dashboard reads, to ZERO publishes
+  # in the same window. The 1m level tier meanwhile published 51 with rows in 50,
+  # so the narrow-dimension design is sound; only the derived half was premature.
