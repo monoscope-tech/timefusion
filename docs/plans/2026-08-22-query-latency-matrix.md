@@ -1195,3 +1195,43 @@ not currently enforcing that.
 
 This needs a reproducing test before a fix. Shipping a guess into this path is
 exactly what produced tonight's level-tier regression.
+
+### Sharpening the `duration_digest` diagnosis — and marking what is still unproven
+
+Still live: 477 errors in 8 minutes (72% of claims), all the same message.
+
+**Proven:**
+- `duration_digest` was added to the v3 spec on **2026-08-22** (`c4d615d`), to a
+  table that has existed since 08-15/16. The measure is a year younger than the
+  table.
+- The error's valid-fields list is `dashboard_1m_v3`'s and contains
+  `server_duration_digest` but not `duration_digest`.
+- `information_schema` DOES report the column — but that is the **synthesized**
+  schema (`get_schema`, from the YAML), not the Delta metadata. It cannot be used
+  to argue the physical table has it. That is what nearly sent me to the wrong
+  layer.
+- Recent `_delta_log` commits for v3 contain only `commitInfo` and `add` — **no
+  `metaData` action**, i.e. no schema evolution in the recent history. (An earlier
+  `grep '"metaData"'` matched inside a stats string; a false positive.)
+
+**Therefore, most likely:** adding a measure to a rollup spec does not evolve the
+existing rollup table's Delta schema, so the derived build's provider — built
+from the base tier's eager snapshot — has no such column, and every derived unit
+over that tier fails at planning.
+
+**Still unproven:** whether the v3 table's Delta metadata truly lacks the column
+(needs the creating `metaData` action or the checkpoint, not the recent commits).
+The previous entry framed this as "older FILES lack the column"; the file-level
+story and the table-level story predict the same error, and the table-level one
+now looks more likely. Do not act on either until that one read settles it.
+
+**Two candidate fixes, both needing a test first:**
+1. Evolve the rollup target's Delta schema when its spec gains a measure — the
+   general fix, and it makes spec evolution work rather than merely not crash.
+2. Project a missing base measure as NULL in the derived build — narrower,
+   honest (those rows genuinely have no digest), and it unblocks the queue
+   immediately.
+
+Deliberately not attempted at this hour. This is the most correctness-sensitive
+path in the rollup system, and moving fast in exactly this area is what produced
+the level-tier regression earlier tonight.
