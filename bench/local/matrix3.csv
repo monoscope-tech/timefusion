@@ -1,0 +1,247 @@
+project,window,shape,rep1_ms,rep2_ms,rows,status
+p1,1h,throughput,2255.2,1734.3,60,ok
+p1,1h,group_by_service,3664.0,3378.5,593,ok
+p1,1h,p95_latency,1275.9,1282.8,61,ok
+p1,1h,error_rate,2065.2,1363.9,61,ok
+p1,1h,log_list,5649.8,4001.5,251,ok
+p1,3h,throughput,1360.2,1070.2,37,ok
+p1,3h,group_by_service,1450.1,1838.9,461,ok
+p1,3h,p95_latency,3412.4,1127.5,37,ok
+p1,3h,error_rate,1950.9,2607.3,37,ok
+p1,3h,log_list,6637.4,4748.6,251,ok
+p1,24h,throughput,3008.1,2403.2,289,ok
+p1,24h,group_by_service,6608.0,4761.5,3321,ok
+p1,24h,p95_latency,5430.1,4752.2,186,ok
+p1,24h,error_rate,4405.4,3328.6,289,ok
+p1,24h,log_list,5940.5,3149.4,251,ok
+p1,24h,dcount_service,3156.1,3211.7,1,ok
+p1,24h,facet_service,5225.3,4404.5,17,ok
+p1,3d,throughput,5985.9,8217.4,73,ok
+p1,3d,group_by_service,6022.2,6678.9,1131,ok
+p1,3d,p95_latency,5916.5,4203.0,70,ok
+p1,3d,error_rate,8992.3,6720.8,73,ok
+p1,3d,log_list,4613.5,4041.0,251,ok
+p1,7d,throughput,11412.7,10344.2,169,ok
+p1,7d,group_by_service,13374.4,12233.9,2598,ok
+p1,7d,p95_latency,3524.9,2558.4,160,ok
+p1,7d,error_rate,11418.0,10451.5,169,ok
+p1,7d,log_list,4876.4,7462.3,251,ok
+p1,7d,dcount_service,10439.5,11519.7,1,ok
+p1,7d,facet_service,,,,FAIL: canceling statement due to statement timeout
+p1,14d,throughput,,,,FAIL: canceling statement due to statement timeout
+p1,14d,group_by_service,,,,FAIL: canceling statement due to statement timeout
+p1,14d,p95_latency,,,,FAIL: canceling statement due to statement timeout
+p1,14d,error_rate,,,,FAIL: canceling statement due to statement timeout
+p1,14d,log_list,4395.6,7993.8,251,ok
+p1,30d,throughput,,,,skip_implied
+p1,30d,group_by_service,,,,skip_implied
+p1,30d,p95_latency,,,,skip_implied
+p1,30d,error_rate,,,,skip_implied
+p1,30d,log_list,,,,"FAIL: Resources exhausted: scan selected 1404 files / 431629 MiB, over the 16384 MiB per-scan li"
+p1,30d,dcount_service,,,,"FAIL: Resources exhausted: scan selected 1404 files / 431629 MiB, over the 16384 MiB per-scan li"
+p1,30d,facet_service,,,,skip_implied
+p2,1h,throughput,862.1,1606.2,0,ok
+p2,1h,group_by_service,2111.4,1680.2,0,ok
+p2,1h,p95_latency,1613.7,1386.8,0,ok
+p2,1h,error_rate,3962.3,1425.5,0,ok
+p2,1h,log_list,1627.5,1539.1,0,ok
+p2,3h,throughput,1535.8,1641.7,0,ok
+p2,3h,group_by_service,1219.5,832.0,0,ok
+p2,3h,p95_latency,1109.2,1184.7,0,ok
+p2,3h,error_rate,1374.8,1254.5,0,ok
+p2,3h,log_list,1526.0,1637.6,0,ok
+p2,24h,throughput,3891.3,3364.6,0,ok
+p2,24h,group_by_service,982.0,737.7,0,ok
+p2,24h,p95_latency,587.7,3723.4,0,ok
+p2,24h,error_rate,679.1,355.1,0,ok
+p2,24h,log_list,534.4,590.6,0,ok
+p2,24h,dcount_service,467.1,619.4,1,ok
+p2,24h,facet_service,607.6,837.3,0,ok
+p2,3d,throughput,960.5,1282.9,0,ok
+p2,3d,group_by_service,1479.3,3324.0,0,ok
+p2,3d,p95_latency,1757.8,1825.9,0,ok
+p2,3d,error_rate,1721.0,1402.5,0,ok
+p2,3d,log_list,1489.8,1736.8,0,ok
+p2,7d,throughput,1691.6,4402.1,0,ok
+p2,7d,group_by_service,1685.1,1600.8,0,ok
+p2,7d,p95_latency,7161.0,1693.5,0,ok
+p2,7d,error_rate,1438.6,1416.1,0,ok
+p2,7d,log_list,3794.8,1131.9,0,ok
+p2,7d,dcount_service,807.9,781.4,1,ok
+p2,7d,facet_service,467.2,559.3,0,ok
+p2,14d,throughput,906.6,1280.5,0,ok
+p2,14d,group_by_service,1608.4,1826.3,0,ok
+p2,14d,p95_latency,1480.3,1713.0,0,ok
+p2,14d,error_rate,1665.5,1440.5,0,ok
+p2,14d,log_list,4191.0,819.7,0,ok
+p2,30d,throughput,,,,FAIL: canceling statement due to statement timeout
+p2,30d,group_by_service,,,,FAIL: consuming input failed: server closed the connection unexpectedly
+p2,30d,p95_latency,50327.6,,39,ok
+p2,30d,error_rate,75926.4,,39,ok
+p2,30d,log_list,4663.2,4769.2,251,ok
+p2,30d,dcount_service,19694.2,,1,ok
+p2,30d,facet_service,30904.0,,1,ok
+p3,1h,throughput,1746.4,1196.4,61,ok
+p3,1h,group_by_service,2787.2,525.1,1347,ok
+p3,1h,p95_latency,293.9,282.0,61,ok
+p3,1h,error_rate,223.4,204.7,61,ok
+p3,1h,log_list,504.6,532.3,251,ok
+p3,3h,throughput,285.9,247.2,37,ok
+p3,3h,group_by_service,509.7,382.7,889,ok
+p3,3h,p95_latency,908.1,1321.6,37,ok
+p3,3h,error_rate,2986.9,2657.8,37,ok
+p3,3h,log_list,2243.5,1151.6,251,ok
+p3,24h,throughput,1432.7,2335.2,289,ok
+p3,24h,group_by_service,3913.0,2886.6,6937,ok
+p3,24h,p95_latency,4262.1,1429.0,289,ok
+p3,24h,error_rate,1130.3,915.2,289,ok
+p3,24h,log_list,324.7,289.2,251,ok
+p3,24h,dcount_service,1036.5,922.3,1,ok
+p3,24h,facet_service,3509.5,5957.1,26,ok
+p3,3d,throughput,2847.9,2355.1,73,ok
+p3,3d,group_by_service,3591.5,4561.4,1770,ok
+p3,3d,p95_latency,3411.7,3753.2,73,ok
+p3,3d,error_rate,2657.5,2566.3,73,ok
+p3,3d,log_list,428.7,286.8,251,ok
+p3,7d,throughput,5554.2,7146.8,169,ok
+p3,7d,group_by_service,6992.0,7062.6,4086,ok
+p3,7d,p95_latency,,,,FAIL: canceling statement due to statement timeout
+p3,7d,error_rate,,,,FAIL: canceling statement due to statement timeout
+p3,7d,log_list,1690.1,1441.1,251,ok
+p3,7d,dcount_service,,,,FAIL: canceling statement due to statement timeout
+p3,7d,facet_service,,,,FAIL: canceling statement due to statement timeout
+p3,14d,throughput,,,,FAIL: canceling statement due to statement timeout
+p3,14d,group_by_service,26693.3,,1404,ok
+p3,14d,p95_latency,,,,skip_implied
+p3,14d,error_rate,,,,skip_implied
+p3,14d,log_list,2392.5,2525.2,251,ok
+p3,30d,throughput,,,,skip_implied
+p3,30d,group_by_service,,,,FAIL: canceling statement due to statement timeout
+p3,30d,p95_latency,,,,skip_implied
+p3,30d,error_rate,,,,skip_implied
+p3,30d,log_list,1050.1,690.0,251,ok
+p3,30d,dcount_service,,,,skip_implied
+p3,30d,facet_service,,,,skip_implied
+p4,1h,throughput,215.5,246.3,61,ok
+p4,1h,group_by_service,211.5,37322.0,140,ok
+p4,1h,p95_latency,1531.9,1659.1,60,ok
+p4,1h,error_rate,3772.9,1230.3,61,ok
+p4,1h,log_list,2405.7,1624.0,251,ok
+p4,3h,throughput,362.5,357.9,37,ok
+p4,3h,group_by_service,467.4,1178.3,110,ok
+p4,3h,p95_latency,1528.5,3688.9,37,ok
+p4,3h,error_rate,4150.2,1942.8,37,ok
+p4,3h,log_list,4249.2,514.2,251,ok
+p4,24h,throughput,1088.7,1062.9,289,ok
+p4,24h,group_by_service,9367.6,1644.4,865,ok
+p4,24h,p95_latency,709.6,825.1,288,ok
+p4,24h,error_rate,964.4,1631.8,288,ok
+p4,24h,log_list,2151.0,2713.7,251,ok
+p4,24h,dcount_service,932.5,809.0,1,ok
+p4,24h,facet_service,1939.3,2886.2,3,ok
+p4,3d,throughput,904.0,777.2,49,ok
+p4,3d,group_by_service,3887.9,2875.3,219,ok
+p4,3d,p95_latency,671.6,906.8,49,ok
+p4,3d,error_rate,818.8,864.9,49,ok
+p4,3d,log_list,1758.8,1263.1,251,ok
+p4,7d,throughput,7537.7,10066.8,145,ok
+p4,7d,group_by_service,11018.8,6963.3,507,ok
+p4,7d,p95_latency,12852.2,7722.2,145,ok
+p4,7d,error_rate,8601.6,8164.3,145,ok
+p4,7d,log_list,1773.0,1087.9,251,ok
+p4,7d,dcount_service,9705.5,8322.4,1,ok
+p4,7d,facet_service,11649.2,8041.3,3,ok
+p4,14d,throughput,17053.1,,57,ok
+p4,14d,group_by_service,15820.0,,171,ok
+p4,14d,p95_latency,23820.5,,57,ok
+p4,14d,error_rate,15392.7,,57,ok
+p4,14d,log_list,1128.3,1743.9,251,ok
+p4,30d,throughput,35026.5,,117,ok
+p4,30d,group_by_service,41624.8,,349,ok
+p4,30d,p95_latency,,,,FAIL: canceling statement due to statement timeout
+p4,30d,error_rate,61440.0,,117,ok
+p4,30d,log_list,2661.9,4504.1,251,ok
+p4,30d,dcount_service,47759.8,,1,ok
+p4,30d,facet_service,,,,FAIL: canceling statement due to statement timeout
+p5,1h,throughput,1235.0,4905.3,61,ok
+p5,1h,group_by_service,1951.9,2997.1,484,ok
+p5,1h,p95_latency,1767.4,2404.4,61,ok
+p5,1h,error_rate,1065.6,2103.7,61,ok
+p5,1h,log_list,5236.4,4032.2,251,ok
+p5,3h,throughput,925.2,2151.6,37,ok
+p5,3h,group_by_service,1481.6,3384.1,294,ok
+p5,3h,p95_latency,1783.8,10510.5,37,ok
+p5,3h,error_rate,1123.7,1846.0,37,ok
+p5,3h,log_list,905.1,2257.4,251,ok
+p5,24h,throughput,3585.9,2400.3,288,ok
+p5,24h,group_by_service,1240.7,1523.1,2308,ok
+p5,24h,p95_latency,1025.9,1383.4,289,ok
+p5,24h,error_rate,1188.2,1290.6,289,ok
+p5,24h,log_list,512.7,693.4,251,ok
+p5,24h,dcount_service,875.9,1169.4,1,ok
+p5,24h,facet_service,1277.2,2048.2,8,ok
+p5,3d,throughput,774.7,812.2,46,ok
+p5,3d,group_by_service,2407.3,2518.8,570,ok
+p5,3d,p95_latency,2191.4,1960.1,46,ok
+p5,3d,error_rate,1081.8,3212.7,46,ok
+p5,3d,log_list,1940.4,2559.3,251,ok
+p5,7d,throughput,3630.9,2918.6,121,ok
+p5,7d,group_by_service,7476.8,6332.9,1281,ok
+p5,7d,p95_latency,5458.5,4899.6,121,ok
+p5,7d,error_rate,3535.9,5437.1,121,ok
+p5,7d,log_list,1011.4,1533.7,251,ok
+p5,7d,dcount_service,5225.7,5320.4,1,ok
+p5,7d,facet_service,9032.4,7048.5,8,ok
+p5,14d,throughput,9313.6,7787.0,49,ok
+p5,14d,group_by_service,12292.1,10660.5,445,ok
+p5,14d,p95_latency,18773.2,,49,ok
+p5,14d,error_rate,8655.0,7522.1,49,ok
+p5,14d,log_list,2523.5,3777.6,251,ok
+p5,30d,throughput,25752.7,,118,ok
+p5,30d,group_by_service,27827.4,,930,ok
+p5,30d,p95_latency,,,,FAIL: canceling statement due to statement timeout
+p5,30d,error_rate,47047.8,,118,ok
+p5,30d,log_list,2246.0,2967.3,251,ok
+p5,30d,dcount_service,24316.8,,1,ok
+p5,30d,facet_service,54275.3,,8,ok
+p6,1h,throughput,4456.9,2049.4,61,ok
+p6,1h,group_by_service,1542.4,1605.9,61,ok
+p6,1h,p95_latency,1200.4,1378.1,61,ok
+p6,1h,error_rate,1086.1,677.8,61,ok
+p6,1h,log_list,1670.7,1910.8,251,ok
+p6,3h,throughput,1933.7,1327.3,37,ok
+p6,3h,group_by_service,1585.2,1896.4,37,ok
+p6,3h,p95_latency,4094.8,1645.1,37,ok
+p6,3h,error_rate,1988.1,1809.3,37,ok
+p6,3h,log_list,5204.7,1693.2,251,ok
+p6,24h,throughput,3529.0,2466.8,289,ok
+p6,24h,group_by_service,3525.7,6197.5,289,ok
+p6,24h,p95_latency,7275.7,8134.8,289,ok
+p6,24h,error_rate,3327.6,2787.7,289,ok
+p6,24h,log_list,2382.0,1895.4,251,ok
+p6,24h,dcount_service,2711.7,2251.1,1,ok
+p6,24h,facet_service,6708.9,5169.4,1,ok
+p6,3d,throughput,2051.5,1892.3,28,ok
+p6,3d,group_by_service,15633.8,,73,ok
+p6,3d,p95_latency,2437.2,2821.5,28,ok
+p6,3d,error_rate,5216.1,2260.1,28,ok
+p6,3d,log_list,1693.1,1735.3,251,ok
+p6,7d,throughput,12366.2,7544.9,103,ok
+p6,7d,group_by_service,16396.6,,169,ok
+p6,7d,p95_latency,15572.5,,103,ok
+p6,7d,error_rate,13915.7,9361.3,103,ok
+p6,7d,log_list,2058.2,2151.6,251,ok
+p6,7d,dcount_service,21135.6,,1,ok
+p6,7d,facet_service,27548.5,,1,ok
+p6,14d,throughput,18888.2,,46,ok
+p6,14d,group_by_service,52276.2,,57,ok
+p6,14d,p95_latency,,,,FAIL: canceling statement due to statement timeout
+p6,14d,error_rate,,,,FAIL: canceling statement due to statement timeout
+p6,14d,log_list,3490.0,7790.7,251,ok
+p6,30d,throughput,,,,"FAIL: Resources exhausted: scan selected 597 files / 26418 MiB, over the 16384 MiB per-scan limi"
+p6,30d,group_by_service,,,,"FAIL: Resources exhausted: scan selected 597 files / 26418 MiB, over the 16384 MiB per-scan limi"
+p6,30d,p95_latency,,,,skip_implied
+p6,30d,error_rate,,,,skip_implied
+p6,30d,log_list,,,,"FAIL: Resources exhausted: scan selected 597 files / 26418 MiB, over the 16384 MiB per-scan limi"
+p6,30d,dcount_service,,,,"FAIL: Resources exhausted: scan selected 597 files / 26418 MiB, over the 16384 MiB per-scan limi"
+p6,30d,facet_service,,,,"FAIL: Resources exhausted: scan selected 597 files / 26418 MiB, over the 16384 MiB per-scan limi"
