@@ -457,3 +457,58 @@ rollups:
          - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
          - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
          - { name: duration_digest, agg: tdigest, column: duration }
+
+  # `level` is a dashboard filter no tier above can express, so every
+  # `level == "ERROR" | summarize …` panel falls back to a raw scan. It is
+  # canonical enough in monoscope's query language to appear in the AI
+  # assistant's prompt examples and in LiveTail's doctests.
+  #
+  # A NEW spec, never a fourth dimension on `dashboard_1m_v3`. `generation_id`
+  # hashes the whole spec, so EDITING v3 would change every existing file's
+  # generation and take the tier dark until 30 days rebuilt. Adding is safe by
+  # construction: `route_for` tries every declared rollup and one that cannot
+  # serve a query declines, so "adding a spec can only ever widen what routes",
+  # and the reader takes the first tier actually BUILT — an unbuilt tier is
+  # skipped, never served. That is also what `generation_id`'s own comment means
+  # by bumping the table name.
+  #
+  # DELIBERATELY NARROW: `level` alone, not `level` plus v3's three. A tier's
+  # build cost scales with its group count, and duplicating the fat spec would
+  # cost far more for one filter. The candidate sort breaks ties toward the
+  # narrower dimension set, so this is tried first and declines immediately for
+  # anything needing service/kind/status_code, which routes to v3 as it does now.
+  #
+  # KNOWN COST, stated because it is the reason to reconsider: enqueued rollup
+  # work scales with the number of declared specs
+  # (`plan_rollup_backfill`, src/database/maintain.rs), so these two tiers
+  # DOUBLE rollup maintenance. Deleting these two entries is the whole revert —
+  # nothing else references them, and no existing tier changes identity.
+  #
+  # Measures are the core panel set. `error_count` is carried because `level`
+  # and `status_code` are different columns, so an errors-by-level chart still
+  # asks for it.
+  - grain: 1m
+    name: dashboard_level_1m_v1
+    dimensions: [level]
+    measures:
+      - { name: request_count, agg: count }
+      - { name: duration_count, agg: count, column: duration }
+      - { name: error_count, agg: count, filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500" }
+      - { name: duration_sum, agg: sum, column: duration }
+      - { name: duration_min, agg: min, column: duration }
+      - { name: duration_max, agg: max, column: duration }
+      - { name: duration_digest, agg: tdigest, column: duration }
+  # Coarse tier for 7d/30d windows, derived so it re-aggregates the 1m rows
+  # instead of scanning the raw partition a second time.
+  - grain: 1h
+    name: dashboard_level_1h_v1
+    derive_from: dashboard_level_1m_v1
+    dimensions: [level]
+    measures:
+      - { name: request_count, agg: count }
+      - { name: duration_count, agg: count, column: duration }
+      - { name: error_count, agg: count, filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500" }
+      - { name: duration_sum, agg: sum, column: duration }
+      - { name: duration_min, agg: min, column: duration }
+      - { name: duration_max, agg: max, column: duration }
+      - { name: duration_digest, agg: tdigest, column: duration }

@@ -2677,7 +2677,7 @@ mod tests {
             .await
             .expect("match count")
             .expect("declared rollup route");
-        assert_eq!(route.target, TARGET);
+        assert!(route.target.contains("_1m_"), "a minute-bucketed count must route to a 1m tier, got {}", route.target);
         assert_eq!(route.project_id.as_deref(), Some("project"));
         assert!(generated_sql(&route).contains("COALESCE(SUM(request_count), 0)"));
     }
@@ -2765,7 +2765,7 @@ mod tests {
 
         // The rollup leg answers only for the projects that proved coverage...
         assert!(
-            generated.contains(&format!("FROM {TARGET} WHERE project_id IN ('good', 'fine')")),
+            generated.contains(&format!("FROM {} WHERE project_id IN ('good', 'fine')", route.target)),
             "rollup leg must be restricted to covered projects: {generated}"
         );
         // ...and the uncovered one is read raw across the WHOLE window, not dropped.
@@ -2992,11 +2992,14 @@ mod tests {
                AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(864000000000) \
              GROUP BY time_bucket('1 hours', timestamp)"
         );
-        assert_eq!(
-            route_for(&state, &wide).await.expect("match").expect("route").target,
-            "otel_logs_and_spans_rollup_dashboard_1h_v2",
-            "a 10-day window bucketed hourly must use the coarse tier"
-        );
+        // The GRAIN is what this pins. Which 1h tier wins is a separate
+        // question — the candidate sort breaks ties toward the narrower
+        // dimension set, so a dimensionless COUNT(*) prefers the smaller table,
+        // and the reader falls through to the next tier when that one is not
+        // built. Asserting the exact name here made adding a tier read as a
+        // grain regression.
+        let coarse = route_for(&state, &wide).await.expect("match").expect("route").target;
+        assert!(coarse.contains("_1h_"), "a 10-day window bucketed hourly must use a coarse tier, got {coarse}");
 
         // Ten minutes: the 1h tier cannot cover it, so the 1m tier must win.
         let narrow = format!(
@@ -3004,7 +3007,8 @@ mod tests {
                AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(600000000) \
              GROUP BY time_bucket('5 minutes', timestamp)"
         );
-        assert_eq!(route_for(&state, &narrow).await.expect("match").expect("route").target, TARGET, "a 10-minute window must fall back to the fine tier");
+        let fine = route_for(&state, &narrow).await.expect("match").expect("route").target;
+        assert!(fine.contains("_1m_"), "a 10-minute window must fall back to a fine tier, got {fine}");
     }
 
     /// Grouping by a bucket without SELECTing it is an ordinary dashboard shape

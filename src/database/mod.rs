@@ -12592,12 +12592,19 @@ mod tests {
 
         let journal = db.maintenance_tasks.lock().unwrap();
         let tasks = journal.tasks().filter(|task| task.key.project_id == project).collect::<Vec<_>>();
-        assert_eq!(tasks.len(), 13, "one touched hour: 6 dedup + 6 base + 1 derived, not 312 for the whole day");
+        // Derived from the DECLARED specs for the same reason as
+        // `first_rollup_invalidation_enqueues_only_the_touched_hour`: this pins
+        // per-hour sparseness, and a literal would fail whenever a tier is
+        // added — which reads as a regression and is not one.
+        let rollups = crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups.clone();
+        let (derived, base): (Vec<_>, Vec<_>) = rollups.iter().partition(|spec| spec.derive_from.is_some());
+        let expected = 6 + 6 * base.len() + derived.len();
+        assert_eq!(tasks.len(), expected, "one touched hour: 6 dedup + 6 per base tier + 1 per derived tier, not 312 for the whole day");
         assert!(
             tasks.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + 3_600_000_000),
             "every reconciled task must lie inside the touched hour; day {day} starts {day_start}"
         );
-        assert_eq!(queued, 2, "one dirty hour x two rollup specs");
+        assert_eq!(queued, rollups.len(), "one dirty hour x one enqueue per declared rollup spec");
         Ok(())
     }
 
