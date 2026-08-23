@@ -225,11 +225,14 @@ pub mod scan_metric_names {
     ///
     /// `counter_value` reads by `&'static str`, so the names are consts and this
     /// is the one place reason strings and metric names are tied together.
-    pub const PREFILTER_SKIP_REASONS: [(&str, &str); 6] = [
+    pub const PREFILTER_SKIP_REASONS: [(&str, &str); 9] = [
         ("empty_index", "timefusion.scan.prefilter_skipped.empty_index"),
         ("low_selectivity", "timefusion.scan.prefilter_skipped.low_selectivity"),
         ("field_coverage_gap", "timefusion.scan.prefilter_skipped.field_coverage_gap"),
-        ("delta_no_index_or_cap_exceeded", "timefusion.scan.prefilter_skipped.no_index_or_cap"),
+        ("delta_no_index", "timefusion.scan.prefilter_skipped.no_index"),
+        ("delta_no_usable_index", "timefusion.scan.prefilter_skipped.no_usable_index"),
+        ("delta_cap_exceeded_one_index", "timefusion.scan.prefilter_skipped.cap_exceeded_one_index"),
+        ("delta_cap_exceeded_combined", "timefusion.scan.prefilter_skipped.cap_exceeded_combined"),
         ("delta_no_hits_returned", "timefusion.scan.prefilter_skipped.no_hits_returned"),
         ("delta_error", "timefusion.scan.prefilter_skipped.delta_error"),
     ];
@@ -9400,6 +9403,25 @@ mod stale_coverage_metric_tests {
         // The one agreeing case never reaches the classifier.
         assert!(crate::rollup::slice_coverage_agrees(&[Some(10)], Some(10)));
     }
+
+    /// Every refusal `search_detailed` can return must have a metric, or it
+    /// vanishes from the breakdown — the `debug_assert` in
+    /// `record_prefilter_skip` only fires if a query happens to hit that path.
+    ///
+    /// These four had ONE label between them, and they want opposite fixes: an
+    /// empty manifest needs a backfill, a blown cap needs a bigger cap or a
+    /// narrower query, entries-but-none-usable needs a reindex. The standing
+    /// "76% of prefilter skips are a missing index" was measured through that
+    /// single label and cannot tell them apart.
+    #[test]
+    fn every_search_refusal_is_a_registered_prefilter_reason() {
+        for reason in ["delta_no_index", "delta_no_usable_index", "delta_cap_exceeded_one_index", "delta_cap_exceeded_combined", "delta_error"] {
+            assert!(scan_metric_names::prefilter_skip_metric(reason).is_some(), "{reason} would vanish from the breakdown");
+        }
+        // Distinct names, or the split buys nothing.
+        let names: std::collections::HashSet<_> = scan_metric_names::PREFILTER_SKIP_REASONS.iter().map(|(_, metric)| *metric).collect();
+        assert_eq!(names.len(), scan_metric_names::PREFILTER_SKIP_REASONS.len());
+    }
 }
 
 /// Charge one prefilter skip to the total AND to its reason.
@@ -9790,8 +9812,8 @@ impl TableProvider for ProjectRoutingTable {
             // (And→Must, Or→Should; `collect_text_match_tree` only emits OR
             // nodes whose every branch is completely covered), hits unioned
             // across indexes (they cover disjoint row sets).
-            match svc.search_with_stats(&self.table_name, &project_id, tree, max_hits, query_time_range).await {
-                Ok(Some(result)) => {
+            match svc.search_detailed(&self.table_name, &project_id, tree, max_hits, query_time_range).await {
+                Ok(Ok(result)) => {
                     delta_any_usable = true;
                     delta_indexed_rows = result.indexed_rows;
                     delta_covered = result.covered_files;
@@ -9800,8 +9822,11 @@ impl TableProvider for ProjectRoutingTable {
                     delta_row_sel = result.row_selections;
                     delta_ids = Some(result.hits.into_iter().map(|h| h.id).collect());
                 }
-                Ok(None) => {
-                    abort_reason = Some("delta_no_index_or_cap_exceeded");
+                // Four distinct refusals, previously one label. An empty
+                // manifest wants a backfill; a blown cap wants a bigger cap or a
+                // narrower query; entries-but-none-usable wants a reindex.
+                Ok(Err(reason)) => {
+                    abort_reason = Some(reason);
                 }
                 Err(e) => {
                     warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);

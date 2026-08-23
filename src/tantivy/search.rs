@@ -199,9 +199,23 @@ impl TantivySearchService {
     pub async fn search_with_stats(
         &self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
     ) -> Result<Option<SearchResult>> {
+        Ok(self.search_detailed(table, project_id, node, max_hits, time_range).await?.ok())
+    }
+
+    /// `search_with_stats`, but saying WHY it could not answer.
+    ///
+    /// The four refusals below had one label between them
+    /// (`delta_no_index_or_cap_exceeded`), and they want opposite fixes: an
+    /// empty manifest needs a backfill, a blown cap needs a bigger cap or a
+    /// narrower query, and entries-but-none-usable needs a reindex. "76% of
+    /// prefilter skips are a missing index" was measured through that label and
+    /// could not distinguish them.
+    pub async fn search_detailed(
+        &self, table: &str, project_id: &str, node: &PredNode, max_hits: usize, time_range: Option<(i64, i64)>,
+    ) -> Result<std::result::Result<SearchResult, &'static str>> {
         let m = self.load_manifest_cached(table, project_id).await?;
         if m.entries.is_empty() {
-            return Ok(None);
+            return Ok(Err("delta_no_index"));
         }
         let plan_started = Instant::now();
         let current = || m.entries.iter().filter(|(_, e)| e.schema_version == SCHEMA_VERSION);
@@ -276,7 +290,7 @@ impl TantivySearchService {
         while let Some(res) = tasks.next().await {
             // Per-index overflow: some index alone exceeds `max_hits`.
             let Some((hits, rows, entry_covered, ordinals_valid)) = res? else {
-                return Ok(None);
+                return Ok(Err("delta_cap_exceeded_one_index"));
             };
             let Some(hits) = hits else {
                 // An in-window index that can't answer a queried field (e.g.
@@ -306,18 +320,18 @@ impl TantivySearchService {
                 if seen.insert((h.timestamp_micros, h.id.clone())) {
                     all_hits.push(h);
                     if all_hits.len() > max_hits {
-                        return Ok(None);
+                        return Ok(Err("delta_cap_exceeded_combined"));
                     }
                 }
             }
             any_usable = true;
         }
         if !any_usable {
-            return Ok(None);
+            return Ok(Err("delta_no_usable_index"));
         }
         zero_hit_files.retain(|f| !unprunable_files.contains(f));
         row_selections.retain(|f, _| !unselectable_files.contains(f));
-        Ok(Some(SearchResult { hits: all_hits, indexed_rows, covered_files, zero_hit_files, row_selections, field_coverage_gap }))
+        Ok(Ok(SearchResult { hits: all_hits, indexed_rows, covered_files, zero_hit_files, row_selections, field_coverage_gap }))
     }
 
     /// Warm the local disk cache with every blob whose data is at most
