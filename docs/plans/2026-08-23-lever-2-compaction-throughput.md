@@ -320,3 +320,57 @@ What the next person needs, in order:
    untagged-tier stall, the counter that fired before the commit).
 2. With that, decide whether large-file-first selection is starving the small
    files, and if so pack smallest-first within the L0 budget.
+
+## The pack-first fix shipped, and it did NOT fix this
+
+`02e3778` reached prod as `34508ee`. Consolidation confirmed active on the new
+build (`pending_sealed_consolidation = 76`). After ~20 minutes:
+
+```
+                         before fix        after fix
+Delta version               498987            499118
+out-of-policy cells             48                48
+small files                  1,772             1,771
+6297304f / 2026-08-17     275 files         275 files
+87576849 / 2026-08-19     238 files         238 files
+28f62f01 / 2026-08-18     230 files         230 files
+```
+
+Unchanged. **The hypothesis is refuted.** A large-but-under-target file
+monopolising the L0 budget is NOT what stops these cells retiring — or at least
+not the only thing. The change itself is still defensible on its own terms
+(packing several small files beats rewriting one file into one file, and it has a
+test), but it did not move the number it was written to move, and it should not
+be described as having fixed anything.
+
+What that rules out, and what it leaves:
+
+- **Ruled out:** starvation (units are claimed every 30-60 s), the debt-slot cap,
+  a missing caller, the flush health gate, the memory brake, and now the
+  selection-order hypothesis.
+- **Left:** the files may never reach the selector at all. `coordinator_compaction_files`
+  filters on `path.contains("date=<d>/")`, a `project_id` partition match, and an
+  event-range overlap against the slice, using the snapshot from
+  `resolve_table(key.project_id, key.source)`. Any one of those returning nothing
+  produces `files.is_empty()`, which marks the task **complete** and logs
+  NOTHING — the planner then re-mints it 60 s later. That is a silent treadmill
+  and it fits every observation, including the ~30 Delta commits (other work) and
+  the flat file counts.
+
+## The next step is instrumentation, not another guess
+
+I have now had two hypotheses for this and shipped one of them; the second was
+wrong. The code gives no way to tell an empty selection from a completed unit,
+which is why guessing is all that is available. Before any further change:
+
+```
+log/counter at the `files.is_empty()` branch of `run_coordinator_compaction_once`
+  - the key (project, date, operation)
+  - candidate count BEFORE and AFTER each filter stage
+    (date_marker, project match, event-range overlap, size/sorted selection)
+```
+
+That single line converts this from a guessing game into a one-tick answer. This
+repo has been burned by precisely this shape before — the dirty-bin drain with no
+caller, the untagged-tier stall, the counter that fired before its commit — and
+each was found the same way: make the silent refusal say why.
