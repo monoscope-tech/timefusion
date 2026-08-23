@@ -182,3 +182,47 @@ So the conclusion changes in degree, not in kind: the backlog now genuinely
 converges, on the order of a day or two rather than a week, and coarsening the
 24.4x inflation would still collapse that by an order of magnitude. But "it does
 not converge" — stated earlier on this page — is retracted.
+
+## The number that actually decides the goal: sealed cells drain at ~2.7/hr
+
+The checkpoint went stale for 3h and then refreshed, which accidentally produced
+a clean before/after 3h44m apart:
+
+```
+            09:53      13:37     delta        rate
+sealed units   11,174     11,020    -154      ~41/hr
+sealed CELLS      458        448     -10      ~2.7 cells/hr
+pending base   12,207     12,091    -116
+inflation       24.4x      24.6x
+```
+
+Both prior estimates on this page were measuring the wrong thing:
+
+- ~490 rebuilds/hr is real, but **only ~41/hr of it is sealed work**. The rest is
+  today's frontier, which ingest replenishes continuously.
+- so "12,100 pending / 490 per hour = ~25 h" does not describe the goal. The wide
+  windows need SEALED days, and those clear at **2.7 cells/hr**.
+
+**448 sealed cells at 2.7 cells/hr is ~166 hours — about a week.**
+
+### This is the quantified case for coarsening
+
+The inflation is doing the damage in exactly the place that matters:
+
+| | units | rate | time |
+|---|---|---|---|
+| today, 24.6 units per sealed cell | 11,020 | ~41 units/hr | ~166 h |
+| coarsened to one unit per cell | 448 | ~41 units/hr | **~11 h** |
+
+Same worker pool, same per-unit cost, 15x less wall clock — because the fixed
+commit cost stops being paid 24.6 times per day. Raising `coordinator_jobs`
+cannot touch this: it buys more units per hour, and 24.6 of every 25 units are
+redundant fixed cost.
+
+### Caveats on this measurement
+
+- The two endpoints come from checkpoint rewrites, not a controlled sample, so
+  the rate is an average over 3h44m that includes several restarts. It is the
+  right order of magnitude, not a precise figure.
+- `complete` base_rollup is 3,000 of which 889 are sealed, consistent with the
+  sealed share of drain being small but non-zero.
