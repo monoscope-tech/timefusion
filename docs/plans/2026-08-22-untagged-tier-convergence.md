@@ -282,6 +282,22 @@ What is established:
   `timestamp` (so the no-stats caveat below does not apply); and both coarsening
   deletion paths are now exempt, so they are not being deleted after enqueue.
 
+**The interior-gap shape now has a test, and it PASSES**
+(`recovery_queues_an_interior_gap_between_live_tagged_slices`): an untagged file
+with tagged slices either side of an eleven-minute hole is queued correctly. That
+eliminates `uncovered_gaps` and the covering-slice substitution, and fills a real
+coverage hole — the previous test only exercised a partition with NO tagged range,
+where the gap is the file's whole span.
+
+**All four stuck cells share one fingerprint**, from the journal snapshot plus
+WAL: a DAY-WIDE unit that is `Superseded` with reason `split_into_smaller_slices`,
+alongside a day-wide `Complete` one — and nothing at the gap itself. That is the
+signature of the day being enqueued (not the gap), split by the preflight, its
+children deleted, and the cycle repeating. Which would mean `uncovered_gaps`
+returns EMPTY for these cells in prod and the fallback substitutes the day-wide
+covering slice — even though an offline replay of the same log shows a real hole.
+Reconciling those two readings is the next concrete step.
+
 Candidates left, needing a local repro rather than more prod archaeology: the
 covering-slice substitution redirecting a gap onto a range that already exists
 (making `enqueue` a no-op against a Complete key), or `enqueue` returning early on
