@@ -876,3 +876,44 @@ unmeasured*. The residual ~28/hr of sealed accrual is therefore unattributed —
 it may be wave refusals, the optimize path (whose carry-forward is gated on
 `sole_commit` and silently declines under concurrent commits), or a third
 producer. No claim either way until the fixed instrument reports.
+
+### 14:35 — the bend was process age, not carry-forward. Retracted in full.
+
+The next census settles it, against me:
+
+| time | older | rate since previous | process age |
+|---|---|---|---|
+| 13:45 | 3742 | (pre-deploy ~128/hr) | — |
+| 13:59 | 3742 | **0/hr** | 6 min |
+| 14:14 | 3749 | ~28/hr | 21 min |
+| 14:29 | 3780 | **~124/hr** | 36 min |
+
+`docker service ps` explains the third column. The container running now started
+at **~13:53**; the image I credited the bend to (`3654960`) was live for roughly
+fourteen minutes before `0927494` replaced it. Five images ran in the last hour.
+
+So the two readings that looked like a fix — `+0` at 13:59 and `+7` at 14:14 —
+were taken 6 and 21 minutes into a **fresh process**, before its maintenance
+waves had spun up. No waves, no rewrites, no accrual. As the process matured,
+accrual climbed 0 -> 28 -> 124/hr and landed back on the pre-deploy ~128/hr,
+indistinguishable from where it started.
+
+**Carry-forward on the wave path has not been shown to reduce sealed accrual at
+all.** Every claim in the two entries above is withdrawn: the "bend", the
+"breakeven against drain", and the `week` decline read the same way. What
+remains true is only the mechanism-level observation that some waves do carry
+(27 lines), and — after `4a8a154` — that how often they *refuse* is still
+unmeasured.
+
+This is the failure mode already written down in
+`tf_prod_counters_need_a_quiet_process_2026-08-23`: **counters are immature with
+process age, and a young process reads as healthy.** I read three census points
+without once checking uptime, which that memory exists to prevent.
+
+**The binding constraint is not tantivy. It is the deploy cadence.** Five
+restarts in an hour — at least one of them mine, at 14:19 — against maintenance
+units that average ~21 minutes means units die to process exit and no throughput
+number taken inside a 15-minute window means anything. The correct next action
+is therefore restraint: **stop deploying, hold ~1h quiet, then measure.** No
+further code changes until a census series exists from a single process older
+than the work it is measuring.
