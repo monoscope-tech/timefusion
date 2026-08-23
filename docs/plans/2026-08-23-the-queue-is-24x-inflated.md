@@ -95,3 +95,50 @@ weaker statement than the one the stale file appeared to support.
 
 This is the same shape as the session's earlier traps: a number that will not
 move is first a claim about the ruler.
+
+## The drain rate, measured live — and what it implies
+
+Live counters (not the stale checkpoint), 6 minutes, `tasks_running` = 16 the
+whole time:
+
+```
+15:11  pending_base_rollup=12514  rebuilds_full=32
+15:13  pending_base_rollup=12504  rebuilds_full=32
+15:15  pending_base_rollup=12495  rebuilds_full=41
+15:17  pending_base_rollup=12511  rebuilds_full=41
+```
+
+- **9 rebuilds in 6 minutes at 16 concurrent = ~90 units/hr**, i.e. ~11 minutes
+  of worker time per unit (consistent with the concurrent session's "units
+  average ~21 min").
+- `pending_base_rollup` oscillates 12,495–12,518. **Flat: drain ~= accrual.**
+
+The arithmetic that follows is the whole story:
+
+| | at 90 units/hr |
+|---|---|
+| 12,500 pending units | ~139 hours |
+| 458 sealed CELLS behind them (24.4x) | ~3.7 cells/hr -> ~124 hours |
+
+So the backlog does not converge at this granularity, and it is not close. This
+is the quantitative case that **coarsening is the lever and concurrency is not**:
+doubling workers halves 139 hours to 70, while collapsing 24.4 units per cell
+into one attacks the same number by an order of magnitude — and does it by
+removing fixed commit cost rather than by buying more of it.
+
+## Pass condition, re-measured after the coordinator was unblocked
+
+Unchanged at **9 of 12**:
+
+```
+87576849 14d  61.0s TIMEOUT     87576849 30d  2.5s REFUSED (460 GB selected)
+edb04135 14d   0.8s ok          edb04135 30d 23.7s ok
+00000000 14d  14.1s ok          00000000 30d 60.1s ok
+dcad860a 14d  10.9s ok          dcad860a 30d 32.0s ok
+be87ebc1 14d   9.0s ok          be87ebc1 30d 24.7s ok
+28f62f01 14d  42.3s ok          28f62f01 30d  1.1s REFUSED
+```
+
+Getting the coordinator running was necessary and is not sufficient: the three
+failing cells need their SEALED days built, and at 3.7 cells/hr against 458 they
+are days away. Nothing on the query side moves them.
