@@ -5515,7 +5515,10 @@ impl Database {
             }
         }
         let files: Vec<_> = files.into_iter().filter(|(_, _, uri)| !carried.contains(uri)).collect();
-        if !carried.is_empty() {
+        // Log whenever there was work, not only when something carried: gating on
+        // `!carried.is_empty()` hides every all-rebuild wave, so the event reads
+        // `rebuilding=0` 100% of the time and the refusals are invisible.
+        if !carried.is_empty() || !files.is_empty() {
             info!(table_name, carried = carried.len(), rebuilding = files.len(), event = "tantivy_wave_carried_forward");
         }
         let (built, failed) = futures::stream::iter(files.into_iter().map(|(project, rel, uri)| {
