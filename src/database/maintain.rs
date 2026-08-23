@@ -2883,6 +2883,14 @@ impl Database {
             // the general queue they compete with ~7,000 other units behind a restart
             // cadence measured in tens of minutes. Queue them explicitly instead.
             let mut witnessless: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
+            // The BACKLOG comes from the Delta tags, which are durable and unaffected
+            // by journal state. Counting it from `published_rollups` instead made the
+            // gauge lie the moment it worked: enqueueing a slice flips its task off
+            // Complete, `published_rollups` filters on Complete, so the second hourly
+            // pass saw zero and prod read `rollup_witnessless_slices = 0` over a
+            // 23,337-slice backlog. Same "cannot tell none from unmeasured" failure
+            // the untagged gauge above already had, reintroduced one field over.
+            unverifiable += tagged.keys().filter(|(.., source_rows)| source_rows.is_none()).count() as u64;
             let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {
                 if publication.source_rows.is_none() {
@@ -2918,11 +2926,9 @@ impl Database {
                     );
                     recovered += 1;
                 }
-                unverifiable += witnessless.len() as u64;
                 self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
                 continue;
             }
-            unverifiable += witnessless.len() as u64;
             self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
             if !published.is_empty() {
                 continue;

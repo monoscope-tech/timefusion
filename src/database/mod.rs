@@ -11437,9 +11437,16 @@ mod tests {
             queued.iter().all(|slice| chrono::DateTime::from_timestamp_micros(slice.start_micros).is_some_and(|time| time.date_naive() == day)),
             "the republish must land on the unverifiable slice's own date, got {queued:?}"
         );
-        assert!(
-            crate::observability::maintenance_stats().rollup_witnessless_slices.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "the backlog gauge must be able to distinguish 'none' from 'unmeasured'"
+        // The gauge reads the DELTA TAGS, not the journal, and this fixture only
+        // blanked the journal — so zero here is the correct answer and pins the
+        // distinction. Deriving it from `published_rollups` instead made it lie the
+        // moment it worked: enqueueing flips a task off Complete, which is what
+        // `published_rollups` filters on, so the second hourly pass reported 0 over
+        // prod's 23,337-slice backlog.
+        assert_eq!(
+            crate::observability::maintenance_stats().rollup_witnessless_slices.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the backlog gauge must come from the durable tags, not from journal state the enqueue itself mutates"
         );
         Ok(())
     }
