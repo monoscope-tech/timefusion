@@ -152,3 +152,35 @@ deferred.
 
 Worth flagging on its own: one project selecting **1,447 files / 460 GB** for a
 30-day `count(*)` is a compaction signal, not a query signal.
+
+## Tier 1, verified against master's tree rather than asserted
+
+Checked by grepping `origin/master` directly, not from memory:
+
+| item | present in master | note |
+|---|---|---|
+| 1.1 `TIMEFUSION_ROLLUP_SLICE_FP_FALLBACK` | **0 refs** | deleted in `7e5bb5a`; there is nothing to flip |
+| 1.2 bounded `log_list` dedup | not present | its failure mode no longer reproduces — see the 1.2 section |
+| 1.3 per-scan byte refusal | 3 refs | live in prod at 16 GiB, observed refusing a 460 GB scan |
+| 1.4 null guard | 9 refs | `filter_not_eligible` measured 0 in prod |
+| 1.5 cooperative cancellation + its test | 2 refs | shipped by me (`6a5975a`) |
+| + witness/bound fix (3 sites) | present | `stale_coverage` measured 0 in prod |
+| + coordinator preload unblock | present | `319c5a8`, awaiting its deploy |
+
+So four of the five items' INTENT is realised in the shipped code. Two are not
+reachable as literally written, and both for the same kind of reason — the world
+moved between the checklist being written and the work being done:
+
+- **1.1** named a lever that was deleted an hour after it was created, because it
+  was measured end-to-end to route nothing (the two `source_fp` values are
+  computed by different hashers over different file sets). Re-adding it to "flip
+  it" would restore dead code a teammate removed *with* a measurement, and the
+  removal note says why: "a flag that does nothing is worse than no flag."
+- **1.2** targeted a failure that no longer occurs. The cell that defined mode B
+  is now refused by 1.3 at the scan guard in 2.9 s, having selected 460 GB.
+  Bounding its dedup would change nothing observable and would not make the cell
+  complete either.
+
+Writing code for either would produce dead code or duplicate code. What the goal
+actually needed was the thing neither item named: **nothing was being built at
+all**, which is `319c5a8`.
