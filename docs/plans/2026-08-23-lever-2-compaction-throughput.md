@@ -110,3 +110,54 @@ hypothesis rather than a plan.
 If p1's files really are mostly at target, then its 460 GB is data volume, not
 fragmentation, and no compaction will make a 30-day raw scan cheap — only routing
 to the rollup tier will, which is lever 1's territory and now unblocked.
+
+## Measured from object storage — and it overturns the section above
+
+Delta snapshot v498924, 4,547 add actions, sealed days only:
+
+```
+out-of-policy sealed cells (>=2 files under the 256 MB target):   48
+small files in those cells:                                    1,784
+
+  6297304f  2026-08-17   275 files /  0.90 GB   <- 3.3 MB per file
+  87576849  2026-08-19   238 files /  1.93 GB
+  28f62f01  2026-08-18   230 files /  1.48 GB
+  6297304f  2026-08-18   114 files /  0.54 GB
+  87576849  2026-08-18    62 files /  1.00 GB
+
+small files by project: 87576849=631  6297304f=500  28f62f01=459  dcad860a=141
+```
+
+**Both projects whose 14d/30d cells still fail are among the three worst.**
+`87576849` and `28f62f01` carry 631 and 459 small files respectively.
+
+### The inference I got wrong, and why
+
+Earlier on this page I reasoned that p1's 1,447 files over 460 GB averages
+~318 MB, above the 256 MB target, and therefore "p1 is not fragmented, it is just
+big". That is wrong. The distribution:
+
+```
+p1 sealed files (1,339 sampled)
+  p10 = 0 MB    p50 = 340 MB    p90 = 797 MB    max = 1,829 MB
+  under 256 MB: 588 / 1,339  = 44%
+```
+
+Nearly half of p1's sealed files are under target and the 10th percentile rounds
+to zero. The mean was pulled up by a long tail of large files and said nothing
+about the small ones — the same mistake this repo recorded hours earlier about
+tantivy build sizes ("one 718 MB whale among eight builds under 40 MB; a mean
+does not describe this population"). I had even written the caveat down and then
+reasoned past it. A mean is not a distribution; measure the percentiles.
+
+### Status of the mechanism
+
+Consolidation IS running — 23 consolidation log events in a 20-minute window, and
+the planner mints ~75 units (48 cells x tiers). The backlog is bounded and being
+worked, not stalled. What slows it is the restart cadence: `SealedConsolidation`
+is a DERIVED operation, so every deploy discards the queued units and the planner
+re-mints them from the file list, giving each unit a narrow window to be claimed.
+
+So lever 2 does not need a new mechanism. It needs the 48 cells to drain, and the
+thing that most slows that is the same deploy cadence that has truncated every
+measurement in this session.
