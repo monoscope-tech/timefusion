@@ -871,3 +871,30 @@ yet". `955f05f` adds `priced_by_footprint` (buckets that fit ONLY because a
 shared file set was charged once; zero means the rule changes nothing) and
 `input_fp` on `maintenance_task_started`. Those two are the pass condition —
 read them before claiming Fix B moved anything.
+
+## #3 — sealed hygiene now ranks by benefit (unblocked by the footprint)
+
+This was blocked on a signal the journal did not carry, and `InputFootprint`
+supplied it. The planner already counts the sub-target files to decide a
+partition is out of policy, so `files` rides along with the fingerprint the
+fusion pricing needs — no extra work, no extra field.
+
+Every hygiene unit is day-wide, so `-width` ties among them and the tie-break
+was pure recency, which says nothing about how much debt a claim retires. Four
+sealed cells held ~850 removable files in 4.9 GB while capacity went to
+whichever sealed most recently.
+
+**Bucketed at 64 files, and that is load-bearing.** `claim_next` matches the
+winning tuple EXACTLY, so a raw count makes one cell the sole winner of every
+claim and defeats the per-project rotation `fair_cursors` exists for — the same
+starvation the width ordering above it already records twice. Comparable cells
+tie and rotate; a 200-file cell still outranks a 3-file one.
+
+Narrow on purpose: starvation still leads the tuple (so no small cell is
+stranded), benefit is zero for every non-hygiene operation (so damage repair's
+deliberate tie is untouched), and an unknown benefit orders LAST rather than
+first. Both earlier proposals stay rejected — widening the size band is lossy,
+and sorting bin candidates by size breaks the `event_range` ordering that keeps
+output runs time-disjoint for range pruning.
+
+`sealed_hygiene_ranks_by_files_removed_not_by_date` pins all four properties.
