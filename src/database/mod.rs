@@ -3296,8 +3296,11 @@ impl Database {
             };
             (t.get_file_uris()?.collect::<Vec<String>>(), sizes, t.log_store().object_store(None))
         };
-        let by_pid: HashMap<String, Vec<String>> =
-            uris.into_iter().filter(|uri| uri.ends_with(".parquet")).filter_map(|uri| Some((project_id_of_uri(&uri)?.to_string(), uri))).into_group_map();
+        let (by_pid, raw_len) = group_parquet_by_project(uris);
+        let distinct_len: usize = by_pid.values().map(Vec::len).sum();
+        if raw_len > distinct_len {
+            warn!(table_name, raw = raw_len, distinct = distinct_len, event = "delta_snapshot_duplicate_files");
+        }
         let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
         let mut result: HashMap<String, Vec<String>> = HashMap::with_capacity(by_pid.len());
         for (pid, mut uris) in by_pid {
@@ -6679,6 +6682,31 @@ mod due_manifest_flush_tests {
 
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
 type DirtyBinKey = (String, String, String, i64);
+
+/// Group snapshot parquet URIs by project id, dropping repeats, and return the
+/// pre-dedupe count alongside so a caller can report duplication.
+///
+/// `get_file_uris()` can yield the same path more than once when the incremental
+/// snapshot duplicates its file list across a checkpoint (2026-08-02). Counting
+/// the raw list made the tantivy census report 6441 uncovered files for a table
+/// holding 4490 live files in total — a subset larger than the set — and every
+/// throughput number derived from it was wrong for a day.
+///
+/// ```
+/// # use timefusion::database::group_parquet_by_project;
+/// let dup = "s3://b/t/project_id=p1/date=2026-08-23/part-0.parquet".to_string();
+/// let (by_pid, raw) = group_parquet_by_project(vec![dup.clone(), dup, "s3://b/t/_delta_log/0.json".into()]);
+/// assert_eq!(raw, 2, "both parquet copies counted before dedupe");
+/// assert_eq!(by_pid["p1"].len(), 1, "the repeat is dropped");
+/// ```
+pub fn group_parquet_by_project(uris: impl IntoIterator<Item = String>) -> (HashMap<String, Vec<String>>, usize) {
+    use crate::tantivy::search::project_id_of_uri;
+    // Count the SAME population on both sides — parquet files carrying a project
+    // id — or the caller's duplication warning fires on ordinary filtering.
+    let parquet: Vec<String> = uris.into_iter().filter(|uri| uri.ends_with(".parquet") && project_id_of_uri(uri).is_some()).collect();
+    let raw_len = parquet.len();
+    (parquet.into_iter().unique().filter_map(|uri| Some((project_id_of_uri(&uri)?.to_string(), uri))).into_group_map(), raw_len)
+}
 
 /// Snapshot-relative files belonging to one physical project/date partition.
 /// Unified tables carry `project_id=` path segments; custom-project tables do
