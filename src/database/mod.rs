@@ -11721,6 +11721,108 @@ mod tests {
         assert_eq!(*kept.last().expect("bounded"), 88 * day, "the bound must cut from the OLD end, not the new one");
     }
 
+    /// An INTERIOR gap must be queued — the prod shape that never was.
+    ///
+    /// Four cells on 2026-08-23 held holes of 3 to 11 minutes and got no unit at
+    /// all: recovery ran and queued for OTHER damaged cells in the same
+    /// projects, but nothing covering these, in either the journal snapshot or
+    /// its WAL. The existing coverage only exercises a partition with NO live
+    /// tagged range, where the gap is the file's whole span; nothing covered a
+    /// gap with tagged slices on both sides of it, which is what prod has.
+    #[tokio::test]
+    async fn recovery_queues_an_interior_gap_between_live_tagged_slices() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        use object_store::ObjectStoreExt as _;
+        let mut cfg = (*create_test_config("untagged-interior-gap")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("gap_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+        // Rows at both ends of the day, so the untagged file's statistics span it.
+        for hour in [1, 23] {
+            let at = day_start + hour * 3_600_000_000;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        }
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        let tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+        let tier_ref = db.get_or_create_table(&project, &tier).await?;
+        // Replace the day-wide tagged file with: an UNTAGGED copy spanning the
+        // day, plus two tagged slices that leave 12:00-12:11 uncovered.
+        const HOLE: (i64, i64) = (12 * 3_600_000_000, 12 * 3_600_000_000 + 11 * 60_000_000);
+        {
+            let mut table = tier_ref.read().await.clone();
+            let live: Vec<_> = table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .map(|file| {
+                    #[allow(deprecated)]
+                    file.add_action()
+                })
+                .collect();
+            let store = table.log_store().object_store(None);
+            let mut actions = Vec::new();
+            let tag = |start: i64, end: i64| {
+                std::collections::HashMap::from([
+                    (crate::maintenance_coordinator::TAG_SLICE_START.to_owned(), Some(start.to_string())),
+                    (crate::maintenance_coordinator::TAG_SLICE_END.to_owned(), Some(end.to_string())),
+                    (crate::maintenance_coordinator::TAG_PROJECT.to_owned(), Some(project.clone())),
+                    (crate::maintenance_coordinator::TAG_SOURCE.to_owned(), Some("otel_logs_and_spans".to_owned())),
+                ])
+            };
+            for add in live {
+                for (suffix, tags) in [
+                    ("untagged", None),
+                    ("before", Some(tag(day_start, day_start + HOLE.0))),
+                    ("after", Some(tag(day_start + HOLE.1, day_start + 24 * 3_600_000_000))),
+                ] {
+                    let path = format!("{}-{suffix}.parquet", add.path.trim_end_matches(".parquet"));
+                    store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                    actions.push(Action::Add(deltalake::kernel::Add { path, tags, ..add.clone() }));
+                }
+                actions.push(Action::Remove(remove_for_add(&add, true)));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            *tier_ref.write().await = table;
+        }
+
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in &keys {
+                journal.complete(key);
+            }
+        }
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let queued: Vec<(i64, i64)> = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal
+                .tasks()
+                .filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier)
+                .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
+                .collect()
+        };
+        assert!(
+            queued.iter().any(|(start, end)| *start <= day_start + HOLE.0 && *end >= day_start + HOLE.1),
+            "the interior gap {:?} must be queued; got {queued:?}",
+            (day_start + HOLE.0, day_start + HOLE.1)
+        );
+        Ok(())
+    }
+
     /// A partition still holding an untagged tier file must be QUEUED for rebuild.
     ///
     /// `slice_retires` can retire such a file, but only when something publishes that partition,
