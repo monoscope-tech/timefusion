@@ -766,3 +766,66 @@ fusing, and is also one line.
 2. `filter_not_eligible` (31) — `level` / `status_code` are not rollup
    dimensions. Needs a spec decision, then a rebuild.
 3. Read the new `prefilter_skipped_*` rows once prod has an hour on them.
+
+## The queue can shrink now — `InputFootprint`, and the two shredding paths
+
+The 2026-08-23 experiment above (price a uniform group as one child) was the
+right instinct with the wrong key. Estimates are not a proxy for "same work";
+the file set is. Both halves shipped together:
+
+**FIX A — `uncovered_gaps` merges adjacent holes.** Each untagged file
+contributes its own statistics span, so a day whose files tile it end-to-end
+produced a gap per file, and `enqueue_untagged_rebuilds` minted a unit each.
+`dedup` only removed exact repeats. Adjacent and overlapping gaps are now one
+gap (`merge_ranges`), and a genuine separation still survives — asserted both
+ways. The `gaps.is_empty()` fallback that republishes the untagged spans
+themselves is merged for the same reason.
+
+**FIX B — a unit records what it READS, and fusion charges a file set once.**
+`estimated_decoded_bytes` prorates a file by the time share its slice covers,
+which is right for one unit and wrong the moment `coarsen_to_width` sums
+siblings: parquet prunes at row-group granularity, so `slice_share_of_file`
+floors every slice at one row group — and on ~10 MB files that IS the file. Each
+of prod's 1,440 sixty-second estimates was therefore *honest*
+(`__maintenance_stale_estimate_v2` had already run); the defect was summing
+1,440 reads of the same 35 files.
+
+`MaintenanceTask.input: Option<InputFootprint>` carries `{fp, whole_file_bytes}`
+— an order-independent hash of the selected file paths, and their unprorated
+decoded cost. `coarsen_to_width` prices a bucket as the sum over **distinct**
+`fp`. Members with no footprint keep the old summed price, so this can only
+lower an estimate, never raise one; partial overlap counts twice, which refuses
+a fusion that would have fit — the safe direction, and the existing behaviour.
+
+Both preflights record the footprint on **every** claim, not only when they
+split. That is load-bearing: the split that shredded prod was not the byte one.
+A unit that fits its estimate and then times out is bisected by
+`abandon_running`, which knows only a key — so without a footprint already on
+the parent, the bisect ladder mints footprint-less children and is one-way
+again. The stored widths confirm the ladder rather than a single planner
+decision: 600 s ×3,118, 3,600 s ×2,638, 60 s ×2,088, 360 s ×2,016, 300 s ×1,679.
+
+**The legacy queue needs a migration, because its units predate the field.**
+`__maintenance_coarse_backfill_v2` re-runs the one-shot that drops non-Complete
+sealed sub-day units for the coarse-planned operations; the planner re-derives
+what coverage actually lacks, and the split that follows now stamps its children.
+Measured against the real prod journal (95,655 tasks, 2026-08-23):
+
+| | before | after |
+|---|---|---|
+| live non-Complete units | 22,040 | 2,954 |
+| of which the migration drops | — | 19,086 |
+| real cells behind them | 760 | 760 |
+| inflation | **25.1x** | 1x |
+
+**What was previously ignored now passes.**
+`a_day_shredded_to_the_minute_floor_collapses` was `#[ignore]`d as a documented
+live defect. It now splits a day to the floor through the real path, asserts
+every child inherits the footprint, and asserts one coarsen pass collapses
+1,440 units to ≤24. Its doc comment's "stale estimates" diagnosis is corrected
+in place — that reading was wrong, and it was the reasoning that sent the
+previous fix at the wrong mechanism.
+
+`fusion_charges_a_shared_file_set_once_and_disjoint_sets_twice` pins both
+directions, including that footprint equality is order-independent (a snapshot
+lists files in no fixed order).

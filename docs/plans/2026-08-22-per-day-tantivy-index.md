@@ -1039,3 +1039,47 @@ from rates (three rate-inferences retracted today). Take ~20 files newly
 uncovered in `older` this hour and read from the Delta commit info which
 operation added each — OPTIMIZE, dedup, wave, or flush. That is a direct
 attribution the census series structurally cannot give.
+
+### 15:20 — direct attribution: sealed files are not being CREATED, coverage is being LOST
+
+Per the advisor, stopped inferring the producer from rates and read the Delta
+commit log directly (prod creds from `.env.prod`, read-only). 244 commits,
+spanning **165 minutes**, on `timefusion/otel_logs_and_spans`:
+
+| operation | commits | files added to SEALED (`date != today`) partitions |
+|---|---|---|
+| WRITE | 134 | **4** (of 735 adds) |
+| OPTIMIZE | 110 | **13** (of 110 adds) |
+
+**17 files in 2.75 hours — about 6/hr.** Over the same period `older` grew from
+3742 to 3863, roughly **+290 files/2.75h**. The producer of sealed uncovered
+files is therefore *not* file creation, by a factor of ~20-50x. It cannot be:
+the commits are the complete record of what enters the table.
+
+Two loopholes checked and closed before believing it:
+- The census also walks custom project tables. `s3://…/timefusion/projects/` is
+  **empty** — the unified table is the whole population, so the scan is complete.
+- The census buckets by **partition date, not mtime** (`mod.rs:3371`, and the
+  comment says why: "a compaction rewrite of old data must count as OLD, or every
+  rewrite would masquerade as fresh accrual"). So a rewrite of old data lands in
+  `older` by design — but it still has to be an *add*, and there are only 17.
+
+**So `older` climbs because live files that WERE covered stop being covered.**
+That is a different defect class from everything chased today: not throughput,
+not scheduling, not build cost, not accrual — *coverage destruction*. It also
+explains why the drain looks hopeless at ~7/hr: the backfill is refilling a
+bucket with a hole in it.
+
+Candidate mechanisms, none yet tested, in rough order of suspicion:
+1. **Manifest edits not persisting.** Carry-forward and build results mutate the
+   manifest in memory and rely on a flush; prod restarts every ~15 min. Anything
+   unflushed at exit reverts, and the files it covered become uncovered again.
+   This would also make the 12/12 `carried=1 rebuilding=0` readingtrue *and*
+   worthless — carrying perfectly into memory that is then discarded.
+2. `gc_after_compaction` pruning survivors too aggressively.
+3. Entries invalidated by `schema_version` mismatch or `ordinals_valid = false`
+   being treated as uncovered.
+
+**Discriminating check, next:** read the manifest objects on S3 and compare their
+last-modified times against the restart history. A manifest whose persisted state
+predates the coverage it should contain settles #1 immediately.

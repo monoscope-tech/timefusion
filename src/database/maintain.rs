@@ -2792,7 +2792,10 @@ impl Database {
             // fires it, and is still bounded by those files rather than the day.
             let slices = crate::rollup::uncovered_gaps(untagged, tagged).tap_mut(|gaps| {
                 if gaps.is_empty() {
-                    gaps.extend_from_slice(untagged);
+                    // Merged for the same reason `uncovered_gaps` merges: one
+                    // span per untagged file is one unit per file, and files in
+                    // a partition overlap.
+                    *gaps = crate::write::mem_buffer::merge_ranges(untagged.clone());
                 }
             });
             for (start, end) in slices {
