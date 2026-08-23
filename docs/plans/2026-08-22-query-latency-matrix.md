@@ -852,3 +852,22 @@ narrower than `MIN_SLICE_MICROS`.
 figures are the old ones — `over_budget 456,374` against `fused 69`. That is the
 design, not a disappointment: footprint-less units price exactly as before, so
 **the migration, not the pricing rule, is what clears the legacy queue.**
+
+### Prod after the deploy: the migration removed nothing, and that is the finding
+
+Image `1608958` carries the fix. The v2 migration ran at the first boot that had
+it (16:50 UTC — `maintenance_runtime_started` proves the block executed) and
+logged **no** `maintenance_coarse_backfill_migrated` line, which is emitted only
+when it removed something. Live `tasks_pending` was already 5,294.
+
+So the 22,040 → 2,954 table above is arithmetic on a **stale journal snapshot**:
+by deploy time the live queue no longer held those 19,086 sealed sub-day units.
+The prediction was sound and the input was old. Do not quote it as an outcome.
+
+Worse, there was no instrument for the pricing rule itself — `record_input` has
+no counter, and the coarsen line reported only the summed verdict, so the first
+prod read could not distinguish "working" from "no unit carries a footprint
+yet". `955f05f` adds `priced_by_footprint` (buckets that fit ONLY because a
+shared file set was charged once; zero means the rule changes nothing) and
+`input_fp` on `maintenance_task_started`. Those two are the pass condition —
+read them before claiming Fix B moved anything.
