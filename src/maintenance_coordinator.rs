@@ -118,6 +118,8 @@ pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
+/// File-count band for hygiene benefit ranking — see `scheduling_class`.
+const BENEFIT_BUCKET_FILES: u32 = 64;
 pub const TAG_SOURCE: &str = "timefusion.source";
 pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
@@ -2593,7 +2595,14 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         // compliant and is retired, so the queue drains toward the small cells
         // by itself.
         let benefit = match task.key.operation {
-            Operation::SealedConsolidation | Operation::HotPacking | Operation::Repair => -i64::from(task.input.map_or(0, |input| input.files)),
+            // BUCKETED, for the same reason recency is. `claim_next` matches the
+            // winning tuple EXACTLY, so a raw file count makes one cell the sole
+            // winner of every claim and defeats the per-project rotation
+            // `fair_cursors` exists for. A band of 64 lets comparable cells tie
+            // and rotate while a 200-file cell still outranks a 3-file one.
+            Operation::SealedConsolidation | Operation::HotPacking | Operation::Repair => {
+                -i64::from(task.input.map_or(0, |input| input.files) / BENEFIT_BUCKET_FILES)
+            }
             _ => 0,
         };
         (1, starved, -task.key.slice.width(), benefit, if starved == 0 { recency } else { -recency })
