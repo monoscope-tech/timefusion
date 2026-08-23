@@ -46,3 +46,35 @@ witness described above: the 1h tier records its witness against its PARENT tier
 while the read path verifies against the raw source. Until that is fixed the
 coarsest tier — the one the widest windows select — cannot verify, so 14d/30d
 cannot route however complete coverage becomes.
+
+## The witness fix, verified in prod (`45b9ab4`, coverage 30)
+
+The three-site bound mismatch is fixed and `stale_coverage` is **gone**, measured
+on a build carrying it with `rollup_min_contiguous_days = 30`:
+
+```
+rollup_miss_stale_coverage_total   0        (across 9 probe queries)
+rollup_stale_no_source_rows        0
+rollup_stale_moved                 0
+rollup_hits_hybrid_total           0 -> 1   (a query routed)
+rollup_miss_not_built_total        113 -> 120
+```
+
+Every remaining miss is `not_built`. That is the honest end state for this tier
+of work: the routing RULES no longer refuse these queries — the null guard
+(master's `91030f9`) cleared `filter_not_eligible`, and the bound fix cleared
+`stale_coverage` — so what is left is the tier genuinely not being built for
+those partitions. That is drain throughput, which is rebuild-class and was
+excluded from this goal by construction.
+
+monoscope's p95 chart, spelled exactly as it ships it, now declines `not_built`
+where it declined `filter_not_eligible` before, and returns in 5.3 s against
+17.3 s earlier in the session.
+
+**The pass condition is still not met** and cannot be met by code alone: 14d/30d
+completing for all six projects needs the tier BUILT for those days. Two
+independent constraints stand in the way and both are outside this tier —
+build throughput (~4 builds/hr by the concurrent session's own measurement), and
+a prod that is quiet long enough to measure, which the deploy train has not
+provided: coverage takes ~25 min to rebuild and prod restarted roughly every
+15-25 min throughout this session.
