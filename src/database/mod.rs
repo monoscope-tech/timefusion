@@ -2518,9 +2518,17 @@ fn fair_tantivy_backfill_work_split(
     let per_tail = head.len().div_ceil(tail.len().max(1)).max(1);
     let mut out = Vec::with_capacity(head.len() + tail.len());
     let reserved: HashSet<String> = tail.iter().map(|(_, _, uri)| uri.clone()).collect();
+    // TAIL FIRST in each group, not after it. Interleaving alone was not enough:
+    // at cap 8 / 33% the order was h,h,h,t,… so the first reserved build was
+    // FOURTH, and prod passes are killed after 2-3 builds. Measured 2026-08-23 —
+    // six attributed builds across three passes, every one `from_reserved_tail
+    // =false`. The reservation had never executed in production, which is
+    // exactly the starvation it exists to prevent, now one level deeper again.
+    // Leading with it costs the head nothing that matters: today is excluded by
+    // `skip_today`, so BOTH sides are backlog and neither is latency-critical.
     while !head.is_empty() || !tail.is_empty() {
-        out.extend((0..per_tail).filter_map(|_| head.pop_front()));
         out.extend(tail.pop_front());
+        out.extend((0..per_tail).filter_map(|_| head.pop_front()));
     }
     (out, reserved)
 }
@@ -12198,7 +12206,9 @@ mod tests {
         // Measured in prod 2026-08-22 — 33 min into a live pass, `older` had not
         // moved because the run was still on the newest files.
         let oldest_at = split.iter().position(|u| u == "uri/2026-01-01").expect("present");
-        assert!(oldest_at < split.len() / 2, "the reserved tail must be interleaved, not appended — it was at {oldest_at} of {}", split.len());
+        // Not merely "interleaved": prod kills a pass after 2-3 builds, so a
+        // reservation that first appears 4th never runs at all.
+        assert_eq!(oldest_at, 0, "the reserved tail must be served FIRST, or a killed pass never reaches it; it was at {oldest_at} of {}", split.len());
         // The reserved set is what lets a build line say which side it served.
         assert!(reserved.contains("uri/2026-01-01"), "the oldest file must be reported as coming from the reservation, got {reserved:?}");
         assert!(!reserved.contains("uri/2026-08-22-00"), "the hot-window head must not be labelled as reserved");

@@ -714,3 +714,46 @@ Downward, but ~-4 in 2.5 hours, which is months. Expect that to change once the
 timer flush is live, because until now the expensive builds were being redone;
 if it does NOT change, the drain rate is genuinely the problem and the whale
 handling (`max_file_mb`, or sharding the unit) is next.
+
+### 13:10 — the reservation had never once executed, and `older` is GROWING
+
+**Two findings, both from the `from_reserved_tail` attribution and the census.**
+
+**1. The reservation never ran.** Six attributed builds across three passes
+(12:30, 12:45, 13:00) were `from_reserved_tail=false` — every single one. The
+cause is arithmetic in my own fix: the interleave emitted `per_tail` head items
+BEFORE each tail item, so at cap 8 / 33% the order was `h,h,h,t,…` and the first
+reserved build was **fourth**. Prod passes die after 2-3 builds. Fixed by
+emitting the tail item FIRST in each group; the unit test now asserts position
+0, not merely "not last".
+
+This is the third time this defect has reappeared one level deeper: newest-first
+starved the tail; the reservation was appended, so truncation dropped it;
+interleaving put it fourth, so a killed pass never reached it. **The lesson is
+not about ordering — it is that on a box where work is routinely interrupted,
+"eventually" is indistinguishable from "never", and every scheduling decision
+has to be judged at the point of interruption rather than over a whole pass.**
+
+**2. The old backlog is not static — it is growing.** `older` across today:
+
+| time | older |
+|---|---|
+| 09:06 | 3621 |
+| 12:01 | 3627 |
+| 12:54 | 3650 |
+| 13:08 | 3663 |
+
++36 in the last hour (~70/hr) while `week` sat flat at ~2036, so these are not
+files ageing in — they are NEW uncovered files appearing in old partitions,
+i.e. sealed-day rewrites (the dedup cron and coordinator waves). **This
+contradicts "the 3460-file old backlog is static", which I have been asserting
+all day and which is written into the memory notes.** A 195 MB wave-reindex
+build at 12:57 with no accompanying `tantivy_backfill_unit` line is one of them
+being rebuilt from scratch.
+
+Consequence: the drain is not racing a fixed 5,600-file backlog, it is racing a
+backlog that grows ~70/hr in its oldest bucket. Carry-forward is the right
+mechanism for exactly this churn, but it is wired only into `optimize_table` —
+the wave path still pays a full rebuild per output. **Wiring carry-forward into
+`reindex_wave_outputs` is now the highest-value remaining change**, ahead of
+`max_file_mb` and ahead of the per-day index.
