@@ -917,3 +917,40 @@ number taken inside a 15-minute window means anything. The correct next action
 is therefore restraint: **stop deploying, hold ~1h quiet, then measure.** No
 further code changes until a census series exists from a single process older
 than the work it is measuring.
+
+### 14:38 — a correction to the correction, and why the quiet hold is unenforceable
+
+Two things the previous entry got wrong in the other direction.
+
+**1. `older` is a level, not a process counter.** It is a census of files in
+storage, so its *value* is valid the instant it is read, restart or no. Process
+age affects only the *rate*, and it does so in one direction: a restarting
+process stops running maintenance waves, so it stops producing uncovered files.
+**Restarts can only make accrual look better than it is.** The observed
+~124-173/hr is therefore a lower bound, not a number needing an asterisk. The
+gap against a ~30/hr drain is real and larger than measured.
+
+That does not rescue the carry-forward claim — a lower bound of ~124/hr still
+sits on top of the ~128/hr it was supposed to have removed.
+
+**2. The hold cannot be held.** Prod restarted again at ~14:33 onto `f25d3e4`,
+which is not the SHA I pushed. Deploys are arriving from outside this session,
+so "stop deploying and wait an hour" is not mine to enforce; waiting would just
+burn the hour and produce the same fragmented series.
+
+| time | older | span |
+|---|---|---|
+| 13:59 | 3742 | — |
+| 14:14 | 3749 | +7 |
+| 14:29 | 3780 | +31 |
+| 14:38 | 3806 | +26 |
+
+Net **+64 in 39 minutes** across two process generations. Accrual is unambiguous
+and ongoing.
+
+**So the plan changes rather than waits.** The measurement that matters no longer
+needs a quiet process: it needs the refusal split from `4a8a154`, which is a
+per-event ratio (`carried` vs `rebuilding` within a single wave) and is immune to
+both restarts and warm-up. That is the one number that says whether carry-forward
+is refusing most of its inputs. It is committed but unpushed, and pushing it is
+itself a restart — which, per point 1, costs nothing I care about.
