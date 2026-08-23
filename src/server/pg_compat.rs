@@ -1197,6 +1197,11 @@ impl StatsTableProvider {
                     "tantivy_live_files_total" => cv(TANTIVY_LIVE_FILES),
                     "tantivy_raw_files_total" => cv(TANTIVY_RAW_FILES),
                     "tantivy_backfill_built" => cv(TANTIVY_BACKFILL_BUILT),
+                    // Read against `tantivy_backfill_built`: the ratio is how much
+                    // rewrite churn stopped costing a build. A counter that is
+                    // incremented but never surfaced cannot be used to judge the
+                    // change it exists to judge.
+                    "tantivy_carried_forward" => cv(TANTIVY_CARRIED_FORWARD),
                     // built / commits is the manifest-write amortisation the
                     // batching bought; before it the ratio was 1.
                     // Splits tantivy_scan_us into its three steps, so the next
