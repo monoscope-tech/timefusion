@@ -5625,9 +5625,24 @@ impl Database {
     /// Wait until preload has published all discoverable table handles. The
     /// atomic closes the `Notify` check/subscribe race and also makes late
     /// subscribers return immediately.
+    /// Wait for the boot preload, but never forever — see
+    /// `timefusion_coordinator_preload_wait_secs` for the prod measurement that
+    /// made this bounded. `false` means "give up on this worker" and is
+    /// returned ONLY for cancellation; a preload that is merely slow returns
+    /// `true` so maintenance proceeds.
     async fn wait_for_preload(&self, cancel: &CancellationToken) -> bool {
+        let budget = self.config.maintenance.timefusion_coordinator_preload_wait_secs;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(budget);
         loop {
             if self.preload_complete.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+            if budget == 0 || tokio::time::Instant::now() >= deadline {
+                warn!(
+                    event = "maintenance_coordinator_preload_wait_expired",
+                    waited_secs = budget,
+                    "starting maintenance before the cache preload finished; it would otherwise never start on this container"
+                );
                 return true;
             }
             let notified = self.preload_complete_notify.notified();
@@ -5637,6 +5652,7 @@ impl Database {
             tokio::select! {
                 _ = cancel.cancelled() => return false,
                 _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
             }
         }
     }
@@ -11827,6 +11843,44 @@ mod tests {
         ] {
             assert!(!mutable.contains(column), "{column} is immutable and its filter must be pushable below the dedup");
         }
+    }
+
+    /// Maintenance must not be hostage to the boot cache preload.
+    ///
+    /// `preload_complete` is set ONLY when the warm finishes every table; it is
+    /// abandoned and left unset if shutdown arrives first. The coordinator, the
+    /// tantivy reconcile and the coverage recovery all gate on it, so a warm
+    /// that never finishes silently disables all three for the life of the
+    /// container.
+    ///
+    /// Prod 2026-08-23, 45 min across two boots: 26
+    /// `bootstrap.phase=table_preload` starts, **zero**
+    /// `table_preload_complete`, `tasks_running` = 0 against 22,218 pending and
+    /// 12,329 ELIGIBLE units, `rollup_rebuilds_*` = 0. With a deploy cadence
+    /// shorter than the warm this is permanent — the warm restarts each boot and
+    /// never reaches the end — and an unbuilt tier is what keeps wide windows
+    /// missing `not_built`.
+    ///
+    /// Time is paused, so this asserts the BOUND rather than sleeping for it.
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_starts_even_if_the_cache_preload_never_completes() -> Result<()> {
+        let mut cfg = (*create_test_config("preload-wait")).clone();
+        cfg.maintenance.timefusion_coordinator_preload_wait_secs = 300;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        // Deliberately never set `preload_complete` — the prod state.
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        assert!(db.wait_for_preload(&cancel).await, "a slow preload must release maintenance, not disable it");
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_secs(300), "it must still yield to the warm for the configured budget, waited {waited:?}");
+        assert!(waited < std::time::Duration::from_secs(360), "and must not wait appreciably longer, waited {waited:?}");
+
+        // Cancellation is the ONLY reason to abandon a worker.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let db2 = Database::with_config(create_test_config("preload-cancel")).await?;
+        assert!(!db2.wait_for_preload(&cancel).await, "a cancelled worker must still stop");
+        Ok(())
     }
 
     /// An untagged tier file must not be immortal.
