@@ -42,6 +42,26 @@ was just built from; whether it lands before or after the build is a scheduling
 detail, which is precisely why the tests flip between runs rather than failing
 deterministically.
 
+## What is NOT wrong, checked before claiming it
+
+A dedup rewrite does not leave the rollup silently dark forever.
+`invalidate_rollup` marks `rollup_dirty`, bumps `rollup_source_epochs` and drops
+the date-level coverage entry, and the planner re-enqueues from that mask every
+tick. So prod converges.
+
+That is also why draining maintenance twice does **not** fix the tests: a second
+`run_maintenance_units` only drains units that already exist, and nothing runs a
+planner tick between the two calls, so the invalidated rollup is never re-planned
+inside the test. The gap is in the harness, not in the coordinator — worth
+stating, because "nothing re-queues it" was the obvious next claim and it is
+false.
+
+What remains true, and is the actual cost: a rewrite that preserves the logical
+row set still bumps the epoch and marks the partition dirty, so a rollup that was
+**already correct** is torn down and rebuilt. That is wasted rebuild work against
+a queue already ~12,000 units deep at ~16 builds/hr — not a wrong answer, but
+directly in the way of the thing everything else is waiting on.
+
 ## Why this matters beyond the tests
 
 Prod's `stale_coverage` splits into `rollup_stale_no_witness` (~80%, the slices
