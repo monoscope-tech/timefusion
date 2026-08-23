@@ -1753,3 +1753,39 @@ the indexed set is larger than the five I counted twice today. It changes nothin
 quantitative here (they have no work), but "I have finally enumerated the
 population" has now been wrong three times, and it is worth writing down that I
 should stop asserting it.
+
+## 22:35 — the decline did not hold. Refuted by the check I registered.
+
+| time | uncovered | today | week | older |
+|---|---|---|---|---|
+| 19:24 (pre-budget) | 6773 | 686 | 2026 | 4061 |
+| 20:02 | **6294** | 714 | 1832 | 3748 |
+| 20:16 | 6383 | 778 | 1833 | 3772 |
+| 20:31 | **7024** | **1208** | 1854 | 3962 |
+
+`uncovered` is now *higher* than before the change. So **"coverage fell for the
+first time today" is withdrawn** — it was one favourable interval, which is
+precisely what the provisional caveat was for. Registering the check is the only
+reason this took thirty minutes to catch instead of becoming tomorrow's premise.
+
+Reading it properly, though, the picture is not simply "no better":
+
+- **The rise is dominated by `today`**: 714 → 778 → **1208**, +494 in thirty
+  minutes, against `older` +214. Evening traffic and today's compaction churn.
+- **`skip_today` is on, so the backfill deliberately does not touch those
+  files.** Today's growth is therefore expected-by-design, not a failure of the
+  budget — but it means `uncovered` as a headline number cannot measure this
+  change at all. The metric that can is `week + older`.
+- On that metric: 6087 → 5580 → 5605 → **5816**. Net **-271** against the
+  pre-budget baseline, but rising across the last two intervals.
+
+So: not a win, not a refutation of the byte budget either — genuinely
+insufficient evidence, across a window containing **two restarts**.
+
+**And a structural consequence worth naming before it surprises someone:**
+`today` is ~1,208 uncovered files that `skip_today` defers by design. At UTC
+midnight that partition ages into `week` wholesale, so the sealed backlog takes a
+~1,200-file step change in one census interval. That is not accrual and must not
+be read as a regression when it appears — it is deferred work arriving on
+schedule, and it is the strongest argument yet that `skip_today` deserves
+revisiting for tables whose writes land in today's partition continuously.
