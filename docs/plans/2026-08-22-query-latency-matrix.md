@@ -1143,3 +1143,55 @@ maintenance capacity spent on work that has nothing to do. The silent
 empty-completion branch is already being instrumented in the compaction planner
 (`ae33420`); this is the same shape in the rollup planner and the two should be
 fixed together.
+
+## TOP OPEN ITEM: the 1h tier stopped ingesting at 20:17 and burns ~95% of maintenance
+
+Found while checking the level tier. Six minutes of prod on `fd3883c`:
+
+```
+maintenance_task_started      209
+maintenance_coordinator_error 198     <- 95% of claims
+maintenance_rollup_published    9
+```
+
+The error, on every one:
+
+```
+Schema error: No field named duration_digest. Valid fields are
+  __maintenance_slice_raw.{project_id, timestamp, date, id, …,
+  server_duration_count, server_duration_min, server_duration_max,
+  server_error_scope_count, server_error_count, server_duration_digest}
+```
+
+That valid-fields list is `dashboard_1m_v3`'s and it has `server_duration_digest`
+but **not** `duration_digest`. The live table does have the column —
+`information_schema` confirms both digests — so the scan is not seeing the table
+schema. It is seeing the schema of the base **files it selected**, and
+`duration_digest` was added to the v3 spec on 2026-08-22, so every 1m file
+written before that lacks the column. A derived unit over an older day therefore
+fails, retries, and fails again.
+
+Consequences, all consistent with what the tiers show:
+
+- `dashboard_1h_v2`'s last Delta commit is **20:17:30** — it has not ingested
+  since. Its `contiguous_days=30` is history, and it will erode from the newest
+  end as days age in.
+- `1h_v2` took **1,364 of ~1,530 claims in 12 minutes** — the retry loop, not
+  useful work.
+- `dashboard_level_1m_v1` got **zero** claims in that window and is stuck at
+  `contiguous_days=1`: the retry loop is crowding out every other tier,
+  including the one that needs to build.
+
+**Not caused by the level tiers** — the failing measure is v3's and predates them
+by a day. But it is why nothing else can make progress right now.
+
+**Fix direction, deliberately not attempted here:** the derived build must
+tolerate a measure that is absent from older base files (project it as NULL, or
+exclude those files from the slice) rather than failing the whole unit. Adding a
+measure to a spec bumps `generation_id`, so files from before the bump are a
+different generation — which suggests the cleaner rule is that a derived unit
+must only read base files of the generation it is deriving, and the selection is
+not currently enforcing that.
+
+This needs a reproducing test before a fix. Shipping a guess into this path is
+exactly what produced tonight's level-tier regression.
