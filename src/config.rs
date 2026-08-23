@@ -2429,21 +2429,6 @@ pub struct MemoryConfig {
     /// became unreachable, so every other tenant paid for one query. Refusing it instead
     /// costs one client an error naming the limit and what to do about it.
     ///
-    /// **16 GiB, chosen from the distribution rather than guessed.** It shipped as 0
-    /// precisely so the threshold could be measured first; after a day of prod traffic
-    /// `wide_scan_selected_mb_p99` read **3,506 MB**, so 16,384 is 4.7x the 99th
-    /// percentile of gated scans and roughly half the 32.8 GB scan that took the box
-    /// down. Nothing a dashboard does reaches it.
-    ///
-    /// Re-read `wide_scan_selected_mb_p99` before changing this — a workload shift
-    /// moves the percentile, and a threshold below it rejects working dashboards.
-    /// **That reading is PROCESS-SCOPED**: measured across one boot it went 0 at 11
-    /// minutes, 1,057 at an hour and 3,506 at seven hours, because the wide scans
-    /// that populate it are rare. Sizing from a young process would set the
-    /// threshold far too low. Read it off an instance with hours of uptime.
-    /// `TIMEFUSION_WIDE_SCAN_REFUSE_MB=0` is the kill switch back to admit-everything.
-    #[serde_inline_default(16384)]
-    pub timefusion_wide_scan_refuse_mb: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
     /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
     /// set with room to spare. Each entry is one LogicalPlan (~KBs).
