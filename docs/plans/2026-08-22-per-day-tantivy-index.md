@@ -954,3 +954,43 @@ per-event ratio (`carried` vs `rebuilding` within a single wave) and is immune t
 both restarts and warm-up. That is the one number that says whether carry-forward
 is refusing most of its inputs. It is committed but unpushed, and pushing it is
 itself a restart — which, per point 1, costs nothing I care about.
+
+### 14:55 — the un-gated log IS live, and it exonerates the wave path
+
+First, a false alarm of my own making: `git merge-base --is-ancestor 4a8a154
+f25d3e4` said NO and I briefly concluded the fix had been dropped. It had not —
+the rebase before pushing rewrote it as **`c990009`**, which *is* an ancestor,
+and `git show origin/master:src/database/maintain.rs` has the un-gated form at
+line 5521. Checking a pre-rebase SHA for ancestry is meaningless; check the
+content.
+
+So this is a real measurement, not the artifact:
+
+| window | wave events | carried | rebuilding |
+|---|---|---|---|
+| 14:38-14:53 (process `yrod6lnw`, un-gated) | 12 | 1 each | **0 each** |
+
+With the guard removed, every wave still carries and none rebuilds. **The wave
+path is not the accrual producer.** The carry-forward wiring works; it simply
+was never where the ~124/hr was coming from. That also means the earlier
+retraction was right for the wrong reason — carry-forward did not fail, it was
+aimed at the wrong producer.
+
+**And the drain figure I have quoted all day is wrong by ~7x.** 62
+`tantivy_index_built` events in 18 minutes = **~207/hr**, not the ~30/hr I have
+been repeating (a sibling separately retracted a related drain figure in
+`b91ae6d`, ~90/hr -> ~490/hr past cache warm). So the system builds indexes far
+faster than uncovered files accrue — and `uncovered` still climbed 6297 -> 6360
+across the same window.
+
+That is the contradiction worth chasing next, and it reframes the whole day:
+**this was never a throughput problem.** Builds outpace accrual roughly 2:1 and
+coverage still falls behind, which means built indexes are not sticking —
+discarded before the manifest persists, or invalidated immediately after. The
+whale timer-flush symptom (a 759,809-row file built, lost, rebuilt, lost) is the
+same shape and is probably the general case rather than a whale-specific one.
+
+Open question, not a claim: are those 62 builds 62 distinct files, or a few
+files rebuilt repeatedly? The `tantivy_index_built` line does not carry the
+file path in a form my grep found, so this needs the field checked in code
+before the next read.
