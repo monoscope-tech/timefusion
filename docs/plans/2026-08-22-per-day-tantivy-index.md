@@ -1122,3 +1122,46 @@ not see, and the error is in my attribution rather than in the system.
 
 Either outcome eliminates a branch. That is the next read — no deploy, no quiet
 window, no code change.
+
+## 15:45 — THE CENSUS COUNTS MORE UNCOVERED FILES THAN THE TABLE HAS FILES
+
+The premise that was wrong is the measurement itself.
+
+```
+_last_checkpoint (v498863):  {"numOfAddFiles": 4490}
+census @15:20:               uncovered=6441  (today=519 week=2031 older=3891)
+manifests @15:20:            covered_files=2850 distinct
+```
+
+**Uncovered alone (6,441) exceeds the total number of live files in the table
+(4,490).** No ratio argument is needed — a subset cannot be larger than the set.
+Adding coverage makes it worse: 6441 + 2850 = 9,291 files enumerated against
+4,490 that exist, a factor of **2.07**.
+
+This is the doubling defect already on record as
+`tf_incremental_snapshot_checkpoint_dup_2026-08-02` — the incremental Delta
+snapshot duplicating its file list at checkpoint boundaries. The census walks
+that snapshot, so it inherits it.
+
+**It explains every stubborn observation of the day, including the ones I
+misread:**
+
+- Growth tracks **process age** (0 -> 28 -> 124/hr after each restart). That was
+  never waves spinning up, and never carry-forward working then failing — it is
+  the duplicate list re-accumulating as the process crosses checkpoints.
+- `older` grows ~130/hr while the Delta log adds **28 sealed files in 6.1 hours**
+  (~4.6/hr, max 2 per commit, not bursty — checked precisely because "bursty
+  adds" was the last innocent explanation standing).
+- Coverage is not being destroyed in sealed partitions: the manifest diff lost
+  120 files, **118 of them in today's partition**, 2 sealed.
+- The drain could never converge on a backlog roughly half of which is not real.
+
+**Everything today that was measured in units of "uncovered files" is suspect** —
+the ~7/hr drain, the ~100/hr accrual, the 6,400 backlog, and the census-based
+verdict on carry-forward. The mechanism-level readings survive (waves do carry;
+manifests do persist; 121/121 builds are the flush path), because those come from
+event logs rather than from the snapshot.
+
+**Next is not a tantivy change.** It is to confirm the doubling at its source and
+fix the snapshot, then re-run the census and see what the real backlog is. There
+may not be one worth a per-day index at all.
