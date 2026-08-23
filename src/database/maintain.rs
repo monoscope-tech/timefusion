@@ -1319,7 +1319,7 @@ impl Database {
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
-        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity) = {
+        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_fp) = {
             let table = from_table.read().await;
             let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
             let date_string = date.to_string();
@@ -1338,11 +1338,7 @@ impl Database {
                 stats.remove(&(key.project_id.clone(), date_string.clone())).or_else(|| stats.remove(&("default".to_string(), date_string.clone())))
             });
             let source_rows = partition_stats.map(|stats| stats.rows);
-            // `(fingerprint, min_ts)`: the identity the date-level read path
-            // compares, plus the earliest row the partition actually holds —
-            // which is what decides whether this slice may claim the day's
-            // opening hours (see the publish site).
-            let partition_identity = partition_stats.map(|stats| (stats.fingerprint, stats.min_ts));
+            let partition_fp = partition_stats.map(|stats| stats.fingerprint);
             let partition_paths = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string);
             let mut selected = Vec::new();
             let mut estimated = 0u64;
@@ -1444,7 +1440,7 @@ impl Database {
                 estimated = estimated.saturating_add(projected.saturating_mul(share).div_ceil(whole.max(1)));
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity)
+            (snapshot, table.log_store(), selected, estimated, source_rows, partition_fp)
         };
         if untagged_inputs > 0 {
             crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
@@ -1873,22 +1869,17 @@ impl Database {
             // `rollup_hits_* = 0`; this route does not consult the witness at
             // all, it compares the whole-partition fingerprint instead.
             //
-            // Gated on the partition's EARLIEST ROW, not on the slice starting at
-            // midnight. The read path serves `[day_start, covered_through)` from
-            // this entry, so a slice beginning mid-day would claim a morning it
-            // never aggregated — the silent-wrong-number failure. But units are
-            // planned from row statistics, so their slices begin at the first row
-            // rather than at 00:00, and a midnight test would simply never fire
-            // (it did not: the regression test still failed with it).
-            //
-            // `partition_min_ts >= slice.start` is the honest form of the same
-            // guarantee: if the partition holds no row before this slice, then
-            // `[day_start, slice.start)` is empty and serving it from the rollup
-            // returns exactly what a raw scan would — nothing. `min_ts` comes
-            // from the same `partition_stats_bounded` call as the fingerprint, so
-            // it describes the snapshot this build actually read.
-            if let Some((partition_fp, partition_min_ts)) = partition_identity
-                && partition_min_ts >= key.slice.start_micros
+            // Only when the slice reaches back to the start of the day. The read
+            // path serves `[day_start, covered_through)` from this entry, so a
+            // slice that begins mid-day would claim a morning it never
+            // aggregated — the silent-wrong-number failure. A later slice ending
+            // further into the day simply replaces this one, since
+            // `covered_through` grows monotonically for a fixed fingerprint.
+            // `date_start_micros` on purpose, not a local conversion: the read
+            // path derives `day_start` with that exact function, and this bound
+            // is the whole soundness argument.
+            if let Some(partition_fp) = partition_fp
+                && date_start_micros(&date.to_string()).is_some_and(|day_start| key.slice.start_micros <= day_start)
             {
                 self.rollup_coverage.insert(
                     (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), date.to_string()),
