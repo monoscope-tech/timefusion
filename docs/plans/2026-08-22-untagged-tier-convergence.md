@@ -260,6 +260,37 @@ arrives and does it again. Each cycle spends a multi-hour rebuild on a
 ten-minute invalidation. It is correct (the escalation exists to prevent a double
 count) but it is a treadmill, and it is where sealed-tier capacity is going.
 
+## Open, and deliberately not guessed at again: four cells that never get a unit
+
+85 → 23. Nineteen of the twenty-three are grinding down normally (total uncovered
+time fell 10,096 → 10,052 minutes in one hour, ~44 min/hour, so the tail is days
+not hours). **Four are not**: `dcad860a` 08-13/08-14/08-15 and `87576849` 08-12,
+holes of 5, 3, 11 and 6 minutes, untouched all day.
+
+What is established:
+
+- Recovery RUNS and queues — `rollup_tier_untagged_rebuild_queued` fires, and the
+  gauge reads 23, matching the log replay exactly.
+- No unit covering those holes exists in the journal SNAPSHOT **or** the WAL, and
+  together those are the complete state — so they are not enqueued, not merely
+  unclaimed. No such slice has been `maintenance_task_started` in 90 minutes.
+- Recovery enqueues for OTHER damaged cells in the same projects — `dcad860a`
+  08-13 has 66 WAL records, `87576849` 07-24 has 33 — so it is per-cell, not a
+  dead pass.
+- Three hypotheses REFUTED by measurement: the files' `partitionValues` and path
+  shape are identical to cells that do enqueue; their statistics all carry a
+  `timestamp` (so the no-stats caveat below does not apply); and both coarsening
+  deletion paths are now exempt, so they are not being deleted after enqueue.
+
+Candidates left, needing a local repro rather than more prod archaeology: the
+covering-slice substitution redirecting a gap onto a range that already exists
+(making `enqueue` a no-op against a Complete key), or `enqueue` returning early on
+a Superseded ancestor that still has a live descendant elsewhere in the day.
+
+This is 4 files of ~8,000 live — worth understanding, not worth a fourth
+speculative ordering change. Two of my three ordering changes today were wrong in
+the same way, and the tell each time was a population that would not move.
+
 ## Explicitly rejected
 
 - **Journal-derived `covered`.** The journal knows which slices were built, but a
