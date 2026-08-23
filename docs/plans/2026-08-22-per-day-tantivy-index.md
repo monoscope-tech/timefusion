@@ -1083,3 +1083,42 @@ Candidate mechanisms, none yet tested, in rough order of suspicion:
 **Discriminating check, next:** read the manifest objects on S3 and compare their
 last-modified times against the restart history. A manifest whose persisted state
 predates the coverage it should contain settles #1 immediately.
+
+### 15:35 — candidate #1 and #3 both fail; a baseline is set for the real test
+
+**#1 (manifests not persisting) is refused.** `index_manifests/otel_logs_and_spans/`
+holds 22 manifests and the newest were written **this minute** (17:09 server
+time, contemporaneous with the census). Persistence is live and continuous, so
+"carry-forward mutates memory that a restart discards" does not hold.
+
+**#3 (entries invalidated) is refused.** Parsed all 22 manifests:
+
+```
+entries=3113  usable=3112  covered_files=3294
+no_index=1  error_set=0  schema_version={1: 3112, None: 1}
+```
+
+One unusable entry out of 3,113. Nothing is being invalidated by
+`schema_version` or errors.
+
+I also checked the parser, on the suspicion that an unparseable URI would fall to
+`i64::MAX` and land in `older` regardless of its real age — which would have made
+`older` an artifact and fit the arithmetic almost too well (735 WRITE adds to
+today over the window ≈ 267/hr). It does not: `date_partition_of` reads
+`date=YYYY-MM-DD` and the live paths are exactly
+`project_id=<uuid>/date=2026-08-23/part-….zstd.parquet`. Hypothesis dropped
+before it got written up as a finding.
+
+So the position is an honest negative: sealed uncovered files are **not** created
+(~6/hr vs ~105/hr), **not** losing coverage through invalidation, and the
+manifest **is** being persisted. One of my premises is wrong and I do not yet
+know which.
+
+**Baseline recorded for the discriminating test:** covered_files = **3294** at
+15:35, against uncovered = 6403. If coverage is being destroyed, a second
+snapshot must show that number *fall* while `older` climbs. If it holds steady
+or rises, then the live file set is growing in a way the Delta commit scan did
+not see, and the error is in my attribution rather than in the system.
+
+Either outcome eliminates a branch. That is the next read — no deploy, no quiet
+window, no code change.
