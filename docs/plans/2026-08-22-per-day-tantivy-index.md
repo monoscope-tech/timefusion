@@ -847,3 +847,32 @@ is the next thing to attribute — `tantivy_wave_carried_forward` logs
 `carried`/`rebuilding` per call, so the split is already readable.
 
 `week` also ticked 2035 -> 2033, the first decline of the day in that bucket.
+
+### 14:30 — retraction: `rebuilding=0` was a gated log, and it hid the refusals
+
+The entry above said the residual ~28/hr was "the share of wave/dedup outputs
+that carry-forward legitimately cannot cover", and that the split was "already
+readable" from the `carried`/`rebuilding` fields. Both halves are wrong.
+
+45 minutes of prod logs: 27 `tantivy_wave_carried_forward` lines, **every one of
+them `carried=1 rebuilding=0`**. A mechanism that refuses some share of its
+inputs does not report zero refusals 27 times out of 27. The log site explains it:
+
+```rust
+if !carried.is_empty() { info!(carried = …, rebuilding = files.len(), …) }
+```
+
+When carry-forward refuses *every* bin in a wave, `carried` is empty and the
+event is not emitted at all — so an all-rebuild wave is invisible, and the only
+waves that ever reach the log are ones that carried something. `rebuilding=0` is
+a property of the guard, not of the system. This is the same shape as the
+`rollup_tier_untagged_retired` counter and the `prefilter` LOCAL_REGISTRY read:
+**the fifth measurement this session that failed in the direction of good news.**
+
+Fixed in `4a8a154` — the event now fires whenever there was work
+(`!carried.is_empty() || !files.is_empty()`). Until that is deployed, the honest
+statement is: the wave path carries at ~36/hr, and *how often it refuses is
+unmeasured*. The residual ~28/hr of sealed accrual is therefore unattributed —
+it may be wave refusals, the optimize path (whose carry-forward is gated on
+`sole_commit` and silently declines under concurrent commits), or a third
+producer. No claim either way until the fixed instrument reports.
