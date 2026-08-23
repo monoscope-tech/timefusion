@@ -67,3 +67,31 @@ number that workstream needs — 458 cells behind 11,174 units — rather than a
 competing change to the same planner. The obvious question for whoever takes it:
 why does a sealed, immutable day keep sub-day slices at all, when 670 day-wide
 units in the same queue prove the planner can emit them.
+
+## Measurement trap: the JSON is a CHECKPOINT, not live state
+
+`maintenance_tasks.json` is rewritten only on checkpoint. Caught while reading
+it twice, 30 minutes apart, and getting byte-identical numbers:
+
+```
+maintenance_tasks.json   mtime 09:53:30   46.7 MB
+maintenance_tasks.wal    mtime 13:09:09   57.9 MB   <- the live one
+now                            13:09:09
+```
+
+The checkpoint was **3h15m old**. So:
+
+- The 24.4x inflation above is real, but it is a snapshot **as of 09:53**, not a
+  current reading. Quote it with that timestamp.
+- "The sealed backlog is not draining" does **not** follow from the two identical
+  readings — they were the same file. That claim is withdrawn; it may still be
+  true, but this is not evidence for it.
+
+Live pending counts do exist and should be preferred for trend work:
+`pending_base_rollup`, `pending_dedup`, `pending_derived_rollup` in
+`timefusion_stats` are process-live. Across this session they read 12,663 →
+12,544 → 12,602 → 12,552 — hovering rather than clearly draining, which is a
+weaker statement than the one the stale file appeared to support.
+
+This is the same shape as the session's earlier traps: a number that will not
+move is first a claim about the ruler.
