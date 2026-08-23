@@ -8566,9 +8566,8 @@ impl ProjectRoutingTable {
         // not the query. Admitting it degrades everyone; refusing it costs one client a
         // legible error. Default 0 = disabled, because refusal is client-visible and the
         // threshold has to come from `wide_scan_selected_mb_p*` on a real workload first.
-        if let Some((files, bytes)) = selected
-            && let Some(limit) = wide_scan_refusal_bytes(mem.timefusion_wide_scan_refuse_mb, bytes)
-        {
+        let refusal = selected.and_then(|(files, bytes)| {
+            let limit = wide_scan_refusal_bytes(mem.timefusion_wide_scan_refuse_mb, bytes)?;
             metrics::counter!(scan_metric_names::WIDE_SCAN_REFUSED_TOTAL).increment(1);
             warn!(
                 event = "wide_scan_refused",
@@ -8578,25 +8577,25 @@ impl ProjectRoutingTable {
                 limit_mb = limit / (1 << 20),
                 "wide scan refused: selected more than the refusal threshold"
             );
-            return Err(DataFusionError::ResourcesExhausted(format!(
+            Some(format!(
                 "scan selected {} files / {} MiB, over the {} MiB per-scan limit; narrow the time window or add a more selective filter",
                 files,
                 bytes / (1 << 20),
                 limit / (1 << 20)
-            )));
-        }
-        // Two thresholds over one measure, not two notions of "wide": the gate
-        // bounds decode HEAP and must fire early (hours), while the cache
-        // bypass gives up cache population and must NOT fire on a merely-widish
-        // dashboard that will be re-read — hence its own, higher, knob.
+            ))
+        });
         let bypass_cache = self.database.config.cache.cache_bypass_scan_micros().is_some_and(deeper_than);
-        Ok(Arc::new(GatedScanExec::new(
+        let gated = GatedScanExec::new(
             plan,
             self.database.heavy_scan_sem.clone(),
             Some(self.database.scan_metrics.clone()),
             bypass_cache,
             mem.timefusion_max_concurrent_scan_readers.max(1) as u32 * DECODE_UNITS_PER_READER,
-        )))
+        );
+        Ok(Arc::new(match refusal {
+            Some(refusal) => gated.refusing(refusal),
+            None => gated,
+        }))
     }
 
     /// Lead sort key that makes `DedupExec`'s keep-greatest engage.
@@ -9077,19 +9076,36 @@ struct GatedScanExec {
     /// Size of `sem`'s pool — `scan_pressure_permits` scales its claim off it
     /// (tokio semaphores don't expose their initial size).
     pool_size: u32,
+    /// Set when this scan selected more than the refusal limit. Carried as an
+    /// error to raise at EXECUTE time rather than raised during planning, because
+    /// `gate_if_wide` runs inside `scan()` — refusing there also refuses `EXPLAIN`,
+    /// which removes the one tool that explains why a query was refused. EXPLAIN
+    /// plans but never executes, so it now prints the plan and the operator
+    /// declares the refusal in its own display line.
+    refusal: Option<String>,
 }
 
 impl GatedScanExec {
     fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>, bypass_cache: bool, pool_size: u32) -> Self {
         let properties = input.properties().clone();
-        Self { input, sem, properties, metrics, bypass_cache, pool_size }
+        Self { input, sem, properties, metrics, bypass_cache, pool_size, refusal: None }
+    }
+
+    fn refusing(mut self, refusal: String) -> Self {
+        self.refusal = Some(refusal);
+        self
     }
 }
 
 impl DisplayAs for GatedScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(f, "GatedScanExec: permits={}", self.sem.available_permits()),
+            // The refusal is part of the plan's identity: EXPLAIN is how someone
+            // finds out WHY the query they ran was rejected, so it has to say so.
+            DisplayFormatType::Default | DisplayFormatType::Verbose => match &self.refusal {
+                Some(refusal) => write!(f, "GatedScanExec: REFUSED ({refusal}), permits={}", self.sem.available_permits()),
+                None => write!(f, "GatedScanExec: permits={}", self.sem.available_permits()),
+            },
             _ => write!(f, "GatedScanExec"),
         }
     }
@@ -9106,9 +9122,21 @@ impl ExecutionPlan for GatedScanExec {
         vec![&self.input]
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache, self.pool_size)))
+        let rebuilt = Self::new(children[0].clone(), self.sem.clone(), self.metrics.clone(), self.bypass_cache, self.pool_size);
+        // Carried across replacement, or any optimizer rule that rebuilds this
+        // node silently un-refuses the query.
+        Ok(Arc::new(match self.refusal.clone() {
+            Some(refusal) => rebuilt.refusing(refusal),
+            None => rebuilt,
+        }))
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        // Raised HERE and not in `gate_if_wide`, which runs inside `scan()` during
+        // planning — refusing there also refused EXPLAIN, removing the one tool
+        // that explains the refusal. EXPLAIN plans and never executes.
+        if let Some(refusal) = &self.refusal {
+            return Err(DataFusionError::ResourcesExhausted(refusal.clone()));
+        }
         let inner = self.input.execute(partition, context)?;
         let schema = inner.schema();
         let sem = self.sem.clone();
@@ -12787,6 +12815,38 @@ mod tests {
     #[test_case(8192, 32_800 * (1 << 20) => Some(8192 * (1 << 20)) ; "the 32.8 GB scan that took prod down")]
     fn wide_scan_refusal_fires_only_past_a_configured_limit(refuse_mb: u64, selected: u64) -> Option<u64> {
         wide_scan_refusal_bytes(refuse_mb, selected)
+    }
+
+    /// A refused scan must still PLAN — EXPLAIN is how someone finds out why their
+    /// query was rejected, and raising the error during `scan()` refused the EXPLAIN
+    /// too. So the refusal rides on the operator, shows up in its display line, and
+    /// fires on execute. It must also survive `with_new_children`, or any optimizer
+    /// rule that rebuilds the node silently un-refuses a 450 GB scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_scan_still_plans_and_survives_being_rebuilt() {
+        use arrow::array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&[vec![batch]], schema, None).unwrap())));
+        let refused =
+            Arc::new(GatedScanExec::new(src.clone(), Arc::new(tokio::sync::Semaphore::new(4)), None, false, 4).refusing("selected 450000 MiB".to_string()));
+
+        let shown = datafusion::physical_plan::displayable(refused.as_ref() as &dyn ExecutionPlan).indent(false).to_string();
+        assert!(shown.contains("REFUSED"), "EXPLAIN must say the scan was refused, got: {shown}");
+        assert!(shown.contains("450000 MiB"), "and must carry the size that caused it, got: {shown}");
+
+        let err = match refused.execute(0, Arc::new(TaskContext::default())) {
+            Err(err) => err,
+            Ok(_) => panic!("a refused scan must not execute"),
+        };
+        assert!(matches!(err, DataFusionError::ResourcesExhausted(_)), "refusal must be ResourcesExhausted, got {err:?}");
+
+        let rebuilt = Arc::clone(&refused).with_new_children(vec![src]).expect("rebuild");
+        assert!(
+            rebuilt.execute(0, Arc::new(TaskContext::default())).is_err(),
+            "with_new_children must carry the refusal — dropping it silently admits the scan"
+        );
     }
 
     /// GatedScanExec must release its permit BETWEEN batches: a per-stream hold

@@ -1,0 +1,61 @@
+project,window,shape,rep1_ms,rep2_ms,rows,status
+p1,14d,throughput,canceling statement due to statement timeout,,0,fail
+p1,14d,group_by_service,canceling statement due to statement timeout,,0,fail
+p1,14d,p95_latency,canceling statement due to statement timeout,,0,fail
+p1,14d,error_rate,56620,,57,ok
+p1,14d,log_list,1632,2520,251,ok
+p1,30d,throughput,"Resources exhausted: scan selected 1447 files / 450603 MiB, ",,0,err
+p1,30d,group_by_service,"Resources exhausted: scan selected 1447 files / 450603 MiB, ",,0,err
+p1,30d,p95_latency,"Resources exhausted: scan selected 1447 files / 450603 MiB, ",,0,err
+p1,30d,error_rate,"Resources exhausted: scan selected 1447 files / 450603 MiB, ",,0,err
+p1,30d,log_list,"Resources exhausted: scan selected 1447 files / 450603 MiB, ",,0,err
+p2,14d,throughput,856,519,0,ok
+p2,14d,group_by_service,1887,657,0,ok
+p2,14d,p95_latency,459,921,0,ok
+p2,14d,error_rate,583,668,0,ok
+p2,14d,log_list,991,1756,0,ok
+p2,30d,throughput,30908,,40,ok
+p2,30d,group_by_service,30905,,40,ok
+p2,30d,p95_latency,46685,,40,ok
+p2,30d,error_rate,34326,,40,ok
+p2,30d,log_list,2340,1643,251,ok
+p3,14d,throughput,17774,,57,ok
+p3,14d,group_by_service,20169,,1403,ok
+p3,14d,p95_latency,40576,,57,ok
+p3,14d,error_rate,20203,,57,ok
+p3,14d,log_list,1228,1089,251,ok
+p3,30d,throughput,59955,,121,ok
+p3,30d,group_by_service,canceling statement due to statement timeout,,0,fail
+p3,30d,p95_latency,canceling statement due to statement timeout,,0,fail
+p3,30d,error_rate,canceling statement due to statement timeout,,0,fail
+p3,30d,log_list,1499,560,251,ok
+p4,14d,throughput,11399,8234,57,ok
+p4,14d,group_by_service,10870,10693,171,ok
+p4,14d,p95_latency,35494,,57,ok
+p4,14d,error_rate,12734,11125,57,ok
+p4,14d,log_list,724,400,251,ok
+p4,30d,throughput,27089,,117,ok
+p4,30d,group_by_service,37540,,349,ok
+p4,30d,p95_latency,canceling statement due to statement timeout,,0,fail
+p4,30d,error_rate,51817,,117,ok
+p4,30d,log_list,3344,2023,251,ok
+p5,14d,throughput,9360,8150,57,ok
+p5,14d,group_by_service,10809,10101,445,ok
+p5,14d,p95_latency,15759,,57,ok
+p5,14d,error_rate,13599,9480,57,ok
+p5,14d,log_list,1891,1900,251,ok
+p5,30d,throughput,28226,,118,ok
+p5,30d,group_by_service,28859,,930,ok
+p5,30d,p95_latency,canceling statement due to statement timeout,,0,fail
+p5,30d,error_rate,34426,,118,ok
+p5,30d,log_list,3845,1949,251,ok
+p6,14d,throughput,45337,,57,ok
+p6,14d,group_by_service,canceling statement due to statement timeout,,0,fail
+p6,14d,p95_latency,canceling statement due to statement timeout,,0,fail
+p6,14d,error_rate,consuming input failed: server closed the connection unexpec,,0,err
+p6,14d,log_list,5853,2734,251,ok
+p6,30d,throughput,"Resources exhausted: scan selected 617 files / 26136 MiB, ov",,0,err
+p6,30d,group_by_service,"Resources exhausted: scan selected 617 files / 26136 MiB, ov",,0,err
+p6,30d,p95_latency,"Resources exhausted: scan selected 617 files / 26136 MiB, ov",,0,err
+p6,30d,error_rate,"Resources exhausted: scan selected 617 files / 26136 MiB, ov",,0,err
+p6,30d,log_list,"Resources exhausted: scan selected 617 files / 26136 MiB, ov",,0,err
