@@ -19,6 +19,12 @@ const HOUR_MICROS: i64 = 3_600_000_000;
 const MINT_INTERVAL_MICROS: i64 = crate::maintenance_coordinator::NORMAL_SLICE_MICROS;
 /// Lets idle workers notice newly mature deadlines.
 const IDLE_POLL_MICROS: i64 = 5 * MICROS;
+/// `run_maintenance_coordinator_once` coarsens on the same 60s cadence it plans
+/// debt on. Modelled because coarsening is the only mechanism that SHRINKS the
+/// queue, and without it the sim cannot answer any question about queue size —
+/// which is most of what it is asked. Its absence made a fusion-pricing change
+/// look like it moved 25 units when the sim never fused at all.
+const COARSEN_INTERVAL_MICROS: i64 = 60 * MICROS;
 
 #[derive(Clone, Debug, educe::Educe)]
 #[educe(Default)]
@@ -79,6 +85,14 @@ pub struct SimReport {
     pub pending_end: usize,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub tasks_end: HashMap<String, usize>,
+    /// What coarsening did over the run: `subsumed` + `fused` is queue removed,
+    /// and `over_budget` against `candidates` is the fusion that was refused —
+    /// the number that says whether the queue CAN shrink at all.
+    pub coarsen_subsumed: usize,
+    pub coarsen_fused: usize,
+    pub coarsen_candidates: usize,
+    pub coarsen_blocked: usize,
+    pub coarsen_over_budget: usize,
     pub frontier_lag_secs_max: u64,
     pub min_contiguous_days_end: u64,
     pub hours_to_contiguous_14: Option<f64>,
@@ -295,6 +309,8 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     };
     let tick = (cfg.horizon_micros / 48).max(3_600 * MICROS);
     let mut next_tick = start_micros + tick;
+    let mut next_coarsen = start_micros + COARSEN_INTERVAL_MICROS;
+    let mut report_coarsen = crate::maintenance_coordinator::CoarsenReport::default();
     let mut now = start_micros;
     // #176: (jobs * 3 / 4).max(1) — the floor keeps debt work possible at all
     // on a one-worker box.
@@ -315,7 +331,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
 
     while now < end {
         let next_worker_free = workers.iter().map(|w| w.busy_until).min().unwrap_or(end);
-        now = next_worker_free.min(next_mint).min(next_tick).min(next_restart).min(end);
+        now = next_worker_free.min(next_mint).min(next_tick).min(next_restart).min(next_coarsen).min(end);
         if now >= end {
             break;
         }
@@ -330,6 +346,19 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             // The cadence advances whether or not minting is on — otherwise
             // `next_mint` pins `now` here forever.
             next_mint += MINT_INTERVAL_MICROS;
+        }
+
+        if now >= next_coarsen {
+            let report = journal.coarsen_sealed_slices_reporting(now);
+            report_coarsen.subsumed += report.subsumed;
+            report_coarsen.fused += report.fused;
+            report_coarsen.candidates += report.candidates;
+            report_coarsen.blocked += report.blocked;
+            report_coarsen.over_budget += report.over_budget;
+            if report.total() != 0 {
+                none_until = [0; 6];
+            }
+            next_coarsen += COARSEN_INTERVAL_MICROS;
         }
 
         if now >= next_restart {
@@ -473,6 +502,11 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
 
     report.min_contiguous_days_end = coverage.min_contiguous_days(now);
     report.pending_end = journal.tasks().filter(|t| !matches!(t.state, TaskState::Complete | TaskState::Superseded)).count();
+    report.coarsen_subsumed = report_coarsen.subsumed;
+    report.coarsen_fused = report_coarsen.fused;
+    report.coarsen_candidates = report_coarsen.candidates;
+    report.coarsen_blocked = report_coarsen.blocked;
+    report.coarsen_over_budget = report_coarsen.over_budget;
     for task in journal.tasks() {
         *report.tasks_end.entry(format!("{:?}/{:?}", task.key.operation, task.state)).or_default() += 1;
     }

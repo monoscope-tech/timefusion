@@ -260,6 +260,10 @@ fn run_sim_cli() -> anyhow::Result<()> {
         cfg.seed
     );
     println!("pending: {} -> {} | executions: {} | splits: {}", report.pending_start, report.pending_end, report.executions, report.splits);
+    println!(
+        "coarsen: subsumed {} fused {} | candidates {} blocked {} over_budget {}",
+        report.coarsen_subsumed, report.coarsen_fused, report.coarsen_candidates, report.coarsen_blocked, report.coarsen_over_budget
+    );
     let mut completions = report.completions.iter().collect::<Vec<_>>();
     completions.sort();
     println!("completions: {}", completions.iter().map(|(op, n)| format!("{op}={n}")).collect::<Vec<_>>().join(" "));
