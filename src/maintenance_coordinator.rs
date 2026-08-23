@@ -1668,12 +1668,23 @@ impl TaskJournal {
         // a second day running, while day-wide derived units for 08-17 were
         // claimed repeatedly. Newest-first is right for FRESHNESS and wrong for
         // CONTIGUITY, and 30 contiguous days is a contiguity goal.
-        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, i64, i64) {
+        // DAMAGE leads its class, ahead of `starved`, because the starvation
+        // window is a FRESHNESS heuristic and damage is not a freshness
+        // question. `starved` is only set for work aged 3 to 31 days; every
+        // untagged file left on prod 2026-08-23 was 32 to 37 days old, so it
+        // fell outside the window and ranked below the entire ~12,000-unit
+        // backfill queue — unreachable in practice, whatever `hole_rank` said,
+        // because `starved` is compared first.
+        //
+        // Bounded and self-terminating: the set comes from files that exist and
+        // empties as they are retired.
+        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, u8, i64, i64) {
             let (class, starved, width, order) = scheduling_class(task, now_micros);
-            (class, starved, journal.hole_rank(task), width, order)
+            let hole = journal.hole_rank(task);
+            (class, u8::from(hole > 0), starved, hole, width, order)
         };
-        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, i64, i64)> {
-            let mut class: Option<(u8, u8, u8, i64, i64)> = None;
+        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, u8, i64, i64)> {
+            let mut class: Option<(u8, u8, u8, u8, i64, i64)> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_live_frontier(task.key.slice, now_micros))) {
                 let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
@@ -3621,6 +3632,51 @@ mod tests {
             journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
             "damaged",
             "a ten-minute damage repair must outrank a day-wide backfill hole"
+        );
+    }
+
+    /// Damage outranks starvation, because the starvation window is a
+    /// FRESHNESS heuristic and damage is not a freshness question.
+    ///
+    /// `starved` is set only for work aged 3 to 31 days and is compared BEFORE
+    /// `hole_rank`. Every untagged file left on prod 2026-08-23 was 32 to 37
+    /// days old, so it fell outside the window and sorted below the whole
+    /// ~12,000-unit backfill queue — the hole rank could never be reached.
+    #[test]
+    fn damage_outranks_work_inside_the_starvation_window() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        // 36 days sealed: PAST the horizon, so `starved` is 1 and it loses to
+        // anything inside the window on the old ordering.
+        let seed = |journal: &mut TaskJournal| {
+            let mut ancient = task("damaged", 3 * DAY, 4 * DAY, Operation::BaseRollup);
+            ancient.key.physical_table = "rollup_1m".to_owned();
+            ancient.deadline_micros = 0;
+            ancient.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            let mut inside = task("recent", 30 * DAY, 31 * DAY, Operation::BaseRollup);
+            inside.key.physical_table = "rollup_1m".to_owned();
+            inside.deadline_micros = 0;
+            inside.created_unix_ms = ancient.created_unix_ms;
+            journal.upsert(ancient);
+            journal.upsert(inside);
+        };
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
+            "recent",
+            "control: inside the starvation window leads work that is past the horizon"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-01-04".to_owned())]);
+        assert_eq!(
+            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
+            "damaged",
+            "a damaged cell past the starvation horizon must still lead, or it is unreachable"
         );
     }
 
