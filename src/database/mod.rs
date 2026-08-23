@@ -3531,7 +3531,32 @@ impl Database {
                 async move { (pid.clone(), svc.build_index_for_file_deferred(&table, &pid, &rel, &uri, store).await) }
             }))
             .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
-            while let Some((pid, result)) = jobs.next().await {
+            // Flush on a TIMER, not only on build completions. The age bound is
+            // swept inside this loop, so with multi-minute builds a long gap
+            // between completions means no sweep runs at all — and the bound is
+            // unreachable in exactly the window it exists to protect. Prod
+            // 2026-08-23 proved it: a 759,809-row / 630 MB whale finished at
+            // 11:57:37, the container died at 12:06:48 with no completion in
+            // between, its entry was never committed, and the SAME file was
+            // rebuilt at 12:22 — then lost again 22 seconds later. Ten minutes
+            // of the most expensive work in the pass, done twice and banked
+            // neither time.
+            let mut flush_tick = tokio::time::interval(MANIFEST_MAX_AGE / 2);
+            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let (pid, result) = tokio::select! {
+                    item = jobs.next() => match item {
+                        Some(v) => v,
+                        None => break,
+                    },
+                    _ = flush_tick.tick() => {
+                        for project in due_manifest_flushes(&pending, &pending_since) {
+                            pending_since.remove(&project);
+                            Self::commit_manifest_batch(svc, table_name, &project, &mut pending).await;
+                        }
+                        continue;
+                    }
+                };
                 match result {
                     // Counted live, not just at pass end: the `built=` pass line
                     // has NEVER been harvested in prod — passes outrun their tick
