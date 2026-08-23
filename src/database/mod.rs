@@ -4491,8 +4491,21 @@ impl Database {
                 warn!(event = "tantivy_reconcile_no_indexer");
                 return;
             };
-            for table_name in svc.config.indexed_tables() {
-                match db.tantivy_reconcile_table(&table_name).await {
+            // Rotate where the pass STARTS. `indexed_tables()` comes from a
+            // BTreeSet, so it was always sorted and `otel_logs_and_spans` was
+            // always first — and one spans pass costs an unbounded per-project
+            // GC plus up to `max_files_per_pass` builds at ~4 min each, which
+            // does not fit between prod's ~15-minute restarts. Every table after
+            // it was therefore never reached: the rollup and metrics manifests
+            // stopped being written on 2026-08-20 and nothing noticed, because
+            // the flush path kept indexing spans and coverage looked alive.
+            //
+            // The offset is derived from the clock, not from state, so a restart
+            // cannot reset it back to the same starving order.
+            let tables = svc.config.indexed_tables();
+            let offset = rotation_offset(crate::support::now_micros(), tables.len());
+            for table_name in tables.iter().cycle().skip(offset).take(tables.len()) {
+                match db.tantivy_reconcile_table(table_name).await {
                     // Logged even when it did nothing: a silent no-op arm made
                     // "ran and found nothing" indistinguishable from "never
                     // ran", and the cron not firing at all was the actual bug.
@@ -6688,6 +6701,25 @@ mod due_manifest_flush_tests {
 
 /// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
 type DirtyBinKey = (String, String, String, i64);
+
+/// Which table a rotating maintenance pass should start with, derived from the
+/// clock so a restart cannot reset it to the same starving order.
+///
+/// One 15-minute slot per position: with N tables every table leads a pass once
+/// every `15 * N` minutes, so a pass that dies part-way still serves a different
+/// prefix next time.
+///
+/// ```
+/// # use timefusion::database::rotation_offset;
+/// const SLOT: i64 = 15 * 60 * 1_000_000;
+/// assert_eq!(rotation_offset(0, 3), 0);
+/// assert_eq!(rotation_offset(SLOT, 3), 1, "the next slot leads with the next table");
+/// assert_eq!(rotation_offset(3 * SLOT, 3), 0, "and wraps");
+/// assert_eq!(rotation_offset(SLOT, 0), 0, "no tables: no panic on %0");
+/// ```
+pub fn rotation_offset(now_micros: i64, len: usize) -> usize {
+    (now_micros / (15 * 60 * 1_000_000)).unsigned_abs() as usize % len.max(1)
+}
 
 /// Snapshot-relative files belonging to one physical project/date partition.
 /// Unified tables carry `project_id=` path segments; custom-project tables do

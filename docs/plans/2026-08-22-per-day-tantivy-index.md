@@ -1439,3 +1439,43 @@ reasoning further from the source.
 correct on the page, so patching it on suspicion would risk another change
 shipped on a false premise — the mistake already made once today with the census
 dedupe. One instrument, one deploy, then the fix.
+
+## 17:35 — the instrument refuted my root cause, and the real one is serial-loop starvation
+
+`1608958` deployed, and the gate it made observable **never fired**:
+
+```
+tantivy_reconcile_no_indexer  (30m)  =  0
+tantivy reconcile gc: table=otel_logs_and_spans project=6297304f… entries_removed=15 blobs_deleted=15
+```
+
+So the indexer is present and the reconcile **does** run. "The tantivy indexer is
+absent from the Database the cron holds" is withdrawn — which is exactly why the
+instrument shipped instead of the blind fix I was one step from writing into
+`server/mod.rs`.
+
+What the GC line reveals is better. It comes from *inside* `tantivy_reconcile_table`,
+so the pass starts and works; what never appears is the per-table **summary**,
+which prints only when the table finishes. The pass is not being skipped — **it
+is not completing.** Costing it:
+
+- `indexed_tables()` is a `BTreeSet`, so the order is sorted and
+  `otel_logs_and_spans` is **always first**.
+- Per table, GC walks *every* project's manifest and for each one re-reads the
+  full live-file list and deletes blobs — unbounded, 22 projects.
+- Then `backfill_table_indexes` builds up to `max_files_per_pass` files at the
+  measured ~4 min/build — **8 files ≈ 32 minutes** on its own.
+- Prod restarts roughly every 15 minutes.
+
+A spans pass cannot fit between restarts, the loop is sequential and awaits each
+table, so **every table after the first is never reached** — for three days. The
+manifests freezing on 2026-08-20 is that, and nothing noticed because the flush
+path kept indexing spans, so coverage looked alive from the outside.
+
+**Fixed by rotating where the pass starts** (`rotation_offset`, doctested): one
+15-minute slot per position, offset derived from the clock rather than from
+state, so a restart cannot reset it to the same starving order. With six tables
+every table leads a pass every 90 minutes instead of never. It does not make the
+pass faster — bounding GC and the build cost is the real repair — but it converts
+"three tables permanently starved" into "every table served on a cycle", which
+is the difference between a backlog that grows without bound and one that drains.
