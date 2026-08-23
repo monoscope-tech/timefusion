@@ -985,7 +985,11 @@ impl Database {
     fn log_task_started(&self, task: &crate::maintenance_coordinator::MaintenanceTask) {
         let key = &task.key;
         info!(operation = ?key.operation, table = %key.physical_table, project_id = %key.project_id, slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
-            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts, event = "maintenance_task_started");
+            estimated_decoded_bytes = task.estimated_decoded_bytes, attempts = task.attempts,
+            // Whether this unit knows what it reads. `record_input` has no
+            // counter of its own, and without this there is no way to tell in
+            // production whether footprint pricing has anything to work with.
+            input_fp = task.input.map(|input| input.fp), event = "maintenance_task_started");
     }
 
     pub(crate) async fn run_coordinator_dedup_once(&self) -> Result<bool> {
@@ -2239,6 +2243,7 @@ impl Database {
                 candidates = report.candidates,
                 blocked = report.blocked,
                 over_budget = report.over_budget,
+                priced_by_footprint = report.priced_by_footprint,
                 event = "maintenance_sealed_slices_coarsened"
             );
         }

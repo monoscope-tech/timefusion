@@ -36,8 +36,13 @@ pub struct CoarsenReport {
     pub candidates: usize,
     /// Candidates whose bucket a Running / equal-or-wider / superseded unit held.
     pub blocked: usize,
-    /// Candidates in a group whose summed estimate exceeded MAX_DECODED_BYTES.
+    /// Candidates in a group whose priced estimate exceeded MAX_DECODED_BYTES.
     pub over_budget: usize,
+    /// Buckets that fit ONLY because members sharing a file set were charged
+    /// once. Zero means [`InputFootprint`] pricing is changing nothing — either
+    /// no unit carries a footprint yet, or fusion was never the constraint. It
+    /// is the one number that says whether the fix is doing work.
+    pub priced_by_footprint: usize,
 }
 
 impl CoarsenReport {
@@ -373,10 +378,14 @@ struct GroupPrice {
     /// Members with nothing better to say than their prorated share.
     unpriced_bytes: u64,
     unpriced_members: usize,
+    /// Every member's own estimate, summed — what the old rule charged, kept
+    /// only so a pass can report whether footprint pricing changed anything.
+    summed_bytes: u64,
 }
 
 impl GroupPrice {
     fn add(&mut self, task: &MaintenanceTask) {
+        self.summed_bytes = self.summed_bytes.saturating_add(task.estimated_decoded_bytes);
         match task.input {
             Some(input) => {
                 self.distinct.insert(input.fp, input.whole_file_bytes);
@@ -891,6 +900,7 @@ impl TaskJournal {
             report.candidates += stage.candidates;
             report.blocked += stage.blocked;
             report.over_budget += stage.over_budget;
+            report.priced_by_footprint += stage.priced_by_footprint;
         }
         report
     }
@@ -1135,6 +1145,7 @@ impl TaskJournal {
         }
         groups.retain(|group, price| {
             let fits = price.bytes() <= MAX_DECODED_BYTES;
+            report.priced_by_footprint += usize::from(fits && price.summed_bytes > MAX_DECODED_BYTES);
             if !fits {
                 report.over_budget += members.get(group).copied().unwrap_or(0);
             }
