@@ -1106,3 +1106,40 @@ The level tiers are unbuilt, so for ~30 days:
 - The payoff is `level`-filtered panels routing at all, which they have never
   done. Zero of the currently-observed misses are that shape, so do not expect
   `rollup_misses_total` to fall — expect the raw-scan population to shrink.
+
+### CORRECTION: the level tier did NOT starve `dashboard_1h_v2`
+
+`08fcace`'s message says the derived level tier "starved dashboard_1h_v2 to
+zero". That is **false**, and the durable evidence says so: `1h_v2`'s last Delta
+commit is **20:17:30**, over an hour before the level tiers reached prod (~21:50
+via `b555776`). It was already quiet.
+
+I reached the wrong conclusion by reading `docker service logs --since 4h`, which
+returned **fewer** matching lines than a 20-minute query had 50 minutes earlier —
+the aggregated Swarm log drops a restarted task's history, so a "0 over 4h" there
+means nothing. Same trap as the process-scoped counters, one layer out. Object
+storage settled it in one listing, again.
+
+**And "quiet" is correct here, not broken.** `rollup_coverage_contiguity` reports:
+
+```
+dashboard_1m_v3        contiguous_days=30
+dashboard_1h_v2        contiguous_days=30     <- the tier 7d/30d dashboards read
+otel_metrics_1m_v2     contiguous_days=30
+otel_metrics_1h_v2     contiguous_days=30
+dashboard_level_1m_v1  contiguous_days=1      <- new, ~1h old, building
+```
+
+Both dashboard tiers are fully covered. `1h_v2` has nothing left to publish.
+
+**Removing the derived level tier was still right**, on its own evidence: 489
+publishes with rows in 3. That justification never depended on the starvation
+claim.
+
+**What IS worth someone's time:** 526 of 919 claims in 15 minutes (57%) go to
+`dashboard_1h_v2`, a tier at full coverage, and complete without publishing,
+timing out, or logging anything. Not a correctness bug — a majority of
+maintenance capacity spent on work that has nothing to do. The silent
+empty-completion branch is already being instrumented in the compaction planner
+(`ae33420`); this is the same shape in the rollup planner and the two should be
+fixed together.
