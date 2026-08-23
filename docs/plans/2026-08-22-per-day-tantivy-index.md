@@ -1625,3 +1625,49 @@ set to `true` this morning, and which would matter if rollup writes land in
 today's partition after all), `max_file_mb`, or a candidate list that is empty
 for a reason worth knowing. The per-table summary line carries `built=`, so one
 `grep` after the next pass distinguishes them.
+
+## 21:00 — `built=8` in 14 seconds: the cap I lowered this morning is the throttle
+
+The per-table summary finally printed, and it answers the question directly:
+
+```
+18:45:14 tantivy reconcile: table=…rollup_dashboard_1m_v2 built=8 entries_removed=0 blobs_deleted=0
+18:45:28 tantivy reconcile: table=…rollup_dashboard_1m_v3 built=8 entries_removed=0 blobs_deleted=0
+```
+
+**`built=8` — the cap — and eight builds took 14 seconds.** So the rollup passes
+are not building "approximately zero" (yesterday's guess, wrong): they build
+exactly as much as they are allowed, at **~1.75s per build**. The 4-5 min/build
+figure written into the config comment is a `otel_logs_and_spans` number, ~150x
+more expensive, and it was generalised to every table.
+
+**I lowered that cap from 150 to 8 this morning**, on the reasoning recorded in
+the config: *"The cap does NOT throttle throughput — build rate does — so
+lowering it costs nothing."* True for spans. False for every other indexed
+table, and false for exactly the tables whose coverage had been frozen since
+08-20. At 8 files per lead slot a rollup table drains ~6/hr against ~77/hr of
+accrual — a 12x deficit created by a knob, not by physics.
+
+**Fixed by bounding the pass in the unit that actually costs: bytes.**
+
+- `timefusion_tantivy_backfill_max_bytes_per_pass_mb` (default 2048) is the real
+  limiter; `truncate_to_byte_budget` applies it *after* the fair round-robin
+  split, so ordering and the reserved tail share still decide WHICH files and
+  the budget only decides how far down that order the pass gets.
+- `max_files_per_pass` goes back to 128 and is documented as a count ceiling
+  against pathological tiny-file queues, not as the sizing knob.
+- Files with unknown size count as free rather than being dropped — a missing
+  size entry must not silently remove work — and at least one file always
+  survives, so an over-budget whale makes progress instead of wedging the queue
+  behind it. Both pinned by doctest.
+- `tantivy_backfill_started` now carries `planned_mb` and `budget_mb`: with bytes
+  as the bound, a pass reporting only a file count cannot be shown to have been
+  limited by the budget rather than the ceiling.
+
+This is the same population-mismatch mistake as the census and the build counts,
+in its third form today: one number generalised across two populations that
+differ by two orders of magnitude. It is now written into the config comment so
+the next person does not re-derive it.
+
+**Still outstanding:** `…1h_v1` remains at 2026-08-19 — the ~21:35 prediction has
+not come due yet.

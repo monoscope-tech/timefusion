@@ -2474,6 +2474,40 @@ fn sort_backfill_uris_newest_first(uris: &mut [String]) {
 
 type TantivyBackfillWork = (String, String, String); // project, relative parquet, absolute URI
 
+/// Bound a backfill pass by INPUT BYTES, keeping fair-ordering intact.
+///
+/// A count cap cannot size a pass whose queue mixes populations 150x apart in
+/// build cost (2026-08-23: 8 rollup builds in 14s; one spans build takes 4-5
+/// min). Sizes are keyed by the snapshot-relative path. Files with no known
+/// size are counted as free rather than dropped — a missing entry must not
+/// silently remove work. At least one file always survives, so an over-budget
+/// file makes progress instead of wedging the queue behind it forever.
+///
+/// ```
+/// # use timefusion::database::truncate_to_byte_budget;
+/// # use std::collections::HashMap;
+/// let w = |n: &str| (n.to_string(), n.to_string(), format!("s3://b/{n}"));
+/// let sizes = HashMap::from([("a".to_string(), 60u64), ("b".to_string(), 60), ("c".to_string(), 60)]);
+/// let got = truncate_to_byte_budget(vec![w("a"), w("b"), w("c")], &sizes, 130);
+/// assert_eq!(got.len(), 2, "a and b fit in 130; c would exceed it");
+///
+/// let huge = HashMap::from([("a".to_string(), 9_000u64)]);
+/// assert_eq!(truncate_to_byte_budget(vec![w("a")], &huge, 10).len(), 1, "never yield an empty pass");
+/// assert_eq!(truncate_to_byte_budget(vec![w("a")], &sizes, 0).len(), 1, "a zero budget still makes progress");
+/// ```
+pub fn truncate_to_byte_budget(work: Vec<TantivyBackfillWork>, sizes: &HashMap<String, u64>, budget_bytes: u64) -> Vec<TantivyBackfillWork> {
+    let mut spent = 0u64;
+    let keep = work
+        .iter()
+        .position(|(_, rel, _)| {
+            spent = spent.saturating_add(sizes.get(rel).copied().unwrap_or(0));
+            spent > budget_bytes
+        })
+        .unwrap_or(work.len())
+        .max(1);
+    work.into_iter().take(keep).collect()
+}
+
 /// `fair_tantivy_backfill_work`, but reserving `tail_pct` of the pass for the
 /// OLDEST uncovered files instead of spending all of it on the newest.
 ///
@@ -3493,7 +3527,7 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
                 continue;
             };
-            let (by_pid, _sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
+            let (by_pid, sizes, delta_store) = self.group_uncovered_files_by_project(svc, &table_ref, table_name, &mut oversized_total, true).await?;
             let mut queues = Vec::with_capacity(by_pid.len());
             // Today's partition is churn: rewritten continuously by flush and
             // hot-tail compaction, and already covered at birth by the flush
@@ -3522,6 +3556,12 @@ impl Database {
             let cap = self.config.tantivy.timefusion_tantivy_backfill_max_files_per_pass;
             let available: usize = queues.iter().map(|(_, q)| q.len()).sum();
             let (work, reserved_tail) = fair_tantivy_backfill_work_split(queues, cap, self.config.tantivy.timefusion_tantivy_backfill_tail_share_pct);
+            // `cap` is only a count ceiling; BYTES are what the pass actually
+            // costs. Applied after the fair split so the round-robin ordering
+            // (and the reserved tail share) decide WHICH files, and the budget
+            // only decides how far down that order the pass gets.
+            let budget = self.config.tantivy.timefusion_tantivy_backfill_max_bytes_per_pass_mb * 1024 * 1024;
+            let work = truncate_to_byte_budget(work, &sizes, budget);
             deferred_total = deferred_total.saturating_add((available - work.len()) as u64);
             // Announce the pass BEFORE the first build, with what it will
             // attempt. `tantivy_backfill_pass` only prints at the very end, and
@@ -3530,7 +3570,11 @@ impl Database {
             // (Equivalent to the unmerged fix/tantivy-reconcile-progress-logging;
             // rewritten here because that branch predates the bounded pass.)
             let planned = work.len();
-            info!(table_name, root = %root, planned, cap, skipped_today, event = "tantivy_backfill_started");
+            // `planned_mb` alongside `cap`: with bytes as the real bound, a pass
+            // reporting only a file count cannot be shown to have been limited
+            // by the budget rather than the ceiling.
+            let planned_mb = work.iter().filter_map(|(_, rel, _)| sizes.get(rel)).sum::<u64>() / (1024 * 1024);
+            info!(table_name, root = %root, planned, planned_mb, cap, budget_mb = budget / (1024 * 1024), skipped_today, event = "tantivy_backfill_started");
             let mut done = 0usize;
             // Manifest writes are batched per project: each is a full
             // read-modify-write of that project's manifest (745 KB / 950 entries
@@ -12574,11 +12618,16 @@ mod tests {
             *counts.entry(task.key.operation).or_default() += 1;
             counts
         });
+        // Derived from the DECLARED specs, not hardcoded: the point of the test
+        // is per-hour sparseness, and pinning a literal made it fail whenever a
+        // tier was added — which reads as a regression and is not one.
+        let rollups = crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups.clone();
+        let (derived, base): (Vec<_>, Vec<_>) = rollups.iter().partition(|spec| spec.derive_from.is_some());
         assert_eq!(counts.get(&Operation::Dedup), Some(&6));
-        assert_eq!(counts.get(&Operation::BaseRollup), Some(&6));
-        assert_eq!(counts.get(&Operation::DerivedRollup), Some(&1));
+        assert_eq!(counts.get(&Operation::BaseRollup), Some(&(6 * base.len())));
+        assert_eq!(counts.get(&Operation::DerivedRollup), Some(&derived.len()));
         assert_eq!(counts.get(&Operation::HotPacking), None, "ingest must not mint file-hygiene work; the debt planner owns it");
-        assert_eq!(journal.tasks().count(), 13, "one touched hour, not 456 full-day tasks");
+        assert_eq!(journal.tasks().count(), 6 + 6 * base.len() + derived.len(), "one touched hour, not 456 full-day tasks");
         Ok(())
     }
 

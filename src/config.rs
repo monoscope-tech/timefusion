@@ -820,13 +820,28 @@ pub struct TantivyConfig {
     /// still in progress". A pass that never ends never refreshes its work
     /// list, never reports its end-line, and blocks every later tick.
     ///
-    /// 8 is ~2 hours at the measured rate: it completes inside a normal
-    /// container life, so the end-line fires and the work list is re-derived
-    /// from a fresh snapshot rather than one hours stale. The cap does NOT
-    /// throttle throughput — build rate does — so lowering it costs nothing
-    /// and buys the observability the pass has never once delivered on this box.
-    #[serde_inline_default(8)]
+    /// A COUNT ceiling only — the real bound is
+    /// `timefusion_tantivy_backfill_max_bytes_per_pass`. This exists to stop a
+    /// pathological queue of tiny files, not to size the pass.
+    ///
+    /// It was 8, on the reasoning that "the cap does NOT throttle throughput —
+    /// build rate does". That was measured on `otel_logs_and_spans`, where a
+    /// build costs 4-5 MINUTES, and it is false for every other indexed table:
+    /// on 2026-08-23 a rollup pass logged `built=8` in **14 seconds**, ~1.75s
+    /// per build, ~150x cheaper. One count cap across populations that differ
+    /// by two orders of magnitude in cost throttles the cheap tables to protect
+    /// against the expensive one — which is exactly the rollup tables whose
+    /// coverage had been frozen since 08-20.
+    #[serde_inline_default(128)]
     pub timefusion_tantivy_backfill_max_files_per_pass: usize,
+    /// The real per-pass bound: total INPUT bytes a backfill pass will read.
+    ///
+    /// Cost tracks bytes, not files, so this bounds a pass to a predictable
+    /// wall-clock regardless of whether the queue holds 4 GB spans whales or
+    /// 2 MB rollup files. At least one file is always attempted, so an
+    /// over-budget file still makes progress instead of wedging the queue.
+    #[serde_inline_default(2048)]
+    pub timefusion_tantivy_backfill_max_bytes_per_pass_mb: u64,
     /// Percentage of each backfill pass reserved for the OLDEST uncovered files.
     ///
     /// Without it the pass is pure newest-first and the tail starves. Measured
