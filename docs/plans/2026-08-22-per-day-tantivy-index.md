@@ -1317,3 +1317,41 @@ What would settle it, in preference order:
 Even if they are read, indexing low-cardinality raw dimensions (`level`, `kind`)
 is questionable next to bloom filters and column stats — but that is a design
 opinion, not evidence, and it does not justify deleting anything today.
+
+### 16:40 — EXPLAIN on prod: the dashboard query did not route, and the spans prefilter is live
+
+Ran a routed-shaped dashboard query against prod (read-only EXPLAIN, no execution):
+
+```sql
+SELECT date_trunc('hour', timestamp), count(*) FROM otel_logs_and_spans
+WHERE project_id = '87576849-…' AND timestamp >= now() - interval '3 days'
+  AND kind = 'server' GROUP BY 1
+```
+
+Two things, one of them not what I was looking for:
+
+1. **It did not route to a rollup.** Every `DataSourceExec` reads raw
+   `otel_logs_and_spans` parquet. So this plan says nothing about whether rollup
+   tantivy indexes are read — the question stays open, and I need a query that
+   actually routes before it can be answered.
+2. **The spans-side tantivy prefilter is unambiguously live.** The scan carries
+   `text_match(kind, server)` *and* `id IN (SET)` with 55 ids and
+   `required_guarantees=[id in (…)]` — that id-set is the tantivy index answering
+   the predicate and pruning row groups. Whatever else is true, the index on
+   `otel_logs_and_spans` earns its keep.
+
+An incidental asymmetry worth noting rather than chasing now: the sealed
+(`date=2026-08-20`) file group carries the `required_guarantees` id-set while the
+`date=2026-08-23` group has `required_guarantees=[]` — the prefilter contributes
+to one leg and not the other. That is consistent with today's partition being
+uncovered, and it is a concrete example of coverage translating directly into
+pruning power.
+
+**Where this leaves the day's goal.** Coverage convergence is blocked by a
+population question, not a throughput one: rollup tables are 52% of the indexed
+file set and mint ~77/hr of sealed uncovered files, through an inheritance
+(`..f` in `synthesize`) that looks accidental. Whether they *should* be indexed
+is a design decision — a rollup row is an aggregate, and a `text_match` on a
+low-cardinality dimension is a different proposition from one on `body` — and it
+is the user's call, not mine to make silently. The spans index, by contrast, is
+demonstrably load-bearing and should not be touched.
