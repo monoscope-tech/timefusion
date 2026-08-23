@@ -985,11 +985,37 @@ impl TaskJournal {
     /// nothing at least that wide already covers it.
     fn coarsen_to_width_reporting(&mut self, width: i64, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>) -> CoarsenReport {
         let bucket_of = |start: i64| start.div_euclid(width) * width;
+        // DAMAGE REPAIR IS NEVER COARSENED. A repair unit is deliberately sized
+        // to one file's uncovered span, so fusing it destroys the only work that
+        // can close that hole — and the fused unit does not replace it, because
+        // the preflight measures it over budget and shreds it back down. That is
+        // the split/fuse cycle the comment below argues cannot happen: fusion is
+        // gated on the CHILDREN'S summed estimate, but a slice claims at least
+        // one row group of every overlapping file, so those estimates are floor
+        // inflated and their sum does not predict the fused unit's real cost.
+        //
+        // Measured on prod 2026-08-23: the three units covering `dcad860a`
+        // 08-15's eleven-minute hole (5m, 6m, 8m — Pending, eligible,
+        // attempts=0) had VANISHED from the journal a few hours later, leaving
+        // only completed units on either side of the hole. Five such cells sat
+        // at 3-11 minutes for an entire day while their neighbours converged.
+        // Cloned, not borrowed: this pass mutates `self` further down. The set is
+        // the damaged cells only — 24 entries when this shipped, and zero once
+        // they converge.
+        let untagged_cells = self.untagged_cells.clone();
         let coarsenable = |task: &MaintenanceTask| {
             matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
                 && matches!(task.state, TaskState::Pending | TaskState::Retry)
                 && !is_live_frontier(task.key.slice, now_micros)
                 && task.key.slice.width() < width
+                && !chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
+                    untagged_cells.contains(&(
+                        task.key.source.clone(),
+                        task.key.project_id.clone(),
+                        task.key.physical_table.clone(),
+                        time.date_naive().to_string(),
+                    ))
+                })
         };
         // Which buckets may not be fused at this width, and why. Three distinct
         // reasons, and collapsing them into one rule is what made the old
@@ -3857,6 +3883,48 @@ mod tests {
             "damaged",
             "a ten-minute damage repair must outrank a day-wide backfill hole"
         );
+    }
+
+    /// Coarsening must not eat a damage repair.
+    ///
+    /// A repair unit is sized to one file's uncovered span, so fusing it
+    /// destroys the only work that closes that hole — and the fused unit does
+    /// not replace it, because the preflight measures it over budget and shreds
+    /// it back down. Prod 2026-08-23: the three units covering `dcad860a`
+    /// 08-15's eleven-minute hole (5m, 6m, 8m, Pending, eligible, attempts=0)
+    /// had VANISHED from the journal hours later, leaving only completed units
+    /// on either side of the hole. Five such cells sat at 3-11 minutes all day.
+    #[test]
+    fn coarsening_leaves_damage_repairs_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 40 * DAY;
+        let unit = |project: &str, start: i64, width: i64| {
+            let mut t = task(project, start, start + width, Operation::BaseRollup);
+            t.key.physical_table = "rollup_1m".to_owned();
+            t.deadline_micros = 0;
+            t.estimated_decoded_bytes = 1;
+            t.created_unix_ms = 0;
+            t
+        };
+        // Two narrow sealed units in the same bucket, in different cells: the
+        // ordinary one is fair game to fuse, the damaged one is not.
+        let seed = |journal: &mut TaskJournal| {
+            journal.upsert(unit("ordinary", 10 * DAY, 300_000_000));
+            journal.upsert(unit("ordinary", 10 * DAY + 600_000_000, 300_000_000));
+            journal.upsert(unit("damaged", 10 * DAY, 300_000_000));
+            journal.upsert(unit("damaged", 10 * DAY + 600_000_000, 300_000_000));
+        };
+        let survives = |journal: &TaskJournal, project: &str| {
+            journal.tasks().filter(|task| task.key.project_id == project && task.key.slice.width() == 300_000_000).count()
+        };
+
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        seed(&mut journal);
+        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-01-11".to_owned())]);
+        journal.coarsen_sealed_slices(now);
+        assert_eq!(survives(&journal, "damaged"), 2, "a damaged cell's repair units must survive coarsening");
+        assert_eq!(survives(&journal, "ordinary"), 0, "control: ordinary narrow sealed units are still fused");
     }
 
     /// Damage ROTATES across cells; one cell's ladder cannot monopolise it.

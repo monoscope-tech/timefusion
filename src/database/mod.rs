@@ -3295,8 +3295,11 @@ impl Database {
             };
             (t.get_file_uris()?.collect::<Vec<String>>(), sizes, t.log_store().object_store(None))
         };
-        let by_pid: HashMap<String, Vec<String>> =
-            uris.into_iter().filter(|uri| uri.ends_with(".parquet")).filter_map(|uri| Some((project_id_of_uri(&uri)?.to_string(), uri))).into_group_map();
+        let by_pid: HashMap<String, Vec<String>> = uris
+            .into_iter()
+            .filter(|uri| uri.ends_with(".parquet"))
+            .filter_map(|uri| Some((crate::tantivy::search::project_id_of_uri(&uri)?.to_string(), uri)))
+            .into_group_map();
         let max_bytes = self.config.tantivy.timefusion_tantivy_backfill_max_file_mb * 1024 * 1024;
         let mut result: HashMap<String, Vec<String>> = HashMap::with_capacity(by_pid.len());
         for (pid, mut uris) in by_pid {
