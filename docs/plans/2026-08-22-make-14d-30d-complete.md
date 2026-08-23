@@ -119,12 +119,18 @@ merge-on-read table answers with the pre-update row. So this is a cost to
 
 ### Tier 2 — reduces the raw-path cost that remains
 
-- [ ] **2.1 Get certification working so `dedup_skipped` is non-zero.**
-      100% of scans currently denied, `cert_granted_total = 0`. Prior sessions
-      found certification itself works and the blocker is *contiguity* (the
-      read path wants every in-window date certified). Per-date dedup skip
-      shipped default-OFF — evaluate enabling it, since partial certification
-      only pays once that lands.
+- [ ] **2.1 Certification needs a PARTIAL-GRANT producer — rescoped 2026-08-23.**
+      Not an enablement task. The prod sidecar holds 106 certifications reaching
+      2026-08-22, so contiguity is no longer the blocker; the blocker is that
+      every recent entry belongs to a SMALL project and none to `dcad860a`,
+      `87576849` or `00000000` — the three whose dashboards are slow.
+      `record_certification` grants only when the whole partition's file
+      fingerprint held still across the sweep, which a churning tenant's day
+      never does. Additive per-file certification (4b91f8c) cannot rescue it
+      because it resolves its file list FROM a granted `Certification`, so it
+      sits downstream of the same gate. See
+      `2026-08-23-certification-only-works-where-it-is-not-needed.md`.
+
 - [x] **2.2 The 7-day cliff was a cold first touch — closed 2026-08-23.** Three
       reps per window on both projects: p3 7d = 33489 / 2600 / 1679 ms, p4 7d =
       46127 / 4477 / 1102 ms. Warm, 7d beats BOTH neighbours; counter diffs are
