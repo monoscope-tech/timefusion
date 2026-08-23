@@ -472,6 +472,46 @@ Neither is settled. `timefusion sim <journal.json>` over the real prod journal
 answers both offline, in seconds, without a deploy — that is the next step, not
 another prod experiment.
 
+### What a 10-minute sample actually showed, because it spanned a restart
+
+One-minute interval, all 16 CPU tokens held throughout:
+
+```
+07:10 -> 07:16   commits 4,323 -> 4,326 (+3 in 6 min), output_rows +668
+                 pending_base_rollup 12,231 -> 12,218 (-13)
+07:17            EVERYTHING resets to 0 — restart onto a new deploy
+```
+
+Sixteen units running concurrently at ~45 commits/hr means **each unit averages
+~21 minutes**, and the restart killed all sixteen in flight at once — up to ~5.6
+worker-hours discarded in a single deploy. Prod took **8 deploys** during this
+session.
+
+**So the mechanism is not re-claiming, and it is not merely slowness: units take
+longer than the interval between restarts, so in-flight work is destroyed before
+it can commit.** `abandon_running` already bisects a unit that times out; nothing
+handles a unit whose *process exits*. `oldest_task_age_seconds = 7,197,321` — 83
+days — is the signature. A merely-slow unit finishes eventually.
+
+That one mechanism explains all three standing symptoms: six sealed compaction
+days bit-identical for 58 hours, 1,567 witness-less slices never republished, and
+a queue flat-to-growing at 12k while the pool runs 100% busy.
+
+The journal persists correctly — `dirty_bin_queue_depth` and
+`pending_base_rollup` both survived the 07:17 restart to the unit. What is lost
+is the work, not the plan.
+
+Two fixes, and the first already exists for one operation:
+
+1. **Resume instead of redo.** `timefusion_repair_resume_enabled` (default true,
+   on in prod) already commits a matching staged-but-uncommitted rewrite rather
+   than redoing 40+ minutes — for Repair. Extend it to `BaseRollup`, which is the
+   operation holding 12,218 of the queue.
+2. **Bound unit WALL TIME, not just decoded bytes.** `abandon_running`'s own
+   comment says byte-splitting misses this: "it fires on decoded bytes, while
+   what overran was WALL TIME — a day-sized slice with modest bytes still pays an
+   object-store round trip per file."
+
 ## Open, in priority order
 
 1. `stale_coverage` (49 misses, and it owns plain `count(*)`) — the per-slice
