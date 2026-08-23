@@ -142,3 +142,43 @@ be87ebc1 14d   9.0s ok          be87ebc1 30d 24.7s ok
 Getting the coordinator running was necessary and is not sufficient: the three
 failing cells need their SEALED days built, and at 3.7 cells/hr against 458 they
 are days away. Nothing on the query side moves them.
+
+## CORRECTION: the drain rate is ~490/hr, not ~90/hr
+
+The "~90 units/hr and flat" figure above is **wrong**, and the error was the
+measurement window, not the system. It was taken on a container still finishing
+its cache warm, where the coordinator was competing with warm tasks for the same
+small pool. Re-measured on a container PAST the warm, 6.5 minutes, `tasks_running`
+= 16 throughout:
+
+```
+15:33:27  rebuilds_full=44  pending_base_rollup=12153  output_rows=27704
+15:34:43  rebuilds_full=67  pending_base_rollup=12128  output_rows=50360
+15:36:00  rebuilds_full=73  pending_base_rollup=12118  output_rows=52552
+15:39:59  rebuilds_full=97  pending_base_rollup=12099  output_rows=76724
+```
+
+- **53 rebuilds in 6.5 min = ~490/hr.**
+- `pending_base_rollup` fell 12,153 -> 12,099, i.e. **~500/hr NET drain** — it is
+  draining, not holding level. Across the wider window it went 12,460 -> 12,099
+  in ~15 minutes.
+
+The earlier "flat" reading was the same artifact: sampled while the coordinator
+was starved, so accrual matched a suppressed drain.
+
+### What this does to the estimate
+
+| | at 90/hr (wrong) | at 490/hr (measured) |
+|---|---|---|
+| 12,100 pending base_rollup | ~139 h | **~25 h** |
+| duty-cycled for restarts (~50%) | — | **~50 h** |
+
+The duty cycle matters and is the remaining tax: each container spends its first
+5 minutes in the preload bound, and deploys land every ~20-40 minutes, so a
+container gets roughly 15-35 productive minutes before it is replaced. On a quiet
+prod the figure is the ~25 h one.
+
+So the conclusion changes in degree, not in kind: the backlog now genuinely
+converges, on the order of a day or two rather than a week, and coarsening the
+24.4x inflation would still collapse that by an order of magnitude. But "it does
+not converge" — stated earlier on this page — is retracted.
