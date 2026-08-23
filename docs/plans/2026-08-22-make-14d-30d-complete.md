@@ -10,7 +10,7 @@ Baseline and method: `2026-08-22-seven-window-six-project-matrix.md` — six
 projects × seven windows × nine of monoscope's real query shapes, prod,
 read-only, warm rep quoted.
 
-## What "fails" actually means — three distinct failure modes
+## What "fails" actually means — four distinct failure modes
 
 Not one problem. The checklist below is organised around this split, because
 the fixes do not overlap.
@@ -20,17 +20,25 @@ the fixes do not overlap.
 | **A. Statement timeout** | `canceling statement due to statement timeout` at the 60 s `DEFAULT_MAX_STATEMENT_SECS` cap (`min(client, server)`, so a client cannot raise it) | most aggregates at 14d/30d, every project with data |
 | **B. Per-query memory budget** | `Resources exhausted: unordered merge-on-read dedup exceeded its 2048 MiB per-query budget` | p1 `log_list` at 30d — while p4's same shape at 30d returns in 879 ms |
 | **C. Server-wide unavailability** | new connections time out entirely while one wide scan runs; killed the harness once and blanked a `timefusion_stats` poll | during 30d aggregates |
-| **D. Wedged query — no completion, no cancel** | a query ran **>20 min with `statement_timeout = 70s` set and the timeout never fired**, while the server kept answering `SELECT 1` on new connections normally | p5 7d `throughput`, prod `a7a4eb0` |
+| **D. Wedged query — no completion, no cancel** | a query ran **>20 min and the effective 60 s cap never fired** (client asked 70 s, server caps at 60 s, `min()` applies), while the server kept answering `SELECT 1` on new connections normally and the container had 2 h uptime | p5 7d `throughput`, prod `a7a4eb0` |
 
 Mode C is the one to be loudest about: a single 30-day query is currently an
 **availability** event, not just a slow query.
 
 Mode D is worse than a timeout and deserves its own investigation. A cancelled
 query returns an error the dashboard can render; a wedged one holds the
-connection forever. It also means **the 60 s cap is not a reliable backstop** —
-any plan for 14d/30d that assumes "worst case, it times out at 60 s" is
-assuming something that did not hold here. Reproduce it before trusting any
-completion guarantee.
+connection forever. It also means **the 60 s cap may not be a reliable
+backstop** — any plan for 14d/30d that assumes "worst case, it times out at
+60 s" is assuming something that did not hold in the p5 case.
+
+**Evidence quality, stated because it cuts both ways.** The p5 instance is
+clean: container up 2 h, `SELECT 1` instant on a new connection, no deploy in
+the window. A second apparent instance — p6 7d `group_by_service` returning 169
+rows after **189,775 ms** — is *confounded*: prod deployed mid-sweep
+(`a7a4eb0` → `7e5bb5a` → `11cd17a`), and two `server closed the connection
+unexpectedly` errors in the same p6 run were those restarts, **not** query
+crashes as first read. So: one clean instance, one suggestive but contaminated.
+Reproduce on a quiet build before treating mode D as characterised.
 
 ## The two root causes both modes A and B trace to
 
@@ -74,6 +82,14 @@ merge-on-read table answers with the pre-update row. So this is a cost to
       now exist in prod — read them before choosing a fix, because
       `no_witness` is a *throughput* problem (republish clears it) and `moved`
       is not (the partition really is churning). Opposite fixes, same miss.
+      **First action is a flag flip, not a wait.** The build currently deployed
+      (`a7a4eb0`, "fingerprint fallback for witness-less slices, default OFF")
+      already carries the fallback for the `no_witness` sub-case, gated behind
+      `TIMEFUSION_ROLLUP_SLICE_FP_FALLBACK`. If `rollup_stale_no_witness`
+      dominates `rollup_stale_moved` when read — prior measurement put
+      `no_witness` at ~95% — then enabling that flag is the cheapest available
+      test of item 1.1, with a kill switch. Read the two counters first; the
+      flag does nothing for `moved`.
 - [ ] **1.2 Bound `log_list` so TopK never deduplicates the whole window.**
       `ORDER BY timestamp DESC LIMIT 251` should resolve versions for ~251
       rows, not 30 days of them. p4 answers this shape at 30d in 879 ms and p1
@@ -85,8 +101,17 @@ merge-on-read table answers with the pre-update row. So this is a cost to
       connections. (Note a scan-pressure valve / `GatedScanExec` already exists
       in `database/scan.rs` — establish why it did not fire here before
       building anything new.)
-- [ ] **1.4 Make the statement timeout actually fire.** Mode D: a 7d query ran
-      >20 min against `statement_timeout = 70s` and never cancelled, on a
+- [ ] **1.4 Treat `col IS NOT NULL` as a no-op against a measure that already
+      skips nulls. CONFIRMED BY MEASUREMENT — see §"The p95 finding" below.**
+      monoscope emits `AND duration IS NOT NULL` on every latency chart. That
+      single predicate flips the miss reason from `not_built` to
+      `filter_not_eligible`, i.e. **the latency charts can never route no
+      matter how good coverage gets.** `p95_latency` is one of the two shapes
+      that fails most often at 30d, `duration_digest` is already declared, and
+      this is a planner change with no spec change and no rebuild. Highest
+      value-per-effort item on this page.
+- [ ] **1.5 Make the statement timeout actually fire.** Mode D: a 7d query ran
+      >20 min against an effective 60 s cap and never cancelled, on a
       server that was otherwise healthy. Until this is understood, "it will at
       worst time out" is not a property we have. Find where the cancellation
       check is not reached — a tight loop with no yield point, or a blocking
@@ -125,16 +150,94 @@ merge-on-read table answers with the pre-update row. So this is a cost to
       - `level` / `status_code` filters — `filter_not_eligible`; `level` is
         not a declared dimension.
       Each is a spec change plus a 30-day rebuild, which is wall-clock physics.
-- [ ] **3.2 Verify whether `AND duration IS NOT NULL` disqualifies the p95
-      widget.** monoscope emits it on every latency chart (§3a). `duration` is
-      not a declared dimension and the spec's own rule is "a filter on any
-      column NOT listed disqualifies a query from routing" — yet
-      `duration_digest` exists precisely to answer that widget. If confirmed,
-      the fix is to recognise `col IS NOT NULL` as a no-op against a measure
-      that already skips nulls, and it would unblock every latency chart at
-      every window for free. **Unverified** — the counter-diff A/B is written
-      (`routing_ab.py`, arms 2 vs 3 isolate exactly this predicate) but has not
-      been run.
+- [x] ~~**3.2 Verify whether `AND duration IS NOT NULL` disqualifies the p95
+      widget.**~~ **Done — confirmed.** Promoted to item 1.4; it needs no spec
+      change and no rebuild. Evidence below.
+
+## The p95 finding — measured, and it is a planner bug not a coverage problem
+
+Counter-diff A/B on the whale at 3d, 3 reps per arm, requiring the reason to
+increment ≥3 so a coincidence with live monoscope traffic is implausible.
+Arms 2 and 3 are **character-identical except for `AND duration IS NOT NULL`**:
+
+| arm | miss reason, ×3 |
+|---|---|
+| 1 `count(*)` by bucket, bare | `not_built` |
+| **2 p95 exactly as monoscope emits it** | **`filter_not_eligible`** |
+| **3 the same p95, minus `IS NOT NULL`** | **`not_built`** |
+| 4 group-by `resource___service___name` | `not_built` |
+| 5 error-rate with the verbatim declared predicate | `not_built` |
+| 6 `dcount` | `missing_measure` |
+
+Every other arm reports `not_built`, which is what a rebuilding tier reports
+(`rollup_min_contiguous_days` was 0 on this young container). Arm 2 reports
+`filter_not_eligible` **instead** — so the eligibility check runs *before*
+coverage is consulted, and the conclusion is independent of the coverage state
+this happened to be measured in:
+
+> **The latency charts cannot route at any window, however complete the rollup
+> tier becomes.** `duration_digest` is declared and unfiltered specifically to
+> answer this widget, and a null-guard the widget always emits is what rejects
+> it.
+
+The spec rule doing this is deliberate and correct in general — "a filter on
+any column NOT listed disqualifies a query, because a filter cannot be applied
+after aggregation". `IS NOT NULL` against a measure that already skips nulls is
+the case where it is over-strict: `count`/`sum`/`tdigest` over `duration`
+ignore null rows anyway, so the predicate cannot change the answer.
+
+Arm 6 independently confirms the `dcount` gap in item 3.1 — `missing_measure`,
+not a filter problem.
+
+### Confirmed in the code, not only in the counters
+
+`src/rollup.rs:1741` — the residual survives promotion, and the guard asks
+whether any column it constrains is mentioned by *any declared filter*:
+
+```rust
+if !promotable
+    .iter()
+    .flat_map(|expr| expr.column_refs())
+    .any(|column| configured_filters.iter().any(|(_, filter)| filter.contains(column.name.as_str())))
+{
+    return MissReason::FilterNotEligible;
+}
+```
+
+The declared filters mention `kind`, `name`, `status_code` and
+`attributes___http___response___status_code`. They never mention `duration` —
+`duration` is a measure *column*, not a filter column — so a residual of
+`duration IS NOT NULL` matches nothing and declines. The counter measurement
+and the code agree.
+
+The guard itself is sound and was added for a good reason (2026-08-12: 84
+declines in 3 h, all log-explorer/facet residuals, drowning the real
+near-misses). The narrow gap is that it tests against *filter* columns only,
+while a null-guard on a *measure* column can be a no-op — `count`, `sum`,
+`min`, `max` and `tdigest` over `duration` all skip nulls. So the fix is to
+drop `col IS NOT NULL` from the residual before this guard runs — not to weaken
+the guard.
+
+**The drop condition must be ALL measures, not the matched one — getting this
+wrong is a silent wrong-answer bug.** A mixed query is the common case, and the
+§6 top-K shapes are exactly it:
+
+```sql
+SELECT count(*), approx_percentile(0.95, percentile_agg(duration)) …
+WHERE … AND duration IS NOT NULL GROUP BY bucket
+```
+
+`count(*)` maps to `request_count`, which counts rows **including** those with
+a null `duration`. The predicate is therefore load-bearing for that measure —
+drop it and `count(*)` silently returns a larger number than the raw path.
+`p95` maps to `duration_digest`, for which the same predicate is a no-op.
+
+So the rule is: strip `col IS NOT NULL` only when **every** measure the query
+resolves to null-skips on `col` (i.e. aggregates `col` itself). If any resolved
+measure is null-insensitive to `col` — `count(*)`, or an aggregate over a
+different column — the predicate stays and the query declines exactly as it
+does today. Conservative in the mixed case, correct in the pure-latency case,
+which is the one that actually fails at 30d.
 
 ### Explicitly NOT on this list, with the measurement that says so
 
@@ -148,6 +251,31 @@ merge-on-read table answers with the pre-update row. So this is a cost to
 - **"Mirror the Delta log into a second database" to fix planning.** The
   ghost-project control shows planning cost tracks the *window asked for*, not
   the files found, and delta-rs already keeps the snapshot resident.
+
+## The pass/fail baseline this goal is defined against
+
+Completion only — ignore latency. `✓` = returned rows, `✗` = failed.
+p1–p4 measured on `5062a7d`, p5–p6 on `a7a4eb0`+ (see the deploy caveat).
+
+| project | 14d | 30d | notes |
+|---|---|---|---|
+| p1 `87576849` | 1 of 5 | 0 of 5 | only `log_list`; 30d `log_list` **OOMs** (mode B) |
+| p2 `edb04135` | 5 of 5 | 3 of 5 | 14d is empty-window (no data newer than 14d) |
+| p3 `00000000` | 3 of 6 | 1 of 6 | shared unified-default table, worst case |
+| p4 `dcad860a` | 4 of 6 | 3 of 6 | whale; 30d `log_list` fine at 879 ms |
+| p5 `be87ebc1` | **5 of 5** | 3 of 5 | best result; 30d p95 + error_rate time out |
+| p6 `28f62f01` | 3 of 5 | 1 of 5 | one cell confounded by a deploy restart |
+
+Two things this table says that the latency numbers hide:
+
+- **`log_list` completes at 30d for five of six projects**, and the one
+  exception fails on *memory*, not time. Item 1.2 alone moves p1 from 0/5 to
+  1/5 at 30d.
+- **`p95_latency` and `error_rate` are the two shapes that fail most often at
+  30d.** Both are rollup-routable in principle — `duration_digest` and
+  `error_count` are declared measures — so items 1.1 and 1.4 target exactly the
+  cells that fail. Item 1.4 is confirmed to be what blocks `p95_latency`
+  specifically, independent of coverage.
 
 ## How to tell it worked
 

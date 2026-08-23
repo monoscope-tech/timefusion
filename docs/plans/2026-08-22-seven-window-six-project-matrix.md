@@ -84,7 +84,35 @@ with nothing to read.
 | topk_services | — | — | 5,828 | — | 37,857* | — | — |
 | facet_service | — | — | 1,309 | — | 31,903* | — | — |
 
-*(p4–p6 pending; sweep in progress.)*
+### p4 `dcad860a-9a98-4c9e-9e69-20d52dcf90e2` — the whale
+
+| shape | 1h | 3h | 24h | 3d | 7d | 14d | 30d |
+|---|---|---|---|---|---|---|---|
+| throughput | 1,542 | 562 | 1,367 | 2,848 | 6,734 | 15,190 | 30,901* |
+| group_by_service | 1,032 | 570 | 2,874 | 4,951 | 7,437 | 16,956* | fail |
+| p95_latency | 653 | 648 | 4,774 | 7,306 | 11,875 | fail | fail' |
+| error_rate | 380 | 527 | 1,811 | 4,905 | 9,140 | 23,128* | fail |
+| log_list | 623 | 402 | 414 | 303 | 693 | 659 | **879** |
+| needle_trace_id | 246 | 518 | 260 | 258 | **35,106\*** | 1,032 | 6,012 |
+| dcount_service | — | — | 1,501 | — | 8,411 | — | 44,148* |
+| topk_services | — | — | 4,372 | — | 29,144* | — | fail |
+| facet_service | — | — | 1,218 | — | 29,673* | — | fail |
+
+### p5 and p6 — measured on a later build, do not merge with the above
+
+p5 `be87ebc1` and p6 `28f62f01` were re-measured after the session lost its
+scratchpad, on prod `a7a4eb0`+ with cold caches — a **different build** from
+p1–p4's `5062a7d`. Per this page's own boundary rule they are not comparable
+cell-for-cell, so they are reported as completion status rather than latency,
+in the pass/fail table of
+`2026-08-22-make-14d-30d-complete.md`. Headline: p5 completes **5 of 5** shapes
+at 14d and 3 of 5 at 30d — the best result of the six — while p6 completes 3 of
+5 and 1 of 5. The same aggregate-versus-needle split holds: p6's `log_list`
+returns in 2,151 ms at 30d while every one of its aggregates fails.
+
+The cold-cache penalty on the later build is itself worth noting: p5's 1h
+throughput read 2,054 ms there against 189 ms on the earlier warm run of the
+same shape. Any cross-build comparison on this page is a cache measurement.
 
 ## What the matrix says
 
@@ -175,8 +203,10 @@ That is an availability symptom, not merely a latency one.
 
 - The planning floor's internal split. Needs `wall − EXPLAIN ANALYZE execution`
   per window; EXPLAIN ANALYZE times execution only.
-- Whether monoscope's `AND duration IS NOT NULL` (shapes doc §3a) is itself a
-  routing blocker. `duration` is not a declared dimension, and the spec's own
-  rule is "a filter on any column NOT listed disqualifies a query from
-  routing" — yet `duration_digest` exists precisely to answer that widget.
-  A counter-diff A/B is queued.
+- ~~Whether monoscope's `AND duration IS NOT NULL` is a routing blocker.~~
+  **Answered: yes.** A counter-diff A/B isolating exactly that predicate flips
+  the miss from `not_built` to `filter_not_eligible`, and the mechanism is
+  confirmed at `src/rollup.rs:1741`. The latency charts cannot route at any
+  window regardless of coverage. Written up in
+  `2026-08-22-make-14d-30d-complete.md` §"The p95 finding", including the
+  all-measures condition the fix must respect to avoid changing `count(*)`.
