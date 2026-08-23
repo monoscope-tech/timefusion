@@ -1285,3 +1285,35 @@ argument that rollup routing strips tantivy hints (`strip_index_hints`, and the
 `ebfa7e0` fix behind it) suggests no `text_match` ever reaches a rollup scan, but
 that is exactly the shape of reasoning that has failed repeatedly today. A log
 query for tantivy activity by table is running; the claim waits for it.
+
+### 16:30 — the "rollup indexes are never read" hypothesis weakens on its own code evidence
+
+Read `strip_index_hints` properly instead of leaning on the memory of it. Its
+doc comment is explicit about scope: it drops hints **inside the matcher**, where
+a query's filter is compared against a declared measure's filter, because the two
+sides do not receive the same hints (prod 2026-08-12: three hints in two arities
+on one side, one on the other). It says nothing about the plan that executes.
+
+So it does **not** support "no `text_match` reaches a rollup scan". The opposite
+is more likely: `tantivy_rewriter` attaches hints additively based on
+`indexed_columns_for(table)`, and rollup dimensions *are* indexed columns by the
+inheritance above — so a routed query can carry a hint straight into the rollup
+`TableScan`, and the rollup index would be consulted.
+
+**So the recommendation I was one step from making — disable tantivy on
+synthesized dimensions — is not supported, and I am not making it.** The
+inheritance via `..f` is real and looks unintended; whether it is load-bearing is
+unresolved, and the cheap inference cut *toward* these indexes being used once I
+read the code rather than recalling it.
+
+What would settle it, in preference order:
+1. A prod log scan for tantivy/prefilter activity keyed by table name. Started;
+   it exceeds the SSH command timeout on a busy service and needs narrowing to a
+   single grep over a short window.
+2. `EXPLAIN` of a routed dashboard query that carries a `text_match` hint — if a
+   rollup `TableScan` shows a tantivy prefilter, the question is answered in one
+   query and no log scan is needed.
+
+Even if they are read, indexing low-cardinality raw dimensions (`level`, `kind`)
+is questionable next to bloom filters and column stats — but that is a design
+opinion, not evidence, and it does not justify deleting anything today.
