@@ -78,3 +78,49 @@ Two adjacent facts worth carrying:
 - **`dirty_bin_queue_depth` is 19,411** with `dirty_bin_processed_total = 0` on
   this container — the same "queued but nothing draining" shape, from the
   compaction side.
+
+## Verified in prod — maintenance started for the first time
+
+`319c5a8` reached prod as image `2321c47`. The container booted at ~14:36 and the
+preload-wait bound is 300 s, so the prediction was "nothing until ~14:41, then
+work". Sampled once a minute:
+
+```
+14:36:15  tasks_running=0   rebuilds_full=0   output_rows=0      pending=22445
+14:37:15  tasks_running=0   rebuilds_full=0   output_rows=0      pending=22445
+14:38:16  tasks_running=0   rebuilds_full=0   output_rows=0      pending=22445
+14:39:16  tasks_running=0   rebuilds_full=0   output_rows=0      pending=22445
+14:40:16  tasks_running=0   rebuilds_full=0   output_rows=0      pending=22445
+14:41:17  tasks_running=15  rebuilds_full=18  output_rows=6970   pending=22370
+```
+
+It fires at the bound, to the minute. Sustained over the following eight
+minutes:
+
+```
+14:42  running=16  rebuilds=30  output_rows=21782
+14:46  running=16  rebuilds=40  output_rows=22647
+14:49  running=16  rebuilds=41  output_rows=24807
+```
+
+`tasks_running` sits at 16 — the pool is saturated, i.e. work is queued and
+being taken, not trickling. ~23 full rebuilds in 8 minutes is roughly 170/hr
+against a previous rate of **zero**; the concurrent session's "~4 builds/hr"
+ceiling was measured on containers where the coordinator had never started.
+
+`tasks_pending` drifts down slowly (22,445 → 22,326) because ingest keeps
+enqueueing while the backlog drains — the relevant fact is that it is moving at
+all, and `pending_base_rollup` is falling (12,663 → 12,544).
+
+### What this does and does not settle
+
+It settles the mechanism: an unbounded wait on a preload that never completes was
+disabling all maintenance, and bounding it starts the work. It does NOT yet show
+14d/30d completing — 12.5k base-rollup units remain, and at this rate that is
+hours of drain, during which the deploy train will restart prod repeatedly. Each
+restart now costs the 5-minute wait rather than the whole container's life, which
+is the difference between a backlog that drains and one that only grows.
+
+The honest next check is whether the tier reaches the sealed days the widest
+windows need — `rollup_miss_not_built_total` falling, and `14d`/`30d` cells
+turning from `not_built` into hits.
