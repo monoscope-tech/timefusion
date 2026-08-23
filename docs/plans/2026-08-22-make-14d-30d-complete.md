@@ -298,6 +298,28 @@ Two things this table says that the latency numbers hide:
   cells that fail. Item 1.4 is confirmed to be what blocks `p95_latency`
   specifically, independent of coverage.
 
+## The pass condition could not be run on 2026-08-23, and why
+
+Attempted and abandoned with evidence. Over one working session prod was
+observed running `fa5d2f7`, `6a5975a`, `b12b4ac` and `70f4a9b` — **a restart
+roughly every 10-15 minutes**, against a `rollup_min_contiguous_days` rebuild
+that takes ~25. It never reached 30. Two automated watchers polled for a valid
+window and neither found one.
+
+With coverage at 0 the router does not attempt, so every cell records neither a
+hit nor a miss and the sweep reads exactly like "the fixes did nothing" — trap 1
+below, in its most expensive form. Every other process-scoped counter is equally
+unreadable: `wide_scan_selected_mb_p99` went 3,506 → 1,057 → 554 → 0 purely with
+process age, and `rollup_witnessless_slices` reads 0 until the hourly recovery
+pass has run once.
+
+**So the precondition for this sweep is not a code state, it is a quiet prod.**
+Nothing measured inside a 15-minute process is worth quoting. Before re-running:
+confirm uptime exceeds the coverage rebuild, stamp every cell with
+`docker service ps` (not `ls`), and reduce scope to the 14d and 30d cells — the
+pass condition names only those, and a 30d aggregate is itself the mode-C
+availability risk.
+
 ## How to tell it worked
 
 The pass condition is binary and cheap to re-measure: re-run the sweep and
