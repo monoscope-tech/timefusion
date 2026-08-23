@@ -979,3 +979,42 @@ reach the age bound). #6 is confirmed.
 Worth keeping: when the deploy cadence is minutes, *reach for the object store,
 not the counter*. Three separate questions tonight were unanswerable from
 `timefusion_stats` for exactly this reason.
+
+## #5's premise is REFUTED — nothing declining is `level=` or `kind IN (...)`
+
+The task assumed two spec gaps. Both are wrong, and the second is wrong in a way
+worth stating plainly: **`kind` is already a declared dimension, and `InList` on
+a declared dimension has been handled since the otel_metrics work**
+(`dimension_filter_sql`, src/rollup.rs:1216). `kind IN (...)` routes today.
+
+What actually declines, from `rollup_promotion_unmatched` over 8 h of prod — two
+shapes, both the same chart, `level` appearing in exactly ZERO of them:
+
+```
+promoted = status_code GtEq N AND jsonb_path_exists(to_jsonb(hashes), "<endpointHash>")
+promoted = status_code GtEq N AND status_code Lt N AND jsonb_path_exists(to_jsonb(hashes), "<endpointHash>")
+```
+
+These are **endpoint-scoped status-class charts**: monoscope's per-endpoint 4xx/5xx
+panels. The `kind = ?` conjunct in them is fine. Two things are not:
+
+1. **Status CLASS buckets.** The spec declares `error_count` at `>= 500` only,
+   so a 4xx bucket matches no measure. A `status_class` dimension (five values:
+   1xx-5xx) would answer every one of them.
+2. **The endpoint hash.** `jsonb_path_exists(to_jsonb(hashes), …)` selects one
+   endpoint out of a per-project set. That is a genuine dimension in the
+   dashboard's terms and a cardinality question in the tier's.
+
+So had `level` been added tonight — at the cost of a 30-day dark tier — it would
+have fixed **none** of the observed misses. That is the whole value of the check
+the task asked for.
+
+Sample size is small (8 warns over 8 h; the WARN is per-plan, not per-query) but
+unanimous, and it is consistent with `filter_not_eligible = 31` being one query
+family, exactly as `rollup_miss_was_one_query_shape` found in August.
+
+**Recommendation, unchanged in shape but re-aimed:** the per-file dimension-set
+tag first, so a spec addition stops being invalidation; then `status_class`,
+which is cheap and answers both observed shapes; then the endpoint hash, which
+needs a cardinality decision. `level` drops to last — it is a real filter shape
+in monoscope's query language, but it is not what production is refusing.
