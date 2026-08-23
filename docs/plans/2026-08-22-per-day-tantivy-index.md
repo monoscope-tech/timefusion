@@ -1165,3 +1165,32 @@ event logs rather than from the snapshot.
 **Next is not a tantivy change.** It is to confirm the doubling at its source and
 fix the snapshot, then re-run the census and see what the real backlog is. There
 may not be one worth a per-day index at all.
+
+### 15:55 — census deduped, and one corroboration withdrawn before it was used
+
+Fixed in `0417691`: the census now groups snapshot URIs through a pure
+`group_parquet_by_project`, which drops repeats and returns the pre-dedupe count
+so the caller can log `delta_snapshot_duplicate_files{raw, distinct}`. Doctest
+covers it and is discriminating (without `.unique()` the grouped length is 2).
+
+**A corroboration I nearly used, and shouldn't have.** I found
+`dedup_partition_paths` called from several compaction paths and was about to
+write that "the codebase already defends against this duplication, just not in
+the census". Reading it first: it does **not** dedupe anything — it *filters*
+snapshot paths to one project/date partition. The name says dedup; the body is a
+partition filter. So there is no existing duplicate defence, and the comforting
+"established remedy" framing was false.
+
+That leaves the mechanism inferred rather than proven. What is *proven* is
+over-counting: 6441 uncovered > 4490 live files is arithmetic, not a theory.
+*Why* the list repeats is still a hypothesis, which is exactly what the new
+warning settles — it fires only if `get_file_uris()` genuinely returns the same
+path twice. If the census still exceeds `numOfAddFiles` while the warning stays
+silent, the cause is elsewhere (summing across roots, or a stale `table_ref`),
+and I would rather learn that from the instrument than from another day of
+inference.
+
+**The larger question this opens, flagged not fixed:** if `get_file_uris()`
+repeats paths, the census is not the only consumer. Whether the scan path can
+double-read a file is a correctness question well outside the tantivy work, and
+it should be answered deliberately rather than patched on suspicion.
