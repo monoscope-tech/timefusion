@@ -430,6 +430,36 @@ The mitigation the plan hypothesized for a "cost tracks uptime" outcome — a
 scheduled restart — would have been actively harmful: **restarts are the thing
 that produced every stall measured here.**
 
+### A second, smaller phenomenon survives the quiet window — and it IS the connection path
+
+One slow sample appeared with no deploy anywhere near it (26 samples, 1 slow).
+Lined up against the four deploy-churn stalls, it does not belong to them:
+
+| uptime | load | dns | tcp | **connect** | **reuse** | |
+|---|---|---|---|---|---|---|
+| 722 s | 37.2 | 1.7 | 78.5 | 1,433 | **353** | deploy churn |
+| 184 s | 28.4 | 1.4 | 123.5 | 1,420 | **198** | deploy churn |
+| 505 s | 41.3 | 1.6 | 86.4 | 2,960 | **680** | deploy churn |
+| 544 s | 49.5 | 4.3 | 103.2 | 3,675 | **1,249** | deploy churn |
+| 2,057 s | **30.6** | 2.0 | 62.5 | **1,450** | **77.5** | quiet window |
+
+In the churn stalls the *whole process* is slow — a warm `SELECT 1` costs
+198–1,249 ms. In the quiet-window stall the warm query is **77.5 ms**, DNS and
+TCP are normal, and only the phase between "socket open" and "ready for query"
+— pgwire startup, auth, session setup — takes 1.4 s. Everything else about that
+sample is calm: load 30.6, mid-life uptime, no restart on either side of it.
+
+**This narrows the connection path back in, on better evidence than the plan
+ruled it out with.** §1 discharged it because a warm connection paid the cost
+too — but every sample §1 had was a churn sample, where everything pays. With
+churn removed, what is left is connection-establishment-only, at ~4 % of samples.
+
+The instrument for it already half-exists: the healthcheck probe times its own
+`auth_ms` stage (see `spawn_runtime_lag_sampler`'s doc), and per-connection
+session setup is the obvious suspect to time next. That is the natural Phase 2
+if the rate holds — but at 1 in 26, it needs more samples before anyone
+instruments a specific stage.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
