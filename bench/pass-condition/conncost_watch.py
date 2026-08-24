@@ -82,6 +82,10 @@ STATS = [
     ("memory", "charged_bytes"),
     # Fragmentation: memory held but not in use. The only candidate left after
     # every other instrument either froze or fell across the cost onset.
+    # Per-connection setup: the one phase a connect-only stall can hide in.
+    ("block", "pgwire_startup_handler_build.max_ms"),
+    ("block", "pgwire_simple_handler_build.max_ms"),
+    ("block", "pgwire_simple_handler_build.avg_us"),
     ("jemalloc", "frag_pct"),
     ("jemalloc", "allocated_mb"),
     ("jemalloc", "resident_mb"),
