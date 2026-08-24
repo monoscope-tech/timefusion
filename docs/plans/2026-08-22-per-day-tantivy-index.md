@@ -2203,14 +2203,37 @@ from.
    reconcile taught to sweep tables that have manifests but are no longer
    indexed. Tracked as follow-up; deliberately not in this diff.
 
+## P0 verification, from the same 90 minutes of logs
+
+| # | Pass condition | Result |
+|---|---|---|
+| 1 | no `exit 137` after several cycles | **PASS** — every container transition in the window is a deploy, none an OOM kill |
+| 2 | `skipped_today=0` on the rollup tiers | **PASS** — 0 on all four (was 690); `otel_logs_and_spans` still skips 5-6, which is the intended half |
+| 3 | `tantivy_reconcile_gc_deferred` absent or small | **PASS** — absent over 90 minutes |
+| 4 | `older` drains | **UNSETTLED** — and now unmeasurable against the old population, see below |
+
+`tantivy_uncovered_files = 6,315` is the last reading under the OLD definition.
+Prod index blob counts at the same moment, which is the population about to
+change: `otel_logs_and_spans` 10,874 objects / **441 GB**, the six rollup
+prefixes **6,398 objects / 428 MB** combined. So the tiers are 37% of index
+objects and 0.1% of index bytes — the obligation they impose is per-file build
+overhead (~1.75s each), not storage.
+
 ## What this demotes
 
-The reconcile cadence defect found earlier today stands but is now second
-priority. `spawn_cron_job` skips an overlapping tick **for the whole job**, so a
-spans pass longer than 15 minutes blocks every other table's next tick too —
-prod logged `Tantivy reconcile job run still in progress after 600s (skips=2)`
-at 11:00 and 11:15 against a 10:45 start, i.e. one slot per ~45 min where the
-22:15 sizing assumed four an hour. `buffer_unordered(3)` fixed
-slow-blocks-fast *within* a tick and moved the starvation to *between* ticks.
-Re-measure it after the population is 48% smaller before building per-table tick
-gating.
+The reconcile cadence defect found earlier today is real but second priority.
+`spawn_cron_job` skips an overlapping tick **for the whole job**, so a spans pass
+longer than 15 minutes blocks every other table's next tick too:
+`Tantivy reconcile job run still in progress after 600s (skips=2)` at 11:00 and
+11:15 against a 10:45 start — one slot in 45 minutes where the 22:15 sizing
+assumed four an hour. `buffer_unordered(3)` fixed slow-blocks-fast *within* a
+tick and moved the starvation to *between* ticks.
+
+**How chronic it is, is not established, and prod cannot answer it right now.**
+The 11:45 and 12:00 passes each served all five tables promptly — but they ran in
+*different containers* (`oraxglu2ny21`, `xx3yvnnzuqx7`), so each container got
+exactly one tick before being replaced and neither could have skipped. That is
+P2 #7 (deploy cadence vs unit length) confounding the measurement, not evidence
+either way. Re-measure on a container with >45 min uptime, and after the
+population is 37% smaller — a shorter spans pass may close the gap by itself
+before any per-table tick gating is worth building.
