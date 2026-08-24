@@ -108,6 +108,19 @@ mid-run means the samples either side are different processes.
     cd bench/pass-condition && python3 conncost_watch.py            # 30-min loop
     python3 conncost_watch.py --analyze                             # the verdict
 
+**The quiet window, and who it binds.** Phase 0 and "push to master often" are
+in direct conflict: master deploys, a deploy restarts prod, and a restart voids
+the series. So the instrumentation above was front-loaded into one push
+(`5e7934b`, 2026-08-24) and the window starts with the process that deploy
+brings up. **Any push to master during the window resets the clock** — the
+sampler keeps running and `--analyze` will simply report a shorter longest-run.
+Nobody has to coordinate; they only have to know that a deploy is not free here.
+
+The 2026-08-24 baseline against the *pre*-instrumentation binary, for reference:
+`connect=2147 ms`, `query=1269 ms`, `reuse=749 ms` at host load 27.5 — the
+symptom reproduces, and `runtime.uptime_seconds` came back **empty**, which is
+the gap this instrumentation closes.
+
 **Phase 1 — attribute the block, not the CPU.** With no CPU profiler in prod
 (`TIMEFUSION_CPU_PROFILE=false` since the 2026-08-11 SIGSEGV crashloop, newest
 flamegraph is Aug 12), the usual tool is unavailable, and the signal to chase is
