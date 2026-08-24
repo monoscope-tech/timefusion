@@ -2254,3 +2254,48 @@ re-run the two arms and require both:
 If (1) passes and (2) does not, the rollup leg was not the cost and the raw
 leg's prefilter is; that is a different fix and this one still stands on the
 build-side saving alone.
+
+## 2026-08-24 — pass condition 1: PASS, on `3700730`
+
+Same script, same project, same window, on a container running the fix
+(`git merge-base --is-ancestor 8698271 <live-sha>`, not SHA equality — the
+deploy train landed out of order today and put an *older* image live twice):
+
+| rep | `kind = 'server'` | `upper(kind) = 'SERVER'` | `d_attempt` |
+|---|---|---|---|
+| 0 | 308 ms | 192 ms | 0 |
+| 1 | 211 ms | 209 ms | 0 |
+| 2 | 219 ms | 200 ms | 0 |
+| 3 | 248 ms | 412 ms | 0 |
+| 4 | 229 ms | 223 ms | 0 |
+
+**8,206 ms -> 211 ms, and the two arms are now indistinguishable** — which is
+the real result, because it says the predicate is being served by the ordinary
+scan rather than by a cheaper index. `prefilter_attempts` moved 0 on every rep,
+so the tier has left `indexed_set()`, which is the mechanism check the latency
+alone cannot give.
+
+### The orphans are collected
+
+Deleted from object storage after the fix went live, having backed the manifests
+up locally first:
+
+- six rollup prefixes: **84 manifests + 6,398 blobs** (428 MB)
+- `indexes/otel_metrics/`: **981 blobs, 3.67 GB** — the other half of the
+  2026-08-23 orphan. Last session deleted that table's manifests and left its
+  blobs, which nothing can read (no manifest) and nothing can GC (the table is
+  not in `indexed_set()`).
+
+`index_manifests/` and `indexes/` now contain exactly one prefix,
+`otel_logs_and_spans`. The generic fix — reconcile sweeping tables that have
+manifests but are no longer indexed — is still worth building; this is the third
+time the shape has appeared and each time it was cleaned by hand.
+
+### Not caused by this change: a flaky E2E guard
+
+CI on `3700730` shows `E2E / text_match_conjunct_does_not_poison_parquet_pushdown`
+failing on the SECOND assertion (`DedupExec fell to full-set`; the primary
+`input_rows = 0` passes). It is **not** this change: the same test failed the
+same way on `7f15de5` hours earlier, passed on `fb8dd70` between them, and passes
+locally on the current tree. A regression guard that fails intermittently is
+worth its own look — it protects a path with two logged prod incidents.
