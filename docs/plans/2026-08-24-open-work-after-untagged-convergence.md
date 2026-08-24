@@ -6,8 +6,8 @@
 |---|---|
 | §1 immutability gap | **§1b instrumented** (`8b8ad30`), default OFF; decision still pending real data |
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
-| §3 ledger | **steps 1-3 done** (`3ec8003`, `f6b50e5`, `b9572cf`) — types, trait, JSON backend, merge/replace/retirement, populated from the tag replay, and VERIFIED against it (`coverage_ledger_disagreements`). Still additive; tags remain the authority. Next: let the counter read zero over real prod data, then move reads over, then drop the tags |
-| §4 escalation treadmill | not started (re-evaluate after §3) |
+| §3 ledger | **steps 1-3 done** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`) — built, populated from the tag replay, verified against it, and entries now name their FILES (without which it could only supplement the tags, never replace them). Gate before reads move over: `coverage_ledger_disagreements` reads zero on real prod data |
+| §4 escalation treadmill | **investigated, no code — two corrections** (`98e72d5`). (b) batching is ALREADY implicit: `enqueue` is keyed, so N escalations to one covering slice collapse to one task. (a) the on-demand split written in this doc is UNSOUND — the covering file physically holds the hole's rows, so re-tagging it narrower double-counts. Escalation stays correct until the ledger can name files per range |
 | §5 fragment debris | not started (deploy with §2, not before) |
 | §6 whale cells | no action; 7 as of 11:26 UTC |
 
