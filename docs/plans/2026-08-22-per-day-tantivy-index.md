@@ -2087,3 +2087,130 @@ matcher-scoped and does **not** settle it; I checked, and it points the other wa
 
 P0 tomorrow on a process with >40 min uptime, then **#5 before any further
 tantivy work** — it could delete half the problem rather than optimise it.
+
+---
+
+# 2026-08-24 — P1 #5 ANSWERED: rollup indexes are read, used, and a 29x loss
+
+The plan's open question was "are rollup tantivy indexes ever READ? — if nothing
+`text_match`es them, half the coverage obligation is waste and the fix is one
+line." The answer is worse than "never read", and the same one line fixes it.
+
+## The instrument, because the one the TODO named cannot work
+
+The TODO said to `EXPLAIN` a routed dashboard query and look for a tantivy
+prefilter on the rollup `TableScan`. **`EXPLAIN` cannot answer this**:
+`LogicalPlan::Explain` wraps the plan and the rewriter in `dml.rs` never sees
+it, so every EXPLAIN shows a raw `otel_logs_and_spans` scan and no rollup
+counter moves ([[tf_rollup_routing_works_plan_is_slow_2026-08-17]]). I ran it
+anyway before remembering, and it produced exactly the false negative that
+memory predicts — no rollup table anywhere in the plan, for *every* shape
+including the unfiltered one that does in fact route.
+
+What works is diffing counters around a REAL query on one connection. Two arms
+over the SAME rows, verified equal first (1,616 both ways):
+
+- `kind = 'server'` — `kind` is `tantivy: { indexed: true, tokenizer: raw }` on
+  the source, so with `route_equality` on it is rewritten to
+  `text_match(kind, 'server')` and consults the index.
+- `upper(kind) = 'SERVER'` — opaque to the rewriter, and cannot prune anything,
+  so it is the *pessimistic* control.
+
+## The measurement (prod, uptime > 40 min, `rollup_min_contiguous_days = 30`)
+
+Direct query on the tier, `bench/local/rollup_prefilter_ab.py`, 5 reps
+interleaved:
+
+| rep | `kind = 'server'` | `upper(kind) = 'SERVER'` |
+|---|---|---|
+| 0 | 9,421 ms | 296 ms |
+| 1 | 9,331 ms | 428 ms |
+| 2 | 8,529 ms | 345 ms |
+| 3 | 8,206 ms | 1,841 ms |
+| 4 | 10,885 ms | 283 ms |
+
+**best-of-5: 8,206 ms vs 283 ms — 29x.** The tantivy arm recorded
+`prefilter_attempts +1` and `prefilter_used +1` every rep; the control recorded
+neither, which is what makes this an attribution rather than a correlation.
+`index_opens` did not move, so the cost is not blob fetching — it is the search
+plus the `id IN (...)` list it hands to the scan.
+
+Not a `count(*)`-pushdown artifact: the same A/B on the real dashboard shape
+(`GROUP BY time_bucket('1 hours', …)`, `sum(request_count)`, 46 identical
+buckets) gives 7.4-9.3 s against 0.44-1.4 s.
+
+## It is not confined to direct tier queries
+
+The rollup rewrite plans its SQL through the same `SessionState`, so a routed
+dashboard pays it on the rollup leg. Four real 7d queries on p4, each routing
+(`rollup_hits_hybrid_total +1` on all four):
+
+| filter | ms | counters |
+|---|---|---|
+| none | 7,240 | `hits_hybrid+1` |
+| `kind = 'server'` | **14,484** | `hits_hybrid+1 prefilter_attempts+2 prefilter_used+1` |
+| `status_code = 'ERROR'` | **10,548** | `hits_hybrid+1 prefilter_attempts+2 prefilter_used+1` |
+| `resource___service___name = …` | 164 | `hits_hybrid+1` |
+
+`attempts+2` is one per leg — rollup and raw. The service-name arm is the
+control that proves the mechanism and not the filter is the cost:
+`resource___service___name` is a dimension too but carries no tantivy config,
+and it is the fast one.
+
+**So a filtered dashboard that routes pays roughly +3 to +7 s over the
+unfiltered one**, on exactly the 7d/14d/30d shapes the goal is about.
+
+## Why it was ever built
+
+`RollupSpec::synthesize` copies dimensions from the source with a struct update:
+
+```rust
+fields.push(FieldDef { nullable: true, ..f });   // inherits f.tantivy
+```
+
+while the `plain()` helper directly above it sets `tantivy: None` for every
+identity and measure column. `kind` and `status_code` are indexed on the source,
+so every tier inherited `indexed: true` — which is the whole reason rollup
+tables are in `indexed_set()` at all, i.e. why they are **52% of the indexed
+file population** the rest of this plan spent a day trying to drain. Item #6
+("is the `..f` inheritance intended?") is answered by #5: no.
+
+## The fix
+
+`FieldDef { nullable: true, tantivy: None, ..f }`, with the measurement in a
+comment beside it and a regression assert in
+`synthesized_rollup_stores_a_generation_and_tdigest`. `FieldDef.tantivy` never
+reaches Arrow or Delta (`TableSchema::fields`/`columns` build from name, type
+and nullability only), so this is TimeFusion-side and needs no migration of any
+live table.
+
+It fixes two things with one line: the read-path loss above, and the build-side
+obligation — four tiers leave `indexed_set()`, so the backfill, the reconcile
+pass and the coverage census all stop counting a population nothing benefits
+from.
+
+## Pre-registered, so the aftermath is not misread
+
+1. **The census will collapse, and it is NOT the drain working.** `sealed`,
+   `older` and every uncovered count drop because 52% of the population left the
+   definition, not because anything was indexed. State the population before
+   comparing to any number earlier in this document
+   ([[tf_tantivy_census_double_counts_2026-08-23]]).
+2. **Rollup manifests and blobs become orphans.** Reconcile only visits tables
+   in `indexed_set()`, so nothing will GC them — the `otel_metrics` precedent
+   (§Session close item 5), but thousands of blobs rather than ten. They must be
+   backed up and deleted from object storage by hand after the deploy, or
+   reconcile taught to sweep tables that have manifests but are no longer
+   indexed. Tracked as follow-up; deliberately not in this diff.
+
+## What this demotes
+
+The reconcile cadence defect found earlier today stands but is now second
+priority. `spawn_cron_job` skips an overlapping tick **for the whole job**, so a
+spans pass longer than 15 minutes blocks every other table's next tick too —
+prod logged `Tantivy reconcile job run still in progress after 600s (skips=2)`
+at 11:00 and 11:15 against a 10:45 start, i.e. one slot per ~45 min where the
+22:15 sizing assumed four an hour. `buffer_unordered(3)` fixed
+slow-blocks-fast *within* a tick and moved the starvation to *between* ticks.
+Re-measure it after the population is 48% smaller before building per-table tick
+gating.

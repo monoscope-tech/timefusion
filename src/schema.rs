@@ -236,7 +236,17 @@ impl RollupSpec {
             let f = src_field(d)?;
             // Always nullable in the rollup: GROUP BY emits a NULL group for
             // rows missing the dimension, even when the source column is not.
-            fields.push(FieldDef { nullable: true, ..f });
+            //
+            // `tantivy: None` explicitly, against the struct update: `kind` and
+            // `status_code` are tantivy-indexed on the source, so inheriting the
+            // config put every rollup tier into `indexed_set()` — 52% of the
+            // indexed file population — and turned a dimension equality into a
+            // `text_match` the prefilter then serves. Measured on prod
+            // 2026-08-24, same rows, 5 reps: `kind = 'server'` over a 2-day
+            // rollup window took 8.2-10.9s against 0.28-1.8s for an opaque
+            // control, and a routed 7d dashboard went 7.2s -> 14.5s when a
+            // dimension filter was added. The index is read, used, and a loss.
+            fields.push(FieldDef { nullable: true, tantivy: None, ..f });
         }
         for m in &self.measures {
             let ty = match (m.agg.as_str(), &m.column) {
@@ -846,6 +856,10 @@ mod tests {
         let rollup = spec.synthesize(source).expect("valid rollup");
         assert_eq!(rollup.field_def("rollup_generation"), Some((ArrowDataType::Utf8View, false)));
         assert_eq!(rollup.field_def("digest"), Some((ArrowDataType::Binary, true)));
+        // `kind` is tantivy-indexed on the source and must NOT inherit it here:
+        // measured 2026-08-24, the prefilter it enables costs 8.2s against a
+        // 0.28s control on the same rows. See the comment in `synthesize`.
+        assert!(rollup.fields.iter().all(|f| f.tantivy.is_none()), "no rollup field may carry a tantivy config");
     }
 
     #[test]
