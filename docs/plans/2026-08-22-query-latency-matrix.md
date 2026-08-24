@@ -1346,3 +1346,39 @@ This closes the loop opened by the 08-22 declaration: YAML declared a measure,
 storage never gained it, every derived unit failed to plan, and the documented
 migration that should have preceded it could not express the type until
 `6054b6e`.
+
+## PROVEN: the 08-22 spec change orphaned every rollup slice before it
+
+Measured offline, so it does not depend on prod uptime — which mattered, because
+prod is redeploying every few minutes and no in-process reading survives.
+
+Stored `rollup_generation` for project `00000000…`, tier `dashboard_1m_v3`,
+against what the CURRENT spec computes:
+
+| date | stored | current spec | match |
+|---|---|---|---|
+| 2026-08-18 | `b3d661e1550311f3` | `ea77658ff500170f` | **NO** |
+| 2026-08-23 | `e2f03c8ff10ffd1d` | `e2f03c8ff10ffd1d` | yes |
+
+`recover_rollup_coverage` skips any slice whose stored generation differs from
+the current spec's, so **every date built before 2026-08-22 is unrecoverable
+into the coverage map and reads `not_built` forever** — until it is rebuilt.
+
+**And nothing reports it.** `rollup_coverage_contiguity` counts DATE PARTITIONS,
+so the tier reports `contiguous_days=30` while roughly two days are actually
+usable by the read path. Every gauge we watched all session said healthy. That
+is why routing hits stayed in the tens while misses accumulated.
+
+This is the "30-day dark tier" cost I predicted as the reason NOT to edit a spec
+— and it had already been paid on 08-22, silently, before this session started.
+`stale_generation` (shipped in `b9572cf`) is what makes the next one visible.
+
+**The system should self-heal**: the backfill planner enqueues from coverage, and
+that coverage is missing, so those days are re-derivable. The open question is
+throughput, not correctness — 30 days of rebuild against a queue that is now
+finally able to shrink.
+
+**Method note.** `generation_id` ignores `source_fp` (the parameter is `_source_fp`),
+so the current value is computable from (spec, source, project, date) alone — a
+throwaway `#[test]` that prints it, compared against a bounded `SELECT DISTINCT
+rollup_generation`. No prod process involved, and the probe was reverted.
