@@ -141,6 +141,65 @@ The equivalence test had asserted only `tags ⊆ ledger`, the SAFE direction, an
 could never have caught it. It now asserts both, and the reverse is the one that
 matters.
 
+## NEW work discovered while implementing this plan
+
+`tasks/` is **gitignored**, so these are recorded here too or they are lost.
+
+### A. Units cannot survive a restart — the root cause behind everything gated
+(`tasks/16`)
+
+Not a duplicate of "hold a quiet window". That asks for calm; this asks why a
+unit needs calm. Measured: 5 deploys in 51 min, 300 s of every boot idle before
+maintenance starts, containers living 10-25 min, units averaging ~21 min. Units
+essentially never complete.
+
+`TIMEFUSION_REPAIR_RESUME_ENABLED` is the obvious extension and **does not
+port**: `classify_resume` rests on ROW PRESERVATION and a rollup aggregates, so
+every rollup resume is refused by construction. Do not relax that check — it is
+what stops a truncated staging being committed. The workable safety argument is
+the `source_fingerprint`: a staged rollup is still valid iff its input file set
+is unchanged. Sketch and traps in `tasks/16`.
+
+Cheaper partial win: the 300 s preload wait costs a fifth to a third of every
+container's life. Measure what it protects before shortening it.
+
+### B. Ledger durability and scale, before the tags are dropped (`tasks/17`)
+
+The ledger is verified but is still a best-effort JSON sidecar wearing an
+authority's clothes:
+
+- `store_sidecar` warns and continues on a failed write. Safe while tags remain
+  (a lost write UNDERSTATES, costing a rebuild); unsafe once they are the only
+  copy.
+- `CoverageEntry.files` makes the sidecar grow with FILE count (~13,800 live tier
+  files), and every change re-serializes everything. `2156525` cut this from
+  O(cells^2) to one write per tier, but the shape is unchanged. This is the
+  concrete argument for the Postgres/SlateDB backend the trait exists for.
+- `RollupCoverage.rows` is 0 when seeded from the ledger, and `source_epoch` is 0
+  on both paths. Harmless today, latent traps tomorrow — populate or delete.
+- `JsonCoverageLedger::retire_before` exists, is tested, and **has no caller**,
+  so the ledger grows for every partition the process has ever seen.
+
+### C. A defect I introduced and fixed, worth not repeating (`2156525`)
+
+`replace()` persists the WHOLE ledger; `record_readable_coverage` called it once
+per cell. That is O(cells^2) serialization on the boot path, hourly, with every
+file path in every write. The batch API is on the TRAIT rather than the backend
+because any future datastore faces the same one-write-versus-thousands choice.
+
+### D. Stop signs (`tasks/18`)
+
+Two items specified above were investigated and found HARMFUL, not merely
+unnecessary. Both sections are corrected in place, but the original text is
+exactly what a later reader re-derives:
+
+- **§4(a) is unsound.** The covering file physically holds the hole's rows, so
+  re-tagging it narrower double-counts.
+- **§5's migration deletes real queued work.** The debris needs FUSING, not
+  deleting, and the ceiling that does it is already wired.
+
+---
+
 ## Why the drain stopped (2026-08-24 13:30 UTC)
 
 `untagged` sat at 7 for four hours and I read it as expected wall-clock
