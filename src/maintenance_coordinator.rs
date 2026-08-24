@@ -4787,6 +4787,60 @@ mod tests {
     /// number. `coarsen_to_width` sums its members, so 144 of them summed 144
     /// whole days and could never fit. Prod 2026-08-19, right after the estimate
     /// fix landed: `blocked=24 over_budget=266506` — the superseded trap gone
+    /// The debris left by the old preflight shred is footprint-less one-minute
+    /// units whose stored estimates are WHOLE-FILE figures, so their sum grows
+    /// with the shredding and the fit test refuses hardest exactly where fusing
+    /// is worth most. Prod 2026-08-23: `base_rollup / 00000000 / 2026-08-13`
+    /// held 1,440 such units claiming 391 GB between them over a partition
+    /// holding 0.36 GB.
+    ///
+    /// This pins that the PARTITION CEILING alone rescues them — no migration,
+    /// no deletion of queued work. It is why the "one-shot destructive
+    /// migration" this codebase's plan called for should not be written: the
+    /// debris fuses back, and fusing preserves the work where deleting it would
+    /// not.
+    #[test]
+    fn a_footprintless_shred_fuses_once_the_partition_ceiling_is_known() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let day = 3 * DAY_MICROS;
+
+        // One-minute units, each carrying a whole-file estimate and NO
+        // footprint — the shape `split_time_task` produced before it recorded
+        // one, which is the entire stuck population.
+        let minutes = 600;
+        for slot in 0..minutes {
+            let start = day + slot * MIN_SLICE_MICROS;
+            let mut unit = task("p", start, start + MIN_SLICE_MICROS, Operation::BaseRollup);
+            unit.estimated_decoded_bytes = 4_466_185_462;
+            unit.input = None;
+            journal.upsert(unit);
+        }
+        let pending = |journal: &TaskJournal| {
+            journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup && matches!(t.state, TaskState::Pending | TaskState::Retry)).count()
+        };
+        assert_eq!(pending(&journal), minutes as usize, "the shred is queued");
+
+        // Without a ceiling the summed price is ~2.7 TB and every width refuses.
+        assert_eq!(journal.coarsen_sealed_slices(now), 0, "summed whole-file estimates refuse to fuse — this is the stuck state");
+
+        // The partition actually holds 0.36 GB. No unit over one partition can
+        // decode more than the partition contains.
+        let report = journal.coarsen_sealed_slices_capped(now, &|_project, _source, _date| Some(360 * 1024 * 1024));
+
+        assert!(report.fused > 0, "the ceiling makes the fused unit's real cost knowable, so the day collapses: {report:?}");
+        assert!(
+            pending(&journal) < minutes as usize / 10,
+            "600 one-minute units collapse to a handful of wide ones, not to nothing and not to 600: {} left",
+            pending(&journal)
+        );
+        assert!(
+            journal.tasks().any(|t| t.key.operation == Operation::BaseRollup && t.key.slice.width() > MIN_SLICE_MICROS),
+            "the work SURVIVES as wider units — fusing preserves it where a deleting migration would not"
+        );
+    }
+
     /// and every candidate refused on a number written before the fix existed.
     #[test]
     fn clearing_stale_estimates_runs_once_and_lets_a_split_day_fuse_again() {

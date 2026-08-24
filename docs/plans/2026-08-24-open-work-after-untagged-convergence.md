@@ -10,7 +10,7 @@ anything else** — notably which commits are live and the §3 gate trap.
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
 | §3 ledger | **steps 1-3 done** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`) — built, populated from the tag replay, verified against it, and entries now name their FILES (without which it could only supplement the tags, never replace them). Gate before reads move over: `coverage_ledger_disagreements` reads zero on real prod data |
 | §4 escalation treadmill | **investigated, no code — two corrections** (`98e72d5`). (b) batching is ALREADY implicit: `enqueue` is keyed, so N escalations to one covering slice collapse to one task. (a) the on-demand split written in this doc is UNSOUND — the covering file physically holds the hole's rows, so re-tagging it narrower double-counts. Escalation stays correct until the ledger can name files per range |
-| §5 fragment debris | **NOT implemented, premise unverifiable right now.** Prod reads `tasks_pending` 5,983 (not ~12,700) and is dominated by dedup (3,702) rather than base-rollup fragments (2,116) — but the process was 6 MINUTES OLD when sampled, so a low count may mean the planner has not re-derived debt yet, not that debris drained. Needs a quiet process before any destructive migration is written |
+| §5 fragment debris | **RESOLVED - no migration, and it must not be written.** `clear_stale_estimates` already exists, and the partition ceiling rescues footprint-less debris by FUSING it (proven by test). Deleting those units would have discarded real queued work |
 | §6 whale cells | **BLOCKED, not self-completing — earlier assessment was wrong.** See "Why the drain stopped" below |
 
 ## HANDOFF — read this first (session ended 2026-08-24 ~14:15 UTC)
@@ -476,37 +476,51 @@ is being attempted).
 
 ---
 
-## 5. Fragment debris cleanup
+## 5. Fragment debris cleanup - RESOLVED, and the migration must NOT be written
 
-**Size:** small-medium. **Depends on:** §2 landing first, or the debris returns.
+**Status: closed 2026-08-24. No migration. The machinery already exists and is
+wired; what was missing was evidence, now pinned by
+`a_footprintless_shred_fuses_once_the_partition_ceiling_is_known`.**
 
-### What is wrong
+### What this section originally called for, and why it was wrong
 
-~12,700 units of queue debt from earlier shreds. Most describe slices that are
-subsumed by, or irrelevant to, current coverage. They inflate every queue gauge
-and cost `claim_next` real work on every tick — the queue was measured at
-**339x inflated** at one point (`tf_queue_is_339x_inflated_2026-08-19`).
+A one-shot destructive migration deleting ~12,700 stale units. Three findings
+retire that plan:
 
-### Fix direction
+1. **`clear_stale_estimates()` already exists** - a one-shot, cursor-guarded
+   migration doing exactly what was proposed, with the
+   `checkpoint()`-cannot-delete landmine already handled. Writing a second one
+   would have duplicated it.
+2. **The rescue does not need deletion at all.** The debris is footprint-less
+   one-minute units whose stored estimates are WHOLE-FILE figures, so their sum
+   grows with the shredding and the fit test refuses hardest exactly where
+   fusing is worth most. `coarsen_sealed_slices_capped` bounds that price by
+   what the partition actually holds - no unit over one partition can decode
+   more than the partition contains - and that ceiling alone rescues them. It is
+   wired in prod at `database/maintain.rs:2383` with a real ceilings map.
+3. **Section 2 removed the source.** The preflight no longer shreds past the
+   row-group floor, so the population stops growing.
 
-A one-shot cursor-guarded migration. Precedent exists and should be copied
-directly: `migrate_fine_grained_backfill`
-(`maintenance_coordinator.rs:843`), driven from `database/mod.rs:4141`, guarded
-so it runs exactly once.
+### The evidence
 
-**Landmine, from the 08-19 session:** `checkpoint()` cannot delete — a removing
-pass must rewrite the journal, not append to it. See
-`tf_journal_checkpoint_cannot_delete_2026-08-19`. The existing migration already
-handles this correctly; follow it rather than inventing a path.
+`a_footprintless_shred_fuses_once_the_partition_ceiling_is_known` builds the
+exact prod shape - 600 one-minute units each claiming 4,466,185,462 bytes with
+no `InputFootprint`, the `base_rollup / 00000000 / 2026-08-13` signature - and
+shows:
 
-**Do not run this before §2.** Clearing debris while the engine that produces it
-still runs just regenerates it, and burns the one-shot cursor.
+- **without** a ceiling, `coarsen_sealed_slices` fuses **0** - the stuck state;
+- **with** the real ceiling, the day collapses to under a tenth of the units,
+  and wider units remain.
 
-### Success criterion
+That last assertion is the point. **Fusing preserves the work; deleting it would
+not.** A migration that removed these units would have discarded queued rollup
+work whose only defect was a mispriced estimate.
 
-Pending unit count drops to within ~2x of the real cell count (the 08-19
-measurement put 88,100 pending against 260 real cells), and
-`oldest_task_age` stops reporting values in the tens of days.
+### What is left
+
+Nothing to implement. If prod still shows an inflated queue after section 2 has
+been live through a quiet period, the question is whether `ceilings` is
+populated for those partitions - not whether to delete units.
 
 ---
 
