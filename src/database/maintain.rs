@@ -3133,12 +3133,13 @@ impl Database {
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
-            let tagged = match self.resolve_table("default", &target).await {
+            let (tagged, ledger_rows) = match self.resolve_table("default", &target).await {
                 Ok(table) => {
                     let table = table.read().await;
                     // `source_rows` is part of the KEY so a partition rebuilt against a
                     // different source count cannot merge with the older evidence.
                     let mut groups: HashMap<TaggedSliceIdentity, u64> = HashMap::new();
+                    let mut ledger_rows: Vec<(crate::storage::CoverageCell, crate::storage::CoverageEntry)> = Vec::new();
                     for add in table.snapshot()?.log_data().iter() {
                         #[allow(deprecated)]
                         let action = add.add_action();
@@ -3156,7 +3157,8 @@ impl Database {
                         // ranges beside it are what is already done. `hi + 1`
                         // because statistics bounds are inclusive while a slice
                         // end is not.
-                        if let Some(partition) = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default") {
+                        let file_partition = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default");
+                        if let Some(partition) = file_partition.clone() {
                             let tags = action.tags.as_ref();
                             let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
                             match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
@@ -3193,11 +3195,35 @@ impl Database {
                             .and_then(|rows| u64::try_from(rows).ok());
                         let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows)).or_default();
                         *entry = entry.saturating_add(rows);
+                        // Same facts, recorded explicitly. The date comes from the
+                        // file's own partition rather than from `slice_start`,
+                        // because a day-wide slice starts at midnight of the day it
+                        // covers while a file in `date=D` cannot hold rows outside
+                        // `D` — the partition is the stronger statement.
+                        if let Some((partition_project, date)) = file_partition.as_ref() {
+                            ledger_rows.push((
+                                (source.to_owned(), (*partition_project).to_owned(), target.clone(), (*date).to_owned()),
+                                crate::storage::CoverageEntry {
+                                    start_micros: slice_start,
+                                    end_micros: slice_end,
+                                    generation: generation.to_owned(),
+                                    source_fingerprint: source_fp,
+                                    source_rows: source_rows.and_then(|rows| i64::try_from(rows).ok()),
+                                },
+                            ));
+                        }
                     }
-                    groups
+                    (groups, ledger_rows)
                 }
-                Err(_) => HashMap::new(),
+                Err(_) => (HashMap::new(), Vec::new()),
             };
+            // Recorded AFTER the replay that read them, never speculatively: the
+            // ledger may understate coverage (costing a rebuild) but must never
+            // claim coverage that is not there (serving wrong results).
+            for (cell, entry) in ledger_rows {
+                use crate::storage::CoverageLedger;
+                self.coverage_ledger.record(&cell, entry);
+            }
             // Before any `continue` below, so a partition still holding
             // untagged files is queued whatever the coverage verdict is.
             // The gauge, from the WHOLE tier, hourly. Setting it only on publish

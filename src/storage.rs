@@ -3693,6 +3693,7 @@ pub struct StoredCoverage {
 /// Write-through rather than periodic, for the reason certifications had to
 /// become write-through (2026-08-21): this box restarts constantly, and state
 /// that only reaches disk on a clean shutdown is state that never reaches disk.
+#[derive(Debug)]
 pub struct JsonCoverageLedger {
     data_dir: std::path::PathBuf,
     cells: dashmap::DashMap<CoverageCell, Vec<CoverageEntry>>,

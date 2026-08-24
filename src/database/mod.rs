@@ -2308,6 +2308,17 @@ pub struct Database {
     /// shared slot would read clean while another tier still held damage).
     /// The exported gauge is the SUM over tiers.
     rollup_tier_untagged: Arc<dashmap::DashMap<String, u64>>,
+    /// Rollup coverage as an explicit record, populated from the SAME tag replay
+    /// that `recover_rollup_coverage` already does.
+    ///
+    /// Nothing reads it yet — the tags remain the authority. This is the
+    /// migration: once the ledger is populated and has been shown to agree with
+    /// the replay, reads can move onto it, and only then do the tags become
+    /// removable. Populating first is also what keeps invariant 3 of the plan
+    /// available forever: the replay stays as a VERIFIER, so the one risk the
+    /// ledger adds — an authority that can drift, where self-describing files
+    /// cannot — has a standing alarm against it.
+    coverage_ledger: Arc<crate::storage::JsonCoverageLedger>,
     /// 24-bit changed-hours mask per `(project, source, date)`. PRESENCE claims
     /// every change since the last build was observed; absence means "unknown"
     /// and forces a full rebuild. Only a successful build inserts one.
@@ -3027,7 +3038,7 @@ impl Database {
         let logical_count_cache =
             Arc::new(crate::read::LogicalCountCache::new(cfg.core.timefusion_data_dir.join("logical_count"), cfg.derived.logical_count_memory_bytes()));
         let db = Self {
-            config: cfg,
+            config: cfg.clone(),
             runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
@@ -3068,6 +3079,7 @@ impl Database {
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
+            coverage_ledger: Arc::new(crate::storage::JsonCoverageLedger::load(&cfg.core.timefusion_data_dir)),
             rollup_dirty,
             rollup_invalidated_at,
             rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),
@@ -11920,6 +11932,48 @@ mod tests {
     /// and the coordinator publishes for the live frontier and for coverage gaps — neither of which
     /// describes a sealed day that already has coverage. Recovery already sees these files and
     /// skipped them silently, which is how 352 of them accumulated across 26 days unnoticed.
+    /// Step 1 of moving coverage off file tags: the replay that reads the tags
+    /// also RECORDS what it read. Nothing consumes the ledger yet, which is the
+    /// point — it has to be shown to agree with the replay before any read can
+    /// move onto it, and the replay has to stay afterwards as the verifier.
+    ///
+    /// The cell's date comes from the file's PARTITION, not from `slice_start`:
+    /// a file in `date=D` cannot hold rows outside `D`, so the partition is the
+    /// stronger statement, and a day-wide slice starting at midnight would
+    /// otherwise be indistinguishable from one that merely begins there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        use crate::storage::CoverageLedger as _;
+        let mut cfg = (*create_test_config("ledger-populate")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("ledger_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        let tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+        assert!(
+            db.coverage_ledger.coverage(&("otel_logs_and_spans".to_owned(), project.clone(), tier.clone(), day.to_string())).is_empty(),
+            "the ledger is populated BY the replay, so it is empty until one runs"
+        );
+
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let recorded = db.coverage_ledger.coverage(&("otel_logs_and_spans".to_owned(), project.clone(), tier, day.to_string()));
+        assert!(!recorded.is_empty(), "the replay recorded the published slice");
+        assert!(
+            recorded.iter().all(|entry| entry.end_micros > entry.start_micros),
+            "slice ends are exclusive and must be after their start: {recorded:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn recovery_queues_a_rebuild_for_a_partition_holding_untagged_tier_files() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskState};
