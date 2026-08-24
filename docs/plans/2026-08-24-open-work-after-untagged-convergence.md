@@ -8,8 +8,37 @@
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
 | §3 ledger | **steps 1-3 done** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`) — built, populated from the tag replay, verified against it, and entries now name their FILES (without which it could only supplement the tags, never replace them). Gate before reads move over: `coverage_ledger_disagreements` reads zero on real prod data |
 | §4 escalation treadmill | **investigated, no code — two corrections** (`98e72d5`). (b) batching is ALREADY implicit: `enqueue` is keyed, so N escalations to one covering slice collapse to one task. (a) the on-demand split written in this doc is UNSOUND — the covering file physically holds the hole's rows, so re-tagging it narrower double-counts. Escalation stays correct until the ledger can name files per range |
-| §5 fragment debris | not started (deploy with §2, not before) |
-| §6 whale cells | no action; 7 as of 11:26 UTC |
+| §5 fragment debris | **NOT implemented, premise unverifiable right now.** Prod reads `tasks_pending` 5,983 (not ~12,700) and is dominated by dedup (3,702) rather than base-rollup fragments (2,116) — but the process was 6 MINUTES OLD when sampled, so a low count may mean the planner has not re-derived debt yet, not that debris drained. Needs a quiet process before any destructive migration is written |
+| §6 whale cells | **BLOCKED, not self-completing — earlier assessment was wrong.** See "Why the drain stopped" below |
+
+## Why the drain stopped (2026-08-24 13:30 UTC)
+
+`untagged` sat at 7 for four hours and I read it as expected wall-clock
+granularity. It is not.
+
+`docker service ps` shows **five deploys in 51 minutes**, each a DIFFERENT image
+(`5bb5f1c`, `86132a3`, `c8860f5`, `3700730`, `1e42237`) — so this is deploy
+churn from concurrent pushes, not a crash loop. Shutdowns are graceful SIGTERM.
+
+The arithmetic settles it:
+
+- maintenance does not start until the cache preload finishes or times out, and
+  the log shows `maintenance_coordinator_preload_wait_expired waited_secs=300`
+  on every boot — so **the first 5 minutes of each container do no maintenance**;
+- a container lives ~10-25 minutes between deploys;
+- a maintenance unit averages **~21 minutes**.
+
+So a unit essentially never completes. The journal survives; the work does not.
+This is the same shape as `tf_units_die_to_restarts_2026-08-23`.
+
+**Consequence for everything else in this document:** every prod measurement
+taken under this cadence is immature, including the §5 queue depths above and
+any future reading of `coverage_ledger_disagreements` (§3's gate). The gate
+cannot be evaluated until pushes stop.
+
+**The fix is not code.** It is a push freeze on master long enough for the drain
+to finish — roughly an hour of quiet would let units complete for the first time
+today.
 
 **Nothing is pushed.** A non-docs push restarts prod, which kills in-flight
 maintenance units (~21 min each) and voids the coverage map — that would undo the
