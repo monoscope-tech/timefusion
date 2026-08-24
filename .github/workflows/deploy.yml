@@ -11,9 +11,16 @@ on:
     # backlog (1038 files, see docs/plans/2026-08-12-whale-backlog-burndown.md)
     # burned down by exactly zero files. `paths-ignore` skips only when EVERY
     # changed path matches, so a commit touching code still deploys.
+    # `bench/` is python/shell load-gen and audit tooling — not cargo, not in
+    # the binary. A push there cannot change the running image, so deploying
+    # for it only costs a restart. 2026-08-24: five pushes to ONE benchmark
+    # script restarted prod five times in an hour, while that very script was
+    # measuring how cost varies with process uptime — the measurement was
+    # destroying its own precondition.
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
+      - 'bench/**'
 
 # Serialize deploys. Keep the active build alive: GitHub concurrency already
 # retains at most one pending run and replaces older pending runs with the

@@ -1487,6 +1487,21 @@ impl StatsTableProvider {
             "scheduling_lag_max_ms" => lag_max,
             "worker_threads" => std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
         ];
+        // Fragmentation, if jemalloc is the allocator (prod: yes). `frag_pct`
+        // is the share of resident memory backing no live allocation — the last
+        // candidate for the ~1.5h cost onset, since every other instrument here
+        // either froze or fell across it.
+        let jemalloc = crate::observability::jemalloc_bytes().map_or_else(Vec::new, |(allocated, active, resident, mapped, retained)| {
+            rows!["jemalloc";
+                "allocated_mb" => mib(allocated as usize),
+                "active_mb" => mib(active as usize),
+                "resident_mb" => mib(resident as usize),
+                "mapped_mb" => mib(mapped as usize),
+                "retained_mb" => mib(retained as usize),
+                "frag_pct" => pct(resident.saturating_sub(allocated), resident),
+            ]
+        });
+
         // `block` = a worker was occupied that long; `section` = wall time only,
         // awaits included. Same shape, different claim — see `SECTION_STATS`.
         let mut sections = crate::observability::section_stats();
@@ -1499,11 +1514,27 @@ impl StatsTableProvider {
             })
             .collect();
 
-        let rows: Vec<Row> =
-            [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, tantivy, bloom_prune, parquet, cache_sizes, runtime, block]
-                .into_iter()
-                .flatten()
-                .collect();
+        let rows: Vec<Row> = [
+            budget,
+            layer,
+            dml,
+            read_dedup,
+            maintenance,
+            plan_cache,
+            scan,
+            foyer,
+            logical_count,
+            tantivy,
+            bloom_prune,
+            parquet,
+            cache_sizes,
+            runtime,
+            block,
+            jemalloc,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let cols: Vec<ArrayRef> = vec![
             Arc::new(rows.iter().map(|r| Some(r.0)).collect::<StringArray>()),
             Arc::new(rows.iter().map(|r| Some(r.1.as_str())).collect::<StringArray>()),

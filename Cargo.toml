@@ -181,12 +181,17 @@ e2e = []
 # builds with symbols (CARGO_PROFILE_RELEASE_STRIP=none) so jeprof/pprof can
 # resolve stacks. Artifacts land in <data_dir>/timefusion/profiles + the
 # jemalloc prof_prefix (see src/main.rs malloc_conf).
-profiling = ["dep:tikv-jemallocator", "dep:pprof"]
+profiling = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:pprof"]
 
 # Profiling deps are Linux-only (jemalloc prof needs it; and prod is Linux) so a
 # macOS `--features profiling` check doesn't try to build jemalloc with prof.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
+# Reads jemalloc's own arena stats (allocated/resident/retained). The
+# resident-minus-allocated gap is fragmentation, which is the only
+# remaining candidate for the 1.5h query-cost onset that every other
+# instrument failed to explain (2026-08-24 plan).
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 
 [[test]]

@@ -275,6 +275,11 @@ load explains none of it. Over the first ~15 minutes a TimeFusion process gets
 consistent with the standing note that "idle == 4-min-old container == cold
 cache".
 
+**Extended to n=5 across 117 s → 1,357 s (22.6 min) of one process, sign holds:**
+`connect` r=-0.77, `reuse` r=-0.69, against load r=-0.29 / -0.04. The series is
+409 → 506 → 298 → 299 → 273 ms: it falls off the cold start and then **plateaus
+at ~270–300 ms**. Through 22 minutes of uptime there is no degradation at all.
+
 Three samples is not a result — the sign could flip with the fourth, and this
 run covers 3–16 minutes of uptime while the observation that opened this plan
 was at **five hours**. But it does say something already: the plan's framing —
@@ -287,6 +292,331 @@ Meanwhile the in-process counters keep climbing within every run
 (`journal_hold.max_ms` 42 → 702, `charged_bytes` 13.7 GB → 47.6 GB in nine
 minutes), so "state grows" and "queries get slower" are, so far, *not* the same
 statement.
+
+### The spike caught in-flight — three samples, one process, drivers separated
+
+Correlations over a plateau hide the thing that matters, so `--analyze` now
+prints the worst `connect` sample beside its neighbours. All three below are the
+**same process**, five minutes apart:
+
+| uptime | load | connect | reuse | `scheduling_lag_ms` | `refresh.avg_us` | `journal_hold.max_ms` |
+|---|---|---|---|---|---|---|
+| 170 s | 20.7 | 270 ms | 74 ms | 0 | 107,062 | 6 |
+| **505 s** | **41.3** | **2,960 ms** | **680 ms** | **1** | **175,138** | 615 |
+| 810 s | 33.8 | 252 ms | 70 ms | 0 | 144,271 | 1,186 |
+
+Four things fall out of one table:
+
+- **Age is not the driver.** Uptime rose monotonically while cost spiked 11× and
+  came back. Whatever this is, it is not accumulated state — the process was
+  *older* when it was fast again.
+- **Workers were not starved.** `scheduling_lag_ms` was 0 → 1 → 0 straight
+  through the spike. The "blocked workers while cores idle" story — hypothesis 1,
+  the best fit on paper — is **not** what is happening in this event.
+- **The journal mutex is eliminated for the spike.** `journal_hold.max_ms`
+  climbs monotonically (6 → 615 → 1,186) and is *highest* on the fast sample. It
+  grows with age; it does not track cost.
+- **What does track it: host load, and the Delta snapshot refresh.**
+  `refresh.avg_us` is cumulative, so a jump from 107 ms to 175 ms *average* means
+  the marginal refreshes during that interval were far more expensive. Query cost
+  and snapshot-refresh cost moved together, at peak host load, with no worker
+  starvation — which points at IO/CPU contention with the co-tenant processes
+  (the plan's own §3: monoscope was using ~15.8 of 48 cores) or at object-store
+  latency, not at anything TimeFusion accumulates.
+
+**The second spike replicates it, 16 minutes later and in a different process:**
+uptime 194 s → 544 s → 850 s, connect 280 ms → **3,675 ms** → 258 ms, at load
+29.2 → **49.5** → 39.2, with `scheduling_lag_ms` 1 ms throughout. Same shape,
+same eliminations. Across all 17 instrumented samples the four slow ones
+(`connect` > 800 ms) sit at **median load 39.2** against **29.9** for the
+thirteen fast ones, and *every* slow sample had a scheduling lag of 0–1 ms.
+
+**One ambiguity is still open, and `load1` cannot close it.** A host load of 49
+is equally consistent with "the box got busy" and with "TimeFusion got busy" —
+a flush or a maintenance burst *raises host load itself*, so the correlation
+with load is not yet evidence of an external neighbour. The sampler now also
+records `buffered_layer.{flush_completed_total, flush_failed_total,
+pressure_pct}`; a flush counter that advances across exactly the slow samples
+says it is our own work, and one that sits still says it is the neighbours. Both
+spikes landing at ~8–9 minutes of uptime is a hint toward the former (the flush
+interval is 600 s), and it is only a hint — the other two slow samples sat at
+184 s and 722 s.
+
+**First four samples with the flush counters — and load alone is already not
+enough.** No spike landed in the window, but the quiet samples are informative:
+
+| uptime | load | connect | flushes | pressure_pct | refresh avg_us |
+|---|---|---|---|---|---|
+| 280 s | 25.5 | 397 ms | 0 | 9 | 76,765 |
+| 152 s | 23.4 | 356 ms | 0 | 8 | 150,398 |
+| 462 s | 33.2 | 344 ms | 30 | 5 | 86,115 |
+| 770 s | 39.4 | 412 ms | 61 | 5 | 86,074 |
+
+Thirty-one flushes completed between the last two samples — roughly six a
+minute, continuously — with `connect` flat at ~350–410 ms throughout. **Flushes
+are not by themselves a stall**, which weakens "our own flush burst" as the spike
+mechanism before any spike has even been caught with the counter attached.
+
+And `load1` alone is not sufficient either: **load 39.4 here cost 412 ms**, while
+slow samples sat at load 37–49. A monotone load→cost story would have predicted a
+stall at 39.4. So the live lead narrows again — to a *threshold* or a burst that
+`load1` averages away over its minute, not to load as a continuous driver.
+Sampling moved to 180 s to resolve how long a spike actually lasts, which is the
+next thing worth knowing: a stall that spans two adjacent samples is a different
+animal from one that fits inside a single 6-rep probe.
+
+This reorders the hypothesis table: **1 and 2 are eliminated for the spikes**
+(directly, with the instrument built for them), 3 survives only as "state grows"
+without yet explaining cost, and the live lead is contention — which is the
+branch the plan predicted would mean *a restart buys nothing*.
+
+### The measurement was destroying its own precondition
+
+Ten samples across 30 minutes of one process, all fast (281–428 ms) at loads
+from 23 to **44.7** — and load 44.7 cost 386 ms. That is higher than the load at
+three of the four slow samples, so **`load1` is finished as an explanation**; the
+earlier "slow median 39.2 vs fast 29.9" was an association that this run breaks.
+
+What made this run possible is the actual finding. `docker service ps` shows
+prod cycling through `c8860f5`, `86132a3`, `4aa69aa`, `5b38240` — **all of them
+mine**. `paths-ignore` exempts `docs/**` and `**/*.md`; it does not exempt
+`bench/**`, so every push to the sampler script deployed and restarted prod.
+Five restarts in an hour, caused by the tool that exists to measure what happens
+when a process is left alone. I had already written in this file that another
+worker's deploy broke the window — that was true once and self-inflicted the
+rest of the time.
+
+`bench/**` is now in `paths-ignore` (it is python/shell tooling, not cargo, and
+cannot change the running image).
+
+**This also supplies a mechanism for the spikes that survives the evidence.**
+Every slow sample sat inside a deploy: a *new* container replaying its WAL and
+materializing snapshots while the *old* one still served traffic. That explains
+what nothing else did — why the old process spiked at mid-life uptimes (722 s,
+505 s, 544 s) rather than at any consistent age; why host load peaked without
+TimeFusion's own scheduling lag moving (the load was the other container); and
+why 30 quiet minutes at load 44.7 cost nothing. It is a hypothesis, not a
+result: the test is whether spikes disappear now that the sampler no longer
+triggers deploys, and that test runs itself from here.
+
+### The quiet window: 0 slow samples of 15, and hypothesis 3 decoupled too
+
+Since the sampler stopped triggering deploys: **15 samples, none above 800 ms**,
+against 4 of 17 before. That includes a continuous 36-minute run at loads up to
+44.7. The spike-free period is exactly the deploy-free period.
+
+One sample in it retires the remaining suspect. At uptime 524 s,
+`delta_snapshot_refresh.avg_us` read **403,842** — the refresh got roughly five
+times more expensive than its usual ~80 ms — and `connect` was **305 ms**,
+completely unmoved. So the earlier co-movement of refresh cost and query cost was
+not causal; both were downstream of the deploy churn. Hypothesis 3 survives only
+as "some state grows" and no longer as an explanation of query cost.
+
+**What this does not explain, and I am not going to pretend otherwise:** the
+observation that opened this plan was a **5-hour-old** process at 4,748 ms with
+no deploy in progress. Nothing in this window got past 36 minutes of uptime, so
+that regime was never reproduced. The honest state is two separate claims:
+
+1. **Established here** — spikes of 1.4–3.7 s on a *young or mid-life* process
+   are deploy churn: a new container replaying WAL while the old one serves.
+   Instrumented, replicated four times, and gone once the churn stopped. This is
+   also, retroactively, what most of the plan's own §1/§2 samples were: that
+   session ran eight images in a working day.
+2. **Untested** — whether a genuinely long-lived process degrades. It needs prod
+   to stay up for hours, which is now more likely (bench pushes no longer
+   deploy) but is not something this work can force.
+
+The mitigation the plan hypothesized for a "cost tracks uptime" outcome — a
+scheduled restart — would have been actively harmful: **restarts are the thing
+that produced every stall measured here.**
+
+### A second, smaller phenomenon survives the quiet window — and it IS the connection path
+
+One slow sample appeared with no deploy anywhere near it (26 samples, 1 slow).
+Lined up against the four deploy-churn stalls, it does not belong to them:
+
+| uptime | load | dns | tcp | **connect** | **reuse** | |
+|---|---|---|---|---|---|---|
+| 722 s | 37.2 | 1.7 | 78.5 | 1,433 | **353** | deploy churn |
+| 184 s | 28.4 | 1.4 | 123.5 | 1,420 | **198** | deploy churn |
+| 505 s | 41.3 | 1.6 | 86.4 | 2,960 | **680** | deploy churn |
+| 544 s | 49.5 | 4.3 | 103.2 | 3,675 | **1,249** | deploy churn |
+| 2,057 s | **30.6** | 2.0 | 62.5 | **1,450** | **77.5** | quiet window |
+
+In the churn stalls the *whole process* is slow — a warm `SELECT 1` costs
+198–1,249 ms. In the quiet-window stall the warm query is **77.5 ms**, DNS and
+TCP are normal, and only the phase between "socket open" and "ready for query"
+— pgwire startup, auth, session setup — takes 1.4 s. Everything else about that
+sample is calm: load 30.6, mid-life uptime, no restart on either side of it.
+
+**This narrows the connection path back in, on better evidence than the plan
+ruled it out with.** §1 discharged it because a warm connection paid the cost
+too — but every sample §1 had was a churn sample, where everything pays. With
+churn removed, what is left is connection-establishment-only, at ~4 % of samples.
+
+The instrument for it already half-exists: the healthcheck probe times its own
+`auth_ms` stage (see `spawn_runtime_lag_sampler`'s doc), and per-connection
+session setup is the obvious suspect to time next. That is the natural Phase 2
+if the rate holds — but at 1 in 26, it needs more samples before anyone
+instruments a specific stage.
+
+### One hour of uptime, and the process is at its fastest
+
+The first undisturbed process to survive an hour reached **3,529 s** with:
+
+    up=2794s load=25.5 connect=180ms reuse=45.0ms
+    up=3162s load=24.7 connect=209ms reuse=43.8ms
+    up=3529s load=39.0 connect=179ms reuse=42.6ms
+
+`reuse` at 42–45 ms is **the plan's own healthy baseline** (46 ms, measured on a
+4-minute-old process), and `connect` at ~180 ms beats the 219 ms that §2 called
+healthy. At an hour of uptime, at load 39, with `journal_hold.max_ms` past 1,000
+and gigabytes of allocation churn behind it.
+
+So the age hypothesis is now falsified across the entire range this window can
+reach: 3 minutes to 1 hour, cost is flat-to-improving. Five hours remains
+unreached, but the burden has shifted — an hour of uptime produces the best
+numbers in the dataset, not the worst.
+
+**Still flat at 102 minutes** (`connect` 182–340 ms, `reuse` 42–68 ms, 1 slow
+sample of 45). And in that stretch `block.journal_hold.max_ms` reached **2,380**
+— a `std::sync::Mutex` occupied a runtime worker for 2.4 seconds — with
+`scheduling_lag_max_ms` at 2,356 and **no effect on query cost whatsoever**.
+That is the strongest disposal of hypothesis 2 available: the event it predicts
+happened, at the magnitude it predicts, and queries did not notice. The 48
+workers absorb it.
+
+### At ~108 minutes the slow regime arrived on its own — and hypothesis 4 is the live lead
+
+The flat stretch ended without a deploy. From uptime 6,494 s onward, five of six
+samples were slow, with **`reuse` slow too** (191–627 ms) — the whole-process
+signature, not the connection-only one:
+
+| uptime | load | connect | reuse | lag_ms | hold_max | refresh avg_us | charged |
+|---|---|---|---|---|---|---|---|
+| 4,449 s | 44.0 | **178 ms** | 45 ms | 0 | 1,064 | 179,821 | — |
+| 6,494 s | 43.0 | **852 ms** | 302 ms | 1 | 2,380 | 120,082 | 25.5 GB |
+| 6,704 s | 38.4 | 1,074 ms | 192 ms | 12 | 2,380 | 118,520 | 13.1 GB |
+| 6,993 s | — | 3,049 ms | 525 ms | 1 | 2,380 | 117,750 | 26.5 GB |
+| 7,399 s | 47.1 | 705 ms | 627 ms | 0 | 2,380 | 115,225 | 17.4 GB |
+| 7,611 s | 49.4 | 1,025 ms | 151 ms | 1 | 2,380 | 113,838 | 15.6 GB |
+
+Load 43.0 costs 852 ms here; load 44.0 cost 178 ms an hour earlier. So it is
+**not load**, and it is not the counters this plan built either — `hold_max` is
+frozen at 2,380, `refresh_avg_us` is *falling*, `pressure_pct` is 0–7, and
+`scheduling_lag_ms` is 0–1 through all of it. **TimeFusion's own runtime is not
+starved while its queries take 600 ms.**
+
+`top` on the host during the slow window says what the in-process counters
+cannot:
+
+    %Cpu(s): 37.7 us, 17.4 sy, 40.2 id, 4.3 wa
+    3740410 timefusion   861.5% CPU   18.9g RES
+    3617008 monoscope    430.8%       3940135 monoscope 407.7%
+    318     kcompactd    100.0%  (kernel memory compaction, pinned)
+    3623661 postgres     100.0%       3667422 postgres  100.0%
+    MiB Swap: 2048.0 total, 0.2 free, 2047.8 used
+
+Three facts together: **TimeFusion is now the top consumer at 861 %** (8.6 of 48
+cores, up from the 554 % §3 recorded), **`kcompactd` is pinned at 100 %**, and
+**swap is 100 % full** — while the box is still 40 % idle. Meanwhile
+`charged_bytes` oscillates between 13 GB and 26 GB every few minutes: TimeFusion
+is allocating and releasing ~13 GB repeatedly, which is precisely what drives
+kernel compaction pressure.
+
+**That makes hypothesis 4 the live lead, not the dead one.** Not "swap thrashing"
+as originally framed, but its neighbour: sustained multi-gigabyte allocation
+churn keeping `kcompactd` saturated, so allocation latency rises box-wide. It
+fits every observation the others failed — cost that ignores load, workers that
+are never starved, a `SELECT 1` that costs 600 ms, and an onset ~2 hours in
+rather than at a fixed age. The counters that would confirm it are jemalloc's
+own (fragmentation, dirty page decay), which this codebase has tangled with
+before.
+
+### CORRECTION: the plan's original premise is CONFIRMED. Age wins.
+
+At uptime **8,052 s (2.24 h)**, load **32.9**: `connect` = **4,460 ms**,
+`reuse` = **807 ms**. That is the plan's opening measurement reproduced
+(4,748 ms at 5 h) on a process nobody touched, at a load *lower* than samples
+that cost 178 ms.
+
+So the earlier heading in this file — "the age hypothesis is now falsified" —
+was **wrong, and wrong in the way this repo keeps being wrong**: it generalized
+from a range that did not include the phenomenon. Everything up to ~1.2 h was
+genuinely flat; the onset is later. Corrected picture:
+
+| process age | behaviour | evidence |
+|---|---|---|
+| 0–3 min | slow (cold caches) | connect 400–1,400 ms, falling |
+| 3 min – ~1.2 h | **flat, and the best of the day** | connect ~177 ms at loads 24–44, 40+ samples |
+| ~1.8 h – 2.2 h | **degrading badly** | connect 705 → 852 → 1,025 → 3,049 → **4,460 ms** |
+
+And load is now decisively eliminated in *both* directions: **44.0 → 178 ms**
+(1.2 h) versus **32.9 → 4,460 ms** (2.2 h). Higher load, twenty-five times
+faster. What is left standing is the thing the plan named first and I twice
+talked myself out of: **something in-process grows, and past roughly 1.5 hours it
+starts costing every query, including `SELECT 1`.**
+
+The deploy-churn finding survives intact and is still worth having — it explains
+the *young-process* stalls, it was destroying the measurement, and the fix is
+merged. It was simply not the whole thing. The honest sequence is: churn masked
+the real signal, removing the churn made a clean window possible, and the clean
+window then took two hours to show what it was always going to show.
+
+`kcompactd` was at 0 % in this sample after being pinned at 100 % twenty minutes
+earlier, so the allocation-pressure lead is *not* confirmed either — one
+instantaneous `top` is not a time series, which is why the sampler now records
+`kcompactd_cpu`, `swap_free_mb` and `iowait_pct` on every row.
+
+### Qualifier, one hour later: the degradation is EPISODIC, not monotone
+
+At 2.5–2.9 h of uptime — the same process, no restart — `connect` is back to
+**280–420 ms** across eight samples, with `kcompactd` at 0 % throughout, swap
+100 % full the whole time (so swap is constant and cannot be a differentiator),
+and `iowait` between 0.2 % and 18.1 % on *fast* samples alike.
+
+So the 1.8–2.24 h slow stretch was an **episode that ended on its own**. Cost is
+not a monotone function of age; a process at 2.9 h is fine. Both of my previous
+headings were too strong in opposite directions, and the shape that fits all of
+it is: **occasional multi-minute episodes where everything gets slow, which
+resolve without intervention** — deploy churn is one reliable trigger for them,
+and there is at least one other trigger that is not a deploy.
+
+That reframes what to look for. Not "which quantity grows with age" but "which
+quantity spikes during an episode and recovers". Anything monotone — uptime,
+`journal_hold`, cache entry counts — is the wrong shape by construction.
+
+### First jemalloc reading (deployed `c3fb011`, uptime 4,873 s)
+
+    jemalloc.allocated_mb   10,943      jemalloc.resident_mb   13,838
+    jemalloc.active_mb      11,420      jemalloc.mapped_mb     15,436
+    jemalloc.frag_pct         20.9      jemalloc.retained_mb  147,247
+
+**`retained` is 147 GB** — address space jemalloc has decommitted but kept
+mapped, on a box with 192 GB of RAM and a 120 GB cgroup limit. It is not
+resident, so it costs no RSS, but it is the accumulated record of exactly the
+churn `kcompactd` was seen burning a core on. `frag_pct` at 20.9 % (2.9 GB
+resident behind no live allocation) is the number to watch across the next
+episode: the prediction is that it climbs into one and falls out of it. If it
+stays flat through a slow window, fragmentation is out too and the remaining
+suspect is the connection-setup path itself.
+
+Note the deploy that carried this **failed its own post-deploy gate** —
+"replacement returned 57P03/not-ready continuously for 12,011 ms (budget
+10,000 ms)" — with `WAL recovery 0ms`. The image is live and serving; the gate
+measures handoff readiness, and 12 s against a 10 s budget on a box at load ~35
+is its own small signal about startup under contention. Not chased here.
+
+**What to do next, in order:**
+1. Let the process keep ageing with the host columns recording. The question is
+   now narrow: which in-process quantity is monotone across the 1.2 h → 2.2 h
+   transition? `journal_hold` froze, `refresh_avg_us` *fell*, `pressure_pct` is
+   low — none of the current instruments explain it, so the next one has to come
+   from jemalloc's own stats (fragmentation, dirty decay) or from a per-stage
+   breakdown of connection setup.
+2. Do **not** ship a scheduled restart yet. It would help this, and it would
+   reintroduce the churn stalls that dominated the first half of this
+   investigation. Measure which is worse before trading one for the other.
 
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism

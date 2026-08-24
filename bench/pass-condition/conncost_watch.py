@@ -68,12 +68,24 @@ STATS = [
     ("section", "delta_snapshot_refresh.avg_us"),
     ("section", "delta_snapshot_refresh.max_ms"),
     ("section", "delta_snapshot_refresh.count"),
+    # Host load rising and TimeFusion's OWN flush/maintenance burst are not
+    # distinguishable from `load1` alone — a flush drives load up itself. These
+    # are the counters that separate "the box got busy" from "we got busy".
+    ("buffered_layer", "flush_completed_total"),
+    ("buffered_layer", "flush_failed_total"),
+    ("buffered_layer", "pressure_pct"),
     ("mem_buffer", "total_rows"),
     ("mem_buffer", "estimated_bytes_approx"),
     ("mem_buffer", "total_buckets"),
     ("plan_cache", "hits"),
     ("plan_cache", "misses"),
     ("memory", "charged_bytes"),
+    # Fragmentation: memory held but not in use. The only candidate left after
+    # every other instrument either froze or fell across the cost onset.
+    ("jemalloc", "frag_pct"),
+    ("jemalloc", "allocated_mb"),
+    ("jemalloc", "resident_mb"),
+    ("jemalloc", "retained_mb"),
     ("scan", "provider_cache_entries"),
     ("scan", "fast_resolve_cache_entries"),
     ("pgwire", "queries_total"),
@@ -81,7 +93,7 @@ STATS = [
     ("maintenance", "tasks_running"),
 ]
 STAGES = ("dns", "tcp", "connect", "query", "reuse")
-FIELDS = ["ts", "load1", *STAGES, *(f"{c}.{k}" for c, k in STATS)]
+FIELDS = ["ts", "load1", "kcompactd_cpu", "swap_free_mb", "iowait_pct", *STAGES, *(f"{c}.{k}" for c, k in STATS)]
 
 
 def stages():
@@ -110,17 +122,31 @@ def stats():
     return {f"{c}.{k}": got.get((c, k), "") for c, k in STATS}
 
 
-def host_load1():
-    """1-minute load average from the host, or '' if SSH is unavailable."""
+def host():
+    """`(load1, kcompactd_cpu, swap_free_mb, iowait_pct)`, or blanks if SSH fails.
+
+    `load1` alone was not enough: load 43 cost 852 ms in one window and load 44
+    cost 178 ms an hour earlier. `kcompactd` pinned at 100 % and a full swap are
+    the box-wide allocation-pressure signal that separates those two windows,
+    and neither is visible from inside the process.
+    """
     try:
-        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST, "uptime"], capture_output=True, text=True, timeout=30)
-        return out.stdout.rsplit("load average:", 1)[1].split(",")[0].strip()
+        out = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST, "top -bn1 | head -20; free -m | grep -i swap"],
+            capture_output=True, text=True, timeout=45,
+        ).stdout
+        load = out.rsplit("load average:", 1)[1].split(",")[0].strip()
+        kcomp = next((l.split()[8] for l in out.splitlines() if "kcompact" in l), "0")
+        swap_free = next((l.split()[3] for l in out.splitlines() if l.lower().startswith("swap")), "")
+        wa = next((l.split("wa")[0].rsplit(",", 1)[1].strip() for l in out.splitlines() if "%Cpu(s)" in l and "wa" in l), "")
+        return load, kcomp, swap_free, wa
     except Exception:
-        return ""
+        return "", "", "", ""
 
 
 def sample():
-    row = {"ts": int(time.time()), "load1": host_load1(), **stages(), **stats()}
+    load1, kcomp, swap_free, wa = host()
+    row = {"ts": int(time.time()), "load1": load1, "kcompactd_cpu": kcomp, "swap_free_mb": swap_free, "iowait_pct": wa, **stages(), **stats()}
     new = not CSV.exists()
     with CSV.open("a", newline="") as f:
         w = csv.DictWriter(f, FIELDS)
@@ -128,7 +154,7 @@ def sample():
             w.writeheader()
         w.writerow(row)
     print(f"{time.strftime('%H:%M:%S')} uptime={row['runtime.uptime_seconds']}s load={row['load1']} "
-          f"connect={row['connect']}ms reuse={row['reuse']}ms lag={row['runtime.scheduling_lag_ms']}ms", flush=True)
+          f"connect={row['connect']}ms reuse={row['reuse']}ms lag={row['runtime.scheduling_lag_ms']}ms kcompactd={kcomp}%", flush=True)
     return row
 
 
@@ -180,6 +206,22 @@ def analyze():
             line.append(f"{driver.split('.')[-1]}: r={statistics.correlation(x, y):+.2f}")
         print("  " + "   ".join(line))
     print("\n  r near +1 for exactly one driver is the answer; both high means they are still confounded.")
+
+    # The spikes are the phenomenon, and a correlation over 5 samples hides
+    # them: one sample went 270 -> 2,960 -> 252 ms while uptime rose
+    # monotonically. So print the worst sample beside its neighbours — what
+    # moved WITH it is the lead, and what didn't move is eliminated.
+    # Only rows carrying in-process context can implicate anything, so a
+    # pre-instrumentation row is never "the worst" here however slow it was.
+    with_ctx = [r for r in all_rows if up(r) is not None]
+    worst = max(with_ctx, key=lambda r: float(r["connect"] or 0))
+    i = all_rows.index(worst)
+    print(f"\n  worst `connect` sample and its neighbours (row {i} of {len(all_rows)}):")
+    for r in all_rows[max(0, i - 1) : i + 2]:
+        mark = "->" if r is worst else "  "
+        print(f"  {mark} up={r['runtime.uptime_seconds'] or '?':>6}s load={r['load1'] or '?':>6} connect={r['connect']:>8}ms reuse={r['reuse']:>7}ms "
+              f"lag={r['runtime.scheduling_lag_ms'] or '?'}ms refresh_avg_us={r['section.delta_snapshot_refresh.avg_us'] or '?'} "
+              f"hold_max={r['block.journal_hold.max_ms'] or '?'}ms")
     for c, k in STATS:
         v = nums(f"{c}.{k}")
         if v and max(v) != min(v):
