@@ -18,8 +18,12 @@ reference document for behavior that remains true after the work is complete.
 
 Deletion is not loss: `git log --diff-filter=D -- docs/plans` lists every deleted
 plan with the SHA that still holds it, and `git show <sha>:<path>` reads it back.
-Fourteen were deleted on 2026-08-24 under the rules above; their surviving open
-items were transplanted into the handoff before the deletion, not dropped.
+Twelve were deleted on 2026-08-24 under the rules above; their surviving open
+items were transplanted into the handoff before the deletion, not dropped. Two
+more were on that list and were kept only because a live plan cites them:
+`2026-08-23-a-440gb-scan-no-longer-starves-the-box.md` and
+`2026-08-22-untagged-tier-convergence.md`. Deleting a page something still points
+at trades one kind of stale for a worse one.
 
 ## Current plans
 

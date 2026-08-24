@@ -1,7 +1,8 @@
 # Rollup correctness, chart routing, and the dedup certification band
 
-2026-08-22, follow-on from `2026-08-22-dashboard-query-profile.md`. That
-document measured; this one diagnoses and plans. Investigation is complete
+2026-08-22, follow-on from `2026-08-22-dashboard-query-profile.md` (deleted
+2026-08-24 — read it with `git show <sha>:<path>`). That document measured;
+this one diagnoses and plans. Investigation is complete
 and recorded below; implementation follows the ordering in §5.
 
 ## 1. The P0, correctly diagnosed — it is NOT the interior/fringe split

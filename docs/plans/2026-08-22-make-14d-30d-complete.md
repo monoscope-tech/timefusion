@@ -337,6 +337,26 @@ Two traps when re-measuring, both hit during this work:
    session (once from a concurrent session's push), each time zeroing coverage
    and the caches. Stamp every cell with the image it ran on.
 
+## The condition, last measured 2026-08-23: 39 of 60 cells
+
+`24/30 at 14d, 15/30 at 30d` (six projects x five monoscope shapes x two
+windows). Transplanted from `2026-08-23-the-14d-30d-pass-condition-measured.md`,
+deleted 2026-08-24; the full per-cell grid is in git history. **Two failures that
+need different work**, and conflating them wasted time before they were split:
+
+1. **`p95_latency` is the single worst shape** — at 30d it fails on p3, p4 and
+   p5, and on p4 and p5 it is the ONLY failure. This is what the
+   `duration IS NOT NULL` routing fix (`91030f9`) and the `duration_digest`
+   measure exist for. Fixing p95 routing alone takes 30d from 15/30 to 18/30 and
+   clears p4 and p5 completely — blocked on the tier rebuilding, not on code.
+2. **p1 and p6 are a volume problem, not a query-shape problem** — every one of
+   their 30d cells is refused by the per-scan limit at
+   `1,447 files / 450,603 MiB`. At ~310 MB per file that is data volume, not
+   fragmentation, and no routing or dedup change touches it. Both were ALREADY
+   failing before the limit existed (timeout, or the 2 GiB dedup OOM); they now
+   fail in milliseconds with a message naming the size. p4's 30d `log_list` still
+   returns 251 rows in 2.0 s, which was the specific risk of a default-ON refusal.
+
 ## 2026-08-24 — one blocker removed from every FILTERED cell
 
 A filtered dashboard chart was paying a tantivy prefilter on the rollup leg it
