@@ -736,8 +736,8 @@ impl Database {
                 // does want the backfill capacity — but it is untested, and
                 // saying so is better than letting it look covered.
                 let horizon_ms = horizon.saturating_mul(24 * 60 * 60 * 1_000);
-                let tier_is_ramping = tier_created_ms
-                    .is_some_and(|created| crate::support::now_micros().div_euclid(1_000).saturating_sub(created) < horizon_ms);
+                let tier_is_ramping =
+                    tier_created_ms.is_some_and(|created| crate::support::now_micros().div_euclid(1_000).saturating_sub(created) < horizon_ms);
                 // The goal metric, computed from the set this planner already
                 // built: how many days back from yesterday are covered with NO
                 // hole, minimised over projects. A 30d panel reads the coarse
