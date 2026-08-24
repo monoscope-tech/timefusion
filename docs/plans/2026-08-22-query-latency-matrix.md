@@ -1606,3 +1606,33 @@ spec change, made explicit and paid deliberately rather than never. Options:
 
 The third is free and self-limiting, and worth weighing seriously against the
 first two.
+
+## The orphaning, quantified: 92% of the tier is dark
+
+Measured from data, so it needs neither my un-deployed gauge nor a warm process:
+
+```sql
+SELECT COUNT(*) FILTER (WHERE date >= '2026-08-22'), COUNT(*)
+FROM (SELECT DISTINCT project_id, date
+      FROM otel_logs_and_spans_rollup_dashboard_1m_v3
+      WHERE date >= '2026-07-20') t
+```
+
+```
+37 usable / 461 total cells in the 35-day window
+```
+
+**92% of the rollup tier cannot be read**, while `contiguous_days` reports 30 and
+every other gauge reports healthy. 37 ≈ 3 days x ~13 projects, which is exactly
+the post-08-22 population.
+
+This is the cost of one spec edit, and it went unnoticed for two days because
+both the planner and the census define "covered" as "a non-empty file exists at
+this path".
+
+It also re-prices the three options. "Do nothing and let the horizon age it out"
+means running at ~8% rollup coverage for ~11 more days — which is a real cost,
+not a free one, and changes my earlier recommendation from "probably wait" to
+"worth deciding deliberately". The bounded one-shot migration over the orphaned
+range now looks the most attractive: it is ~424 cells of work, once, against 11
+days of near-total tier darkness.
