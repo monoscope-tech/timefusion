@@ -6,7 +6,7 @@
 |---|---|
 | §1 immutability gap | **§1b instrumented** (`8b8ad30`), default OFF; decision still pending real data |
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
-| §3 ledger | **steps 1-2 done** (`3ec8003`, `f6b50e5`) — types, trait, JSON backend, merge + retirement, and the tag replay now POPULATES it. Additive; tags remain the authority and nothing reads the ledger. Next: a verifier pass comparing ledger against replay, then move reads over, then drop the tags |
+| §3 ledger | **steps 1-3 done** (`3ec8003`, `f6b50e5`, `b9572cf`) — types, trait, JSON backend, merge/replace/retirement, populated from the tag replay, and VERIFIED against it (`coverage_ledger_disagreements`). Still additive; tags remain the authority. Next: let the counter read zero over real prod data, then move reads over, then drop the tags |
 | §4 escalation treadmill | not started (re-evaluate after §3) |
 | §5 fragment debris | not started (deploy with §2, not before) |
 | §6 whale cells | no action; 7 as of 11:26 UTC |
