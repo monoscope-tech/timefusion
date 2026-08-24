@@ -82,62 +82,86 @@ query result is correct with and without the pushdown.
 **Note:** this section is materially cheaper than previously scoped — the
 escape hatch already exists in the code.
 
-### What is wrong
+### What is wrong — this is a PRICING bug, not an ordering one
 
-The rollup preflight (`database/maintain.rs:1603`) is:
+`byte_bounded_units` (`maintenance_coordinator.rs:434-468`) is the splitter.
+Its structure:
+
+1. bytes fit `MAX_DECODED_BYTES` (512 MiB) ⇒ one unit;
+2. width > `MIN_SLICE_MICROS` (1 min) ⇒ **bisect in time**, recursing on halves;
+3. only at the 1-minute floor ⇒ **hash-shard**.
+
+The defect is how step 2 prices the children (`:444-451`):
 
 ```rust
-if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > MIN_SLICE_MICROS {
-    if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) { … }
-}
-let hash_shards = estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(1);
+let left_bytes = bytes * (midpoint - start) / width;   // prorate by TIME SHARE
 ```
 
-`MAX_DECODED_BYTES` is 512 MiB, `MIN_SLICE_MICROS` is 1 minute
-(`maintenance_coordinator.rs:78-80`).
+**Children are priced by time share — a model, never a measurement.** So the
+recursion is guaranteed to terminate on paper: keep halving and the number
+eventually drops under 512 MiB, whatever the real cost is.
 
-The loop bisects a slice in **time** until either the estimate fits or the width
-hits one minute. But **the estimate does not keep falling with width**: a slice
-claims at least one row group of every file it overlaps, so below some width the
-estimate is dominated by that floor, not by the time range. Measured this
-session: **302 MB for a 5-minute slice** — halving the time again buys almost
-nothing.
+Reality has a floor. A slice must read **at least one row group of every file it
+overlaps**, so below some width the true cost stops tracking the time range.
+Measured this session: **302 MB for a 5-minute slice.**
 
-So a whale day bisects 1 day → 12h → 6h → … → 1 min, minting up to **1,440
-units** for a single (project, tier, day), each still expensive. Prod held
-**3,455 units for one cell**, 1,423 pending. That is the origin of the ~12,700
-fragment units in §5.
+The two disagree, and the disagreement is discovered *later*: the preflight
+(`database/maintain.rs:1603`) measures the child's bytes for real at claim time,
+finds it over budget, and calls `split_time_task` again. Each level costs a
+claim, a real scan-estimate and a journal write, and the cycle runs to the
+1-minute floor. Prod held **3,455 units for one (project, tier, day)**, 1,423
+pending — the origin of the ~12,700 fragment units in §5.
 
-### The part that makes this cheap
+Note `split_time_task:2213` already refuses a split whose children would need
+hash shards, and step 3 exists — so the machinery to divide **rows** instead of
+**time** is present. It is simply unreachable until bisection has already ground
+the slice to a minute.
 
-Line 1609 already implements the correct escape: **hash sharding**, which splits
-by row hash rather than by time and therefore *does* reduce per-unit bytes
-proportionally. It is simply unreachable until bisection has already ground all
-the way to the floor.
+### Why the obvious fix is wrong
+
+"Hash-shard when bisecting stops paying" needs to know where the floor is. The
+floor is `files × row_group_bytes`. `InputFootprint`
+(`maintenance_coordinator.rs:331-342`) records `whole_file_bytes` and `files` —
+**but not row-group size.** Using `whole_file_bytes` as the floor would
+hash-shard days that bisection handles perfectly well today, because a file with
+100 row groups genuinely does cost ~1/100th for a narrow slice.
+
+**Do not guess a constant here.** The floor moves with file layout and therefore
+per tenant and per day.
 
 ### Fix direction
 
-Stop bisecting when bisection stops paying, and shard instead. Concretely:
-when a child's estimate is not meaningfully below its parent's (the row-group
-floor is dominating), **do not split further in time — hash-shard at the current
-width.**
+Close the loop with the measurement we already take, rather than modelling it:
 
-`split_time_task` (`maintenance_coordinator.rs:2204`) already receives the
-observed bytes, so the parent estimate is available to compare against. The
-condition wants to be "did halving the width buy less than ~25% of the bytes",
-not a fixed width threshold — the floor's location depends on file layout and
-moves per tenant.
+1. Record the parent's **measured** bytes on each child at split time
+   (`split_time_task` already receives `observed_bytes`).
+2. At the next preflight, compare the child's freshly measured bytes against
+   that inherited parent measurement. If halving the width bought less than
+   ~25%, the floor dominates — **hash-shard at the current width instead of
+   bisecting again.**
 
-**Do not** change the bisection itself, and do not lower `MIN_SLICE_MICROS`.
-Both make more units, which is the symptom.
+This learns the floor per unit instead of assuming it, needs no new datum in
+`InputFootprint`, and degrades to today's behaviour when bisection is working.
+
+Alternative if that proves fiddly: record `row_groups` in `InputFootprint` at
+selection time (it is available from the parquet metadata already being read)
+and compute the floor directly. Costs a journal format field; gives an exact
+answer instead of a feedback loop.
+
+**Do not** change the bisection arithmetic itself, and do not lower
+`MIN_SLICE_MICROS`. Both make more units, which is the symptom.
 
 ### Success criterion
 
 Replay a known whale day through `timefusion sim` (or `run-unit --op
 BaseRollup` against staging) and show the same day completes in **tens of
 units, not thousands**, with no unit exceeding `MAX_DECODED_BYTES` at run time.
-Regression test: a synthetic day whose estimate floors out must produce
-hash-sharded units at a width above `MIN_SLICE_MICROS`.
+
+Regression test, per the mandatory bug-fix workflow: a synthetic day whose
+measured child bytes do **not** fall with width must produce hash-sharded units
+at a width above `MIN_SLICE_MICROS`, and must not recurse to the floor. Write
+this test **first** — the pathology is a multi-level cycle through the journal,
+so a single-call unit test on `byte_bounded_units` does not reproduce it.
 
 ---
 
