@@ -811,7 +811,7 @@ async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> 
             "--dry-run" => dry_run = true,
             "--add" => {
                 let spec = it.next().context("--add needs NAME:TYPE")?;
-                let (n, t) = spec.split_once(':').context("--add expects NAME:TYPE (timestamp|boolean)")?;
+                let (n, t) = spec.split_once(':').context("--add expects NAME:TYPE (timestamp|boolean|bigint|double|binary)")?;
                 adds.push((n.to_string(), t.to_string()));
             }
             other => anyhow::bail!("unknown argument: {other} (usage: timefusion migrate-columns --table T --add NAME:TYPE [--add ...] [--dry-run])"),

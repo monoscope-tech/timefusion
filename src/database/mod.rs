@@ -8957,8 +8957,8 @@ impl Database {
         };
         let missing: Vec<&(String, String)> = adds.iter().filter(|(n, _)| !stored.contains(n)).collect();
         let report = |after: usize, added: Vec<String>| ColumnMigrationReport { stored_before: stored.len(), stored_after: after, added };
-        if missing.is_empty() || dry_run {
-            return Ok(report(stored.len(), missing.iter().map(|(n, _)| n.clone()).collect()));
+        if missing.is_empty() {
+            return Ok(report(stored.len(), Vec::new()));
         }
 
         let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = missing
@@ -8969,11 +8969,31 @@ impl Database {
                     Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()).with_timezone("UTC")) as ArrayRef,
                 )),
                 "boolean" => Ok((Field::new(n, DataType::Boolean, true), Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef)),
-                other => anyhow::bail!("unsupported column type '{other}' (expected timestamp|boolean)"),
+                // The types a ROLLUP MEASURE is actually made of. Without them
+                // this command could not widen a tier at all — counts are Int64,
+                // sums/min/max Int64 or Float64, and `tdigest`/`hll` states are
+                // Binary — so the only way to declare a new measure was to skip
+                // the migration, which is exactly what happened to
+                // `duration_digest` on 2026-08-22: the YAML declared it, the
+                // Delta log never gained it, and every derived unit over the
+                // tier failed to plan until `ceb10b8` made the read tolerant.
+                // The doc block on `run_migrate_columns_cli` already states the
+                // rule — "only once every live table has the columns may the
+                // YAML declare them" — and it was unfollowable for a measure.
+                "bigint" => Ok((Field::new(n, DataType::Int64, true), Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())) as ArrayRef)),
+                "double" => Ok((Field::new(n, DataType::Float64, true), Arc::new(arrow::array::Float64Array::from(Vec::<f64>::new())) as ArrayRef)),
+                "binary" => Ok((Field::new(n, DataType::Binary, true), Arc::new(arrow::array::BinaryArray::from(Vec::<&[u8]>::new())) as ArrayRef)),
+                other => anyhow::bail!("unsupported column type '{other}' (expected timestamp|boolean|bigint|double|binary)"),
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .unzip();
+        // AFTER the type mapping, so a dry run rejects a typo instead of
+        // reporting work it would then fail to do. `--dry-run` exists to be
+        // trusted before a production migration.
+        if dry_run {
+            return Ok(report(stored.len(), missing.iter().map(|(n, _)| n.clone()).collect()));
+        }
         let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)?;
 
         let t = { table_ref.read().await.clone() };

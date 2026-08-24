@@ -1605,6 +1605,26 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
     assert!(second.added.is_empty(), "re-running the migration must add nothing, got {:?}", second.added);
     assert_eq!(second.stored_before, first.stored_after, "the second run must observe the widened schema");
 
+    // A ROLLUP MEASURE must be migratable, or the documented rule — widen
+    // storage first, only then declare it in YAML — cannot be followed for the
+    // one kind of column most likely to be added. It could not: only
+    // timestamp|boolean were supported, while counts are Int64, sums/min/max
+    // Int64 or Float64, and `tdigest`/`hll` states are Binary. That is why
+    // `duration_digest` was declared on 2026-08-22 without a migration, and why
+    // every derived unit over the 1m tier then failed to plan.
+    let measures = vec![
+        ("m_count".to_string(), "bigint".to_string()),
+        ("m_ratio".to_string(), "double".to_string()),
+        ("m_digest".to_string(), "binary".to_string()),
+    ];
+    let widened = db.migrate_add_columns(TABLE, &measures, false).await?;
+    assert_eq!(widened.added.len(), 3, "every measure type must be migratable, got {:?}", widened.added);
+    assert_eq!(widened.stored_after, widened.stored_before + 3);
+    assert!(db.migrate_add_columns(TABLE, &measures, false).await?.added.is_empty(), "measure migration must be idempotent too");
+
+    // An unknown type must still be refused rather than guessed at.
+    assert!(db.migrate_add_columns(TABLE, &[("m_bad".to_string(), "decimal".to_string())], true).await.is_err());
+
     Ok(())
 }
 
