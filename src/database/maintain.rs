@@ -808,11 +808,7 @@ impl Database {
                 // takes ~5.5 minutes to rebuild after a restart (measured), so
                 // `usable_cells` reads low on a young process. Compare the two
                 // only once the process has outlived that.
-                let usable_cells = self
-                    .rollup_coverage
-                    .iter()
-                    .filter(|entry| entry.key().1 == source && entry.key().2 == target)
-                    .count();
+                let usable_cells = self.rollup_coverage.iter().filter(|entry| entry.key().1 == source && entry.key().2 == target).count();
                 info!(
                     source,
                     tier = %target,

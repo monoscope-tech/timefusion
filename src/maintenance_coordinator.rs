@@ -1452,15 +1452,10 @@ impl TaskJournal {
     /// the planner already counted — so the answer is about the cell that matters
     /// rather than whichever one the journal happens to hold first.
     pub fn most_indebted_unclaimed(&self, operation: Operation, now_micros: i64) -> Option<String> {
-        let eligible = || {
-            self.snapshot
-                .tasks
-                .iter()
-                .filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry))
-        };
+        let eligible =
+            || self.snapshot.tasks.iter().filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry));
         let date_of = |task: &MaintenanceTask| {
-            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
-                .map_or_else(|| "?".to_owned(), |time| time.date_naive().to_string())
+            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map_or_else(|| "?".to_owned(), |time| time.date_naive().to_string())
         };
         let worst = eligible().max_by_key(|task| task.input.map_or(0, |input| input.files))?;
         let files = worst.input.map_or(0, |input| input.files);
@@ -4173,11 +4168,7 @@ mod tests {
         let yesterday = cell("small", 399 * DAY, 3, Operation::SealedConsolidation);
         let five_days_old = cell("bigdebt", 395 * DAY, 238, Operation::SealedConsolidation);
 
-        assert_eq!(
-            super::scheduling_class(&yesterday, now).0,
-            1,
-            "the planner mints SealedConsolidation only for a date it already treats as sealed"
-        );
+        assert_eq!(super::scheduling_class(&yesterday, now).0, 1, "the planner mints SealedConsolidation only for a date it already treats as sealed");
         assert!(
             super::scheduling_class(&five_days_old, now) < super::scheduling_class(&yesterday, now),
             "238 files of debt must outrank 3 — which class 0 was silently preventing"
@@ -4185,11 +4176,7 @@ mod tests {
 
         // The blast radius. Today's packing IS frontier work and must stay class
         // 0, or this trades one starvation for another.
-        assert_eq!(
-            super::scheduling_class(&cell("today", 400 * DAY, 9, Operation::HotPacking), now).0,
-            0,
-            "today's packing is genuinely live-frontier work"
-        );
+        assert_eq!(super::scheduling_class(&cell("today", 400 * DAY, 9, Operation::HotPacking), now).0, 0, "today's packing is genuinely live-frontier work");
     }
 
     /// "Planned and never claimed" must name what beat it.
