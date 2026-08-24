@@ -39,6 +39,12 @@ fn fold_fleet_gauge(previous: u64, value: u64, seeded_by_real: bool, ramping: bo
     }
 }
 
+/// The window the one-shot orphan repair rebuilds. `BEFORE` is the date the
+/// `duration_digest` spec edit landed and changed `generation_id`; `FROM` bounds
+/// the work, leaving older orphans to age out of the 35-day horizon.
+const ORPHAN_REPAIR_FROM: &str = "2026-08-01";
+const ORPHAN_REPAIR_BEFORE: &str = "2026-08-22";
+
 fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
 }
@@ -831,7 +837,52 @@ impl Database {
                     .filter(|(index, _)| schema.rollups[*index].derive_from.is_none())
                     .flat_map(|(_, covered)| covered.iter().map(|(project, date)| (source.clone(), project.clone(), date.to_string()))),
             );
-            let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
+            let mut missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
+            // ONE-SHOT REPAIR for coverage the planner is structurally blind to.
+            //
+            // `partitions_of` decides "covered" from a non-empty file existing at
+            // the path — it never reads the generation. So when a spec edit
+            // changes `generation_id`, every slice built before it keeps the old
+            // value, the READ path refuses those dates, and the planner counts
+            // them covered and never re-derives them. They stay dark forever.
+            //
+            // Measured 2026-08-24 on `dashboard_1m_v3`: 37 usable of 461 cells in
+            // the 35-day window — 92% of the tier unreadable — while
+            // `contiguous_days` reported 30 and no gauge moved. The spec edit was
+            // `duration_digest` on 08-22.
+            //
+            // Forces every tier of every in-window day BEFORE that edit back into
+            // `missing_tiers` so the ordinary enqueue path below rebuilds them.
+            // Going through that path rather than a parallel one is deliberate:
+            // it already decides Dedup-vs-not, orders derived after base, and
+            // respects the already-queued veto.
+            //
+            // Bounded to `[ORPHAN_REPAIR_FROM, ORPHAN_REPAIR_BEFORE)` so it is a
+            // known quantity of work. Older orphans are left to age out of the
+            // 35-day horizon rather than rebuilt days before they leave it.
+            if let Some(cursor_was) = self.journal().repair_orphaned_coverage_once()
+                && let (Ok(from), Ok(before)) = (
+                    chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"),
+                    chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"),
+                )
+            {
+                let mut forced = 0usize;
+                for (project, date) in &candidates {
+                    if *date >= from && *date < before {
+                        missing_tiers.insert((project.clone(), *date), (0..schema.rollups.len()).collect());
+                        forced += 1;
+                    }
+                }
+                warn!(
+                    source,
+                    forced,
+                    cursor_was,
+                    from = ORPHAN_REPAIR_FROM,
+                    before = ORPHAN_REPAIR_BEFORE,
+                    event = "rollup_orphaned_coverage_repair",
+                    "re-enqueueing coverage a spec change orphaned and the planner cannot see"
+                );
+            }
             // Publish the holes so `claim_next` can rank them ahead of days that
             // already have tier output. Same coverage read, same 60s cadence.
             for ((project, date), missing) in &missing_tiers {
@@ -2068,9 +2119,8 @@ impl Database {
                 (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros),
                 RollupCoverage {
                     source_fp,
-                    source_epoch: 0,
+                    source_epoch: None,
                     generation: generation.clone(),
-                    rows,
                     source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                     covered_through: key.slice.end_micros,
                 },
@@ -2105,12 +2155,12 @@ impl Database {
                     (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), date.to_string()),
                     RollupCoverage {
                         source_fp: partition_fp,
-                        source_epoch: self
-                            .rollup_source_epochs
-                            .get(&(key.project_id.clone(), key.source.clone(), date.to_string()))
-                            .map_or(0, |epoch| *epoch.value()),
+                        source_epoch: Some(
+                            self.rollup_source_epochs
+                                .get(&(key.project_id.clone(), key.source.clone(), date.to_string()))
+                                .map_or(0, |epoch| *epoch.value()),
+                        ),
                         generation: generation.clone(),
-                        rows,
                         source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                         covered_through: key.slice.end_micros,
                     },
@@ -3085,9 +3135,8 @@ impl Database {
                 (project.clone(), source.to_string(), target.to_string(), date.clone()),
                 RollupCoverage {
                     source_fp: partition.fingerprint,
-                    source_epoch: self.rollup_source_epochs.get(&(project, source.to_string(), date)).map_or(0, |epoch| *epoch.value()),
+                    source_epoch: Some(self.rollup_source_epochs.get(&(project, source.to_string(), date)).map_or(0, |epoch| *epoch.value())),
                     generation: newest.generation.clone(),
-                    rows: slices.iter().map(|(_, coverage)| coverage.rows).sum(),
                     source_rows: Some(current_rows),
                     covered_through,
                 },
@@ -3184,9 +3233,8 @@ impl Database {
                     (project_id.clone(), source.clone(), table_name.clone(), entry.start_micros, entry.end_micros),
                     RollupCoverage {
                         source_fp: entry.source_fingerprint,
-                        source_epoch: 0,
+                        source_epoch: None,
                         generation: entry.generation.clone(),
-                        rows: 0,
                         source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
                         covered_through: entry.end_micros,
                     },
@@ -3256,11 +3304,44 @@ impl Database {
         }
     }
 
+    /// Drop ledger cells whose date fell out of the rollup horizon, returning how
+    /// many went.
+    ///
+    /// Without a caller the ledger grows for as long as the process has ever seen
+    /// a partition — including partitions that aged out months ago, whose file
+    /// lists it would go on carrying in every write. The tier replay's own orphan
+    /// sweep does not cover this: it only retires cells of a tier it just read,
+    /// so a tier that stops being replayed at all leaves its history behind
+    /// forever.
+    ///
+    /// Bounded by `timefusion_rollup_backfill_days`, which is the horizon the
+    /// planner itself enumerates and is pinned to the dedup certification window
+    /// — one constant, so a future horizon change moves both rather than leaving
+    /// the ledger retiring coverage the planner still wants. `0` disables the
+    /// backfill entirely and must therefore retire NOTHING, not everything.
+    ///
+    /// Dates come from `crate::support::now_micros()` — the virtual clock — so
+    /// e2e time travel drives this the same way it drives every other horizon.
+    fn retire_aged_out_coverage(&self) -> usize {
+        let horizon = self.config.maintenance.timefusion_rollup_backfill_days;
+        if horizon == 0 {
+            return 0;
+        }
+        let Some(now) = chrono::DateTime::from_timestamp_micros(crate::support::now_micros()) else { return 0 };
+        let keep_from = (now.date_naive() - chrono::Duration::days(i64::from(horizon))).to_string();
+        let retired = self.coverage_ledger.retire_before(&keep_from);
+        if retired > 0 {
+            info!(retired, keep_from, event = "rollup_coverage_ledger_retired", "coverage cells past the rollup horizon dropped from the ledger");
+        }
+        retired
+    }
+
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
         if !self.config.maintenance.timefusion_rollup_enabled {
             return Ok(0);
         }
+        self.retire_aged_out_coverage();
         let mut recovered = 0;
         // Summed over every declared tier, then stored ONCE. Storing per tier made
         // the last spec's count the whole reading, which is zero whenever only the
@@ -3284,7 +3365,12 @@ impl Database {
                     let table = table.read().await;
                     // `source_rows` is part of the KEY so a partition rebuilt against a
                     // different source count cannot merge with the older evidence.
-                    let mut groups: HashMap<TaggedSliceIdentity, u64> = HashMap::new();
+                    // A SET, not a count: the per-identity `num_records` sum this
+                    // used to carry fed exactly one `debug!` line and a placeholder
+                    // zero on the ledger-seeded path, so it was a field that read
+                    // as measured on one route and unset on another while meaning
+                    // nothing on either.
+                    let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
                     // Paths per tagged identity, keyed exactly like `groups` so the
                     // FILTERED loop below can recover them. The ledger must not be
                     // written from this raw loop: the filters that follow
@@ -3339,15 +3425,13 @@ impl Database {
                         ) else {
                             continue;
                         };
-                        let rows = action.get_stats().ok().flatten().map_or(0, |stats| u64::try_from(stats.num_records.max(0)).unwrap_or(0));
                         // Absent on generations written before the tag; `-1` is the
                         // sentinel a build writes when the source reported no count.
                         // Both become `None`, which the read path refuses to verify.
                         let source_rows = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS)
                             .and_then(|value| value.parse::<i64>().ok())
                             .and_then(|rows| u64::try_from(rows).ok());
-                        let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows)).or_default();
-                        *entry = entry.saturating_add(rows);
+                        groups.insert((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows));
                         // Same facts, recorded explicitly. The date comes from the
                         // file's own partition rather than from `slice_start`,
                         // because a day-wide slice starts at midnight of the day it
@@ -3368,7 +3452,7 @@ impl Database {
                     }
                     (groups, paths_by_identity)
                 }
-                Err(_) => (HashMap::new(), HashMap::new()),
+                Err(_) => (std::collections::HashSet::new(), HashMap::new()),
             };
             // Filled by the FILTERED loop below, then verified and written once
             // per tier. Nothing is recorded for a slice the read path would
@@ -3413,7 +3497,7 @@ impl Database {
             // pass saw zero and prod read `rollup_witnessless_slices = 0` over a
             // 23,337-slice backlog. Same "cannot tell none from unmeasured" failure
             // the untagged gauge above already had, reintroduced one field over.
-            unverifiable += tagged.keys().filter(|(.., source_rows)| source_rows.is_none()).count() as u64;
+            unverifiable += tagged.iter().filter(|(.., source_rows)| source_rows.is_none()).count() as u64;
             let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {
                 if publication.source_rows.is_none() {
@@ -3423,9 +3507,8 @@ impl Database {
                     (key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros),
                     RollupCoverage {
                         source_fp: publication.source_fingerprint,
-                        source_epoch: 0,
+                        source_epoch: None,
                         generation: publication.generation.clone(),
-                        rows: publication.rows,
                         source_rows: publication.source_rows,
                         covered_through: key.slice.end_micros,
                     },
@@ -3433,7 +3516,7 @@ impl Database {
                 recovered += 1;
             }
             if !tagged.is_empty() {
-                for ((project_id, slice_start, slice_end, generation, source_fp, source_rows), rows) in tagged {
+                for (project_id, slice_start, slice_end, generation, source_fp, source_rows) in tagged {
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else { continue };
                     let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else { continue };
@@ -3483,7 +3566,7 @@ impl Database {
                     }
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
-                        RollupCoverage { source_fp, source_epoch: 0, generation, rows, source_rows, covered_through: slice_end },
+                        RollupCoverage { source_fp, source_epoch: None, generation, source_rows, covered_through: slice_end },
                     );
                     recovered += 1;
                 }
