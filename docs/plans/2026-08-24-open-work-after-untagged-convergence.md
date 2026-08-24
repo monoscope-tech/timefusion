@@ -141,6 +141,74 @@ The equivalence test had asserted only `tags ⊆ ledger`, the SAFE direction, an
 could never have caught it. It now asserts both, and the reverse is the one that
 matters.
 
+## RESOLVED 2026-08-24 in `ab78c4d` — tasks 16, 17 and 18
+
+`tasks/` is **gitignored**. Sections A, B and C below record what those tasks
+said; this records what shipped, and the three places their premises were wrong.
+
+**Task 18 needed no implementation.** It is a stop sign — its whole purpose is to
+stop someone re-deriving two harmful "fixes" from corrected plan text. Do not
+open a change for it. A third entry was added to it (see the `source_epoch`
+correction below).
+
+**Task 17 — all four Done-whens closed.**
+
+- `store_sidecar` returns whether the write landed (not `#[must_use]`, so the
+  hint stores' call sites did not churn) and the ledger counts losses in
+  **`coverage_ledger_persist_failures`**. The contract, decided: a failed persist
+  does NOT fail the recovery pass while the tags remain the authority — but it
+  must be visible, because a ledger that silently stopped persisting reads
+  exactly like a ledger with nothing to say. **The gate on
+  `TIMEFUSION_COVERAGE_LEDGER_READS` is now two-sided: `disagreements == 0` AND
+  `persist_failures == 0`.**
+- `retire_before` has a caller: `retire_aged_out_coverage`, at the top of the
+  hourly `recover_rollup_coverage`, bounded by `timefusion_rollup_backfill_days`
+  — the horizon the planner itself enumerates, so one constant moves both. `0`
+  retires NOTHING, not everything. The tier replay's orphan sweep does not cover
+  this: it only retires cells of a tier it just read.
+- **`RollupCoverage.rows` deleted** (one `debug!` line and a sum feeding it).
+- **`source_epoch` was NOT a placeholder — task 17's premise was wrong.** It is
+  live on the DATE path (routing and `rollup_ticket_current` both read it); only
+  the SLICE path, which shares the struct and never reads the field, wrote a
+  literal `0`. Now `Option<u64>`: `None` on the slice path. Deleting it would
+  have broken date-level routing silently.
+- Datastore backend: **DEFERRED**, recorded in `storage.rs` beside the trait.
+  JSON is the fallback, not the plan. The one thing that must not happen is a
+  caller reaching past `CoverageLedger` to `JsonCoverageLedger`.
+
+**Task 16 — implemented, tested, shipped DEFAULT OFF behind
+`TIMEFUSION_ROLLUP_RESUME_ENABLED`.** Two things differ from section A's sketch:
+
+- **The `source_fingerprint` recomputation is not what shipped**, because it is
+  both more expensive (it hashes the SELECTED file list, so recomputing means
+  re-running selection) and weaker (it says nothing about the target side, which
+  is where the double-count happens). `classify_rollup_resume` asks two cheaper
+  questions: a **source-row witness** (the same two-sided rule the read path
+  uses; no witness ⇒ never resume) and a **no-double-count test** requiring the
+  live files overlapping the slice to be exactly the recorded replace set.
+- **The sketch omitted the half that makes resume worth anything.** The intent
+  carries the journal `TaskKey` and `Publication`, and the resume PUBLISHES. A
+  resumed commit without the publication is invisible to coverage recovery
+  (`rollup_slice_complete`), so the planner sees a hole, re-enqueues, and pays the
+  whole ~21-minute scan anyway. Committing without publishing is no win at all.
+
+It hooks in at the top of `run_coordinator_rollup_once` — after the source
+metadata is read, before the aggregate — and short-circuits the bisection, which
+would otherwise shred a unit whose answer is already written.
+
+Still open on 16, and **not producible from a workstation**: `oldest_task_age`
+falling on prod across a normal deploy cadence. Read `rollup_resumed_total`
+against `rollup_resume_declined_total`; a high decline count is a fleet of
+CORRECT refusals, not a broken mechanism.
+
+**The preload wait was instrumented, not changed.** It is already
+condition-triggered with a cap, so there is no fixed sleep to convert. What is
+now established: prod logs `preload_wait_expired` on EVERY boot, so the 300s is
+always paid in full and maintenance competes with a still-running warm anyway —
+the wait does not achieve the thing it exists for. It now logs
+`tables_done`/`tables_total`, which is the ratio that says whether to raise or
+lower it. Do not change the default on the argument alone.
+
 ## NEW work discovered while implementing this plan
 
 `tasks/` is **gitignored**, so these are recorded here too or they are lost.
