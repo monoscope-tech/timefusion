@@ -1485,12 +1485,15 @@ impl StatsTableProvider {
             "scheduling_lag_max_ms" => lag_max,
             "worker_threads" => std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
         ];
-        let mut sections = crate::observability::block_stats();
+        // `block` = a worker was occupied that long; `section` = wall time only,
+        // awaits included. Same shape, different claim — see `SECTION_STATS`.
+        let mut sections = crate::observability::section_stats();
         sections.sort_unstable_by_key(|s| s.0);
         let block: Vec<Row> = sections
             .into_iter()
-            .flat_map(|(name, count, total_us, max_us)| {
-                [("count", count), ("total_ms", total_us / 1000), ("max_ms", max_us / 1000)].map(|(k, v)| ("block", format!("{name}.{k}"), v.to_string()))
+            .flat_map(|((component, name), count, total_us, max_us)| {
+                [("count", count), ("total_ms", total_us / 1000), ("max_ms", max_us / 1000), ("avg_us", total_us.checked_div(count).unwrap_or(0))]
+                    .map(|(k, v)| (component, format!("{name}.{k}"), v.to_string()))
             })
             .collect();
 
@@ -1598,13 +1601,18 @@ mod stats_table_tests {
     fn exposes_process_uptime_scheduling_lag_and_blocking_sections() {
         crate::observability::mark_process_start();
         drop(crate::observability::BlockWatch::new("test_section"));
+        drop(crate::observability::TimedSection::new("test_section"));
 
         let rows = snapshot_rows(&StatsTableProvider::new(None));
         for key in ["uptime_seconds", "scheduling_lag_ms", "scheduling_lag_max_ms", "worker_threads"] {
             assert_has(&rows, "runtime", key);
         }
-        for key in ["test_section.count", "test_section.total_ms", "test_section.max_ms"] {
-            assert_has(&rows, "block", key);
+        // Same section name under both kinds must stay two distinct rows: one
+        // claims worker occupancy, the other only wall time.
+        for component in ["block", "section"] {
+            for key in ["test_section.count", "test_section.total_ms", "test_section.max_ms", "test_section.avg_us"] {
+                assert_has(&rows, component, key);
+            }
         }
     }
 

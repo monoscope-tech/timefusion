@@ -578,6 +578,12 @@ const REFRESH_APPEND_CATCHUP_MAX_GAP: u64 = 64;
 /// old snapshot while a clone refreshes, and the write lock is held only for the swap. The swap is
 /// version-guarded against concurrent committers, so the shared handle never regresses.
 pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incremental: bool) -> std::result::Result<Option<u64>, deltalake::DeltaTableError> {
+    // Every query on the resolve path pays this, and its cost scales with the
+    // active file list, not with what the query reads — the shape hypothesis 3
+    // predicts for "a trivial query gets slower as the process ages". Wall
+    // time, not occupancy (`section`, not `block`): the body awaits, so a slow
+    // sample here means slow, not blocking. Read `avg_us` against uptime.
+    let _timed = crate::observability::TimedSection::new("delta_snapshot_refresh");
     // Staleness probe: versions are contiguous, so the snapshot is current iff
     // `{version+1}.json` doesn't exist — one GET/404 instead of update_state's
     // `_delta_log` LIST (LISTs bypass the Foyer cache). On probe *error* fall

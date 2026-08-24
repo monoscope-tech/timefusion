@@ -532,18 +532,32 @@ pub fn spawn_runtime_lag_sampler(cancel: tokio_util::sync::CancellationToken) {
     });
 }
 
-/// Cumulative time a named section blocked a runtime worker: `(count, total_us, max_us)`.
+/// Cumulative time in a named section: `(count, total_us, max_us)`.
 #[derive(Default)]
-struct BlockStat {
+struct SectionStat {
     count: AtomicU64,
     total_us: AtomicU64,
     max_us: AtomicU64,
 }
 
-static BLOCK_STATS: std::sync::LazyLock<dashmap::DashMap<&'static str, BlockStat>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+/// Keyed by `(component, name)`. The component keeps the two kinds apart and is
+/// load-bearing: a `block` row claims a worker was OCCUPIED for that long, a
+/// `section` row only claims wall time, which for an `async` body includes
+/// awaits that gave the worker back. Reading one as the other is how "blocked"
+/// and "slow" get confused, which is the exact confusion this plan exists to
+/// resolve.
+static SECTION_STATS: std::sync::LazyLock<dashmap::DashMap<(&'static str, &'static str), SectionStat>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+fn record_section(component: &'static str, name: &'static str, elapsed: Duration) {
+    let entry = SECTION_STATS.entry((component, name)).or_default();
+    entry.count.fetch_add(1, Relaxed);
+    entry.total_us.fetch_add(elapsed.as_micros() as u64, Relaxed);
+    entry.max_us.fetch_max(elapsed.as_micros() as u64, Relaxed);
+}
 
 /// Times a section that occupies a runtime worker without yielding — a
-/// `std::sync::Mutex` hold, a synchronous snapshot refresh.
+/// `std::sync::Mutex` hold, a synchronous rebuild. **Not for `async` bodies**:
+/// use [`TimedSection`] there, which makes no occupancy claim.
 ///
 /// This is the instrument `scheduling_lag_ms` asks for and cannot supply: lag
 /// says workers woke late while the host was half idle, which means blocked,
@@ -555,33 +569,41 @@ static BLOCK_STATS: std::sync::LazyLock<dashmap::DashMap<&'static str, BlockStat
 /// Cost is two `Instant::now()` and one atomic triple per section entry.
 pub struct BlockWatch(&'static str, std::time::Instant);
 
-impl BlockWatch {
-    pub fn new(name: &'static str) -> Self {
-        Self(name, std::time::Instant::now())
-    }
-}
+/// Wall time of a named section, awaits included. Answers "does this get slower
+/// as the process ages" — hypothesis 3 — without claiming a worker was held.
+pub struct TimedSection(&'static str, std::time::Instant);
 
-impl Drop for BlockWatch {
-    fn drop(&mut self) {
-        /// Below this a hold is ordinary and a log line would be pure noise;
-        /// the totals still count it.
-        const WARN_MS: u128 = 250;
-        let held = self.1.elapsed();
-        let us = held.as_micros() as u64;
-        let entry = BLOCK_STATS.entry(self.0).or_default();
-        entry.count.fetch_add(1, Relaxed);
-        entry.total_us.fetch_add(us, Relaxed);
-        entry.max_us.fetch_max(us, Relaxed);
-        if held.as_millis() >= WARN_MS {
-            warn!(section = self.0, held_ms = held.as_millis() as u64, "blocking section held a runtime worker — queries scheduled onto this worker waited behind it");
+macro_rules! section_timer {
+    ($ty:ident, $component:literal $(, warn_ms = $warn:literal, $msg:literal)?) => {
+        impl $ty {
+            pub fn new(name: &'static str) -> Self {
+                Self(name, std::time::Instant::now())
+            }
         }
-    }
+        impl Drop for $ty {
+            fn drop(&mut self) {
+                let elapsed = self.1.elapsed();
+                record_section($component, self.0, elapsed);
+                $(if elapsed.as_millis() >= $warn {
+                    warn!(section = self.0, elapsed_ms = elapsed.as_millis() as u64, $msg);
+                })?
+            }
+        }
+    };
 }
 
-/// `(section, count, total_us, max_us)` for every blocking section entered this
-/// process. Unsorted; the caller orders it.
-pub fn block_stats() -> Vec<(&'static str, u64, u64, u64)> {
-    BLOCK_STATS.iter().map(|e| (*e.key(), e.count.load(Relaxed), e.total_us.load(Relaxed), e.max_us.load(Relaxed))).collect()
+section_timer!(
+    BlockWatch,
+    "block",
+    warn_ms = 250,
+    "blocking section held a runtime worker — queries scheduled onto this worker waited behind it"
+);
+section_timer!(TimedSection, "section");
+
+/// `((component, section), count, total_us, max_us)` for every timed section
+/// entered this process. Unsorted; the caller orders it.
+pub fn section_stats() -> Vec<((&'static str, &'static str), u64, u64, u64)> {
+    SECTION_STATS.iter().map(|e| (*e.key(), e.count.load(Relaxed), e.total_us.load(Relaxed), e.max_us.load(Relaxed))).collect()
 }
 
 /// Holds `inner` while a [`BlockWatch`] times it. Derefs to `inner`, so a

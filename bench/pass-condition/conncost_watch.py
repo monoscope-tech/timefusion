@@ -62,6 +62,11 @@ STATS = [
     ("block", "journal_lock_wait.max_ms"),
     ("block", "journal_hold.max_ms"),
     ("block", "journal_hold.total_ms"),
+    # Hypothesis 3, directly: cost that scales with the active file list rather
+    # than with what the query reads. Every query on the resolve path pays it.
+    ("section", "delta_snapshot_refresh.avg_us"),
+    ("section", "delta_snapshot_refresh.max_ms"),
+    ("section", "delta_snapshot_refresh.count"),
     ("mem_buffer", "total_rows"),
     ("mem_buffer", "estimated_bytes_approx"),
     ("mem_buffer", "total_buckets"),
@@ -134,14 +139,26 @@ def analyze():
     def nums(key):
         return [float(r[key]) for r in rows if r.get(key) not in (None, "")]
 
-    # A restart resets uptime, which splits the series: samples either side are
-    # different processes and a correlation across the break is meaningless.
+    # A restart resets uptime, which SPLITS the series: samples either side are
+    # different processes, so a correlation across the break is meaningless.
+    # Correlate only inside the longest uninterrupted run — warning about the
+    # break and then correlating across it anyway is the same mistake with a
+    # disclaimer attached.
+    all_rows = rows
+    runs = [[all_rows[0]]]
+    for prev, row in zip(all_rows, all_rows[1:]):
+        restarted = float(row["runtime.uptime_seconds"] or 0) < float(prev["runtime.uptime_seconds"] or 0)
+        runs.append([row]) if restarted else runs[-1].append(row)
+    rows = max(runs, key=len)  # `nums` reads this name — late binding is deliberate
+
     ups = nums("runtime.uptime_seconds")
-    restarts = sum(1 for a, b in zip(ups, ups[1:]) if b < a)
-    span_h = (int(rows[-1]["ts"]) - int(rows[0]["ts"])) / 3600
-    print(f"{len(rows)} samples over {span_h:.1f} h, {restarts} restart(s) mid-run, uptime {min(ups)/3600:.1f}–{max(ups)/3600:.1f} h")
-    if restarts:
-        print("  ! a restart mid-run splits the series — Phase 0 needs a process nobody redeploys")
+    span_h = (int(all_rows[-1]["ts"]) - int(all_rows[0]["ts"])) / 3600
+    print(f"{len(all_rows)} samples over {span_h:.1f} h in {len(runs)} process run(s)")
+    if len(runs) > 1:
+        print(f"  ! restarts split the series; analyzing the longest run only ({len(rows)} samples)")
+    if len(rows) < 3:
+        sys.exit("  the longest uninterrupted run is too short — Phase 0 needs a process nobody redeploys")
+    print(f"  uptime spanned {min(ups)/3600:.1f}–{max(ups)/3600:.1f} h")
 
     for cost in ("connect", "query", "reuse"):
         line = [f"{cost:8}"]

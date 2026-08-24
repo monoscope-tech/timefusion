@@ -123,9 +123,16 @@ flamegraph is Aug 12), the usual tool is unavailable, and the signal to chase is
 2. Instrument suspected blocking sections with a "held for N ms" warn, starting
    with the journal mutex and the Delta snapshot refresh. **Done for the
    journal** (`observability::BlockWatch` / `Watched<T>`, exposed as the `block`
-   component: `<section>.{count,total_ms,max_ms}`, plus a warn over 250 ms).
-   The snapshot refresh is not wrapped yet — wrap it the same way when the
-   journal numbers come back uninteresting.
+   component: `<section>.{count,total_ms,max_ms,avg_us}`, plus a warn over
+   250 ms). **The Delta snapshot refresh is wrapped too, but under a different
+   claim**: `refresh_table_snapshot` is `async` and deliberately does not hold
+   the write lock across `update_state()`, so timing it as "blocking" would be
+   a lie — awaits give the worker back. It reports under `section`
+   (wall time only), the journal under `block` (worker occupancy). Every query
+   on the resolve path pays the refresh and its cost scales with the active
+   file list rather than with what the query reads, which is exactly the shape
+   hypothesis 3 predicts: read `section.delta_snapshot_refresh.avg_us` against
+   uptime.
 3. Only if 1–2 are inconclusive, consider re-enabling the CPU profiler — noting
    that it took prod down once and that the signal wanted here is a blocked
    worker, which a CPU sampler shows as *idle*.
