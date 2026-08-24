@@ -660,13 +660,38 @@ compare, essentially nothing in this process's connection path is expensive.
 
 **So the search moves outside the process — and there is an obvious candidate
 this plan never mentioned: `srv-timefusion-pgwire-proxy`, the haproxy in front
-of pgwire.** Every measured connection traverses it. That fits the signature
-exactly: TCP connect is to *haproxy* and stays fast (62.5 ms in the stall
-sample), the warm `SELECT 1` on an established connection stays fast (77.5 ms),
-and only establishing a *new* backend session is slow — which is the one phase
-haproxy owns. Nothing in this investigation has looked at it. Its config is in
-`deploy/`; the next probe is whether a stall reproduces when connecting to the
-backend port directly, bypassing the proxy.
+of pgwire.** Every measured connection traverses it, and its config is built to
+produce exactly this signature: `timeout connect 1s` with `fall 2` on a 250 ms
+`tcp-check`, so a backend marked DOWN makes *new* connections pay a connect
+timeout plus retries while *established* sessions are untouched.
+
+**Refuted within the hour, by its own logs.** Over 8 hours haproxy logged 17
+`is DOWN` transitions, every one of them `Layer4 connection problem, Connection
+refused` — the signature of a container that is gone, i.e. a deploy restart, not
+a health-check timeout. Lining the transitions up against every slow sample
+recorded all day:
+
+| slow sample | connect | nearest DOWN/UP |
+|---|---|---|
+| 12:00Z | 1,433 ms | 87.8 min away |
+| 13:20Z | 2,960 ms | 7.5 min away |
+| 15:02Z | 1,450 ms | 33.7 min away |
+| 16:23Z | 3,049 ms | 97.6 min away |
+| 16:42Z | 4,460 ms | 78.8 min away |
+
+Not one stall is within 7 minutes of a proxy transition; most are an hour or two
+away. The proxy is not flapping during the stalls, and its DOWN events are the
+deploy churn already accounted for. **Hypothesis raised and killed in the same
+session — worth recording precisely so nobody re-raises it from the config
+alone, which reads guilty.**
+
+What that leaves inside connection establishment, having eliminated DNS, TCP,
+auth, handler construction and the proxy: the pgwire **startup exchange itself**
+and the **accept path**. A slow accept fits the signature exactly — the kernel
+completes the TCP handshake from the listen backlog (so `tcp` stays fast) while
+the startup message waits for a task that has not been polled yet. That is the
+next thing to time, and it needs a timer around accept-to-first-message rather
+than around anything measured so far.
 
 **Second finding, from the same read:** `jemalloc.retained_mb` is **21,127** on a
 184-second-old process, against **147,247** on an ~80-minute-old one. Retained
