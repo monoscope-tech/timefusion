@@ -427,3 +427,34 @@ immediately — and then answered a second, different defect that no amount of
 staring at file counts would have separated from the first.
 
 Instrument the silent branch BEFORE the second guess, not after the third.
+
+## VERIFIED 2026-08-24: compaction retires files now
+
+All three fixes live (`680acac` funnel, `8844064` smallest-first, `e16f157`
+policy-matches-packer). Two independent confirmations:
+
+**The silent branch went quiet.** `compaction_unit_selected_nothing` fired
+constantly before — every 30-60 s, once per claimed cell. In a 15-minute window
+after the fixes: **zero events**. Every unit now selects at least two files and
+does real work.
+
+**Object storage agrees.** Delta v500674:
+
+```
+                          before          after
+small files (fleet)        1,772          1,273     -28%
+6297304f / 2026-08-17    275 files      49 files    -82%
+28f62f01 / 2026-08-18    230 files     165 files    -28%
+87576849 / 2026-08-22     47 files      28 files    -40%
+87576849 / 2026-08-19    238 files     238 files    unchanged
+```
+
+Against a baseline that was **flat for 45 minutes** — 275/238/230 before and
+after, not one file retired.
+
+Cell count reads 52 vs 48 because 2026-08-23 sealed and brought its own debt;
+the meaningful number is small files, down 499.
+
+`87576849 / 2026-08-19` is unchanged and is the next thing to look at — it may be
+a fourth variant of the same silent-refusal family, and the funnel log will now
+say so directly rather than requiring a guess.
