@@ -1538,3 +1538,28 @@ honest summary of where the goal stands.
 and `Dedup` — file rewrites — not `BaseRollup`. The rollup rebuild is NOT
 timeout-limited, so the fix for it is ordering and process lifetime, not
 deadlines.
+
+### Qualifying "the rebuild is progressing": not for this project
+
+Stored vs expected generation, project `00000000…`, tier `dashboard_1m_v3`:
+
+| date | stored | expected | match |
+|---|---|---|---|
+| 2026-07-20 | `4e41ef706cc11d47` | `1df28d70da8163cb` | no |
+| 2026-07-21 | `4e45ef706cc5061e` | `1df68d70da854ca2` | no |
+| 2026-08-01 | `bccd8ae15a2ca699` | `f3708e8ffa2d11b5` | no |
+| 2026-08-21 | `ab0d38e14fff3b0f` | `e2f63c8ff11468cb` | no |
+| 2026-08-23 | `e2f03c8ff10ffd1d` | `e2f03c8ff10ffd1d` | **yes** |
+
+**Every pre-08-22 date is still stale, including 07-20 — which I watched publish
+six units.** Those publishes therefore belonged to OTHER projects. The earlier
+claim that "the rebuild is progressing" holds only in the sense that some cells
+somewhere advance; there is no evidence it is advancing this project's orphaned
+history, and this is the project every 30d benchmark uses.
+
+Worth noting the hash families as a diagnostic: `08-23` stored matches expected
+exactly, and `08-21` EXPECTED is `e2f63c8f…` — same `e2f` family as 08-23, since
+the date is hashed — while `08-21` STORED is `ab0d38e1…`, a different family
+entirely. The spec change is visible in the prefix alone, which makes this a
+cheap spot-check for the future: compare a stored generation against its
+neighbours' expected values.
