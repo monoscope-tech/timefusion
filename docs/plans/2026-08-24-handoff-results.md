@@ -267,8 +267,8 @@ was claimed and selected nothing". There is no instrument for "a cell was planne
 and never claimed", and that is the branch this cell is in — the planner reports
 `planned=341` every 60 s, so it is being planned.
 
-**Mechanism 2 is now PROVEN**, in a unit test, with no prod dependency — branch
-`handoff-frontier-class`, commit `cf1a937`. `plan_compaction_debt` chooses the
+**Mechanism 2 is now PROVEN and FIXED ON MASTER** (`3465ecc`), by a unit test with
+no prod dependency. `plan_compaction_debt` chooses the
 operation from the calendar (`date == today` mints HotPacking, older mints
 SealedConsolidation) while `is_live_frontier` stays true for a full 24 h after a
 slice ENDS. So yesterday's consolidation unit holds **class 0** — strict priority
@@ -281,10 +281,15 @@ Class being strict priority means `scheduling_class`'s own promise — "a cell w
 200 files outranks one worth 3" — could never apply across a day boundary.
 
 The fix (`is_frontier_task`, applied to the five sites that decide or report claim
-order) is green on 905 lib tests and `cargo lint`. **It is deliberately NOT on
-master**: a code push here triggers a deploy, this is a scheduling change, and
-this codebase's history says scheduling changes want one-per-deploy with a quiet
-window to read. It wants review and a staging run, not a drive-by merge.
+order) is green on 906 lib tests and `cargo lint`.
+
+**Landed as the default, by explicit decision, without a staging run.** The
+tradeoff accepted: it ships on the next push by any session, and this box OOMs
+under maintenance fan-in, so the first quiet window after it deploys is worth
+watching. What to watch: `SealedConsolidation` claims should stop concentrating on
+the newest sealed day, `out_of_policy_cells` should fall below 48 for the first
+time, and the new `maintenance_hygiene_debt_unclaimed` line should stop reporting
+`outranked_by` for the 238-file cell.
 
 Candidate mechanisms, the first still unproven:
 
