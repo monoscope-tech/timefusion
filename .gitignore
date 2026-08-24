@@ -18,3 +18,4 @@ bench/data/query_latency_state.json
 bench/local/
 # Phase-0 sampler output: machine-local time series, appended to on every run
 bench/pass-condition/conncost_watch.csv
+scripts/local/
