@@ -21,9 +21,15 @@ later data overturned. The net result, as of 2026-08-24 22:00:
    while `connect_ms` and `write_ms` are 0 and handler construction maxes at
    4 ms. Not the network, not the haproxy, not auth logic, not handler build.
    Frequent (2 of 3 sampling windows), and it explains the external
-   connect-only stalls. Leading hypothesis for the remaining gap: the
-   connection's task is not polled promptly —
-   `scheduling_lag_max_ms` is 2.8–8.2 s in the same processes.
+   connect-only stalls.
+
+**The system-level finding, which is bigger than either:** this process **fails
+to wake a 500 ms timer on time by 0.3–2.9 s, several times a minute,
+continuously**, on 48 workers with the host 40 % idle. The auth stalls sit inside
+that distribution. Causation is unproven precisely *because* the lag never stops
+— an always-present cause cannot be correlated with an intermittent effect — so
+the next step is per-connection accept-to-startup timing inside the server, not
+more outside correlation.
 
 **Eliminated, each with the instrument built for it:** host load (44.0 → 178 ms
 versus 32.9 → 4,460 ms — both directions); the maintenance journal mutex (held a
@@ -738,6 +744,39 @@ scheduling reading supports the former: `scheduling_lag_max_ms` sat at
 sampler almost always misses. That is a *hypothesis*, not a result: the sampler
 now records `inproc_auth_ms` and `scheduling_lag_max_ms` on the same row, and
 their correlation is the next thing to read.
+
+### The lag test: inconclusive by saturation, because the runtime is late CONTINUOUSLY
+
+`spawn_runtime_lag_sampler` has been writing a timestamped `warn!` per event at
+≥250 ms all along, and nothing had read it. Lining those up against the three
+healthcheck windows above:
+
+| window (UTC) | `auth_ms` | lag warns inside it |
+|---|---|---|
+| 20:49:05–20:49:30 | **470** | 518, 593, 500 ms |
+| 20:51:09–20:51:34 | **1** | 290, 345, 545, 313 ms |
+
+**The hypothesis cannot be tested this way: the warns never stop.** Over twelve
+minutes there are ~40 of them — several a minute, 275 ms to 2,850 ms — in stall
+windows *and* in the window where `auth_ms` was 1 ms. A cause that is always
+present cannot be correlated with an effect that is intermittent.
+
+But the negative result is smaller than what it uncovers. **This process fails
+to wake a 500 ms timer on time, by 0.3–2.9 seconds, several times a minute,
+continuously, on a 48-worker runtime and a host that is 40 % idle.** That is not
+a connection problem or a query problem; it is the runtime being persistently
+unable to poll a trivial task. The auth stalls (470–1,423 ms) sit squarely
+inside that distribution, which is consistent with causation without proving it.
+
+Proving it needs the timing *inside* the server — accept-to-startup-handled per
+connection — not more correlation of two things measured from outside. That is
+a code change and it is the first move for whoever picks this up. Note the
+instrument shape trap while doing it: `scheduling_lag_max_ms` is a monotone
+high-water mark (already 2.8–8.2 s, so a 1.4 s event cannot move it) and
+`scheduling_lag_ms` is an instantaneous read that misses sub-second events —
+**neither column can ever correlate with an episodic stall.** The per-event
+`warn!` is the only record that can, which is why the logs answered what the
+counters could not.
 
 **What to do next, in order:**
 1. Let the process keep ageing with the host columns recording. The question is
