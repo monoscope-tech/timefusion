@@ -80,6 +80,12 @@ STATS = [
     ("plan_cache", "hits"),
     ("plan_cache", "misses"),
     ("memory", "charged_bytes"),
+    # Fragmentation: memory held but not in use. The only candidate left after
+    # every other instrument either froze or fell across the cost onset.
+    ("jemalloc", "frag_pct"),
+    ("jemalloc", "allocated_mb"),
+    ("jemalloc", "resident_mb"),
+    ("jemalloc", "retained_mb"),
     ("scan", "provider_cache_entries"),
     ("scan", "fast_resolve_cache_entries"),
     ("pgwire", "queries_total"),
