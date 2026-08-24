@@ -1,6 +1,8 @@
 # Open work after the untagged-tier convergence
 
-**Status:** in progress, 2026-08-24.
+**Status:** handed off 2026-08-24 ~14:15 UTC. Four items shipped, two blocked on a
+quiet prod, one deliberately not attempted. **Read the HANDOFF section below before
+anything else** — notably which commits are live and the §3 gate trap.
 
 | Item | State |
 |---|---|
@@ -10,6 +12,107 @@
 | §4 escalation treadmill | **investigated, no code — two corrections** (`98e72d5`). (b) batching is ALREADY implicit: `enqueue` is keyed, so N escalations to one covering slice collapse to one task. (a) the on-demand split written in this doc is UNSOUND — the covering file physically holds the hole's rows, so re-tagging it narrower double-counts. Escalation stays correct until the ledger can name files per range |
 | §5 fragment debris | **NOT implemented, premise unverifiable right now.** Prod reads `tasks_pending` 5,983 (not ~12,700) and is dominated by dedup (3,702) rather than base-rollup fragments (2,116) — but the process was 6 MINUTES OLD when sampled, so a low count may mean the planner has not re-derived debt yet, not that debris drained. Needs a quiet process before any destructive migration is written |
 | §6 whale cells | **BLOCKED, not self-completing — earlier assessment was wrong.** See "Why the drain stopped" below |
+
+## HANDOFF — read this first (session ended 2026-08-24 ~14:15 UTC)
+
+### What is deployed vs what is not
+
+The checkout is SHARED with another Claude session working the tantivy/rollup
+plans, and its pushes carried some of my commits with them. So "what I pushed"
+is not the same as "what is live". Verified with
+`git merge-base --is-ancestor <sha> origin/master`:
+
+| Commit | What | State |
+|---|---|---|
+| `69e6503` | §2 preflight floor fix | **PUSHED — live in prod** |
+| `3ec8003` | ledger types/trait/backend | **PUSHED — live** |
+| `f6b50e5` | tag replay populates ledger | **PUSHED — live** |
+| `b9572cf` | ledger verifier + `replace()` | **PUSHED — live** |
+| `8b8ad30` | §1b immutability audit (default OFF) | local only |
+| `98e72d5` | coverage entries name their FILES | local only |
+| `a9ab66e` | declined unit is still claimable | local only |
+
+`git status`: 13 ahead / 6 behind `origin/master`, and the ahead-list is
+INTERLEAVED with the other session's commits. Do not force-push, do not rebase
+without checking whose work is in the tree.
+
+### TRAP: the first deploy of `98e72d5` will fake a §3 gate failure
+
+`CoverageEntry.files` was added in `98e72d5`, which is NOT deployed. Prod is
+therefore writing ledger entries with **no file identity**, and the field is
+`#[serde(default)]`, so those entries reload as `files: []`.
+
+The moment `98e72d5` ships, the verifier compares `held` (no files, from the old
+sidecar) against `proved` (with files, from the replay), they differ, and
+**`coverage_ledger_disagreements` will spike once for essentially every cell**.
+
+That is a serialization artifact, not drift. It should clear on the following
+hourly pass, because `replace()` overwrites the cell with the proved version.
+**Do not read the §3 gate until at least two hourly recovery passes have run on
+a build that includes `98e72d5`.** Misreading that spike as real drift would
+send someone chasing a ledger bug that does not exist.
+
+The cheaper alternative is to delete `.timefusion_meta/rollup_coverage_ledger.json`
+once when that build first boots; the ledger is rebuilt from the tag replay, so
+losing it costs nothing.
+
+### What blocks everything else
+
+Prod redeployed **5+ times in 51 minutes** (see the next section). Maintenance
+units average ~21 minutes and do not start until 300s after boot, so they never
+finish, and every process-scoped counter is immature. Both remaining gates —
+§1's `immutable_column_disagreement_total` and §3's
+`coverage_ledger_disagreements` — are unreadable until pushes stop.
+
+### Next actions, in order
+
+1. **Freeze pushes to master for ~1h.** Not a code change. Nothing else on this
+   list can be measured until maintenance units survive to completion. Confirm
+   with `docker service ps srv-captain--timefusion` showing one task older than
+   ~30 minutes.
+2. **Confirm §6 drains.** `scripts/rollup_untagged_cells.py`, or the session's
+   `measure.sh`. It sat at 7 all session, entirely because of (1). Measure from
+   the Delta log, never from a counter.
+3. **Push the three local commits**, then let two hourly passes run, then read
+   `coverage_ledger_disagreements` — remembering the trap above.
+4. **Turn on `TIMEFUSION_IMMUTABLE_AUDIT_ENABLED`** for ~24h of quiet uptime and
+   read `immutable_column_disagreement_total`. Non-zero means §1 is real and
+   fix (c) is justified; zero means the pushdown premise holds and §1 closes.
+5. **Only then consider §5**, whose premise is still unmeasured.
+
+### Corrections made this session — do not re-derive these
+
+- **§2 is a PRICING bug**, not an ordering one. `byte_bounded_units:444` prices
+  children by TIME SHARE, so the recursion always fits on paper while the real
+  cost floors out. Also: the runner ALREADY hash-shards internally at any width
+  (`maintain.rs:1623`), so bisection is a cost optimisation, not a memory
+  mechanism — declining a split is safe.
+- **§4 option (a) is UNSOUND.** Splitting a covering slice by re-tagging does
+  not work: the file physically holds the hole's rows, so both copies get
+  summed. Option (b) is already implicit — `enqueue` is keyed by `TaskKey`.
+- **`record()` was append-only and wrong.** Coverage is not additive; a slice
+  rebuilt under a new generation supersedes the old one. Fixed by `replace()`
+  in `b9572cf`. Without it the ledger would have served coverage whose files
+  were gone.
+- **The ledger needed file identity** (`98e72d5`) or it could only ever
+  supplement the tags, never replace them — files stay non-anonymous, the tier
+  stays non-compactable, and the entire point is lost.
+- **"7 unchanged is expected granularity" was WRONG.** It was a stall with a
+  cause. Four hours were spent reporting it as healthy.
+
+### What could not be done, and why
+
+- **No `timefusion sim` replay of a real prod journal.** The journal is not
+  readable as `ubuntu` without sudo, and `docker cp` is outside the read-only
+  remit for that host (logs / `inspect` / `ps` only). §2 is therefore verified
+  by unit tests and reasoning, NOT against real queue shape. That validation is
+  still owed.
+- **No §5 migration.** It is destructive, its premise (~12,700 units) is
+  unverified, and the one sample taken read 5,983 against a 6-minute-old
+  process — which is exactly the young-process artifact that has produced false
+  "it is fixed" readings here before.
+
+---
 
 ## Why the drain stopped (2026-08-24 13:30 UTC)
 
