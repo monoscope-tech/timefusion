@@ -267,20 +267,34 @@ was claimed and selected nothing". There is no instrument for "a cell was planne
 and never claimed", and that is the branch this cell is in — the planner reports
 `planned=341` every 60 s, so it is being planned.
 
-Candidate mechanisms, none yet proven, in order of how well they fit:
+**Mechanism 2 is now PROVEN**, in a unit test, with no prod dependency — branch
+`handoff-frontier-class`, commit `cf1a937`. `plan_compaction_debt` chooses the
+operation from the calendar (`date == today` mints HotPacking, older mints
+SealedConsolidation) while `is_live_frontier` stays true for a full 24 h after a
+slice ENDS. So yesterday's consolidation unit holds **class 0** — strict priority
+over every genuinely sealed cell — until it is 48 h old. The test asserts
+`scheduling_class(yesterday).0 == 1` and fails on the current code with
+`left: 0, right: 1`.
 
-1. **Quarantine.** `QUARANTINE_ATTEMPTS = 2` and hygiene units time out at 900 s
+That is exactly what window A measured: 26 of 27 claims on the newest sealed day.
+Class being strict priority means `scheduling_class`'s own promise — "a cell worth
+200 files outranks one worth 3" — could never apply across a day boundary.
+
+The fix (`is_frontier_task`, applied to the five sites that decide or report claim
+order) is green on 905 lib tests and `cargo lint`. **It is deliberately NOT on
+master**: a code push here triggers a deploy, this is a scheduling change, and
+this codebase's history says scheduling changes want one-per-deploy with a quiet
+window to read. It wants review and a staging run, not a drive-by merge.
+
+Candidate mechanisms, the first still unproven:
+
+1. **Quarantine (unproven).** `QUARANTINE_ATTEMPTS = 2` and hygiene units time out at 900 s
    (SealedConsolidation: 8 timeouts in 27 claims, 30%). Two timeouts make a unit
    claimable only through the narrow quarantined-occupancy permit. A 238-file,
    17 GB-decoded cell is the most likely thing in the fleet to have timed out
    twice, and thereafter the largest debt in the fleet becomes the least
    reachable work in the fleet — benefit ordering inverted by attempt count.
-2. **Frontier misclassification.** `plan_compaction_debt` calls any date before
-   today `SealedConsolidation`, but `is_live_frontier` is true for a full
-   `LIVE_FRONTIER_WINDOW_MICROS` = 24h after the slice ENDS. So yesterday's
-   consolidation unit is class 0 — strict priority over every genuinely sealed
-   cell — until it is 48h old. One 90-minute window had **26 of 27**
-   SealedConsolidation claims on 2026-08-23 for exactly this shape.
+2. **Frontier misclassification — PROVEN, see above.**
 
 **Built, `f7e2717`.** `most_indebted_unclaimed` selects the eligible hygiene unit
 with the most files — for hygiene that IS the debt, and the planner already
