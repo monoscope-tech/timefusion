@@ -337,9 +337,10 @@ specific cell may never be looked at, and `first_refused_sealed` answers a bare
 a method so a read-only caller can ask the question; ordering is unchanged and the
 19 scheduling tests that would have caught a change pass untouched.
 
-**This does not fix the starvation — it makes the next diagnosis one log line
-instead of a guess**, which is the lesson the lever-2 page already ends on. The
-candidate mechanisms above stay candidates until prod prints which one it is.
+**The instrument alone does not fix the starvation** — it makes the next diagnosis
+one log line instead of a guess, which is the lesson the lever-2 page already ends
+on. Both candidate mechanisms were then run down: one was a real defect and is
+fixed (`3465ecc`), the other is deliberate and correctly left alone. See above.
 
 ## 6. The known-red test is **green**
 
@@ -390,4 +391,129 @@ session — `8c37d37` (`fold_fleet_gauge`) and `69e6503` ("stop bisecting a slic
 once it stops getting cheaper") — and the 22 targeted tests pass on the tree as it
 stands at `0d8b0ed`.
 
-Nothing in this session was committed or pushed by hand, and nothing was deployed.
+Nothing was pushed by hand and nothing was deployed from this session. What was
+committed locally is listed in the handoff below.
+
+---
+
+# Pick up here tomorrow
+
+## What is on master and NOT yet deployed
+
+Both land on the next push by anyone. Neither has had a staging run.
+
+| commit | what | risk |
+|---|---|---|
+| `3465ecc` | `is_frontier_task` — a `SealedConsolidation` unit is never the live frontier | **Scheduling change.** Routes more large sealed partitions into the heavy path, and this box OOM-killed at 124.9 GB on a maintenance fan-in before. This is the one to watch. |
+| `f7e2717` | `most_indebted_unclaimed` + the `maintenance_hygiene_debt_unclaimed` log line | Read-only instrument, logs once per 60 s planner tick. |
+
+Shipped earlier by the concurrent session, already live: `8c37d37`
+(`fold_fleet_gauge`), `69e6503` (stop bisecting at the floor).
+
+## The first thing to do after it deploys
+
+Wait for a container older than ~40 min (the work period), then check three
+signals. They are independent — if the first moves and the others do not, the
+starvation had a second cause.
+
+1. **Claims stop concentrating on the newest sealed day.** Was 26 of 27 on a
+   mature container.
+   ```bash
+   ssh ubuntu@captain.s.past3.tech 'docker service logs srv-captain--timefusion --since 60m 2>&1' \
+     | sed -e 's/\x1b\[[0-9;]*m//g' | grep -a maintenance_task_started | grep -a SealedConsolidation
+   ```
+   Parse `slice_start` to a date before quoting anything — and **read the window
+   you actually got**, not the one you asked for (see the `--since` trap below).
+2. **`out_of_policy_cells` drops below 48** — it was 48 at all three censuses.
+   ```bash
+   set -a; source .env.prod; set +a
+   export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+   python3 bench/local/small_file_census.py
+   ```
+3. **`87576849 / 2026-08-19` finally loses files.** It read exactly 238 at four
+   censuses spanning a day. It is the top line of the census output.
+
+If it is still 238, the new log line now answers why directly:
+
+```bash
+ssh ubuntu@captain.s.past3.tech \
+  'docker service logs srv-captain--timefusion --since 30m 2>&1 | grep -a maintenance_hygiene_debt_unclaimed | tail'
+```
+
+`quarantined:` means the permit is the constraint (see §5 — quarantine is
+deliberate, so the question is SIZING, not removal). `outranked_by:` means
+something still outranks it and the line names what. `not_due:` means backoff.
+No line at all means the biggest debt is winning its claims and the problem is
+downstream of selection.
+
+## Open threads, most tractable first
+
+1. **The p1 1h shape at ~9x baseline.** The only unexplained latency finding left.
+   3d is fully explained by cold cache (rep 3 lands 4 ms off baseline on a busy
+   box); 1h does NOT recover with warmth — it got worse across reps
+   (1,783 -> 3,034 -> 2,592 ms) against a 199 ms baseline. A narrow window is the
+   cheapest possible query, so this is neither scan volume nor caching. Smallest
+   open question, and it needs no prod coordination — reproduce with
+   `bench/local/` against p1 and read `EXPLAIN ANALYZE`.
+2. **Quarantine permit sizing.** Only worth touching if signal 3 above says
+   `quarantined:`. Do not "fix" quarantine itself — `enqueue`'s early return for
+   `Retry` + `WORKER_FAILURE_REASON` is load-bearing and its removal restores a
+   known duty-cycle bug (day-wide units re-claiming every 5-8 min against a
+   >=900 s floor).
+3. **§4, the p1 30d `log_list` OOM.** Untouched on purpose — the original plan
+   says "do not rush this", and its three obstacles are unchanged. Note the
+   correction in §4 above: the scan ceiling is NOT deployed, so the OOM is live
+   and unmasked, not hidden as the plan assumed.
+4. **Reconcile with `9602e49`.** That commit concludes "the drain is BLOCKED by
+   deploy churn, not waiting on wall-clock". The eight samples in §1 say the drain
+   is flat *during* quiet stretches too — 435 cells unchanged through a 37-minute
+   and a 38-minute pause. Both cannot be right, and the difference decides whether
+   batching deploys is worth doing.
+
+## The tools, and why each exists
+
+All in `bench/local/` (gitignored). Create `bench/local/tfurl` first:
+`grep -m1 '^TIMEFUSION_PG_URL=' ../monoscope/.env | cut -d= -f2- > bench/local/tfurl`
+
+| tool | why it exists |
+|---|---|
+| `journal_snapshot.py` | The checkpoint is NOT live state — it was **2h51m stale** all session. This replays the `.wal` beside it. Any count taken from the JSON alone is a reading of hours ago. |
+| `drain_sampler.sh` | Samples the journal + counters every 15 min **with the image SHA**, so a deploy annotates the series instead of silently truncating it. |
+| `small_file_census.py` | Object storage, per (project, date). Counters cannot answer this — they are process-scoped and the box restarts constantly. |
+| `routing_probe.py` | Reads routing counters immediately before and after each query **on the same connection**, so latency and hit/miss are one event. |
+| `miss_reasons` sweep | Same, for the miss-reason breakdown specifically. |
+
+## Traps this session hit, beyond the five the original plan lists
+
+Each cost real time here, and each produced a reading that looked correct.
+
+1. **`docker service logs --since 6h` returned FIVE MINUTES.** The flag asks; the
+   container's retention decides, and a replaced container takes its logs with it.
+   124 task-starts looked like a long-window sample and was not. **Parse min/max
+   timestamps out of any log fetch before quoting a duration.**
+2. **Counter attribution needs the same CONNECTION, not just the same box.** The
+   first miss-reason reading said "every reason is 0 except `not_built`" — taken
+   after a restart, so it described 3 fresh misses on a new process rather than
+   the 15 the probe had just produced. This is the plan's own trap 1, recommitted.
+3. **The idle arm is confounded with a cold cache.** `tasks_running = 0` only
+   happens inside `wait_for_preload`, i.e. in a container's first 300 s — so
+   "no contention" and "no cache" arrive together. It took a third arm
+   (busy + WARM) to separate them, and that arm is what settled §3.
+4. **Count CELLS, not units.** The sealed unit count oscillated 924-980 and once
+   grew 6% in 16 minutes with **zero** new cells — units split. The unit count is
+   not a backlog measure.
+5. **`rollup_min_contiguous_days` read 30 on a 4-minute-old container** and 0 on
+   an equally young one. The "resets to 0, needs ~25 min" rule is not reliable in
+   either direction — read the gauge, do not infer it from uptime.
+6. **A test can encode the bug it was written beside.** The
+   `most_indebted_unclaimed` test's winner won *because* of the class-0 defect, so
+   fixing the defect broke the test. That failure was the fix working.
+
+## Working-tree hazard
+
+This checkout is shared with concurrent sessions. During this session it entered a
+conflicted rebase mid-edit, and `src/maintenance_coordinator.rs` changed under an
+in-flight edit twice. If that happens again: stop editing, put a ref on your
+commits (`git update-ref refs/heads/<name> <sha>`) so they cannot be lost, and
+work in `git worktree add` with `CARGO_TARGET_DIR` pointed at the existing
+`target/` — a second build tree is ~75 G and the disk has ~195 G.
