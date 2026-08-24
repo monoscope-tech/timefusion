@@ -1914,3 +1914,49 @@ can be measured. Today already produced one change shipped on a false premise
 and reverted; the failure mode is not caution, it is stacking. The diagnosis is
 recorded and the change is one function call when there is a quiet process to
 measure it against.
+
+## 01:55 — the whole cycle completed: 901 builds in 13 minutes
+
+```
+23:32:42 DONE otel_logs_and_spans           built=7
+23:34:05 DONE …rollup_dashboard_1h_v1       built=261
+23:35:51 DONE …rollup_dashboard_1h_v2       built=320
+23:35:53 DONE …rollup_dashboard_1m_v2       built=0
+23:37:08 DONE …rollup_dashboard_1m_v3       built=320
+23:45:00 DONE …dashboard_level_1m_v1        built=0
+```
+
+**Every indexed table completed in one cycle — 901 builds in ~13 minutes.**
+Against the 8-per-pass cap this morning, and against a baseline accrual of
+~77/hr, that is roughly 4,000 builds/hr of capacity.
+
+**Correction: "the spans pass never completes" was too strong.** It printed
+`built=7` at 23:32. The ninety-minute window I drew that from contained no
+completion, but absence over one window is not never — the right claim was "did
+not complete in 90 minutes", and I overstated it. It completes; it is simply
+slow and small (7 files, byte-bound), which does not block the others the way I
+inferred.
+
+And `week` moved again the moment a full cycle landed:
+
+| time | today | week | older | sealed |
+|---|---|---|---|---|
+| 22:46 | 1486 | 1404 | 4336 | 5740 |
+| 23:16 | 1496 | 1401 | 4619 | 6020 |
+| 23:31 | 1593 | 1401 | **5430** | 6831 |
+| 23:46 | 1605 | **1032** | 5354 | 6386 |
+
+Two things in that table:
+
+- **`week` 1401 -> 1032**, -369 in one interval, after three samples frozen. So
+  the flatness was passes not completing, not a tier the backfill cannot reach.
+- **`older` spiked +811 in fifteen minutes** (4619 -> 5430) and then fell back to
+  5354. That is an inflow event, not drift — something wrote ~800 files into
+  historical partitions around 23:31, which is what a rollup rebuilding old dates
+  looks like. The cycle then started clearing it.
+
+So the throughput problem is solved: capacity now exceeds baseline accrual by
+~50x, and the remaining question is whether inflow *spikes* like the 23:31 one
+are frequent enough to matter. That is a measurement for a quiet morning, not
+another change tonight — the three shipped changes are now visibly doing their
+job and nothing here argues for a fourth.
