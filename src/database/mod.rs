@@ -3324,9 +3324,7 @@ impl Database {
             let Ok(table_ref) = self.resolve_table(pid, table_name).await else { continue };
             let live_uris = match live_cache.entry(Arc::as_ptr(&table_ref) as usize) {
                 std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    Arc::clone(e.insert(Arc::new(table_ref.read().await.get_file_uris()?.collect())))
-                }
+                std::collections::hash_map::Entry::Vacant(e) => Arc::clone(e.insert(Arc::new(table_ref.read().await.get_file_uris()?.collect()))),
             };
             let report = svc.gc_after_compaction(table_name, pid, &live_uris).await?;
             if report.entries_removed > 0 || report.blob_delete_errors > 0 {
@@ -3576,8 +3574,8 @@ impl Database {
             // the UTC-midnight roll — 2026-08-23 measured `skipped_today=690`
             // on `1m_v3` against `planned=8`, and ~1,600 files sat until 00:00.
             let hot_packed = crate::schema::registry().get(table_name).is_some_and(|s| !s.fields.iter().any(|f| f.name == "rollup_generation"));
-            let skip_today = (self.config.tantivy.timefusion_tantivy_backfill_skip_today && hot_packed)
-                .then(|| format!("date={}", chrono::Utc::now().date_naive()));
+            let skip_today =
+                (self.config.tantivy.timefusion_tantivy_backfill_skip_today && hot_packed).then(|| format!("date={}", chrono::Utc::now().date_naive()));
             let mut skipped_today = 0u64;
             for (pid, mut uris) in by_pid {
                 // Dashboard acceptance is governed by recent windows; a
@@ -4603,15 +4601,15 @@ impl Database {
             futures::stream::iter(ordered.into_iter().map(|table_name| {
                 let db = Arc::clone(&db);
                 async move {
-                match db.tantivy_reconcile_table(&table_name).await {
-                    // Logged even when it did nothing: a silent no-op arm made
-                    // "ran and found nothing" indistinguishable from "never
-                    // ran", and the cron not firing at all was the actual bug.
-                    Ok((built, removed, blobs)) => {
-                        info!("tantivy reconcile: table={} built={} entries_removed={} blobs_deleted={}", table_name, built, removed, blobs);
+                    match db.tantivy_reconcile_table(&table_name).await {
+                        // Logged even when it did nothing: a silent no-op arm made
+                        // "ran and found nothing" indistinguishable from "never
+                        // ran", and the cron not firing at all was the actual bug.
+                        Ok((built, removed, blobs)) => {
+                            info!("tantivy reconcile: table={} built={} entries_removed={} blobs_deleted={}", table_name, built, removed, blobs);
+                        }
+                        Err(e) => warn!("tantivy reconcile failed for {}: {}", table_name, e),
                     }
-                    Err(e) => warn!("tantivy reconcile failed for {}: {}", table_name, e),
-                }
                 }
             }))
             .buffer_unordered(TANTIVY_RECONCILE_CONCURRENCY)
