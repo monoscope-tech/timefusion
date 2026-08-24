@@ -10,14 +10,14 @@ section before anything else.**
 | What remains | Why it cannot be closed today |
 |---|---|
 | §1 decision (fix (c) or close) | criterion is `immutable_column_disagreement_total` over ≥24h of quiet uptime |
-| §3 step 4 ENABLEMENT | engineering is done and equivalence is proven locally; flipping reads is a judgement call that wants `coverage_ledger_disagreements` at zero at production scale first |
+| §3 step 4 ENABLEMENT | code is DONE and shipped default-OFF; flipping `TIMEFUSION_COVERAGE_LEDGER_READS` wants `coverage_ledger_disagreements` at zero at production scale first |
 | §6 drain to 0 | blocked by deploy churn; needs a push freeze, not code |
 
 | Item | State |
 |---|---|
 | §1 immutability gap | **§1b instrumented** (`8b8ad30`), default OFF; decision still pending real data |
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
-| §3 ledger | **steps 1-4 engineering done** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`, `21f3951`) — built, populated, verified, entries name their files, and `routing_view` now answers routing's question from the ledger. **The tag-equivalence gate is checked LOCALLY** on real Delta data: every range the tag-derived map covers is covered by the ledger. Reads are NOT flipped — that is a deliberate config decision, not missing work |
+| §3 ledger | **steps 1-4 DONE** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`, `21f3951`, `4bbd0fe`, `941771a`) — built, populated with only READABLE slices, verified both directions locally, entries name their files, and reads route from it at boot behind `TIMEFUSION_COVERAGE_LEDGER_READS` (default OFF). Remaining: flip the flag once `coverage_ledger_disagreements` reads zero at production scale |
 | §4 escalation treadmill | **investigated, no code — two corrections** (`98e72d5`). (b) batching is ALREADY implicit: `enqueue` is keyed, so N escalations to one covering slice collapse to one task. (a) the on-demand split written in this doc is UNSOUND — the covering file physically holds the hole's rows, so re-tagging it narrower double-counts. Escalation stays correct until the ledger can name files per range |
 | §5 fragment debris | **RESOLVED - no migration, and it must not be written.** `clear_stale_estimates` already exists, and the partition ceiling rescues footprint-less debris by FUSING it (proven by test). Deleting those units would have discarded real queued work |
 | §6 whale cells | **BLOCKED, not self-completing — earlier assessment was wrong.** See "Why the drain stopped" below |
@@ -124,6 +124,22 @@ finish, and every process-scoped counter is immature. Both remaining gates —
   "it is fixed" readings here before.
 
 ---
+
+
+### Late finding: the ledger was over-claiming (fixed `4bbd0fe`)
+
+Implementing the read-path move exposed a latent defect. The ledger was written
+from the RAW tag loop — before `rollup_slice_complete` and the `generation_id`
+match decide whether a slice is readable. Both refuse real slices (a spec change
+invalidates every slice built before it, which is why `stale_generation`
+exists), so the ledger claimed coverage the read path deliberately refuses.
+
+Latent only because nothing read the ledger. Flipping reads onto it would have
+served coverage that is not there — the one failure this design must never have.
+
+The equivalence test had asserted only `tags ⊆ ledger`, the SAFE direction, and
+could never have caught it. It now asserts both, and the reverse is the one that
+matters.
 
 ## Why the drain stopped (2026-08-24 13:30 UTC)
 
