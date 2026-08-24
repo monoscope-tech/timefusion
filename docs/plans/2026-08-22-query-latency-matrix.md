@@ -1480,3 +1480,35 @@ earlier probes this session were invalid.**
 available for part of each window and absent for the first ~5.5 minutes of it.
 Batching deploys is worth more to query latency than any further routing change
 — and it costs nothing to try.
+
+### Why the boundary is not moving: the backlog drains from the wrong end for QUERIES
+
+Boundary re-probed on a valid 19-minute process, ~40 minutes after the first:
+unchanged. `2026-08-23` routes; `08-21`, `08-18`, `08-14` do not. And
+process-independently, `08-18` still carries only the stale generation
+`b3d661e1550311f3` — no rebuild has landed there.
+
+Yet work IS completing. Eighteen minutes of prod:
+
+```
+starts=106   publishes=35   timeouts=15
+publishes by date: 2026-07-20 x6, 2026-08-01 x1, 2026-08-24 x8
+```
+
+So the rebuild progresses — at the **oldest** end. `scheduling_class` drains the
+starved set OLDEST-first, deliberately: *"a backlog has to drain from its old end
+to restore contiguity"*. Every orphaned date is starved, so the range rebuilds
+07-20, 07-21, … and `08-14`..`08-21` come LAST.
+
+**Those are exactly the dates a 7d or 14d panel needs.** Contiguity for a query
+is measured backwards from today, so draining from the far end yields no
+query-visible improvement until nearly the whole 35 days is done. The boundary
+will sit at 08-22 for most of the rebuild and then jump.
+
+This is a genuine tension, not a bug — the oldest-first rule was added for a real
+starvation failure, and reversing it blindly would re-create that. But for
+RESTORING ROUTING after a generation change, the value is at the new end. Worth
+deciding explicitly rather than inheriting.
+
+Also visible: **15 of 106 starts timed out (14%)**, consistent with units
+outliving a process that is replaced every 5-15 minutes.
