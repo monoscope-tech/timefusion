@@ -370,6 +370,35 @@ This reorders the hypothesis table: **1 and 2 are eliminated for the spikes**
 without yet explaining cost, and the live lead is contention — which is the
 branch the plan predicted would mean *a restart buys nothing*.
 
+### The measurement was destroying its own precondition
+
+Ten samples across 30 minutes of one process, all fast (281–428 ms) at loads
+from 23 to **44.7** — and load 44.7 cost 386 ms. That is higher than the load at
+three of the four slow samples, so **`load1` is finished as an explanation**; the
+earlier "slow median 39.2 vs fast 29.9" was an association that this run breaks.
+
+What made this run possible is the actual finding. `docker service ps` shows
+prod cycling through `c8860f5`, `86132a3`, `4aa69aa`, `5b38240` — **all of them
+mine**. `paths-ignore` exempts `docs/**` and `**/*.md`; it does not exempt
+`bench/**`, so every push to the sampler script deployed and restarted prod.
+Five restarts in an hour, caused by the tool that exists to measure what happens
+when a process is left alone. I had already written in this file that another
+worker's deploy broke the window — that was true once and self-inflicted the
+rest of the time.
+
+`bench/**` is now in `paths-ignore` (it is python/shell tooling, not cargo, and
+cannot change the running image).
+
+**This also supplies a mechanism for the spikes that survives the evidence.**
+Every slow sample sat inside a deploy: a *new* container replaying its WAL and
+materializing snapshots while the *old* one still served traffic. That explains
+what nothing else did — why the old process spiked at mid-life uptimes (722 s,
+505 s, 544 s) rather than at any consistent age; why host load peaked without
+TimeFusion's own scheduling lag moving (the load was the other container); and
+why 30 quiet minutes at load 44.7 cost nothing. It is a hypothesis, not a
+result: the test is whether spikes disappear now that the sampler no longer
+triggers deploys, and that test runs itself from here.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
