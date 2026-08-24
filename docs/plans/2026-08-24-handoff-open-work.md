@@ -4,6 +4,24 @@
 cold. Each item states what is known, what is NOT known, the exact commands, and
 the trap that will mislead you if you skip them.
 
+> **ANSWERED — see `2026-08-24-handoff-results.md`.** Every item below was run and
+> has a verdict. Read that page first; four of the premises stated here were
+> measured to be wrong, so acting on this page alone will send you the wrong way:
+>
+> - **§1** the sealed backlog does NOT drain — sealed CELLS were 435 across eight
+>   samples and six deploys, including two quiet stretches. The deploy pause named
+>   below is not the blocker, and the unit count is not a backlog measure (it grew
+>   6% by splitting, with no new cell).
+> - **§2** "all routing RULES are fixed / remaining misses are `not_built`" is
+>   wrong: four reasons, differing per project, `not_built` under half.
+> - **§3** contention is refuted — a WARM arm on a fully busy box lands 4 ms off
+>   the 3d baseline. Only the 1h shape is still unexplained.
+> - **§4** the scan ceiling is on a branch, deployed nowhere, so the OOM is NOT
+>   masked as claimed below.
+> - **§5** the fixes work; the residual was a scheduling defect, now proven and
+>   fixed (`3465ecc`), plus a new instrument for it (`f7e2717`).
+> - **§6** the "known-red" test is green.
+
 Background pages, in reading order:
 
 - `2026-08-22-seven-window-six-project-matrix.md` — the baseline, six projects x
