@@ -2485,8 +2485,7 @@ mod tests {
         let (keys, tiebreak, tombstone) = rollup_tier_dedup(base).expect("a generated tier carries timestamp/id/updated_at");
         let dedup = || SliceDedup { keys: &keys, tiebreak: Some(tiebreak), tombstone };
         // Exactly prod's shape: everything except the measure added later.
-        let present: std::collections::HashSet<String> =
-            base.fields.iter().map(|field| field.name.clone()).filter(|name| name != "duration_digest").collect();
+        let present: std::collections::HashSet<String> = base.fields.iter().map(|field| field.name.clone()).filter(|name| name != "duration_digest").collect();
         assert!(base.fields.iter().any(|field| field.name == "duration_digest"), "precondition: the spec declares it");
 
         let sql = slice_input_sql(base, Some(dedup()), "__raw", "p", (0, 60_000_000), "", Some(&present));
