@@ -893,13 +893,19 @@ impl TaskJournal {
     /// and this box restarts every few minutes. Re-enqueueing is idempotent at
     /// the journal (`enqueue` upserts by key), so the safe failure is running
     /// once and under-repairing, never looping.
-    pub fn repair_orphaned_coverage_once(&mut self) -> Option<u64> {
-        let previous = self.snapshot.source_cursors.get(Self::ORPHAN_REPAIR_MIGRATION).copied().unwrap_or_default();
+    /// PER SOURCE. The caller runs inside a loop over sources, so a single global
+    /// cursor would be consumed by whichever source happens to be processed
+    /// first — and if that is `otel_metrics`, the repair fires for a source that
+    /// does not need it and NEVER runs for `otel_logs_and_spans`, which is the
+    /// one whose spec changed. A silent no-op that looks like success.
+    pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> Option<u64> {
+        let key = format!("{}:{source}", Self::ORPHAN_REPAIR_MIGRATION);
+        let previous = self.snapshot.source_cursors.get(&key).copied().unwrap_or_default();
         if previous >= 1 {
             return None;
         }
-        self.snapshot.source_cursors.insert(Self::ORPHAN_REPAIR_MIGRATION.to_owned(), 1);
-        self.dirty_cursors.insert(Self::ORPHAN_REPAIR_MIGRATION.to_owned());
+        self.snapshot.source_cursors.insert(key.clone(), 1);
+        self.dirty_cursors.insert(key);
         let _ = self.checkpoint();
         Some(previous)
     }
@@ -5523,11 +5529,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         {
             let mut journal = TaskJournal::load(dir.path()).expect("journal");
-            assert_eq!(journal.repair_orphaned_coverage_once(), Some(0), "first call claims it");
-            assert_eq!(journal.repair_orphaned_coverage_once(), None, "second call in the same process must not");
+            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "first call claims it");
+            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "second call in the same process must not");
+            // PER SOURCE: the caller loops over sources, so one global cursor
+            // would let whichever source is processed first consume the repair —
+            // and if that is otel_metrics, the source that actually needs it
+            // never runs. A silent no-op that looks like success.
+            assert_eq!(journal.repair_orphaned_coverage_once("otel_metrics"), Some(0), "a different source claims independently");
         }
         let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
-        assert_eq!(reloaded.repair_orphaned_coverage_once(), None, "a restart must not re-run the repair");
+        assert_eq!(reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with

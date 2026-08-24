@@ -860,7 +860,7 @@ impl Database {
             // Bounded to `[ORPHAN_REPAIR_FROM, ORPHAN_REPAIR_BEFORE)` so it is a
             // known quantity of work. Older orphans are left to age out of the
             // 35-day horizon rather than rebuilt days before they leave it.
-            if let Some(cursor_was) = self.journal().repair_orphaned_coverage_once()
+            if let Some(cursor_was) = self.journal().repair_orphaned_coverage_once(&source)
                 && let (Ok(from), Ok(before)) = (
                     chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"),
                     chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"),
