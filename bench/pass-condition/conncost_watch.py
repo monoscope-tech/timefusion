@@ -38,9 +38,10 @@ def _url():
         return f.read_text().strip()
     if (env := os.environ.get("TIMEFUSION_PG_URL")):
         return env.strip()
-    for candidate in (HERE / "../../../monoscope/.env", HERE / "../../../../monoscope/.env"):
-        if candidate.exists():
-            for line in candidate.read_text().splitlines():
+    for parent in HERE.resolve().parents:  # a checkout may be a worktree, so search upward
+        env = parent / "monoscope" / ".env"
+        if env.exists():
+            for line in env.read_text().splitlines():
                 if line.startswith("TIMEFUSION_PG_URL="):
                     return line.split("=", 1)[1].strip()
     sys.exit("no connection URL: create ./tfurl or set TIMEFUSION_PG_URL")

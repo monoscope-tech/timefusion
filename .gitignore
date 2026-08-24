@@ -16,3 +16,5 @@ bench/data/query_latency_state.json
 # Local benchmark harness: prod creds in bench/local/tfurl, and result CSVs
 # are machine-specific. See bench/local/README.md after creating it.
 bench/local/
+# Phase-0 sampler output: machine-local time series, appended to on every run
+bench/pass-condition/conncost_watch.csv
