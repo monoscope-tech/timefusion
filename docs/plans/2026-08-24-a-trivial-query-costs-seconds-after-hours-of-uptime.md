@@ -151,6 +151,38 @@ flamegraph is Aug 12), the usual tool is unavailable, and the signal to chase is
    that it took prod down once and that the signal wanted here is a blocked
    worker, which a CPU sampler shows as *idle*.
 
+### First readings from the instrumented build (2026-08-24, uptime 198 s)
+
+Deployed `5e7934b` and read it back. On a **fresh** process, before any of the
+Phase-0 day has accumulated:
+
+| row | value | what it says |
+|---|---|---|
+| `runtime.uptime_seconds` | 198 | the qualifier every other row needed |
+| `runtime.scheduling_lag_ms` | 1 | fine right now |
+| `runtime.scheduling_lag_max_ms` | **2,764** | **2.8 s of lag already, on a 3-minute-old process** |
+| `block.journal_lock_wait.max_ms` | **0** (4,017 acquisitions) | nobody ever waits for this mutex |
+| `block.journal_hold.max_ms` | 22 (avg 1.5 ms) | it is not hogging a worker either |
+| `section.delta_snapshot_refresh.avg_us` | **53,510** (max 253 ms, 14 calls) | ~53 ms per resolve, paid by every query |
+
+Two things follow immediately, and both narrow the plan:
+
+- **Hypothesis 2 is effectively dead.** Zero wait across 4,017 acquisitions and
+  a 22 ms worst hold. The journal mutex neither blocks queries directly (no
+  caller in the read path) nor indirectly (it does not hold a worker).
+- **Worker starvation is not exclusive to old processes.** 2.8 s of max lag
+  inside the first 198 seconds means whatever blocks workers also blocks them
+  when the process is new — so lag alone will not separate age from load either.
+  Boot (WAL replay, snapshot materialization) is the obvious confound for a
+  *max* this early; the Phase-0 day is what distinguishes "boot spike" from
+  "steady-state starvation", by whether `scheduling_lag_max_ms` keeps climbing
+  after the first hour.
+
+`delta_snapshot_refresh` is now the most interesting number in the set — 53 ms
+of every query on a process three minutes old, and hypothesis 3 predicts it
+grows. It is a wall-time row, so it is not a starvation claim; the point of
+watching it is the slope.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
