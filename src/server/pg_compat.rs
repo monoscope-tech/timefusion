@@ -1499,9 +1499,9 @@ impl StatsTableProvider {
 
         let rows: Vec<Row> =
             [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, tantivy, bloom_prune, parquet, cache_sizes, runtime, block]
-            .into_iter()
-            .flatten()
-            .collect();
+                .into_iter()
+                .flatten()
+                .collect();
         let cols: Vec<ArrayRef> = vec![
             Arc::new(rows.iter().map(|r| Some(r.0)).collect::<StringArray>()),
             Arc::new(rows.iter().map(|r| Some(r.1.as_str())).collect::<StringArray>()),

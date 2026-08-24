@@ -592,12 +592,7 @@ macro_rules! section_timer {
     };
 }
 
-section_timer!(
-    BlockWatch,
-    "block",
-    warn_ms = 250,
-    "blocking section held a runtime worker — queries scheduled onto this worker waited behind it"
-);
+section_timer!(BlockWatch, "block", warn_ms = 250, "blocking section held a runtime worker — queries scheduled onto this worker waited behind it");
 section_timer!(TimedSection, "section");
 
 /// `((component, section), count, total_us, max_us)` for every timed section
