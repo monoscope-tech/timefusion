@@ -112,7 +112,8 @@ mid-run means the samples either side are different processes.
 in direct conflict: master deploys, a deploy restarts prod, and a restart voids
 the series. So the instrumentation above was front-loaded into one push
 (`5e7934b`, 2026-08-24) and the window starts with the process that deploy
-brings up. **Any push to master during the window resets the clock** — the
+brings up. **Any push to master that touches code resets the clock** (`deploy.yml`
+`paths-ignore` already exempts docs-only pushes, for this exact reason) — the
 sampler keeps running and `--analyze` will simply report a shorter longest-run.
 Nobody has to coordinate; they only have to know that a deploy is not free here.
 
