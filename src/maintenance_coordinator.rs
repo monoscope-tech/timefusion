@@ -3294,6 +3294,32 @@ mod tests {
         assert_eq!(journal.state(&key), Some(TaskState::Pending), "a declined split must leave the unit runnable, not superseded");
     }
 
+    /// Section 4 of the 08-24 plan proposed BATCHING escalations: when several
+    /// holes inside one covering slice each escalate, rebuild the covering slice
+    /// once rather than N times. That needs no code, and this pins why —
+    /// `enqueue` is keyed by `TaskKey`, so N escalations naming the same
+    /// covering slice collapse into a single pending unit by construction.
+    ///
+    /// Worth a test rather than a comment because the claim is what justifies
+    /// NOT building the batching layer, and a future change to enqueue's
+    /// identity rules would silently reintroduce the N-rebuild cost.
+    #[test]
+    fn escalations_to_one_covering_slice_collapse_into_a_single_unit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let day = 3 * DAY_MICROS;
+        let covering = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
+
+        // Five separate narrow units discover holes and each escalates to the
+        // same covering slice, exactly as `covered_by_wider` does.
+        for _ in 0..5 {
+            journal.enqueue(covering.clone(), 0, MAX_DECODED_BYTES, 0);
+        }
+
+        let covering_units = journal.tasks().filter(|t| t.key == covering).count();
+        assert_eq!(covering_units, 1, "the covering rebuild is queued ONCE however many holes escalated to it");
+    }
+
     /// Declining a split must leave the unit RUNNABLE, not merely un-superseded.
     ///
     /// This is the failure mode that would be worse than the shred it replaces:
