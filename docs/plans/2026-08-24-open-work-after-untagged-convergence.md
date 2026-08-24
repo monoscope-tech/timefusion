@@ -1,7 +1,21 @@
 # Open work after the untagged-tier convergence
 
-**Status:** backlog, written 2026-08-24. History and the diagnosis that produced
-this list are in
+**Status:** in progress, 2026-08-24.
+
+| Item | State |
+|---|---|
+| §1 immutability gap | **§1b instrumented** (`8b8ad30`), default OFF; decision still pending real data |
+| §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
+| §3 ledger | not started |
+| §4 escalation treadmill | not started (re-evaluate after §3) |
+| §5 fragment debris | not started (deploy with §2, not before) |
+| §6 whale cells | no action; 7 as of 11:26 UTC |
+
+**Nothing is pushed.** A non-docs push restarts prod, which kills in-flight
+maintenance units (~21 min each) and voids the coverage map — that would undo the
+untagged drain still in progress. Push once §6 reaches 0.
+
+History and the diagnosis that produced this list are in
 [`2026-08-22-untagged-tier-convergence.md`](./2026-08-22-untagged-tier-convergence.md)
 — that doc is the record of what was fixed; this one is what was deliberately
 left.
