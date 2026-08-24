@@ -10,10 +10,25 @@ Background pages, in reading order:
   seven windows, monoscope's real SQL
 - `2026-08-22-make-14d-30d-complete.md` — the four failure modes and the Tier-1
   checklist
-- `2026-08-23-nothing-is-being-built.md` — the coordinator was disabled on every
-  container
-- `2026-08-23-the-queue-is-24x-inflated.md` — coarsening; lever 1
-- `2026-08-23-lever-2-compaction-throughput.md` — compaction; lever 2
+
+Four pages this document used to point at were deleted on 2026-08-24 under the
+`README.md` policy (complete or superseded). Their conclusions, which are all
+this handoff needs:
+
+- **The coordinator was disabled on every container** — that is why `not_built`
+  never cleared; fixed. (`2026-08-23-nothing-is-being-built.md`)
+- **Lever 1, coarsening: the queue was 24x inflated** — a pending day minted one
+  unit per slice; shipped, sealed rollup units 11,174 -> 637.
+  (`2026-08-23-the-queue-is-24x-inflated.md`)
+- **Lever 2, compaction throughput: three defects, all verified fixed 2026-08-24**
+  — cells retire now, 275 -> 49 on the flagship cell, -28% fleet-wide.
+  (`2026-08-23-lever-2-compaction-throughput.md`)
+- **Sealing is slow because each sealed unit re-reads a whole partition to emit a
+  dozen rows** — the cost is the commit, not the sort.
+  (`2026-08-23-why-sealing-is-slow.md`)
+
+Read any of them with `git show <sha>:docs/plans/<name>`; `git log
+--diff-filter=D -- docs/plans` lists every deletion with its SHA.
 
 ## Read this first: four traps that produced wrong readings
 
@@ -208,14 +223,16 @@ if `TIMEFUSION_WIDE_SCAN_REJECT_MB` is raised.
 
 ---
 
-## 5. Compaction: confirm the three fixes actually retire cells
+## 5. Compaction: the three fixes DO retire cells — CLOSED 2026-08-24
 
 **State.** Three defects found via the funnel log (`680acac`) and fixed:
 smallest-first packing (`8844064`) and the debt policy matching the packer
 (`e16f157`). All three are live as of 2026-08-24.
 
-**Not known.** Whether cells now retire. Every prior check was taken minutes
-after a deploy, before consolidation had run.
+**Answered (`565da6e`): compaction is verified retiring files** — 275 -> 49 on
+the flagship cell and -28% fleet-wide, against the 48 cells / ~1,772 small files
+baseline below. The checks are kept because they are the right way to re-verify
+after any packer change, not because the question is still open.
 
 **How to check.** The funnel log answers directly — if a unit still selects
 nothing, it now says which filter stage emptied the list:
@@ -239,11 +256,19 @@ before these fixes.
 
 ---
 
-## 6. Known-red test, not ours
+## 6. Known-red tests
 
 `config::tests::tantivy_defaults_are_the_deserialized_ones_not_the_derived_ones`
-fails on master. Verified by stashing that it fails WITHOUT any of this session's
-changes — it belongs to the concurrent tantivy work.
+was red on master; it **passes as of 2026-08-24 afternoon** (whole suite
+1117/1117 locally). Consider this one closed.
+
+Replacing it, and more serious because it is intermittent: **E2E
+`recent_window_pruning::text_match_conjunct_does_not_poison_parquet_pushdown`**
+fails in CI on its SECOND assertion (`DedupExec fell to full-set`; the primary
+`input_rows = 0` passes). It failed on `7f15de5`, passed on `fb8dd70`, failed on
+`3700730`, and passes locally. It guards a path with two logged prod incidents,
+so a guard that flickers is worth a look on its own account — a flaky assert
+trains people to ignore a red E2E job.
 
 ---
 
@@ -259,6 +284,65 @@ changes — it belongs to the concurrent tantivy work.
   partition inside the shared 5 GB FAIR query pool, so it gets a small share
   beside dashboard traffic — five attempts saw 2.6 to 264 MB free and failed. One
   small cell did succeed (15 files -> 1). Use the consolidation path instead.
+
+---
+
+## 8. Transplanted from `2026-08-22-per-day-tantivy-index.md` (closed 2026-08-24)
+
+That plan is closed as superseded — the per-day index was never built, and the
+three defects that actually explained the divergence were serial-loop starvation,
+a cap sized on the wrong population, and an accidental `tantivy` inheritance.
+Read it at `git show b6acc2a:docs/plans/2026-08-22-per-day-tantivy-index.md`.
+What survives it:
+
+- **Re-measure `tantivy_uncovered_files` against the NEW population before
+  quoting any convergence number.** Rollup tiers left `indexed_set()` on
+  2026-08-24 (`8698271`), so `indexed_set()` is now the single table
+  `otel_logs_and_spans`. Every historical figure in that plan — and in the
+  memory files — is against a population 37% larger. The count will collapse for
+  bookkeeping reasons; that is not the drain working.
+- **A consequence worth knowing before tuning anything:** with one indexed table,
+  the 08-23 rotation and `buffer_unordered(3)` work is inert, and so is the
+  concern that a slow spans pass starves the others. One table cannot starve
+  another. `spawn_cron_job` still skips an overlapping tick for the WHOLE job, so
+  a >15-minute spans pass still costs the next tick — but that now only delays
+  itself.
+- **Reconcile should sweep tables that have manifests but are no longer indexed.**
+  Three manual cleanups now: `otel_metrics` manifests (08-23), then on 08-24 the
+  six rollup prefixes (84 manifests + 6,398 blobs) and `indexes/otel_metrics/`
+  (981 blobs, 3.67 GB) that the first cleanup left behind. Nothing can read them
+  and nothing can collect them.
+- **The read-side pair that plan deferred**, both still unattributed:
+  `search_us_avg` 0.34 -> 2.1 ms and `reader_hit_pct` 96.9% -> 85.2%. Its two
+  hypotheses were "working set > cache" and "IO contention from a permanently
+  running backfill"; removing 37% of the build population should have moved the
+  second, so this is now a cheap re-measure rather than an investigation.
+
+## 9. Transplanted from `2026-08-20-dedup-and-sort-strategy.md` (deleted 2026-08-24)
+
+That plan was self-declared SUPERSEDED (the hot tier it half-addressed no longer
+exists) and substantially shipped. Two of its "STILL OPEN" bullets have since
+closed on their own — the cert-grant watch (certification was diagnosed healthy
+on 08-22; the counter is process-scoped) and resumable dirty-bin staging (shipped
+behind `TIMEFUSION_REPAIR_RESUME_ENABLED`). These three did not:
+
+- **§4b, the unordered-input degraded path.** `DedupNeedsOrderedInput` restores
+  the SPM when ordering was merely coalesced away; genuinely unordered legs still
+  have no policy. Pick one: spillable/hash-partitioned dedup, reject-before-decode
+  with an actionable error plus repair scheduling, or a tightly bounded fallback.
+  Footer repair reduces the frequency and is not a memory-safety invariant — this
+  is the same family as item 4's OOM above.
+- **§5, duplication accounting.** Record per profiled query: physical rows, unique
+  dedup keys, versions per key, predicate-rejected rows, files and object-store
+  requests. The much-quoted "32.6x duplicates" conflates versions at rest with
+  tier copies, and nothing can size the dedup problem honestly until they are
+  separated.
+- **§6, overlap-scoped dedup** — the strategic shape, and explicitly last.
+  Compaction first emits a "unique within dedup key" property on its outputs,
+  invalidated by any overlapping append or rewrite; plan-time overlap analysis
+  over file `[min_ts, max_ts]` then lets proven-unique non-overlapping files
+  bypass `DedupExec` entirely, with overlap groups paying it per group. Binary
+  certification retires once bypass coverage exceeds it.
 
 ---
 

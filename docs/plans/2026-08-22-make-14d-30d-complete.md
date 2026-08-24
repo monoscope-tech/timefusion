@@ -336,3 +336,24 @@ Two traps when re-measuring, both hit during this work:
 2. **A deploy mid-run splits the dataset.** Prod restarted twice during this
    session (once from a concurrent session's push), each time zeroing coverage
    and the caches. Stamp every cell with the image it ran on.
+
+## 2026-08-24 — one blocker removed from every FILTERED cell
+
+A filtered dashboard chart was paying a tantivy prefilter on the rollup leg it
+routed to, because rollup dimensions had accidentally inherited
+`tantivy: { indexed: true }` from the spans schema through a struct update. On
+prod, over identical rows: `kind = 'server'` on a tier took **8,206 ms against
+283 ms** for an opaque control, and the routed 7d chart went **7,240 ms ->
+14,484 ms** purely by adding a `kind` filter. Fixed in `8698271`; after it the
+direct arm is 211 ms and the routed arm records `prefilter_attempts +1` (the raw
+leg) instead of `+2`.
+
+This matters to the pass condition because the sweep's shapes are filtered ones.
+Cells measured before 2026-08-24 afternoon carry that cost and are not comparable
+with cells measured after — stamp the image, as trap 2 already says, and treat
+`8698271` as the boundary.
+
+Reading the third trap into the list above: **a mean is not a distribution, and a
+single sample is not a mean.** The unfiltered 7d control ranged 5,447-10,715 ms
+across two reps minutes apart on the same process. Where a counter can answer the
+question instead of a timing, use the counter.

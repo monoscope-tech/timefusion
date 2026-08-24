@@ -1382,3 +1382,34 @@ finally able to shrink.
 so the current value is computable from (spec, source, project, date) alone — a
 throwaway `#[test]` that prints it, compared against a bounded `SELECT DISTINCT
 rollup_generation`. No prod process involved, and the probe was reverted.
+
+### The orphaned history IS rebuilding — sized, and one correction
+
+Claims over 12 minutes, dated from `slice_start`:
+
+```
+2026-07-20  8      2026-08-01  3      2026-08-23  1
+2026-07-24  1      2026-08-13  1      2026-08-24  7
+2026-07-25  1      2026-08-14  1
+2026-07-26  1      2026-08-16  1
+2026-07-27  3
+```
+
+Work is spread across the whole window, including the orphaned 08-13..08-16
+range — so the backfill is re-deriving exactly what the generation change
+stripped, as predicted. It is not stuck.
+
+**Correction to my own suspicion.** I flagged the eight claims on 2026-07-20 as
+waste, being 35 days old against what I assumed was a 30-day horizon.
+`timefusion_rollup_backfill_days` defaults to **35**, so 07-20 is at the edge and
+inside the window. Checking beat asserting.
+
+**Size:** 461 distinct (project, date) cells in the 35-day window;
+`pending_base_rollup=2123`; publishes running ~115/hour. Order of magnitude for
+the full rebuild is **~a day, not weeks** — tractable, and routing improves
+permanently as it proceeds, because each rebuilt slice carries the current
+generation and so becomes recoverable into the coverage map.
+
+The caveat remains the deploy cadence: units are journaled so restarts do not
+lose the rebuild, but the coverage MAP is process-scoped, so routing only pays
+off for processes that live long enough to rebuild it.
