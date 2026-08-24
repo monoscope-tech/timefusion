@@ -12311,10 +12311,7 @@ mod tests {
         let cell = ("otel_logs_and_spans".to_owned(), project.clone(), tier, day.to_string());
         let recorded = db.coverage_ledger.coverage(&cell);
         assert!(!recorded.is_empty(), "the replay recorded the published slice");
-        assert!(
-            recorded.iter().all(|entry| entry.end_micros > entry.start_micros),
-            "slice ends are exclusive and must be after their start: {recorded:?}"
-        );
+        assert!(recorded.iter().all(|entry| entry.end_micros > entry.start_micros), "slice ends are exclusive and must be after their start: {recorded:?}");
         // THE GATE FOR MOVING READS OFF THE TAGS, checked locally instead of
         // waiting on prod: whatever the ledger claims for routing must cover
         // exactly what the tag-derived map claims. `rollup_slice_coverage` is
@@ -12324,12 +12321,8 @@ mod tests {
         // Compared as SETS OF RANGES, not entry-for-entry: the ledger merges
         // adjacent slices of one generation, so it is deliberately coarser. The
         // covered instants are the only thing routing asks about.
-        let tag_ranges: std::collections::BTreeSet<(i64, i64)> = db
-            .rollup_slice_coverage
-            .iter()
-            .filter(|entry| entry.key().0 == project)
-            .map(|entry| (entry.key().3, entry.key().4))
-            .collect();
+        let tag_ranges: std::collections::BTreeSet<(i64, i64)> =
+            db.rollup_slice_coverage.iter().filter(|entry| entry.key().0 == project).map(|entry| (entry.key().3, entry.key().4)).collect();
         assert!(!tag_ranges.is_empty(), "the tag-derived routing map is populated, or this gate proves nothing");
         let ledger_ranges = db.coverage_ledger.routing_view("otel_logs_and_spans", &cell.2);
         let ledger_ranges: Vec<(i64, i64)> =
@@ -12361,10 +12354,7 @@ mod tests {
         // supplement them — selection would still read tags, so files could not
         // become anonymous and the tier could not be compacted, which is the
         // reason for moving coverage off files at all.
-        assert!(
-            recorded.iter().all(|entry| !entry.files.is_empty()),
-            "every recorded range names the files that serve it: {recorded:?}"
-        );
+        assert!(recorded.iter().all(|entry| !entry.files.is_empty()), "every recorded range names the files that serve it: {recorded:?}");
 
         // The verifier is the reason this replay survives once reads move onto
         // the ledger, so it has to be right in BOTH directions. Nothing changed

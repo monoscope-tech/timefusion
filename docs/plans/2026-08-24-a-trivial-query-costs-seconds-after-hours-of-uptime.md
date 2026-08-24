@@ -4,6 +4,56 @@
 connection turned out to be innocent, and so did the host. What is left is a
 process that gets ~20× slower over hours of uptime.
 
+## 0. Where this stands (read this first)
+
+Everything below §5 is a chronology, including three of my own verdicts that
+later data overturned. The net result, as of 2026-08-24 22:00:
+
+**There are two phenomena, and the stalls are EPISODIC, not a function of age.**
+
+1. **Deploy churn** — a new container replaying WAL while the old one still
+   serves. Explains every stall on a young or mid-life process, replicated four
+   times, and gone once the churn stopped. **My own pushes to the benchmark
+   script were causing it**: `deploy.yml` exempted `docs/**` and `**/*.md` but
+   not `bench/**`. Fixed (`9ab6b00`).
+2. **A server-side stall in the pgwire startup exchange** — **localized**: the
+   container's own healthcheck, over *loopback*, sees `auth_ms` of 470–1,423 ms
+   while `connect_ms` and `write_ms` are 0 and handler construction maxes at
+   4 ms. Not the network, not the haproxy, not auth logic, not handler build.
+   Frequent (2 of 3 sampling windows), and it explains the external
+   connect-only stalls.
+
+**The system-level finding, which is bigger than either:** this process **fails
+to wake a 500 ms timer on time by 0.3–2.9 s, several times a minute,
+continuously**, on 48 workers with the host 40 % idle. The auth stalls sit inside
+that distribution. Causation is unproven precisely *because* the lag never stops
+— an always-present cause cannot be correlated with an intermittent effect — so
+the next step is per-connection accept-to-startup timing inside the server, not
+more outside correlation.
+
+**Eliminated, each with the instrument built for it:** host load (44.0 → 178 ms
+versus 32.9 → 4,460 ms — both directions); the maintenance journal mutex (held a
+worker 2,380 ms with *zero* effect on query cost); Delta snapshot refresh (hit
+403 ms/call while `connect` sat at 305 ms); worker starvation (`scheduling_lag_ms`
+0–1 through every stall); swap (100 % full at all times, so it differentiates
+nothing).
+
+**Not monotone with uptime.** 3 min–1.2 h is flat at ~177 ms; a slow episode ran
+1.8–2.24 h peaking at 4,460 ms; the *same process* was fine again at 2.9 h. Do
+not read "age" as the cause — read "episodes, which recur".
+
+**Armed and pending:** `jemalloc.frag_pct` (prediction: climbs into an episode,
+falls out of it — if it stays flat, fragmentation is out too) and per-connection
+`block.pgwire_*_handler_build` timers.
+
+**Do not** ship a scheduled restart (restarts *cause* the churn stalls) or touch
+allocator decay config (mechanism unconfirmed; the last decay change cost ~15 %
+CPU).
+
+> Reading the CSVs: gaps of tens of minutes are **the sampling laptop asleep**,
+> not prod outages. The sampler now runs under `caffeinate -i`, which still does
+> not cover a closed lid.
+
 ## 1. The measurement that started it
 
 Noticed while proving that a 440 GB scan does not starve the box
@@ -606,6 +656,127 @@ Note the deploy that carried this **failed its own post-deploy gate** —
 10,000 ms)" — with `WAL recovery 0ms`. The image is live and serving; the gate
 measures handoff readiness, and 12 s against a 10 s budget on a box at load ~35
 is its own small signal about startup under contention. Not chased here.
+
+### Handler construction is NOT the connection stall — and that points outside the process
+
+`62f2385` deployed and reporting, over 135 connections:
+
+    block.pgwire_simple_handler_build     avg 876us   max 2ms
+    block.pgwire_extended_handler_build   avg 768us   max 4ms
+    block.pgwire_startup_handler_build    avg   4us   max 0ms
+
+Per-connection setup inside TimeFusion costs **under 5 ms, worst case**. It
+cannot be the 1,450 ms `connect` sample. Combined with auth being a string
+compare, essentially nothing in this process's connection path is expensive.
+
+**So the search moves outside the process — and there is an obvious candidate
+this plan never mentioned: `srv-timefusion-pgwire-proxy`, the haproxy in front
+of pgwire.** Every measured connection traverses it, and its config is built to
+produce exactly this signature: `timeout connect 1s` with `fall 2` on a 250 ms
+`tcp-check`, so a backend marked DOWN makes *new* connections pay a connect
+timeout plus retries while *established* sessions are untouched.
+
+**Refuted within the hour, by its own logs.** Over 8 hours haproxy logged 17
+`is DOWN` transitions, every one of them `Layer4 connection problem, Connection
+refused` — the signature of a container that is gone, i.e. a deploy restart, not
+a health-check timeout. Lining the transitions up against every slow sample
+recorded all day:
+
+| slow sample | connect | nearest DOWN/UP |
+|---|---|---|
+| 12:00Z | 1,433 ms | 87.8 min away |
+| 13:20Z | 2,960 ms | 7.5 min away |
+| 15:02Z | 1,450 ms | 33.7 min away |
+| 16:23Z | 3,049 ms | 97.6 min away |
+| 16:42Z | 4,460 ms | 78.8 min away |
+
+Not one stall is within 7 minutes of a proxy transition; most are an hour or two
+away. The proxy is not flapping during the stalls, and its DOWN events are the
+deploy churn already accounted for. **Hypothesis raised and killed in the same
+session — worth recording precisely so nobody re-raises it from the config
+alone, which reads guilty.**
+
+What that leaves inside connection establishment, having eliminated DNS, TCP,
+auth, handler construction and the proxy: the pgwire **startup exchange itself**
+and the **accept path**. A slow accept fits the signature exactly — the kernel
+completes the TCP handshake from the listen backlog (so `tcp` stays fast) while
+the startup message waits for a task that has not been polled yet. That is the
+next thing to time, and it needs a timer around accept-to-first-message rather
+than around anything measured so far.
+
+**Second finding, from the same read:** `jemalloc.retained_mb` is **21,127** on a
+184-second-old process, against **147,247** on an ~80-minute-old one. Retained
+address space grows roughly 7× over an hour of uptime. That is the first
+quantity found that genuinely accumulates with age — which is what "state grows
+in-process" was always looking for, though it is address space rather than
+resident memory, so it costs no RSS and is not yet tied to query cost.
+
+### VERDICT on the connection stall: server-side, entirely in the startup exchange
+
+The container's own healthcheck runs the same pgwire startup+auth exchange every
+5 seconds **over loopback**, and reports it split by stage. Sampling the worst of
+its last five probes alongside every external sample:
+
+| my `connect` (internet) | in-container `total` | `connect_ms` | `write_ms` | **`auth_ms`** |
+|---|---|---|---|---|
+| 149 ms | **1,423 ms** | 0 | 0 | **1,423** |
+| 160 ms | **470 ms** | 0 | 0 | **470** |
+| 172 ms | 1 ms | 0 | 0 | 1 |
+
+**The stall is real, server-side, and 100 % of it is `auth_ms`** — the window
+between "startup packet written" and "auth response read". Over loopback, so
+the network, the haproxy and my laptop's path are all excluded by construction.
+`connect_ms = 0` excludes the accept itself. And `block.pgwire_*_handler_build`
+maxes at 2–4 ms, so it is not handler construction; auth is a string compare, so
+it is not the credential check.
+
+Note the first two rows: my external `connect` was **fast** (149–160 ms) while
+the server was stalling. The two are near-independent, which is why 26 external
+samples found this once — I was sampling a frequent server-side event through a
+narrow, badly-timed window. **The healthcheck was a better instrument than the
+one I built, and it was already running.**
+
+What remains inside that window is the connection's task being polled at all,
+plus pgwire's own startup processing (parameter status, ready-for-query). The
+scheduling reading supports the former: `scheduling_lag_max_ms` sat at
+2,764–8,177 ms in these same processes while the instantaneous
+`scheduling_lag_ms` read 0–1 ms — multi-second polling gaps that a 500 ms timer
+sampler almost always misses. That is a *hypothesis*, not a result: the sampler
+now records `inproc_auth_ms` and `scheduling_lag_max_ms` on the same row, and
+their correlation is the next thing to read.
+
+### The lag test: inconclusive by saturation, because the runtime is late CONTINUOUSLY
+
+`spawn_runtime_lag_sampler` has been writing a timestamped `warn!` per event at
+≥250 ms all along, and nothing had read it. Lining those up against the three
+healthcheck windows above:
+
+| window (UTC) | `auth_ms` | lag warns inside it |
+|---|---|---|
+| 20:49:05–20:49:30 | **470** | 518, 593, 500 ms |
+| 20:51:09–20:51:34 | **1** | 290, 345, 545, 313 ms |
+
+**The hypothesis cannot be tested this way: the warns never stop.** Over twelve
+minutes there are ~40 of them — several a minute, 275 ms to 2,850 ms — in stall
+windows *and* in the window where `auth_ms` was 1 ms. A cause that is always
+present cannot be correlated with an effect that is intermittent.
+
+But the negative result is smaller than what it uncovers. **This process fails
+to wake a 500 ms timer on time, by 0.3–2.9 seconds, several times a minute,
+continuously, on a 48-worker runtime and a host that is 40 % idle.** That is not
+a connection problem or a query problem; it is the runtime being persistently
+unable to poll a trivial task. The auth stalls (470–1,423 ms) sit squarely
+inside that distribution, which is consistent with causation without proving it.
+
+Proving it needs the timing *inside* the server — accept-to-startup-handled per
+connection — not more correlation of two things measured from outside. That is
+a code change and it is the first move for whoever picks this up. Note the
+instrument shape trap while doing it: `scheduling_lag_max_ms` is a monotone
+high-water mark (already 2.8–8.2 s, so a 1.4 s event cannot move it) and
+`scheduling_lag_ms` is an instantaneous read that misses sub-second events —
+**neither column can ever correlate with an episodic stall.** The per-event
+`warn!` is the only record that can, which is why the logs answered what the
+counters could not.
 
 **What to do next, in order:**
 1. Let the process keep ageing with the host columns recording. The question is
