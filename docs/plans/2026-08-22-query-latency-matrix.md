@@ -1448,3 +1448,35 @@ Either fact alone explains the miss, so the operational conclusion is unchanged 
 but the instrument is in the wrong place for this failure, and `stale_generation`
 should not be read as "coverage lost to spec edits". It measures the tagged-
 mismatch case only, which is currently zero.
+
+### Time-to-routing after a restart: ~5.5 minutes (measured)
+
+The hypothesis that recovery runs only hourly was WRONG — the loop runs the pass
+first and sleeps afterwards, so it does run at boot. The cost is that the pass
+itself takes minutes:
+
+```
+13:51:56  Bound PGWire listener          <- boot
+13:57:18  rollup_coverage_recovered      <- source 1  (+5m22s)
+13:57:43  rollup_coverage_recovered      <- source 2  (+5m47s)
+```
+
+**Every restart costs ~5.5 minutes during which every query is a raw scan**,
+because the coverage map is empty and the router answers `not_built`.
+
+This reconciles every reading of the session:
+
+| process age at probe | 2026-08-23 window |
+|---|---|
+| 37 min (booted 13:51, replaced 14:29) | **hits+1** — routed |
+| 20 s | hits+0 |
+| 3 min | hits+0 |
+
+Same query, same data, same tier. The variable is process age, not coverage on
+disk. **This is why "absence of a hit is not evidence of a miss" — and why three
+earlier probes this session were invalid.**
+
+**Operationally:** at the observed ~5-15 minute deploy cadence, routing is
+available for part of each window and absent for the first ~5.5 minutes of it.
+Batching deploys is worth more to query latency than any further routing change
+— and it costs nothing to try.
