@@ -324,6 +324,24 @@ Four things fall out of one table:
   (the plan's own §3: monoscope was using ~15.8 of 48 cores) or at object-store
   latency, not at anything TimeFusion accumulates.
 
+**The second spike replicates it, 16 minutes later and in a different process:**
+uptime 194 s → 544 s → 850 s, connect 280 ms → **3,675 ms** → 258 ms, at load
+29.2 → **49.5** → 39.2, with `scheduling_lag_ms` 1 ms throughout. Same shape,
+same eliminations. Across all 17 instrumented samples the four slow ones
+(`connect` > 800 ms) sit at **median load 39.2** against **29.9** for the
+thirteen fast ones, and *every* slow sample had a scheduling lag of 0–1 ms.
+
+**One ambiguity is still open, and `load1` cannot close it.** A host load of 49
+is equally consistent with "the box got busy" and with "TimeFusion got busy" —
+a flush or a maintenance burst *raises host load itself*, so the correlation
+with load is not yet evidence of an external neighbour. The sampler now also
+records `buffered_layer.{flush_completed_total, flush_failed_total,
+pressure_pct}`; a flush counter that advances across exactly the slow samples
+says it is our own work, and one that sits still says it is the neighbours. Both
+spikes landing at ~8–9 minutes of uptime is a hint toward the former (the flush
+interval is 600 s), and it is only a hint — the other two slow samples sat at
+184 s and 722 s.
+
 This reorders the hypothesis table: **1 and 2 are eliminated for the spikes**
 (directly, with the instrument built for them), 3 survives only as "state grows"
 without yet explaining cost, and the live lead is contention — which is the

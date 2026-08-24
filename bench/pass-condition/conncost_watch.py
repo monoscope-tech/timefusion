@@ -68,6 +68,12 @@ STATS = [
     ("section", "delta_snapshot_refresh.avg_us"),
     ("section", "delta_snapshot_refresh.max_ms"),
     ("section", "delta_snapshot_refresh.count"),
+    # Host load rising and TimeFusion's OWN flush/maintenance burst are not
+    # distinguishable from `load1` alone — a flush drives load up itself. These
+    # are the counters that separate "the box got busy" from "we got busy".
+    ("buffered_layer", "flush_completed_total"),
+    ("buffered_layer", "flush_failed_total"),
+    ("buffered_layer", "pressure_pct"),
     ("mem_buffer", "total_rows"),
     ("mem_buffer", "estimated_bytes_approx"),
     ("mem_buffer", "total_buckets"),
