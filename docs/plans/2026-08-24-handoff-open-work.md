@@ -129,6 +129,32 @@ because the baseline ran on a box whose coordinator had never started.
 queries slower and the summary mis-attributes it. That is the single most
 important open question here.
 
+**PARTIALLY REFUTED already, 2026-08-24.** p1 and p4 were measured in the SAME
+sweep, on the same box, under the same maintenance load:
+
+| project | 1h throughput before | after | direction |
+|---|---|---|---|
+| p4 `dcad860a` | 1,542 ms | 246 ms | 6x FASTER |
+| p1 `87576849` | 199 ms | 1,734 ms | 8.7x SLOWER |
+
+Contention slows everything. It cannot produce opposite directions in one sweep,
+so "maintenance load" is NOT a sufficient explanation for p1 and the summary
+should not lean on it.
+
+What differs about p1 specifically, and the next hypothesis to test: p1 is the
+most fragmented project (588 of 1,339 sealed files under target) and therefore
+the one compaction is actively rewriting. A rewritten file is a new object, so
+p1's foyer cache is being invalidated continuously while its own partitions are
+compacted — cold reads on every sweep. That predicts p1's latency RECOVERS once
+its compaction settles, while p4 (already compact) never paid the cost.
+
+Test it by re-running the matrix for p1 alone after its out-of-policy cells reach
+zero, and by watching `foyer.hits`/`misses` around a p1 query before and after.
+
+Two busy-arm readings taken minutes apart were 2.43 s and 7.32 s for the same
+p1 1h query, so single samples are worthless here — take several, report the
+minimum, and note that even the fast one is 12x the 199 ms baseline.
+
 **How to test.** The box hands you a free control: after every restart,
 `wait_for_preload` holds the coordinator for 300 s, so `tasks_running = 0`. Probe
 p1 inside that window, then again once it reaches 16.
