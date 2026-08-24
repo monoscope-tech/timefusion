@@ -1357,7 +1357,7 @@ impl TaskJournal {
                 continue;
             }
             pending += 1;
-            sealed += usize::from(!is_live_frontier(task.key.slice, now_micros));
+            sealed += usize::from(!is_frontier_task(task, now_micros));
             unproven += usize::from(!task.base_tier_present);
             quarantined += usize::from(Self::is_quarantined(task));
             not_due += usize::from(task.deadline_micros > now_micros);
@@ -1499,7 +1499,7 @@ impl TaskJournal {
             (task.key.project_id.clone(), date, why(task))
         };
         let mut sealed = self.snapshot.tasks.iter().filter(|task| {
-            task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && !is_live_frontier(task.key.slice, now_micros)
+            task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && !is_frontier_task(task, now_micros)
         });
         // A claimable one is the interesting answer: it means eligibility is fine
         // and the refusal is in ordering. Otherwise report the first task's reason.
@@ -2116,7 +2116,7 @@ impl TaskJournal {
         let rank = |journal: &Self, task: &MaintenanceTask| -> Rank { journal.rank(task, now_micros) };
         let best_class = |journal: &Self, sealed_only: bool| -> Option<Rank> {
             let mut class: Option<Rank> = None;
-            for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_live_frontier(task.key.slice, now_micros))) {
+            for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_frontier_task(task, now_micros))) {
                 let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
                     class = Some(candidate);
@@ -2536,7 +2536,7 @@ impl TaskJournal {
                     if task.key.operation == Operation::BaseRollup {
                         eligible_base_rollup = eligible_base_rollup.saturating_add(1);
                     }
-                    if !is_live_frontier(task.key.slice, now_micros) {
+                    if !is_frontier_task(task, now_micros) {
                         eligible_sealed = eligible_sealed.saturating_add(1);
                     }
                 }
@@ -2682,7 +2682,7 @@ const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 const STARVATION_HORIZON_MICROS: i64 = 31 * 24 * 60 * 60 * 1_000_000;
 
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
-    if is_live_frontier(task.key.slice, now_micros) {
+    if is_frontier_task(task, now_micros) {
         // Smaller tuples run first. Negating makes the newest minute the most
         // urgent while keeping all projects in that minute deadline-equivalent.
         // Width is not a frontier concern — these are all one slice wide.
@@ -2816,6 +2816,29 @@ pub fn blocks_rollup_backfill(task: &MaintenanceTask) -> bool {
 
 fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
     slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && slice.start_micros <= now_micros
+}
+
+/// Whether a TASK is live-frontier work, which is not the same question as
+/// whether its slice is inside the frontier window.
+///
+/// `SealedConsolidation` never is, whatever its slice says. `plan_compaction_debt`
+/// chooses the operation from the calendar — `date == today` mints HotPacking,
+/// anything older mints SealedConsolidation — while `is_live_frontier` stays true
+/// for a full `LIVE_FRONTIER_WINDOW_MICROS` (24 h) after a slice ENDS. Between
+/// midnight and midnight+24h the two disagreed about the same date, and class is
+/// STRICT priority, so yesterday's consolidation outranked every genuinely sealed
+/// cell in the fleet for a whole day.
+///
+/// Prod 2026-08-24, a mature container over 68 minutes: **26 of 27**
+/// SealedConsolidation claims went to 2026-08-23 while 48 out-of-policy cells got
+/// none — one of them holding 238 small files that read exactly 238 at four
+/// object-storage censuses spanning a day. `scheduling_class` promises "a cell
+/// worth 200 files outranks one worth 3"; class silently overrode it.
+///
+/// HotPacking is deliberately NOT included: it is minted for today, so its slice
+/// and its operation agree, and it is genuinely the frontier.
+fn is_frontier_task(task: &MaintenanceTask, now_micros: i64) -> bool {
+    task.key.operation != Operation::SealedConsolidation && is_live_frontier(task.key.slice, now_micros)
 }
 
 fn track_latest_frontier_rollup<'a>(latest: &mut HashMap<(&'a str, &'a str, &'a str), &'a MaintenanceTask>, task: &'a MaintenanceTask, now_micros: i64) {
@@ -4071,6 +4094,56 @@ mod tests {
         assert_eq!(class(&cell("d", 60, 200, Operation::BaseRollup)).3, class(&cell("e", 60, 3, Operation::BaseRollup)).3);
     }
 
+    /// A `SealedConsolidation` unit is never the live frontier, by construction.
+    ///
+    /// `plan_compaction_debt` picks the operation from the calendar — `date ==
+    /// today` mints HotPacking, anything older mints SealedConsolidation — but
+    /// `scheduling_class` asked `is_live_frontier`, which stays true for a full
+    /// `LIVE_FRONTIER_WINDOW_MICROS` (24 h) after the slice ENDS. So yesterday's
+    /// consolidation unit held class 0 — strict priority over every genuinely
+    /// sealed cell — until it was 48 h old, and the two halves of the system
+    /// disagreed about the same date for a whole day.
+    ///
+    /// Measured on prod 2026-08-24, a mature container over 68 minutes: **26 of
+    /// 27** SealedConsolidation claims went to 2026-08-23, while 48 out-of-policy
+    /// cells — one of them holding 238 small files — took none. Class is strict
+    /// priority, so benefit ordering never got a say: `scheduling_class`'s own
+    /// comment promises "a cell worth 200 files outranks one worth 3", and class
+    /// was silently overriding it.
+    #[test]
+    fn a_sealed_consolidation_unit_is_never_the_live_frontier() {
+        const HOUR: i64 = 3_600_000_000;
+        const DAY: i64 = 24 * HOUR;
+        // Late morning, so yesterday's slice ended 11 h ago — inside the 24 h
+        // frontier window, which is the window the defect lives in.
+        let now = 400 * DAY + 11 * HOUR;
+        let cell = |project: &str, start: i64, files: u32, operation| {
+            let mut unit = task(project, start, start + DAY, operation);
+            unit.input = Some(InputFootprint { fp: 1, whole_file_bytes: 1, files });
+            unit
+        };
+        let yesterday = cell("small", 399 * DAY, 3, Operation::SealedConsolidation);
+        let five_days_old = cell("bigdebt", 395 * DAY, 238, Operation::SealedConsolidation);
+
+        assert_eq!(
+            super::scheduling_class(&yesterday, now).0,
+            1,
+            "the planner mints SealedConsolidation only for a date it already treats as sealed"
+        );
+        assert!(
+            super::scheduling_class(&five_days_old, now) < super::scheduling_class(&yesterday, now),
+            "238 files of debt must outrank 3 — which class 0 was silently preventing"
+        );
+
+        // The blast radius. Today's packing IS frontier work and must stay class
+        // 0, or this trades one starvation for another.
+        assert_eq!(
+            super::scheduling_class(&cell("today", 400 * DAY, 9, Operation::HotPacking), now).0,
+            0,
+            "today's packing is genuinely live-frontier work"
+        );
+    }
+
     /// "Planned and never claimed" must name what beat it.
     ///
     /// Prod 2026-08-24: `87576849 / 2026-08-19` held 238 small files — the
@@ -4097,15 +4170,17 @@ mod tests {
             unit.input = Some(InputFootprint { fp: 1, whole_file_bytes: 1, files });
             unit
         };
-        // The prod shape: the biggest debt is OLD, so it is inside the starvation
-        // band; a much smaller cell sealed yesterday is still the live frontier
-        // and takes class 0, which is strict priority.
-        let indebted = cell("bigdebt", 120, 238);
+        // The biggest debt sealed only a day ago, so it is NOT in the starvation
+        // band; a much smaller cell has been waiting five days and is. `starved`
+        // is compared before `benefit`, so the older one legitimately wins and
+        // the 238-file cell waits — which is the ordering this instrument exists
+        // to make legible.
+        let indebted = cell("bigdebt", 24, 238);
         journal.upsert(indebted.clone());
-        journal.upsert(cell("frontier", 1, 3));
+        journal.upsert(cell("starved", 120, 10));
 
         let refusal = journal.most_indebted_unclaimed(Operation::SealedConsolidation, now).expect("the debt is not being claimed");
-        assert!(refusal.starts_with("outranked_by:frontier"), "it must name the winner, not merely say CLAIMABLE — got {refusal}");
+        assert!(refusal.starts_with("outranked_by:starved"), "it must name the winner, not merely say CLAIMABLE — got {refusal}");
         assert!(refusal.contains("files=238"), "and it must carry the debt that makes it worth reporting — got {refusal}");
 
         // Eligibility reasons still win over the ordering answer, because they
@@ -4121,7 +4196,7 @@ mod tests {
         // And silence when there is nothing to explain: the biggest debt winning
         // its own claims is the healthy state, not a finding.
         let mut alone = TaskJournal::load(dir.path()).expect("journal");
-        alone.upsert(cell("bigdebt", 120, 238));
+        alone.upsert(cell("bigdebt", 24, 238));
         assert_eq!(alone.most_indebted_unclaimed(Operation::SealedConsolidation, now), None);
     }
 
