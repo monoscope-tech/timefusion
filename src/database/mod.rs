@@ -11968,10 +11968,7 @@ mod tests {
         let cell = ("otel_logs_and_spans".to_owned(), project.clone(), tier, day.to_string());
         let recorded = db.coverage_ledger.coverage(&cell);
         assert!(!recorded.is_empty(), "the replay recorded the published slice");
-        assert!(
-            recorded.iter().all(|entry| entry.end_micros > entry.start_micros),
-            "slice ends are exclusive and must be after their start: {recorded:?}"
-        );
+        assert!(recorded.iter().all(|entry| entry.end_micros > entry.start_micros), "slice ends are exclusive and must be after their start: {recorded:?}");
 
         // The verifier is the reason this replay survives once reads move onto
         // the ledger, so it has to be right in BOTH directions. Nothing changed

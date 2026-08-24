@@ -3272,9 +3272,7 @@ impl Database {
                     self.coverage_ledger.retire(&cell);
                 }
                 if disagreements > 0 {
-                    crate::observability::maintenance_stats()
-                        .coverage_ledger_disagreements
-                        .fetch_add(disagreements, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::maintenance_stats().coverage_ledger_disagreements.fetch_add(disagreements, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             // Before any `continue` below, so a partition still holding
