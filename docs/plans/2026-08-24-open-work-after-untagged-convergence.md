@@ -10,14 +10,14 @@ section before anything else.**
 | What remains | Why it cannot be closed today |
 |---|---|
 | §1 decision (fix (c) or close) | criterion is `immutable_column_disagreement_total` over ≥24h of quiet uptime |
-| §3 step 4 (move reads to the ledger) | criterion is `coverage_ledger_disagreements` reading zero over ≥24h |
+| §3 step 4 ENABLEMENT | engineering is done and equivalence is proven locally; flipping reads is a judgement call that wants `coverage_ledger_disagreements` at zero at production scale first |
 | §6 drain to 0 | blocked by deploy churn; needs a push freeze, not code |
 
 | Item | State |
 |---|---|
 | §1 immutability gap | **§1b instrumented** (`8b8ad30`), default OFF; decision still pending real data |
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
-| §3 ledger | **steps 1-3 done** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`) — built, populated from the tag replay, verified against it, and entries now name their FILES (without which it could only supplement the tags, never replace them). Gate before reads move over: `coverage_ledger_disagreements` reads zero on real prod data |
+| §3 ledger | **steps 1-4 engineering done** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`, `21f3951`) — built, populated, verified, entries name their files, and `routing_view` now answers routing's question from the ledger. **The tag-equivalence gate is checked LOCALLY** on real Delta data: every range the tag-derived map covers is covered by the ledger. Reads are NOT flipped — that is a deliberate config decision, not missing work |
 | §4 escalation treadmill | **investigated, no code — two corrections** (`98e72d5`). (b) batching is ALREADY implicit: `enqueue` is keyed, so N escalations to one covering slice collapse to one task. (a) the on-demand split written in this doc is UNSOUND — the covering file physically holds the hole's rows, so re-tagging it narrower double-counts. Escalation stays correct until the ledger can name files per range |
 | §5 fragment debris | **RESOLVED - no migration, and it must not be written.** `clear_stale_estimates` already exists, and the partition ceiling rescues footprint-less debris by FUSING it (proven by test). Deleting those units would have discarded real queued work |
 | §6 whale cells | **BLOCKED, not self-completing — earlier assessment was wrong.** See "Why the drain stopped" below |
