@@ -646,6 +646,35 @@ Note the deploy that carried this **failed its own post-deploy gate** —
 measures handoff readiness, and 12 s against a 10 s budget on a box at load ~35
 is its own small signal about startup under contention. Not chased here.
 
+### Handler construction is NOT the connection stall — and that points outside the process
+
+`62f2385` deployed and reporting, over 135 connections:
+
+    block.pgwire_simple_handler_build     avg 876us   max 2ms
+    block.pgwire_extended_handler_build   avg 768us   max 4ms
+    block.pgwire_startup_handler_build    avg   4us   max 0ms
+
+Per-connection setup inside TimeFusion costs **under 5 ms, worst case**. It
+cannot be the 1,450 ms `connect` sample. Combined with auth being a string
+compare, essentially nothing in this process's connection path is expensive.
+
+**So the search moves outside the process — and there is an obvious candidate
+this plan never mentioned: `srv-timefusion-pgwire-proxy`, the haproxy in front
+of pgwire.** Every measured connection traverses it. That fits the signature
+exactly: TCP connect is to *haproxy* and stays fast (62.5 ms in the stall
+sample), the warm `SELECT 1` on an established connection stays fast (77.5 ms),
+and only establishing a *new* backend session is slow — which is the one phase
+haproxy owns. Nothing in this investigation has looked at it. Its config is in
+`deploy/`; the next probe is whether a stall reproduces when connecting to the
+backend port directly, bypassing the proxy.
+
+**Second finding, from the same read:** `jemalloc.retained_mb` is **21,127** on a
+184-second-old process, against **147,247** on an ~80-minute-old one. Retained
+address space grows roughly 7× over an hour of uptime. That is the first
+quantity found that genuinely accumulates with age — which is what "state grows
+in-process" was always looking for, though it is address space rather than
+resident memory, so it costs no RSS and is not yet tied to query cost.
+
 **What to do next, in order:**
 1. Let the process keep ageing with the host columns recording. The question is
    now narrow: which in-process quantity is monotone across the 1.2 h → 2.2 h
