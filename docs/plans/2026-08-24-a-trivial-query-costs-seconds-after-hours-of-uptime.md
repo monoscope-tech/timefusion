@@ -117,15 +117,17 @@ exact reason) — the
 sampler keeps running and `--analyze` will simply report a shorter longest-run.
 Nobody has to coordinate; they only have to know that a deploy is not free here.
 
-**A code push costs *two* restarts, not one, whenever autofmt has something to
-say.** The autofmt workflow runs on every master push and commits its `cargo
-fmt` / `clippy --fix` output as a **new code commit**, which deploys on its own
-~25 min later. `5e7934b` did exactly this (`83423ee`, two cosmetic
-reformattings of the new instrumentation), so the window in practice starts with
-the *autofmt child*, not the commit that was pushed. The rule that generalizes:
-**a quiet window starts after a code push that autofmt leaves alone.** Anyone
-reading a first uptime reset here should check for an autofmt child before
-concluding someone violated the window.
+**An autofmt child does NOT cost a second restart** — checked, because the
+opposite is the intuitive guess and this file asserted it for an hour. The
+autofmt workflow runs on every master push and commits its `cargo fmt` /
+`clippy --fix` output as a new *code* commit (`5e7934b` produced `83423ee`, two
+cosmetic reformattings of the new instrumentation). But that commit is pushed
+with the workflow's `GITHUB_TOKEN`, and **GitHub does not trigger workflows from
+`GITHUB_TOKEN` pushes** — `gh run list --workflow=deploy.yml` shows no run for
+`83423ee`, and prod has stayed on `5e7934b` since. So a code push costs exactly
+one restart, and the running image can sit one commit behind master's tip
+indefinitely. Read `docker service ls` for what is *running*; master's tip is
+not it.
 
 The 2026-08-24 baseline against the *pre*-instrumentation binary, for reference:
 `connect=2147 ms`, `query=1269 ms`, `reuse=749 ms` at host load 27.5 — the
@@ -187,6 +189,20 @@ Two things follow immediately, and both narrow the plan:
   *max* this early; the Phase-0 day is what distinguishes "boot spike" from
   "steady-state starvation", by whether `scheduling_lag_max_ms` keeps climbing
   after the first hour.
+
+**The first two samples of the window, same process, both drivers moving:**
+
+| uptime | host load | connect | reuse |
+|---|---|---|---|
+| 198 s | 26.6 | 469 ms | 207 ms |
+| 722 s | 37.2 | 1,433 ms | 354 ms |
+
+Cost roughly tripled in nine minutes of process age — and load rose 40 % over
+the same interval, so this pair is exactly as confounded as the pair that opened
+this plan. It is two points; the day of samples is what separates them. Worth
+recording only because it says the effect shows up within *minutes*, not hours,
+which makes the Phase-0 day much more likely to succeed than "wait 5 h for the
+slow state to build".
 
 `delta_snapshot_refresh` is now the most interesting number in the set — 53 ms
 of every query on a process three minutes old, and hypothesis 3 predicts it
