@@ -2,7 +2,8 @@
 
 2026-08-22. Implements ranked residual #2 from
 `2026-08-21-post-hot-tier-speed.md` and P5 ("resident plan-time pruning
-index") from `2026-08-21-point-lookup-file-open-wall.md`.
+index") from `2026-08-21-point-lookup-file-open-wall.md` (deleted 2026-08-24;
+`git log --diff-filter=D -- docs/plans` has the SHA).
 
 ## Problem, with the EA evidence
 

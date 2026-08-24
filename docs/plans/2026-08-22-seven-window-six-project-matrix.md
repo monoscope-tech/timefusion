@@ -133,7 +133,8 @@ the earlier page's finding on four more windows and four more projects.
 140–550 ms with **zero rows** across 1h–14d. Nothing is read, decoded or
 deduped, and it still cannot reach 300 ms reliably. That is the same
 window-scaled planning cost the ghost-project control in
-`2026-08-21-planning-floor-attributed.md` found, reproduced here on a real
+`2026-08-21-planning-floor-attributed.md` (deleted 2026-08-24) found,
+reproduced here on a real
 project by accident. **No scan-side or rollup work moves this number**, and it
 alone is ~30–50% of the sub-second budget at every window.
 

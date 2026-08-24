@@ -336,3 +336,44 @@ Two traps when re-measuring, both hit during this work:
 2. **A deploy mid-run splits the dataset.** Prod restarted twice during this
    session (once from a concurrent session's push), each time zeroing coverage
    and the caches. Stamp every cell with the image it ran on.
+
+## The condition, last measured 2026-08-23: 39 of 60 cells
+
+`24/30 at 14d, 15/30 at 30d` (six projects x five monoscope shapes x two
+windows). Transplanted from `2026-08-23-the-14d-30d-pass-condition-measured.md`,
+deleted 2026-08-24; the full per-cell grid is in git history. **Two failures that
+need different work**, and conflating them wasted time before they were split:
+
+1. **`p95_latency` is the single worst shape** — at 30d it fails on p3, p4 and
+   p5, and on p4 and p5 it is the ONLY failure. This is what the
+   `duration IS NOT NULL` routing fix (`91030f9`) and the `duration_digest`
+   measure exist for. Fixing p95 routing alone takes 30d from 15/30 to 18/30 and
+   clears p4 and p5 completely — blocked on the tier rebuilding, not on code.
+2. **p1 and p6 are a volume problem, not a query-shape problem** — every one of
+   their 30d cells is refused by the per-scan limit at
+   `1,447 files / 450,603 MiB`. At ~310 MB per file that is data volume, not
+   fragmentation, and no routing or dedup change touches it. Both were ALREADY
+   failing before the limit existed (timeout, or the 2 GiB dedup OOM); they now
+   fail in milliseconds with a message naming the size. p4's 30d `log_list` still
+   returns 251 rows in 2.0 s, which was the specific risk of a default-ON refusal.
+
+## 2026-08-24 — one blocker removed from every FILTERED cell
+
+A filtered dashboard chart was paying a tantivy prefilter on the rollup leg it
+routed to, because rollup dimensions had accidentally inherited
+`tantivy: { indexed: true }` from the spans schema through a struct update. On
+prod, over identical rows: `kind = 'server'` on a tier took **8,206 ms against
+283 ms** for an opaque control, and the routed 7d chart went **7,240 ms ->
+14,484 ms** purely by adding a `kind` filter. Fixed in `8698271`; after it the
+direct arm is 211 ms and the routed arm records `prefilter_attempts +1` (the raw
+leg) instead of `+2`.
+
+This matters to the pass condition because the sweep's shapes are filtered ones.
+Cells measured before 2026-08-24 afternoon carry that cost and are not comparable
+with cells measured after — stamp the image, as trap 2 already says, and treat
+`8698271` as the boundary.
+
+Reading the third trap into the list above: **a mean is not a distribution, and a
+single sample is not a mean.** The unfiltered 7d control ranged 5,447-10,715 ms
+across two reps minutes apart on the same process. Where a counter can answer the
+question instead of a timing, use the counter.
