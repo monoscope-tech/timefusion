@@ -482,9 +482,18 @@ type RollupSliceCoverageKey = (String, String, String, i64, i64);
 #[derive(Debug, Clone)]
 struct RollupCoverage {
     source_fp: u64,
-    source_epoch: u64,
+    /// The source partition's invalidation epoch when this was built, and `None`
+    /// for SLICE coverage, which does not have one.
+    ///
+    /// One struct serves two maps: `rollup_coverage` (per DATE) compares this
+    /// against the live epoch, and `rollup_slice_coverage` (per slice) proves
+    /// freshness with the row witness instead and never reads it. Every slice
+    /// producer therefore wrote a literal `0`, which is indistinguishable from a
+    /// partition that has genuinely never been invalidated — the "cannot tell
+    /// none from unmeasured" shape that has cost this codebase three separate
+    /// wrong readings. `None` says which one it is.
+    source_epoch: Option<u64>,
     generation: String,
-    rows: u64,
     /// The source DATE partition's `num_records` sum when this slice was built.
     /// `None` for a slice written before `TAG_SOURCE_ROWS` existed, which the
     /// read path treats as unverifiable and refuses — see
@@ -2257,6 +2266,11 @@ pub struct Database {
     /// on it so it's never the first cold-loader of a table foreground needs.
     preload_complete: Arc<std::sync::atomic::AtomicBool>,
     preload_complete_notify: Arc<tokio::sync::Notify>,
+    /// Tables warmed so far, and how many there are. Read only when the
+    /// coordinator's wait EXPIRES — see there for why the ratio is the whole
+    /// question.
+    preload_tables_done: Arc<std::sync::atomic::AtomicU64>,
+    preload_tables_total: Arc<std::sync::atomic::AtomicU64>,
     /// Runtime for CPU/IO-heavy startup and coordinator work; foreground
     /// PGWire tasks never execute here.
     maintenance_executor: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
@@ -3061,6 +3075,8 @@ impl Database {
             preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preload_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             preload_complete_notify: Arc::new(tokio::sync::Notify::new()),
+            preload_tables_done: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            preload_tables_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             maintenance_executor: Arc::new(std::sync::OnceLock::new()),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
@@ -3921,11 +3937,11 @@ impl Database {
                     .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
                     .map_or(0, |stats| stats.fingerprint);
                 let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
-                if coverage.source_fp != source_fp || coverage.source_epoch != source_epoch {
+                if coverage.source_fp != source_fp || coverage.source_epoch != Some(source_epoch) {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
                     continue;
                 }
-                debug!(project_id = %project, source = %route.source, target = %route.target, date, rows = coverage.rows, "rollup coverage selected");
+                debug!(project_id = %project, source = %route.source, target = %route.target, date, "rollup coverage selected");
                 // Merge with the previous run when the dates are adjacent, so a
                 // contiguous span costs one range predicate rather than one per day.
                 // The build's OWN bound, not the day end. They are the same for a
@@ -4108,7 +4124,7 @@ impl Database {
             if self
                 .rollup_coverage
                 .get(&(project_id.clone(), source.clone(), target.clone(), date.clone()))
-                .is_none_or(|coverage| coverage.source_fp != *source_fp || coverage.source_epoch != *source_epoch || coverage.generation != *generation)
+                .is_none_or(|coverage| coverage.source_fp != *source_fp || coverage.source_epoch != Some(*source_epoch) || coverage.generation != *generation)
             {
                 return false;
             }
@@ -5763,7 +5779,9 @@ impl Database {
         let shutdown = self.maintenance_shutdown.clone();
         let concurrency = self.config.maintenance.timefusion_warm_concurrency.max(1);
         let preload = async move {
-            let preload_all = futures::stream::iter(crate::schema::registry().list_tables()).for_each_concurrent(concurrency, |table_name| {
+            let tables = crate::schema::registry().list_tables();
+            db.preload_tables_total.store(tables.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let preload_all = futures::stream::iter(tables).for_each_concurrent(concurrency, |table_name| {
                 let db = Arc::clone(&db);
                 async move {
                     let t = std::time::Instant::now();
@@ -5790,6 +5808,7 @@ impl Database {
                         }
                         Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }
+                    db.preload_tables_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             });
             // Abandon warming on shutdown so in-flight S3 calls can't slow
@@ -5829,9 +5848,19 @@ impl Database {
                 return true;
             }
             if budget == 0 || tokio::time::Instant::now() >= deadline {
+                // HOW FAR IT GOT, not just that it expired. Prod logs this line
+                // on every boot, which says the 300s is always paid in full and
+                // maintenance then competes with a still-running warm anyway —
+                // so the wait does not achieve the thing it exists for. What it
+                // could not say is whether 300s was nearly enough (raise it) or
+                // nowhere near (lower it, and stop paying a fifth of every
+                // container's life for nothing). Without this ratio that is a
+                // guess, and the container lives ~10-25 minutes.
                 warn!(
                     event = "maintenance_coordinator_preload_wait_expired",
                     waited_secs = budget,
+                    tables_done = self.preload_tables_done.load(std::sync::atomic::Ordering::Relaxed),
+                    tables_total = self.preload_tables_total.load(std::sync::atomic::Ordering::Relaxed),
                     "starting maintenance before the cache preload finished; it would otherwise never start on this container"
                 );
                 return true;
@@ -6640,6 +6669,49 @@ pub(crate) struct StagedIntent {
     /// ~96 columns) against a handful of live entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     adds: Vec<deltalake::kernel::Add>,
+    /// Present ONLY on a rollup unit's staged output.
+    ///
+    /// Absence is structural, not a sentinel: a repair entry, a dedup entry and
+    /// an entry written before this field existed all decode to `None`, and
+    /// `None` is never committable as a rollup. A zero-valued struct would have
+    /// been indistinguishable from a real rollup with zero rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollup: Option<RollupResume>,
+}
+
+/// What a killed rollup unit needs in order to be COMMITTED on the next boot
+/// rather than redone.
+///
+/// A rollup unit averages ~21 minutes and a prod container lives ~10-25, so a
+/// unit essentially never completes: the journal survives the restart and the
+/// work does not. `TIMEFUSION_REPAIR_RESUME_ENABLED` already solves this shape
+/// for repairs, and it does NOT port — `classify_resume` rests on ROW
+/// PRESERVATION and a rollup AGGREGATES, so every rollup would be refused by
+/// construction. Relaxing that check is not the answer either; it is the only
+/// thing standing between a truncated staging and silent row loss.
+///
+/// So a rollup carries its own evidence instead, and the two questions are
+/// different:
+///
+/// - the TARGET side asks "would committing this double-count?", answered by
+///   requiring the live files overlapping the slice to be exactly the replace
+///   set recorded at staging;
+/// - the SOURCE side asks "is this output still what a read would be served?",
+///   answered by the same two-sided row witness the read path itself uses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RollupResume {
+    /// The journal unit this output belongs to. A resumed Delta commit with no
+    /// journal publication is WORTHLESS: coverage recovery requires
+    /// `rollup_slice_complete`, so the planner would see a hole, re-enqueue the
+    /// slice, pay the full scan again, and the republish would retire the files
+    /// just resumed. Publishing is what makes resume worth anything.
+    key: crate::maintenance_coordinator::TaskKey,
+    publication: crate::maintenance_coordinator::Publication,
+    /// The source DATE partition's `num_records` when this was built. `None` is
+    /// an unverifiable build and must never resume — same rule the read path
+    /// applies to a witness-less slice.
+    source_rows: Option<u64>,
+    date: String,
 }
 
 /// Parse the append-only manifest, SKIPPING any line that doesn't decode. The
@@ -6691,7 +6763,82 @@ enum ResumeVerdict {
         target_rows: i64,
         staged_rows: i64,
     },
+    /// ROLLUP only: the source partition moved under the staged output, so the
+    /// read path would refuse this slice the moment it landed. Discard it.
+    SourceMoved,
+    /// ROLLUP only: the tier already holds a file overlapping this slice that
+    /// the staged output does not replace. Committing would leave both live and
+    /// a dashboard would SUM them — the double-count `covered_by_wider` exists
+    /// to prevent, and the reason this whole path is correctness-critical rather
+    /// than a throughput nicety.
+    WouldDoubleCount,
     Commit,
+}
+
+/// One live tier file, as the rollup resume check needs to see it: its row count
+/// and the slice range its tags claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveTierFile {
+    rows: Option<i64>,
+    slice: Option<(i64, i64)>,
+}
+
+/// Should a killed rollup unit's staged output be committed on the next boot?
+///
+/// IO-free, like [`classify_resume`], so every branch is unit-testable; the
+/// caller supplies the target tier's live files and the source partition's
+/// CURRENT row count.
+///
+/// The row-preservation test that guards a repair cannot appear here — a rollup
+/// aggregates, so output rows and input rows differ by design. Two checks stand
+/// in for it, and both are refusals by default:
+///
+/// 1. **Source witness.** The build recorded the source partition's
+///    `num_records`; if it differs now, something rewrote the source and the
+///    read path would refuse this slice as `stale_coverage` anyway. Discard.
+///    This is deliberately pessimistic — a benign compaction changes
+///    `num_records` without changing what was aggregated — because that is the
+///    documented behaviour of this witness everywhere else, and being wrong in
+///    the other direction serves wrong numbers.
+/// 2. **No double-count.** Every live file whose tagged range overlaps this
+///    slice must be one the staged output replaces. If a file overlaps and is
+///    not in the replace set, both would be live after the commit and their rows
+///    would be summed.
+fn classify_rollup_resume(
+    entry: &StagedIntent,
+    table_name: &str,
+    now_secs: u64,
+    live: &HashMap<&str, LiveTierFile>,
+    current_source_rows: Option<u64>,
+) -> ResumeVerdict {
+    let Some(rollup) = entry.rollup.as_ref() else { return ResumeVerdict::Skip };
+    if entry.table_name != table_name || entry.adds.is_empty() || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS {
+        return ResumeVerdict::Skip;
+    }
+    // Same argument as `classify_resume`: staged parquet is uuid-named by the
+    // writer, so its presence in the live set means our commit landed.
+    if entry.adds.iter().all(|add| live.contains_key(add.path.as_str())) {
+        return ResumeVerdict::AlreadyLanded;
+    }
+    // A build with no witness can never be verified, by this path or by a read.
+    let (Some(built_from), Some(current)) = (rollup.source_rows, current_source_rows) else {
+        return ResumeVerdict::SourceMoved;
+    };
+    if built_from != current {
+        return ResumeVerdict::SourceMoved;
+    }
+    let replaced: HashSet<&str> = entry.target_paths.iter().map(String::as_str).collect();
+    let (start, end) = (rollup.key.slice.start_micros, rollup.key.slice.end_micros);
+    let overlaps = |(lo, hi): (i64, i64)| lo < end && hi > start;
+    if live.iter().any(|(path, file)| file.slice.is_some_and(overlaps) && !replaced.contains(path)) {
+        return ResumeVerdict::WouldDoubleCount;
+    }
+    // Checked LAST so an input that left the snapshot is reported as staleness
+    // rather than as a double-count, which is the more useful diagnosis.
+    if !replaced.iter().all(|path| live.contains_key(path)) {
+        return ResumeVerdict::Stale;
+    }
+    ResumeVerdict::Commit
 }
 
 /// `live` maps every path in the current snapshot to its `numRecords`
@@ -11966,6 +12113,168 @@ mod tests {
         Ok(())
     }
 
+    /// Build one rollup slice, then reconstruct the state a killed container
+    /// leaves behind: the staged parquet exists in object storage, and the
+    /// commit that would have made it live never happened.
+    ///
+    /// Reconstructed by REMOVING the committed files rather than by trying to
+    /// interrupt a live unit — the objects survive a Remove, so what is left is
+    /// byte-for-byte the killed-mid-stage state, and it uses only real
+    /// machinery.
+    ///
+    /// Returns `(db, key, staged adds, source witness)`.
+    #[allow(clippy::type_complexity)]
+    async fn staged_but_uncommitted_rollup(
+        label: &str,
+    ) -> Result<(Database, crate::maintenance_coordinator::TaskKey, Vec<deltalake::kernel::Add>, Option<u64>, String, String)> {
+        use crate::maintenance_coordinator::Operation;
+        let mut cfg = (*create_test_config(label)).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_rollup_resume_enabled = true;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("resume_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        let tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+        let (key, publication) = db
+            .journal()
+            .published_rollups("otel_logs_and_spans", &tier)
+            .into_iter()
+            .find(|(key, _)| key.project_id == project)
+            .expect("the first run published, or this test proves nothing");
+
+        // The committed output — soon to be the "staged" files.
+        let table_ref = db.get_or_create_table(&project, &tier).await?;
+        let staged: Vec<deltalake::kernel::Add> = {
+            let table = table_ref.read().await;
+            #[allow(deprecated)]
+            table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect()
+        };
+        assert!(!staged.is_empty(), "the build produced files");
+
+        // Un-commit them. The parquet stays in object storage.
+        {
+            let mut table = table_ref.read().await.clone();
+            let actions: Vec<deltalake::kernel::Action> =
+                staged.iter().map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, true))).collect();
+            let schema = get_schema(&tier).expect("tier schema");
+            let op = deltalake::protocol::DeltaOperation::Write {
+                mode: deltalake::protocol::SaveMode::Overwrite,
+                partition_by: Some(schema.partitions.clone()),
+                predicate: None,
+            };
+            let finalized = deltalake::kernel::transaction::CommitBuilder::default()
+                .with_actions(actions)
+                .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
+                .await?;
+            table.state = Some(finalized.snapshot());
+            *table_ref.write().await = table;
+        }
+
+        // The intent the killed process would have left, aged past the
+        // rolling-deploy window so it is unambiguously a crash leftover.
+        db.record_staged_intent(&super::StagedIntent {
+            wave_id: uuid::Uuid::new_v4().to_string(),
+            table_name: tier.clone(),
+            project_id: project.clone(),
+            recorded_at: crate::support::now_secs() - (super::STAGED_INTENT_MIN_AGE_SECS + 1),
+            paths: staged.iter().map(|add| add.path.clone()).collect(),
+            target_paths: Vec::new(),
+            adds: staged.clone(),
+            rollup: Some(super::RollupResume {
+                key: key.clone(),
+                publication: publication.clone(),
+                source_rows: publication.source_rows,
+                date: day.to_string(),
+            }),
+        });
+        Ok((db, key, staged, publication.source_rows, project, tier))
+    }
+
+    /// A rollup unit killed mid-stage must be COMMITTED on the next claim, not
+    /// rebuilt.
+    ///
+    /// This is the root cause behind every "the queue never drains" finding: a
+    /// unit averages ~21 minutes, a prod container lives ~10-25, and maintenance
+    /// does nothing for the first 300s of each. The journal survives the
+    /// restart; the work does not, and `oldest_task_age` in the tens of DAYS is
+    /// that, not a stuck queue.
+    ///
+    /// `TIMEFUSION_REPAIR_RESUME_ENABLED` cannot be extended to cover this:
+    /// `classify_resume` rests on ROW PRESERVATION and a rollup AGGREGATES, so
+    /// every rollup resume is refused by construction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rollup_killed_mid_stage_is_committed_on_the_next_claim() -> Result<()> {
+        let (db, key, staged, source_rows, project, tier) = staged_but_uncommitted_rollup("rollup-resume").await?;
+        let live = |db: &Database, tier: &str, project: &str| {
+            let (tier, project) = (tier.to_owned(), project.to_owned());
+            let db = db.clone();
+            async move {
+                let table_ref = db.get_or_create_table(&project, &tier).await.expect("table");
+                let table = table_ref.read().await;
+                table.snapshot().expect("snapshot").log_data().iter().map(|file| file.path().to_string()).collect::<std::collections::HashSet<_>>()
+            }
+        };
+        assert!(live(&db, &tier, &project).await.is_empty(), "the reconstructed state has nothing live");
+
+        let before = crate::observability::maintenance_stats().rollup_resumed.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(db.resume_rollup_unit(&key, source_rows).await?, "the staged output describes reality and must be committed");
+
+        let after = live(&db, &tier, &project).await;
+        for add in &staged {
+            assert!(after.contains(&add.path), "the staged file {} is live again — committed, not rebuilt", add.path);
+        }
+        assert!(
+            crate::observability::maintenance_stats().rollup_resumed.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "and it is counted as a resume"
+        );
+        // Publication is the half that makes resume worth anything: coverage
+        // recovery requires `rollup_slice_complete`, so a commit without it
+        // leaves the planner seeing a hole and re-running the whole scan.
+        assert!(
+            db.journal().published_rollups("otel_logs_and_spans", &tier).iter().any(|(published, _)| *published == key),
+            "the journal is published too, or the planner rebuilds this slice anyway"
+        );
+        Ok(())
+    }
+
+    /// And the other direction: a unit whose SOURCE moved under it must be
+    /// discarded, not committed.
+    ///
+    /// This is the failure that makes the whole path correctness-critical rather
+    /// than a throughput nicety. The replace-set removes files contained in the
+    /// slice; if the inputs moved, the resumed output and the newer files can
+    /// both end up live and a dashboard SUMs them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rollup_whose_source_moved_is_discarded_not_committed() -> Result<()> {
+        let (db, key, staged, source_rows, project, tier) = staged_but_uncommitted_rollup("rollup-resume-stale").await?;
+        let before = crate::observability::maintenance_stats().rollup_resume_declined.load(std::sync::atomic::Ordering::Relaxed);
+
+        // One more source row: the witness the build recorded no longer
+        // describes the partition. Passed explicitly, exactly as the unit passes
+        // the count it just read.
+        let moved = source_rows.map(|rows| rows + 1);
+        assert!(!db.resume_rollup_unit(&key, moved).await?, "a moved source must not resume");
+
+        let table_ref = db.get_or_create_table(&project, &tier).await?;
+        let live: std::collections::HashSet<String> =
+            table_ref.read().await.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect();
+        for add in &staged {
+            assert!(!live.contains(&add.path), "the staged file {} must NOT have been committed", add.path);
+        }
+        assert!(
+            crate::observability::maintenance_stats().rollup_resume_declined.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "and the refusal is visible rather than silent"
+        );
+        Ok(())
+    }
+
     /// Step 1 of moving coverage off file tags: the replay that reads the tags
     /// also RECORDS what it read. Nothing consumes the ledger yet, which is the
     /// point — it has to be shown to agree with the replay before any read can
@@ -12067,6 +12376,24 @@ mod tests {
         let after = crate::observability::maintenance_stats().coverage_ledger_disagreements.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(after, before, "an unchanged tier replayed twice is not a disagreement");
         assert_eq!(db.coverage_ledger.coverage(&cell), recorded, "and the second replay leaves the same coverage, not a duplicated one");
+
+        // RETIREMENT. `retire_before` existed and was tested but had no caller,
+        // so the ledger grew for as long as the process had ever seen a
+        // partition — carrying every file path of every long-expired day in
+        // every write. The tier replay's own orphan sweep does not reach these:
+        // it only retires cells of a tier it just read.
+        //
+        // Planted under a source/tier this replay NEVER reads, which is the only
+        // way the assertion pins the date-based caller: the orphan sweep filters
+        // on `(source, target)`, so a cell in the tier being replayed would be
+        // retired by that sweep whether or not `retire_aged_out_coverage` exists,
+        // and the test would pass with the caller deleted.
+        let ancient = ("never_replayed".to_owned(), project.clone(), cell.2.clone(), "2025-01-01".to_owned());
+        db.coverage_ledger.record(&ancient, recorded[0].clone());
+        assert!(!db.coverage_ledger.coverage(&ancient).is_empty(), "planted");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert!(db.coverage_ledger.coverage(&ancient).is_empty(), "a cell past the rollup horizon is retired");
+        assert_eq!(db.coverage_ledger.coverage(&cell), recorded, "and an in-window cell is untouched by retirement");
         Ok(())
     }
 
@@ -14376,6 +14703,7 @@ mod tests {
             paths: paths.iter().map(|s| s.to_string()).collect(),
             target_paths: Vec::new(),
             adds: Vec::new(),
+            rollup: None,
         };
         let old = super::STAGED_INTENT_MIN_AGE_SECS + 1;
         let entries = vec![
@@ -14408,6 +14736,7 @@ mod tests {
             paths: adds.iter().map(|a| a.path.clone()).collect(),
             target_paths: targets.iter().map(|s| s.to_string()).collect(),
             adds,
+            rollup: None,
         }
     }
 
@@ -14449,6 +14778,76 @@ mod tests {
         // re-commit (re-committing would remove files the landed commit added).
         let landed = resume_intent(&["in1"], vec![resume_add("out1", 100)]);
         assert_eq!(super::classify_resume(&landed, "logs", 100_000, &resume_live(&[("out1", Some(100))])), AlreadyLanded);
+    }
+
+    /// The rollup half of resume, decided WITHOUT IO.
+    ///
+    /// A rollup aggregates, so the row-preservation test above is meaningless
+    /// for it — output rows and input rows differ by design. These are the two
+    /// checks that stand in for it, and the reason each exists is a way a
+    /// resumed commit can be WRONG rather than merely wasteful.
+    #[test]
+    fn a_rollup_resumes_only_when_the_source_held_still_and_nothing_else_covers_the_slice() {
+        use super::{LiveTierFile, ResumeVerdict::*};
+        let slice = crate::maintenance_coordinator::TimeSlice::new(1_000, 2_000).expect("slice");
+        let rollup = |source_rows: Option<u64>| super::RollupResume {
+            key: crate::maintenance_coordinator::TaskKey {
+                physical_table: "logs".into(),
+                source: "otel_logs_and_spans".into(),
+                project_id: "p".into(),
+                slice,
+                operation: crate::maintenance_coordinator::Operation::BaseRollup,
+            },
+            publication: crate::maintenance_coordinator::Publication {
+                source_fingerprint: 7,
+                generation: "g1".into(),
+                rows: 5,
+                source_rows,
+            },
+            source_rows,
+            date: "2026-08-24".into(),
+        };
+        let intent = |targets: &[&str], source_rows: Option<u64>| super::StagedIntent {
+            rollup: Some(rollup(source_rows)),
+            ..resume_intent(targets, vec![resume_add("out1", 5)])
+        };
+        let file = |rows: i64, slice: Option<(i64, i64)>| LiveTierFile { rows: Some(rows), slice };
+        let live = |files: &[(&'static str, LiveTierFile)]| files.iter().copied().collect::<HashMap<&str, LiveTierFile>>();
+        let inside = live(&[("in1", file(9, Some((1_000, 2_000))))]);
+        let ok = intent(&["in1"], Some(100));
+
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, Some(100)), Commit);
+        // A repair/dedup entry carries no rollup evidence and must never be
+        // committed by this path — absence is structural, not a zero.
+        let repair = resume_intent(&["in1"], vec![resume_add("out1", 5)]);
+        assert_eq!(super::classify_rollup_resume(&repair, "logs", 100_000, &inside, Some(100)), Skip);
+        // The source moved: the read path would refuse this slice as
+        // `stale_coverage` the moment it landed, so committing it buys nothing
+        // and risks a wrong number.
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, Some(101)), SourceMoved);
+        // No witness on either side is unverifiable, which is NOT the same as
+        // verified — the rule the read path applies to a witness-less slice.
+        assert_eq!(super::classify_rollup_resume(&intent(&["in1"], None), "logs", 100_000, &inside, Some(100)), SourceMoved);
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, None), SourceMoved);
+        // THE CORRECTNESS CASE. A live file overlapping this slice that the
+        // staged output does NOT replace would stay live beside it, and a
+        // dashboard would SUM both. An untagged file (`slice: None`) claims no
+        // range and cannot double-count.
+        let overlapping = live(&[("in1", file(9, Some((1_000, 2_000)))), ("other", file(9, Some((1_500, 2_500))))]);
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &overlapping, Some(100)), WouldDoubleCount);
+        let adjacent = live(&[("in1", file(9, Some((1_000, 2_000)))), ("later", file(9, Some((2_000, 3_000))))]);
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &adjacent, Some(100)), Commit, "slice ends are exclusive; touching is not overlapping");
+        let untagged = live(&[("in1", file(9, Some((1_000, 2_000)))), ("legacy", file(9, None))]);
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &untagged, Some(100)), Commit);
+        // An input that left the snapshot entirely.
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &live(&[]), Some(100)), Stale);
+        // Our own output is live ⇒ the commit landed and only the journal
+        // publication was lost. The caller publishes; it must never re-commit.
+        let landed = live(&[("out1", file(5, Some((1_000, 2_000))))]);
+        assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &landed, Some(100)), AlreadyLanded);
+        // A still-running instance on a shared volume may be mid-staging.
+        let young = super::StagedIntent { recorded_at: 100_000 - 10, ..ok.clone() };
+        assert_eq!(super::classify_rollup_resume(&young, "logs", 100_000, &inside, Some(100)), Skip);
     }
 
     /// The Add stats column list must be the narrow prune set, not the whole schema, and must never

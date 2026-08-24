@@ -2028,6 +2028,24 @@ pub struct MaintenanceConfig {
     /// the rewrite survive a restart at all.
     #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
+    /// The same idea for ROLLUP units, on its own switch because it is a
+    /// different risk class.
+    ///
+    /// The problem is the same and worse: a rollup unit averages ~21 minutes and
+    /// a prod container lives ~10-25, so the journal survives every restart and
+    /// the work never does — `oldest_task_age` in the tens of DAYS is that, not
+    /// a stuck queue. What differs is the safety argument. A repair preserves
+    /// rows, so `classify_resume` can compare input and output counts; a rollup
+    /// AGGREGATES, so that comparison is meaningless and the check is replaced
+    /// by two others (see `classify_rollup_resume`) — a source-row witness and a
+    /// no-double-count test against the tier's live files.
+    ///
+    /// Defaults OFF. Committing a STALE rollup double-counts, because the
+    /// replace-set removes files contained in the slice: if the inputs moved,
+    /// the resumed output and the newer files can both end up live and a
+    /// dashboard sums them. Turn on deliberately, one deploy on its own.
+    #[serde(default)]
+    pub timefusion_rollup_resume_enabled: bool,
     /// Audit, during the dedup sweep, whether versions of one key disagree on a
     /// column declared IMMUTABLE — see `FieldDef::mutable`.
     ///

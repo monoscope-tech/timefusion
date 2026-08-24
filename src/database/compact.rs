@@ -1814,6 +1814,7 @@ impl Database {
                 // truncated one. See `resumable_staged_bin`.
                 target_paths: Vec::new(),
                 adds: Vec::new(),
+                rollup: None,
             });
             debug!(table_name, project_id, chunk = label, files = targets.len(), before, after, event = "dedup_chunk_staged");
             return Ok(BinOutcome::Staged(StagedBin {

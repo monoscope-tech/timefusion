@@ -3538,7 +3538,11 @@ pub fn load_sidecar<T: serde::de::DeserializeOwned>(data_dir: &std::path::Path, 
     }
 }
 
-pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&str, &str), items: &[T]) {
+/// Returns whether the write landed. Deliberately not `#[must_use]`: the hint
+/// stores (certifications, dirty bins) are best-effort by design and losing one
+/// costs a recomputation, so their call sites are right to ignore this. A store
+/// whose contents are an AUTHORITY is not — see `JsonCoverageLedger::persist`.
+pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&str, &str), items: &[T]) -> bool {
     use std::io::Write;
     let path = crate::write::wal::meta_path(data_dir, file);
     let result = path
@@ -3549,7 +3553,9 @@ pub fn store_sidecar<T: Serialize>(data_dir: &std::path::Path, (file, what): (&s
         .and_then(|bytes| crate::write::wal::write_atomic_with(&path, false, |f| f.write_all(&bytes)));
     if let Err(error) = result {
         warn!(%error, "failed to persist {what}");
+        return false;
     }
+    true
 }
 
 /// Sidecar file names, paired with the label their warnings use.
@@ -3643,6 +3649,18 @@ pub type CoverageCell = (String, String, String, String);
 /// FIRST backend, not the intended one: this state is destined for a real
 /// datastore (Postgres, SlateDB) where a point read does not mean loading every
 /// cell. Keeping callers on this interface makes that a backend swap.
+///
+/// **The decision, recorded 2026-08-24:** the real backend is DEFERRED, and JSON
+/// is the fallback rather than the plan. Nothing is blocked on it — the tags are
+/// still the authority and the ledger is still being verified against them — so
+/// the datastore is worth choosing when the ledger becomes load-bearing, not
+/// before. What must not happen in the meantime is callers reaching past this
+/// trait to `JsonCoverageLedger`, because that is what would turn a backend swap
+/// back into a rewrite. Two known JSON limits set the bar the replacement has to
+/// clear: `CoverageEntry.files` makes the sidecar grow with the FILE count
+/// (~13,800 live tier files in prod, not the cell count), and every change
+/// re-serializes every cell — `replace_many` bounds that to one write per tier
+/// pass and cannot do better within a single-document store.
 ///
 /// **Ordering is the safety property.** The Delta commit and the ledger write
 /// are not one transaction, and the two failure modes are not symmetric:
@@ -3756,6 +3774,17 @@ impl JsonCoverageLedger {
         Self { data_dir, cells }
     }
 
+    /// Write-through, and COUNTED when it fails.
+    ///
+    /// The sidecar helper warns and continues, which is correct for a hint and
+    /// wrong for an authority: a dropped write means the in-memory ledger and
+    /// the disk copy diverge, and only the memory copy knows. Losing one is safe
+    /// while the Delta tags remain the authority — the ledger merely understates
+    /// coverage and costs a rebuild — so this does NOT fail the recovery pass.
+    /// It has to be VISIBLE, though: `coverage_ledger_persist_failures` joins
+    /// `coverage_ledger_disagreements` as a precondition on
+    /// `timefusion_coverage_ledger_reads`, because a ledger that silently stopped
+    /// persisting reads exactly like a ledger with nothing to say.
     fn persist(&self) {
         let rows: Vec<StoredCoverage> = self
             .cells
@@ -3765,7 +3794,9 @@ impl JsonCoverageLedger {
                 StoredCoverage { source, project_id, table_name, date, entries }
             })
             .collect();
-        store_sidecar(&self.data_dir, ROLLUP_COVERAGE, &rows);
+        if !store_sidecar(&self.data_dir, ROLLUP_COVERAGE, &rows) {
+            crate::observability::maintenance_stats().coverage_ledger_persist_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The covered ranges this ledger claims for one `(source, tier table)`,
@@ -3963,6 +3994,32 @@ mod coverage_ledger_tests {
         let reloaded = JsonCoverageLedger::load(dir.path());
         assert_eq!(reloaded.coverage(&cell()).len(), 1, "and the batch reached disk");
         assert!(reloaded.coverage(&other).is_empty(), "including the retirement");
+    }
+
+    /// A ledger that cannot write must SAY SO. It goes on serving what it holds
+    /// in memory — which is the safe behaviour while the tags are the authority —
+    /// and the only thing distinguishing that from a healthy ledger is this
+    /// counter.
+    ///
+    /// `data_dir` is a FILE, so creating the `.timefusion_meta` directory under
+    /// it fails on every platform regardless of who is running the test. A
+    /// permission bit would not: CI runs as root often enough that a chmod-based
+    /// test passes for the wrong reason.
+    #[test]
+    fn a_ledger_that_cannot_reach_disk_counts_the_loss() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"").expect("write file");
+        let ledger = JsonCoverageLedger::load(&blocked);
+        let before = crate::observability::maintenance_stats().coverage_ledger_persist_failures.load(std::sync::atomic::Ordering::Relaxed);
+
+        ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
+
+        assert!(
+            crate::observability::maintenance_stats().coverage_ledger_persist_failures.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "a failed persist must be visible in timefusion_stats, not only in a log line"
+        );
+        assert_eq!(ledger.coverage(&cell()).len(), 1, "and the in-memory ledger still answers — losing the write is not losing the coverage");
     }
 
     /// Replacing with nothing means the replay found no coverage at all, which
