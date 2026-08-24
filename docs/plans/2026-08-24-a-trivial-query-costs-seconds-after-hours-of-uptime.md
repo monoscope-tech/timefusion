@@ -478,6 +478,14 @@ reach: 3 minutes to 1 hour, cost is flat-to-improving. Five hours remains
 unreached, but the burden has shifted — an hour of uptime produces the best
 numbers in the dataset, not the worst.
 
+**Still flat at 102 minutes** (`connect` 182–340 ms, `reuse` 42–68 ms, 1 slow
+sample of 45). And in that stretch `block.journal_hold.max_ms` reached **2,380**
+— a `std::sync::Mutex` occupied a runtime worker for 2.4 seconds — with
+`scheduling_lag_max_ms` at 2,356 and **no effect on query cost whatsoever**.
+That is the strongest disposal of hypothesis 2 available: the event it predicts
+happened, at the magnitude it predicts, and queries did not notice. The 48
+workers absorb it.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
