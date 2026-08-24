@@ -460,6 +460,24 @@ session setup is the obvious suspect to time next. That is the natural Phase 2
 if the rate holds — but at 1 in 26, it needs more samples before anyone
 instruments a specific stage.
 
+### One hour of uptime, and the process is at its fastest
+
+The first undisturbed process to survive an hour reached **3,529 s** with:
+
+    up=2794s load=25.5 connect=180ms reuse=45.0ms
+    up=3162s load=24.7 connect=209ms reuse=43.8ms
+    up=3529s load=39.0 connect=179ms reuse=42.6ms
+
+`reuse` at 42–45 ms is **the plan's own healthy baseline** (46 ms, measured on a
+4-minute-old process), and `connect` at ~180 ms beats the 219 ms that §2 called
+healthy. At an hour of uptime, at load 39, with `journal_hold.max_ms` past 1,000
+and gigabytes of allocation churn behind it.
+
+So the age hypothesis is now falsified across the entire range this window can
+reach: 3 minutes to 1 hour, cost is flat-to-improving. Five hours remains
+unreached, but the burden has shifted — an hour of uptime produces the best
+numbers in the dataset, not the worst.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
