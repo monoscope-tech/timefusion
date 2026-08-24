@@ -806,6 +806,16 @@ atomic_stats! {
     /// file already covered them. Expected to be rare; if it is not, a late row
     /// inside an already-published day may be going stale in the coarse tier.
     rollup_skipped_covered_by_wider,
+    /// Splits refused because the unit measured nearly what its parent measured:
+    /// bisection has hit the row-group floor and halving the width again buys
+    /// nothing but journal units.
+    ///
+    /// This is the instrument for the 2026-08-22 shred — 3,455 units for a
+    /// single (project, tier, day). Read it against `pending_base_rollup`: this
+    /// rising while pending stops growing is the fix working. This rising while
+    /// pending ALSO rises means units are being declined and then failing to
+    /// run, which is worse than the shred, not better.
+    split_declined_at_floor,
     /// Base rollup files carrying no parseable slice tags — history written
     /// before tagging existed.
     ///

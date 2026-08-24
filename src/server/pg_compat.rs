@@ -1000,6 +1000,7 @@ impl StatsTableProvider {
             "rollup_rebuilds_full_total" => m.rollup_rebuilds_full,
             "rollup_dirty_partitions" => m.rollup_dirty_partitions,
             "rollup_skipped_covered_by_wider" => m.rollup_skipped_covered_by_wider,
+            "split_declined_at_floor" => m.split_declined_at_floor,
             "rollup_untagged_inputs" => m.rollup_untagged_inputs,
             "rollup_tier_untagged_found" => m.rollup_tier_untagged_found,
             // The republish backlog that gates wide-window routing. Watch it fall;

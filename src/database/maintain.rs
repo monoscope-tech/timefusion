@@ -399,6 +399,7 @@ impl Database {
                         publication: None,
                         base_tier_present: false,
                         input: Some(footprint),
+                        parent_measured_bytes: None,
                     });
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
@@ -426,6 +427,7 @@ impl Database {
                             publication: None,
                             base_tier_present: false,
                             input: Some(footprint),
+                            parent_measured_bytes: None,
                         });
                     }
                 }
@@ -1289,6 +1291,7 @@ impl Database {
                     // `dependencies_complete` looks for, so say so.
                     base_tier_present: true,
                     input: None,
+                    parent_measured_bytes: None,
                 });
             }
             journal.enqueue(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());

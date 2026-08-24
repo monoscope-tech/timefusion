@@ -309,6 +309,24 @@ pub struct MaintenanceTask {
     /// exactly as they did before.
     #[serde(default)]
     pub input: Option<InputFootprint>,
+    /// What the parent MEASURED when it split into this unit, so that the next
+    /// preflight can tell whether halving the width actually bought anything.
+    ///
+    /// `byte_bounded_units` prices children by TIME SHARE, which is a model, not
+    /// a measurement — so the recursion always terminates on paper however
+    /// expensive the slice really is. The true cost has a floor (a slice reads
+    /// at least one row group of every file it overlaps; prod 2026-08-22
+    /// measured 302 MB for a FIVE-MINUTE slice), and it surfaces only when the
+    /// preflight re-measures at claim time, finds itself over budget and splits
+    /// again — all the way to `MIN_SLICE_MICROS`. One (project, tier, day) held
+    /// 3,455 units that way.
+    ///
+    /// Comparing against this turns the model into a feedback loop: measure, and
+    /// if the child did not get meaningfully cheaper than its parent, stop.
+    /// `default` so older journals deserialize as `None` and bisect exactly as
+    /// they did before.
+    #[serde(default)]
+    pub parent_measured_bytes: Option<u64>,
 }
 
 /// The file set behind a unit's byte estimate.
@@ -426,6 +444,30 @@ impl GroupPrice {
             _ => None,
         }
     }
+}
+
+/// A child must shed at least this much of what its parent measured for the
+/// next bisection to be worth minting units for. Bisection halves the WIDTH, so
+/// the model expects ~50%; anything above this is the row-group floor, not a
+/// slice that is genuinely too wide.
+const SPLIT_MUST_SHED_NUMERATOR: u64 = 3;
+const SPLIT_MUST_SHED_DENOMINATOR: u64 = 4;
+
+/// Whether halving the width bought enough to justify halving it again.
+///
+/// `None` — no parent evidence — always splits: that is the first measurement
+/// of this lineage and there is nothing yet to compare against.
+///
+/// The window is deliberately two-sided. A child that measured MORE than its
+/// parent is not evidence of the floor, it is evidence the parent's number was
+/// never a measurement — which is exactly what `retry_or_split` stamps when it
+/// forces a bisection with a synthetic `MAX_DECODED_BYTES + 1`. Declining there
+/// would freeze that lineage forever, the immortal-unit shape this file already
+/// has three incidents of. Let it split once more; the next preflight stamps a
+/// real number and the guard starts working.
+fn split_sheds_enough(parent_measured_bytes: Option<u64>, observed_bytes: u64) -> bool {
+    let Some(parent) = parent_measured_bytes else { return true };
+    observed_bytes > parent || observed_bytes.saturating_mul(SPLIT_MUST_SHED_DENOMINATOR) < parent.saturating_mul(SPLIT_MUST_SHED_NUMERATOR)
 }
 
 /// Split a unit until each estimated reservation fits.  A one-minute whale is
@@ -1252,6 +1294,7 @@ impl TaskJournal {
                 // sets reads their union, which no scalar here can state, and
                 // guessing one would let the next width up under-price itself.
                 input: price.unanimous_input(),
+                parent_measured_bytes: None,
             });
         }
         report
@@ -1628,6 +1671,7 @@ impl TaskJournal {
             publication: None,
             base_tier_present,
             input: None,
+            parent_measured_bytes: None,
         });
     }
 
@@ -1749,6 +1793,7 @@ impl TaskJournal {
                         publication: None,
                         base_tier_present: false,
                         input: None,
+                        parent_measured_bytes: None,
                     });
                     self.dirty_tasks.insert(key);
                 }
@@ -2209,6 +2254,26 @@ impl TaskJournal {
         // `coarsen_to_width` put them back together later for the price of one
         // scan instead of N.
         parent.input = input.or(parent.input);
+        // Bisecting halves TIME. It only halves BYTES while the slice is wide
+        // enough that narrowing it drops whole files and row groups; a slice
+        // reads at least one row group of every file it still overlaps, so below
+        // some width the cost stops falling and only the model keeps shrinking.
+        //
+        // `byte_bounded_units` cannot see that — it prices children by time
+        // share (`:444`) — so the recursion always terminates on paper and the
+        // truth arrives one preflight later, over budget, splitting again. That
+        // cycle is what minted 3,455 units for one (project, tier, day).
+        //
+        // The parent's measurement is the evidence: if this unit came back
+        // costing most of what its parent cost, the floor has been reached and
+        // there is nothing left for bisection to win. Decline, and let the unit
+        // RUN — the runner already hash-shards internally at any width
+        // (`database/maintain.rs:1623`), which bounds memory without minting a
+        // single journal unit.
+        if !split_sheds_enough(parent.parent_measured_bytes, observed_bytes) {
+            crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let children = byte_bounded_units(&parent, observed_bytes);
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
             return false;
@@ -2220,6 +2285,9 @@ impl TaskJournal {
             self.dirty_tasks.insert(key.clone());
         }
         for mut child in children {
+            // What the PARENT measured, not the child's modelled share — the
+            // modelled share is the very number that cannot be trusted.
+            child.parent_measured_bytes = Some(observed_bytes);
             child.state = TaskState::Pending;
             child.attempts = 0;
             child.retry_reason = None;
@@ -3032,6 +3100,7 @@ mod tests {
             publication: None,
             base_tier_present: false,
             input: None,
+            parent_measured_bytes: None,
         }
     }
 
@@ -3091,6 +3160,84 @@ mod tests {
         let shards = byte_bounded_units(&minute, MAX_DECODED_BYTES * 3);
         assert_eq!(shards.len(), 3);
         assert!(shards.iter().all(|unit| unit.hash_shards == 3));
+    }
+
+    /// Bisection prices children by TIME SHARE (`byte_bounded_units:444`), so it
+    /// always "fits" on paper. The real cost floors out — a slice reads at least
+    /// one row group of every file it overlaps — and the disagreement surfaces
+    /// only at the next preflight, which re-measures, finds itself over budget
+    /// and splits again. Prod 2026-08-22 held 3,455 units for a single
+    /// (project, tier, day), 1,423 of them pending.
+    ///
+    /// A child that measured essentially what its parent measured IS that floor,
+    /// observed. Splitting again cannot help, so the split must decline —
+    /// declining is safe because the runner already hash-shards INTERNALLY at
+    /// any width (`database/maintain.rs:1623`), which bounds memory without
+    /// minting a single journal unit.
+    #[test]
+    fn a_child_no_cheaper_than_its_parent_stops_bisecting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // A 12h child of a day-wide parent: the model promised half the bytes,
+        // the measurement came back with 96% of them.
+        let mut unit = task("whale", 0, DAY_MICROS / 2, Operation::BaseRollup);
+        unit.parent_measured_bytes = Some(100 * MAX_DECODED_BYTES);
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        assert!(
+            !journal.split_time_task(&key, 96 * MAX_DECODED_BYTES, None),
+            "halving the width bought 4% — the row-group floor dominates, so bisecting again only mints units"
+        );
+        assert_eq!(journal.state(&key), Some(TaskState::Pending), "a declined split must leave the unit runnable, not superseded");
+    }
+
+    /// The guard above is only as good as the evidence it reads, and that
+    /// evidence has to be the parent's MEASUREMENT — the modelled per-child
+    /// number is the very thing that cannot be trusted.
+    #[test]
+    fn a_split_stamps_children_with_what_the_parent_measured() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let unit = task("whale", 0, DAY_MICROS, Operation::BaseRollup);
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        let measured = 4 * MAX_DECODED_BYTES;
+        assert!(journal.split_time_task(&key, measured, None), "a day-wide unit with no floor evidence still bisects");
+
+        let children: Vec<_> = journal.tasks().filter(|t| t.state == TaskState::Pending).collect();
+        assert!(!children.is_empty(), "the split produced children");
+        assert!(
+            children.iter().all(|child| child.parent_measured_bytes == Some(measured)),
+            "children carry the parent's measurement, not their own modelled share"
+        );
+    }
+
+    /// `retry_or_split` forces a bisection with a synthetic
+    /// `MAX_DECODED_BYTES + 1` — it is a "does not fit" signal, not a
+    /// measurement. Stamping it and then comparing the next REAL measurement
+    /// against it would decline every split in that lineage forever, which is
+    /// the immortal-unit shape this file already carries three incidents of.
+    #[test]
+    fn a_synthetic_stamp_does_not_freeze_a_lineage() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let unit = task("whale", 0, DAY_MICROS, Operation::BaseRollup);
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        // The retry path's synthetic value, verbatim.
+        assert!(journal.split_time_task(&key, MAX_DECODED_BYTES.saturating_add(1), None));
+        let child = journal.tasks().find(|t| t.state == TaskState::Pending).expect("a child").clone();
+        assert_eq!(child.parent_measured_bytes, Some(MAX_DECODED_BYTES + 1));
+
+        // A real preflight now measures far more than the synthetic seed. That
+        // is not the row-group floor, so the child must still be splittable.
+        assert!(
+            journal.split_time_task(&child.key, 8 * MAX_DECODED_BYTES, None),
+            "a measurement ABOVE the parent's stamp is evidence the stamp was never a measurement"
+        );
     }
 
     #[test]
