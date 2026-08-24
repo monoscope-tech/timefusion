@@ -6,7 +6,7 @@
 |---|---|
 | §1 immutability gap | **§1b instrumented** (`8b8ad30`), default OFF; decision still pending real data |
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
-| §3 ledger | not started |
+| §3 ledger | **step 1 done** (`3ec8003`) — types, trait, JSON backend, merge + retirement. Additive; tags remain the authority and nothing reads it yet. Next: populate it from `recover_rollup_coverage` so the replay becomes a VERIFIER (invariant 3) rather than the read path |
 | §4 escalation treadmill | not started (re-evaluate after §3) |
 | §5 fragment debris | not started (deploy with §2, not before) |
 | §6 whale cells | no action; 7 as of 11:26 UTC |
