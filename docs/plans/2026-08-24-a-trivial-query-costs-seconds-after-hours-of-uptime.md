@@ -586,6 +586,27 @@ That reframes what to look for. Not "which quantity grows with age" but "which
 quantity spikes during an episode and recovers". Anything monotone — uptime,
 `journal_hold`, cache entry counts — is the wrong shape by construction.
 
+### First jemalloc reading (deployed `c3fb011`, uptime 4,873 s)
+
+    jemalloc.allocated_mb   10,943      jemalloc.resident_mb   13,838
+    jemalloc.active_mb      11,420      jemalloc.mapped_mb     15,436
+    jemalloc.frag_pct         20.9      jemalloc.retained_mb  147,247
+
+**`retained` is 147 GB** — address space jemalloc has decommitted but kept
+mapped, on a box with 192 GB of RAM and a 120 GB cgroup limit. It is not
+resident, so it costs no RSS, but it is the accumulated record of exactly the
+churn `kcompactd` was seen burning a core on. `frag_pct` at 20.9 % (2.9 GB
+resident behind no live allocation) is the number to watch across the next
+episode: the prediction is that it climbs into one and falls out of it. If it
+stays flat through a slow window, fragmentation is out too and the remaining
+suspect is the connection-setup path itself.
+
+Note the deploy that carried this **failed its own post-deploy gate** —
+"replacement returned 57P03/not-ready continuously for 12,011 ms (budget
+10,000 ms)" — with `WAL recovery 0ms`. The image is live and serving; the gate
+measures handoff readiness, and 12 s against a 10 s budget on a box at load ~35
+is its own small signal about startup under contention. Not chased here.
+
 **What to do next, in order:**
 1. Let the process keep ageing with the host columns recording. The question is
    now narrow: which in-process quantity is monotone across the 1.2 h → 2.2 h
